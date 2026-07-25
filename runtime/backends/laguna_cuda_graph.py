@@ -651,12 +651,16 @@ class LagunaCudaGraphDecode:
         has_swa = self._ring_blocks_per_slot > 0
         n_steps = max_tokens - 1
 
-        # ── Pre-compute ALL per-step values as Python ints (zero GPU work) ──
+        # ── Pre-compute ALL per-step values as GPU tensors (zero per-step Python) ──
         positions = list(range(start_kv, start_kv + n_steps))
-        slot_maps = [base * ps + kvl for kvl in positions]
         new_kvs = [kvl + 1 for kvl in positions]
-        lpls = [(nk % ps) if (nk % ps) != 0 else ps for nk in new_kvs]
         n_blocks_list = [(nk + ps - 1) // ps for nk in new_kvs]
+        lpls = [(nk % ps) if (nk % ps) != 0 else ps for nk in new_kvs]
+
+        # GPU pre-computed buffers (allocated once, avoids per-step Python→GPU dispatch)
+        _positions_gpu = torch.tensor(positions, dtype=torch.int64, device=device)
+        _slot_maps_gpu = torch.tensor([base * ps + kvl for kvl in positions], dtype=torch.int64, device=device)
+        _lpls_gpu = torch.tensor(lpls, dtype=torch.int32, device=device)
 
         if has_swa:
             rbps = self._ring_blocks_per_slot
@@ -670,17 +674,18 @@ class LagunaCudaGraphDecode:
             swa_al = [new_kvs[i] - swa_as[i] for i in range(n_steps)]
             swa_lpls = [(al % ps) if (al % ps) != 0 else ps for al in swa_al]
             swa_nrs = [(al + ps - 1) // ps for al in swa_al]
+            # GPU pre-computed SWA buffers
+            _swa_slot_maps_gpu = torch.tensor(swa_slot_maps, dtype=torch.int64, device=device)
+            _swa_lpls_gpu = torch.tensor(swa_lpls, dtype=torch.int32, device=device)
 
         # GPU token accumulator
         out_tokens_gpu = torch.empty(max_tokens, dtype=torch.long, device=device)
         out_tokens_gpu[0] = first_token
         self._input_ids[0] = first_token
 
-        # Pinned CPU staging (allocated once, reused)
-        lpl_cpu = torch.empty(1, dtype=torch.int32, pin_memory=True)
+        # Pinned CPU staging (only for indptr, which changes at page boundaries)
         indptr_cpu = torch.zeros(2, dtype=torch.int32, pin_memory=True)
         if has_swa:
-            swa_lpl_cpu = torch.empty(1, dtype=torch.int32, pin_memory=True)
             swa_indptr_cpu = torch.zeros(2, dtype=torch.int32, pin_memory=True)
 
         prev_nb = 0
@@ -698,18 +703,14 @@ class LagunaCudaGraphDecode:
             prev_nb = init_nb
 
         for step in range(n_steps):
-            # Scalar assigns (GPU-side, from Python int — no sync)
-            self._positions[0] = positions[step]
-            self._slot_mapping[0] = slot_maps[step]
-
-            # H2D: last_page_len (1 int32)
-            lpl_cpu[0] = lpls[step]
-            self._fi_last_page_len_gpu[:1].copy_(lpl_cpu, non_blocking=True)
+            # GPU→GPU indexed copy (avoids Python int → CPU → GPU dispatch)
+            self._positions[:1] = _positions_gpu[step:step+1]
+            self._slot_mapping[:1] = _slot_maps_gpu[step:step+1]
+            self._fi_last_page_len_gpu[:1] = _lpls_gpu[step:step+1]
 
             if has_swa:
-                self._swa_slot_mapping[0] = swa_slot_maps[step]
-                swa_lpl_cpu[0] = swa_lpls[step]
-                self._swa_fi_last_page_len_gpu[:1].copy_(swa_lpl_cpu, non_blocking=True)
+                self._swa_slot_mapping[:1] = _swa_slot_maps_gpu[step:step+1]
+                self._swa_fi_last_page_len_gpu[:1] = _swa_lpls_gpu[step:step+1]
 
             # Block table: O(1) incremental update at page boundaries
             nb = n_blocks_list[step]
