@@ -1,0 +1,38 @@
+{
+  "timestamp": "2026-07-25T09:20:00",
+  "gpu": "RTX PRO 6000 Blackwell 96GB (SM120)",
+  "model": "poolside/Laguna-S-2.1-NVFP4 + DFlash-NVFP4 (K=15)",
+  "fix": "SWA verify_ring window: kv_len-window+1 (was nkv-window, missed 15 tokens)",
+  "config": "eager verify + draft CG, disable_split_kv=True, gpu_util=0.90",
+  "params": {"max_new": 128, "suffix": 10240, "temperature": 0.0},
+  "results": {
+    "64K": {
+      "warmup":        {"tok_s": 43.9, "accept": 0.339, "prefill_s": 11.8, "total_s": 14.7, "mem_gib": 82.1},
+      "prefix_cached": {"tok_s": 52.3, "accept": 0.463, "prefill_s": 2.5,  "total_s": 5.0,  "mem_gib": 82.1},
+      "cold":          {"tok_s": 37.8, "accept": 0.331, "prefill_s": 11.7, "total_s": 15.0, "mem_gib": 82.1}
+    },
+    "128K": {
+      "warmup":        {"tok_s": 24.8, "accept": 0.388, "prefill_s": 38.4, "total_s": 43.6, "mem_gib": 85.4},
+      "prefix_cached": {"tok_s": 9.9,  "accept": 0.164, "prefill_s": 5.3,  "total_s": 18.2, "mem_gib": 85.4},
+      "cold":          {"tok_s": 10.6, "accept": 0.118, "prefill_s": 28.1, "total_s": 40.0, "mem_gib": 85.4}
+    },
+    "200K": {
+      "warmup":        {"tok_s": 22.2, "accept": 0.302, "prefill_s": 44.5, "total_s": 50.2, "mem_gib": 86.5},
+      "prefix_cached": {"tok_s": 33.3, "accept": 0.467, "prefill_s": 4.2,  "total_s": 8.1,  "mem_gib": 86.5},
+      "cold":          {"tok_s": 34.5, "accept": 0.558, "prefill_s": 50.6, "total_s": 54.3, "mem_gib": 87.8}
+    }
+  },
+  "vs_previous_best": {
+    "64K_warmup":  "24.5→43.9 (+79%)",
+    "64K_cached":  "41.5→52.3 (+26%)",
+    "128K_warmup": "28.0→24.8 (eager slower per-forward but correct)",
+    "200K_warmup": "12.2→22.2 (+82%)",
+    "200K_cached": "19.1→33.3 (+74%)",
+    "200K_cold":   "18.3→34.5 (+89%)"
+  },
+  "known_issues": [
+    "128K prefix_cached/cold acceptance still low (16%/12%) — investigate chunked prefill aux alignment",
+    "128K prefill 28-38s — needs chunk size optimization",
+    "vLLM comparison not yet run"
+  ]
+}

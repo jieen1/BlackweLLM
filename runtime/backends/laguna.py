@@ -781,11 +781,13 @@ class LagunaBackend:
             new_kv_lens = [kv_len + qo for kv_len, qo in zip(kv_lengths, qo_lens)]
             max_seq = max(new_kv_lens)
 
-            # seq_lens for SWA = aligned window length (same as decode path)
+            # Window must cover [earliest_query - window + 1, latest_query].
+            # Earliest query is at kv_len (first verify token), so
+            # window_start = kv_len - window + 1  (NOT nkv - window).
             seq_lens_list = []
             for kv_len, qo in zip(kv_lengths, qo_lens):
                 nkv = kv_len + qo
-                ws = max(0, nkv - window)
+                ws = max(0, kv_len - window + 1)
                 aligned_start = (ws // bs) * bs
                 seq_lens_list.append(nkv - aligned_start)
             seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=self.device)
@@ -796,7 +798,7 @@ class LagunaBackend:
                 phys = _physical_slot(slot)
                 ring_base = phys * ring_blocks_per_slot
                 nkv = kv_len + qo
-                ws = max(0, nkv - window)
+                ws = max(0, kv_len - window + 1)
                 aligned_start = (ws // bs) * bs
                 aligned_len = nkv - aligned_start
                 n_ring = min((aligned_len + bs - 1) // bs, ring_blocks_per_slot)
