@@ -130,5 +130,32 @@
     "conclusion": "SparkInfer paged attention is 6-11% FASTER than FlashInfer FA2 in CG replay. Previous 11-13x slower result was a test script bug (CG not properly captured). SparkInfer is viable for full attention.",
     "previous_result_invalid": true,
     "previous_bug": "Custom benchmark script failed to properly capture/replay sparkinfer CUDA graph, measuring eager overhead instead of graph replay"
+  },
+  "integration_prototype_2026_07_25": {
+    "api": "PagedAttentionWorkspace + prepare_decode_graph_replay_state + graph capture",
+    "key_finding": "metadata update is CAPTURED IN GRAPH (_decode_graph_metadata_captured_in_graph=True). Per-step only needs cache_seqlens GPU write + graph.replay()",
+    "per_step_64k": {
+      "pure_replay_us": 39.3,
+      "gpu_copy_plus_replay_us": 45.9,
+      "metadata_overhead_us": 6.6
+    },
+    "correctness": {
+      "cosine_4k": 0.999995,
+      "cosine_16k": 0.999995,
+      "cosine_64k": 0.999995
+    },
+    "projected_savings": {
+      "full_attn_12_layers_ms": 0.551,
+      "flashinfer_12_layers_ms": 1.15,
+      "savings_per_step_ms": 0.599,
+      "run_plan_elimination_ms": 0.045,
+      "total_savings_ms": 0.644
+    },
+    "integration_requirements": [
+      "Change block_size from 16 to 64",
+      "Use PagedAttentionWorkspace.for_tensors() + prepare_decode_graph_replay_state()",
+      "Capture attention in CUDA graph",
+      "Per-step: GPU\u2192GPU copy of cache_seqlens + graph.replay()"
+    ]
   }
 }
