@@ -272,6 +272,10 @@ class LagunaBackend:
         # unmodified against either backend.
         self.block_table: list[list[int]] = [[] for _ in range(num_slots)]
 
+        # M=1 decode CUDA Graph (lazily captured on first generate call)
+        self._decode_cg = None
+        self._decode_cg_enabled = _os.environ.get("QSR_DECODE_CUDA_GRAPH", "1") != "0"
+
         # Pre-allocated decode buffers (avoid per-step tensor allocation)
         max_batch = num_slots
         self._decode_input_ids = torch.zeros(max_batch, dtype=torch.long, device=self.device)
@@ -1476,6 +1480,20 @@ class LagunaBackend:
         """Laguna prefill is never incremental; state is always already done."""
         return state.done
 
+    def _ensure_decode_cg(self) -> None:
+        """Lazily capture M=1 decode CUDA Graph on first use."""
+        if not self._decode_cg_enabled or self._decode_cg is not None:
+            return
+        from runtime.backends.laguna_cuda_graph import LagunaCudaGraphDecode
+        try:
+            cg = LagunaCudaGraphDecode(self, batch_size=1)
+            cg.capture()
+            self._decode_cg = cg
+            logger.info("Laguna: M=1 decode CUDA Graph captured")
+        except Exception as e:
+            logger.warning("Laguna: decode CG capture failed (falling back to eager): %s", e)
+            self._decode_cg_enabled = False
+
     def generate(
         self,
         prompt_ids: list[int],
@@ -1495,6 +1513,19 @@ class LagunaBackend:
             first = self.prefill(slot, prompt_ids)
         else:
             first = self.prefill_sampled(slot, prompt_ids, params)
+
+        # Use CUDA Graph for greedy decode (temperature=0)
+        if temperature == 0 and self._decode_cg_enabled:
+            self._ensure_decode_cg()
+            if self._decode_cg is not None:
+                self._decode_cg.reset()
+                tokens = self._decode_cg.generate(
+                    slot=slot, first_token=first,
+                    max_tokens=max_tokens, eos_tokens=(2, 24))
+                self.reset_slot(slot)
+                return tokens
+
+        # Fallback: eager decode
         tokens = [first]
         for _ in range(max_tokens - 1):
             if temperature == 0:

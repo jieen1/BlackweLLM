@@ -1,0 +1,40 @@
+{
+  "runtime": "blackforge",
+  "cuda_graph": true,
+  "cuda_graph_mode": "LagunaCudaGraphDecode M=1",
+  "dflash": false,
+  "ctx": 65536,
+  "max_new": 128,
+  "gpu_util": 0.85,
+  "prefix_cache": false,
+  "init_s": 67.5,
+  "warmup_s": 12.1,
+  "mem_gib": 79.9,
+  "runs_full_generate": [
+    {
+      "run": 1,
+      "total_s": 10.935,
+      "n_tokens": 128,
+      "total_tok_s": 11.7
+    },
+    {
+      "run": 2,
+      "total_s": 10.891,
+      "n_tokens": 128,
+      "total_tok_s": 11.8
+    },
+    {
+      "run": 3,
+      "total_s": 10.965,
+      "n_tokens": 128,
+      "total_tok_s": 11.7
+    }
+  ],
+  "separate_timing": {
+    "prefill_s": 8.733,
+    "decode_s": 2.241,
+    "n_tokens": 128,
+    "decode_tok_s": 57.1
+  },
+  "output": " decoding offers a promising approach by using a smaller draft model to propose multiple tokens in parallel, which are then verified by the larger target model in a single forward pass.  The quick brown fox jumps over the lazy dog. In a world of artificial intelligence and machine learning, the importance of efficient inference cannot be overstated. Modern language models require careful optimization of memory bandwidth and compute utilization to achieve real-time"
+}

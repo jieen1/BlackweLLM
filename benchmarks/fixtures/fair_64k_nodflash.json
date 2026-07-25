@@ -1,0 +1,56 @@
+{
+  "timestamp": "2026-07-25T10:13:00",
+  "gpu": "RTX PRO 6000 Blackwell 96GB (SM120)",
+  "model": "poolside/Laguna-S-2.1-NVFP4 (117.6B MoE, 8.5B active)",
+  "config": {
+    "ctx": 65536,
+    "max_new": 128,
+    "gpu_util": 0.85,
+    "dflash": false,
+    "prefix_cache": true,
+    "temperature": 0.0,
+    "concurrency": 1,
+    "n_runs": 3,
+    "prompt": "synthetic 64K tokens (repeated text)",
+    "note": "warmup first (populate prefix cache), then 3 cached runs"
+  },
+  "vllm": {
+    "version": "0.25.1.dev0",
+    "cuda_graph": true,
+    "cuda_graph_mode": "PIECEWISE",
+    "enforce_eager": false,
+    "max_model_len": 65920,
+    "init_s": 475.5,
+    "mem_gib": 87.8,
+    "runs": [
+      {"run": 1, "total_s": 1.832, "n_tokens": 128, "tok_s": 69.9},
+      {"run": 2, "total_s": 1.806, "n_tokens": 128, "tok_s": 70.9},
+      {"run": 3, "total_s": 1.813, "n_tokens": 128, "tok_s": 70.6}
+    ],
+    "avg_tok_s": 70.5,
+    "output_preview": "decoding offers a promising approach by using a smaller draft model to propose multiple tokens in parallel..."
+  },
+  "blackforge": {
+    "cuda_graph": false,
+    "cuda_graph_note": "eager M=1 decode — no full-model CG without DFlash",
+    "enforce_eager": true,
+    "max_model_len": 65920,
+    "init_s": 74.9,
+    "mem_gib": 77.9,
+    "runs": [
+      {"run": 1, "total_s": 9.575, "prefill_s": 0.073, "decode_s": 9.502, "n_tokens": 128, "decode_tok_s": 13.5, "prefix_match": 65536},
+      {"run": 2, "total_s": 9.891, "prefill_s": 0.080, "decode_s": 9.811, "n_tokens": 128, "decode_tok_s": 13.0, "prefix_match": 65536},
+      {"run": 3, "total_s": 9.381, "prefill_s": 0.077, "decode_s": 9.305, "n_tokens": 128, "decode_tok_s": 13.8, "prefix_match": 65536}
+    ],
+    "avg_decode_tok_s": 13.4,
+    "output_preview": "decoding is a technique where you have a smaller, faster model that generates tokens..."
+  },
+  "analysis": {
+    "speed_gap": "vLLM 70.5 vs BlackForge 13.4 tok/s = 5.3x gap",
+    "root_cause": "CUDA Graph. vLLM PIECEWISE CG eliminates kernel launch overhead at M=1. BlackForge eager decode has ~74ms/token (launch-dominated). vLLM CG = ~14ms/token.",
+    "memory": "BlackForge 77.9 GiB vs vLLM 87.8 GiB → saves 9.9 GiB (11% less)",
+    "prefix_cache": "Both working. BF prefill on cache hit: 0.07s (near-instant). vLLM cached total 1.8s = pure decode.",
+    "correctness": "Both produce coherent output. BF output is more creative (not just repeating prompt).",
+    "next_step": "BlackForge needs M=1 decode CG (without DFlash) to close the 5x gap. This is the #1 priority."
+  }
+}

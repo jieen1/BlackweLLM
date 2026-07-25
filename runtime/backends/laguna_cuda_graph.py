@@ -268,8 +268,8 @@ class LagunaCudaGraphDecode:
                 kv_data_type=kv_dtype,
                 sm_scale=builder_sm_scale,
                 non_blocking=True,
-                fixed_split_size=2048,
-                disable_split_kv=True,
+                fixed_split_size=-1,
+                disable_split_kv=False,
             )
             wrapper._sm_scale = builder_sm_scale
 
