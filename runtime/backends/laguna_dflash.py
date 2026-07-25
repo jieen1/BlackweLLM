@@ -48,6 +48,7 @@ from runtime.compat_vllm import (
     set_forward_context,
 )
 
+from runtime.backends.bf_attention import bf_attn_context
 logger = logging.getLogger("qwen_sm120_runtime.dflash")
 
 
@@ -437,10 +438,12 @@ class DFlashEngine:
                 positions_list, dtype=torch.long, device=self.device
             )
 
-        with set_forward_context(
-            attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict
-        , skip_compiled=True):
-            result = backend.model.forward(input_ids, positions)
+        with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
+            with set_forward_context(
+                attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict,
+                skip_compiled=True,
+            ):
+                result = backend.model.forward(input_ids, positions)
 
         # Handle tuple return (hidden_states, aux_hidden_states)
         if isinstance(result, tuple):
@@ -751,10 +754,12 @@ class DFlashEngine:
                 attn_metadata_dict[name] = metadata
                 slot_mapping_dict[name] = meta.slot_mapping
 
-        with set_forward_context(
-            attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict
-        , skip_compiled=True):
-            result = backend.model.forward(input_ids, positions)
+        with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
+            with set_forward_context(
+                attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict,
+                skip_compiled=True,
+            ):
+                result = backend.model.forward(input_ids, positions)
 
         if isinstance(result, tuple):
             hidden_states = result[0]
@@ -1236,8 +1241,12 @@ class DFlashEngine:
 
         from runtime.compat_vllm import set_forward_context
         with set_current_vllm_config(backend.vllm_config):
-            with set_forward_context(attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict, skip_compiled=True):
-                result = backend.model.forward(input_ids, positions)
+            with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
+                with set_forward_context(
+                    attn_metadata_dict, backend.vllm_config,
+                    slot_mapping=slot_mapping_dict, skip_compiled=True,
+                ):
+                    result = backend.model.forward(input_ids, positions)
 
         if isinstance(result, tuple):
             hidden_states, aux = result

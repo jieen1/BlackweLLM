@@ -9,6 +9,7 @@ Architecture: 48 layers (12 full attn 48-head + 36 SWA 72-head window=512),
 
 Roadmap ref: E3 Laguna L2 = "LagunaBackend — 过质量链"
 """
+
 from __future__ import annotations
 
 import logging
@@ -29,6 +30,7 @@ from runtime.compat_vllm import (
     set_current_vllm_config,
     set_forward_context,
 )
+from runtime.backends.bf_attention import bf_attn_context
 from runtime.logprobs import compute_logprobs
 from runtime.model_spec import ModelSpec
 from runtime.sampling import SamplingParams, make_generator, sample_from_logits
@@ -44,7 +46,7 @@ SWA_QO_MAX = 16
 
 
 def _ring_blocks_for_window(window: int, block_size: int, qo_max: int = SWA_QO_MAX) -> int:
-    return -(-( window - 1 + qo_max) // block_size) + 1  # cdiv + 1
+    return -(-(window - 1 + qo_max) // block_size) + 1  # cdiv + 1
 
 
 def _physical_slot(slot: int) -> int:
@@ -65,6 +67,16 @@ class LagunaBackend:
         block_size: int = 64,
         blocks_per_slot: int = 1088,
     ) -> None:
+        # The active sparkinfer paged-attention integration has a fixed
+        # 64-token page layout (including its CUDA-graph workspaces).  Fail
+        # before model loading instead of reaching its opaque planner error
+        # after allocating all weights and KV cache.
+        if block_size != 64:
+            raise ValueError(
+                "LagunaBackend requires block_size=64 for sparkinfer paged attention; "
+                f"got {block_size}."
+            )
+
         import os as _os
         import sys as _sys
 
@@ -158,17 +170,26 @@ class LagunaBackend:
 
         # Patch attention layers to use sparkinfer instead of FlashInfer
         from runtime.backends.laguna_sparkinfer_attn import SparkinferAttentionImpl
+
         self._metadata_builders = {}  # kept for CG compat, unused for prefill
         for group_key, layer_names in self._layer_groups.items():
             wl, nqh, nkvh = group_key
             for name in layer_names:
                 layer = sfc[name]
                 layer.impl = SparkinferAttentionImpl(
-                    num_heads=nqh, head_size=128, scale=128**-0.5,
-                    num_kv_heads=nkvh, window_left=wl,
+                    num_heads=nqh,
+                    head_size=128,
+                    scale=128**-0.5,
+                    num_kv_heads=nkvh,
+                    window_left=wl,
                 )
-            logger.info("SparkInfer attn patched: wl=%d, qh=%d, kvh=%d (%d layers)",
-                        wl, nqh, nkvh, len(layer_names))
+            logger.info(
+                "SparkInfer attn patched: wl=%d, qh=%d, kvh=%d (%d layers)",
+                wl,
+                nqh,
+                nkvh,
+                len(layer_names),
+            )
 
         # ── Classify layers: full attention vs SWA ──
         cache_dtype_str = vllm_config.cache_config.cache_dtype
@@ -187,9 +208,7 @@ class LagunaBackend:
                 self._full_layer_names.append(name)
 
         self._ring_blocks_per_slot = (
-            _ring_blocks_for_window(self._swa_window, block_size)
-            if self._swa_window > 0
-            else 0
+            _ring_blocks_for_window(self._swa_window, block_size) if self._swa_window > 0 else 0
         )
         self._ring_slots_per_slot = self._ring_blocks_per_slot * block_size
         logger.info(
@@ -212,13 +231,17 @@ class LagunaBackend:
             # Self-allocated KV cache in sparkinfer-native format:
             # [num_blocks, 2, block_size, num_kv_heads, head_dim]
             # dim=1: 0=K, 1=V. FP8 stored as uint8.
-            kv_dtype = torch.uint8 if "fp8" in (cache_dtype_str or "") else layer.kv_cache_torch_dtype
-            shape = (n_blocks, 2, block_size, layer.num_kv_heads, layer.head_size)
-            self.kv_caches[name] = torch.zeros(
-                shape, dtype=kv_dtype, device=self.device
+            kv_dtype = (
+                torch.uint8 if "fp8" in (cache_dtype_str or "") else layer.kv_cache_torch_dtype
             )
+            shape = (n_blocks, 2, block_size, layer.num_kv_heads, layer.head_size)
+            self.kv_caches[name] = torch.zeros(shape, dtype=kv_dtype, device=self.device)
         runner_kv_caches: list[torch.Tensor] = []
         bind_kv_cache(self.kv_caches, sfc, runner_kv_caches)
+        # Replace vLLM Attention modules with self-developed BFAttention
+        from runtime.backends.bf_attention import replace_vllm_attention
+
+        replace_vllm_attention(self.model, sfc, self.kv_caches)
 
         # ── Persistent prefill scratch for SWA layers (审查非阻断③) ──
         # Allocated once, reused across slots. Not zeroed (causal mask
@@ -229,7 +252,9 @@ class LagunaBackend:
         # scratch before each chunk, then processes chunk_tokens new tokens.
         # Total scratch capacity = window + chunk_tokens.
         self._prefill_chunk_tokens = int(os.environ.get("QSR_PREFILL_CHUNK", "8192"))
-        _scratch_tokens = (self._swa_window if self._swa_window > 0 else 0) + self._prefill_chunk_tokens
+        _scratch_tokens = (
+            self._swa_window if self._swa_window > 0 else 0
+        ) + self._prefill_chunk_tokens
         self._swa_scratch_blocks = min(
             blocks_per_slot,
             -(-_scratch_tokens // block_size),  # cdiv
@@ -237,11 +262,17 @@ class LagunaBackend:
         if self._swa_layer_names:
             for name in self._swa_layer_names:
                 layer = sfc[name]
-                kv_dtype = torch.uint8 if "fp8" in (cache_dtype_str or "") else layer.kv_cache_torch_dtype
-                shape = (self._swa_scratch_blocks, 2, block_size, layer.num_kv_heads, layer.head_size)
-                self._swa_scratch[name] = torch.empty(
-                    shape, dtype=kv_dtype, device=self.device
+                kv_dtype = (
+                    torch.uint8 if "fp8" in (cache_dtype_str or "") else layer.kv_cache_torch_dtype
                 )
+                shape = (
+                    self._swa_scratch_blocks,
+                    2,
+                    block_size,
+                    layer.num_kv_heads,
+                    layer.head_size,
+                )
+                self._swa_scratch[name] = torch.empty(shape, dtype=kv_dtype, device=self.device)
 
         # Per-slot state
         self.slot_kv_len: list[int] = [0] * num_slots
@@ -380,17 +411,30 @@ class LagunaBackend:
             # a1_gscale = 1/input_scale (sparkinfer convention: reciprocal)
             inp13 = getattr(routed, "w13_input_scale", None)
             inp2 = getattr(routed, "w2_input_scale", None)
-            a1g = (1.0 / inp13.float().max()).item() if inp13 is not None and inp13.numel() > 0 else None
-            a2g = (1.0 / inp2.float().max()).item() if inp2 is not None and inp2.numel() > 0 else None
+            a1g = (
+                (1.0 / inp13.float().max()).item()
+                if inp13 is not None and inp13.numel() > 0
+                else None
+            )
+            a2g = (
+                (1.0 / inp2.float().max()).item() if inp2 is not None and inp2.numel() > 0 else None
+            )
             si_experts = prepare_sparkinfer_layer(raw, self.device, a1_gscale=a1g, a2_gscale=a2g)
             del raw
             si_layer = SparkinferMoELayer(si_experts, workspace, self.device)
             self._moe_sparkinfer_layers.append(si_layer)
 
             # Free vLLM's expert weights to reclaim memory
-            for attr in ("w13_weight", "w13_weight_scale", "w13_weight_scale_2",
-                         "w2_weight", "w2_weight_scale", "w2_weight_scale_2",
-                         "w13_input_scale", "w2_input_scale"):
+            for attr in (
+                "w13_weight",
+                "w13_weight_scale",
+                "w13_weight_scale_2",
+                "w2_weight",
+                "w2_weight_scale",
+                "w2_weight_scale_2",
+                "w13_input_scale",
+                "w2_input_scale",
+            ):
                 if hasattr(routed, attr):
                     t = getattr(routed, attr)
                     if isinstance(t, torch.nn.Parameter):
@@ -400,8 +444,15 @@ class LagunaBackend:
             torch.cuda.empty_cache()
 
             def _make_patched_forward(
-                moe_mod, _si_layer, _shared, _scaling,
-                _renorm, _softcap, _e_bias, _top_k, _apply_on_input,
+                moe_mod,
+                _si_layer,
+                _shared,
+                _scaling,
+                _renorm,
+                _softcap,
+                _e_bias,
+                _top_k,
+                _apply_on_input,
             ):
                 def _patched_forward(hidden_states: torch.Tensor) -> torch.Tensor:
                     orig_shape = hidden_states.shape
@@ -411,8 +462,12 @@ class LagunaBackend:
                     if _softcap > 0:
                         router_logits = torch.tanh(router_logits / _softcap) * _softcap
                     topk_weights, topk_ids = fused_topk_bias(
-                        hs, router_logits, "sigmoid", _e_bias,
-                        _top_k, _renorm,
+                        hs,
+                        router_logits,
+                        "sigmoid",
+                        _e_bias,
+                        _top_k,
+                        _renorm,
                         routed_scaling_factor=1.0,
                     )
                     routed_out = _si_layer.forward(hs, topk_ids, topk_weights)
@@ -424,11 +479,19 @@ class LagunaBackend:
                     elif _scaling != 1.0:
                         routed_out = routed_out * _scaling
                     return routed_out.view(orig_shape)
+
                 return _patched_forward
 
             moe_module.forward = _make_patched_forward(
-                moe_module, si_layer, shared_expert, routed_scaling,
-                renormalize, softcap, e_bias, top_k, apply_on_input,
+                moe_module,
+                si_layer,
+                shared_expert,
+                routed_scaling,
+                renormalize,
+                softcap,
+                e_bias,
+                top_k,
+                apply_on_input,
             )
             patched += 1
             if patched % 10 == 0:
@@ -466,9 +529,7 @@ class LagunaBackend:
             )
             if n_blocks < self.blocks_per_slot:
                 self._decode_block_table[i, n_blocks:] = 0
-            self._decode_slot_mapping[i] = (
-                (full_base + pos // bs) * bs + pos % bs
-            )
+            self._decode_slot_mapping[i] = (full_base + pos // bs) * bs + pos % bs
 
             # ── SWA ring block_table / slot_mapping ──
             if self._ring_blocks_per_slot > 0:
@@ -494,9 +555,7 @@ class LagunaBackend:
                 # Ring slot_mapping for the new decode token
                 ring_block = (pos % ring_slots) // bs
                 ring_off = pos % bs
-                self._swa_decode_slot_mapping[i] = (
-                    (ring_base + ring_block) * bs + ring_off
-                )
+                self._swa_decode_slot_mapping[i] = (ring_base + ring_block) * bs + ring_off
 
     def _build_common_attn_metadata(
         self,
@@ -507,6 +566,7 @@ class LagunaBackend:
     ):
         """Build CommonAttentionMetadata for full-attention layers."""
         from runtime.compat_vllm import get_common_attn_metadata_cls
+
         CommonAttentionMetadata = get_common_attn_metadata_cls()
 
         num_reqs = len(slot_ids)
@@ -515,8 +575,8 @@ class LagunaBackend:
         new_kv_lens = [kv_len + qo for kv_len, qo in zip(kv_lengths, qo_lens)]
 
         if is_decode and max(qo_lens) == 1:
-            query_start_loc = self._decode_qsl_gpu[:num_reqs + 1]
-            query_start_loc_cpu = self._decode_qsl_cpu[:num_reqs + 1]
+            query_start_loc = self._decode_qsl_gpu[: num_reqs + 1]
+            query_start_loc_cpu = self._decode_qsl_cpu[: num_reqs + 1]
         else:
             qo_indptr = np.zeros(num_reqs + 1, dtype=np.int32)
             np.cumsum(qo_lens, dtype=np.int32, out=qo_indptr[1:])
@@ -597,6 +657,7 @@ class LagunaBackend:
                   "prefill_scratch", or "auto" (infer from is_decode/qo).
         """
         from runtime.compat_vllm import get_common_attn_metadata_cls
+
         CommonAttentionMetadata = get_common_attn_metadata_cls()
 
         num_reqs = len(slot_ids)
@@ -612,12 +673,10 @@ class LagunaBackend:
                 swa_mode = "prefill_scratch"
 
         if swa_mode == "decode_ring":
-            query_start_loc = self._decode_qsl_gpu[:num_reqs + 1]
-            query_start_loc_cpu = self._decode_qsl_cpu[:num_reqs + 1]
+            query_start_loc = self._decode_qsl_gpu[: num_reqs + 1]
+            query_start_loc_cpu = self._decode_qsl_cpu[: num_reqs + 1]
             seq_lens = self._swa_decode_seq_lens[:num_reqs]
-            max_blocks = max(
-                int(self._swa_decode_seq_lens[i].item()) for i in range(num_reqs)
-            )
+            max_blocks = max(int(self._swa_decode_seq_lens[i].item()) for i in range(num_reqs))
             max_blocks = (max_blocks + bs - 1) // bs
             block_table = self._swa_decode_block_table[:num_reqs, :max_blocks]
             slot_mapping = self._swa_decode_slot_mapping[:num_reqs]
@@ -732,12 +791,11 @@ class LagunaBackend:
             self._fill_decode_buffers(slot_ids, token_ids, kv_lengths)
 
         # Build CommonAttentionMetadata
-        common_meta = self._build_common_attn_metadata(
-            slot_ids, kv_lengths, qo_lens, is_decode
-        )
+        common_meta = self._build_common_attn_metadata(slot_ids, kv_lengths, qo_lens, is_decode)
 
         # Build sparkinfer attention metadata per group
         from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
+
         attn_metadata_dict: dict[str, Any] = {}
         slot_mapping_dict: dict[str, torch.Tensor] = {}
 
@@ -760,7 +818,11 @@ class LagunaBackend:
             meta = swa_meta_obj if (is_swa_group and swa_meta_obj is not None) else full_meta
             for name in layer_names:
                 attn_metadata_dict[name] = meta
-                slot_mapping_dict[name] = common_meta.slot_mapping if not is_swa_group else (swa_common.slot_mapping if swa_common else common_meta.slot_mapping)
+                slot_mapping_dict[name] = (
+                    common_meta.slot_mapping
+                    if not is_swa_group
+                    else (swa_common.slot_mapping if swa_common else common_meta.slot_mapping)
+                )
 
         # Build input tensors (use pre-allocated buffers for decode)
         if is_decode and qo_len == 1:
@@ -780,11 +842,14 @@ class LagunaBackend:
                 positions_list.extend(range(kv_len, kv_len + qo))
             positions = torch.tensor(positions_list, dtype=torch.long, device=self.device)
 
-        with set_forward_context(
-            attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict,
-            skip_compiled=not is_decode,
-        ):
-            result = self.model.forward(input_ids, positions)
+        with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
+            with set_forward_context(
+                attn_metadata_dict,
+                self.vllm_config,
+                slot_mapping=slot_mapping_dict,
+                skip_compiled=not is_decode,
+            ):
+                result = self.model.forward(input_ids, positions)
 
         # Handle tuple return when aux_hidden_state_layers is set (DFlash)
         if isinstance(result, tuple):
@@ -797,9 +862,7 @@ class LagunaBackend:
         logits = self.model.compute_logits(hidden_states)
         return logits
 
-    def _prefill_with_swa_scratch(
-        self, slot: int, prompt_ids: list[int]
-    ) -> torch.Tensor:
+    def _prefill_with_swa_scratch(self, slot: int, prompt_ids: list[int]) -> torch.Tensor:
         """Run prefill with SWA layers rebound to scratch, then copy to ring."""
         sfc = self.static_forward_context
         bs = self.block_size
@@ -810,9 +873,7 @@ class LagunaBackend:
                 sfc[name].kv_cache = self._swa_scratch[name]
 
         try:
-            logits = self._forward(
-                [slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False
-            )
+            logits = self._forward([slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False)
 
             # Copy last window from scratch to ring — slab copy (审查非阻断④)
             if self._swa_scratch:
@@ -842,7 +903,7 @@ class LagunaBackend:
                         so = src_pos % bs
                         db = dst_ring_slot // bs + ring_base
                         do = dst_ring_slot % bs
-                        ring[db, :, do:do + count] = scratch[sb, :, so:so + count]
+                        ring[db, :, do : do + count] = scratch[sb, :, so : so + count]
         finally:
             # Always rebind SWA layers back to ring KV (审查 P3a)
             if self._swa_scratch:
@@ -851,9 +912,7 @@ class LagunaBackend:
 
         return logits
 
-    def _copy_ring_to_scratch(
-        self, slot: int, abs_start: int, count: int
-    ) -> None:
+    def _copy_ring_to_scratch(self, slot: int, abs_start: int, count: int) -> None:
         """Copy `count` tokens from ring KV to scratch starting at scratch pos 0.
 
         Reads ring positions [abs_start, abs_start+count) and writes them to
@@ -888,7 +947,7 @@ class LagunaBackend:
                 so = ring_slot_idx % bs
                 db = dst_pos // bs
                 do = dst_pos % bs
-                scratch[db, :, do:do + n] = ring[sb, :, so:so + n]
+                scratch[db, :, do : do + n] = ring[sb, :, so : so + n]
 
     def _copy_scratch_to_ring(
         self, slot: int, scratch_start: int, abs_start: int, count: int
@@ -923,11 +982,9 @@ class LagunaBackend:
                 so = src_pos % bs
                 db = ring_slot_idx // bs + ring_base
                 do = ring_slot_idx % bs
-                ring[db, :, do:do + n] = scratch[sb, :, so:so + n]
+                ring[db, :, do : do + n] = scratch[sb, :, so : so + n]
 
-    def _prefill_with_swa_chunked(
-        self, slot: int, prompt_ids: list[int]
-    ) -> torch.Tensor:
+    def _prefill_with_swa_chunked(self, slot: int, prompt_ids: list[int]) -> torch.Tensor:
         """Chunked prefill for prompts longer than SWA scratch capacity.
 
         Each chunk: copy last `window` tokens from ring → scratch (overlap),
@@ -960,8 +1017,11 @@ class LagunaBackend:
                 # SWA uses relative kv_length=overlap (positions in scratch)
                 is_last_chunk = chunk_end >= prompt_len
                 logits = self._forward(
-                    [slot], chunk, [chunk_start],
-                    qo_len=chunk_len, is_decode=False,
+                    [slot],
+                    chunk,
+                    [chunk_start],
+                    qo_len=chunk_len,
+                    is_decode=False,
                     swa_kv_lengths=[overlap],
                     skip_logits=not is_last_chunk,
                 )
@@ -984,9 +1044,7 @@ class LagunaBackend:
     def prefill(self, slot: int, prompt_ids: list[int]) -> int:
         """Prefill prompt and return the greedy first token."""
         if self.slot_kv_len[slot] != 0:
-            raise RuntimeError(
-                f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})"
-            )
+            raise RuntimeError(f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})")
         if self._swa_scratch:
             prompt_len = len(prompt_ids)
             if prompt_len <= self._prefill_chunk_tokens:
@@ -994,32 +1052,22 @@ class LagunaBackend:
             else:
                 logits = self._prefill_with_swa_chunked(slot, prompt_ids)
         else:
-            logits = self._forward(
-                [slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False
-            )
+            logits = self._forward([slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False)
         first_token = int(logits[-1].argmax(dim=-1).item())
         self.slot_kv_len[slot] = len(prompt_ids)
         self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
         return first_token
 
-    def prefill_sampled(
-        self, slot: int, prompt_ids: list[int], params: SamplingParams
-    ) -> int:
+    def prefill_sampled(self, slot: int, prompt_ids: list[int], params: SamplingParams) -> int:
         if self.slot_kv_len[slot] != 0:
-            raise RuntimeError(
-                f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})"
-            )
+            raise RuntimeError(f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})")
         if self._swa_scratch:
             logits = self._prefill_with_swa_scratch(slot, prompt_ids)
         else:
-            logits = self._forward(
-                [slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False
-            )
+            logits = self._forward([slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False)
         last_logits = logits[-1].unsqueeze(0)
         gen = make_generator(params.seed)
-        first_token = int(
-            sample_from_logits(last_logits, params, generator=gen).item()
-        )
+        first_token = int(sample_from_logits(last_logits, params, generator=gen).item())
         self.slot_kv_len[slot] = len(prompt_ids)
         self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
         return first_token
@@ -1034,9 +1082,7 @@ class LagunaBackend:
         last chunk (sufficient for DFlash's initial context precompute).
         """
         if self.slot_kv_len[slot] != 0:
-            raise RuntimeError(
-                f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})"
-            )
+            raise RuntimeError(f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})")
         prompt_len = len(prompt_ids)
         PREFILL_CHUNK = self._prefill_chunk_tokens
 
@@ -1076,7 +1122,7 @@ class LagunaBackend:
                         so = src_pos % bs
                         db = dst_ring_slot // bs + ring_base
                         do = dst_ring_slot % bs
-                        ring[db, :, do:do + count] = scratch[sb, :, so:so + count]
+                        ring[db, :, do : do + count] = scratch[sb, :, so : so + count]
             finally:
                 for name in self._swa_layer_names:
                     sfc[name].kv_cache = self.kv_caches[name]
@@ -1097,7 +1143,7 @@ class LagunaBackend:
                 chunk_end = min(chunk_start + PREFILL_CHUNK, prompt_len)
                 chunk = prompt_ids[chunk_start:chunk_end]
                 chunk_len = len(chunk)
-                is_last = (chunk_end == prompt_len)
+                is_last = chunk_end == prompt_len
 
                 # Overlap: copy last `window` tokens from ring to scratch
                 overlap = min(window, chunk_start) if self._swa_scratch else 0
@@ -1115,13 +1161,21 @@ class LagunaBackend:
                     swa_kv = [overlap] if self._swa_scratch else None
                     if is_last:
                         logits, aux = self._forward_with_aux(
-                            [slot], chunk, [chunk_start], qo_len=chunk_len,
-                            is_decode=False, swa_kv_lengths=swa_kv,
+                            [slot],
+                            chunk,
+                            [chunk_start],
+                            qo_len=chunk_len,
+                            is_decode=False,
+                            swa_kv_lengths=swa_kv,
                         )
                     else:
                         self._forward(
-                            [slot], chunk, [chunk_start], qo_len=chunk_len,
-                            is_decode=False, swa_kv_lengths=swa_kv,
+                            [slot],
+                            chunk,
+                            [chunk_start],
+                            qo_len=chunk_len,
+                            is_decode=False,
+                            swa_kv_lengths=swa_kv,
                             skip_logits=True,
                         )
 
@@ -1161,11 +1215,10 @@ class LagunaBackend:
         if is_decode and qo_len == 1:
             self._fill_decode_buffers(slot_ids, token_ids, kv_lengths)
 
-        common_meta = self._build_common_attn_metadata(
-            slot_ids, kv_lengths, qo_lens, is_decode
-        )
+        common_meta = self._build_common_attn_metadata(slot_ids, kv_lengths, qo_lens, is_decode)
 
         from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
+
         attn_metadata_dict: dict[str, Any] = {}
         slot_mapping_dict: dict[str, torch.Tensor] = {}
 
@@ -1187,7 +1240,11 @@ class LagunaBackend:
             meta = swa_meta_obj if (is_swa_group and swa_meta_obj is not None) else full_meta
             for name in layer_names:
                 attn_metadata_dict[name] = meta
-                slot_mapping_dict[name] = common_meta.slot_mapping if not is_swa_group else (swa_common.slot_mapping if swa_common else common_meta.slot_mapping)
+                slot_mapping_dict[name] = (
+                    common_meta.slot_mapping
+                    if not is_swa_group
+                    else (swa_common.slot_mapping if swa_common else common_meta.slot_mapping)
+                )
 
         if is_decode and qo_len == 1:
             input_ids = self._decode_input_ids[:num_reqs]
@@ -1205,11 +1262,14 @@ class LagunaBackend:
                 positions_list.extend(range(kv_len, kv_len + qo))
             positions = torch.tensor(positions_list, dtype=torch.long, device=self.device)
 
-        with set_forward_context(
-            attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict,
-            skip_compiled=True,
-        ):
-            result = self.model.forward(input_ids, positions)
+        with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
+            with set_forward_context(
+                attn_metadata_dict,
+                self.vllm_config,
+                slot_mapping=slot_mapping_dict,
+                skip_compiled=True,
+            ):
+                result = self.model.forward(input_ids, positions)
 
         if isinstance(result, tuple):
             hidden_states, aux_hidden_states = result
@@ -1228,25 +1288,19 @@ class LagunaBackend:
         self.slot_committed_tokens[slot].append(token_id)
         return next_token
 
-    def decode_sampled(
-        self, slot: int, token_id: int, params: SamplingParams
-    ) -> int:
+    def decode_sampled(self, slot: int, token_id: int, params: SamplingParams) -> int:
         kv_len = self.slot_kv_len[slot]
         logits = self._forward([slot], [token_id], [kv_len], qo_len=1, is_decode=True)
         last_logits = logits[-1].unsqueeze(0)
         gen = make_generator(params.seed)
-        next_token = int(
-            sample_from_logits(last_logits, params, generator=gen).item()
-        )
+        next_token = int(sample_from_logits(last_logits, params, generator=gen).item())
         self.slot_kv_len[slot] += 1
         self.slot_committed_tokens[slot].append(token_id)
         return next_token
 
     def decode_batch(self, slot_ids: list[int], token_ids: list[int]) -> list[int]:
         kv_lengths = [self.slot_kv_len[s] for s in slot_ids]
-        logits = self._forward(
-            slot_ids, token_ids, kv_lengths, qo_len=1, is_decode=True
-        )
+        logits = self._forward(slot_ids, token_ids, kv_lengths, qo_len=1, is_decode=True)
         next_tokens = []
         for i, slot in enumerate(slot_ids):
             next_token = int(logits[i].argmax(dim=-1).item())
@@ -1271,9 +1325,7 @@ class LagunaBackend:
         two backends share ServerEngine's calling convention) -- greedy is
         temperature=0, a plain special case of sampling, per B1.
         """
-        logits = self._forward(
-            slot_ids, token_ids, kv_lengths, qo_len=1, is_decode=True
-        )
+        logits = self._forward(slot_ids, token_ids, kv_lengths, qo_len=1, is_decode=True)
         next_tokens: list[int] = []
         for i, (slot, params) in enumerate(zip(slot_ids, params_list)):
             if params.is_greedy:
@@ -1305,7 +1357,6 @@ class LagunaBackend:
                 f"Rebind leak on exception path?"
             )
 
-
     def _patch_rmsnorm_triton(self):
         """Replace vLLM RMSNorm with Triton fused kernel (zero vLLM dependency)."""
         from runtime.kernels.fused_rms_norm import fused_add_rms_norm, rms_norm
@@ -1315,7 +1366,8 @@ class LagunaBackend:
             if residual is None:
                 return rms_norm(x, self_norm.weight.data, self_norm.variance_epsilon)
             out, new_res = fused_add_rms_norm(
-                x, residual, self_norm.weight.data, self_norm.variance_epsilon)
+                x, residual, self_norm.weight.data, self_norm.variance_epsilon
+            )
             return out, new_res
 
         RMSNorm.forward_cuda = _triton_forward
@@ -1377,6 +1429,7 @@ class LagunaBackend:
         if not self._decode_cg_enabled or self._decode_cg is not None:
             return
         from runtime.backends.laguna_cuda_graph import LagunaCudaGraphDecode
+
         try:
             cg = LagunaCudaGraphDecode(self, batch_size=1)
             cg.capture()
@@ -1422,8 +1475,8 @@ class LagunaBackend:
             if self._decode_cg is not None:
                 self._decode_cg.reset()
                 tokens = self._decode_cg.generate_fast(
-                    slot=slot, first_token=first,
-                    max_tokens=max_tokens, eos_tokens=(2, 24))
+                    slot=slot, first_token=first, max_tokens=max_tokens, eos_tokens=(2, 24)
+                )
                 self.reset_slot(slot)
                 return tokens
 
@@ -1477,9 +1530,7 @@ class LagunaBackend:
         if start_pos >= prompt_len:
             # No new tokens — decode the last cached token to get logits
             last_token = prompt_ids[start_pos - 1]
-            logits = self._forward(
-                [slot], [last_token], [start_pos - 1], qo_len=1, is_decode=True
-            )
+            logits = self._forward([slot], [last_token], [start_pos - 1], qo_len=1, is_decode=True)
             first_token = int(logits[0].argmax(dim=-1).item())
             self.slot_kv_len[slot] = start_pos
             self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
@@ -1504,17 +1555,19 @@ class LagunaBackend:
             try:
                 suffix = prompt_ids[start_pos:]
                 logits, aux = self._forward_with_aux(
-                    [slot], suffix, [start_pos], qo_len=suffix_len,
-                    is_decode=False, swa_kv_lengths=[overlap],
+                    [slot],
+                    suffix,
+                    [start_pos],
+                    qo_len=suffix_len,
+                    is_decode=False,
+                    swa_kv_lengths=[overlap],
                 )
                 # Copy last window from scratch to ring
                 total_in_scratch = overlap + suffix_len
                 copy_count = min(window, total_in_scratch)
                 copy_scratch_start = total_in_scratch - copy_count
                 copy_abs_start = start_pos + suffix_len - copy_count
-                self._copy_scratch_to_ring(
-                    slot, copy_scratch_start, copy_abs_start, copy_count
-                )
+                self._copy_scratch_to_ring(slot, copy_scratch_start, copy_abs_start, copy_count)
             finally:
                 for name in self._swa_layer_names:
                     sfc[name].kv_cache = self.kv_caches[name]
@@ -1536,7 +1589,7 @@ class LagunaBackend:
                 chunk_end = min(chunk_start + PREFILL_CHUNK, prompt_len)
                 chunk = prompt_ids[chunk_start:chunk_end]
                 chunk_len = len(chunk)
-                is_last = (chunk_end == prompt_len)
+                is_last = chunk_end == prompt_len
 
                 overlap = min(window, chunk_start) if self._swa_scratch else 0
                 if overlap > 0:
@@ -1549,13 +1602,21 @@ class LagunaBackend:
                     swa_kv = [overlap] if self._swa_scratch else None
                     if is_last:
                         logits, aux = self._forward_with_aux(
-                            [slot], chunk, [chunk_start], qo_len=chunk_len,
-                            is_decode=False, swa_kv_lengths=swa_kv,
+                            [slot],
+                            chunk,
+                            [chunk_start],
+                            qo_len=chunk_len,
+                            is_decode=False,
+                            swa_kv_lengths=swa_kv,
                         )
                     else:
                         self._forward(
-                            [slot], chunk, [chunk_start], qo_len=chunk_len,
-                            is_decode=False, swa_kv_lengths=swa_kv,
+                            [slot],
+                            chunk,
+                            [chunk_start],
+                            qo_len=chunk_len,
+                            is_decode=False,
+                            swa_kv_lengths=swa_kv,
                             skip_logits=True,
                         )
                     if self._swa_scratch:

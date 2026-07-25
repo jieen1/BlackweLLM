@@ -14,6 +14,7 @@ import torch
 if TYPE_CHECKING:
     from runtime.backends.laguna import LagunaBackend
 
+from runtime.backends.bf_attention import bf_attn_context
 logger = logging.getLogger("qwen_sm120_runtime.laguna_cuda_graph")
 
 def _physical_slot(slot: int) -> int:
@@ -260,13 +261,14 @@ class LagunaCudaGraphDecode:
                 slot_mapping_dict[name] = sm
 
         with set_current_vllm_config(backend.vllm_config):
-            with set_forward_context(
-                attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict,
-                skip_compiled=True,
-            ):
-                result = backend.model.forward(
-                    self._input_ids[:bs], self._positions[:bs]
-                )
+            with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
+                with set_forward_context(
+                    attn_metadata_dict, backend.vllm_config,
+                    slot_mapping=slot_mapping_dict, skip_compiled=True,
+                ):
+                    result = backend.model.forward(
+                        self._input_ids[:bs], self._positions[:bs]
+                    )
 
         if isinstance(result, tuple):
             hidden_states, self._aux_hidden_states = result
@@ -424,13 +426,14 @@ class _SparkinferCGDecodeImpl:
         pass
 
     def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
-        """Write K/V into paged cache."""
-        k_cache = kv_cache[:, 0]
-        v_cache = kv_cache[:, 1]
-        torch.ops._C_cache_ops.reshape_and_cache_flash(
-            key, value, k_cache, v_cache, slot_mapping,
-            self.kv_cache_dtype, layer._k_scale, layer._v_scale,
-        )
+        """Write K/V into paged cache (self-contained)."""
+        k_cache = kv_cache[:, 0].view(torch.float8_e4m3fn)
+        v_cache = kv_cache[:, 1].view(torch.float8_e4m3fn)
+        block_size = k_cache.shape[1]
+        block_idx = slot_mapping // block_size
+        block_off = slot_mapping % block_size
+        k_cache[block_idx, block_off] = (key / layer._k_scale).to(torch.float8_e4m3fn)
+        v_cache[block_idx, block_off] = (value / layer._v_scale).to(torch.float8_e4m3fn)
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output, output_scale=None, output_block_scale=None):
@@ -448,6 +451,8 @@ class _SparkinferCGDecodeImpl:
         ws._k_cache = key_cache
         ws._v_cache = value_cache
         ws._output = output[:num_actual_tokens]
+        ws._k_descale = layer._k_scale.detach()
+        ws._v_descale = layer._v_scale.detach()
 
         # Run sparkinfer forward (captured in graph)
         ws.forward()
@@ -690,9 +695,12 @@ class LagunaCudaGraphVerify:
         with torch.cuda.stream(side_stream):
             for _ in range(3):
                 self._fill_buffers(0, dummy_tokens, warmup_kv)
-                with set_forward_context(attn_meta, backend.vllm_config,
-                                         slot_mapping=slot_mapping_dict, skip_compiled=True):
-                    result = backend.model.forward(self._input_ids, self._positions)
+                with bf_attn_context(attn_meta, slot_mapping_dict):
+                    with set_forward_context(
+                        attn_meta, backend.vllm_config,
+                        slot_mapping=slot_mapping_dict, skip_compiled=True,
+                    ):
+                        result = backend.model.forward(self._input_ids, self._positions)
                 if isinstance(result, tuple):
                     hidden_states, aux = result
                 else:
@@ -705,9 +713,12 @@ class LagunaCudaGraphVerify:
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            with set_forward_context(attn_meta, backend.vllm_config,
-                                     slot_mapping=slot_mapping_dict, skip_compiled=True):
-                result = backend.model.forward(self._input_ids, self._positions)
+            with bf_attn_context(attn_meta, slot_mapping_dict):
+                with set_forward_context(
+                    attn_meta, backend.vllm_config,
+                    slot_mapping=slot_mapping_dict, skip_compiled=True,
+                ):
+                    result = backend.model.forward(self._input_ids, self._positions)
             if isinstance(result, tuple):
                 hidden_states, self._aux_hidden_states = result
             else:
@@ -757,11 +768,13 @@ class _SparkinferCGExtendImpl:
         pass
 
     def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
-        k_cache = kv_cache[:, 0]
-        v_cache = kv_cache[:, 1]
-        torch.ops._C_cache_ops.reshape_and_cache_flash(
-            key, value, k_cache, v_cache, slot_mapping,
-            self.kv_cache_dtype, layer._k_scale, layer._v_scale)
+        k_cache = kv_cache[:, 0].view(torch.float8_e4m3fn)
+        v_cache = kv_cache[:, 1].view(torch.float8_e4m3fn)
+        block_size = k_cache.shape[1]
+        block_idx = slot_mapping // block_size
+        block_off = slot_mapping % block_size
+        k_cache[block_idx, block_off] = (key / layer._k_scale).to(torch.float8_e4m3fn)
+        v_cache[block_idx, block_off] = (value / layer._v_scale).to(torch.float8_e4m3fn)
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output, output_scale=None, output_block_scale=None):
@@ -777,10 +790,34 @@ class _SparkinferCGExtendImpl:
 
         if self._binding is None:
             from sparkinfer.attention.paged._scratch import build_paged_attention_binding
-            self._descale = torch.ones(1, dtype=torch.float32, device=q.device)
+            from runtime.backends.laguna_sparkinfer_attn import _paged_descale
+
+            self._k_descale = _paged_descale(
+                layer._k_scale,
+                batch_size=1,
+                num_kv_heads=int(key_cache.shape[2]),
+            ).clone()
+            self._v_descale = _paged_descale(
+                layer._v_scale,
+                batch_size=1,
+                num_kv_heads=int(value_cache.shape[2]),
+            ).clone()
             self._binding = build_paged_attention_binding(
                 scratch=self._ws, q=q, k_cache=key_cache, v_cache=value_cache,
-                output=out, k_descale=self._descale, v_descale=self._descale)
+                output=out, k_descale=self._k_descale, v_descale=self._v_descale)
+        else:
+            from runtime.backends.laguna_sparkinfer_attn import _paged_descale
+
+            self._k_descale.copy_(_paged_descale(
+                layer._k_scale,
+                batch_size=1,
+                num_kv_heads=int(key_cache.shape[2]),
+            ))
+            self._v_descale.copy_(_paged_descale(
+                layer._v_scale,
+                batch_size=1,
+                num_kv_heads=int(value_cache.shape[2]),
+            ))
 
         from sparkinfer.attention.paged._forward import paged_attention_forward
         paged_attention_forward(binding=self._binding)

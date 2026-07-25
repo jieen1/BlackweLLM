@@ -10,6 +10,7 @@ which is exactly sparkinfer's expected [num_pages, page_size, num_kv_heads, head
 
 Integration: monkey-patch each Attention layer's impl after model load.
 """
+
 from __future__ import annotations
 
 import logging
@@ -28,14 +29,58 @@ if _BF_SPARKINFER_PATH and _BF_SPARKINFER_PATH not in sys.path:
 PAGE_SIZE = 64  # Must match LagunaBackend.block_size
 
 
+def _paged_descale(
+    scale: torch.Tensor,
+    *,
+    batch_size: int,
+    num_kv_heads: int,
+) -> torch.Tensor:
+    """Normalize vLLM KV scales to sparkinfer's per-request contract.
+
+    vLLM attention layers expose scalar, per-head, or singleton-expanded
+    scales depending on whether the checkpoint stores FP8 KV scale tensors.
+    SparkInfer requires a rank-1 ``[batch]`` or rank-2
+    ``[batch, num_kv_heads]`` descale tensor.  In particular, DFlash's BF16
+    checkpoint-backed draft layers expose a rank-0 default scale.
+    """
+    scale = scale.detach().to(dtype=torch.float32)
+    count = scale.numel()
+    if count == 1:
+        return scale.reshape(1).expand(batch_size).contiguous()
+    if count == batch_size:
+        return scale.reshape(batch_size).contiguous()
+    if count == num_kv_heads:
+        return scale.reshape(1, num_kv_heads).expand(batch_size, -1).contiguous()
+    if count == batch_size * num_kv_heads:
+        return scale.reshape(batch_size, num_kv_heads).contiguous()
+    raise ValueError(
+        "KV descale must be scalar, per-request, per-head, or per-request/per-head; "
+        f"got shape {tuple(scale.shape)} for batch_size={batch_size}, "
+        f"num_kv_heads={num_kv_heads}."
+    )
+
+
 class SparkinferAttnMetadata:
     """Lightweight metadata passed through forward context for sparkinfer."""
-    __slots__ = ("mode", "page_table", "cache_seqlens", "cu_seqlens_q",
-                 "num_actual_tokens", "window_left")
 
-    def __init__(self, mode: str, page_table: torch.Tensor,
-                 cache_seqlens: torch.Tensor, cu_seqlens_q: torch.Tensor,
-                 num_actual_tokens: int, window_left: int = -1):
+    __slots__ = (
+        "mode",
+        "page_table",
+        "cache_seqlens",
+        "cu_seqlens_q",
+        "num_actual_tokens",
+        "window_left",
+    )
+
+    def __init__(
+        self,
+        mode: str,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        num_actual_tokens: int,
+        window_left: int = -1,
+    ):
         self.mode = mode
         self.page_table = page_table
         self.cache_seqlens = cache_seqlens
@@ -65,6 +110,8 @@ class SparkinferPrefillWorkspace:
         cache_seqlens: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         window_left: int = -1,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
     ) -> None:
         """Run extend-mode attention (prefill)."""
         from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
@@ -72,21 +119,40 @@ class SparkinferPrefillWorkspace:
         from sparkinfer.attention.paged._forward import paged_attention_forward
         from sparkinfer.attention.paged._scratch import build_paged_attention_binding
 
+        if k_descale is None:
+            k_descale = self._descale
+        if v_descale is None:
+            v_descale = self._descale
+
         ws = PagedAttentionWorkspace.for_tensors(
-            mode="extend", q=q, k_cache=k_cache, v_cache=v_cache,
-            use_cuda_graph=False)
+            mode="extend", q=q, k_cache=k_cache, v_cache=v_cache, use_cuda_graph=False
+        )
 
         plan = create_paged_plan(
-            q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
-            mode="extend", enable_cuda_graph=False, window_left=window_left)
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            mode="extend",
+            enable_cuda_graph=False,
+            window_left=window_left,
+        )
         ws._ensure_capacity(plan)
         ws._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
         ws._copy_plan_metadata(plan)
         ws._plan = plan
 
         binding = build_paged_attention_binding(
-            scratch=ws, q=q, k_cache=k_cache, v_cache=v_cache,
-            output=output, k_descale=self._descale, v_descale=self._descale)
+            scratch=ws,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            k_descale=k_descale,
+            v_descale=v_descale,
+        )
         paged_attention_forward(binding=binding)
 
 
@@ -118,33 +184,65 @@ class SparkinferDecodeWorkspace:
 
         # Dummy tensors for workspace creation (real ones bound at capture)
         self._q = torch.zeros(1, num_q_heads, head_dim, dtype=torch.bfloat16, device=self.device)
-        self._k_cache = torch.zeros(max_pages, PAGE_SIZE, num_kv_heads, head_dim,
-                                    dtype=torch.float8_e4m3fn, device=self.device)
-        self._v_cache = torch.zeros(max_pages, PAGE_SIZE, num_kv_heads, head_dim,
-                                    dtype=torch.float8_e4m3fn, device=self.device)
-        self._output = torch.zeros(1, num_q_heads, head_dim, dtype=torch.bfloat16, device=self.device)
+        self._k_cache = torch.zeros(
+            max_pages,
+            PAGE_SIZE,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.float8_e4m3fn,
+            device=self.device,
+        )
+        self._v_cache = torch.zeros(
+            max_pages,
+            PAGE_SIZE,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.float8_e4m3fn,
+            device=self.device,
+        )
+        self._output = torch.zeros(
+            1, num_q_heads, head_dim, dtype=torch.bfloat16, device=self.device
+        )
         self._descale = torch.ones(1, dtype=torch.float32, device=self.device)
+        self._k_descale = self._descale
+        self._v_descale = self._descale
 
         # Create graph-mode workspace with prepare_decode_graph_replay_state.
         # Requires sparkinfer commit 0a7b143+ (fixes capacity underestimation
         # for windowed attention with small page counts).
         self._workspace = PagedAttentionWorkspace.for_tensors(
-            mode="decode", q=self._q, k_cache=self._k_cache,
-            v_cache=self._v_cache, use_cuda_graph=True)
+            mode="decode",
+            q=self._q,
+            k_cache=self._k_cache,
+            v_cache=self._v_cache,
+            use_cuda_graph=True,
+        )
         self._workspace.prepare_decode_graph_replay_state(
-            batch=1, max_page_table_width=max_pages, window_left=window_left)
+            batch=1, max_page_table_width=max_pages, window_left=window_left
+        )
 
         # Bind runtime metadata at max context for capture
-        capture_page_table = torch.arange(max_pages, dtype=torch.int32, device=self.device).unsqueeze(0)
-        capture_cache_seqlens = torch.tensor([max_pages * PAGE_SIZE - 1], dtype=torch.int32, device=self.device)
+        capture_page_table = torch.arange(
+            max_pages, dtype=torch.int32, device=self.device
+        ).unsqueeze(0)
+        capture_cache_seqlens = torch.tensor(
+            [max_pages * PAGE_SIZE - 1], dtype=torch.int32, device=self.device
+        )
         cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=self.device)
-        self._workspace._copy_runtime_metadata(capture_page_table, capture_cache_seqlens, cu_seqlens_q)
+        self._workspace._copy_runtime_metadata(
+            capture_page_table, capture_cache_seqlens, cu_seqlens_q
+        )
 
         self._cu_seqlens_q = cu_seqlens_q
         logger.info(
             "SparkinferDecodeWorkspace: q_heads=%d kv_heads=%d head_dim=%d "
             "max_pages=%d window_left=%d",
-            num_q_heads, num_kv_heads, head_dim, max_pages, window_left)
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            max_pages,
+            window_left,
+        )
 
     def bind_kv(
         self,
@@ -170,8 +268,8 @@ class SparkinferDecodeWorkspace:
             k_cache=self._k_cache,
             v_cache=self._v_cache,
             output=self._output,
-            k_descale=self._descale,
-            v_descale=self._descale,
+            k_descale=self._k_descale,
+            v_descale=self._v_descale,
         )
         paged_attention_forward(binding=binding)
         return self._output
@@ -192,8 +290,15 @@ class SparkinferAttentionImpl:
     sparkinfer paged attention. Handles both prefill (extend) and decode.
     """
 
-    def __init__(self, num_heads: int, head_size: int, scale: float,
-                 num_kv_heads: int, window_left: int = -1, **kwargs):
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int,
+        window_left: int = -1,
+        **kwargs,
+    ):
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = scale
@@ -219,15 +324,21 @@ class SparkinferAttentionImpl:
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        """Write K/V into paged cache using vLLM's reshape_and_cache_flash."""
-        k_cache = kv_cache[:, 0]
-        v_cache = kv_cache[:, 1]
-        torch.ops._C_cache_ops.reshape_and_cache_flash(
-            key, value, k_cache, v_cache, slot_mapping,
-            self.kv_cache_dtype,
-            layer._k_scale,
-            layer._v_scale,
-        )
+        """Write K/V into paged cache (self-contained, zero vLLM dependency).
+
+        kv_cache: [num_blocks, 2, block_size, num_kv_heads, head_dim] (uint8/FP8)
+        key/value: [num_tokens, num_kv_heads, head_dim] (bf16)
+        slot_mapping: [num_tokens] (int64, flat index = block_idx * block_size + block_off)
+        """
+        k_cache = kv_cache[:, 0].view(torch.float8_e4m3fn)
+        v_cache = kv_cache[:, 1].view(torch.float8_e4m3fn)
+        block_size = k_cache.shape[1]
+        block_idx = slot_mapping // block_size
+        block_off = slot_mapping % block_size
+        k_scale = layer._k_scale
+        v_scale = layer._v_scale
+        k_cache[block_idx, block_off] = (key / k_scale).to(torch.float8_e4m3fn)
+        v_cache[block_idx, block_off] = (value / v_scale).to(torch.float8_e4m3fn)
 
     def forward(
         self,
@@ -267,6 +378,19 @@ class SparkinferAttentionImpl:
             ws.forward()
             return output
 
+        batch_size = int(attn_metadata.cache_seqlens.numel())
+        num_kv_heads = int(key_cache.shape[2])
+        k_descale = _paged_descale(
+            layer._k_scale,
+            batch_size=batch_size,
+            num_kv_heads=num_kv_heads,
+        )
+        v_descale = _paged_descale(
+            layer._v_scale,
+            batch_size=batch_size,
+            num_kv_heads=num_kv_heads,
+        )
+
         # Prefill/extend path: create ephemeral workspace
         ws = self._get_prefill_ws(q.device)
         ws.forward(
@@ -278,5 +402,7 @@ class SparkinferAttentionImpl:
             cache_seqlens=attn_metadata.cache_seqlens,
             cu_seqlens_q=attn_metadata.cu_seqlens_q,
             window_left=attn_metadata.window_left,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         return output

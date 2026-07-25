@@ -91,31 +91,32 @@ _IS_LAGUNA = SERVER_MODEL_BACKEND == "laguna"
 
 SERVER_CAPACITY = int(os.environ.get("QSR_SERVER_CAPACITY", "1" if _IS_LAGUNA else "4"))
 SERVER_NUM_SLOTS = int(os.environ.get("QSR_SERVER_NUM_SLOTS", "1" if _IS_LAGUNA else "8"))
-SERVER_BLOCK_SIZE = int(os.environ.get("QSR_SERVER_BLOCK_SIZE", "16"))
-# 256K context support: blocks_per_slot = 262144 / block_size(16) = 16384.
+SERVER_BLOCK_SIZE = int(os.environ.get("QSR_SERVER_BLOCK_SIZE", "64" if _IS_LAGUNA else "16"))
+# 256K context support: Qwen uses 16384 × 16; Laguna's sparkinfer attention
+# uses 4096 × 64.  The Laguna default below is currently 128K/slot.
 # The KV cache pool size is now determined by GPU memory profiling (see
 # server/engine.py _load_model → profile_kv_cache_blocks), NOT by the old
 # fixed formula (num_slots + 1) * blocks_per_slot. blocks_per_slot is the
 # per-slot MAXIMUM context ceiling; the actual pool is sized to fit the GPU.
 # The E2E check sets its OWN smaller blocks_per_slot (its prompts are moderate),
 # so it does not pay for the full long-context pool.
-# Laguna default (8192 = 128K/slot) is conservative pending the SWA
+# Laguna default (2048 × 64 = 128K/slot) is conservative pending the SWA
 # ring-buffer optimization above -- see notes/2026-07-23-laguna-server-
 # integration-plan.md for the memory math.
 SERVER_BLOCKS_PER_SLOT = int(
-    os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "8192" if _IS_LAGUNA else "16384")
+    os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "2048" if _IS_LAGUNA else "16384")
 )
-SERVER_ENABLE_CUDAGRAPH = os.environ.get(
-    "QSR_SERVER_ENABLE_CUDAGRAPH", "0" if _IS_LAGUNA else "1"
-) != "0"
+SERVER_ENABLE_CUDAGRAPH = (
+    os.environ.get("QSR_SERVER_ENABLE_CUDAGRAPH", "0" if _IS_LAGUNA else "1") != "0"
+)
 # P4a (notes/prefix-cache-design.md sec 5-P4): the prefix-cache rollback
 # spine, plumbed straight into ServerEngine(enable_prefix_cache=...). Default
 # ON (this is THE product value -- warm prefix hits served across requests);
 # `python -m server.app --no-prefix-cache` (or QSR_SERVER_ENABLE_PREFIX_CACHE=0)
 # turns it off => byte-for-byte the old server.
-SERVER_ENABLE_PREFIX_CACHE = os.environ.get(
-    "QSR_SERVER_ENABLE_PREFIX_CACHE", "0" if _IS_LAGUNA else "1"
-) != "0"
+SERVER_ENABLE_PREFIX_CACHE = (
+    os.environ.get("QSR_SERVER_ENABLE_PREFIX_CACHE", "0" if _IS_LAGUNA else "1") != "0"
+)
 # P4b session affinity (notes/2026-07-20-p4b-session-affinity-plan.md): opt-in
 # warm-slot retention. Default OFF => byte-for-byte P4a (without a session_id, or
 # with the flag off, _finish_request does the unconditional reset_slot). Requires
@@ -159,9 +160,15 @@ async def _tokenize_chat(engine_ref, messages, tools=None, chat_template_kwargs=
 
 
 async def _tokenize_encode(engine_ref, text):
-    """Run tokenizer encode in a thread."""
+    """Run tokenizer encode in a thread.
+
+    Laguna requires BOS (add_special_tokens=True, the default).
+    Qwen3.6 does not use BOS (add_special_tokens=False).
+    """
     loop = asyncio.get_running_loop()
-    fn = functools.partial(engine_ref.tok.encode, text, add_special_tokens=False)
+    fn = functools.partial(
+        engine_ref.tok.encode, text, add_special_tokens=_IS_LAGUNA
+    )
     return await loop.run_in_executor(None, fn)
 
 
