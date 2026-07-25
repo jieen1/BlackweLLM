@@ -1,0 +1,162 @@
+{
+  "timestamp": "2026-07-25T07:07:57.861987",
+  "gpu": "RTX PRO 6000 Blackwell 96GB (SM120)",
+  "model": "poolside/Laguna-S-2.1-NVFP4 + DFlash-NVFP4 (K=15)",
+  "params": {
+    "max_new": 128,
+    "suffix": 10240,
+    "gpu_util": 0.92,
+    "temperature": 0.0,
+    "cg_ours": "eager (CG disabled for stability)",
+    "cg_vllm": "enabled"
+  },
+  "benchmarks": [
+    {
+      "warmup": {
+        "phase": "warmup",
+        "prompt_len": 65536,
+        "n_tokens": 128,
+        "total_s": 15.32,
+        "prefill_ms": 9987.9,
+        "decode_ms": 5328.5,
+        "accept": 0.183,
+        "tok_step": 2.7,
+        "tok_s": 23.8,
+        "mem_gib": 81.5
+      },
+      "prefix_cached": {
+        "phase": "prefix_cached",
+        "prompt_len": 75776,
+        "cached_len": 65536,
+        "suffix_len": 10240,
+        "n_tokens": 128,
+        "total_s": 5.35,
+        "prefill_ms": 2280.3,
+        "decode_ms": 3071.6,
+        "accept": 0.359,
+        "tok_step": 4.88,
+        "tok_s": 41.3,
+        "mem_gib": 81.5,
+        "preview": "anciacronregarNGs Prev(mode orbitals]interface-exchange bifurc</think>\n\nUnt_Load"
+      },
+      "cold": {
+        "phase": "cold",
+        "prompt_len": 75776,
+        "n_tokens": 9,
+        "total_s": 11.25,
+        "prefill_ms": 10616.8,
+        "decode_ms": 633.6,
+        "accept": 0.107,
+        "tok_step": 1.6,
+        "tok_s": 12.6,
+        "mem_gib": 81.5
+      },
+      "runtime": "blackforge",
+      "base_ctx": 65536,
+      "suffix": 10240
+    },
+    {
+      "runtime": "vllm",
+      "base_ctx": 65536,
+      "error": "crashed"
+    },
+    {
+      "warmup": {
+        "phase": "warmup",
+        "prompt_len": 131072,
+        "n_tokens": 128,
+        "total_s": 28.58,
+        "prefill_ms": 24045.4,
+        "decode_ms": 4529.6,
+        "accept": 0.31,
+        "tok_step": 4.54,
+        "tok_s": 28.0,
+        "mem_gib": 84.5
+      },
+      "prefix_cached": {
+        "phase": "prefix_cached",
+        "prompt_len": 141312,
+        "cached_len": 131072,
+        "suffix_len": 10240,
+        "n_tokens": 128,
+        "total_s": 8.67,
+        "prefill_ms": 3145.0,
+        "decode_ms": 5524.4,
+        "accept": 0.259,
+        "tok_step": 3.85,
+        "tok_s": 23.0,
+        "mem_gib": 84.5,
+        "preview": "anciacronregarNGs Prev(mode orbitals]interface-exchange\n\nThe</think> acquaint</t"
+      },
+      "cold": {
+        "phase": "cold",
+        "prompt_len": 141312,
+        "n_tokens": 128,
+        "total_s": 30.28,
+        "prefill_ms": 25820.5,
+        "decode_ms": 4461.8,
+        "accept": 0.359,
+        "tok_step": 4.88,
+        "tok_s": 28.5,
+        "mem_gib": 84.5
+      },
+      "runtime": "blackforge",
+      "base_ctx": 131072,
+      "suffix": 10240
+    },
+    {
+      "runtime": "vllm",
+      "base_ctx": 131072,
+      "error": "crashed"
+    },
+    {
+      "warmup": {
+        "phase": "warmup",
+        "prompt_len": 200000,
+        "n_tokens": 128,
+        "total_s": 49.81,
+        "prefill_ms": 45245.3,
+        "decode_ms": 4560.2,
+        "accept": 0.435,
+        "tok_step": 6.05,
+        "tok_s": 27.8,
+        "mem_gib": 86.1
+      },
+      "prefix_cached": {
+        "phase": "prefix_cached",
+        "prompt_len": 210240,
+        "cached_len": 200000,
+        "suffix_len": 10240,
+        "n_tokens": 128,
+        "total_s": 21.14,
+        "prefill_ms": 4334.1,
+        "decode_ms": 16796.5,
+        "accept": 0.112,
+        "tok_step": 1.67,
+        "tok_s": 7.6,
+        "mem_gib": 86.1,
+        "preview": "anciacronregarNGs\n\nTheTheThe user extensive, it appears repetitive repeated repe"
+      },
+      "cold": {
+        "phase": "cold",
+        "prompt_len": 210240,
+        "n_tokens": 5,
+        "total_s": 50.18,
+        "prefill_ms": 49723.6,
+        "decode_ms": 453.3,
+        "accept": 0.133,
+        "tok_step": 2.0,
+        "tok_s": 8.8,
+        "mem_gib": 87.2
+      },
+      "runtime": "blackforge",
+      "base_ctx": 200000,
+      "suffix": 10240
+    },
+    {
+      "runtime": "vllm",
+      "base_ctx": 200000,
+      "error": "crashed"
+    }
+  ]
+}

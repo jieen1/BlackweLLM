@@ -1,54 +1,28 @@
 {
   "64K": {
     "warmup": {
-      "prefill_ms": 11885.611991994665,
-      "decode_ms": 12688.221072006854,
-      "total_ms": 24573.83306400152,
+      "prefill_ms": 12079.944359997171,
+      "decode_ms": 10229.955740011064,
+      "total_ms": 22309.900100008235,
       "num_tokens": 256,
-      "num_steps": 90,
-      "acceptance_rate": 0.18888888888888888,
-      "tokens_per_step": 2.8333333333333335,
-      "tok_per_s": 20.097379967834016
+      "num_steps": 71,
+      "acceptance_rate": 0.23943661971830985,
+      "tokens_per_step": 3.591549295774648,
+      "tok_per_s": 24.92679406252487
     },
     "measured": {
-      "prefill_ms": 11063.212307009962,
-      "decode_ms": 1883.6087669915287,
-      "total_ms": 12946.821074001491,
+      "prefill_ms": 10936.878710999736,
+      "decode_ms": 3029.084531997796,
+      "total_ms": 13965.963242997532,
       "num_tokens": 256,
-      "num_steps": 51,
-      "acceptance_rate": 0.3333333333333333,
-      "tokens_per_step": 5.0,
-      "tok_per_s": 135.37843126908044
+      "num_steps": 83,
+      "acceptance_rate": 0.20481927710843373,
+      "tokens_per_step": 3.072289156626506,
+      "tok_per_s": 84.18385070020408
     },
-    "baseline_tps": 11.302706102267006,
-    "baseline_itl_ms": 88.47438754507012,
-    "speedup": 11.977523793344261,
-    "itl_ms": 7.3867010470256025
-  },
-  "128K": {
-    "warmup": {
-      "prefill_ms": 25996.516911996878,
-      "decode_ms": 1640.213603997836,
-      "total_ms": 27636.730515994714,
-      "num_tokens": 256,
-      "num_steps": 42,
-      "acceptance_rate": 0.40476190476190477,
-      "tokens_per_step": 6.071428571428571,
-      "tok_per_s": 155.467555797895
-    },
-    "measured": {
-      "prefill_ms": 26535.746630004724,
-      "decode_ms": 3187.3569839954143,
-      "total_ms": 29723.103614000138,
-      "num_tokens": 256,
-      "num_steps": 82,
-      "acceptance_rate": 0.2073170731707317,
-      "tokens_per_step": 3.1097560975609757,
-      "tok_per_s": 80.0035895823481
-    },
-    "baseline_tps": 11.926612903932895,
-    "baseline_itl_ms": 83.84610182747208,
-    "speedup": 6.707989118684843,
-    "itl_ms": 12.499439152923193
+    "baseline_tps": 11.395706425748278,
+    "baseline_itl_ms": 87.75234835293126,
+    "speedup": 7.387330592335464,
+    "itl_ms": 11.878762870579592
   }
 }

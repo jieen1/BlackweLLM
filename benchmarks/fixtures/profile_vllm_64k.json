@@ -1,0 +1,20 @@
+{
+  "date": "2026-07-24T23:17:09",
+  "config": "stock vLLM + DFlash(k=15) + CG + auto(TRTLLM), 64K, seqs=1, greedy, prefix_cache=OFF",
+  "profiled_run": {
+    "total_s": 8.440261602401733,
+    "num_tokens": 256,
+    "tok_per_s": 30.330813434402728
+  },
+  "clean_run": {
+    "total_s": 8.653095245361328,
+    "num_tokens": 256,
+    "tok_per_s": 29.584789343123678
+  },
+  "warmup_run": {
+    "total_s": 9.433826684951782,
+    "num_tokens": 256,
+    "tok_per_s": 27.136389987782405
+  },
+  "profiler_dir": "/home/bot/project/qwen-sm120-runtime/benchmarks/fixtures/vllm_profile"
+}

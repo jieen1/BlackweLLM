@@ -269,7 +269,7 @@ class LagunaCudaGraphDecode:
                 sm_scale=builder_sm_scale,
                 non_blocking=True,
                 fixed_split_size=2048,
-                disable_split_kv=False,
+                disable_split_kv=True,
             )
             wrapper._sm_scale = builder_sm_scale
 
@@ -340,7 +340,9 @@ class LagunaCudaGraphDecode:
         # Reserve warmup slots (last bs slots)
         warmup_slots = list(range(backend.num_slots - bs, backend.num_slots))
         dummy_tokens = [1] * bs
-        dummy_kv_lens = [32] * bs  # 2 pages
+        # Capture at max kv_len so FlashInfer grid covers all context lengths
+        capture_kv = self.blocks_per_slot * self.block_size - 1
+        dummy_kv_lens = [capture_kv] * bs
 
         logger.info("Capturing Laguna CUDA Graph: batch_size=%d", bs)
 

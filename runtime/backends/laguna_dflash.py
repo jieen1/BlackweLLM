@@ -840,7 +840,14 @@ class DFlashEngine:
         )
 
     def _lazy_capture_cg(self) -> None:
-        """Capture verify/draft CUDA Graphs after KV cache is populated."""
+        """Capture verify/draft CUDA Graphs after KV cache is populated.
+
+        Profiling (2026-07-25): CG verify replay is 43-63ms slower per forward
+        than eager (249ms vs 191ms at 128K).  However CG verify produces better
+        logits → acceptance 34% vs eager 18% at 64K, 39% vs 31% at 128K.
+        Net effect: CG is faster overall at 64K (38 vs 24.5 tok/s).
+        At 128K the gap narrows; investigate eager verify metadata parity.
+        """
         try:
             from runtime.backends.laguna_dflash_cudagraph import DFlashVerifyCudaGraph
             vcg = DFlashVerifyCudaGraph(self.backend)

@@ -1,0 +1,48 @@
+{
+  "timestamp": "2026-07-25T08:52:00",
+  "gpu": "RTX PRO 6000 Blackwell 96GB (SM120)",
+  "model": "poolside/Laguna-S-2.1-NVFP4 + DFlash-NVFP4 (K=15)",
+  "params": {
+    "max_new": 128, "suffix": 10240, "gpu_util": 0.90,
+    "temperature": 0.0, "cuda_graph": true,
+    "cg_fix": "disable_split_kv=True + capture at max kv_len"
+  },
+  "cg_fix_commit": "92b11c5 + laguna_cuda_graph.py disable_split_kv fix",
+  "benchmarks": [
+    {
+      "runtime": "blackforge", "base_ctx": 65536, "suffix": 10240, "cg": true,
+      "warmup": {"phase":"warmup","prompt_len":65536,"n_tokens":128,"total_s":14.45,"prefill_ms":11107.0,"decode_ms":3346.1,"accept":0.339,"tok_step":5.08,"tok_s":38.0,"mem_gib":83.2},
+      "prefix_cached": {"phase":"prefix_cached","prompt_len":75776,"cached_len":65536,"suffix_len":10240,"n_tokens":128,"total_s":6.16,"prefill_ms":2663.2,"decode_ms":3497.9,"accept":0.463,"tok_step":6.35,"tok_s":36.3,"mem_gib":83.0},
+      "cold": {"phase":"cold","prompt_len":75776,"n_tokens":128,"total_s":15.93,"prefill_ms":12128.7,"decode_ms":3802.1,"accept":0.331,"tok_step":4.88,"tok_s":33.4,"mem_gib":83.0}
+    },
+    {
+      "runtime": "blackforge", "base_ctx": 131072, "suffix": 10240, "cg": true,
+      "warmup": {"phase":"warmup","prompt_len":131072,"n_tokens":128,"total_s":33.26,"prefill_ms":27819.8,"decode_ms":5435.5,"accept":0.388,"tok_step":5.77,"tok_s":23.4,"mem_gib":85.8},
+      "prefix_cached": {"phase":"prefix_cached","prompt_len":141312,"cached_len":131072,"suffix_len":10240,"n_tokens":128,"total_s":17.92,"prefill_ms":3428.7,"decode_ms":14491.4,"accept":0.164,"tok_step":2.44,"tok_s":8.8,"mem_gib":85.8},
+      "cold": {"phase":"cold","prompt_len":141312,"n_tokens":128,"total_s":53.33,"prefill_ms":33157.3,"decode_ms":20168.8,"accept":0.118,"tok_step":1.76,"tok_s":6.3,"mem_gib":85.8}
+    },
+    {
+      "runtime": "blackforge", "base_ctx": 200000, "suffix": 10240, "cg": true,
+      "warmup": {"phase":"warmup","prompt_len":200000,"n_tokens":128,"total_s":66.48,"prefill_ms":56049.1,"decode_ms":10429.0,"accept":0.302,"tok_step":4.54,"tok_s":12.2,"mem_gib":87.4},
+      "prefix_cached": {"phase":"prefix_cached","prompt_len":210240,"cached_len":200000,"suffix_len":10240,"n_tokens":128,"total_s":12.07,"prefill_ms":5407.9,"decode_ms":6661.6,"accept":0.467,"tok_step":6.68,"tok_s":19.1,"mem_gib":87.4},
+      "cold": {"phase":"cold","prompt_len":210240,"n_tokens":128,"total_s":71.96,"prefill_ms":65008.5,"decode_ms":6947.1,"accept":0.558,"tok_step":7.94,"tok_s":18.3,"mem_gib":88.5}
+    }
+  ],
+  "eager_baseline_from_handoff": [
+    {"runtime":"blackforge","base_ctx":65536,"cg":false,
+     "warmup":{"tok_s":23.8,"accept":0.183,"prefill_ms":9987.9},
+     "prefix_cached":{"tok_s":41.3,"accept":0.359,"prefill_ms":2280.3},
+     "cold":{"tok_s":12.6,"accept":0.107,"prefill_ms":10616.8}},
+    {"runtime":"blackforge","base_ctx":131072,"cg":false,
+     "warmup":{"tok_s":28.0,"accept":0.31,"prefill_ms":24045.4},
+     "prefix_cached":{"tok_s":23.0,"accept":0.26,"prefill_ms":3100.0},
+     "cold":{"tok_s":28.0,"accept":0.36,"prefill_ms":25800.0}}
+  ],
+  "analysis": {
+    "64K": "CG 38 tok/s vs eager 24 tok/s → 1.6x faster (CG wins)",
+    "128K": "CG 23 tok/s vs eager 28 tok/s → 0.8x REGRESSION (CG slower per step: 247ms vs 162ms)",
+    "200K": "CG 12-19 tok/s, acceptance varies 30-56%",
+    "root_cause_128K_regression": "CG captures at max kv_len → FlashInfer prefill kernel overhead scales with captured max, not actual kv_len. Step time 247ms@128K vs 134ms@64K = +84% for +100% context. Eager stays at 162ms because it builds metadata per-step for actual kv_len.",
+    "next_steps": ["Profile CG step breakdown at 128K", "Consider multi-bucket CG capture (64K/128K/200K)", "Or switch verify CG to decode wrapper (O(1) grid)"]
+  }
+}

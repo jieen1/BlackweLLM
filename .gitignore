@@ -65,3 +65,4 @@ notes/2026-07-2*-session*.md
 
 # vLLM FlashInfer autotune cache (local, reproducible)
 .autotune_cache/
+benchmarks/fixtures/vllm_profile/
