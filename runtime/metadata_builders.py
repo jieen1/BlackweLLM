@@ -30,21 +30,14 @@ def build_attention_metadata(
     device: torch.device,
     block_table: list[int] | None = None,
 ) -> SM120GQAMetadata:
-    """Hand-built SM120GQAMetadata for one request in one fixed slot. Shared
-    between ``DirectModelRunner`` (which tracks ``prior_kv_len`` itself via
-    ``self.slot_kv_len``) and Stage C of the 2026-07-16 ownership-transfer
-    ladder (``runtime/vllm_stage_c_baseline.py``, which derives
-    ``prior_kv_len`` from vLLM's own real, scheduler-computed
-    ``CommonAttentionMetadata`` instead) -- this is deliberately the exact
-    same field-construction logic in both cases, so Stage C tests whether
-    *this logic* is correct, not a second, independently-written copy of it.
+    """Hand-built SM120GQAMetadata for one request in one fixed slot.
+    ``DirectModelRunner`` tracks ``prior_kv_len`` itself via
+    ``self.slot_kv_len``.
 
     ``block_table`` (P0, 2026-07-19, ``notes/prefix-cache-design.md`` sec
     5): optional per-slot list of physical block ids, indexed by LOGICAL
     page position. ``None`` (the default) preserves the exact prior
-    arange-based addressing byte-for-byte -- required for
-    ``runtime/vllm_stage_c_baseline.py``, which does not pass this
-    parameter and must remain untouched. ``DirectModelRunner`` passes its
+    arange-based addressing byte-for-byte. ``DirectModelRunner`` passes its
     own ``self.block_table[slot]`` here only when constructed with
     ``enable_block_table=True``.
     """

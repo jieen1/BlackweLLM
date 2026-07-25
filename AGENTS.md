@@ -4,28 +4,28 @@
 
 Actual structure (post-B5 modularization, 2026-07-22):
 
-- `runtime/`: Core inference engine (B5 模块化后拆分为 5 个域):
-  - `direct_model_runner.py`: Main runner class (4550 lines, MTP/prefill/decode)
+- `runtime/`: Core inference engine (B5 模块化后拆分为多个域):
+  - `direct_model_runner.py`: Qwen3.6 main runner class (MTP/prefill/decode)
   - `block_pool.py`: Paging/prefix-cache infrastructure (Block, BlockPool, hash)
   - `metadata_builders.py`: Attention/GDN metadata construction
   - `cuda_graphs.py`: CUDA Graph capture/replay (CapturedBatchDecodeGraph, CapturedMTPDraftStepGraph)
   - `mtp_accept.py`: MTP accept/reject logic (pure functions)
   - `compat_vllm.py`: B7-V1 single-point vLLM dependency consolidation
   - `sampling.py`: Temperature/top-k/top-p sampling primitives
-  - `engine.py`, `slot_manager.py`, `hybrid_cache.py`, `op_registry.py`
+  - `backends/laguna.py`: Laguna-S-2.1 backend (sparkinfer MoE kernel, SWA ring KV, DFlash)
 - `server/`: OpenAI + Anthropic dual-protocol API (streaming, tools, thinking)
   - `app.py`: FastAPI application
   - `engine.py`: Continuous-batching server engine
   - `formats/`: Protocol adapters (openai, anthropic, stream, tools, thinking)
 - `benchmarks/`: Reproducible performance measurements + fixtures
   - `fixtures/`: speed_baseline.json, golden/, laguna_vllm_baseline.json
-- `tests/`: 216 tests (CPU-only, no model weights required)
+- `tests/`: CPU-only unit tests, no model weights required
 - `notes/`: Design documents and investigation records
 - `docs/`: roadmap.md, architecture.md
 
-Keep components small and layer boundaries explicit. Register replaceable
-operations through a shared `OpRegistry`; do not embed backend-specific calls
-throughout model code.
+Keep components small and layer boundaries explicit. Do not embed
+backend-specific calls throughout model code; route all vLLM imports through
+`runtime/compat_vllm.py`.
 
 ## Build, Test, and Development Commands
 

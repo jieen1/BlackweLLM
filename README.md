@@ -169,10 +169,11 @@ due to slot-wedge risk at 16K+ token generations. Full methodology in
 ```
 blackforge/
 ├── runtime/                  # Core inference engine
-│   ├── direct_model_runner.py   # Prefill, decode, MTP verify
-│   ├── hybrid_cache.py          # KV + GDN state management
-│   ├── op_registry.py           # Replaceable op dispatch
-│   └── slot_manager.py          # Fixed-slot scheduler (≤4 concurrent)
+│   ├── direct_model_runner.py   # Qwen3.6 prefill, decode, MTP verify
+│   ├── block_pool.py             # Paging + content-addressed prefix cache
+│   ├── cuda_graphs.py            # CUDA Graph capture/replay
+│   ├── compat_vllm.py            # Single-point vLLM dependency consolidation
+│   └── backends/laguna.py       # Laguna-S-2.1 backend (sparkinfer MoE)
 ├── server/                   # HTTP server (OpenAI + Anthropic API)
 │   ├── app.py                   # FastAPI endpoints + /metrics
 │   └── engine.py                # Admission, MTP loop, prefix cache
@@ -180,7 +181,7 @@ blackforge/
 ├── loader/                   # Weight loading (safetensors, NVFP4)
 ├── kernels/                  # CUDA kernel docs (sources in sm120-flash-attention)
 ├── benchmarks/               # Reproducible perf & correctness checks
-├── tests/                    # Unit tests (170+ tests, CPU-only)
+├── tests/                    # Unit tests (CPU-only)
 └── oracle/                   # vLLM reference comparison utilities
 ```
 
@@ -194,10 +195,8 @@ OpenAI/Anthropic-compatible server. The Qwen3.6 model graph and the SM120
 CUDA kernels are provided by vLLM plus the `sm120-flash-attention`
 integration, which this runtime drives as a library (see
 `runtime/direct_model_runner.py`). That is why `model/` (config only) and
-`kernels/` (documentation only) are intentionally thin here. The
-`runtime/vllm_*_baseline.py` modules are historical reference baselines kept
-for parity checks (e.g. `benchmarks/real_forward_smoke.py`), not the active
-serving path.
+`kernels/` (documentation only) are intentionally thin here. All vLLM
+imports in the production path go through `runtime/compat_vllm.py`.
 
 > **Naming:** the product and GitHub repo are **BlackForge**; the package
 > directory is historically `qwen-sm120-runtime`; configuration env vars use
