@@ -321,6 +321,11 @@ class LagunaCudaGraphDecode:
 
         self._graph = graph
         self._captured = True
+
+        # Restore original attention impls so the eager path keeps working.
+        # CG replay uses the captured graph directly, not the impl attribute.
+        self.unpatch_impls()
+
         logger.info("Laguna CUDA Graph captured (sparkinfer): batch_size=%d", bs)
 
     def _patch_impls_for_cg(self) -> None:
@@ -727,6 +732,11 @@ class LagunaCudaGraphVerify:
 
         self._graph = graph
         self._captured = True
+
+        # Restore original attention impls so the eager path keeps working.
+        # CG replay uses the captured graph directly, not the impl attribute.
+        self.unpatch_impls()
+
         logger.info("Laguna Verify CUDA Graph captured (M=%d)", nt)
 
     def replay_with_aux(

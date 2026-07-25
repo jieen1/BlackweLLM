@@ -1072,9 +1072,9 @@ class DFlashEngine:
         kv_len = backend.slot_kv_len[slot]  # = prompt_len
 
         if self._draft_cg is not None:
-            draft_tokens = self._draft_cg.replay(slot, bonus_token, kv_len + 1)
+            draft_tokens = self._draft_cg.replay(slot, bonus_token, kv_len)
         else:
-            draft_tokens = self._draft_forward(slot, bonus_token, kv_len + 1)
+            draft_tokens = self._draft_forward(slot, bonus_token, kv_len)
 
         tokens = [first_token]
         total_draft = 0
@@ -1151,9 +1151,9 @@ class DFlashEngine:
             bonus_token = new_bonus
             new_kv_len = backend.slot_kv_len[slot]
             if self._draft_cg is not None:
-                draft_tokens = self._draft_cg.replay(slot, bonus_token, new_kv_len + 1)
+                draft_tokens = self._draft_cg.replay(slot, bonus_token, new_kv_len - 1)
             else:
-                draft_tokens = self._draft_forward(slot, bonus_token, new_kv_len + 1)
+                draft_tokens = self._draft_forward(slot, bonus_token, new_kv_len - 1)
 
         t_total = time.perf_counter()
         # Prefix cache: preserve slot KV for next turn
