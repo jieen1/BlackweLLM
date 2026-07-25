@@ -1,0 +1,11 @@
+{
+  "config": "torch.compile(VLLM_COMPILE) + custom CG",
+  "context_len": 65536,
+  "step_ms": 16.15,
+  "tok_per_s": 61.9,
+  "prefill_s": 12.28,
+  "load_s": 144.5,
+  "cg_capture_s": 0.9,
+  "baseline_step_ms": 14.65,
+  "baseline_tok_per_s": 68.3
+}

@@ -95,6 +95,8 @@ class LagunaBackend:
                 vllm_config, rank=0, distributed_init_method=init_method, local_rank=0
             )
             self.model = get_model(vllm_config=vllm_config)
+        # Set IR op priority (fused RMSNorm C++ kernels) — normally done by worker init
+        vllm_config.kernel_config.ir_op_priority.set_default()
 
         # Initialize workspace manager for MoE layers
         from runtime.compat_vllm import init_flashinfer_workspace
