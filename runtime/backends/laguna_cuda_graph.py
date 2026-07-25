@@ -130,60 +130,51 @@ class LagunaCudaGraphDecode:
         token_ids: list[int],
         kv_lengths: list[int],
     ) -> None:
-        """Update pre-allocated buffers for replay."""
+        """Update pre-allocated buffers for replay. Optimized for batch=1."""
         bs = len(slot_ids)
         ps = self.block_size
         bps = self.blocks_per_slot
 
-        # Input IDs and positions
+        if bs == 1:
+            self._fill_buffers_b1(slot_ids[0], token_ids[0], kv_lengths[0])
+            return
+
+        # Generic batch path (batch > 1)
         for i in range(bs):
             self._input_ids[i] = token_ids[i]
             self._positions[i] = kv_lengths[i]
 
-        # Full-attention: page_table + cache_seqlens + slot_mapping
         for group_key, ws in self._decode_workspaces.items():
             wl = group_key[0]
             is_swa = wl >= 0 and self._ring_blocks_per_slot > 0
 
             if not is_swa:
-                # Full attention: consecutive blocks
                 for i in range(bs):
                     phys = slot_ids[i] + 1
                     base = phys * bps
                     new_kv = kv_lengths[i] + 1
                     n_blocks = (new_kv + ps - 1) // ps
-
-                    # Update page_table only on boundary crossing
                     if n_blocks != self._prev_n_blocks[i]:
                         self._prev_n_blocks[i] = n_blocks
                         pt = self._page_tables[group_key]
                         pt[0, :n_blocks] = torch.arange(
                             base, base + n_blocks, dtype=torch.int32, device=self.device)
-
-                    # cache_seqlens
                     self._cache_seqlens[group_key][i] = new_kv
-
-                    # slot_mapping for KV write
                     pos = kv_lengths[i]
                     self._slot_mapping[i] = (base + pos // ps) * ps + pos % ps
             else:
-                # SWA ring buffer
                 rbps = self._ring_blocks_per_slot
                 ring_slots = self._ring_slots_per_slot
                 window = self._swa_window
-
                 for i in range(bs):
                     phys = slot_ids[i] + 1
                     ring_base = phys * rbps
                     pos = kv_lengths[i]
                     new_kv = pos + 1
-
                     window_start = max(0, pos - window + 1)
                     aligned_start = (window_start // ps) * ps
                     aligned_len = new_kv - aligned_start
                     n_ring = (aligned_len + ps - 1) // ps
-
-                    # Update ring page_table on boundary crossing
                     if n_ring != self._swa_prev_n_blocks[i]:
                         self._swa_prev_n_blocks[i] = n_ring
                         pt = self._page_tables[group_key]
@@ -191,14 +182,60 @@ class LagunaCudaGraphDecode:
                             actual = aligned_start + j * ps
                             rb = (actual % ring_slots) // ps
                             pt[i, j] = ring_base + rb
-
-                    # cache_seqlens = aligned window length
                     self._cache_seqlens[group_key][i] = aligned_len
-
-                    # SWA slot_mapping
                     rb_dec = (pos % ring_slots) // ps
                     ro_dec = pos % ps
                     self._swa_slot_mapping[i] = (ring_base + rb_dec) * ps + ro_dec
+
+    def _fill_buffers_b1(self, slot: int, token_id: int, kv_len: int) -> None:
+        """Optimized fill for batch=1: minimal Python, pre-cached constants."""
+        ps = self.block_size
+        bps = self.blocks_per_slot
+        phys = slot + 1
+        base = phys * bps
+        new_kv = kv_len + 1
+
+        # Scalar writes (each is a tiny CUDA memcpy, ~2us each)
+        self._input_ids[0] = token_id
+        self._positions[0] = kv_len
+
+        for group_key in self._decode_workspaces:
+            wl = group_key[0]
+            is_swa = wl >= 0 and self._ring_blocks_per_slot > 0
+
+            if not is_swa:
+                # Full attention: page_table only changes on block boundary
+                n_blocks = (new_kv + ps - 1) // ps
+                if n_blocks != self._prev_n_blocks[0]:
+                    self._prev_n_blocks[0] = n_blocks
+                    self._page_tables[group_key][0, :n_blocks] = torch.arange(
+                        base, base + n_blocks, dtype=torch.int32, device=self.device)
+                self._cache_seqlens[group_key][0] = new_kv
+                self._slot_mapping[0] = base * ps + kv_len
+            else:
+                # SWA ring buffer
+                rbps = self._ring_blocks_per_slot
+                ring_slots = self._ring_slots_per_slot
+                ring_base = phys * rbps
+                window = self._swa_window
+
+                window_start = max(0, kv_len - window + 1)
+                aligned_start = (window_start // ps) * ps
+                aligned_len = new_kv - aligned_start
+                n_ring = (aligned_len + ps - 1) // ps
+
+                if n_ring != self._swa_prev_n_blocks[0]:
+                    self._swa_prev_n_blocks[0] = n_ring
+                    pt = self._page_tables[group_key]
+                    for j in range(n_ring):
+                        actual = aligned_start + j * ps
+                        rb = (actual % ring_slots) // ps
+                        pt[0, j] = ring_base + rb
+
+                self._cache_seqlens[group_key][0] = aligned_len
+                rb_dec = (kv_len % ring_slots) // ps
+                ro_dec = kv_len % ps
+                self._swa_slot_mapping[0] = (ring_base + rb_dec) * ps + ro_dec
 
     def _build_metadata_and_forward(self) -> torch.Tensor:
         """Build sparkinfer CG metadata and run forward."""
