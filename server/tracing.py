@@ -1,4 +1,4 @@
-"""D3: Lightweight request-level tracing for BlackForge.
+"""D3: Lightweight request-level tracing for BlackweLLM.
 
 Records span-level timing for each request's lifecycle:
   admission_wait → prefill → decode rounds → finish

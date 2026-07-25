@@ -249,7 +249,7 @@ def set_forward_context(
     skip_compiled: bool = False,
     **_ignored_kwargs,
 ):
-    """Simplified forward context manager for single-GPU BlackForge.
+    """Simplified forward context manager for single-GPU BlackweLLM.
 
     Self-written replacement for vLLM's ``set_forward_context``.
     Skips DP coordination, batch-size tracking, cudagraph mode dispatch,

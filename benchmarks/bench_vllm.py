@@ -1,4 +1,4 @@
-"""vLLM benchmark — identical parameters to BlackForge bench."""
+"""vLLM benchmark — identical parameters to BlackweLLM bench."""
 import json, os, sys, time, subprocess
 
 def main():

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict integration test for BlackForge server API compatibility.
+"""Strict integration test for BlackweLLM server API compatibility.
 
 Tests both OpenAI and Anthropic formats for:
 1. Normal chat (non-streaming)
@@ -589,7 +589,7 @@ def main():
     args = parser.parse_args()
     base = args.base_url.rstrip("/")
 
-    print("BlackForge API Compatibility Test")
+    print("BlackweLLM API Compatibility Test")
     print("Target: " + base)
     print("Time: " + time.strftime("%Y-%m-%d %H:%M:%S"))
 

@@ -1,4 +1,4 @@
-"""Real-world integration tests for BlackForge server.
+"""Real-world integration tests for BlackweLLM server.
 
 Covers the actual scenarios that Claude Desktop / OpenAI clients hit:
 - Anthropic API format compliance (all required fields)

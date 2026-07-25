@@ -1,4 +1,4 @@
-"""Format compatibility layer for BlackForge server.
+"""Format compatibility layer for BlackweLLM server.
 
 This package handles ALL input/output format conversion between external
 API formats (OpenAI, Anthropic) and the internal engine representation.

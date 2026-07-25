@@ -127,7 +127,7 @@ def main() -> None:
     args = parser.parse_args()
 
     baseline = load_baseline()
-    print("=== BlackForge Speed Baseline Comparison ===")
+    print("=== BlackweLLM Speed Baseline Comparison ===")
     print(f"  Baseline date: {baseline['date']}")
     print(f"  GPU: {baseline['gpu']}")
     print()

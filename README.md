@@ -1,8 +1,8 @@
-# BlackForge
+# BlackweLLM
 
-**Blackwell inference, forged for speed.**
+**Blackwell-native inference, built to outrun vLLM.**
 
-BlackForge is a full-stack inference engine built from the ground up for
+BlackweLLM is a full-stack inference engine built from the ground up for
 NVIDIA Blackwell (SM120) GPUs. It features hand-written CUDA attention
 kernels, FP8 KV cache, MTP speculative decoding, and CUDA Graph capture —
 all co-designed to extract maximum performance from SM120's unique hardware.
@@ -13,7 +13,7 @@ Currently optimized for **Qwen3.6-27B** (NVFP4). More model support coming.
 
 ---
 
-## Why BlackForge?
+## Why BlackweLLM?
 
 Mainstream inference frameworks (vLLM, TGI) use generic attention kernels
 (FlashInfer, FlashAttention) targeting a wide range of GPU architectures.
@@ -21,7 +21,7 @@ On SM120 (Blackwell consumer/workstation), these kernels leave significant
 performance on the table — they don't exploit SM120-specific features like
 16-byte `cp.async` loads or the specific shared memory bank layout.
 
-BlackForge's decode attention kernel is **written from scratch for SM120**,
+BlackweLLM's decode attention kernel is **written from scratch for SM120**,
 achieving **56% lower latency** than FlashInfer on 128K-context decode
 (0.988 ms vs 1.540 ms per decode step, batch=4, GQA 24→4 heads,
 head_dim=256, FP8 KV cache, paged layout).
@@ -62,7 +62,7 @@ Qwen3.6-27B-NVFP4, FP8 KV cache, MTP K=3, CUDA Graph enabled.
 
 ### Kernel Latency (decode attention only)
 
-| Context | Concurrency | BlackForge | FlashInfer | Speedup |
+| Context | Concurrency | BlackweLLM | FlashInfer | Speedup |
 |---------|-------------|------------|------------|---------|
 | 128K    | 4           | 0.988 ms   | 1.540 ms   | 1.56×   |
 
@@ -85,7 +85,7 @@ Qwen3.6-27B-NVFP4, FP8 KV cache, MTP K=3, CUDA Graph enabled.
 questions, ~30/category, thinking mode, 5-shot CoT, greedy, max_tokens=32768,
 zero truncation). Compared against the official Qwen3.6-27B model card score:
 
-| Benchmark | BlackForge (SM120) | Official Qwen3.6-27B | Delta   |
+| Benchmark | BlackweLLM (SM120) | Official Qwen3.6-27B | Delta   |
 |-----------|--------------------|-----------------------|---------|
 | MMLU-Pro  | **84.54%** (414q)  | 86.2                  | −1.7pp  |
 
@@ -120,7 +120,7 @@ python benchmarks/official/mmlu_pro_eval.py --base-url http://localhost:8000/v1 
 greedy decoding, temperature=0), identical OpenAI API prompts on both servers.
 Same model weights, same harness, different backend:
 
-| Benchmark  | vLLM (FlashInfer)    | BlackForge           | Delta  |
+| Benchmark  | vLLM (FlashInfer)    | BlackweLLM           | Delta  |
 |------------|----------------------|----------------------|--------|
 | HumanEval  | 71/164 = 0.433       | 73/164 = 0.445       | +1.2pp |
 | HumanEval+ | 70/164 = 0.427       | 71/164 = 0.433       | +0.6pp |
@@ -167,7 +167,7 @@ due to slot-wedge risk at 16K+ token generations. Full methodology in
 ## Architecture
 
 ```
-blackforge/
+blackwellm/
 ├── runtime/                  # Core inference engine
 │   ├── direct_model_runner.py   # Qwen3.6 prefill, decode, MTP verify
 │   ├── block_pool.py             # Paging + content-addressed prefix cache
@@ -198,9 +198,11 @@ integration, which this runtime drives as a library (see
 `kernels/` (documentation only) are intentionally thin here. All vLLM
 imports in the production path go through `runtime/compat_vllm.py`.
 
-> **Naming:** the product and GitHub repo are **BlackForge**; the package
-> directory is historically `qwen-sm120-runtime`; configuration env vars use
-> the `QSR_` (Qwen SM120 Runtime) prefix. All three refer to this same system.
+> **Naming:** the product and GitHub repo are **BlackweLLM** (formerly
+> BlackForge); the package directory is historically `qwen-sm120-runtime`;
+> configuration env vars still use the legacy `QSR_` (Qwen SM120 Runtime)
+> prefix; migration target is `BWLLM_`, actual rename pending. All three
+> refer to this same system.
 
 ## Quick Start
 
@@ -212,8 +214,8 @@ imports in the production path go through `runtime/compat_vllm.py`.
 ### Installation
 
 ```bash
-git clone https://github.com/jieen1/blackforge.git
-cd blackforge
+git clone https://github.com/jieen1/BlackweLLM.git
+cd BlackweLLM
 python -m pip install -e '.[dev,serving]'
 
 # Build the custom CUDA attention kernel (separate repo)
@@ -350,7 +352,7 @@ Apache 2.0 — see [LICENSE](LICENSE).
 
 ### 项目简介
 
-BlackForge 是一个专为 NVIDIA Blackwell（SM120）GPU 打造的全栈推理引擎。
+BlackweLLM 是一个专为 NVIDIA Blackwell（SM120）GPU 打造的全栈推理引擎。
 通过手写 CUDA attention kernel、FP8 KV cache、MTP 投机解码和 CUDA Graph
 捕获等深度优化，在 SM120 架构上实现极致推理性能。
 
@@ -377,8 +379,8 @@ BlackForge 是一个专为 NVIDIA Blackwell（SM120）GPU 打造的全栈推理�
 ### 快速开始
 
 ```bash
-git clone https://github.com/jieen1/blackforge.git
-cd blackforge
+git clone https://github.com/jieen1/BlackweLLM.git
+cd BlackweLLM
 python -m pip install -e '.[dev,serving]'
 
 # 启动服务（256K 上下文，2 并发）
