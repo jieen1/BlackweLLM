@@ -1,4 +1,4 @@
-# BlackForge 系统架构与技术设计
+# BlackweLLM 系统架构与技术设计
 
 > **Blackwell inference, forged for speed.**
 > 一台软件意义上的「Qwen3.6-27B 专用推理机」：为 NVIDIA Blackwell（SM120）单卡场景从零构建的全栈推理引擎，自研 CUDA attention kernel、FP8 KV cache、MTP 投机解码、CUDA Graph 与内容寻址前缀缓存，对外提供 OpenAI 与 Anthropic 双协议 API。
@@ -29,7 +29,7 @@
 
 ## 1. 项目定位：一台专用推理机
 
-主流推理框架（vLLM、TGI）使用面向多代 GPU 的通用 attention kernel（FlashInfer / FlashAttention），在 SM120（Blackwell 消费级/工作站）上留下了可观的性能空间——它们没有利用 16 字节 `cp.async` 向量化加载、特定的 shared memory bank 布局等 SM120 独有特性。BlackForge 的立项判断是：**与其无限扩展一个 vLLM attention backend，不如构建一台只服务单一工作负载的专用推理机**，其性能上限显著更高。
+主流推理框架（vLLM、TGI）使用面向多代 GPU 的通用 attention kernel（FlashInfer / FlashAttention），在 SM120（Blackwell 消费级/工作站）上留下了可观的性能空间——它们没有利用 16 字节 `cp.async` 向量化加载、特定的 shared memory bank 布局等 SM120 独有特性。BlackweLLM 的立项判断是：**与其无限扩展一个 vLLM attention backend，不如构建一台只服务单一工作负载的专用推理机**，其性能上限显著更高。
 
 为此，第一版的支持范围被刻意冻结：
 
@@ -44,7 +44,7 @@
 | 接口 | OpenAI + Anthropic 兼容 API，SSE 流式 |
 | 暂不支持 | 多卡、LoRA、beam search、其他模型 |
 
-> **命名说明**：产品与 GitHub 仓库名为 **BlackForge**；包目录沿用历史名 `qwen-sm120-runtime`；环境变量前缀为 `QSR_`（Qwen SM120 Runtime）。三者指同一系统。自研 CUDA kernel 独立于 `sm120-flash-attention` 仓库维护，作为「kernel 实验室」，只有通过正确性与性能门禁的 kernel 才进入本运行时。
+> **命名说明**：产品与 GitHub 仓库名为 **BlackweLLM**（原名 BlackForge，2026-07-25 更名）；包目录沿用历史名 `qwen-sm120-runtime`；环境变量前缀暂沿用历史的 `QSR_`（Qwen SM120 Runtime），迁移目标已定为 `BWLLM_`，实际代码改名另行排期。三者指同一系统。自研 CUDA kernel 独立于 `sm120-flash-attention` 仓库维护，作为「kernel 实验室」，只有通过正确性与性能门禁的 kernel 才进入本运行时。
 
 ## 2. 现状架构：两平面、五层
 
@@ -280,7 +280,7 @@ sequenceDiagram
 
 ### 4.1 线程间通信
 
-`ServerEngine` 启动名为 `blackforge-engine` 的 daemon 线程，在其中完成模型加载与所有 GPU 操作（`_engine_thread_main → _step_sync` 循环）。两条通道连接两个世界：
+`ServerEngine` 启动名为 `blackwellm-engine` 的 daemon 线程，在其中完成模型加载与所有 GPU 操作（`_engine_thread_main → _step_sync` 循环）。两条通道连接两个世界：
 
 - **请求通道（asyncio → 引擎）**：无锁 `collections.deque` 加一对 `os.pipe()`。引擎空闲时阻塞在 `os.read(pipe)` 上，零 CPU 占用；新请求写一个字节即唤醒。
 - **结果通道（引擎 → asyncio）**：每请求一个 `StreamChannel`（deque + `asyncio.Event`），引擎线程 `put()` 后通过 `loop.call_soon_threadsafe` 唤醒 SSE 生成器；非流式请求则经 Future 一次性解析。
@@ -436,7 +436,7 @@ Decode attention 单步延迟（128K context · batch=4 · GQA 24→4 · head_di
 
 | 实现 | 延迟 | 相对 |
 |---|---:|---:|
-| **BlackForge（自研 SM120 kernel）** | **0.988 ms** | **1.56×** |
+| **BlackweLLM（自研 SM120 kernel）** | **0.988 ms** | **1.56×** |
 | FlashInfer（通用 kernel） | 1.540 ms | 1.00× |
 
 1.56× 加速来自 SM120 专有优化：16 字节 cp.async 向量化加载 · 272 字节对齐 shared memory stride · 每请求 32 路 split-K（匹配 132 SMs）。仅在同条件下对比 kernel 级延迟，不做端到端跨框架吞吐对比。
@@ -463,7 +463,7 @@ STEM 强、人文偏弱是模型本身画像（同权重 stock vLLM 得分相同
 
 | 验证 | 方法 | 结果 |
 |---|---|---|
-| HumanEval+ A/B | 同权重、同 harness、同 prompt，仅后端不同（stock vLLM vs BlackForge），164 题 greedy | 0.445 / 0.433 vs vLLM 0.433 / 0.427（+1.2pp / +0.6pp，噪声内，无系统性退化） |
+| HumanEval+ A/B | 同权重、同 harness、同 prompt，仅后端不同（stock vLLM vs BlackweLLM），164 题 greedy | 0.445 / 0.433 vs vLLM 0.433 / 0.427（+1.2pp / +0.6pp，噪声内，无系统性退化） |
 | 工具调用回归 | 20 组工具 schema + 查询，精确匹配 | **100%** |
 | Agent 循环回归 | 多轮 plan → call → observe → answer | **100%** |
 | 长上下文回归 | Needle-in-haystack @ 8K / 32K / 64K / 128K | **100%** |

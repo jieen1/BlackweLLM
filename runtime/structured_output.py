@@ -1,6 +1,6 @@
 """C3: Structured output (JSON mode / json_schema) via xgrammar logits masking.
 
-Provides grammar-constrained decoding for the BlackForge runtime:
+Provides grammar-constrained decoding for the BlackweLLM runtime:
 - ``json_object`` mode: output is guaranteed valid JSON
 - ``json_schema`` mode: output conforms to a user-provided JSON Schema
 

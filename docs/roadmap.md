@@ -1,4 +1,4 @@
-# BlackForge 后续路线图（2026 H2 → 2027 H1）
+# BlackweLLM 后续路线图（2026 H2 → 2027 H1）
 
 > 从「Qwen3.6-27B 专用推理机」演进为「SM120 上的小型多模型推理平台」。五条并行轨道：当前模型性能深挖、架构弹性化（含去 vLLM 化主线）、兼容层补全、观测性与质量加固、多模型支持（Qwen3 系列 与 **poolside Laguna-S-2.1**）。第二租户目标模型于 2026-07-22 由 HY3 改为 **Laguna-S-2.1-NVFP4**（对比论证见第 8 节）；`hy3-sm120-research` 调研归档为方法论资产。每一项都沿用既有的门禁文化：有证据才动手，过回归才合入。
 >
@@ -8,7 +8,7 @@
 > - **M3（2026-Q4）弹性与平台化**：动态 KV 分配 · 模型抽象层 · Qwen3 系列接入 · Laguna L2 Backend 接入（过质量链）· 去 vLLM 化 V2 按证据推进
 > - **M4（2027-H1）新模型与扩展**：Laguna L3 性能专项（DFlash 投机 · MoE dispatch · NVFP4 autotune 扩展）· sm120-runtime-core 收敛 + 零依赖门禁（V3）· 自动回退
 >
-> 编制于 2026-07-22；同日修订：并入 HY3 调研现状 + 新增 B7「去 vLLM 化」主线（分步混合 + 证据拉动替换）；三修：第二租户目标模型改为 Laguna-S-2.1-NVFP4；四修（07-23）：新增 Track F 开源发布主线——**全开源决策 + BlackForge 命名统一**；五修（07-25）：Laguna sparkinfer 自研 kernel 冲刺复盘——MoE/attention 两大 kernel 均已脱离通用实现，但 server 生产集成（L2）与 vLLM 对比方法论明显落后于 kernel 进度，详见执行看板与第 8 节 E3。配套架构文档见 [architecture.md](architecture.md)。
+> 编制于 2026-07-22；同日修订：并入 HY3 调研现状 + 新增 B7「去 vLLM 化」主线（分步混合 + 证据拉动替换）；三修：第二租户目标模型改为 Laguna-S-2.1-NVFP4；四修（07-23）：新增 Track F 开源发布主线——**全开源决策 + BlackForge 命名统一**（已于 2026-07-25 进一步更名为 **BlackweLLM**，见第 9 节 F1）；五修（07-25）：Laguna sparkinfer 自研 kernel 冲刺复盘——MoE/attention 两大 kernel 均已脱离通用实现，但 server 生产集成（L2）与 vLLM 对比方法论明显落后于 kernel 进度，详见执行看板与第 8 节 E3。配套架构文档见 [architecture.md](architecture.md)。
 
 ## 目录
 
@@ -45,7 +45,7 @@
 7. ✅ B5 模块化 60%（runner 4597→1966 行，5 域提取）· ~~E1 Phase 1+2~~ ✅ · ~~C2 logprobs~~ ✅ · ~~D2/D3~~ ✅ · ~~C3/C4/C6~~ ✅
 8. ⏸ B2 动态 KV · A4 显存换速度 · C2/C4/C6 · D6 自动回退 · E2 Qwen3
 9. 🧊 暂缓：**A1 GDN 融合**（占比仅 ~4%，A2/A6 榨干后再评）；远期：B6 多 GPU · V3 零依赖门禁
-10. 🔥 **当前冲刺焦点：Laguna L2 → L3 = 开源发布的核心门禁（2026-07-23 用户裁定，详见第 9 节 F2）**——L2 完全支持（质量链 + server 生产形态端到端）→ L3 性能飞跃（DFlash K=15 投机为首选杠杆）；命名统一（仓库→`blackforge` · pip `blackforge-llm` · `QSR_`→`BF_`）与发布物料**并行准备**，但**宣传严格卡 Laguna 双门禁**；域名/GitHub org 由用户占位
+10. 🔥 **当前冲刺焦点：Laguna L2 → L3 = 开源发布的核心门禁（2026-07-23 用户裁定，详见第 9 节 F2）**——L2 完全支持（质量链 + server 生产形态端到端）→ L3 性能飞跃（DFlash K=15 投机为首选杠杆）；命名统一（仓库→`BlackweLLM` · pip `blackwellm` · 环境变量前缀迁移目标待定）与发布物料**并行准备**，但**宣传严格卡 Laguna 双门禁**；域名/GitHub org 由用户占位
 
 **一个月视界（2026-07-23 更新：Laguna 发布冲刺）**：①–⑦ 大体收官后，全月主线切换为 ⑩——**第 1–2 周 L2**（LagunaBackend 经 E1 接入 + server 生产形态端到端 + 质量链全绿），**第 2–4 周 L3**（DFlash K=15 投机为首选杠杆 → A2 GEMM patch 复用 → attention 按 profiling 补刀），命名统一与发布物料并行准备；对账标尺 = F2 双门禁（完全支持 + 性能飞跃），达成即发布，**流量窗口不等人，其余一切（⑧⑨）让路**。
 
@@ -152,7 +152,7 @@ flowchart LR
 
 ### B7 · 去 vLLM 化主线（P0 · M1→M4）
 
-**问题定性**：生产路径 `runtime/direct_model_runner.py` 对本地 vLLM 树是**运行时硬依赖**——模型图与 NVFP4 加载（`get_model` / `EngineArgs`）、attention/GDN 元数据类型与 backend 注册、`bind_kv_cache` / `set_forward_context`、FLA 算子、MTP 加载（`load_eagle_model`）全部经由本地 vLLM 树。核查发现（2026-07-22）：`/home/bot/vllm` **甚至不是 fork**，而是上游 v0.25.0 检出 + 5 个文件 +135/−52 行**未提交**补丁（多服务于 stock-vLLM 基线路径，非 BlackForge 生产路径）+ 一个散落树内的未跟踪文件 `sm120_gqa.py`（1115 行，本应属于 sm120-flash-attention）。当前最痛的不是「依赖 vLLM」，而是「依赖不可复现的本地状态」。
+**问题定性**：生产路径 `runtime/direct_model_runner.py` 对本地 vLLM 树是**运行时硬依赖**——模型图与 NVFP4 加载（`get_model` / `EngineArgs`）、attention/GDN 元数据类型与 backend 注册、`bind_kv_cache` / `set_forward_context`、FLA 算子、MTP 加载（`load_eagle_model`）全部经由本地 vLLM 树。核查发现（2026-07-22）：`/home/bot/vllm` **甚至不是 fork**，而是上游 v0.25.0 检出 + 5 个文件 +135/−52 行**未提交**补丁（多服务于 stock-vLLM 基线路径，非 BlackweLLM 生产路径）+ 一个散落树内的未跟踪文件 `sm120_gqa.py`（1115 行，本应属于 sm120-flash-attention）。当前最痛的不是「依赖 vLLM」，而是「依赖不可复现的本地状态」。
 
 **已决策路线（2026-07-22 沟通确认）：分步混合 + 证据拉动替换。** 「独立」与「剥离」解耦为两级验收：
 
@@ -174,7 +174,7 @@ flowchart LR
 | 阶段 | 内容 | 出口门禁 | 里程碑 |
 |---|---|---|---|
 | **V0** 锁定与取证 | ① 5 个未提交补丁提交为有名字的 patch 并存档 `notes/`，逐个确认与生产路径的关系（初判：多服务于 stock-vLLM 基线，direct runner 绕开了被改的 Scheduler/KVCacheManager）；② `sm120_gqa.py` 迁回 `sm120-flash-attention`（本有 out-of-tree 注册机制）；③ 查清两个未跟踪 `csrc/` marlin 目录的来源；④ vLLM 依赖 pin 到 v0.25.x + lock，CI 加 hermetic 安装；⑤ **用当前正常系统落盘 golden fixtures**（固定 prompt 集逐层 logits、GDN state、MTP 接受序列）——后续所有替换的裁判，动手前必须录好 | 补丁清单入库且与生产路径的关系逐个判明；fixtures 可复现；hermetic CI 绿 | M1（2–3 天，立刻做） |
-| **V1** 接口收窄 = 独立建仓 | 全仓库 vLLM import 收口到单文件 `runtime/compat_vllm.py`（依赖面从此可枚举）；薄依赖逐个自写替换、forward context 改显式传参；sm120-flash-attention 增加不经 backend registry 的直调 API；FLA / causal-conv1d 切上游包；BlackForge 以 `pip install blackforge[vllm-provider]`（pinned 官方 vLLM）形态独立建仓——需验证官方 wheel 在 SM120 + CUDA 13 可用，否则 pin 源码 tag 构建 | **独立建仓门禁：干净 venv + pinned vLLM 可复现安装启动，质量回归全绿**；`compat_vllm.py` 只剩 `get_model` / `load_eagle_model` / NVFP4 linear 三个符号；fixtures 全比对通过 | M1→M2（1–2 周） |
+| **V1** 接口收窄 = 独立建仓 | 全仓库 vLLM import 收口到单文件 `runtime/compat_vllm.py`（依赖面从此可枚举）；薄依赖逐个自写替换、forward context 改显式传参；sm120-flash-attention 增加不经 backend registry 的直调 API；FLA / causal-conv1d 切上游包；BlackweLLM 以 `pip install blackwellm[vllm-provider]`（pinned 官方 vLLM）形态独立建仓——需验证官方 wheel 在 SM120 + CUDA 13 可用，否则 pin 源码 tag 构建 | **独立建仓门禁：干净 venv + pinned vLLM 可复现安装启动，质量回归全绿**；`compat_vllm.py` 只剩 `get_model` / `load_eagle_model` / NVFP4 linear 三个符号；fixtures 全比对通过 | M1→M2（1–2 周） |
 | **V2** 厚依赖替换（证据拉动，无固定排期） | 三个厚符号各有各的「拉动信号」，被拉动才替换：**NVFP4 linear ← A2**（性能拉动：occupancy 排序 + autotune，自研 GEMM 落地即退出 vLLM，过渡期可 vendor 该 op 源码保先能跑）；**模型图 ← A1 深度融合或 E1 抽象层**（GDN block 级融合与「模型描述」接口都需要自有 layer graph——届时按原规划补齐 `qwen36_model.py` / `gdn_layer.py` 等，`loader/` 升级为真实加载器）；**`load_eagle_model` ← A3 MTP 融合**。未被任何信号拉动的部分**合法地留在界面后** | 每项替换独立结算：逐层 oracle 比对（`oracle/comparator.py`）+ 各自收益门禁（A1 单层 ≥10% / A2 端到端 ≥1%）+ greedy 固定集无漂移；沿用 Stage A/B/C 一次一个变量纪律 | M2 起随 A1/A2/A3/E1 各自节奏 |
 | **V3** 零依赖收口（方向门，随 core 抽取关闭） | 三个厚符号全部退出后：删除 `compat_vllm.py`；`vllm_*_baseline.py` 移入 `extras/`，vLLM 降级为 A/B 对比时才装的 dev 依赖；README 架构说明更新。与 `sm120-runtime-core` 抽取同批执行；若届时仍有未被证据拉动的厚依赖，做一次显式的「保留 or 强制替换」决策并记录 | CI 固定门禁：**干净 venv（无 vLLM）安装 → 启动 → 冒烟 → 质量回归全绿** | M4（与 core 抽取同批） |
 
@@ -227,7 +227,7 @@ B7 与 **B5（runner 模块化）、E1（模型抽象层）、A2（NVFP4 GEMM）
 | 维度 | 事实 |
 |---|---|
 | 模型 | poolside Laguna-S-2.1：**117.6B MoE，激活 8.5B/token**；**256 routed experts + 1 shared expert**；48 层 = **12 层全局 attention + 36 层 sliding window attention（窗口 512）**，GQA；上下文 262,144（另有原生 1M checkpoint，暂不启用）；2026-07-21 发布，OpenMDW-1.1 许可 |
-| 定位 | **agentic coding 专用**：Terminal-Bench 2.1 70.2% · SWE-bench Multilingual 78.5% · SWE-Bench Pro 59.4%——与 BlackForge 的 coding-agent 目标负载精确对口 |
+| 定位 | **agentic coding 专用**：Terminal-Bench 2.1 70.2% · SWE-bench Multilingual 78.5% · SWE-Bench Pro 59.4%——与 BlackweLLM 的 coding-agent 目标负载精确对口 |
 | 量化 | **NVFP4 权重 ≈71 GB + FP8 KV**——与 Qwen3.6 现有路径同格式（模型卡另提示 NVFP4 需 FlashInfer nightly，我们的 A2 自研 GEMM 路线不受此限） |
 | 投机 | 官方配套 quantization-matched draft 模型 **Laguna-S-2.1-DFlash-NVFP4**，推荐 `num_speculative_tokens=15` |
 | 框架 | **vLLM ≥ 0.25.0（恰为 B7 已 pin 的版本）**/ SGLang / TRT-LLM ≥1.3.0rc16 / llama.cpp（另有 GGUF Q4_K_M ≈75 GB 发行版，本项目不采用） |
@@ -266,12 +266,11 @@ B7 与 **B5（runner 模块化）、E1（模型抽象层）、A2（NVFP4 GEMM）
 
 | 项 | 决定 |
 |---|---|
-| 品牌 / 仓库 | **BlackForge**（已核查 GitHub 空间干净、双关即定位：Black(well) + Forge 手工锻造）；仓库 `qwen-sm120-runtime` → `blackforge`（GitHub 自动重定向旧链接） |
-| pip 包名 | `blackforge-llm`（PyPI `blackforge` 被闲置游戏框架占用；PEP 541 转让申请挂为低优先待办） |
-| 环境变量 | `QSR_` → `BF_`，保留一个版本的兼容别名 |
-| kernel 仓库 | **保留** `sm120-flash-attention`（描述性 SEO 资产——搜这个词的人就是目标用户），README 标注 "part of BlackForge" |
-| core 包 | 未来抽取 sm120-runtime-core 时以 `blackforge-core` 定名发布 |
-| 域名 / 组织 | 占 `blackforge.dev` 与 GitHub org（待办，用户执行） |
+| 品牌 / 仓库 | **BlackweLLM**（2026-07-25 更名，取代此前的 BlackForge：Blackwell + LLM 双关，大写 LL 凸显 LLM）；GitHub 仓库已改名 `jieen1/BlackweLLM`（远程已同步，GitHub 自动重定向旧链接） |
+| pip 包名 | `blackwellm`（`pyproject.toml` 已同步；PyPI 命名空间待用户实际发布前自行核查是否被占用） |
+| 环境变量 | `QSR_` → `BWLLM_`（已裁定），保留一个版本的兼容别名 |
+| kernel 仓库 | **保留** `sm120-flash-attention`（描述性 SEO 资产——搜这个词的人就是目标用户），README 标注 "part of BlackweLLM" |
+| core 包 | 未来抽取 sm120-runtime-core 时以 `blackwellm-core` 定名发布 |
 
 ### F2 · 发布门禁与素材纪律
 
@@ -281,7 +280,7 @@ B7 与 **B5（runner 模块化）、E1（模型抽象层）、A2（NVFP4 GEMM）
 - **核心门禁 ① 完全支持**：L2 质量链全绿（oracle 逐层 → 回归 A/B → SWE-bench 子集官方分对标）**且生产形态跑通**——server 双协议 + SSE 流式 + 工具调用 + 前缀缓存在 Laguna 上端到端可用，而不只是 backend 冒烟；
 - **核心门禁 ② 性能飞跃**：同硬件同模型对 stock vLLM 基线的**显著且单命令可复现**的优势（首选杠杆按序：DFlash K=15 投机 · 已验证的 A2 GEMM patch · attention 路径；具体倍数以实测定档，达不到「明显领先」就继续打磨，不带着平庸数字发布）；
 - **前置门禁 = B7-V1 独立建仓**（已收官）：推广前最后复验一次干净 venv 安装 → 起服务 → 回归全绿；
-- 素材公式：GitHub 描述与发布标题用「**开发者拥有的硬件 + 具体倍数**」（如 `BlackForge: LLM inference 1.5× faster than FlashInfer on RTX 5090`）——名字负责被记住，声明负责被点击；
+- 素材公式：GitHub 描述与发布标题用「**开发者拥有的硬件 + 具体倍数**」（如 `BlackweLLM: LLM inference 1.5× faster than FlashInfer on RTX 5090`）——名字负责被记住，声明负责被点击；
 - 每个公开性能数字必须配单命令复现脚本（benchmarks/ 已有基础），可复现性做成品牌；
 - 私有边界：运维脚本与生产配置不开源；`notes/` 打磨后作为技术博客逐步公开（首批素材：BOS 排查复盘、INV7 教训、GDN 免快照机制）。
 
@@ -316,7 +315,7 @@ B7 与 **B5（runner 模块化）、E1（模型抽象层）、A2（NVFP4 GEMM）
 | Laguna：DFlash K=15 的 verify 形状（qo_len=16）使 CUDA Graph 图数量与持久 buffer 显存膨胀，实际接受率未知 | 投机收益不达预期，显存预算被挤占 | L0 先做形状与显存分析；K 可下调（现有 Qwen 路径 K=3 的图设计经验直接迁移）；沿用「按 accepted tok/s 结算净收益」纪律，不达标退回非投机路径 |
 | Laguna：256 专家 MoE 的 dispatch/grouped GEMM 开销未知；若 L0 账本判定需要 expert offload，流量证据需重新采集 | 多并发吞吐不达标 | 复用 hy3 研究的 union-batch 设计与 G2 路由 trace 方法论（工具现成，换模型重录）；offload 仅在账本证明需要时启动 |
 | 换目标模型的沉没成本与摇摆风险（HY3 → Laguna） | hy3 投入被浪费、路线反复 | hy3-sm120-research 归档为方法论资产（v1-static 冻结完好，可随时从复验断点重启）；本次切换理由已书面化（第 8 节对比表）；再次切换需同等强度的对比论证 |
-| Laguna 实验与 BlackForge 生产共用一张 96 GB 卡 | 互相抢显存 / 干扰基准 | 沿用既有纪律：GPU 窗口审批制、Laguna 实验绝不修改 Qwen 生产路径、基准运行独占窗口 |
+| Laguna 实验与 BlackweLLM 生产共用一张 96 GB 卡 | 互相抢显存 / 干扰基准 | 沿用既有纪律：GPU 窗口审批制、Laguna 实验绝不修改 Qwen 生产路径、基准运行独占窗口 |
 | 6506 行单文件 runner 在多人/多模型演进下失控 | 迭代速度持续劣化 | B5 模块化重构以 parity 门禁先行；抽象层（E1）只在拆分后的模块边界上动刀 |
 | 去 vLLM 化：跳过 V0 直接替换——fork 本地补丁未盘点即丢失、golden fixtures 缺失 | V2 阶段每个数值偏差都变成两周盲调；隐性行为（oracle hook、SM120 修复）无声消失 | V0 是硬前置：diff fork vs 上游存档 `notes/`；fixtures 未落盘不得开始任何替换——这是 direct-model-runner 时期用血换来的教训 |
 | 去 vLLM 化：FLA / causal-conv1d 上游包与 vLLM 内嵌版本行为差异（chunk size、kernel 签名、数值细节） | GDN 状态无声漂移，输出质量事故 | 切换时单独过 1000-step GDN 状态演化 + 四槽 reset/复用测试；上游包版本进 lock 文件；fixtures 比对含 GDN state 而不只是 logits |

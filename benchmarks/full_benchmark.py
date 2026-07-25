@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full benchmark: BlackForge runtime — 64K/128K/200K × prefix-cache + CG × 3 rounds.
+"""Full benchmark: BlackweLLM runtime — 64K/128K/200K × prefix-cache + CG × 3 rounds.
 
 Each context runs in a separate subprocess to avoid GPU memory leaks.
 """
@@ -127,7 +127,7 @@ print("RESULT_JSON:" + json.dumps(result))
 def main():
     results = {
         "date": datetime.now().isoformat(),
-        "runtime": "blackforge",
+        "runtime": "blackwellm",
         "config": {"block_size": 64, "gpu_util": 0.92, "prefix_cache": True,
                    "cuda_graph": True, "dflash": False, "max_new": 128,
                    "suffix_len": 10240, "n_rounds": N_ROUNDS},

@@ -1,4 +1,4 @@
-"""BlackForge benchmark with CUDA Graph enabled."""
+"""BlackweLLM benchmark with CUDA Graph enabled."""
 import gc, json, os, sys, time, subprocess
 os.environ["USE_LIBUV"]="0"; os.environ["HF_HUB_OFFLINE"]="1"
 os.environ["QSR_DFLASH_CUDA_GRAPH"]="1"
@@ -51,7 +51,7 @@ engine.generate(base_ids[:256], max_tokens=5, temperature=0.0, slot=0, enable_pr
 torch.cuda.synchronize()
 print(f"Init done, mem={mem()}GiB, cg={engine._cg_captured}", file=sys.stderr)
 
-results = dict(runtime="blackforge", base_ctx=base_len, suffix=suffix_len, cg=True)
+results = dict(runtime="blackwellm", base_ctx=base_len, suffix=suffix_len, cg=True)
 
 # Phase 1: warmup (full prefill base, populates prefix cache)
 print(f"  [warmup] {base_len} tokens...", file=sys.stderr)

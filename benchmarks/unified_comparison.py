@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified benchmark: BlackForge vs vLLM — prefix cache + DFlash + CG.
+"""Unified benchmark: BlackweLLM vs vLLM — prefix cache + DFlash + CG.
 
 Test pattern (per context length):
   1. Warmup: send base prompt (e.g. 64K) → full prefill, populates prefix cache
@@ -64,7 +64,7 @@ def make_prompt(tok, n):
         ids.extend(chunk)
     return ids[:n]
 
-# ── BlackForge (runs in-process) ─────────────────────────────────────────
+# ── BlackweLLM (runs in-process) ─────────────────────────────────────────
 def bench_ours(base_len, suffix_len, base_ids, suffix_ids, tok):
     import torch; torch.set_grad_enabled(False)
     os.environ["QSR_DFLASH_CUDA_GRAPH"] = "1"
@@ -157,7 +157,7 @@ def bench_ours(base_len, suffix_len, base_ids, suffix_ids, tok):
           f"mem={mem_c:.1f}GiB")
 
     del engine, backend; gc.collect(); torch.cuda.empty_cache()
-    return dict(runtime="blackforge", base_ctx=base_len, suffix=suffix_len, **results)
+    return dict(runtime="blackwellm", base_ctx=base_len, suffix=suffix_len, **results)
 
 # ── vLLM (separate subprocess) ───────────────────────────────────────────
 VLLM_SCRIPT = r'''
@@ -289,15 +289,15 @@ def main():
         suffix_ids = [(t + 50000) % 100352 for t in suffix_ids]
         print(f"  Base: {len(base_ids)} tok, Suffix: {len(suffix_ids)} tok")
 
-        # BlackForge
-        print(f"\n[BlackForge] DFlash + CG + prefix cache")
+        # BlackweLLM
+        print(f"\n[BlackweLLM] DFlash + CG + prefix cache")
         try:
             r = bench_ours(len(base_ids), len(suffix_ids), base_ids, suffix_ids, tok)
             all_results["benchmarks"].append(r)
         except Exception as e:
             print(f"  FAILED: {e}"); traceback.print_exc()
             all_results["benchmarks"].append(
-                dict(runtime="blackforge", base_ctx=ctx, error=str(e)))
+                dict(runtime="blackwellm", base_ctx=ctx, error=str(e)))
         gc.collect()
         import torch; torch.cuda.empty_cache()
         time.sleep(5)

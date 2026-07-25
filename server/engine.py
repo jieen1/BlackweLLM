@@ -486,7 +486,7 @@ class ServerEngine:
         """Spawn the dedicated engine thread; blocks until model is ready."""
         self._asyncio_loop = asyncio.get_running_loop()
         self._engine_thread = threading.Thread(
-            target=self._engine_thread_main, daemon=True, name="blackforge-engine"
+            target=self._engine_thread_main, daemon=True, name="blackwellm-engine"
         )
         self._engine_thread.start()
         if not self._ready_event.wait(timeout=600):

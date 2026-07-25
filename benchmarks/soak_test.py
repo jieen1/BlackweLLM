@@ -1,4 +1,4 @@
-"""D4: Long-stability soak test for BlackForge.
+"""D4: Long-stability soak test for BlackweLLM.
 
 Sends mixed workloads (short/long requests, streaming/non-streaming,
 greedy/sampled, disconnects) against a running server and monitors for:
@@ -11,7 +11,7 @@ Usage:
     python benchmarks/soak_test.py [--base-url URL] [--duration-minutes N]
         [--concurrency C] [--max-tokens M]
 
-Requires a running BlackForge server (python -m server.app or launch_test_server.py).
+Requires a running BlackweLLM server (python -m server.app or launch_test_server.py).
 """
 
 from __future__ import annotations
@@ -241,7 +241,7 @@ async def run_soak(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="BlackForge soak test (D4)")
+    parser = argparse.ArgumentParser(description="BlackweLLM soak test (D4)")
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--duration-minutes", type=float, default=5.0)
     parser.add_argument("--concurrency", type=int, default=4)

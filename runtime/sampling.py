@@ -1,4 +1,4 @@
-"""Graph-safe sampling primitives for BlackForge.
+"""Graph-safe sampling primitives for BlackweLLM.
 
 Implements temperature / top-k / top-p (nucleus) sampling as pure tensor
 operations on logits.  ``temperature == 0`` is defined as greedy (argmax)

@@ -1,4 +1,4 @@
-"""OpenAI + Anthropic compatible HTTP server for BlackForge runtime.
+"""OpenAI + Anthropic compatible HTTP server for BlackweLLM runtime.
 
 Wraps ``server/engine.py`` (continuous-batching engine) with full
 OpenAI ``/v1/chat/completions`` and Anthropic ``/v1/messages`` APIs.
@@ -344,7 +344,7 @@ app = FastAPI(title="qwen-sm120-runtime server", lifespan=lifespan)
 @app.head("/")
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "blackforge"}
+    return {"status": "ok", "service": "blackwellm"}
 
 
 @app.middleware("http")

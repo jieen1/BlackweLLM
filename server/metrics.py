@@ -1,4 +1,4 @@
-"""Prometheus-style request metrics for the BlackForge server.
+"""Prometheus-style request metrics for the BlackweLLM server.
 
 Hand-rolled (no ``prometheus_client`` dependency) to match the existing
 hand-rolled ``/metrics`` endpoint in ``server/app.py`` and to honour the
