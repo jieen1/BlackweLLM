@@ -62,8 +62,8 @@ class LagunaBackend:
         vllm_config: VllmConfig,
         *,
         num_slots: int = 4,
-        block_size: int = 16,
-        blocks_per_slot: int = 512,
+        block_size: int = 64,
+        blocks_per_slot: int = 1024,
     ) -> None:
         import os as _os
         import sys as _sys
