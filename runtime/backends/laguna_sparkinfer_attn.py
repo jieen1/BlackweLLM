@@ -125,26 +125,20 @@ class SparkinferDecodeWorkspace:
         self._output = torch.zeros(1, num_q_heads, head_dim, dtype=torch.bfloat16, device=self.device)
         self._descale = torch.ones(1, dtype=torch.float32, device=self.device)
 
-        # Create graph-mode workspace
+        # Create graph-mode workspace with prepare_decode_graph_replay_state.
+        # Requires sparkinfer commit 0a7b143+ (fixes capacity underestimation
+        # for windowed attention with small page counts).
         self._workspace = PagedAttentionWorkspace.for_tensors(
             mode="decode", q=self._q, k_cache=self._k_cache,
             v_cache=self._v_cache, use_cuda_graph=True)
         self._workspace.prepare_decode_graph_replay_state(
             batch=1, max_page_table_width=max_pages, window_left=window_left)
 
-        # Capture plan at max context
+        # Bind runtime metadata at max context for capture
         capture_page_table = torch.arange(max_pages, dtype=torch.int32, device=self.device).unsqueeze(0)
         capture_cache_seqlens = torch.tensor([max_pages * PAGE_SIZE - 1], dtype=torch.int32, device=self.device)
         cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=self.device)
-
-        capture_plan = create_paged_plan(
-            self._q, self._k_cache, self._v_cache,
-            capture_page_table, capture_cache_seqlens, cu_seqlens_q,
-            mode="decode", enable_cuda_graph=True, graph_chunk_policy=True)
-        self._workspace._ensure_capacity(capture_plan)
         self._workspace._copy_runtime_metadata(capture_page_table, capture_cache_seqlens, cu_seqlens_q)
-        self._workspace._copy_plan_metadata(capture_plan)
-        self._workspace._plan = capture_plan
 
         self._cu_seqlens_q = cu_seqlens_q
         logger.info(
@@ -263,6 +257,17 @@ class SparkinferAttentionImpl:
             value_cache = value_cache.view(torch.float8_e4m3fn)
         # Now: [num_blocks, block_size, num_kv_heads, head_dim] — sparkinfer layout
 
+        # CG decode path: metadata has a workspace attribute
+        if hasattr(attn_metadata, "workspace"):
+            ws = attn_metadata.workspace
+            ws._q = q
+            ws._k_cache = key_cache
+            ws._v_cache = value_cache
+            ws._output = output[:num_actual_tokens]
+            ws.forward()
+            return output
+
+        # Prefill/extend path: create ephemeral workspace
         ws = self._get_prefill_ws(q.device)
         ws.forward(
             q=q,
