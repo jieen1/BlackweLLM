@@ -686,6 +686,17 @@ class LagunaCudaGraphDecode:
         prev_nb = 0
         swa_prev_nr = 0
 
+        # Pre-fill block table for initial kv_len (avoids O(n) rewrite per boundary)
+        init_nb = n_blocks_list[0] if n_blocks_list else 0
+        if init_nb > 0:
+            self._block_table[0, :init_nb] = torch.arange(
+                base, base + init_nb, dtype=torch.int32, device=device)
+            self._fi_indices_gpu[:init_nb] = torch.arange(
+                base, base + init_nb, dtype=torch.int32, device=device)
+            indptr_cpu[1] = init_nb
+            self._fi_indptr_gpu[:2].copy_(indptr_cpu, non_blocking=True)
+            prev_nb = init_nb
+
         for step in range(n_steps):
             # Scalar assigns (GPU-side, from Python int — no sync)
             self._positions[0] = positions[step]
@@ -700,26 +711,25 @@ class LagunaCudaGraphDecode:
                 swa_lpl_cpu[0] = swa_lpls[step]
                 self._swa_fi_last_page_len_gpu[:1].copy_(swa_lpl_cpu, non_blocking=True)
 
-            # Block table: only at page boundaries
+            # Block table: O(1) incremental update at page boundaries
             nb = n_blocks_list[step]
             if nb != prev_nb:
+                # Only write the NEW block (blocks are contiguous: base..base+nb-1)
+                self._block_table[0, nb - 1] = base + nb - 1
+                self._fi_indices_gpu[nb - 1] = base + nb - 1
                 prev_nb = nb
-                self._block_table[0, :nb] = torch.arange(
-                    base, base + nb, dtype=torch.int32, device=device)
                 indptr_cpu[1] = nb
-                self._fi_indices_gpu[:nb] = torch.arange(
-                    base, base + nb, dtype=torch.int32, device=device)
                 self._fi_indptr_gpu[:2].copy_(indptr_cpu, non_blocking=True)
 
-            # SWA ring block_table: only at boundaries
+            # SWA ring block_table: vectorized update at boundaries
             if has_swa:
                 nr = swa_nrs[step]
                 if nr != swa_prev_nr:
                     swa_prev_nr = nr
                     as_val = swa_as[step]
-                    for j in range(nr):
-                        ap = as_val + j * ps
-                        self._swa_block_table[0, j] = ring_base_g + (ap % ring_slots) // ps
+                    # Vectorized: compute all ring block IDs at once
+                    aps = torch.arange(as_val, as_val + nr * ps, ps, dtype=torch.int64, device=device)
+                    self._swa_block_table[0, :nr] = (ring_base_g + (aps % ring_slots) // ps).to(torch.int32)
                     swa_indptr_cpu[1] = nr
                     self._swa_fi_indices_gpu[:nr] = self._swa_block_table[0, :nr]
                     self._swa_fi_indptr_gpu[:2].copy_(swa_indptr_cpu, non_blocking=True)

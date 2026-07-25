@@ -1,0 +1,26 @@
+{
+  "test_date": "2026-07-25",
+  "gpu": "RTX PRO 6000 Blackwell 96GB (SM120)",
+  "config": {
+    "num_q_heads": 24, "num_kv_heads": 4, "head_dim": 128,
+    "page_size": 64, "batch": 1, "kv_dtype": "fp8_e4m3",
+    "q_dtype": "bf16"
+  },
+  "full_attention_window_left_-1": {
+    "4096":  {"flashinfer_ms": 0.036, "sparkinfer_eager_ms": 0.436, "sparkinfer_cg_ms": 0.091, "ratio": 2.51},
+    "16384": {"flashinfer_ms": 0.083, "sparkinfer_eager_ms": 0.446, "sparkinfer_cg_ms": 0.331, "ratio": 3.99},
+    "65536": {"flashinfer_ms": 0.096, "sparkinfer_eager_ms": 1.251, "sparkinfer_cg_ms": 1.155, "ratio": 12.08}
+  },
+  "swa_window_left_511": {
+    "4096":  {"flashinfer_ms": 0.037, "sparkinfer_eager_ms": 0.760, "sparkinfer_cg_ms": 0.035, "ratio": 0.95},
+    "16384": {"flashinfer_ms": 0.037, "sparkinfer_eager_ms": 0.756, "sparkinfer_cg_ms": 0.034, "ratio": 0.93},
+    "65536": {"flashinfer_ms": 0.035, "sparkinfer_eager_ms": 0.803, "sparkinfer_cg_ms": 0.036, "ratio": 1.02}
+  },
+  "conclusion": "SparkInfer paged attention is 2.5-12x SLOWER than FlashInfer for full attention at long context. For SWA (window=512), CG performance is equal (~0.035ms). FlashInfer remains the correct choice for attention.",
+  "per_layer_64k_total": {
+    "flashinfer_full_12_layers_ms": 1.15,
+    "flashinfer_swa_36_layers_ms": 1.26,
+    "sparkinfer_full_12_layers_ms": 13.86,
+    "sparkinfer_swa_36_layers_ms": 1.30
+  }
+}
