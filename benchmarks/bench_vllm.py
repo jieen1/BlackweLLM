@@ -38,7 +38,7 @@ def main():
     full_prompt = tok.decode(full_ids)
 
     from vllm import LLM, SamplingParams
-    max_len = max(len(full_ids) + 1024, 262144)
+    max_len = len(full_ids) + 2048  # tight fit to avoid OOM
     print(f"  Initializing vLLM (max_len={max_len}, gpu_util={gpu_util})...", file=sys.stderr)
     t0 = time.perf_counter()
     llm = LLM(model=MODEL, dtype="bfloat16", max_model_len=max_len,

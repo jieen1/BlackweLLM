@@ -1,0 +1,48 @@
+{
+  "timestamp": "2026-07-25T09:35:00",
+  "gpu": "RTX PRO 6000 Blackwell 96GB (SM120)",
+  "model": "poolside/Laguna-S-2.1-NVFP4 + DFlash-NVFP4 (K=15)",
+  "params": {"max_new": 128, "suffix": 10240, "temperature": 0.0, "gpu_util": 0.92},
+  "vllm_config": {
+    "version": "0.25.1.dev0",
+    "enforce_eager": false,
+    "enable_prefix_caching": true,
+    "torch_compile": true,
+    "cudagraph_mode": "PIECEWISE",
+    "moe_backend": "FLASHINFER_CUTLASS",
+    "init_s": 571
+  },
+  "blackforge_config": {
+    "enforce_eager": true,
+    "cuda_graph": "draft only (verify eager)",
+    "moe_backend": "FLASHINFER_CUTLASS",
+    "swa_fix": "verify_ring window corrected"
+  },
+  "64K": {
+    "vllm": {
+      "warmup": {"tok_s": 13.8, "n_tokens": 128, "total_s": 9.26, "mem_gib": 92.9, "note": "includes prefill"},
+      "prefix_cached": {"tok_s": 7.3, "n_tokens": 18, "total_s": 2.48, "mem_gib": 92.9, "note": "EOS at 18 tokens"},
+      "cold": {"tok_s": 47.2, "n_tokens": 18, "total_s": 0.38, "mem_gib": 92.9, "note": "cache not evicted, EOS at 18"}
+    },
+    "blackforge": {
+      "warmup": {"tok_s": 43.9, "n_tokens": 128, "total_s": 14.7, "prefill_s": 11.8, "accept": 0.339, "mem_gib": 82.1, "note": "decode-only tok/s"},
+      "prefix_cached": {"tok_s": 52.3, "n_tokens": 128, "total_s": 5.0, "prefill_s": 2.5, "accept": 0.463, "mem_gib": 82.1},
+      "cold": {"tok_s": 37.8, "n_tokens": 128, "total_s": 15.0, "prefill_s": 11.7, "accept": 0.331, "mem_gib": 82.1}
+    }
+  },
+  "analysis": {
+    "memory": "BlackForge 82.1 GiB vs vLLM 92.9 GiB → BlackForge saves 10.8 GiB (13% less)",
+    "decode_speed": "BlackForge 43.9 tok/s (decode-only) vs vLLM 13.8 tok/s (includes prefill) — NOT directly comparable",
+    "vllm_issues": [
+      "cached/cold only 18 tokens (EOS hit early with synthetic prompt)",
+      "cold cache eviction ineffective (prefix cache still holds 64K prefix)",
+      "tok_s includes prefill time (not decode-only)"
+    ],
+    "next_steps": [
+      "Fix vLLM benchmark: use ignore_eos=True or real prompts",
+      "Add prefill/decode time separation to vLLM benchmark",
+      "Run 128K/200K vLLM benchmarks",
+      "Use real agent prompts for fair comparison"
+    ]
+  }
+}
