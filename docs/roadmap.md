@@ -8,7 +8,7 @@
 > - **M3（2026-Q4）弹性与平台化**：动态 KV 分配 · 模型抽象层 · Qwen3 系列接入 · Laguna L2 Backend 接入（过质量链）· 去 vLLM 化 V2 按证据推进
 > - **M4（2027-H1）新模型与扩展**：Laguna L3 性能专项（DFlash 投机 · MoE dispatch · NVFP4 autotune 扩展）· sm120-runtime-core 收敛 + 零依赖门禁（V3）· 自动回退
 >
-> 编制于 2026-07-22；同日修订：并入 HY3 调研现状 + 新增 B7「去 vLLM 化」主线（分步混合 + 证据拉动替换）；三修：第二租户目标模型改为 Laguna-S-2.1-NVFP4；四修（07-23）：新增 Track F 开源发布主线——**全开源决策 + BlackForge 命名统一**。配套架构文档见 [architecture.md](architecture.md)。
+> 编制于 2026-07-22；同日修订：并入 HY3 调研现状 + 新增 B7「去 vLLM 化」主线（分步混合 + 证据拉动替换）；三修：第二租户目标模型改为 Laguna-S-2.1-NVFP4；四修（07-23）：新增 Track F 开源发布主线——**全开源决策 + BlackForge 命名统一**；五修（07-25）：Laguna sparkinfer 自研 kernel 冲刺复盘——MoE/attention 两大 kernel 均已脱离通用实现，但 server 生产集成（L2）与 vLLM 对比方法论明显落后于 kernel 进度，详见执行看板与第 8 节 E3。配套架构文档见 [architecture.md](architecture.md)。
 
 ## 目录
 
@@ -50,6 +50,17 @@
 **一个月视界（2026-07-23 更新：Laguna 发布冲刺）**：①–⑦ 大体收官后，全月主线切换为 ⑩——**第 1–2 周 L2**（LagunaBackend 经 E1 接入 + server 生产形态端到端 + 质量链全绿），**第 2–4 周 L3**（DFlash K=15 投机为首选杠杆 → A2 GEMM patch 复用 → attention 按 profiling 补刀），命名统一与发布物料并行准备；对账标尺 = F2 双门禁（完全支持 + 性能飞跃），达成即发布，**流量窗口不等人，其余一切（⑧⑨）让路**。
 
 **已裁决变更**：AIME26 评测撤销（`686f421`，五层质量证据已足）· A1 降级 · 新增 A6。
+
+**2026-07-25 复盘（Laguna sparkinfer 冲刺，Lane 2）**：三天内（07-23→07-25）近百次提交，MoE 与 attention 两个最大 kernel 全部脱离通用实现——**sparkinfer MoE** 替换 MARLIN/CUTLASS（CUDA Graph 下 38μs/层 vs CUTLASS eager 186μs/层，4.8×；B12x 因 SM121 MMA guard 在 SM120 上恒零输出，已确认死路并随 PR #1 删除）；**sparkinfer paged attention** 全面替换 FlashInfer（4K 短上下文 72.9 tok/s 微跑赢 vLLM 70.5，但 64K 67.2 tok/s 仍落后 0.95×）；另有 block_size 16→64、CUDA Graph split-KV、decode CG batch=1 专用路径等收尾优化。**但这批 kernel 级证据尚不能兑现为 F2「性能飞跃」门禁**：现有「跑赢 vLLM」的对比都是不开 DFlash 投机、短上下文的纯 decode-step 微跑；唯一一次开着 DFlash K=15、拉到 64K–200K 真实工作负载的 vLLM 对比（`unified_comparison.json`）里 vLLM 进程本身在三个上下文长度上全部 crash，未产出可用基线；上一次真正跑通的 vLLM 对比（07-24，MARLIN 时代）显示 64K 下仍有 7× 差距（52.8 vs 376.9 tok/s），且尚未用新 kernel 栈复验。
+
+**L2（server 生产集成）与 kernel 进度出现倒挂**：`server/engine.py` / `server/app.py` 自 07-24 08:27（`716c024`）起未再改动——sparkinfer MoE/attention/CUDA Graph/DFlash 全部只存在于独立 benchmark 脚本与 `runtime/backends/laguna_cuda_graph.py` 等模块（07-23 集成笔记里明确标注的「Lane 2」），`ServerEngine._load_laguna_model` 仍硬编码 `moe_backend="marlin"`、`enable_cudagraph=0`，且同一笔记记录的「`_load_laguna_model` 从未过 GPU 冒烟」至今没有变化的证据。换句话说：L0/L1 已关账，L3 性能专项的三大杠杆（MoE/attention/DFlash 自研 kernel）都已在独立验证中见到真实收益，但 L2「server 端到端可用」尚未把这些成果接进服务路径，也从未有过一次真实 GPU 请求打过 Laguna 生产路径——这是当前最大的结构性风险，优先级应高于继续榨 kernel 收益。
+
+**新增待办（记录留给开发验证/执行，模型不代跑基准、不代下权重）**：
+1. 把 Lane 2（sparkinfer MoE/attention/CUDA Graph/DFlash）合入 `server/engine.py._load_laguna_model` 默认值，替换硬编码的 `marlin` / `enable_cudagraph=0`；
+2. 跑一次真实 GPU 请求端到端冒烟（HTTP 双协议各一轮），关掉「`_load_laguna_model` 从未跑过」这条遗留缺口；
+3. 修复并重跑 vLLM 对比方法论（`unified_comparison.json` 里 vLLM 三次全部 crash）——在 DFlash K=15 开启、真实 128K/200K 工作负载下重新对标，这才是 F2「性能飞跃」门禁真正要看的数字；
+4. B7 记账更新：核查确认 Laguna 相关文件里共有 **6 处直接 `from vllm...` import 绕开 `compat_vllm.py`**（`laguna.py:330` MoE router bias、`laguna_dflash.py:135-136,170` SpeculativeConfig/load_dflash_model、`laguna_dflash_cudagraph.py:229,448` FlashInfer prefill/metadata），另有 **4 个 A2 NVFP4 patch 模块**（`nvfp4_b12x_patch.py`/`nvfp4_cudnn_patch.py`/`nvfp4_custom_gemm.py`/`nvfp4_cutlass_direct_patch.py`）各自直接 import vLLM、被 `direct_model_runner.py` 与 `laguna.py` 生产路径引用——这些均未纳入 B7-V1 的「compat_vllm 单点收口」核算，B7-V1 对 Qwen 路径的收口成果不能想当然覆盖 Laguna 与 A2 patch；`pyproject.toml` 至今未声明 `vllm` 为可选依赖、仓库无任何 lock 文件，「干净 venv + pinned vLLM 可复现安装」这条 V1 出口门禁从未被实际跑过一次（详见第 5 节 B7）；
+5. Laguna 前缀缓存目前是永久 miss 桩实现（`reconcile_prefix_hit` 对 Laguna 尚未真正接入 BlockPool 命中逻辑），且 DFlash 投机解码未接入 engine 主循环（只有 backend 层代码与独立 benchmark 调用）——这两项都是 L2「server 生产形态端到端可用」门禁的缺口，需和 Lane 2 合并一起补上。
 
 ## 1. 现状盘点：已锻成与未竟
 
@@ -169,6 +180,8 @@ flowchart LR
 
 B7 与 **B5（runner 模块化）、E1（模型抽象层）、A2（NVFP4 GEMM）合并为同一条主线**排期，不额外新开线：V1 的接口收口自然产出 B5 的模块边界；V2 若被 E1 拉动产出自有模型图，即是「模型描述」接口的第一个实现。附带红利：Laguna 与 Qwen 同为 NVFP4 且同受 pinned vLLM 0.25 支持，compat 界面天然可承载双租户的过渡期；core 无 vLLM 化后，`sm120-runtime-core` 的抽取会干净得多。**节奏要点：V0+V1（约两周）即达成「独立项目」目标**——可复现、可公开、依赖面收敛为一个文件里的三个可枚举符号；此后零依赖只是性能路线顺路收割的方向，不再是悬在头上的排期。
 
+> **2026-07-25 记账更新**：B7-V1 对 **Qwen3.6 路径**的收口成果（`compat_vllm.py` 单点收口、FLA 切上游、`bind_kv_cache`/`set_forward_context`/`compute_causal_conv1d_metadata` 自写）依旧成立，未受影响。但 **Laguna 第二租户引入了一批 B7-V1 范围之外的新 vLLM/FlashInfer 触点**：`get_model()`/`EngineArgs`（模型加载）、attention backend 的 monkey-patch 注册、`CommonAttentionMetadata`（vLLM dataclass，Laguna 侧转换为 sparkinfer 格式前的中间表示）、以及 **DFlash 投机解码的 draft/verify attention 至今仍构建在 FlashInfer 之上**（sparkinfer 只替换了 Laguna 主路径的 attention，未覆盖 DFlash）——这些触点需要单独计入 compat_vllm 收口清单，不能默认已被 Qwen 路径的 V1 收口覆盖。另外，`pyproject.toml` 从未把 `vllm` 列为可选依赖（无 `vllm-provider` extra），`/home/bot/vllm` 仍是本地 checkout 且带 5 个未提交补丁（与 07-22 V0 盘点时一致，未见变化）——V1 出口门禁「干净 venv + pinned 官方 vLLM 可复现安装启动」从未被实际执行验证过一次，记为待办。
+
 ## 6. Track C · 兼容层补全
 
 目标客户是 coding agent：优先补「agent 真的会用到」的语义，而不是追协议全集。
@@ -236,10 +249,10 @@ B7 与 **B5（runner 模块化）、E1（模型抽象层）、A2（NVFP4 GEMM）
 
 | 阶段 | 内容 | 门禁（合入/晋级标准） | 里程碑 |
 |---|---|---|---|
-| **L0** 本地调研合同 | **账本已关（2026-07-22）**：[notes/2026-07-22-laguna-l0-memory-budget.md](../notes/2026-07-22-laguna-l0-memory-budget.md)——权重实测 66.96 GiB（14 分片齐）、12 全局层（每 4 层 1 层）+ 36 滑窗层实证、KV 增长 24 KiB/token（HY3 的 1/6.7）、**2×200K / 2×256K / 4×128K 均无需 expert offload**（4×256K 不可行，届时再议）。剩余：pinned vLLM 0.25 加载冒烟（需 GPU 窗口）；DFlash draft 体量与 K=15 verify 形状（qo_len=16）分析 | 账本 ✅；冒烟通过或明确版本要求后 L0 关账 | M1（S） |
-| **L1** pinned-vLLM 冒烟租户 | 经 B7 compat 界面以 `get_model` 加载 Laguna，eager 正确性（oracle = stock vLLM/SGLang 输出逐 token 比对）+ 基线吞吐入库；**不做任何自研 kernel** | 固定 prompt 集与 oracle 一致；基线数字可复现 | M2（M） |
-| **L2** LagunaBackend 接入 | 经 E1 抽象层落地：模型描述（12 全局层 paged FP8 KV + 36 SWA 层环形 KV + MoE expert dispatch）、复用 BlockPool 与固定槽位调度；质量链全跑（oracle 逐层比对 → HumanEval+/自建回归 A/B → 官方分对标：SWE-bench 子集 / Terminal-Bench 抽样） | 新增模型不改 runner 核心；Qwen 路径 bit 级不变；质量链全绿 | M3（L） |
-| **L3** 性能专项 | A2 NVFP4 autotune 表扩到 Laguna shapes（含 256 专家的 grouped/masked expert GEMM）；DFlash 投机集成（复用 draft/verify 循环骨架，K 从 15 起调参）；SWA kernel 评估（sm120-flash-attention 的窗口变体，按 profiling 占比决定是否自研）；**expert offload 仅在 L0 账本证明需要时启动**（复用 hy3 设计与 trace 方法论重新采集证据） | 每项按既有收益门禁结算（A2 端到端 ≥1% / kernel 项 profiling 准入）；投机按 accepted tok/s 净收益 | M4（L） |
+| **L0** 本地调研合同 | ✅ **已关（2026-07-22）**：[notes/2026-07-22-laguna-l0-memory-budget.md](../notes/2026-07-22-laguna-l0-memory-budget.md)——权重实测 66.96 GiB（14 分片齐）、12 全局层 + 36 滑窗层实证、KV 增长 24 KiB/token；**07-23 复验发现**首版 `LagunaBackend` 未实现环形 KV（48 层一律按满上下文分页，96 KiB/token，账本失真 4×），**07-24 已补上 SWA 环形 KV**（`laguna.py` 的 `_ring_blocks_per_slot`/`_ring_slots_per_slot`），账本恢复有效 | 账本 ✅；冒烟通过或明确版本要求后 L0 关账 | ✅ 已关 |
+| **L1** pinned-vLLM 冒烟租户 | ✅ **已关（2026-07-22/23）**：`get_model` 加载 Laguna + eager 正确性 4/4（`laguna_l1_correctness.json`/`laguna_quality_gate.json`），MARLIN/CUTLASS 基线吞吐入库 | 固定 prompt 集与 oracle 一致；基线数字可复现 | ✅ 已关 |
+| **L2** LagunaBackend 接入 | 🟡 **半开**：E1 抽象层已落地（`ModelSpec`/`Qwen36Backend`/`LagunaBackend`），`server/engine.py` 已有 `backend="qwen36"｜"laguna"` 分派 + 双协议接线（Lane 1，2026-07-23，CPU-only，12/12 结构测试 + 全仓库回归绿），poolside_v1 工具调用/思考解析已按 chat_template 适配。**但**：`_load_laguna_model` 至今**从未跑过真实 GPU 请求**；`enable_cudagraph=0`、`moe_backend="marlin"` 硬编码在 server 路径里，07-24/25 的 sparkinfer/CUDA Graph/DFlash 成果（Lane 2）尚未合并进来；质量链（oracle 逐层 → A/B → SWE-bench 对标）未跑 | 新增模型不改 runner 核心；Qwen 路径 bit 级不变；质量链全绿；**新增：一次真实 GPU 端到端冒烟** | M3（L，**当前最高优先级缺口**） |
+| **L3** 性能专项 | 🟡 **kernel 级证据已出，组合证据未出**：sparkinfer MoE 替换 MARLIN/CUTLASS（CUDA Graph 下 4.8× vs CUTLASS eager，B12x 因 SM121 MMA guard 确认死路已删除）；sparkinfer paged attention 替换 FlashInfer（4K 微跑赢 vLLM 70.5，64K 仍落后 0.95×）；block_size 16→64、split-KV、decode CG batch=1 路径落地。DFlash（K=15）已集成但**仍用 FlashInfer attention**（未随主路径切 sparkinfer），128K+ 场景 acceptance 与 prefill 分块对齐仍有已知问题（`swa_fix_benchmark_20260725.json` known_issues）；expert offload 未触发（L0 账本仍判定不需要） | 每项按既有收益门禁结算（A2 端到端 ≥1% / kernel 项 profiling 准入）；投机按 accepted tok/s 净收益；**新增：DFlash K=15 全开、128K/200K 真实工作负载下与 vLLM 的可比对标**（现有对比要么未开 DFlash，要么 vLLM 进程 crash，见执行看板） | M4（L） |
 
 #### HY3 处置与收敛
 
@@ -308,6 +321,8 @@ B7 与 **B5（runner 模块化）、E1（模型抽象层）、A2（NVFP4 GEMM）
 | 去 vLLM 化：跳过 V0 直接替换——fork 本地补丁未盘点即丢失、golden fixtures 缺失 | V2 阶段每个数值偏差都变成两周盲调；隐性行为（oracle hook、SM120 修复）无声消失 | V0 是硬前置：diff fork vs 上游存档 `notes/`；fixtures 未落盘不得开始任何替换——这是 direct-model-runner 时期用血换来的教训 |
 | 去 vLLM 化：FLA / causal-conv1d 上游包与 vLLM 内嵌版本行为差异（chunk size、kernel 签名、数值细节） | GDN 状态无声漂移，输出质量事故 | 切换时单独过 1000-step GDN 状态演化 + 四槽 reset/复用测试；上游包版本进 lock 文件；fixtures 比对含 GDN state 而不只是 logits |
 | 动态 KV 分配破坏前缀缓存不变量 | 隐性输出错误（最危险形态） | INV*/R* 不变量测试全量随行；bootstrap check 在该阶段临时提高采样率；可一键回退静态配额 |
+| Laguna：L2（server 集成）与 L3（kernel 性能）两条子链各自推进未同步——性能优化（Lane 2）三天内未合并进 server 路径（Lane 1），`_load_laguna_model` 从未过 GPU 冒烟 | F2 release 门禁①「完全支持」实际上比②「性能飞跃」更晚达成；kernel 收益无法兑现为用户可见的服务能力 | 下一 sprint 优先把 Lane 2 合并进 `server/engine.py`（sparkinfer 默认值 + CUDA Graph 开关），跑通一次真实 GPU 端到端冒烟，再继续榨 kernel 收益（记为待办，见执行看板） |
+| Laguna：「跑赢 vLLM」的性能对比方法论不统一——已发布的「beats vLLM」数字均为不开 DFlash 的短上下文纯 decode 微跑，唯一一次开 DFlash 的长上下文对比里 vLLM 进程全部 crash | 对外/对内都可能高估当前性能位置，F2 发布门禁按错误数字裁决的风险 | 待办：修复 vLLM 侧长上下文 + DFlash 场景的对比脚本，在 64K/128K/200K、DFlash K=15 开启下重新产出双方都成功完成的可比数字，再谈「显著且可复现的优势」 |
 
 ## 12. 不做清单
 

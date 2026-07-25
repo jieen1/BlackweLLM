@@ -6,6 +6,8 @@
 > 关键指标：decode attention **1.56×** vs FlashInfer · 单卡 96 GB 支持 **256K 上下文** · **222 tok/s**（128K × 4 并发）· MMLU-Pro **84.5%**（官方 86.2，噪声内）
 >
 > 本文档编制于 2026-07-22，基于 README、《项目实施规划》、notes/ 设计文档及对 `server/`、`runtime/` 源码的逐文件调研。性能与质量数据均可由 `benchmarks/` 内脚本复现。文档同时描述**现状架构**（第 2 节）与**完全剥离 vLLM 后的终态架构**（第 3 节）——后者是路线图 B7 主线所有替换工作的收敛方向。
+>
+> **2026-07-25 修订**：`runtime/backends/` 已成为真实的第二租户目录——`Qwen36Backend`（E1 Phase 2 抽取）与 `LagunaBackend`（poolside Laguna-S-2.1，自研 sparkinfer MoE + attention kernel）并存，`server/engine.py` 已能按 `backend=` 分派。第 2 节按现状更新；差距与待办见 [roadmap.md 执行看板](roadmap.md#0-执行看板先做什么2026-07-22-复盘)。
 
 ## 目录
 
@@ -68,7 +70,7 @@ flowchart TB
     subgraph eng["服务引擎 — server/engine.py"]
         e1["ServerEngine：请求准入 · 批量排队 · MTP 主循环<br/>专用引擎线程独占 CUDA 上下文"]
     end
-    subgraph rt["执行平面 — runtime/direct_model_runner.py（6506 行）"]
+    subgraph rt["执行平面 — runtime/direct_model_runner.py（2008 行，B5+E1 抽取后）"]
         direction LR
         r1["DirectModelRunner<br/>prefill · decode · MTP verify"]
         r2["BlockPool 分页<br/>+ 前缀缓存"]
@@ -100,6 +102,20 @@ flowchart TB
 ### 2.4 现状的结构性短板
 
 现状架构的最底层（模型与 kernel 库层）经由本地 vLLM 树提供，构成**运行时硬依赖**：模型图与 NVFP4 加载、attention backend 注册、KV 绑定、FLA 算子、MTP draft 加载全部穿过它。这带来三个问题：① 无法独立部署维护（依赖不可复现的本地状态）；② 使用的是 vLLM **内部 API**，版本升级即破坏；③ 多模型平台化（Hy3Backend）被一个与目标无关的重依赖挡路。终态解法见第 3 节。
+
+### 2.5 第二租户：LagunaBackend（E1 落地进行中，2026-07 冲刺）
+
+第 3 节描绘的「core + 多 backend」终态，已经提前以雏形落地——`runtime/backends/` 目前是两个真实模型后端并存的目录，而非纯规划：
+
+- **`Qwen36Backend`**（`backends/qwen36.py`，E1 Phase 2）：从 `DirectModelRunner` 机械抽取出的 MTP 方法集合（verify/sync/propose 等 13 个方法），`self._r` 持有对 runner 的引用以复用共享基础设施；`DirectModelRunner` 本体已从 6506 行降到 **2008 行**。`runtime/model_spec.py` 的 `ModelSpec`（E1 Phase 1）把层结构、MTP 配置、KV dtype 等显式化为 frozen dataclass，两个 backend 共用同一接口形状。
+- **`LagunaBackend`**（`backends/laguna.py`，1548 行）：poolside Laguna-S-2.1（117.6B MoE，12 全局 attention 层 + 36 层窗口 512 的 SWA）第二租户实现。三个自研/替换要点：
+  - **sparkinfer MoE**（`laguna_sparkinfer_moe.py`）替换 vLLM MARLIN/CUTLASS 专家 kernel——直接从 safetensors checkpoint 读权重、自行 swizzle block scale，绕开 vLLM 的 CUTLASS 权重格式（该格式与 sparkinfer kernel 不兼容，是 07-24 用两天定位的根因）；CUDA Graph 下单层 38μs，47 层 1.8ms，比 CUTLASS eager（186μs/层）快 4.8×。曾评估的 B12x（FlashInfer CuTe-DSL）因 CUTLASS SM121 MMA guard 在 SM120 上恒输出全零，已确认死路并删除。
+  - **sparkinfer paged attention**（`laguna_sparkinfer_attn.py`）替换 FlashInfer，覆盖 Laguna 主路径的 prefill 与 decode CUDA Graph；page size 统一为 64（原 16，FlashInfer 在该 size 下 prefill 会 crash，切 sparkinfer 后已解决）。**DFlash 投机解码的 draft/verify attention 尚未随主路径迁移，仍构建在 vLLM 的 `CommonAttentionMetadata` + FlashInfer 之上**——这是 Laguna 侧残留的 vLLM 依赖面，未计入 B7-V1 的收口清单（见 roadmap.md 第 5 节）。
+  - **SWA 环形 KV**（`_ring_blocks_per_slot`/`_ring_slots_per_slot`）：36 层滑窗 attention 按窗口 512 的有界环形缓冲分配，而非像全局层那样按满上下文分页——07-23 曾发现首版实现遗漏此项（48 层一律满配额分页，显存开销比 L0 账本高 4×），07-24 已补齐。
+- **`server/engine.py` 的 backend 分派**（"Lane 1"，2026-07-23 完成，CPU-only worktree）：`ServerEngine(backend="qwen36"|"laguna")`，双协议（OpenAI/Anthropic）路由、poolside_v1 工具调用与思考标记解析均已适配 Laguna 的输出格式（基于 `chat_template.jinja` 的应然格式，尚未用真实生成样本核实）。12 项结构测试 + 全仓库回归绿。
+- **未合并的性能优化（"Lane 2"）**：上述 sparkinfer kernel、CUDA Graph（`laguna_cuda_graph.py`，含 07-25 一次未提交的 batch=1 专用填充路径优化）、DFlash（`laguna_dflash.py`/`laguna_dflash_cudagraph.py`，K=15）均在独立 benchmark 脚本中验证，**尚未接入 `server/engine.py`**：`_load_laguna_model` 硬编码 `moe_backend="marlin"`、`enable_cudagraph=0`，且从未跑过一次真实 GPU 请求端到端（prefill→decode→finish，经 HTTP）。`runtime/backends/decode_loop.cu` 是一个消除 Python 逐步开销的 C++ decode loop 原型（pybind11 扩展），目前只有源码，未见构建产物或调用点，属早期探索。
+
+这一小节的差距点已计入 roadmap.md 的待办与风险登记，不在此处展开执行细节。
 
 ## 3. 终态架构：完全剥离 vLLM 之后
 
@@ -467,7 +483,7 @@ STEM 强、人文偏弱是模型本身画像（同权重 stock vLLM 得分相同
 ### 13.2 当前边界
 
 - 采样支持 temperature / top-p / top-k / seed（B1/C1 已完成）；greedy（T=0）路径 bit 级不变；
-- 单模型（Qwen3.6-27B-NVFP4）、单 GPU、仅 SM120；
+- 生产验证过的仍是单模型（Qwen3.6-27B-NVFP4）、单 GPU、仅 SM120；第二租户 **LagunaBackend** 已有真实代码与 server 分派骨架（第 2.5 节），但从未经真实 GPU 请求端到端验证，且其性能优化（sparkinfer/CUDA Graph/DFlash）尚未接入 server 路径——按「生产可用」标准，目前仍视为单模型；
 - KV 容量按槽静态划分（上下文长度与并发的组合需在启动时确定）。
 
 ### 13.3 路线图
