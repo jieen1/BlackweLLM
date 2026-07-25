@@ -1,0 +1,25 @@
+{
+  "date": "2026-07-25",
+  "config": "64K context, M=1, CG + sparkinfer MoE, block_size=16",
+  "gpu": "RTX PRO 6000 Blackwell 96GB (SM120)",
+  "results": {
+    "current_best": {
+      "per_step_ms": 15.29,
+      "tok_s": 65.4,
+      "optimizations": ["GPU pre-compute buffers", "O(1) block table", "sparkinfer MoE"]
+    },
+    "previous": {
+      "per_step_ms": 16.83,
+      "tok_s": 59.4,
+      "note": "before O(1) block table + GPU pre-compute"
+    },
+    "vllm_reference": {
+      "per_step_ms": 14.2,
+      "tok_s": 70.5,
+      "config": "PIECEWISE CG, FLASHINFER_CUTLASS MoE"
+    }
+  },
+  "gpu_compute_ms": 14.58,
+  "python_overhead_ms": 0.71,
+  "remaining_gap_to_vllm_ms": 1.09
+}

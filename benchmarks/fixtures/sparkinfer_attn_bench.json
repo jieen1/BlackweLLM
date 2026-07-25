@@ -104,5 +104,31 @@
       "hardcoded_cap": 48
     },
     "conclusion": "page_size=128 bypasses ps64 conservative branch (ctas 1->2) but max_chunks capped at 48. Larger pages waste bandwidth at M=1. SparkInfer attention is 11-13x slower than FlashInfer regardless of page_size. Kernel-level gap, not configurable."
+  },
+  "official_benchmark_2026_07_25": {
+    "source": "sparkinfer/benchmarks/benchmark_paged_attention.py --mode decode-graph-buckets --compare-fa2",
+    "config": "page_size=64, q_heads=24, kv_heads=4, head_dim=128, bf16/fp8_e4m3fn, batch=1, L2 flush on",
+    "capture_ctx": 131071,
+    "results": {
+      "4096": {
+        "sparkinfer_us": 15.2,
+        "flashinfer_fa2_us": 16.8,
+        "ratio": 1.111
+      },
+      "16384": {
+        "sparkinfer_us": 24.4,
+        "flashinfer_fa2_us": 26.4,
+        "ratio": 1.084
+      },
+      "65536": {
+        "sparkinfer_us": 55.3,
+        "flashinfer_fa2_us": 58.6,
+        "ratio": 1.059
+      }
+    },
+    "geomean_fa2_over_sparkinfer": 1.084,
+    "conclusion": "SparkInfer paged attention is 6-11% FASTER than FlashInfer FA2 in CG replay. Previous 11-13x slower result was a test script bug (CG not properly captured). SparkInfer is viable for full attention.",
+    "previous_result_invalid": true,
+    "previous_bug": "Custom benchmark script failed to properly capture/replay sparkinfer CUDA graph, measuring eager overhead instead of graph replay"
   }
 }
