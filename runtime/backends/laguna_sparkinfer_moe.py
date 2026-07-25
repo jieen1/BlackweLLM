@@ -32,6 +32,10 @@ import torch
 
 logger = logging.getLogger("qwen_sm120_runtime.sparkinfer_moe")
 
+# Enable deterministic MoE output (ROUTE_BUFFER_TOPK_SUM instead of ATOMIC_SCATTER)
+# Required for DFlash speculative decoding acceptance (greedy argmax must be stable).
+os.environ.setdefault("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
+
 # ---------------------------------------------------------------------------
 # sparkinfer import: editable install preferred, env fallback
 # ---------------------------------------------------------------------------

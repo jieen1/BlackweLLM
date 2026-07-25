@@ -207,14 +207,15 @@ class LagunaBackend:
         self.kv_caches: dict[str, torch.Tensor] = {}
         for name in self.attn_layer_names:
             layer = sfc[name]
-            backend_cls = layer.get_attn_backend()
             is_swa = name in self._swa_layer_names
             n_blocks = ring_num_blocks if is_swa else full_num_blocks
-            shape = backend_cls.get_kv_cache_shape(
-                n_blocks, block_size, layer.num_kv_heads, layer.head_size, cache_dtype_str
-            )
+            # Self-allocated KV cache in sparkinfer-native format:
+            # [num_blocks, 2, block_size, num_kv_heads, head_dim]
+            # dim=1: 0=K, 1=V. FP8 stored as uint8.
+            kv_dtype = torch.uint8 if "fp8" in (cache_dtype_str or "") else layer.kv_cache_torch_dtype
+            shape = (n_blocks, 2, block_size, layer.num_kv_heads, layer.head_size)
             self.kv_caches[name] = torch.zeros(
-                shape, dtype=layer.kv_cache_torch_dtype, device=self.device
+                shape, dtype=kv_dtype, device=self.device
             )
         runner_kv_caches: list[torch.Tensor] = []
         bind_kv_cache(self.kv_caches, sfc, runner_kv_caches)
@@ -236,13 +237,10 @@ class LagunaBackend:
         if self._swa_layer_names:
             for name in self._swa_layer_names:
                 layer = sfc[name]
-                backend_cls = layer.get_attn_backend()
-                shape = backend_cls.get_kv_cache_shape(
-                    self._swa_scratch_blocks, block_size, layer.num_kv_heads,
-                    layer.head_size, cache_dtype_str,
-                )
+                kv_dtype = torch.uint8 if "fp8" in (cache_dtype_str or "") else layer.kv_cache_torch_dtype
+                shape = (self._swa_scratch_blocks, 2, block_size, layer.num_kv_heads, layer.head_size)
                 self._swa_scratch[name] = torch.empty(
-                    shape, dtype=layer.kv_cache_torch_dtype, device=self.device
+                    shape, dtype=kv_dtype, device=self.device
                 )
 
         # Per-slot state

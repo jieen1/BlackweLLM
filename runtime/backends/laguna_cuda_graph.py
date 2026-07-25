@@ -16,6 +16,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("qwen_sm120_runtime.laguna_cuda_graph")
 
+def _physical_slot(slot: int) -> int:
+    return slot + 1  # RESERVED_PHYSICAL_SLOTS = 1
+
 
 class SparkinferDecodeCGMetadata:
     """Metadata for CG decode: references pre-created sparkinfer decode workspace."""
@@ -448,4 +451,337 @@ class _SparkinferCGDecodeImpl:
 
         # Run sparkinfer forward (captured in graph)
         ws.forward()
+        return output
+
+
+class LagunaCudaGraphVerify:
+    """CUDA-graph-captured M=16 verify forward using SparkInfer extend attention.
+
+    Captures the full model forward with 16 tokens (1 bonus + 15 draft).
+    Per-step: update input_ids, positions, page_table, cache_seqlens, slot_mapping.
+    Returns logits (16 × vocab) + aux hidden states.
+    """
+
+    def __init__(self, backend: "LagunaBackend", num_tokens: int = 16) -> None:
+        self.backend = backend
+        self.num_tokens = num_tokens
+        self.device = backend.device
+        self.block_size = backend.block_size
+        self.blocks_per_slot = backend.blocks_per_slot
+        self.max_kv_len = backend.blocks_per_slot * backend.block_size
+
+        self._graph: torch.cuda.CUDAGraph | None = None
+        self._captured = False
+        self._logits: torch.Tensor | None = None
+        self._aux_hidden_states: list[torch.Tensor] | None = None
+
+        # Pre-allocated input buffers (fixed address for CG)
+        self._input_ids = torch.zeros(num_tokens, dtype=torch.long, device=self.device)
+        self._positions = torch.zeros(num_tokens, dtype=torch.long, device=self.device)
+        self._slot_mapping = torch.zeros(num_tokens, dtype=torch.long, device=self.device)
+
+        # Per-group extend workspaces
+        self._extend_workspaces: dict[tuple, Any] = {}
+        self._page_tables: dict[tuple, torch.Tensor] = {}
+        self._cache_seqlens: dict[tuple, torch.Tensor] = {}
+        self._cu_seqlens_q = torch.tensor([0, num_tokens], dtype=torch.int32, device=self.device)
+
+        # SWA ring state
+        rbps = backend._ring_blocks_per_slot
+        self._ring_blocks_per_slot = rbps
+        self._ring_slots_per_slot = rbps * self.block_size
+        self._swa_window = backend._swa_window
+        self._swa_slot_mapping = torch.zeros(num_tokens, dtype=torch.long, device=self.device)
+
+    def _init_workspaces(self) -> None:
+        """Create sparkinfer extend workspaces per layer group (CG mode)."""
+        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+        from sparkinfer.attention.paged.planner import create_paged_plan
+
+        backend = self.backend
+        nt = self.num_tokens
+
+        for group_key, layer_names in backend._layer_groups.items():
+            wl, nqh, nkvh = group_key
+            is_swa = wl >= 0 and self._ring_blocks_per_slot > 0
+
+            if is_swa:
+                max_pages = self._ring_blocks_per_slot
+            else:
+                max_pages = self.blocks_per_slot
+
+            # Dummy tensors for workspace creation
+            q = torch.zeros(nt, nqh, 128, dtype=torch.bfloat16, device=self.device)
+            k_cache = torch.zeros(max_pages, self.block_size, nkvh, 128,
+                                  dtype=torch.float8_e4m3fn, device=self.device)
+            v_cache = torch.zeros(max_pages, self.block_size, nkvh, 128,
+                                  dtype=torch.float8_e4m3fn, device=self.device)
+
+            ws = PagedAttentionWorkspace.for_tensors(
+                mode="extend", q=q, k_cache=k_cache, v_cache=v_cache,
+                use_cuda_graph=True)
+
+            # Create CG-compatible plan at max context
+            max_kv = max_pages * self.block_size - 1
+            page_table = torch.arange(max_pages, dtype=torch.int32, device=self.device).unsqueeze(0)
+            cache_seqlens = torch.tensor([max_kv], dtype=torch.int32, device=self.device)
+
+            plan = create_paged_plan(
+                q, k_cache, v_cache, page_table, cache_seqlens, self._cu_seqlens_q,
+                mode="extend", enable_cuda_graph=True, window_left=wl)
+            ws._ensure_capacity(plan)
+            ws._copy_runtime_metadata(page_table, cache_seqlens, self._cu_seqlens_q)
+            ws._copy_plan_metadata(plan)
+            ws._plan = plan
+
+            self._extend_workspaces[group_key] = ws
+            self._page_tables[group_key] = page_table
+            self._cache_seqlens[group_key] = cache_seqlens
+
+            logger.info("CG verify workspace: wl=%d qh=%d kvh=%d max_pages=%d",
+                        wl, nqh, nkvh, max_pages)
+
+    def _bind_kv_caches(self) -> None:
+        """Bind real KV cache tensors to workspaces."""
+        backend = self.backend
+        sfc = backend.static_forward_context
+
+        for group_key, ws in self._extend_workspaces.items():
+            wl = group_key[0]
+            is_swa = wl >= 0 and self._ring_blocks_per_slot > 0
+            first_name = backend._layer_groups[group_key][0]
+            layer = sfc[first_name]
+            kv_cache = layer.kv_cache
+            key_cache, value_cache = kv_cache.unbind(1)
+            if key_cache.dtype == torch.uint8:
+                key_cache = key_cache.view(torch.float8_e4m3fn)
+                value_cache = value_cache.view(torch.float8_e4m3fn)
+            ws._k_cache = key_cache
+            ws._v_cache = value_cache
+
+    def _patch_impls_for_cg(self) -> None:
+        """Patch attention impls to dispatch to extend CG workspaces."""
+        backend = self.backend
+        sfc = backend.static_forward_context
+
+        if not hasattr(self, '_original_impls'):
+            self._original_impls = {}
+            for group_key, layer_names in backend._layer_groups.items():
+                for name in layer_names:
+                    self._original_impls[name] = sfc[name].impl
+
+        for group_key, layer_names in backend._layer_groups.items():
+            ws = self._extend_workspaces[group_key]
+            for name in layer_names:
+                layer = sfc[name]
+                layer.impl = _SparkinferCGExtendImpl(ws, self.num_tokens)
+
+    def unpatch_impls(self) -> None:
+        """Restore original attention impls."""
+        if not hasattr(self, '_original_impls'):
+            return
+        sfc = self.backend.static_forward_context
+        for name, impl in self._original_impls.items():
+            sfc[name].impl = impl
+
+    def repatch_impls(self) -> None:
+        """Re-apply CG verify impls."""
+        self._patch_impls_for_cg()
+
+    def _fill_buffers(self, slot: int, token_ids: list[int], kv_len: int) -> None:
+        """Fill input buffers for verify replay."""
+        backend = self.backend
+        nt = self.num_tokens
+        bs = self.block_size
+        phys = _physical_slot(slot)
+        new_kv_len = kv_len + nt
+
+        # Input IDs and positions
+        for i, tok in enumerate(token_ids[:nt]):
+            self._input_ids[i] = tok
+        for i in range(nt):
+            self._positions[i] = kv_len + i
+
+        # Full-attention: page table and slot mapping
+        full_base = phys * self.blocks_per_slot
+        n_blocks_full = (new_kv_len + bs - 1) // bs
+        for group_key, ws in self._extend_workspaces.items():
+            wl = group_key[0]
+            is_swa = wl >= 0 and self._ring_blocks_per_slot > 0
+
+            if is_swa:
+                # SWA ring: page table covers window-aligned blocks
+                ring_base = phys * self._ring_blocks_per_slot
+                ring_slots = self._ring_slots_per_slot
+                window_start = max(0, kv_len - self._swa_window + 1)
+                aligned_start = (window_start // bs) * bs
+                aligned_len = new_kv_len - aligned_start
+                n_ring = min(-(-aligned_len // bs), self._ring_blocks_per_slot)
+                pt = self._page_tables[group_key]
+                for j in range(n_ring):
+                    actual_pos = aligned_start + j * bs
+                    ring_block = (actual_pos % ring_slots) // bs
+                    pt[0, j] = ring_base + ring_block
+                self._cache_seqlens[group_key][0] = aligned_len
+                # SWA slot mapping: ring-wrapped
+                for j in range(nt):
+                    pos = kv_len + j
+                    ring_block = (pos % ring_slots) // bs
+                    ring_off = pos % bs
+                    self._swa_slot_mapping[j] = (ring_base + ring_block) * bs + ring_off
+            else:
+                # Full attention: sequential blocks
+                pt = self._page_tables[group_key]
+                for j in range(n_blocks_full):
+                    pt[0, j] = full_base + j
+                self._cache_seqlens[group_key][0] = new_kv_len
+
+        # Full-attention slot mapping
+        for j in range(nt):
+            pos = kv_len + j
+            self._slot_mapping[j] = (full_base + pos // bs) * bs + pos % bs
+
+        # Copy runtime metadata to workspaces
+        for group_key, ws in self._extend_workspaces.items():
+            ws._copy_runtime_metadata(
+                self._page_tables[group_key],
+                self._cache_seqlens[group_key],
+                self._cu_seqlens_q)
+
+    def capture(self) -> None:
+        """Warmup → capture the verify forward."""
+        if self._captured:
+            return
+
+        backend = self.backend
+        nt = self.num_tokens
+        sfc = backend.static_forward_context
+
+        logger.info("Capturing Laguna Verify CUDA Graph (M=%d, sparkinfer extend)", nt)
+
+        self._init_workspaces()
+        self._bind_kv_caches()
+        self._patch_impls_for_cg()
+
+        # Build metadata and slot mapping dicts (reused across warmup/capture)
+        dummy_tokens = [1] * nt
+        warmup_kv = 64
+        self._fill_buffers(0, dummy_tokens, warmup_kv)
+
+        slot_mapping_dict = {}
+        for group_key, layer_names in backend._layer_groups.items():
+            wl = group_key[0]
+            is_swa = wl >= 0 and self._ring_blocks_per_slot > 0
+            sm = self._swa_slot_mapping if is_swa else self._slot_mapping
+            for name in layer_names:
+                slot_mapping_dict[name] = sm
+
+        attn_meta = {}
+        for group_key, layer_names in backend._layer_groups.items():
+            ws = self._extend_workspaces[group_key]
+            meta = _SparkinferCGExtendMetadata(ws, nt)
+            for name in layer_names:
+                attn_meta[name] = meta
+
+        from runtime.compat_vllm import set_forward_context
+
+        # Warmup (3x)
+        side_stream = torch.cuda.Stream()
+        with torch.cuda.stream(side_stream):
+            for _ in range(3):
+                self._fill_buffers(0, dummy_tokens, warmup_kv)
+                with set_forward_context(attn_meta, backend.vllm_config,
+                                         slot_mapping=slot_mapping_dict, skip_compiled=True):
+                    result = backend.model.forward(self._input_ids, self._positions)
+                if isinstance(result, tuple):
+                    hidden_states, aux = result
+                else:
+                    hidden_states, aux = result, None
+                backend.model.compute_logits(hidden_states)
+        side_stream.synchronize()
+
+        # Final fill before capture
+        self._fill_buffers(0, dummy_tokens, warmup_kv)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            with set_forward_context(attn_meta, backend.vllm_config,
+                                     slot_mapping=slot_mapping_dict, skip_compiled=True):
+                result = backend.model.forward(self._input_ids, self._positions)
+            if isinstance(result, tuple):
+                hidden_states, self._aux_hidden_states = result
+            else:
+                hidden_states, self._aux_hidden_states = result, None
+            self._logits = backend.model.compute_logits(hidden_states)
+
+        self._graph = graph
+        self._captured = True
+        logger.info("Laguna Verify CUDA Graph captured (M=%d)", nt)
+
+    def replay_with_aux(
+        self, slot: int, token_ids: list[int], kv_len: int
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """Replay verify graph. Returns (logits[16×vocab], aux_hidden_states)."""
+        if not self._captured:
+            raise RuntimeError("Verify CG not captured")
+        self._fill_buffers(slot, token_ids, kv_len)
+        self._graph.replay()
+        return self._logits, self._aux_hidden_states
+
+
+class _SparkinferCGExtendMetadata:
+    """Lightweight metadata for CG extend impl."""
+    __slots__ = ("workspace", "num_actual_tokens")
+    def __init__(self, workspace, num_actual_tokens: int):
+        self.workspace = workspace
+        self.num_actual_tokens = num_actual_tokens
+
+
+class _SparkinferCGExtendImpl:
+    """Attention impl that dispatches to CG extend workspace.
+    
+    Creates the binding on first forward call (warmup), then reuses it
+    for CG capture and replay. The binding references fixed-address tensors
+    so it remains valid across replays.
+    """
+
+    def __init__(self, workspace, num_tokens: int):
+        self._ws = workspace
+        self._num_tokens = num_tokens
+        self._binding = None
+        self._descale = None
+        self.kv_cache_dtype = "fp8_e4m3"
+        self.supports_quant_query_input = False
+
+    def process_weights_after_loading(self, act_dtype):
+        pass
+
+    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
+        k_cache = kv_cache[:, 0]
+        v_cache = kv_cache[:, 1]
+        torch.ops._C_cache_ops.reshape_and_cache_flash(
+            key, value, k_cache, v_cache, slot_mapping,
+            self.kv_cache_dtype, layer._k_scale, layer._v_scale)
+
+    def forward(self, layer, query, key, value, kv_cache, attn_metadata,
+                output, output_scale=None, output_block_scale=None):
+        if attn_metadata is None:
+            return output.fill_(0)
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        q = query[:num_actual_tokens]
+        key_cache, value_cache = kv_cache.unbind(1)
+        if key_cache.dtype == torch.uint8:
+            key_cache = key_cache.view(torch.float8_e4m3fn)
+            value_cache = value_cache.view(torch.float8_e4m3fn)
+        out = output[:num_actual_tokens]
+
+        if self._binding is None:
+            from sparkinfer.attention.paged._scratch import build_paged_attention_binding
+            self._descale = torch.ones(1, dtype=torch.float32, device=q.device)
+            self._binding = build_paged_attention_binding(
+                scratch=self._ws, q=q, k_cache=key_cache, v_cache=value_cache,
+                output=out, k_descale=self._descale, v_descale=self._descale)
+
+        from sparkinfer.attention.paged._forward import paged_attention_forward
+        paged_attention_forward(binding=self._binding)
         return output

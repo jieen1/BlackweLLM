@@ -108,8 +108,11 @@ class DFlashEngine:
         # Allocate draft KV cache and bind to draft model
         self._alloc_draft_kv_cache()
 
-        # Build FlashInfer metadata builder for draft model
-        self._init_draft_metadata_builder()
+        # Patch draft attention layers to use sparkinfer (replaces FlashInfer)
+        self._patch_draft_sparkinfer()
+
+        # FlashInfer metadata builder skipped — sparkinfer handles draft attention
+        # self._init_draft_metadata_builder()
 
         # Pre-allocated buffers
         self._init_buffers()
@@ -253,13 +256,10 @@ class DFlashEngine:
         self._draft_kv_caches: dict[str, torch.Tensor] = {}
         for name in self._draft_layer_names:
             attn = self._draft_attn_layers[name]
-            backend_cls = attn.get_attn_backend()
-            shape = backend_cls.get_kv_cache_shape(
-                total_blocks, self.block_size,
-                attn.num_kv_heads, attn.head_size, "auto",
-            )
+            # Self-allocated: [blocks, 2, bs, kv_heads, head_dim], FP8 as uint8
+            shape = (total_blocks, 2, self.block_size, attn.num_kv_heads, attn.head_size)
             self._draft_kv_caches[name] = torch.zeros(
-                shape, dtype=attn.kv_cache_torch_dtype, device=self.device
+                shape, dtype=torch.uint8, device=self.device
             )
 
         # Bind draft KV caches to draft attention layers
@@ -268,6 +268,20 @@ class DFlashEngine:
             "DFlash: draft KV allocated: %d blocks/slot × %d layers",
             draft_blocks_per_slot, len(self._draft_layer_names),
         )
+
+
+    def _patch_draft_sparkinfer(self) -> None:
+        """Patch draft model attention layers to use sparkinfer (zero FlashInfer dep)."""
+        from runtime.backends.laguna_sparkinfer_attn import SparkinferAttentionImpl
+        for name in self._draft_layer_names:
+            attn = self._draft_attn_layers[name]
+            attn.impl = SparkinferAttentionImpl(
+                num_heads=attn.num_heads, head_size=attn.head_size,
+                scale=attn.head_size ** -0.5,
+                num_kv_heads=attn.num_kv_heads, window_left=DRAFT_WINDOW - 1,
+            )
+        logger.info("DFlash: draft attention patched with sparkinfer (%d layers)",
+                    len(self._draft_layer_names))
 
     def _init_draft_metadata_builder(self) -> None:
         """Initialize FlashInfer metadata builder for draft model attention."""
@@ -308,21 +322,32 @@ class DFlashEngine:
         self._draft_qsl_cpu = torch.tensor([0, max_tokens], dtype=torch.int32)
 
     def _init_cuda_graph(self) -> None:
-        """Set up CUDA Graph state for decode, verify, and draft.
+        """Set up CUDA Graph state for verify and draft.
 
-        The M=1 main-decode graph (self._cuda_graph) is captured lazily on
-        first use (see _ensure_decode_cg), not here: it's only consumed by
-        speculative_decode_step()/generate_legacy() -- kept for comparison,
-        not the production path (generate() routes to generate_verify_only(),
-        which never touches it). Capturing it eagerly at every __init__ paid
-        a full warmup+capture cycle and a dedicated LagunaCudaGraphDecode's
-        FlashInfer workspace buffers for callers that never use it.
+        Verify CG (M=16) is captured eagerly — it uses extend-mode sparkinfer
+        workspaces and is deterministic across KV lengths. This eliminates
+        the MoE kernel non-determinism that causes 0% acceptance in eager mode.
         """
-        # Verify/Draft CUDA Graph: lazy capture after first prefill
-        # (capture warmup writes to KV cache, must not corrupt fresh state)
         self._verify_cg = None
         self._draft_cg = None
         self._cg_captured = False
+
+        # Capture verify CG immediately (deterministic MoE via CG replay)
+        if self._use_cuda_graph:
+            self._capture_verify_cg()
+
+    def _capture_verify_cg(self) -> None:
+        """Capture M=16 verify CUDA Graph with sparkinfer extend attention."""
+        from runtime.backends.laguna_cuda_graph import LagunaCudaGraphVerify
+        try:
+            cg = LagunaCudaGraphVerify(self.backend, num_tokens=NUM_QUERY_PER_REQ)
+            cg.capture()
+            self._verify_cg = cg
+            logger.info("DFlash: verify CG captured (M=%d)", NUM_QUERY_PER_REQ)
+        except Exception as e:
+            logger.warning("DFlash: verify CG capture failed: %s", e)
+            import traceback; traceback.print_exc()
+            self._verify_cg = None
 
     def _ensure_decode_cg(self) -> None:
         """Lazily capture the M=1 main-decode CUDA Graph on first use.
@@ -378,18 +403,18 @@ class DFlashEngine:
                 slot_ids, kv_lengths, qo_lens, is_decode, swa_mode=mode
             )
 
-        for group_key, builder in backend._metadata_builders.items():
+        full_spark_meta = backend._build_sparkinfer_metadata(common_meta, window_left=-1)
+        swa_spark_meta = None
+        if swa_meta is not None:
+            swa_wl = backend._swa_window - 1 if backend._swa_window > 0 else -1
+            swa_spark_meta = backend._build_sparkinfer_metadata(swa_meta, window_left=swa_wl)
+        for group_key, layer_names in backend._layer_groups.items():
             wl = group_key[0]
             is_swa_group = wl >= 0
-            meta = swa_meta if (is_swa_group and swa_meta is not None) else common_meta
-            with set_current_vllm_config(backend.vllm_config):
-                metadata = builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=meta,
-                )
-            for name in backend._layer_groups[group_key]:
-                attn_metadata_dict[name] = metadata
-                slot_mapping_dict[name] = meta.slot_mapping
+            meta = swa_spark_meta if (is_swa_group and swa_spark_meta is not None) else full_spark_meta
+            for name in layer_names:
+                attn_metadata_dict[name] = meta
+                slot_mapping_dict[name] = common_meta.slot_mapping if not is_swa_group else (swa_meta.slot_mapping if swa_meta else common_meta.slot_mapping)
 
         # Build input tensors
         if is_decode:
@@ -507,16 +532,20 @@ class DFlashEngine:
         # Build draft attention metadata
         common_meta = self._build_draft_attn_metadata(slot, kv_len, num_tokens)
 
-        # Build FlashInfer metadata
-        with set_current_vllm_config(self.vllm_config):
-            draft_fi_meta = self._draft_metadata_builder.build(
-                common_prefix_len=0,
-                common_attn_metadata=common_meta,
-            )
+        # Build sparkinfer metadata for draft (extend mode, qo=16)
+        from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
+        draft_meta = SparkinferAttnMetadata(
+            mode="extend",
+            page_table=common_meta.block_table_tensor,
+            cache_seqlens=common_meta.seq_lens,
+            cu_seqlens_q=common_meta.query_start_loc,
+            num_actual_tokens=num_tokens,
+            window_left=DRAFT_WINDOW - 1,
+        )
 
         # Create metadata dict for all draft layers
         attn_metadata_dict = {
-            name: draft_fi_meta for name in self._draft_layer_names
+            name: draft_meta for name in self._draft_layer_names
         }
         slot_mapping_dict = {
             name: self._draft_slot_mapping[:num_tokens]
@@ -1189,16 +1218,20 @@ class DFlashEngine:
                 [slot], [kv_len], [num_tokens], False, swa_mode="verify_ring"
             )
 
+        from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
         attn_metadata_dict = {}
         slot_mapping_dict = {}
-        for group_key, builder in backend._metadata_builders.items():
+        full_spark_meta = backend._build_sparkinfer_metadata(full_meta, window_left=-1)
+        swa_spark_meta = None
+        if swa_meta is not None:
+            swa_wl = backend._swa_window - 1 if backend._swa_window > 0 else -1
+            swa_spark_meta = backend._build_sparkinfer_metadata(swa_meta, window_left=swa_wl)
+        for group_key, layer_names in backend._layer_groups.items():
             wl = group_key[0]
             is_swa = wl >= 0
-            meta = swa_meta if (is_swa and swa_meta is not None) else full_meta
-            with set_current_vllm_config(backend.vllm_config):
-                metadata = builder.build(common_prefix_len=0, common_attn_metadata=meta)
-            for name in backend._layer_groups[group_key]:
-                attn_metadata_dict[name] = metadata
+            meta = swa_spark_meta if (is_swa and swa_spark_meta is not None) else full_spark_meta
+            for name in layer_names:
+                attn_metadata_dict[name] = meta
                 slot_mapping_dict[name] = full_sm if not is_swa else swa_meta.slot_mapping
 
         from runtime.compat_vllm import set_forward_context
