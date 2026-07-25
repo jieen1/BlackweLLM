@@ -323,13 +323,31 @@ class LagunaCudaGraphDecode:
         backend = self.backend
         sfc = backend.static_forward_context
 
+        # Save original impls for prefill restore
+        if not hasattr(self, '_original_impls'):
+            self._original_impls = {}
+            for group_key, layer_names in backend._layer_groups.items():
+                for name in layer_names:
+                    self._original_impls[name] = sfc[name].impl
+
         for group_key, layer_names in backend._layer_groups.items():
             meta = self._cg_metadata[group_key]
             ws = self._decode_workspaces[group_key]
             for name in layer_names:
                 layer = sfc[name]
-                # Replace impl with CG-aware version
                 layer.impl = _SparkinferCGDecodeImpl(ws, meta)
+
+    def unpatch_impls(self) -> None:
+        """Restore original attention impls (for prefill after CG capture)."""
+        if not hasattr(self, '_original_impls'):
+            return
+        sfc = self.backend.static_forward_context
+        for name, impl in self._original_impls.items():
+            sfc[name].impl = impl
+
+    def repatch_impls(self) -> None:
+        """Re-apply CG decode impls (after prefill, before decode replay)."""
+        self._patch_impls_for_cg()
 
     def replay(
         self,

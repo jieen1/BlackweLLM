@@ -1,0 +1,106 @@
+{
+  "date": "2026-07-25T17:17:57.490961",
+  "runtime": "blackforge",
+  "config": {
+    "block_size": 64,
+    "gpu_util": 0.92,
+    "prefix_cache": true,
+    "cuda_graph": true,
+    "dflash": false,
+    "max_new": 128,
+    "suffix_len": 10240,
+    "n_rounds": 3
+  },
+  "contexts": {
+    "65536": {
+      "status": "OK",
+      "ctx": 65536,
+      "total_len": 75776,
+      "warmup_prefill_s": 10.23,
+      "mem_load_gib": 72.6,
+      "rounds": [
+        {
+          "round": 1,
+          "prefill_s": 22.6,
+          "step_ms": 12.73,
+          "tok_s": 78.5,
+          "mem_gib": 76.8
+        },
+        {
+          "round": 2,
+          "prefill_s": 11.875,
+          "step_ms": 11.98,
+          "tok_s": 83.5,
+          "mem_gib": 76.8
+        },
+        {
+          "round": 3,
+          "prefill_s": 11.933,
+          "step_ms": 12.65,
+          "tok_s": 79.1,
+          "mem_gib": 76.8
+        }
+      ]
+    },
+    "131072": {
+      "status": "OK",
+      "ctx": 131072,
+      "total_len": 141312,
+      "warmup_prefill_s": 44.8,
+      "mem_load_gib": 75.6,
+      "rounds": [
+        {
+          "round": 1,
+          "prefill_s": 34.893,
+          "step_ms": 13.71,
+          "tok_s": 72.9,
+          "mem_gib": 79.8
+        },
+        {
+          "round": 2,
+          "prefill_s": 30.346,
+          "step_ms": 13.7,
+          "tok_s": 73.0,
+          "mem_gib": 79.8
+        },
+        {
+          "round": 3,
+          "prefill_s": 30.32,
+          "step_ms": 13.67,
+          "tok_s": 73.2,
+          "mem_gib": 79.8
+        }
+      ]
+    },
+    "200000": {
+      "status": "OK",
+      "ctx": 200000,
+      "total_len": 210240,
+      "warmup_prefill_s": 75.08,
+      "mem_load_gib": 78.8,
+      "rounds": [
+        {
+          "round": 1,
+          "prefill_s": 64.48,
+          "step_ms": 14.85,
+          "tok_s": 67.3,
+          "mem_gib": 83.6
+        },
+        {
+          "round": 2,
+          "prefill_s": 56.847,
+          "step_ms": 14.54,
+          "tok_s": 68.8,
+          "mem_gib": 83.6
+        },
+        {
+          "round": 3,
+          "prefill_s": 56.623,
+          "step_ms": 14.56,
+          "tok_s": 68.7,
+          "mem_gib": 83.6
+        }
+      ]
+    }
+  }
+}

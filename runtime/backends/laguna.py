@@ -1388,6 +1388,16 @@ class LagunaBackend:
             logger.warning("Laguna: decode CG capture failed (falling back to eager): %s", e)
             self._decode_cg_enabled = False
 
+    def _unpatch_impls_for_prefill(self) -> None:
+        """Restore original attention impls so prefill works after CG capture."""
+        if self._decode_cg is not None:
+            self._decode_cg.unpatch_impls()
+
+    def _repatch_impls_for_cg(self) -> None:
+        """Re-apply CG decode impls after prefill."""
+        if self._decode_cg is not None:
+            self._decode_cg.repatch_impls()
+
     def generate(
         self,
         prompt_ids: list[int],
