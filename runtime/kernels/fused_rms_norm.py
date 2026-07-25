@@ -93,8 +93,8 @@ def fused_add_rms_norm(
     normed_output = rmsnorm(new_residual) * weight
     """
     orig_shape = x.shape
-    x_2d = x.view(-1, orig_shape[-1])
-    res_2d = residual.view(-1, orig_shape[-1])
+    x_2d = x.reshape(-1, orig_shape[-1])
+    res_2d = residual.reshape(-1, orig_shape[-1])
     M, N = x_2d.shape
 
     out = torch.empty_like(x_2d)
@@ -117,7 +117,7 @@ def rms_norm(
 ) -> torch.Tensor:
     """Standalone RMSNorm: out = rmsnorm(x) * weight."""
     orig_shape = x.shape
-    x_2d = x.view(-1, orig_shape[-1])
+    x_2d = x.reshape(-1, orig_shape[-1])
     M, N = x_2d.shape
 
     out = torch.empty_like(x_2d)
