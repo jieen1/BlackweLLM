@@ -1,7 +1,7 @@
 """E3: Laguna-S-2.1 Backend — direct model.forward() without vLLM's LLM engine.
 
 Loads the model via compat_vllm.get_model(), allocates KV caches, builds
-FlashInfer attention metadata via vLLM's own FlashInferMetadataBuilder, and
+SparkInfer paged attention for prefill and decode.
 drives prefill/decode forward passes directly.
 
 Architecture: 48 layers (12 full attn 48-head + 36 SWA 72-head window=512),
@@ -54,7 +54,7 @@ def _physical_slot(slot: int) -> int:
 class LagunaBackend:
     """Direct model runner for Laguna-S-2.1-NVFP4.
 
-    Uses vLLM's own FlashInferMetadataBuilder for correct attention metadata.
+    Uses SparkInfer paged attention (replaces FlashInfer).
     """
 
     def __init__(
@@ -63,7 +63,7 @@ class LagunaBackend:
         *,
         num_slots: int = 4,
         block_size: int = 64,
-        blocks_per_slot: int = 1024,
+        blocks_per_slot: int = 1088,
     ) -> None:
         import os as _os
         import sys as _sys
@@ -116,7 +116,7 @@ class LagunaBackend:
         logger.info("Laguna: %d attention layers discovered", len(self.attn_layer_names))
 
         # Group layers by (num_qo_heads, num_kv_heads, window_left)
-        # Each group gets its own FlashInferMetadataBuilder
+        # Each group gets sparkinfer impl patched
         hf_config = vllm_config.model_config.hf_config
         layer_types = getattr(hf_config, "layer_types", None)
         sliding_window = getattr(hf_config, "sliding_window", None)
@@ -151,23 +151,19 @@ class LagunaBackend:
             {f"wl={k[0]},qh={k[1]},kvh={k[2]}": len(v) for k, v in self._layer_groups.items()},
         )
 
-        # Create FlashInferMetadataBuilder for each group
-        from runtime.compat_vllm import get_flashinfer_metadata_builder
-        FlashInferMetadataBuilder = get_flashinfer_metadata_builder()
-
-        self._metadata_builders: dict[tuple, FlashInferMetadataBuilder] = {}
-        with set_current_vllm_config(vllm_config):
-            for group_key, layer_names in self._layer_groups.items():
-                first_layer = sfc[layer_names[0]]
-                kv_cache_spec = first_layer.get_kv_cache_spec(vllm_config)
-                builder = FlashInferMetadataBuilder(
-                    kv_cache_spec=kv_cache_spec,
-                    layer_names=layer_names,
-                    vllm_config=vllm_config,
-                    device=self.device,
+        # Patch attention layers to use sparkinfer instead of FlashInfer
+        from runtime.backends.laguna_sparkinfer_attn import SparkinferAttentionImpl
+        self._metadata_builders = {}  # kept for CG compat, unused for prefill
+        for group_key, layer_names in self._layer_groups.items():
+            wl, nqh, nkvh = group_key
+            for name in layer_names:
+                layer = sfc[name]
+                layer.impl = SparkinferAttentionImpl(
+                    num_heads=nqh, head_size=128, scale=128**-0.5,
+                    num_kv_heads=nkvh, window_left=wl,
                 )
-                builder.disable_split_kv = True
-                self._metadata_builders[group_key] = builder
+            logger.info("SparkInfer attn patched: wl=%d, qh=%d, kvh=%d (%d layers)",
+                        wl, nqh, nkvh, len(layer_names))
 
         # ── Classify layers: full attention vs SWA ──
         cache_dtype_str = vllm_config.cache_config.cache_dtype
@@ -565,6 +561,25 @@ class LagunaBackend:
             causal=True,
         )
 
+    def _build_sparkinfer_metadata(self, common_meta, window_left: int = -1):
+        """Convert CommonAttentionMetadata to SparkinferAttnMetadata."""
+        from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
+
+        num_reqs = common_meta.num_reqs
+        seq_lens = common_meta.seq_lens  # GPU tensor [num_reqs]
+        block_table = common_meta.block_table_tensor  # [num_reqs, max_blocks]
+        query_start_loc = common_meta.query_start_loc  # GPU [num_reqs+1]
+        num_actual_tokens = common_meta.num_actual_tokens
+
+        return SparkinferAttnMetadata(
+            mode="extend" if num_actual_tokens > num_reqs else "decode",
+            page_table=block_table.int(),
+            cache_seqlens=seq_lens.int(),
+            cu_seqlens_q=query_start_loc.int(),
+            num_actual_tokens=num_actual_tokens,
+            window_left=window_left,
+        )
+
     def _build_swa_attn_metadata(
         self,
         slot_ids: list[int],
@@ -718,30 +733,31 @@ class LagunaBackend:
             slot_ids, kv_lengths, qo_lens, is_decode
         )
 
-        # Build per-group FlashInferMetadata using vLLM's builder
-        # SWA groups use ring metadata; full groups use standard metadata
+        # Build sparkinfer attention metadata per group
+        from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
         attn_metadata_dict: dict[str, Any] = {}
         slot_mapping_dict: dict[str, torch.Tensor] = {}
 
-        swa_meta = None
+        # Full-attention metadata
+        full_meta = self._build_sparkinfer_metadata(common_meta, window_left=-1)
+
+        # SWA metadata (ring or scratch depending on mode)
+        swa_meta_obj = None
         if self._ring_blocks_per_slot > 0 and self._swa_layer_names:
             effective_swa_kv = swa_kv_lengths if swa_kv_lengths is not None else kv_lengths
-            swa_meta = self._build_swa_attn_metadata(
+            swa_common = self._build_swa_attn_metadata(
                 slot_ids, effective_swa_kv, qo_lens, is_decode
             )
+            swa_wl = self._swa_window - 1 if self._swa_window > 0 else -1
+            swa_meta_obj = self._build_sparkinfer_metadata(swa_common, window_left=swa_wl)
 
-        for group_key, builder in self._metadata_builders.items():
+        for group_key, layer_names in self._layer_groups.items():
             wl = group_key[0]
             is_swa_group = wl >= 0
-            meta = swa_meta if (is_swa_group and swa_meta is not None) else common_meta
-            with set_current_vllm_config(self.vllm_config):
-                metadata = builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=meta,
-                )
-            for name in self._layer_groups[group_key]:
-                attn_metadata_dict[name] = metadata
-                slot_mapping_dict[name] = meta.slot_mapping
+            meta = swa_meta_obj if (is_swa_group and swa_meta_obj is not None) else full_meta
+            for name in layer_names:
+                attn_metadata_dict[name] = meta
+                slot_mapping_dict[name] = common_meta.slot_mapping if not is_swa_group else (swa_common.slot_mapping if swa_common else common_meta.slot_mapping)
 
         # Build input tensors (use pre-allocated buffers for decode)
         if is_decode and qo_len == 1:
@@ -1146,28 +1162,29 @@ class LagunaBackend:
             slot_ids, kv_lengths, qo_lens, is_decode
         )
 
+        from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
         attn_metadata_dict: dict[str, Any] = {}
         slot_mapping_dict: dict[str, torch.Tensor] = {}
 
-        swa_meta = None
+        full_meta = self._build_sparkinfer_metadata(common_meta, window_left=-1)
+
+        swa_meta_obj = None
+        swa_common = None
         if self._ring_blocks_per_slot > 0 and self._swa_layer_names:
             effective_swa_kv = swa_kv_lengths if swa_kv_lengths is not None else kv_lengths
-            swa_meta = self._build_swa_attn_metadata(
+            swa_common = self._build_swa_attn_metadata(
                 slot_ids, effective_swa_kv, qo_lens, is_decode
             )
+            swa_wl = self._swa_window - 1 if self._swa_window > 0 else -1
+            swa_meta_obj = self._build_sparkinfer_metadata(swa_common, window_left=swa_wl)
 
-        for group_key, builder in self._metadata_builders.items():
+        for group_key, layer_names in self._layer_groups.items():
             wl = group_key[0]
             is_swa_group = wl >= 0
-            meta = swa_meta if (is_swa_group and swa_meta is not None) else common_meta
-            with set_current_vllm_config(self.vllm_config):
-                metadata = builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=meta,
-                )
-            for name in self._layer_groups[group_key]:
-                attn_metadata_dict[name] = metadata
-                slot_mapping_dict[name] = meta.slot_mapping
+            meta = swa_meta_obj if (is_swa_group and swa_meta_obj is not None) else full_meta
+            for name in layer_names:
+                attn_metadata_dict[name] = meta
+                slot_mapping_dict[name] = common_meta.slot_mapping if not is_swa_group else (swa_common.slot_mapping if swa_common else common_meta.slot_mapping)
 
         if is_decode and qo_len == 1:
             input_ids = self._decode_input_ids[:num_reqs]
