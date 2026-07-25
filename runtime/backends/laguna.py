@@ -109,6 +109,7 @@ class LagunaBackend:
             )
             self.model = get_model(vllm_config=vllm_config)
 
+
         # Initialize workspace manager for MoE layers
         from runtime.compat_vllm import init_flashinfer_workspace
 
@@ -1519,7 +1520,7 @@ class LagunaBackend:
             self._ensure_decode_cg()
             if self._decode_cg is not None:
                 self._decode_cg.reset()
-                tokens = self._decode_cg.generate(
+                tokens = self._decode_cg.generate_fast(
                     slot=slot, first_token=first,
                     max_tokens=max_tokens, eos_tokens=(2, 24))
                 self.reset_slot(slot)

@@ -625,6 +625,122 @@ class LagunaCudaGraphDecode:
         return self._captured
 
 
+
+    def generate_fast(
+        self,
+        slot: int,
+        first_token: int,
+        max_tokens: int,
+        eos_tokens: tuple[int, ...] = (2, 24),
+    ) -> list[int]:
+        """Ultra-fast zero-sync decode: ALL metadata pre-computed as Python ints.
+
+        Per-step work: 3 scalar tensor assigns + 2 small H2D copies + plan + replay.
+        No .item(), no GPU→CPU sync, no Python arithmetic in the hot loop.
+        """
+        if not self._captured:
+            raise RuntimeError("Graph not captured. Call capture() first.")
+
+        backend = self.backend
+        ps = self.block_size
+        bps = self.blocks_per_slot
+        phys = slot + 1
+        base = phys * bps
+        start_kv = backend.slot_kv_len[slot]
+        device = self.device
+        has_swa = self._ring_blocks_per_slot > 0
+        n_steps = max_tokens - 1
+
+        # ── Pre-compute ALL per-step values as Python ints (zero GPU work) ──
+        positions = list(range(start_kv, start_kv + n_steps))
+        slot_maps = [base * ps + kvl for kvl in positions]
+        new_kvs = [kvl + 1 for kvl in positions]
+        lpls = [(nk % ps) if (nk % ps) != 0 else ps for nk in new_kvs]
+        n_blocks_list = [(nk + ps - 1) // ps for nk in new_kvs]
+
+        if has_swa:
+            rbps = self._ring_blocks_per_slot
+            ring_slots = self._ring_slots_per_slot
+            ring_base_g = phys * rbps
+            window = self._swa_window
+            swa_slot_maps = [((ring_base_g + (kvl % ring_slots) // ps) * ps + kvl % ps)
+                             for kvl in positions]
+            swa_ws = [max(0, kvl - window + 1) for kvl in positions]
+            swa_as = [(ws // ps) * ps for ws in swa_ws]
+            swa_al = [new_kvs[i] - swa_as[i] for i in range(n_steps)]
+            swa_lpls = [(al % ps) if (al % ps) != 0 else ps for al in swa_al]
+            swa_nrs = [(al + ps - 1) // ps for al in swa_al]
+
+        # GPU token accumulator
+        out_tokens_gpu = torch.empty(max_tokens, dtype=torch.long, device=device)
+        out_tokens_gpu[0] = first_token
+        self._input_ids[0] = first_token
+
+        # Pinned CPU staging (allocated once, reused)
+        lpl_cpu = torch.empty(1, dtype=torch.int32, pin_memory=True)
+        indptr_cpu = torch.zeros(2, dtype=torch.int32, pin_memory=True)
+        if has_swa:
+            swa_lpl_cpu = torch.empty(1, dtype=torch.int32, pin_memory=True)
+            swa_indptr_cpu = torch.zeros(2, dtype=torch.int32, pin_memory=True)
+
+        prev_nb = 0
+        swa_prev_nr = 0
+
+        for step in range(n_steps):
+            # Scalar assigns (GPU-side, from Python int — no sync)
+            self._positions[0] = positions[step]
+            self._slot_mapping[0] = slot_maps[step]
+
+            # H2D: last_page_len (1 int32)
+            lpl_cpu[0] = lpls[step]
+            self._fi_last_page_len_gpu[:1].copy_(lpl_cpu, non_blocking=True)
+
+            if has_swa:
+                self._swa_slot_mapping[0] = swa_slot_maps[step]
+                swa_lpl_cpu[0] = swa_lpls[step]
+                self._swa_fi_last_page_len_gpu[:1].copy_(swa_lpl_cpu, non_blocking=True)
+
+            # Block table: only at page boundaries
+            nb = n_blocks_list[step]
+            if nb != prev_nb:
+                prev_nb = nb
+                self._block_table[0, :nb] = torch.arange(
+                    base, base + nb, dtype=torch.int32, device=device)
+                indptr_cpu[1] = nb
+                self._fi_indices_gpu[:nb] = torch.arange(
+                    base, base + nb, dtype=torch.int32, device=device)
+                self._fi_indptr_gpu[:2].copy_(indptr_cpu, non_blocking=True)
+
+            # SWA ring block_table: only at boundaries
+            if has_swa:
+                nr = swa_nrs[step]
+                if nr != swa_prev_nr:
+                    swa_prev_nr = nr
+                    as_val = swa_as[step]
+                    for j in range(nr):
+                        ap = as_val + j * ps
+                        self._swa_block_table[0, j] = ring_base_g + (ap % ring_slots) // ps
+                    swa_indptr_cpu[1] = nr
+                    self._swa_fi_indices_gpu[:nr] = self._swa_block_table[0, :nr]
+                    self._swa_fi_indptr_gpu[:2].copy_(swa_indptr_cpu, non_blocking=True)
+
+            self._run_plan([slot], [positions[step]])
+            self._graph.replay()
+            out_tokens_gpu[step + 1] = self._input_ids[0]
+            backend.slot_kv_len[slot] += 1
+
+        # Single sync at end
+        torch.cuda.synchronize()
+        all_tokens = out_tokens_gpu[:max_tokens].tolist()
+        tokens = [first_token]
+        for tok in all_tokens[1:]:
+            tokens.append(tok)
+            backend.slot_committed_tokens[slot].append(tok)
+            if tok in eos_tokens:
+                break
+        return tokens
+
+
 class MultiBatchGraphManager:
     """Manages CUDA Graphs for batch_size=1..max_bs, dispatches by actual batch.
 
@@ -686,3 +802,4 @@ class MultiBatchGraphManager:
     @property
     def captured_sizes(self) -> list[int]:
         return sorted(self._graphs.keys())
+
