@@ -1,0 +1,42 @@
+{
+  "test_date": "2026-07-25",
+  "description": "SparkInfer attention integration benchmark (replaces FlashInfer)",
+  "config": {
+    "block_size": 64,
+    "kv_dtype": "fp8_e4m3fn",
+    "num_q_heads": 24,
+    "num_kv_heads": 8,
+    "head_dim": 128,
+    "gpu": "RTX PRO 6000 Blackwell 96GB (SM120)"
+  },
+  "results": {
+    "4k_context": {
+      "per_step_ms": 13.71,
+      "tok_s": 72.9,
+      "vllm_baseline_tok_s": 70.5,
+      "speedup_vs_vllm": 1.03
+    },
+    "64k_context": {
+      "per_step_ms": 14.89,
+      "tok_s": 67.2,
+      "vllm_baseline_tok_s": 70.5,
+      "speedup_vs_vllm": 0.95,
+      "gap_ms": 0.7
+    },
+    "64k_prefill_eager_s": 42.59,
+    "cg_capture_time_s": 13.8
+  },
+  "sparkinfer_fork": {
+    "repo": "github.com/jieen1/sparkinfer",
+    "branch": "blackforge-main",
+    "commit": "0a7b143",
+    "fix": "plan_decode_graph_capacity SWA windowed attention capacity underestimation"
+  },
+  "notes": [
+    "FlashInfer attention fully replaced by sparkinfer for prefill and decode CG",
+    "block_size=64 prefill crash (FlashInfer bug) is resolved",
+    "64K gap vs vLLM (~0.7ms) likely in attention kernel at long context",
+    "sparkinfer standalone bench shows 6-11% faster than FlashInfer decode",
+    "CG capture includes JIT compile (~14s first time, ~7s subsequent)"
+  ]
+}
