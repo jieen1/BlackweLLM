@@ -42,19 +42,6 @@ RESERVED_PHYSICAL_SLOTS = 1
 # qo_max=1 → 33, qo_max=16 → 34 (审查阻断①)
 SWA_QO_MAX = 16
 
-# Upper bound on num_tokens for any CUDA-graph-captured forward step:
-# decode (batch_size<=4, MultiBatchGraphManager) and DFlash verify/draft
-# (fixed NUM_QUERY_PER_REQ=16, dflash_constants.py) both stay <= 16.
-# LagunaMoEB12x instances built for these hot paths must be constructed
-# with use_cuda_graph=True and max_num_tokens>=this bound -- FlashInfer's
-# B12xMoEWrapper.run() raises RuntimeError if invoked during CUDA graph
-# capture with use_cuda_graph=False (dynamic per-call torch.empty alloc
-# is not graph-capturable). Prefill (chunked at 2048 tokens, never
-# graph-captured) keeps using a separate use_cuda_graph=False instance --
-# sizing the graph-safe workspace to 2048 instead of 16 would multiply its
-# fixed VRAM footprint ~128x across all 47 MoE layers for no benefit.
-MOE_GRAPH_SAFE_MAX_TOKENS = 16
-
 
 def _ring_blocks_for_window(window: int, block_size: int, qo_max: int = SWA_QO_MAX) -> int:
     return -(-( window - 1 + qo_max) // block_size) + 1  # cdiv + 1
@@ -109,19 +96,15 @@ class LagunaBackend:
             )
             self.model = get_model(vllm_config=vllm_config)
 
-
         # Initialize workspace manager for MoE layers
         from runtime.compat_vllm import init_flashinfer_workspace
 
         init_flashinfer_workspace(self.device)
 
-        # Patch MoE layers with direct kernel (自研 kernel 集成)
-        self._moe_b12x_kernels: list = []
+        # Patch MoE layers with the sparkinfer kernel (自研 kernel 集成,
+        # zero vLLM dependency for the expert compute itself)
         self._moe_sparkinfer_layers: list = []
-        if _os.environ.get("QSR_MOE_SPARKINFER", "0") != "0":
-            self._patch_moe_sparkinfer()
-        elif _os.environ.get("QSR_MOE_B12X", "0") != "0":
-            self._patch_moe_b12x()
+        self._patch_moe_sparkinfer()
 
         # Discover attention layers from static_forward_context
         sfc = vllm_config.compilation_config.static_forward_context
@@ -330,134 +313,8 @@ class LagunaBackend:
             block_size,
         )
 
-    def _patch_moe_b12x(self) -> None:
-        """Replace vLLM FusedMoE dispatch with direct FlashInfer B12x kernel.
-
-        Monkey-patches each LagunaMoE.forward to:
-        1. gate → sigmoid topk routing (vLLM's fused_topk_bias)
-        2. B12x expert compute (single fused kernel, CUDA Graph captured)
-        3. shared expert + combine
-
-        Each layer gets TWO LagunaMoEB12x instances, dispatched by num_tokens
-        at call time:
-        - graph-safe (use_cuda_graph=True, max_num_tokens=MOE_GRAPH_SAFE_MAX_TOKENS):
-          for decode/DFlash-verify calls that run inside an outer
-          torch.cuda.graph() capture (LagunaCudaGraphDecode / DFlashVerifyCudaGraph
-          / DFlashDraftCudaGraph all call backend.model.forward() directly inside
-          `with torch.cuda.graph(...)`). FlashInfer's B12xMoEWrapper.run() raises
-          RuntimeError if called during graph capture unless it was constructed
-          with use_cuda_graph=True (see flashinfer/fused_moe/cute_dsl/b12x_moe.py,
-          the _is_cuda_graph_capturing() guard) -- this is the previously-observed
-          "CUDA graph不兼容" failure. The graph-safe wrapper also uses pre-allocated
-          fixed buffers instead of a fresh torch.empty() per call, which is the
-          fix for the paired "性能不及预期" finding too (eager B12xMoEWrapper
-          dynamic-alloc mode is measurably slower, see notes/2026-07-23-laguna-
-          moe-b12x-direct-kernel.md).
-        - eager (use_cuda_graph=False): for prefill, whose chunk size (2048) is
-          never graph-captured and far exceeds MOE_GRAPH_SAFE_MAX_TOKENS.
-        """
-        from runtime.backends.laguna_moe_kernel import LagunaMoEB12x
-        from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
-            fused_topk_bias,
-        )
-
-        model = self.model
-        hf_config = self.vllm_config.model_config.hf_config
-        num_experts = getattr(hf_config, "num_experts", 256)
-        top_k = getattr(hf_config, "num_experts_per_tok", 10)
-        hidden_size = getattr(hf_config, "hidden_size", 3072)
-        intermediate_size = getattr(hf_config, "moe_intermediate_size", 1024)
-
-        patched = 0
-        for name, module in model.named_modules():
-            if not hasattr(module, "gate") or not hasattr(module, "experts"):
-                continue
-            experts_obj = module.experts
-            if not hasattr(experts_obj, "routed_experts"):
-                continue
-            routed = experts_obj.routed_experts
-            if not hasattr(routed, "w13_weight"):
-                continue
-
-            moe_module = module
-            shared_expert = getattr(moe_module, "shared_expert", None)
-            routed_scaling = getattr(moe_module, "routed_scaling_factor", 1.0)
-            renormalize = getattr(hf_config, "norm_topk_prob", True)
-            softcap = getattr(hf_config, "moe_router_logit_softcapping", 0.0) or 0.0
-            e_bias = getattr(experts_obj, "e_score_correction_bias", None)
-            apply_on_input = getattr(hf_config, "moe_apply_router_weight_on_input", False)
-
-            weight_kwargs = dict(
-                w13_weight=routed.w13_weight,
-                w13_weight_scale=routed.w13_weight_scale,
-                w13_weight_scale_2=routed.w13_weight_scale_2,
-                w2_weight=routed.w2_weight,
-                w2_weight_scale=routed.w2_weight_scale,
-                w2_weight_scale_2=routed.w2_weight_scale_2,
-            )
-
-            b12x_graph = LagunaMoEB12x(
-                num_experts=num_experts,
-                top_k=top_k,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-                device=self.device,
-                use_cuda_graph=True,
-                max_num_tokens=MOE_GRAPH_SAFE_MAX_TOKENS,
-            )
-            b12x_graph.load_weights(**weight_kwargs)
-
-            b12x_eager = LagunaMoEB12x(
-                num_experts=num_experts,
-                top_k=top_k,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-                device=self.device,
-                use_cuda_graph=False,
-            )
-            b12x_eager.load_weights(**weight_kwargs)
-
-            self._moe_b12x_kernels.append(b12x_graph)
-            self._moe_b12x_kernels.append(b12x_eager)
-
-            def _make_patched_forward(
-                moe_mod, _b12x_graph, _b12x_eager, _shared, _scaling,
-                _renorm, _softcap, _e_bias, _top_k, _apply_on_input,
-            ):
-                def _patched_forward(hidden_states: torch.Tensor) -> torch.Tensor:
-                    orig_shape = hidden_states.shape
-                    hs = hidden_states.view(-1, hidden_states.shape[-1])
-                    router_logits, _ = moe_mod.gate(hs)
-                    router_logits = router_logits.float()
-                    if _softcap > 0:
-                        router_logits = torch.tanh(router_logits / _softcap) * _softcap
-                    topk_weights, topk_ids = fused_topk_bias(
-                        hs, router_logits, "sigmoid", _e_bias,
-                        _top_k, _renorm, routed_scaling_factor=_scaling if not _apply_on_input else 1.0,
-                    )
-                    b12x_kernel = (
-                        _b12x_graph if hs.shape[0] <= MOE_GRAPH_SAFE_MAX_TOKENS else _b12x_eager
-                    )
-                    routed_out = b12x_kernel.forward(hs, topk_ids, topk_weights)
-                    if _apply_on_input:
-                        routed_out = routed_out * _scaling
-                    if _shared is not None:
-                        shared_out = _shared(hs)
-                        routed_out = routed_out + shared_out
-                    return routed_out.view(orig_shape)
-                return _patched_forward
-
-            moe_module.forward = _make_patched_forward(
-                moe_module, b12x_graph, b12x_eager, shared_expert, routed_scaling,
-                renormalize, softcap, e_bias, top_k, apply_on_input,
-            )
-            patched += 1
-
-        logger.info("Laguna: patched %d MoE layers with B12x direct kernel", patched)
-
-
     def _patch_moe_sparkinfer(self) -> None:
-        """Replace vLLM FusedMoE expert kernel with sparkinfer.
+        """Replace vLLM FusedMoE expert kernel with sparkinfer (the default MoE path).
 
         Loads weights directly from checkpoint (bypasses vLLM scale reformat),
         uses runtime-alpha path (Phase 1 validated: cos=0.964 vs bf16 truth).
@@ -465,8 +322,6 @@ class LagunaBackend:
 
         After preparing sparkinfer weights for a layer, frees vLLM's copy of
         that layer's expert weights to avoid double memory usage.
-
-        Gated by QSR_MOE_SPARKINFER=1.
         """
         from runtime.backends.laguna_sparkinfer_moe import (
             SparkinferMoELayer,

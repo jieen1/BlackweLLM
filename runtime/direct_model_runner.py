@@ -1,6 +1,6 @@
 """Direct (non-HTTP) model runner: this process owns GPU KV/GDN state itself
-and drives ``model.forward()`` directly, replacing the HTTP bridge to a
-separate vLLM server (``runtime/vllm_bridge_backend.py``, commit ``b28942c``).
+and drives ``model.forward()`` directly, replacing an earlier prototype's
+HTTP bridge to a separate vLLM server (commit ``b28942c``).
 
 Design and the four reused vLLM primitives this depends on (``EngineArgs
 .create_engine_config()``, ``get_model()``, ``bind_kv_cache()``,
@@ -164,13 +164,10 @@ def allocate_fixed_slot_kv_caches(
     num_blocks_override: int | None = None,
 ) -> dict[str, object]:
     """Allocate our own num_slots-fixed-slot KV (attention) and state (GDN)
-    tensors and bind them via vLLM's own real ``bind_kv_cache()`` -- shared
-    between ``DirectModelRunner`` (hand-built metadata) and
-    ``runtime/vllm_stage_b_baseline.py`` (real vLLM metadata/scheduler,
-    Stage B of the 2026-07-16 ownership-transfer ladder: this is the ONLY
-    thing that differs from vLLM's own tensor allocation -- everything else
-    stays real). Returns the same ``dict[str, tensor|tuple]`` bind_kv_cache
-    expects, keyed by layer name.
+    tensors and bind them via vLLM's own real ``bind_kv_cache()`` -- this is
+    the only thing that differs from vLLM's own tensor allocation, everything
+    else stays real. Returns the same ``dict[str, tensor|tuple]``
+    bind_kv_cache expects, keyed by layer name.
     """
     attn_layer_names = []
     gdn_layer_names = []

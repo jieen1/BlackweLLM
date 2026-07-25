@@ -86,17 +86,9 @@ flowchart TB
 
 ### 2.1 控制平面与执行平面
 
-代码库存在清晰的两层结构。**控制平面**是四个刻意做小的纯 Python 契约模块（合计约 235 行，不持有任何 CUDA tensor）：`slot_manager.py`（固定槽位所有权，`FixedSlotManager`）、`hybrid_cache.py`（缓存几何与生命周期契约，强制校验 16+48 层结构）、`op_registry.py`（可替换算子分发表）、`engine.py`（eager 执行状态机 `PREFILL → DECODE → COMPLETED`）。
+**执行平面**是 `runtime/direct_model_runner.py`——单文件 `DirectModelRunner`，持有全部 GPU 状态：KV/GDN cache 张量（`block_pool.py`/`gdn_state.py`）、CUDA Graph（`cuda_graphs.py`）、MTP 循环（`mtp_accept.py`）、attention/GDN 元数据构建（`metadata_builders.py`），直接驱动 `model.forward()`。它复用 vLLM 的四个原语——`EngineArgs.create_engine_config()`、`get_model()`、`bind_kv_cache()`、`set_forward_context()`——但绕开 vLLM 的 Scheduler 与元数据构建器，自行手工构建 attention / GDN 元数据。所有 vLLM import 收口到 `runtime/compat_vllm.py` 单点。
 
-**执行平面**是 `runtime/direct_model_runner.py`——单文件 6506 行的 `DirectModelRunner`，持有全部 GPU 状态：KV/GDN cache 张量、分页池、CUDA Graph、MTP 循环，直接驱动 `model.forward()`。它复用 vLLM 的四个原语——`EngineArgs.create_engine_config()`、`get_model()`、`bind_kv_cache()`、`set_forward_context()`——但绕开 vLLM 的 Scheduler 与元数据构建器，自行手工构建 attention / GDN 元数据。
-
-### 2.2 所有权转移阶梯
-
-从「完整 vLLM」走到「全自研编排」不是一步到位，而是保留了一条可对照的阶梯，每一级只替换一个变量，用于隔离正确性问题（曾借此定位过一个 100% 确定性错误输出的根因）：
-
-| 阶段 | 模块 | 内容 |
-|---|---|---|
-| Stage A | `vllm_inprocess_baseline` | 进程内跑真实 vLLM `LLM` 类，作为无 HTTP 的正确性 oracle，证明 kernel 本身无误 |
+> 早期（Phase 0-3）曾有一条独立的 `EagerEngine` 原型（`engine.py`/`hybrid_cache.py`/`op_registry.py`/`slot_manager.py` + HTTP bridge `vllm_bridge_backend.py`），从未被生产路径引用，`DirectModelRunner` 落地后已是死代码，随本轮工程清理一并删除。「所有权转移阶梯」Stage A/B/C 的三个 baseline 模块（`vllm_inprocess_baseline` / `vllm_stage_b_baseline` / `vllm_stage_c_baseline`）同属该原型的历史调试脚手架，同样已删除；下方表格保留作历史方法论记录。
 | Stage B | `vllm_stage_b_baseline` | 只把 KV/GDN 张量分配换成自研 `allocate_fixed_slot_kv_caches`，其余全用 vLLM |
 | Stage C | `vllm_stage_c_baseline` | 进一步换入自研 `build_attention_metadata` / `build_gdn_metadata` |
 | 当前生产路径 | `DirectModelRunner` | 全自研编排：固定槽位、分页、前缀缓存、MTP 循环、CUDA Graph，vLLM 仅作模型/kernel 库 |
