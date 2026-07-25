@@ -98,6 +98,9 @@ class LagunaBackend:
         # Set IR op priority (fused RMSNorm C++ kernels) — normally done by worker init
         vllm_config.kernel_config.ir_op_priority.set_default()
 
+        # Replace vLLM RMSNorm with our Triton fused kernel (zero vLLM dep)
+        self._patch_rmsnorm_triton()
+
         # Initialize workspace manager for MoE layers
         from runtime.compat_vllm import init_flashinfer_workspace
 
@@ -1303,6 +1306,22 @@ class LagunaBackend:
                 f"(got {id(actual):#x}, expected {id(expected):#x}). "
                 f"Rebind leak on exception path?"
             )
+
+
+    def _patch_rmsnorm_triton(self):
+        """Replace vLLM RMSNorm with Triton fused kernel (zero vLLM dependency)."""
+        from runtime.kernels.fused_rms_norm import fused_add_rms_norm, rms_norm
+        from vllm.model_executor.layers.layernorm import RMSNorm
+
+        def _triton_forward(self_norm, x, residual=None):
+            if residual is None:
+                return rms_norm(x, self_norm.weight.data, self_norm.variance_epsilon)
+            out, new_res = fused_add_rms_norm(
+                x, residual, self_norm.weight.data, self_norm.variance_epsilon)
+            return out, new_res
+
+        RMSNorm.forward_cuda = _triton_forward
+        logger.info("Laguna: RMSNorm patched with Triton fused kernel")
 
     def reset_slot(self, slot: int) -> None:
         self.slot_kv_len[slot] = 0
