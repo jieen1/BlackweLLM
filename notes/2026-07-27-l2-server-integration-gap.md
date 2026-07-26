@@ -57,12 +57,31 @@ SERVER_ENABLE_PREFIX_CACHE  Laguna 默认 "0"
 SERVER_KV_CACHE_DTYPE       Laguna 默认 "auto",不是本次全程验证的 "fp8_e4m3"
 ```
 
-### 4. server 端 MoE backend 默认不是 sparkinfer
+### 4. server 端 MoE backend——重新核实:其实不是问题
 
-`server/engine.py:402`:`moe_backend=os.environ.get("QSR_MOE_BACKEND", "marlin")`——
-默认 `"marlin"`,不是本次 session 全程验证、且已确认"CUDA Graph 下 38μs/层 vs
-CUTLASS eager 186μs/层"的 sparkinfer MoE。要显式设置 `QSR_MOE_BACKEND=sparkinfer`
-才会用上。
+`server/engine.py:402` 的 `moe_backend=os.environ.get("QSR_MOE_BACKEND", "marlin")`
+**不控制是否使用 sparkinfer MoE**。`LagunaBackend.__init__`(`runtime/backends/
+laguna.py:175`)无条件调用 `self._patch_moe_sparkinfer()`,和这个 vLLM `EngineArgs`
+参数完全无关——`moe_backend="marlin"` 只影响 vLLM 最初怎么加载/格式化 FusedMoE 权重,
+随后立刻被我们的代码整体替换成 sparkinfer kernel。**结论:sparkinfer MoE 在 server
+的 Laguna 路径上本来就一直生效,这条不是缺口,是我最初核实不够仔细写错的。**
+
+### 4b.(更正)CUDA Graph 服务路径:比想象的缺口更大
+
+最初以为 `decode_batch_sampled`(`ServerEngine._step_sync` 实际调用的方法)可能已经
+通过 `_decode_cg_enabled` 环境变量(`QSR_DECODE_CUDA_GRAPH`,默认开启)间接吃到
+CUDA Graph——**这个假设是错的,已核实推翻**。`decode_batch_sampled`
+(`runtime/backends/laguna.py:1375`)直接调用 `self._forward(...)`(eager),完全
+不触碰 `_decode_cg`。CUDA Graph replay 只存在于另一个独立方法(约 1540-1560 行,
+`generate_fast` 风格,一次性跑完整个生成的单请求辅助方法),专门给独立 benchmark
+脚本用,和 `ServerEngine` 的逐步、多槽、持续批处理调用模型不兼容。
+
+好消息:`LagunaCudaGraphDecode.replay(slot_ids, token_ids, kv_lengths)` 本身是支持
+多槽批量 replay 的(`laguna_cuda_graph.py`),所以理论上可行的修复路径是让
+`decode_batch_sampled` 在条件匹配时(全 batch greedy、CG 已捕获、batch 组成和捕获时
+一致)改走 `self._decode_cg.replay(...)`,不匹配则退回现有 eager 路径——这是一个有
+边界、可测试的改动,但不是简单的默认值翻转,需要专门设计+验证(batch size 不匹配、
+greedy/非 greedy 混合等边界情况),不在本次直接实现。
 
 ## 结论
 
@@ -94,11 +113,12 @@ DFlash 投机解码——换句话说,今天验证的所有性能成果,在生�
 
 ## 建议的下一步顺序(等当前 fork 完成、GPU 空出来之后)
 
-1. **P0(最小、风险最低)**:`server/engine.py` 的 `QSR_MOE_BACKEND` 默认值
-   `"marlin"→"sparkinfer"`(仅 Laguna 模式),跑一次真实 HTTP 端到端冒烟确认没崩。
-2. **P1**:核实 `LagunaBackend` 是否已经实现 `decode_batch_sampled` 等接口方法里
-   调用 CUDA Graph 的路径,如果没有,评估工作量;如果有但从没测过,先跑一次真实
-   请求验证 `enable_cudagraph=True` 能不能正常工作。
+1. ~~P0~~(已核实,不是问题,见上文 4):`moe_backend` 参数不控制 sparkinfer MoE 是否
+   生效,`_patch_moe_sparkinfer()` 无条件调用,server 路径本来就在用 sparkinfer MoE。
+2. **P1**(已核实,比预期工作量更大,见上文 4b):`decode_batch_sampled` 目前是纯
+   eager,要接 CUDA Graph 需要新写代码——在 batch 组成匹配捕获形状且全部 greedy 时
+   走 `_decode_cg.replay(...)`,否则退回现有 eager 路径,并处理 batch size/组成
+   不匹配的边界情况。这是一个需要专门设计和测试的改动,不是简单摸个开关。
 3. **P2**:前缀缓存——`reconcile_prefix_hit` 目前是永久 miss,要不要给 Laguna 接一套
    等价机制,是照搬 `DirectModelRunner` 的内容寻址方案还是设计更简单的版本,需要
    单独评估(工作量可能不小,历史上 `DirectModelRunner` 那套花了 P0-P4 好几轮)。
