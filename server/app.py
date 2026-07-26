@@ -90,7 +90,11 @@ SERVER_MODEL_BACKEND = os.environ.get("QSR_SERVER_MODEL_BACKEND", "qwen36")
 _IS_LAGUNA = SERVER_MODEL_BACKEND == "laguna"
 
 SERVER_CAPACITY = int(os.environ.get("QSR_SERVER_CAPACITY", "1" if _IS_LAGUNA else "4"))
-SERVER_NUM_SLOTS = int(os.environ.get("QSR_SERVER_NUM_SLOTS", "1" if _IS_LAGUNA else "8"))
+# Laguna default bumped 1->2: ServerEngine requires num_slots >= capacity +
+# (capacity if enable_cudagraph else 0), and enable_cudagraph now defaults
+# on for Laguna (see SERVER_ENABLE_CUDAGRAPH below) -- capacity=1 needs the
+# extra slot for the CG capture's warmup writes.
+SERVER_NUM_SLOTS = int(os.environ.get("QSR_SERVER_NUM_SLOTS", "2" if _IS_LAGUNA else "8"))
 SERVER_BLOCK_SIZE = int(os.environ.get("QSR_SERVER_BLOCK_SIZE", "64" if _IS_LAGUNA else "16"))
 # 256K context support: Qwen uses 16384 × 16; Laguna's sparkinfer attention
 # uses 4096 × 64.  The Laguna default below is currently 128K/slot.
@@ -106,8 +110,15 @@ SERVER_BLOCK_SIZE = int(os.environ.get("QSR_SERVER_BLOCK_SIZE", "64" if _IS_LAGU
 SERVER_BLOCKS_PER_SLOT = int(
     os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "2048" if _IS_LAGUNA else "16384")
 )
+# Laguna default flipped 0->1 (2026-07-27): decode CUDA Graph is now wired
+# into decode_batch_sampled (runtime/backends/laguna.py's
+# _decode_cg_batch_eligible) and verified end-to-end over a real HTTP
+# request (notes/2026-07-27-p1-http-e2e-and-thinking-strip-bug.md) --
+# eager decode_batch_sampled is no longer the only path exercised in
+# production. QSR_SERVER_ENABLE_CUDAGRAPH=0 / --no-cudagraph still rolls
+# back to eager.
 SERVER_ENABLE_CUDAGRAPH = (
-    os.environ.get("QSR_SERVER_ENABLE_CUDAGRAPH", "0" if _IS_LAGUNA else "1") != "0"
+    os.environ.get("QSR_SERVER_ENABLE_CUDAGRAPH", "1") != "0"
 )
 # P4a (notes/prefix-cache-design.md sec 5-P4): the prefix-cache rollback
 # spine, plumbed straight into ServerEngine(enable_prefix_cache=...). Default
