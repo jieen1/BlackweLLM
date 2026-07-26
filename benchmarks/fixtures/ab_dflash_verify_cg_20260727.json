@@ -1,0 +1,20 @@
+{
+  "config": "QSR_VERIFY_CUDA_GRAPH=1",
+  "ctx": 65536,
+  "max_tokens": 256,
+  "verify_cg_active": true,
+  "rounds": [
+    {
+      "round": 0,
+      "tok_per_s": 37.52641925584048,
+      "acceptance_rate": 0.6869565217391305,
+      "wall_s": 20.8
+    },
+    {
+      "round": 1,
+      "tok_per_s": 36.90381315128187,
+      "acceptance_rate": 0.6869565217391305,
+      "wall_s": 20.5
+    }
+  ]
+}
