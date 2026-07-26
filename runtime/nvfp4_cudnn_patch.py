@@ -41,7 +41,9 @@ def patch_nvfp4_to_cudnn() -> bool:
         return False
 
     try:
-        from vllm.utils.flashinfer import flashinfer_scaled_fp4_mm, has_flashinfer
+        from runtime.compat_vllm import get_nvfp4_cudnn_components
+
+        flashinfer_scaled_fp4_mm, has_flashinfer = get_nvfp4_cudnn_components()
 
         if not has_flashinfer():
             logger.warning("FlashInfer not available, skipping cuDNN patch")
@@ -51,20 +53,21 @@ def patch_nvfp4_to_cudnn() -> bool:
         return False
 
     try:
-        import vllm.model_executor.kernels.linear.nvfp4.flashinfer as fi_mod
+        from runtime.compat_vllm import (
+            get_nvfp4_cudnn_apply_dependencies,
+            get_nvfp4_flashinfer_module,
+        )
 
-        _original_apply = fi_mod.FlashInferCutlassNvFp4LinearKernel.apply_weights
+        fi_mod = get_nvfp4_flashinfer_module()
 
         def _cudnn_apply_weights(self, layer, x, bias=None):
             """Drop-in replacement using cuDNN backend (bit-exact, 12.6% faster)."""
-            from vllm._custom_ops import scaled_fp4_quant
-            from vllm.model_executor.layers.fusion.quant_activation import (
+            (
+                scaled_fp4_quant,
                 as_quantized_activation,
-            )
-            from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
                 pad_nvfp4_activation_for_cutlass,
                 slice_nvfp4_output,
-            )
+            ) = get_nvfp4_cudnn_apply_dependencies()
 
             output_size = layer.output_size_per_partition
             weights_padding_bytes = getattr(layer, "weights_padding_cols", 0)

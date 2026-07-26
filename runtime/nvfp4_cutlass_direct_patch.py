@@ -32,11 +32,13 @@ def patch_nvfp4_prefer_cutlass_direct() -> bool:
         return False
 
     try:
-        from vllm.model_executor.kernels.linear import _POSSIBLE_NVFP4_KERNELS
-        from vllm.model_executor.kernels.linear.nvfp4.cutlass import (
+        from runtime.compat_vllm import get_nvfp4_cutlass_kernel_components
+
+        (
+            _POSSIBLE_NVFP4_KERNELS,
             CutlassNvFp4LinearKernel,
-        )
-        from vllm.platforms import PlatformEnum
+            PlatformEnum,
+        ) = get_nvfp4_cutlass_kernel_components()
     except ImportError:
         logger.warning("A2: cannot import vLLM kernel registry")
         return False

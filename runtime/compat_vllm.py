@@ -56,6 +56,14 @@ __all__ = [
     "get_flashinfer_metadata_builder",
     "get_common_attn_metadata_cls",
     "init_flashinfer_workspace",
+    "get_nvfp4_b12x_kernel_components",
+    "get_nvfp4_cutlass_kernel_components",
+    "get_nvfp4_cudnn_components",
+    "get_nvfp4_cudnn_apply_dependencies",
+    "get_nvfp4_custom_ops",
+    "get_nvfp4_cutlass_module",
+    "get_nvfp4_flashinfer_module",
+    "get_cutlass_scaled_fp4_mm",
 ]
 
 # ---------------------------------------------------------------------------
@@ -385,3 +393,88 @@ def init_flashinfer_workspace(device):
     """Lazy import: init_workspace_manager."""
     from vllm.v1.worker.workspace import init_workspace_manager
     init_workspace_manager(device)
+
+
+# ---------------------------------------------------------------------------
+# Re-exported: NVFP4 patch dependencies
+#
+# The four local NVFP4 tuning modules deliberately own only policy and patch
+# logic.  All imports from vLLM stay here, so those modules remain usable as
+# thin, self-owned adapters while each upstream symbol is replaced over time.
+# ---------------------------------------------------------------------------
+
+
+def get_nvfp4_b12x_kernel_components():
+    """Return the vLLM registry, B12x kernel class, and CUDA platform enum."""
+    from vllm.model_executor.kernels.linear import _POSSIBLE_NVFP4_KERNELS
+    from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
+        FlashInferB12xNvFp4LinearKernel,
+    )
+    from vllm.platforms import PlatformEnum
+
+    return _POSSIBLE_NVFP4_KERNELS, FlashInferB12xNvFp4LinearKernel, PlatformEnum
+
+
+def get_nvfp4_cutlass_kernel_components():
+    """Return the vLLM registry, CUTLASS kernel class, and CUDA platform enum."""
+    from vllm.model_executor.kernels.linear import _POSSIBLE_NVFP4_KERNELS
+    from vllm.model_executor.kernels.linear.nvfp4.cutlass import (
+        CutlassNvFp4LinearKernel,
+    )
+    from vllm.platforms import PlatformEnum
+
+    return _POSSIBLE_NVFP4_KERNELS, CutlassNvFp4LinearKernel, PlatformEnum
+
+
+def get_nvfp4_cudnn_components():
+    """Return FlashInfer's NVFP4 GEMM entry point and availability predicate."""
+    from vllm.utils.flashinfer import flashinfer_scaled_fp4_mm, has_flashinfer
+
+    return flashinfer_scaled_fp4_mm, has_flashinfer
+
+
+def get_nvfp4_cudnn_apply_dependencies():
+    """Return vLLM helpers needed by the cuDNN NVFP4 apply-weights patch."""
+    from vllm._custom_ops import scaled_fp4_quant
+    from vllm.model_executor.layers.fusion.quant_activation import (
+        as_quantized_activation,
+    )
+    from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+        pad_nvfp4_activation_for_cutlass,
+        slice_nvfp4_output,
+    )
+
+    return (
+        scaled_fp4_quant,
+        as_quantized_activation,
+        pad_nvfp4_activation_for_cutlass,
+        slice_nvfp4_output,
+    )
+
+
+def get_nvfp4_custom_ops():
+    """Return vLLM custom ops for a narrow, reversible local patch."""
+    import vllm._custom_ops as ops
+
+    return ops
+
+
+def get_nvfp4_cutlass_module():
+    """Return the vLLM CUTLASS NVFP4 module when that upstream layout exists."""
+    import vllm.model_executor.kernels.linear.nvfp4.cutlass as cutlass_module
+
+    return cutlass_module
+
+
+def get_nvfp4_flashinfer_module():
+    """Return the vLLM FlashInfer NVFP4 module for a narrow local patch."""
+    import vllm.model_executor.kernels.linear.nvfp4.flashinfer as flashinfer_module
+
+    return flashinfer_module
+
+
+def get_cutlass_scaled_fp4_mm():
+    """Return vLLM's fallback NVFP4 CUTLASS operator."""
+    from vllm._custom_ops import cutlass_scaled_fp4_mm
+
+    return cutlass_scaled_fp4_mm

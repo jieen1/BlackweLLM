@@ -48,11 +48,13 @@ def patch_nvfp4_prefer_b12x() -> bool:
         return False
 
     try:
-        from vllm.model_executor.kernels.linear import _POSSIBLE_NVFP4_KERNELS
-        from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
+        from runtime.compat_vllm import get_nvfp4_b12x_kernel_components
+
+        (
+            _POSSIBLE_NVFP4_KERNELS,
             FlashInferB12xNvFp4LinearKernel,
-        )
-        from vllm.platforms import PlatformEnum
+            PlatformEnum,
+        ) = get_nvfp4_b12x_kernel_components()
     except ImportError:
         logger.warning("A2: cannot import vLLM kernel registry, skipping B12x patch")
         return False

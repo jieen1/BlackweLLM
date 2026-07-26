@@ -19,8 +19,10 @@ import ctypes
 import logging
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import torch
+if TYPE_CHECKING:
+    import torch
 
 logger = logging.getLogger("qwen_sm120_runtime.nvfp4_custom_gemm")
 
@@ -110,9 +112,12 @@ def custom_scaled_fp4_mm(
     """
     lib = _load_lib()
     if lib is None:
-        from vllm._custom_ops import cutlass_scaled_fp4_mm
+        from runtime.compat_vllm import get_cutlass_scaled_fp4_mm
 
+        cutlass_scaled_fp4_mm = get_cutlass_scaled_fp4_mm()
         return cutlass_scaled_fp4_mm(a, b, block_scale_a, block_scale_b, alpha, out_dtype)
+
+    import torch
 
     m = a.shape[0]
     n = b.shape[0]
@@ -138,8 +143,9 @@ def custom_scaled_fp4_mm(
 
     if rc != 0:
         logger.warning("Custom GEMM failed (rc=%d) for M=%d N=%d K=%d, falling back", rc, m, n, k)
-        from vllm._custom_ops import cutlass_scaled_fp4_mm
+        from runtime.compat_vllm import get_cutlass_scaled_fp4_mm
 
+        cutlass_scaled_fp4_mm = get_cutlass_scaled_fp4_mm()
         return cutlass_scaled_fp4_mm(a, b, block_scale_a, block_scale_b, alpha, out_dtype)
 
     return out
@@ -165,7 +171,9 @@ def patch_nvfp4_custom_gemm() -> bool:
         return False
 
     try:
-        import vllm._custom_ops as ops
+        from runtime.compat_vllm import get_nvfp4_custom_ops, get_nvfp4_cutlass_module
+
+        ops = get_nvfp4_custom_ops()
 
         ops.cutlass_scaled_fp4_mm = custom_scaled_fp4_mm
 
@@ -173,7 +181,7 @@ def patch_nvfp4_custom_gemm() -> bool:
         # "from vllm._custom_ops import cutlass_scaled_fp4_mm" creates a direct
         # reference that isn't affected by changing the module attribute.
         try:
-            import vllm.model_executor.kernels.linear.nvfp4.cutlass as _cutlass_mod
+            _cutlass_mod = get_nvfp4_cutlass_module()
             _cutlass_mod.cutlass_scaled_fp4_mm = custom_scaled_fp4_mm
         except (ImportError, AttributeError):
             pass  # older vLLM layout
