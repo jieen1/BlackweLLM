@@ -18,6 +18,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from vllm._custom_ops import reshape_and_cache_flash
+
 logger = logging.getLogger("qwen_sm120_runtime.bf_attention")
 
 # ── Lightweight forward context (replaces vLLM's ForwardContext for attention) ──
@@ -156,25 +158,18 @@ class BFAttention(nn.Module):
                 f"BFAttention context is missing metadata or slot mapping for {self.layer_name!r}."
             )
 
-        # KV cache write. FP8 caches require the checkpoint scales used by
-        # vLLM's reshape_and_cache_flash; BF16 caches must retain their native
-        # representation instead of being reinterpreted as FP8 bytes.
+        # KV cache write via vLLM's compiled C++ reshape_and_cache_flash.
+        # Single kernel per layer instead of 6 Python ops (288→48 kernels/step).
         if sm is not None and k is not None and v is not None and self.kv_cache is not None:
-            k_cache = self.kv_cache[:, 0]
-            v_cache = self.kv_cache[:, 1]
-            block_size = k_cache.shape[1]
-            block_idx = sm // block_size
-            block_off = sm % block_size
-            is_fp8 = k_cache.dtype in (torch.uint8, torch.float8_e4m3fn)
-            if is_fp8:
-                if k_cache.dtype == torch.uint8:
-                    k_cache = k_cache.view(torch.float8_e4m3fn)
-                    v_cache = v_cache.view(torch.float8_e4m3fn)
-                k_cache[block_idx, block_off] = (k / self._k_scale).to(torch.float8_e4m3fn)
-                v_cache[block_idx, block_off] = (v / self._v_scale).to(torch.float8_e4m3fn)
-            else:
-                k_cache[block_idx, block_off] = k.to(k_cache.dtype)
-                v_cache[block_idx, block_off] = v.to(v_cache.dtype)
+            k_cache = self.kv_cache[0]
+            v_cache = self.kv_cache[1]
+            if k_cache.dtype == torch.uint8:
+                k_cache = k_cache.view(torch.float8_e4m3fn)
+                v_cache = v_cache.view(torch.float8_e4m3fn)
+            reshape_and_cache_flash(
+                k, v, k_cache, v_cache, sm,
+                self.kv_cache_dtype, self._k_scale, self._v_scale,
+            )
 
         # Sparkinfer attention forward
         self.impl.forward(self, q, k, v, self.kv_cache, meta, out)

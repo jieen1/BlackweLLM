@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from vllm._custom_ops import reshape_and_cache_flash
+
 if TYPE_CHECKING:
     from runtime.backends.laguna import LagunaBackend
 
@@ -118,8 +120,8 @@ class LagunaCudaGraphDecode:
             first_name = backend._layer_groups[group_key][0]
             layer = sfc[first_name]
             kv_cache = layer.kv_cache
-            # kv_cache: [num_blocks, 2, block_size, num_kv_heads, head_dim]
-            key_cache, value_cache = kv_cache.unbind(1)
+            # kv_cache: [2, num_blocks, block_size, num_kv_heads, head_dim]
+            key_cache, value_cache = kv_cache.unbind(0)
             if key_cache.dtype == torch.uint8:
                 key_cache = key_cache.view(torch.float8_e4m3fn)
                 value_cache = value_cache.view(torch.float8_e4m3fn)
@@ -434,21 +436,20 @@ class _SparkinferCGDecodeImpl:
         pass
 
     def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
-        """Write K/V into paged cache (self-contained)."""
-        k_cache = kv_cache[:, 0].view(torch.float8_e4m3fn)
-        v_cache = kv_cache[:, 1].view(torch.float8_e4m3fn)
-        block_size = k_cache.shape[1]
-        block_idx = slot_mapping // block_size
-        block_off = slot_mapping % block_size
-        k_cache[block_idx, block_off] = (key / layer._k_scale).to(torch.float8_e4m3fn)
-        v_cache[block_idx, block_off] = (value / layer._v_scale).to(torch.float8_e4m3fn)
+        """Write K/V into paged cache via compiled C++ kernel (CG-safe)."""
+        k_cache = kv_cache[0].view(torch.float8_e4m3fn)
+        v_cache = kv_cache[1].view(torch.float8_e4m3fn)
+        reshape_and_cache_flash(
+            key, value, k_cache, v_cache, slot_mapping,
+            "fp8_e4m3", layer._k_scale, layer._v_scale,
+        )
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output, output_scale=None, output_block_scale=None):
         """Run sparkinfer decode attention (captured in CG)."""
         num_actual_tokens = attn_metadata.num_actual_tokens
         q = query[:num_actual_tokens]
-        key_cache, value_cache = kv_cache.unbind(1)
+        key_cache, value_cache = kv_cache.unbind(0)
         if key_cache.dtype == torch.uint8:
             key_cache = key_cache.view(torch.float8_e4m3fn)
             value_cache = value_cache.view(torch.float8_e4m3fn)
@@ -570,7 +571,7 @@ class LagunaCudaGraphVerify:
             first_name = backend._layer_groups[group_key][0]
             layer = sfc[first_name]
             kv_cache = layer.kv_cache
-            key_cache, value_cache = kv_cache.unbind(1)
+            key_cache, value_cache = kv_cache.unbind(0)
             if key_cache.dtype == torch.uint8:
                 key_cache = key_cache.view(torch.float8_e4m3fn)
                 value_cache = value_cache.view(torch.float8_e4m3fn)
@@ -794,8 +795,8 @@ class _SparkinferCGExtendImpl:
         pass
 
     def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
-        k_cache = kv_cache[:, 0].view(torch.float8_e4m3fn)
-        v_cache = kv_cache[:, 1].view(torch.float8_e4m3fn)
+        k_cache = kv_cache[0].view(torch.float8_e4m3fn)
+        v_cache = kv_cache[1].view(torch.float8_e4m3fn)
         block_size = k_cache.shape[1]
         block_idx = slot_mapping // block_size
         block_off = slot_mapping % block_size
@@ -808,7 +809,7 @@ class _SparkinferCGExtendImpl:
             return output.fill_(0)
         num_actual_tokens = attn_metadata.num_actual_tokens
         q = query[:num_actual_tokens]
-        key_cache, value_cache = kv_cache.unbind(1)
+        key_cache, value_cache = kv_cache.unbind(0)
         if key_cache.dtype == torch.uint8:
             key_cache = key_cache.view(torch.float8_e4m3fn)
             value_cache = value_cache.view(torch.float8_e4m3fn)

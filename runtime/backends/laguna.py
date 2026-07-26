@@ -280,12 +280,12 @@ class LagunaBackend:
             is_swa = name in self._swa_layer_names
             n_blocks = ring_num_blocks if is_swa else full_num_blocks
             # Self-allocated KV cache in sparkinfer-native format:
-            # [num_blocks, 2, block_size, num_kv_heads, head_dim]
-            # dim=1: 0=K, 1=V. FP8 stored as uint8.
+            # [2, num_blocks, block_size, num_kv_heads, head_dim]
+            # dim=0: 0=K, 1=V. FP8 stored as uint8.
             kv_dtype = (
                 torch.uint8 if "fp8" in (cache_dtype_str or "") else layer.kv_cache_torch_dtype
             )
-            shape = (n_blocks, 2, block_size, layer.num_kv_heads, layer.head_size)
+            shape = (2, n_blocks, block_size, layer.num_kv_heads, layer.head_size)
             self.kv_caches[name] = torch.zeros(shape, dtype=kv_dtype, device=self.device)
         runner_kv_caches: list[torch.Tensor] = []
         bind_kv_cache(self.kv_caches, sfc, runner_kv_caches)
@@ -317,8 +317,8 @@ class LagunaBackend:
                     torch.uint8 if "fp8" in (cache_dtype_str or "") else layer.kv_cache_torch_dtype
                 )
                 shape = (
-                    self._swa_scratch_blocks,
                     2,
+                    self._swa_scratch_blocks,
                     block_size,
                     layer.num_kv_heads,
                     layer.head_size,
@@ -956,7 +956,7 @@ class LagunaBackend:
                         so = src_pos % bs
                         db = dst_ring_slot // bs + ring_base
                         do = dst_ring_slot % bs
-                        ring[db, :, do : do + count] = scratch[sb, :, so : so + count]
+                        ring[:, db, do : do + count] = scratch[:, sb, so : so + count]
         finally:
             # Always rebind SWA layers back to ring KV (审查 P3a)
             if self._swa_scratch:
@@ -1000,7 +1000,7 @@ class LagunaBackend:
                 so = ring_slot_idx % bs
                 db = dst_pos // bs
                 do = dst_pos % bs
-                scratch[db, :, do : do + n] = ring[sb, :, so : so + n]
+                scratch[:, db, do : do + n] = ring[:, sb, so : so + n]
 
     def _copy_scratch_to_ring(
         self, slot: int, scratch_start: int, abs_start: int, count: int
@@ -1035,7 +1035,7 @@ class LagunaBackend:
                 so = src_pos % bs
                 db = ring_slot_idx // bs + ring_base
                 do = ring_slot_idx % bs
-                ring[db, :, do : do + n] = scratch[sb, :, so : so + n]
+                ring[:, db, do : do + n] = scratch[:, sb, so : so + n]
 
     def _prefill_with_swa_chunked(self, slot: int, prompt_ids: list[int]) -> torch.Tensor:
         """Chunked prefill for prompts longer than SWA scratch capacity.
@@ -1180,7 +1180,7 @@ class LagunaBackend:
                         so = src_pos % bs
                         db = dst_ring_slot // bs + ring_base
                         do = dst_ring_slot % bs
-                        ring[db, :, do : do + count] = scratch[sb, :, so : so + count]
+                        ring[:, db, do : do + count] = scratch[:, sb, so : so + count]
             finally:
                 for name in self._swa_layer_names:
                     sfc[name].kv_cache = self.kv_caches[name]
@@ -1421,7 +1421,13 @@ class LagunaBackend:
             )
 
     def _patch_rmsnorm_triton(self):
-        """Replace vLLM RMSNorm with Triton fused kernel (zero vLLM dependency)."""
+        """Replace vLLM RMSNorm with Triton fused kernel (zero vLLM dependency).
+
+        vLLM 0.26.0 CustomOp binds _forward_method at __init__ time via
+        dispatch_forward(). Patching the class method alone has no effect on
+        already-constructed instances. We must also rebind each instance's
+        _forward_method after the class-level patch.
+        """
         from runtime.kernels.fused_rms_norm import fused_add_rms_norm, rms_norm
         from vllm.model_executor.layers.layernorm import RMSNorm
 
@@ -1434,7 +1440,15 @@ class LagunaBackend:
             return out, new_res
 
         RMSNorm.forward_cuda = _triton_forward
-        logger.info("Laguna: RMSNorm patched with Triton fused kernel")
+
+        # Re-dispatch all existing RMSNorm instances (vLLM 0.26.0 binds
+        # _forward_method at construction; class patch alone is insufficient)
+        patched = 0
+        for module in self.model.modules():
+            if isinstance(module, RMSNorm):
+                module._forward_method = _triton_forward.__get__(module, RMSNorm)
+                patched += 1
+        logger.info("Laguna: RMSNorm patched with Triton fused kernel (%d instances)", patched)
 
     def reset_slot(self, slot: int) -> None:
         self.slot_kv_len[slot] = 0

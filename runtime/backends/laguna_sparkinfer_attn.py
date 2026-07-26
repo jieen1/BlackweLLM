@@ -4,8 +4,8 @@ Handles both prefill (extend mode) and decode (CG mode) for all layer groups:
 - Full attention: window_left=-1, 24 Q heads, 8 KV heads, head_dim=128
 - SWA: window_left=511, same head config
 
-KV cache layout: vLLM stores [num_blocks, 2, block_size, num_kv_heads, head_dim].
-After unbind(1): k_cache/v_cache = [num_blocks, block_size, num_kv_heads, head_dim]
+KV cache layout: vLLM stores [2, num_blocks, block_size, num_kv_heads, head_dim].
+After unbind(0): k_cache/v_cache = [num_blocks, block_size, num_kv_heads, head_dim]
 which is exactly sparkinfer's expected [num_pages, page_size, num_kv_heads, head_dim].
 
 Integration: monkey-patch each Attention layer's impl after model load.
@@ -19,6 +19,7 @@ import sys
 from typing import Any
 
 import torch
+from vllm._custom_ops import reshape_and_cache_flash
 
 logger = logging.getLogger("qwen_sm120_runtime.sparkinfer_attn")
 
@@ -327,19 +328,16 @@ class SparkinferAttentionImpl:
     ) -> None:
         """Write K/V into paged cache (self-contained, zero vLLM dependency).
 
-        kv_cache: [num_blocks, 2, block_size, num_kv_heads, head_dim] (uint8/FP8)
+        kv_cache: [2, num_blocks, block_size, num_kv_heads, head_dim] (uint8/FP8)
         key/value: [num_tokens, num_kv_heads, head_dim] (bf16)
         slot_mapping: [num_tokens] (int64, flat index = block_idx * block_size + block_off)
         """
-        k_cache = kv_cache[:, 0].view(torch.float8_e4m3fn)
-        v_cache = kv_cache[:, 1].view(torch.float8_e4m3fn)
-        block_size = k_cache.shape[1]
-        block_idx = slot_mapping // block_size
-        block_off = slot_mapping % block_size
-        k_scale = layer._k_scale
-        v_scale = layer._v_scale
-        k_cache[block_idx, block_off] = (key / k_scale).to(torch.float8_e4m3fn)
-        v_cache[block_idx, block_off] = (value / v_scale).to(torch.float8_e4m3fn)
+        k_cache = kv_cache[0].view(torch.float8_e4m3fn)
+        v_cache = kv_cache[1].view(torch.float8_e4m3fn)
+        reshape_and_cache_flash(
+            key, value, k_cache, v_cache, slot_mapping,
+            "fp8_e4m3", layer._k_scale, layer._v_scale,
+        )
 
     def forward(
         self,
@@ -361,8 +359,8 @@ class SparkinferAttentionImpl:
             return output.fill_(0)
 
         q = query[:num_actual_tokens]
-        # KV cache: [num_blocks, 2, block_size, num_kv_heads, head_dim]
-        key_cache, value_cache = kv_cache.unbind(1)
+        # KV cache: [2, num_blocks, block_size, num_kv_heads, head_dim]
+        key_cache, value_cache = kv_cache.unbind(0)
         # vLLM stores FP8 as uint8; sparkinfer expects float8_e4m3fn
         if key_cache.dtype == torch.uint8:
             key_cache = key_cache.view(torch.float8_e4m3fn)

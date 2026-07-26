@@ -297,8 +297,8 @@ class DFlashEngine:
         self._draft_kv_caches: dict[str, torch.Tensor] = {}
         for name in self._draft_layer_names:
             attn = self._draft_attn_layers[name]
-            # Self-allocated: [blocks, 2, bs, kv_heads, head_dim], FP8 as uint8
-            shape = (total_blocks, 2, self.block_size, attn.num_kv_heads, attn.head_size)
+            # Self-allocated: [2, blocks, bs, kv_heads, head_dim], FP8 as uint8
+            shape = (2, total_blocks, self.block_size, attn.num_kv_heads, attn.head_size)
             self._draft_kv_caches[name] = torch.zeros(shape, dtype=torch.uint8, device=self.device)
 
         # Bind draft KV caches to draft attention layers
