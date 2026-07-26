@@ -42,8 +42,8 @@ what `~/vllm_server/vllm_ctl.sh` actually sets for the production runtime.
 | --- | --- | --- | --- | --- |
 | `QSR_SERVER_CAPACITY` | `--capacity` | 4 | 2 | concurrent production slots |
 | `QSR_SERVER_NUM_SLOTS` | `--num-slots` | 8 | 2 | total physical slots |
-| `QSR_SERVER_BLOCK_SIZE` | — | 16 | 16 | KV block size (tokens/block) |
-| `QSR_SERVER_BLOCKS_PER_SLOT` | `--blocks-per-slot` | 16384 | 16384 | per-slot KV ceiling (`× block_size` tokens) ⇒ **256K** |
+| `QSR_SERVER_BLOCK_SIZE` | — | 16 (`qwen36`), 64 (`laguna`) | 16 | KV block size (tokens/block); Laguna sparkinfer requires 64 |
+| `QSR_SERVER_BLOCKS_PER_SLOT` | `--blocks-per-slot` | 16384 (`qwen36`), 2048 (`laguna`) | 16384 | per-slot KV ceiling (`× block_size` tokens) ⇒ **256K** for qwen36, **128K** for Laguna |
 | `QSR_SERVER_ENABLE_CUDAGRAPH` | `--no-cudagraph` | 1 | 0 | captured decode graph |
 | `QSR_SERVER_ENABLE_PREFIX_CACHE` | `--no-prefix-cache` | 1 | 1 | persistent prefix cache (P4a) |
 | `QSR_SERVER_ENABLE_SESSION_AFFINITY` | `--session-affinity` | 0 | 0 | opt-in warm-slot retention (P4b) |

@@ -12,6 +12,7 @@ Covers:
   either don't touch GPU state at all, or only do so past an early return we
   never reach in these tests.
 """
+
 from __future__ import annotations
 
 import inspect
@@ -38,18 +39,14 @@ class TestClassifyDecodeSlots:
 
     def test_mtp_capable_grammar_slots_forced_to_sampled(self):
         active = {1: {"sampled": False}, 2: {"sampled": False}}
-        greedy, sampled = classify_decode_slots(
-            [1, 2], active, grammar_slots=[2], mtp_capable=True
-        )
+        greedy, sampled = classify_decode_slots([1, 2], active, grammar_slots=[2], mtp_capable=True)
         assert greedy == [1]
         assert sampled == [2]
 
     def test_non_mtp_backend_routes_everything_to_sampled(self):
         """Laguna (mtp_capable=False): even a 'greedy' slot skips MTP."""
         active = {1: {"sampled": False}, 2: {"sampled": True}}
-        greedy, sampled = classify_decode_slots(
-            [1, 2], active, grammar_slots=[], mtp_capable=False
-        )
+        greedy, sampled = classify_decode_slots([1, 2], active, grammar_slots=[], mtp_capable=False)
         assert greedy == []
         assert sampled == [1, 2]
 
@@ -69,9 +66,7 @@ class TestServerEngineBackendSelection:
             ServerEngine(backend="not-a-real-backend", capacity=1, num_slots=1)
 
     def test_qwen36_default_is_unchanged(self):
-        engine = ServerEngine(
-            capacity=1, num_slots=1, enable_cudagraph=False, production=True
-        )
+        engine = ServerEngine(capacity=1, num_slots=1, enable_cudagraph=False, production=True)
         assert engine.backend_name == "qwen36"
         assert engine.MODEL == "unsloth/Qwen3.6-27B-NVFP4"
         assert engine.K == 3
@@ -114,10 +109,16 @@ class TestLagunaBackendE1Surface:
         if "runtime.compat_vllm" not in sys.modules:
             stub = types.ModuleType("runtime.compat_vllm")
             for attr in [
-                "VllmConfig", "bind_kv_cache", "get_distributed_init_method",
-                "get_model", "get_open_port", "init_worker_distributed_environment",
-                "set_current_vllm_config", "set_forward_context",
-                "get_flashinfer_metadata_builder", "get_common_attn_metadata_cls",
+                "VllmConfig",
+                "bind_kv_cache",
+                "get_distributed_init_method",
+                "get_model",
+                "get_open_port",
+                "init_worker_distributed_environment",
+                "set_current_vllm_config",
+                "set_forward_context",
+                "get_flashinfer_metadata_builder",
+                "get_common_attn_metadata_cls",
                 "init_flashinfer_workspace",
             ]:
                 setattr(stub, attr, None)
@@ -133,6 +134,13 @@ class TestLagunaBackendE1Surface:
         from runtime.backends.laguna import LagunaBackend
 
         return LagunaBackend.__new__(LagunaBackend)
+
+    def test_rejects_unsupported_sparkinfer_page_size_before_model_load(self):
+        """A stale 16-token launcher must fail before allocating GPU state."""
+        from runtime.backends.laguna import LagunaBackend
+
+        with pytest.raises(ValueError, match="block_size=64"):
+            LagunaBackend(None, block_size=16)
 
     def test_reconcile_prefix_hit_is_permanent_miss(self):
         backend = self._bare_backend()

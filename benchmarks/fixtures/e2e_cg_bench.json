@@ -1,28 +1,28 @@
 {
   "64K": {
     "warmup": {
-      "prefill_ms": 12079.944359997171,
-      "decode_ms": 10229.955740011064,
-      "total_ms": 22309.900100008235,
+      "prefill_ms": 10201.383583000279,
+      "decode_ms": 86408.51820999887,
+      "total_ms": 96609.90179299915,
       "num_tokens": 256,
-      "num_steps": 71,
-      "acceptance_rate": 0.23943661971830985,
-      "tokens_per_step": 3.591549295774648,
-      "tok_per_s": 24.92679406252487
+      "num_steps": 255,
+      "acceptance_rate": 0.06666666666666667,
+      "tokens_per_step": 1.0,
+      "tok_per_s": 2.9510979389818113
     },
     "measured": {
-      "prefill_ms": 10936.878710999736,
-      "decode_ms": 3029.084531997796,
-      "total_ms": 13965.963242997532,
+      "prefill_ms": 117.31107499872451,
+      "decode_ms": 35078.75814400177,
+      "total_ms": 35196.06921900049,
       "num_tokens": 256,
-      "num_steps": 83,
-      "acceptance_rate": 0.20481927710843373,
-      "tokens_per_step": 3.072289156626506,
-      "tok_per_s": 84.18385070020408
+      "num_steps": 255,
+      "acceptance_rate": 0.06666666666666667,
+      "tokens_per_step": 1.0,
+      "tok_per_s": 7.269356542018957
     },
-    "baseline_tps": 11.395706425748278,
-    "baseline_itl_ms": 87.75234835293126,
-    "speedup": 7.387330592335464,
-    "itl_ms": 11.878762870579592
+    "baseline_tps": 9.58089588405214,
+    "baseline_itl_ms": 104.37437292941966,
+    "speedup": 0.7587345306736032,
+    "itl_ms": 137.56375742745792
   }
 }

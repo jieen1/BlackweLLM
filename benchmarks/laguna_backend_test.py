@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Laguna-S-2.1 Backend Test: Direct model.forward() vs vLLM LLM.
+"""Laguna-S-2.1 direct-backend smoke and performance checks.
 
 Tests:
 1. Load model via LagunaBackend (direct forward, no vLLM LLM engine)
 2. Greedy determinism (same prompt → same output, twice)
-3. Correctness vs vLLM LLM baseline (token-level comparison)
-4. Throughput measurement (prefill + decode)
-5. Batch decode test
+3. Throughput measurement (prefill + decode)
+4. Batch decode test
 
 Usage:
+    # Direct LagunaBackend fact smoke only; does not start vLLM's LLM engine.
+    /home/bot/.venvs/vllm/bin/python -m benchmarks.laguna_backend_test --fact-only
+
+    # Full direct-backend smoke and performance suite.
     /home/bot/.venvs/vllm/bin/python -m benchmarks.laguna_backend_test
 """
+
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -28,6 +33,8 @@ os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 MODEL = "poolside/Laguna-S-2.1-NVFP4"
+FACT_PROMPT = "The capital of France is"
+EXPECTED_FACT_FIRST_TOKEN = "Paris"
 
 
 def build_laguna_config(max_model_len: int = 4096):
@@ -47,6 +54,14 @@ def build_laguna_config(max_model_len: int = 4096):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--fact-only",
+        action="store_true",
+        help="run only the direct LagunaBackend Paris fact smoke check",
+    )
+    args = parser.parse_args()
+
     import torch
 
     print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -59,7 +74,15 @@ def main():
     from runtime.backends.laguna import LagunaBackend
 
     t0 = time.perf_counter()
-    backend = LagunaBackend(config, num_slots=4, block_size=16, blocks_per_slot=512)
+    # SparkInfer paged attention requires 64-token pages.  The fact-only
+    # check needs no long-context capacity, so keep its cache allocation small.
+    blocks_per_slot = 128 if args.fact_only else 512
+    backend = LagunaBackend(
+        config,
+        num_slots=4,
+        block_size=64,
+        blocks_per_slot=blocks_per_slot,
+    )
     load_time = time.perf_counter() - t0
     gpu_mem = torch.cuda.max_memory_allocated() / 1024**2
     print(f"  Loaded in {load_time:.1f}s, GPU mem: {gpu_mem:.0f} MiB")
@@ -71,7 +94,7 @@ def main():
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    prompt = "The capital of France is"
+    prompt = FACT_PROMPT
     prompt_ids = tokenizer.encode(prompt)
     print(f"  Prompt: {prompt!r} -> {len(prompt_ids)} tokens")
 
@@ -100,7 +123,19 @@ def main():
     print(f"  Run 2: {text_r2!r}")
 
     determinism_pass = tokens_r1 == tokens_r2
+    first_token_text = tokenizer.decode([first_token], skip_special_tokens=True).strip()
+    fact_pass = first_token_text == EXPECTED_FACT_FIRST_TOKEN
     print(f"  Determinism: {'✅ PASS' if determinism_pass else '❌ FAIL'}")
+    print(
+        "  Fact first token: "
+        f"{first_token_text!r} "
+        f"({'✅ PASS' if fact_pass else f'❌ expected {EXPECTED_FACT_FIRST_TOKEN!r}'})"
+    )
+
+    if args.fact_only:
+        all_pass = determinism_pass and fact_pass
+        print(f"\nFACT SMOKE: {'✅ PASS' if all_pass else '❌ FAIL'}")
+        raise SystemExit(0 if all_pass else 1)
 
     # ── Step 3: Throughput benchmark ──
     print("\n=== Step 3: Throughput benchmark ===")
@@ -171,17 +206,21 @@ def main():
 
     # Check outputs are non-trivial
     for i in range(4):
-        text = tokenizer.decode(backend.slot_committed_tokens[i][len(tokenizer.encode(batch_prompts[i])):], skip_special_tokens=True)
+        text = tokenizer.decode(
+            backend.slot_committed_tokens[i][len(tokenizer.encode(batch_prompts[i])) :],
+            skip_special_tokens=True,
+        )
         print(f"  Slot {i}: {text[:80]}...")
 
     # ── Summary ──
-    print(f"\n{'='*60}")
-    all_pass = determinism_pass
+    print(f"\n{'=' * 60}")
+    all_pass = determinism_pass and fact_pass
     print(f"OVERALL: {'✅ ALL PASS' if all_pass else '❌ SOME FAILED'}")
     print(f"  Greedy determinism: {'✅' if determinism_pass else '❌'}")
+    print(f"  Paris first token: {'✅' if fact_pass else '❌'}")
     print(f"  Throughput: {avg_tps:.1f} tok/s (single), {batch_tps:.1f} tok/s (batch=4)")
     print(f"  ITL: {avg_itl:.1f} ms")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     # Save results
     results = {
@@ -193,6 +232,8 @@ def main():
         "gpu_mem_mib": round(gpu_mem),
         "greedy_determinism": determinism_pass,
         "greedy_output": text_r1,
+        "fact_first_token": first_token_text,
+        "fact_pass": fact_pass,
         "throughput": {
             "single_tps": round(avg_tps, 1),
             "batch4_tps": round(batch_tps, 1),

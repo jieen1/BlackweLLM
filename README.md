@@ -218,6 +218,11 @@ git clone https://github.com/jieen1/BlackweLLM.git
 cd BlackweLLM
 python -m pip install -e '.[dev,serving]'
 
+# Add this only after the pinned vLLM provider build is available.
+# It is intentionally optional so CPU-only development and tests never
+# trigger a vLLM build.
+python -m pip install -e '.[cuda,dev,serving,vllm-provider]'
+
 # Build the custom CUDA attention kernel (separate repo)
 cd /path/to/sm120-flash-attention/kernel
 export CUDA_HOME=/usr/local/cuda
@@ -382,6 +387,9 @@ BlackweLLM 是一个专为 NVIDIA Blackwell（SM120）GPU 打造的全栈推理�
 git clone https://github.com/jieen1/BlackweLLM.git
 cd BlackweLLM
 python -m pip install -e '.[dev,serving]'
+
+# 仅在已完成匹配版本的 vLLM provider 构建后安装；日常 CPU 开发不需要它。
+python -m pip install -e '.[cuda,dev,serving,vllm-provider]'
 
 # 启动服务（256K 上下文，2 并发）
 QSR_SERVER_PRODUCTION=1 \
