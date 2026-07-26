@@ -1,0 +1,123 @@
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'sliding_attention', 'full_attention'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'sliding_attention', 'full_attention'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'sliding_attention', 'full_attention'}
+INFO 07-27 03:13:05 [model.py:619] Resolved architecture: LagunaForCausalLM
+INFO 07-27 03:13:05 [model.py:1776] Using max model len 2560
+INFO 07-27 03:13:06 [scheduler.py:252] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 07-27 03:13:06 [vllm.py:1089] Asynchronous scheduling is enabled.
+WARNING 07-27 03:13:06 [vllm.py:1143] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 07-27 03:13:06 [vllm.py:1191] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 07-27 03:13:06 [kernel.py:292] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 07-27 03:13:06 [vllm.py:1370] Cudagraph is disabled under eager mode
+INFO 07-27 03:13:06 [compilation.py:312] Enabled custom fusions: norm_quant, act_quant
+INFO 07-27 03:13:06 [parallel_state.py:1607] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://127.0.0.1:48351 backend=nccl
+INFO 07-27 03:13:06 [parallel_state.py:1942] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+INFO 07-27 03:13:07 [cuda.py:476] Using FLASHINFER attention backend out of potential backends: ['FLASHINFER', 'TRITON_ATTN'].
+INFO 07-27 03:13:07 [nvfp4.py:285] Using 'FLASHINFER_CUTLASS' NvFp4 MoE backend out of potential backends: ['FLASHINFER_TRTLLM', 'FLASHINFER_CUTEDSL', 'FLASHINFER_CUTEDSL_BATCHED', 'FLASHINFER_CUTLASS', 'VLLM_CUTLASS', 'MARLIN', 'HUMMING', 'EMULATION'].
+INFO 07-27 03:13:08 [weight_utils.py:849] Filesystem type for checkpoints: EXT4. Checkpoint size: 66.98 GiB. Available RAM: 20.14 GiB.
+INFO 07-27 03:13:08 [weight_utils.py:879] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre) and the checkpoint size (66.98 GiB) exceeds 90% of available RAM (20.14 GiB).
+Loading safetensors checkpoint shards:   0% Completed | 0/15 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:   7% Completed | 1/15 [00:03<00:44,  3.21s/it]
+Loading safetensors checkpoint shards:  13% Completed | 2/15 [00:07<00:48,  3.72s/it]
+Loading safetensors checkpoint shards:  20% Completed | 3/15 [00:12<00:50,  4.19s/it]
+Loading safetensors checkpoint shards:  27% Completed | 4/15 [00:17<00:51,  4.69s/it]
+Loading safetensors checkpoint shards:  33% Completed | 5/15 [00:22<00:48,  4.81s/it]
+Loading safetensors checkpoint shards:  40% Completed | 6/15 [00:27<00:43,  4.88s/it]
+Loading safetensors checkpoint shards:  47% Completed | 7/15 [00:32<00:39,  4.94s/it]
+Loading safetensors checkpoint shards:  53% Completed | 8/15 [00:37<00:35,  5.01s/it]
+Loading safetensors checkpoint shards:  60% Completed | 9/15 [00:42<00:30,  5.03s/it]
+Loading safetensors checkpoint shards:  67% Completed | 10/15 [00:46<00:23,  4.74s/it]
+Loading safetensors checkpoint shards:  73% Completed | 11/15 [00:52<00:19,  4.94s/it]
+Loading safetensors checkpoint shards:  80% Completed | 12/15 [00:57<00:14,  4.96s/it]
+Loading safetensors checkpoint shards:  87% Completed | 13/15 [01:02<00:09,  4.97s/it]
+Loading safetensors checkpoint shards:  93% Completed | 14/15 [01:07<00:04,  4.97s/it]
+Loading safetensors checkpoint shards: 100% Completed | 15/15 [01:07<00:00,  3.59s/it]
+Loading safetensors checkpoint shards: 100% Completed | 15/15 [01:07<00:00,  4.51s/it]
+
+INFO 07-27 03:14:16 [default_loader.py:430] Loading weights took 69.57 seconds
+INFO 07-27 03:14:16 [nvfp4.py:543] Using MoEPrepareAndFinalizeNoDPEPModular
+eager (pre-CG): [1012, 1013, 1014, 1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 83, 1028, 350, 33586, 81, 397]
+CG captured: batch_size=1
+cg-routed:      [1012, 1013, 1014, 1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 83, 1028, 350, 33586, 81, 397]
+cg eligible each step: [True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True]
+EXACT MATCH: True
+sampled request correctly excluded from CG: True
+logprobs request correctly excluded from CG: True
+batch_size=2 correctly excluded from CG (captured at 1): True
+sampled decode via eager fallback produced token: 1013
+{
+  "eager_no_cg": [
+    1012,
+    1013,
+    1014,
+    1015,
+    1016,
+    1017,
+    1018,
+    1019,
+    1020,
+    1021,
+    1022,
+    1023,
+    1024,
+    1025,
+    1026,
+    83,
+    1028,
+    350,
+    33586,
+    81,
+    397
+  ],
+  "cg_routed": [
+    1012,
+    1013,
+    1014,
+    1015,
+    1016,
+    1017,
+    1018,
+    1019,
+    1020,
+    1021,
+    1022,
+    1023,
+    1024,
+    1025,
+    1026,
+    83,
+    1028,
+    350,
+    33586,
+    81,
+    397
+  ],
+  "cg_path_used_each_step": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+  ],
+  "exact_match": true,
+  "sampled_not_eligible": true,
+  "logprobs_not_eligible": true,
+  "wrong_batch_size_not_eligible": true,
+  "sampled_fallback_ran_ok": true
+}
+[rank0]:[W727 03:15:37.184517208 ProcessGroupNCCL.cpp:1624] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

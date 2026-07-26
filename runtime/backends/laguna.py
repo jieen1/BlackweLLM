@@ -1372,6 +1372,37 @@ class LagunaBackend:
             self.slot_committed_tokens[slot].append(token_ids[i])
         return next_tokens
 
+    def _decode_cg_batch_eligible(
+        self,
+        slot_ids: list[int],
+        params_list: list[SamplingParams],
+        return_logprobs: bool,
+    ) -> bool:
+        """Whether this decode step can safely replay the captured decode CG.
+
+        The graph is captured once at a fixed batch size (see
+        ``_ensure_decode_cg`` -- currently 1, matching Laguna's default
+        server capacity). Replaying at a different batch size would run the
+        graph's fixed-shape kernels over stale rows left by a previous
+        replay: since ``_physical_slot`` maps 1:1 onto real KV-cache slot
+        ranges, any padding row would write live attention output into
+        whatever physical slot its stale metadata happens to point at --
+        silently corrupting a slot outside this batch, not just wasting
+        compute. Only an exact batch-size match is provably safe, so this
+        stays conservative instead of attempting padding.
+
+        CG replay also only returns an argmax token id (greedy is baked
+        into the captured graph itself, see ``LagunaCudaGraphDecode.capture``),
+        so any request needing logprobs or non-greedy sampling must fall
+        back to eager.
+        """
+        return (
+            self._decode_cg is not None
+            and not return_logprobs
+            and len(slot_ids) == self._decode_cg.batch_size
+            and all(p.is_greedy for p in params_list)
+        )
+
     def decode_batch_sampled(
         self,
         slot_ids: list[int],
@@ -1387,7 +1418,20 @@ class LagunaBackend:
         Signature matches ``DirectModelRunner.decode_batch_sampled`` (E1: the
         two backends share ServerEngine's calling convention) -- greedy is
         temperature=0, a plain special case of sampling, per B1.
+
+        When the batch is a single exact-size, all-greedy, non-logprobs
+        match for the captured decode CUDA Graph (see
+        ``_decode_cg_batch_eligible``), replays it instead of running eager
+        forward -- this is the path ``ServerEngine._step_sync`` actually
+        calls, so it is what makes CUDA Graph decode reach real requests.
         """
+        if self._decode_cg_batch_eligible(slot_ids, params_list, return_logprobs):
+            next_tokens = self._decode_cg.replay(slot_ids, token_ids, kv_lengths)
+            for i, slot in enumerate(slot_ids):
+                self.slot_kv_len[slot] += 1
+                self.slot_committed_tokens[slot].append(token_ids[i])
+            return next_tokens
+
         logits = self._forward(slot_ids, token_ids, kv_lengths, qo_len=1, is_decode=True)
         next_tokens: list[int] = []
         for i, (slot, params) in enumerate(zip(slot_ids, params_list)):

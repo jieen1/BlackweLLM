@@ -1,0 +1,50 @@
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'full_attention', 'sliding_attention'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'full_attention', 'sliding_attention'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'full_attention', 'sliding_attention'}
+INFO 07-27 03:17:12 [model.py:619] Resolved architecture: LagunaForCausalLM
+INFO 07-27 03:17:12 [model.py:1776] Using max model len 8192
+INFO 07-27 03:17:12 [scheduler.py:252] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 07-27 03:17:12 [vllm.py:1089] Asynchronous scheduling is enabled.
+WARNING 07-27 03:17:12 [vllm.py:1143] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 07-27 03:17:12 [vllm.py:1191] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 07-27 03:17:12 [kernel.py:292] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 07-27 03:17:12 [vllm.py:1370] Cudagraph is disabled under eager mode
+INFO 07-27 03:17:12 [compilation.py:312] Enabled custom fusions: norm_quant, act_quant
+INFO 07-27 03:17:12 [parallel_state.py:1607] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://127.0.0.1:44791 backend=nccl
+INFO 07-27 03:17:13 [parallel_state.py:1942] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+INFO 07-27 03:17:13 [cuda.py:476] Using FLASHINFER attention backend out of potential backends: ['FLASHINFER', 'TRITON_ATTN'].
+INFO 07-27 03:17:13 [nvfp4.py:285] Using 'FLASHINFER_CUTLASS' NvFp4 MoE backend out of potential backends: ['FLASHINFER_TRTLLM', 'FLASHINFER_CUTEDSL', 'FLASHINFER_CUTEDSL_BATCHED', 'FLASHINFER_CUTLASS', 'VLLM_CUTLASS', 'MARLIN', 'HUMMING', 'EMULATION'].
+INFO 07-27 03:17:15 [weight_utils.py:849] Filesystem type for checkpoints: EXT4. Checkpoint size: 66.98 GiB. Available RAM: 20.13 GiB.
+INFO 07-27 03:17:15 [weight_utils.py:879] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre) and the checkpoint size (66.98 GiB) exceeds 90% of available RAM (20.13 GiB).
+Loading safetensors checkpoint shards:   0% Completed | 0/15 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:   7% Completed | 1/15 [00:03<00:45,  3.23s/it]
+Loading safetensors checkpoint shards:  13% Completed | 2/15 [00:07<00:47,  3.68s/it]
+Loading safetensors checkpoint shards:  20% Completed | 3/15 [00:12<00:54,  4.57s/it]
+Loading safetensors checkpoint shards:  27% Completed | 4/15 [00:17<00:49,  4.52s/it]
+Loading safetensors checkpoint shards:  33% Completed | 5/15 [00:22<00:47,  4.73s/it]
+Loading safetensors checkpoint shards:  40% Completed | 6/15 [00:27<00:43,  4.82s/it]
+Loading safetensors checkpoint shards:  47% Completed | 7/15 [00:32<00:39,  4.98s/it]
+Loading safetensors checkpoint shards:  53% Completed | 8/15 [00:37<00:34,  4.99s/it]
+Loading safetensors checkpoint shards:  60% Completed | 9/15 [00:42<00:30,  5.01s/it]
+Loading safetensors checkpoint shards:  67% Completed | 10/15 [00:47<00:25,  5.02s/it]
+Loading safetensors checkpoint shards:  73% Completed | 11/15 [00:51<00:19,  4.76s/it]
+Loading safetensors checkpoint shards:  80% Completed | 12/15 [00:57<00:14,  4.85s/it]
+Loading safetensors checkpoint shards:  87% Completed | 13/15 [01:02<00:09,  4.92s/it]
+Loading safetensors checkpoint shards:  93% Completed | 14/15 [01:07<00:05,  5.01s/it]
+Loading safetensors checkpoint shards: 100% Completed | 15/15 [01:07<00:00,  3.61s/it]
+Loading safetensors checkpoint shards: 100% Completed | 15/15 [01:07<00:00,  4.51s/it]
+
+INFO 07-27 03:18:22 [default_loader.py:430] Loading weights took 69.62 seconds
+INFO 07-27 03:18:22 [nvfp4.py:543] Using MoEPrepareAndFinalizeNoDPEPModular
+eager-only (no CG, matches today's server default): 0.9 tok/s (1130.01 ms/step)
+CG-routed (this change, enable_cudagraph=True): 83.8 tok/s (11.93 ms/step)
+{
+  "ctx": 4096,
+  "n_steps": 200,
+  "eager_tok_s": 0.9,
+  "eager_ms_step": 1130.01,
+  "cg_tok_s": 83.8,
+  "cg_ms_step": 11.93,
+  "speedup": 94.702
+}
+[rank0]:[W727 03:25:48.436519378 ProcessGroupNCCL.cpp:1624] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

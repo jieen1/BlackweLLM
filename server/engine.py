@@ -379,14 +379,24 @@ class ServerEngine:
     def _load_laguna_model(self) -> None:
         """Load LagunaBackend. MUST run on engine thread.
 
-        No CUDA Graph (Lane 2 GPU work, not wired into the engine yet), no
-        MTP (no draft model loaded), no persistent prefix cache / session
+        No MTP (no draft model loaded), no persistent prefix cache / session
         affinity (LagunaBackend.reconcile_prefix_hit is a permanent-miss
-        stub -- see runtime/backends/laguna.py). ``enable_cudagraph`` /
-        ``enable_prefix_cache`` / ``enable_session_affinity`` are honored as
-        passed (server/app.py defaults them to False for this backend), not
-        overridden here -- ServerEngine stays a thin, honest pass-through of
-        whatever config the caller chose.
+        stub -- see runtime/backends/laguna.py). ``enable_prefix_cache`` /
+        ``enable_session_affinity`` are honored as passed (server/app.py
+        defaults them to False for this backend), not overridden here --
+        ServerEngine stays a thin, honest pass-through of whatever config
+        the caller chose.
+
+        ``enable_cudagraph`` now does something for Laguna: when set, the
+        M=1 decode CUDA Graph is captured right here, before ``start()``'s
+        admission loop can hand out any slot -- capture scribbles dummy
+        warmup data into the last slot's physical KV-cache range, which is
+        only safe while every slot is still definitionally empty. Capturing
+        later (e.g. lazily on first decode call, as the standalone benchmark
+        helper does) risks corrupting a live request's cache if that slot
+        happens to be in use. See ``decode_batch_sampled`` /
+        ``_decode_cg_batch_eligible`` in runtime/backends/laguna.py for the
+        replay side.
         """
         from runtime.backends.laguna import LagunaBackend
         from runtime.compat_vllm import EngineArgs
@@ -409,6 +419,18 @@ class ServerEngine:
             block_size=self.block_size,
             blocks_per_slot=self.blocks_per_slot,
         )
+        if self._enable_cudagraph:
+            self.runner._ensure_decode_cg()
+            if self.runner._decode_cg is not None:
+                logger.info(
+                    "Laguna decode CUDA Graph captured at load (batch_size=%d)",
+                    self.runner._decode_cg.batch_size,
+                )
+            else:
+                logger.warning(
+                    "Laguna decode CUDA Graph capture failed or disabled "
+                    "(QSR_DECODE_CUDA_GRAPH); falling back to eager decode"
+                )
         logger.info(
             "Laguna model loaded on engine thread: num_slots=%d blocks_per_slot=%d "
             "max_context=%d tokens/slot",
