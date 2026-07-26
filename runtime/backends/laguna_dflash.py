@@ -39,7 +39,12 @@ from runtime.backends.dflash_constants import (
     NUM_QUERY_PER_REQ,
     NUM_SPECULATIVE_TOKENS,
 )
-from runtime.backends.laguna import LagunaBackend, RESERVED_PHYSICAL_SLOTS, _physical_slot, _ring_blocks_for_window
+from runtime.backends.laguna import (
+    RESERVED_PHYSICAL_SLOTS,
+    LagunaBackend,
+    _physical_slot,
+    _ring_blocks_for_window,
+)
 from runtime.compat_vllm import (
     set_current_vllm_config,
     set_forward_context,
@@ -376,7 +381,7 @@ class DFlashEngine:
 
         if self._use_cuda_graph:
             self._capture_draft_cg()
-            if os.environ.get("QSR_VERIFY_CUDA_GRAPH", "1") == "1":
+            if os.environ.get("QSR_VERIFY_CUDA_GRAPH", "0") == "1":
                 self._capture_verify_cg()
             self._cg_captured = True
 
