@@ -466,3 +466,64 @@ Checkpoint 键名：`model.layers.0.self_attn.k_scale`
 
 **如果 `_k_scale = 1.0`（未加载）→ 这就是根因**
 **如果 `_k_scale ≈ 0.032`（已加载）→ 排除此假设，继续其他方向**
+
+---
+
+## 2026-07-26 Session Update: Memory Optimization + Verify CG Fix
+
+### Commits Pushed (this session)
+
+| Commit | Description |
+|--------|-------------|
+| `199ac67` | Reclaim reserved physical slot + free dummy CG caches |
+| `e9cf99d` | Fix verify CG stale worklist (update_prefill_graph_replay_metadata) |
+
+### P3-1: RESERVED_PHYSICAL_SLOTS Reclaimed ✅
+
+**Problem**: `RESERVED_PHYSICAL_SLOTS=1` reserved an entire physical slot (blocks_per_slot blocks per layer) that was never written. At 128K context: ~1.5 GB wasted; at 256K: ~3 GB.
+
+**Analysis**:
+- Physical slot 0 was used as a null sentinel: page table padding entries were set to 0
+- Sparkinfer kernels respect `cache_seqlens` + `block_valid_mask` — padding entries beyond cache_seqlens are NEVER read
+- The sentinel was defensive, not functional
+
+**Fix**:
+- `RESERVED_PHYSICAL_SLOTS = 0` (laguna.py only; block_pool.py for Qwen3.6 runner unchanged)
+- Page table padding changed from `0` to `full_base` / `ring_base` (current slot's first block) as a safe defensive sentinel
+- All hardcoded `slot + 1` replaced with `_physical_slot(slot)` across 4 files
+- Draft KV cache allocation uses symbolic constant
+
+**Memory savings**: One full slot of KV cache = `blocks_per_slot × block_bytes × num_layers`. At 128K with 7 slots: gains an 8th slot capacity.
+
+### P3-2: Dummy FP8 Cache Freed ✅
+
+**Problem**: `LagunaCudaGraphDecode._bind_kv_caches()` computed real key_cache/value_cache but never assigned them to the workspace. Dummy fp8 tensors (~128 MB per full-attention workspace at 128K) remained allocated.
+
+**Fix**: Added `ws._k_cache = key_cache; ws._v_cache = value_cache` in `_bind_kv_caches()`.
+
+### Verify CG Stale Worklist Fix ✅ (needs GPU validation)
+
+**Problem**: `LagunaCudaGraphVerify._fill_buffers()` only called `ws._copy_runtime_metadata()` (page_table + cache_seqlens) but never updated the sparkinfer worklist. The worklist (block_valid_mask, kv_chunk_size, kv_window_start_tokens) stayed frozen at capture-time values. When SWA ring alignment crossed a page boundary during replay, the kernel processed stale chunk boundaries → wrong attention → acceptance collapse (87% → 23-25%).
+
+**Root cause in sparkinfer terms**: `update_prefill_graph_replay_metadata()` is the public API that copies metadata AND runs a Triton kernel to recompute the worklist from runtime cache_seqlens. Our code was only doing the first half.
+
+**Fix**: Replaced `ws._copy_runtime_metadata(...)` with `ws.update_prefill_graph_replay_metadata(..., window_left=wl)`.
+
+**Expected impact**: Eager verify ~308 ms/step → CG ~38 ms/step (8x speedup). Enabled by default via `QSR_VERIFY_CUDA_GRAPH=1`.
+
+### GPU Validation Needed
+
+When GPU is available, run:
+```bash
+CUDA_VISIBLE_DEVICES=0 USE_LIBUV=0 HF_HUB_OFFLINE=1 FLASHINFER_DISABLE_VERSION_CHECK=1 \
+QSR_DFLASH_CUDA_GRAPH=1 SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT=1 \
+/home/bot/.venvs/vllm/bin/python /tmp/test_acceptance_repro.py 65536 256
+```
+
+Expected: acceptance >80% with verify CG enabled. If acceptance drops, set `QSR_VERIFY_CUDA_GRAPH=0` to isolate.
+
+### Outstanding Issues (unchanged)
+
+1. **Full-prefix-hit bug**: warm r1/r2 acceptance collapse. Someone else investigating.
+2. **vLLM 0.26.0 comparison**: needs compilation + GPU time.
+3. **200K benchmark**: not yet run.
