@@ -184,3 +184,45 @@ acceptance test and should be fixed after first-round eager parity.
 - `quack-kernels` 0.4.1 与 `nvidia-cutlass-dsl` 4.6.x 不兼容
   （`cute.core.ThrMma`/`ThrCopy` 缺失）→ sed 替换为字符串注解
 - vLLM 0.26.0 需要 `moe_backend="marlin"` 绕过 FlashInfer MoE API 不兼容
+
+## 2026-07-26 污染测试结果（关键转折）
+
+### 实验设计
+在 Round 2 首次异常（kv_len=65568, accepted=1/15）处：
+1. 记录 sustained verify argmax
+2. Reset slot，重新 prefill prompt + committed tokens 到相同 kv_len
+3. 用完全相同的 verify_tokens 做 fresh forward
+
+### 结果
+```
+Sustained: '  TheOkay brown fox jumps over the'
+Fresh:     '  TheOkay brown fox jumps over the'
+Matches: 16/16
+→ 无 KV 污染
+```
+
+### 结论更新
+
+**"TheOkay" 是模型在 65568 位置的真实预测，不是 bug。**
+
+- 主模型 KV 缓存在 DFlash 循环中完全正确
+- 4K 下主模型完美跟随重复文本模式（15/15 draft 匹配）
+- 64K 下主模型开始偏离模式（产生 "Okay" 等非模式 token）
+- Draft 模型预测重复模式，但主模型不跟随 → 接受率下降
+
+### 根因重新定位
+
+55%→20% 的回归不是逻辑 bug，而是 **数值漂移**：
+- Baseline 用 Marlin MoE + FlashInfer attention
+- 当前用 sparkinfer MoE + BFAttention (sparkinfer attention)
+- 两条路径的数值精度差异在 64K 自回归生成中累积
+- 导致主模型在长上下文下产生不同的 token 序列
+- Draft 模型（基于主模型 aux hidden states）无法预测这些偏差
+
+### 下一步
+
+1. **数值对比**：同一 prompt 同一位置，比较 sparkinfer vs Marlin/FlashInfer 的 logits
+   - 如果 logits 有系统性偏差 → 修 sparkinfer 精度
+   - 如果 logits 一致但 token 不同 → 是混沌效应（微小差异放大），需要提高 draft 模型鲁棒性
+2. **vLLM A/B at 64K**：用 vLLM (Marlin) 跑同一 prompt 同一参数，确认 vLLM 的接受率
+3. **Draft 模型质量**：检查 draft 在 64K 下的 aux hidden states 是否与 4K 一致
