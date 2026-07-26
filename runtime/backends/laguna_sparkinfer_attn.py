@@ -115,10 +115,10 @@ class SparkinferPrefillWorkspace:
         mode: str = "extend",
     ) -> None:
         """Run extend/verify-mode attention (prefill or speculative verify)."""
+        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+        from sparkinfer.attention.paged.planner import create_paged_plan
         from sparkinfer.attention.paged._forward import paged_attention_forward
         from sparkinfer.attention.paged._scratch import build_paged_attention_binding
-        from sparkinfer.attention.paged.planner import create_paged_plan
-        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
 
         if k_descale is None:
             k_descale = self._descale
@@ -174,6 +174,7 @@ class SparkinferDecodeWorkspace:
         device: str = "cuda",
     ):
         from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+        from sparkinfer.attention.paged.planner import create_paged_plan
 
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
