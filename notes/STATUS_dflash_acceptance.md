@@ -118,3 +118,69 @@ acceptance test and should be fixed after first-round eager parity.
 - `/tmp/test_verify_vs_decode.py` — verify (qo=16) vs sequential decode comparison
 - `/tmp/test_full_dflash_init.py` — DFlash init + single draft/verify step
 - `/tmp/test_isolate_corruption.py` — isolate which DFlash init step corrupts main model
+
+## 2026-07-26 GPU 验证结果（状态机修复后）
+
+### A/B 对比（同 prompt、同参数、4K 上下文）
+
+| 引擎 | 接受率 | tok/step | tok/s | 模式 |
+|------|--------|----------|-------|------|
+| BlackweLLM (sparkinfer, 修复后) | **86.3%** | **13.42** | 11.8 | eager |
+| BlackweLLM (sparkinfer, 修复前) | 35.4% | 5.20 | 9.3 | eager |
+| vLLM 0.26.0 (MARLIN, DFlash) | — | — | 190.8 | eager |
+| Baseline b056100 (MARLIN) | 51.2% (64K) / 55.1% (128K) | 7.5 / 8.2 | 77.6 / 210.9 | CG |
+
+**结论：55% 接受率不仅可以复现，修复后在 4K 即达 86.3%。**
+
+### 64K 上下文退化（新发现）
+
+64K 接受率仅 19%（3.81 tok/step），远低于 4K 的 86.3%。
+
+逐轮诊断（/tmp/diag_draft_rounds.py）：
+- Round 0-1: 15/15 (100%) — draft 完美预测
+- Round 2: 1/15 — 首次 reject 后 verify 产生异常 token
+- Round 3-7: 15/15 — 恢复
+- Round 8-9: 0-2/15 — verify 开始产生完全错误的 token（"Okay" 而非 "The"）
+- Round 10-19: 0-4/15 — 模型完全偏离重复文本模式
+
+### 根因定位：decode 和 verify 路径在 64K 下不一致
+
+验证实验（/tmp/diag_verify_consistency.py）：
+- 64K prefill 后，sequential decode（M=1）产生 " decoding" × 16（卡死循环）
+- verify forward（M=16 extend）产生 " offers offers... decoding..."（前 3 个不同）
+- 一致性：12/15 (80%)
+
+**sequential decode 在 64K 下完全坏了**——每次 decode 都产生相同 token，
+说明 KV cache 写入或 attention 读取在长位置下有 bug。
+
+### 待排查方向
+
+1. **sparkinfer extend kernel 在大 seq_lens 下的正确性**
+   - decode (M=1) 和 extend (M=16) 使用同一 SparkinferAttentionImpl.forward()
+   - 但 metadata 不同：decode seq_lens=65537 vs extend seq_lens=65552
+   - 需要确认 sparkinfer 在 seq_lens > 64K 时是否有 int32 溢出或 plan 错误
+
+2. **SWA ring buffer 在 decode 模式下的 block table 正确性**
+   - decode_ring: seq_lens=513, 9 ring blocks
+   - verify_ring: seq_lens=528, 9 ring blocks
+   - 需要确认 ring block table 在 pos > 64K 时的 modulo 映射
+
+3. **full attention block table 在 decode 模式下是否溢出**
+   - n_blocks = ceil(65537/64) = 1025
+   - blocks_per_slot = 1152（足够）
+   - 但 _decode_block_table 的预分配大小需要确认
+
+### 测试脚本
+
+- `/tmp/test_acceptance_repro.py` — 接受率复现（4K/64K）
+- `/tmp/test_vllm_acceptance.py` — vLLM 对比（moe_backend=marlin）
+- `/tmp/diag_draft_quality.py` — draft 预测质量诊断
+- `/tmp/diag_draft_rounds.py` — 20 轮 draft/verify 逐轮追踪
+- `/tmp/diag_verify_consistency.py` — verify vs sequential decode 一致性
+
+### vLLM 依赖修复记录
+
+- `torchvision` 缺失 → `pip install torchvision --no-deps`
+- `quack-kernels` 0.4.1 与 `nvidia-cutlass-dsl` 4.6.x 不兼容
+  （`cute.core.ThrMma`/`ThrCopy` 缺失）→ sed 替换为字符串注解
+- vLLM 0.26.0 需要 `moe_backend="marlin"` 绕过 FlashInfer MoE API 不兼容
