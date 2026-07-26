@@ -344,22 +344,23 @@ class DFlashEngine:
         self._draft_qsl_cpu = torch.tensor([0, max_tokens], dtype=torch.int32)
 
     def _init_cuda_graph(self) -> None:
-        """Set up CUDA Graph state for verify and draft.
+        """Capture the runtime-safe DFlash CUDA Graph.
 
-        Verify CG (M=16) is captured eagerly — it uses extend-mode sparkinfer
-        workspaces and is deterministic across KV lengths. This eliminates
-        the MoE kernel non-determinism that causes 0% acceptance in eager mode.
+        The draft graph has a fixed 16-token query shape and is safe across
+        ring-relative KV lengths after address-aware rebinding.  Main-model
+        verify remains eager: Sparkinfer does not yet update qo=16 graph
+        worklists when SWA ring alignment changes at a page boundary.
         """
         self._verify_cg = None
         self._draft_cg = None
         self._cg_captured = False
 
-        # Capture verify CG immediately (deterministic MoE via CG replay)
         if self._use_cuda_graph:
-            self._capture_verify_cg()
+            self._capture_draft_cg()
+            self._cg_captured = True
 
     def _capture_verify_cg(self) -> None:
-        """Capture M=16 verify CUDA Graph with sparkinfer extend attention."""
+        """Experimental main-model verify graph; not enabled in production."""
         from runtime.backends.laguna_cuda_graph import LagunaCudaGraphVerify
         try:
             cg = LagunaCudaGraphVerify(self.backend, num_tokens=NUM_QUERY_PER_REQ)
@@ -370,6 +371,19 @@ class DFlashEngine:
             logger.warning("DFlash: verify CG capture failed: %s", e)
             import traceback; traceback.print_exc()
             self._verify_cg = None
+
+    def _capture_draft_cg(self) -> None:
+        """Capture the M=16 draft graph before any request owns slot state."""
+        try:
+            from runtime.backends.laguna_dflash_cudagraph import DFlashDraftCudaGraph
+
+            cg = DFlashDraftCudaGraph(self)
+            cg.capture()
+            self._draft_cg = cg
+            logger.info("DFlash: draft CUDA Graph captured")
+        except Exception as e:
+            logger.warning("DFlash: draft CG failed: %s", e)
+            self._draft_cg = None
 
     def _ensure_decode_cg(self) -> None:
         """Lazily capture the M=1 main-decode CUDA Graph on first use.
@@ -895,23 +909,9 @@ class DFlashEngine:
         )
 
     def _lazy_capture_cg(self) -> None:
-        """Capture draft CUDA Graph after KV cache is populated.
-
-        Verify CG disabled: after SWA window fix (verify_ring used nkv-window
-        instead of kv_len-window+1, missing 15 tokens), eager verify achieves
-        55% acceptance / 60.6 tok/s at 64K — better than CG verify (34% / 38).
-        Eager is also 43-63ms faster per forward at 128K (191ms vs 249ms).
-        Draft CG kept: 6.5ms replay vs ~15ms eager (6-layer SWA model).
-        """
-        self._verify_cg = None
-        try:
-            from runtime.backends.laguna_dflash_cudagraph import DFlashDraftCudaGraph
-            dcg = DFlashDraftCudaGraph(self)
-            dcg.capture()
-            self._draft_cg = dcg
-            logger.info("DFlash: draft CUDA Graph captured (lazy)")
-        except Exception as e:
-            logger.warning("DFlash: draft CG failed: %s", e)
+        """Compatibility hook for engines initialized without an eager capture."""
+        if self._draft_cg is None:
+            self._capture_draft_cg()
         self._cg_captured = True
 
     def generate(

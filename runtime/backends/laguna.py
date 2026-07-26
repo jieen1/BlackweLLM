@@ -53,6 +53,57 @@ def _physical_slot(slot: int) -> int:
     return slot + RESERVED_PHYSICAL_SLOTS
 
 
+def _prefill_chunk_ranges(
+    start: int,
+    end: int,
+    chunk_tokens: int,
+    *,
+    min_final_tokens: int = 0,
+) -> list[tuple[int, int]]:
+    """Partition ``[start, end)`` while keeping the final chunk large enough.
+
+    DFlash reconstructs its sliding-window KV from the aux hidden states
+    returned for the final prefill chunk.  A short modulo remainder would
+    otherwise leave part of that window uninitialized.
+    """
+    if start < 0 or end < start:
+        raise ValueError(f"invalid prefill range [{start}, {end})")
+    if chunk_tokens <= 0:
+        raise ValueError(f"chunk_tokens must be positive, got {chunk_tokens}")
+    if min_final_tokens < 0 or min_final_tokens > chunk_tokens:
+        raise ValueError(
+            "min_final_tokens must be in [0, chunk_tokens], got "
+            f"{min_final_tokens} for chunk_tokens={chunk_tokens}"
+        )
+    if start == end:
+        return []
+
+    ranges = [
+        (chunk_start, min(chunk_start + chunk_tokens, end))
+        for chunk_start in range(start, end, chunk_tokens)
+    ]
+    if len(ranges) < 2 or min_final_tokens == 0:
+        return ranges
+
+    final_start, final_end = ranges[-1]
+    final_len = final_end - final_start
+    if final_len >= min_final_tokens:
+        return ranges
+
+    previous_start, previous_end = ranges[-2]
+    deficit = min_final_tokens - final_len
+    new_boundary = previous_end - deficit
+    if new_boundary <= previous_start:
+        raise ValueError(
+            "cannot reserve the requested final prefill tail: "
+            f"range=[{start}, {end}), chunk_tokens={chunk_tokens}, "
+            f"min_final_tokens={min_final_tokens}"
+        )
+    ranges[-2] = (previous_start, new_boundary)
+    ranges[-1] = (new_boundary, final_end)
+    return ranges
+
+
 class LagunaBackend:
     """Direct model runner for Laguna-S-2.1-NVFP4.
 
@@ -1000,8 +1051,13 @@ class LagunaBackend:
         window = self._swa_window
 
         all_logits = None
-        for chunk_start in range(0, prompt_len, chunk_tokens):
-            chunk_end = min(chunk_start + chunk_tokens, prompt_len)
+        chunk_ranges = _prefill_chunk_ranges(
+            0,
+            prompt_len,
+            chunk_tokens,
+            min_final_tokens=window,
+        )
+        for chunk_start, chunk_end in chunk_ranges:
             chunk = prompt_ids[chunk_start:chunk_end]
             chunk_len = len(chunk)
 
@@ -1141,8 +1197,13 @@ class LagunaBackend:
             window = self._swa_window
             aux = None
 
-            for chunk_start in range(0, prompt_len, PREFILL_CHUNK):
-                chunk_end = min(chunk_start + PREFILL_CHUNK, prompt_len)
+            chunk_ranges = _prefill_chunk_ranges(
+                0,
+                prompt_len,
+                PREFILL_CHUNK,
+                min_final_tokens=window,
+            )
+            for chunk_start, chunk_end in chunk_ranges:
                 chunk = prompt_ids[chunk_start:chunk_end]
                 chunk_len = len(chunk)
                 is_last = chunk_end == prompt_len
@@ -1587,8 +1648,13 @@ class LagunaBackend:
             aux = None
             logits = None
 
-            for chunk_start in range(start_pos, prompt_len, PREFILL_CHUNK):
-                chunk_end = min(chunk_start + PREFILL_CHUNK, prompt_len)
+            chunk_ranges = _prefill_chunk_ranges(
+                start_pos,
+                prompt_len,
+                PREFILL_CHUNK,
+                min_final_tokens=window,
+            )
+            for chunk_start, chunk_end in chunk_ranges:
                 chunk = prompt_ids[chunk_start:chunk_end]
                 chunk_len = len(chunk)
                 is_last = chunk_end == prompt_len

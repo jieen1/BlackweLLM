@@ -1,7 +1,7 @@
 """CUDA Graph wrapper for DFlash speculative decoding.
 
 The legacy verify graph still has a FlashInfer implementation below, but the
-active DFlash draft graph uses Sparkinfer's paged-extend CUDA-graph path.
+active DFlash draft graph uses Sparkinfer's paged-verify CUDA-graph path.
 
 Per speculative step:
 1. Main decode (M=1): LagunaCudaGraphDecode (existing)
@@ -327,9 +327,16 @@ class DFlashVerifyCudaGraph:
 class DFlashDraftCudaGraph:
     """CUDA Graph for draft model forward (M=16).
 
-    Draft model has 6 SWA layers (window=512). It uses the same Sparkinfer
-    paged-extend graph path as the main-model verify graph, with a ring KV
-    cache and no FlashInfer metadata or planning in the active graph path.
+    Draft model has 6 SWA layers (window=512). It uses Sparkinfer's
+    paged-verify graph path with a ring KV cache and no FlashInfer metadata or
+    planning in the active graph path.
+
+    Although this forward belongs to the draft model, its attention shape is
+    a 16-token verification-style query.  Sparkinfer's ``extend`` graph plan
+    freezes a non-split schedule from the capture-time KV length; replaying it
+    against the shorter, ring-relative runtime lengths produces incorrect
+    attention.  ``verify`` keeps the graph schedule valid across those
+    changing lengths.
     """
 
     def __init__(self, engine) -> None:
@@ -364,7 +371,7 @@ class DFlashDraftCudaGraph:
         self._captured = False
 
     def _init_workspace(self) -> None:
-        """Create a fixed-address Sparkinfer extend workspace for draft CG."""
+        """Create a fixed-address Sparkinfer verify workspace for draft CG."""
         from sparkinfer.attention.paged.planner import create_paged_plan
         from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
         from runtime.backends.dflash_constants import (
@@ -392,7 +399,7 @@ class DFlashDraftCudaGraph:
         )
         v_cache = torch.zeros_like(k_cache)
         workspace = PagedAttentionWorkspace.for_tensors(
-            mode="extend",
+            mode="verify",
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
@@ -413,7 +420,7 @@ class DFlashDraftCudaGraph:
             capture_page_table,
             capture_cache_seqlens,
             self._cu_seqlens_q,
-            mode="extend",
+            mode="verify",
             enable_cuda_graph=True,
             window_left=DRAFT_WINDOW - 1,
         )
@@ -531,7 +538,7 @@ class DFlashDraftCudaGraph:
 
             self._graph = graph
             self._captured = True
-            logger.info("DFlash draft CUDA Graph captured (sparkinfer extend)")
+            logger.info("DFlash draft CUDA Graph captured (sparkinfer verify)")
         finally:
             # Replay executes the captured graph directly. Restore the eager
             # Sparkinfer implementation so any fallback remains valid.

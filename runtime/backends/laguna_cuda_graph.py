@@ -470,6 +470,11 @@ class LagunaCudaGraphVerify:
     Captures the full model forward with 16 tokens (1 bonus + 15 draft).
     Per-step: update input_ids, positions, page_table, cache_seqlens, slot_mapping.
     Returns logits (16 × vocab) + aux hidden states.
+
+    The graph uses the non-split extend planner even though this is logically a
+    verification forward.  Its KV length and SWA ring alignment change on each
+    replay; the split verify planner captures a length-specific worklist, while
+    the extend kernel reads the runtime metadata inside a fixed query worklist.
     """
 
     def __init__(self, backend: "LagunaBackend", num_tokens: int = 16) -> None:
@@ -490,7 +495,7 @@ class LagunaCudaGraphVerify:
         self._positions = torch.zeros(num_tokens, dtype=torch.long, device=self.device)
         self._slot_mapping = torch.zeros(num_tokens, dtype=torch.long, device=self.device)
 
-        # Per-group extend workspaces
+        # Per-group extend workspaces for the logical verify forward
         self._extend_workspaces: dict[tuple, Any] = {}
         self._page_tables: dict[tuple, torch.Tensor] = {}
         self._cache_seqlens: dict[tuple, torch.Tensor] = {}
@@ -760,17 +765,18 @@ class _SparkinferCGExtendMetadata:
 
 class _SparkinferCGExtendImpl:
     """Attention impl that dispatches to CG extend workspace.
-    
-    Creates the binding on first forward call (warmup), then reuses it
-    for CG capture and replay. The binding references fixed-address tensors
-    so it remains valid across replays.
+
+    Rebuilds the binding as warmup tensors move, then captures the binding
+    backed by the graph-private fixed-address tensors used during replay.
     """
 
     def __init__(self, workspace, num_tokens: int):
         self._ws = workspace
         self._num_tokens = num_tokens
         self._binding = None
-        self._descale = None
+        self._binding_signature = None
+        self._k_descale = None
+        self._v_descale = None
         self.kv_cache_dtype = "fp8_e4m3"
         self.supports_quant_query_input = False
 
@@ -798,10 +804,8 @@ class _SparkinferCGExtendImpl:
             value_cache = value_cache.view(torch.float8_e4m3fn)
         out = output[:num_actual_tokens]
 
-        if self._binding is None:
-            from sparkinfer.attention.paged._scratch import build_paged_attention_binding
-            from runtime.backends.laguna_sparkinfer_attn import _paged_descale
-
+        from runtime.backends.laguna_sparkinfer_attn import _paged_descale
+        if self._k_descale is None:
             self._k_descale = _paged_descale(
                 layer._k_scale,
                 batch_size=1,
@@ -812,12 +816,7 @@ class _SparkinferCGExtendImpl:
                 batch_size=1,
                 num_kv_heads=int(value_cache.shape[2]),
             ).clone()
-            self._binding = build_paged_attention_binding(
-                scratch=self._ws, q=q, k_cache=key_cache, v_cache=value_cache,
-                output=out, k_descale=self._k_descale, v_descale=self._v_descale)
         else:
-            from runtime.backends.laguna_sparkinfer_attn import _paged_descale
-
             self._k_descale.copy_(_paged_descale(
                 layer._k_scale,
                 batch_size=1,
@@ -828,6 +827,25 @@ class _SparkinferCGExtendImpl:
                 batch_size=1,
                 num_kv_heads=int(value_cache.shape[2]),
             ))
+
+        # Model warmup forwards allocate fresh Q/output tensors.  The binding
+        # holds their raw addresses, so caching the first warmup binding makes
+        # the captured graph read and write stale buffers.  Rebind when capture
+        # moves tensors into the graph-private memory pool (or whenever any
+        # bound tensor address changes).
+        binding_signature = (
+            q.data_ptr(),
+            key_cache.data_ptr(),
+            value_cache.data_ptr(),
+            out.data_ptr(),
+        )
+        if self._binding is None or binding_signature != self._binding_signature:
+            from sparkinfer.attention.paged._scratch import build_paged_attention_binding
+
+            self._binding = build_paged_attention_binding(
+                scratch=self._ws, q=q, k_cache=key_cache, v_cache=value_cache,
+                output=out, k_descale=self._k_descale, v_descale=self._v_descale)
+            self._binding_signature = binding_signature
 
         from sparkinfer.attention.paged._forward import paged_attention_forward
         paged_attention_forward(binding=self._binding)

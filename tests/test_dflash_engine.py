@@ -218,3 +218,38 @@ class TestRingBlocksForDraft:
         total_per_slot = blocks * bytes_per_block * DRAFT_NUM_LAYERS
         mb_per_slot = total_per_slot / (1024 * 1024)
         assert 10 < mb_per_slot < 20, f"Draft KV per slot: {mb_per_slot:.1f} MB"
+
+
+class TestPrefillChunkRanges:
+    """The final aux chunk must cover the complete draft SWA window."""
+
+    def _ranges(self, prompt_len, chunk_tokens=8192, window=DRAFT_WINDOW):
+        from runtime.backends.laguna import _prefill_chunk_ranges
+
+        return _prefill_chunk_ranges(
+            0,
+            prompt_len,
+            chunk_tokens,
+            min_final_tokens=window,
+        )
+
+    def test_aligned_prompt_keeps_full_final_chunk(self):
+        ranges = self._ranges(65536)
+        assert ranges[-1] == (57344, 65536)
+
+    def test_short_remainder_is_borrowed_from_previous_chunk(self):
+        ranges = self._ranges(65568)
+        assert ranges[-2] == (57344, 65056)
+        assert ranges[-1] == (65056, 65568)
+        assert ranges[-1][1] - ranges[-1][0] == DRAFT_WINDOW
+
+    def test_remainder_at_window_boundary_is_unchanged(self):
+        ranges = self._ranges(65536 + DRAFT_WINDOW)
+        assert ranges[-1] == (65536, 65536 + DRAFT_WINDOW)
+
+    def test_ranges_are_contiguous_and_bounded(self):
+        ranges = self._ranges(65537)
+        assert ranges[0][0] == 0
+        assert ranges[-1][1] == 65537
+        assert all(left[1] == right[0] for left, right in zip(ranges, ranges[1:]))
+        assert all(0 < end - start <= 8192 for start, end in ranges)

@@ -226,3 +226,101 @@ Matches: 16/16
    - 如果 logits 一致但 token 不同 → 是混沌效应（微小差异放大），需要提高 draft 模型鲁棒性
 2. **vLLM A/B at 64K**：用 vLLM (Marlin) 跑同一 prompt 同一参数，确认 vLLM 的接受率
 3. **Draft 模型质量**：检查 draft 在 64K 下的 aux hidden states 是否与 4K 一致
+
+## 2026-07-26 最终根因与修复（以本节覆盖前述“数值漂移”结论）
+
+前述“64K 固有约 20% 接受率”“`TheOkay` 是长期退化的模型真实行为”
+以及“根因是 Marlin/FlashInfer 与 Sparkinfer 数值漂移”的判断均不成立。
+这些判断混用了 eager、draft Graph 和 verify Graph 路径，并且只比较了
+argmax，没有控制 CUDA Graph binding 的地址生命周期。
+
+### 当前 eager 基线
+
+严格状态机、同一 64K token prompt、256 个输出 token：
+
+```text
+QSR_DFLASH_CUDA_GRAPH=0 ... /home/bot/.venvs/vllm/bin/python \
+  /tmp/test_acceptance_repro.py 65536 256
+
+acceptance_rate=87.0%
+tokens_per_step=13.42
+tok_per_s=44.6
+num_steps=19
+```
+
+逐轮 eager 诊断同样得到 `263/300 = 87.7%`。Round 2 的 token 边界差异
+只造成一次局部拒绝，后续立即恢复；不存在 Round 8 后持续崩塌。
+
+### 真正根因：CUDA Graph attention binding 指向 warmup 临时地址
+
+`_SparkinferCGExtendImpl` 在第一次 warmup forward 时创建并永久缓存
+attention binding。binding 内保存 Q/K/V/output 裸地址，但模型后续 warmup
+以及正式 graph capture 会重新分配 Q/output，进入 graph-private memory pool。
+因此被捕获的 kernel 仍从第一次 warmup 的废弃 Q 地址读取，并写往废弃
+output 地址。
+
+故障证据（修复前，64K、256 token，生产路径为 eager verify + draft Graph）：
+
+```text
+acceptance_rate=0.13%
+tokens_per_step=1.02
+num_steps=250
+```
+
+修复：binding key 记录 Q/K/V/output 的 `data_ptr()`；任一地址变化时重新
+构建 binding，使正式 capture 使用 graph-private buffer。CPU 回归测试覆盖
+“相同地址复用、Q/output 移动后必须重绑”。
+
+修复后，64K、256 token、eager verify + draft CUDA Graph：
+
+```text
+acceptance_rate=86.0%
+tokens_per_step=13.42
+tok_per_s=46.96
+num_steps=19
+```
+
+与 eager 的 87.0% 基本一致，且 Round 8 后保持正常。
+
+### 主模型 verify Graph 暂不启用
+
+地址修复后又分别实测了主模型 verify Graph 的两个 planner：
+
+| verify Graph planner | 64K / 256 token 接受率 | 结论 |
+|---|---:|---|
+| `verify`（split KV） | 23.8% | 长序列跨 page 后退化 |
+| `extend`（non-split） | 25.1% | 长序列跨 page 后退化 |
+
+Sparkinfer 当前只为 decode Graph 提供基于运行时 `cache_seqlens` 的 schedule
+更新。qo=16 的 SWA verify Graph 捕获固定 worklist；ring 的相对
+`cache_seqlens` 会随 `kv_len % 64` 在 528..591 之间变化，跨 page 后捕获的
+window/worklist 不再匹配。短样本（5 steps）正常不能证明长样本正确。
+
+生产策略因此改为：
+
+- DFlash draft forward：CUDA Graph（已验证 64K 正确）；
+- main verify forward：eager Sparkinfer；
+- 不再让首请求进入不安全的 main verify Graph；
+- draft Graph 在引擎初始化、任何请求占用 slot 之前捕获，避免延迟捕获污染
+  prefix-cache slot。
+
+主 verify Graph 的后续正确修法是给 Sparkinfer qo>1 graph replay 增加
+运行时 worklist/window metadata updater；在该能力完成前不得仅凭短样本
+重新启用。
+
+### 同期修复：chunked prefill 的 draft KV 尾窗不完整
+
+`prefill_with_aux()` 只返回最后一个 chunk 的 aux。若 prompt 长度对 8192
+取模后余数小于 DFlash SWA window=512（例如 65568 的最后 chunk 只有 32
+token），清空 draft KV 后只能重建 32 个位置。chunk 划分现会从前一 chunk
+借 token，保证最后 aux chunk 至少覆盖完整 512-token 窗口。
+
+CPU 验证：
+
+```text
+CUDA_VISIBLE_DEVICES='' /home/bot/.venvs/vllm/bin/python -m pytest -q \
+  tests/test_laguna_sparkinfer_attn.py tests/test_dflash_engine.py \
+  tests/test_mtp_accept.py
+
+34 passed
+```
