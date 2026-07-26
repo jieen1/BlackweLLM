@@ -669,6 +669,10 @@ class DirectModelRunner:
         # unless `--baseline-flashinfer` is passed) -- so this is a
         # same-kernel, different-launch-configuration gap, not a
         # different-kernel confound.
+        # NOTE: 32 was tuned when SM count was believed to be 132.
+        # Actual SM120 has 188 SMs → 32×4KVH=128 CTAs fills only 68%.
+        # Optimal ≈ 188/4 = 47 splits. Re-sweep needed (legacy path only;
+        # Laguna/sparkinfer queries SM count dynamically and is unaffected).
         _DECODE_TARGET_SPLITS_PER_REQ = 32
         capacity = self.blocks_per_slot * self.block_size
         self.decode_fixed_kv_split_size = max(1, -(-capacity // _DECODE_TARGET_SPLITS_PER_REQ))

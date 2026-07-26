@@ -30,7 +30,7 @@ head_dim=256, FP8 KV cache, paged layout).
 
 - **Custom SM120 CUDA attention kernel** — 16-byte `cp.async` vectorized
   loads, 272-byte aligned shared memory strides, split-K parallelism
-  (32 splits/request) tuned for SM120's 132 SMs
+  (32 splits/request) tuned for SM120's 188 SMs
 - **FP8 (e4m3) KV cache** — halves KV memory vs FP16, enabling 256K
   context on a single 96 GB GPU
 - **MTP speculative decoding (K=3)** — leverages Qwen3.6's built-in
@@ -50,7 +50,7 @@ head_dim=256, FP8 KV cache, paged layout).
 
 ## Performance
 
-All measurements on **RTX PRO 6000 Blackwell Max-Q** (96 GB, 132 SMs),
+All measurements on **RTX PRO 6000 Blackwell Max-Q** (96 GB, 188 SMs),
 Qwen3.6-27B-NVFP4, FP8 KV cache, MTP K=3, CUDA Graph enabled.
 
 ### Decode Throughput (accepted tokens/s, warm prefix cache)
@@ -374,7 +374,7 @@ BlackweLLM 是一个专为 NVIDIA Blackwell（SM120）GPU 打造的全栈推理�
 
 ### 性能数据
 
-测试环境：RTX PRO 6000 Blackwell Max-Q（96GB，132 SMs）
+测试环境：RTX PRO 6000 Blackwell Max-Q（96GB，188 SMs）
 
 | 上下文 | 并发 | 吞吐量（warm） |
 |--------|------|----------------|

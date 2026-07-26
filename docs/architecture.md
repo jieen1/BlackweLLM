@@ -35,7 +35,7 @@
 
 | 维度 | 固定范围 |
 |---|---|
-| GPU | 单张 RTX PRO 6000 Blackwell（SM120，CC 12.0，96 GB，132 SMs） |
+| GPU | 单张 RTX PRO 6000 Blackwell（SM120，CC 12.0，96 GB，188 SMs） |
 | 模型 | `Qwen3.6-27B`（NVFP4 量化权重） |
 | 模型结构 | 64 层混合架构 = 16 层 full attention + 48 层 GDN（Gated DeltaNet 线性注意力）；GQA 24:4，head_dim 256 |
 | 并发 | 1 – 4 个请求（面向多 coding agent 场景） |
@@ -82,7 +82,7 @@ flowchart TB
         v2["SM120GQABackend<br/>自研 decode attention kernel"]
         v3["GDN / FLA kernels<br/>NVFP4 GEMM"]
     end
-    gpu["RTX PRO 6000 Blackwell · 96 GB · 132 SMs"]
+    gpu["RTX PRO 6000 Blackwell · 96 GB · 188 SMs"]
     clients --> api --> fmt --> eng --> rt --> lib --> gpu
 ```
 
@@ -439,7 +439,7 @@ Decode attention 单步延迟（128K context · batch=4 · GQA 24→4 · head_di
 | **BlackweLLM（自研 SM120 kernel）** | **0.988 ms** | **1.56×** |
 | FlashInfer（通用 kernel） | 1.540 ms | 1.00× |
 
-1.56× 加速来自 SM120 专有优化：16 字节 cp.async 向量化加载 · 272 字节对齐 shared memory stride · 每请求 32 路 split-K（匹配 132 SMs）。仅在同条件下对比 kernel 级延迟，不做端到端跨框架吞吐对比。
+1.56× 加速来自 SM120 专有优化：16 字节 cp.async 向量化加载 · 272 字节对齐 shared memory stride · 每请求 32 路 split-K（匹配 188 SMs）。仅在同条件下对比 kernel 级延迟，不做端到端跨框架吞吐对比。
 
 端到端吞吐（warm 前缀缓存，已确认 token）：**222 tok/s**（128K × 4 并发）、**267 tok/s**（64K × 4 并发）。
 
