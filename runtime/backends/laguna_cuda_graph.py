@@ -537,7 +537,7 @@ class LagunaCudaGraphVerify:
                                   dtype=torch.float8_e4m3fn, device=self.device)
 
             ws = PagedAttentionWorkspace.for_tensors(
-                mode="extend", q=q, k_cache=k_cache, v_cache=v_cache,
+                mode="verify", q=q, k_cache=k_cache, v_cache=v_cache,
                 use_cuda_graph=True)
 
             # Create CG-compatible plan at max context
@@ -547,7 +547,7 @@ class LagunaCudaGraphVerify:
 
             plan = create_paged_plan(
                 q, k_cache, v_cache, page_table, cache_seqlens, self._cu_seqlens_q,
-                mode="extend", enable_cuda_graph=True, window_left=wl)
+                mode="verify", enable_cuda_graph=True, window_left=wl)
             ws._ensure_capacity(plan)
             ws._copy_runtime_metadata(page_table, cache_seqlens, self._cu_seqlens_q)
             ws._copy_plan_metadata(plan)

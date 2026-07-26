@@ -381,7 +381,7 @@ class DFlashEngine:
 
         if self._use_cuda_graph:
             self._capture_draft_cg()
-            if os.environ.get("QSR_VERIFY_CUDA_GRAPH", "0") == "1":
+            if os.environ.get("QSR_VERIFY_CUDA_GRAPH", "1") == "1":
                 self._capture_verify_cg()
             self._cg_captured = True
 
