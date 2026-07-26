@@ -1,0 +1,38 @@
+{
+  "date": "2026-07-27T00:43:14",
+  "test": "M=1 decode CG (NO DFlash)",
+  "config": {
+    "ctx": 65536,
+    "block_size": 64,
+    "gpu_util": 0.92,
+    "max_new": 128,
+    "suffix_len": 10240
+  },
+  "mem_load_gib": 72.0,
+  "warmup_prefill_s": 308.2,
+  "rounds": [
+    {
+      "round": 1,
+      "prefill_s": 103.929,
+      "step_ms": 12.84,
+      "tok_s": 77.9,
+      "mem_gib": 76.7
+    },
+    {
+      "round": 2,
+      "prefill_s": 15.303,
+      "step_ms": 13.03,
+      "tok_s": 76.7,
+      "mem_gib": 76.7
+    },
+    {
+      "round": 3,
+      "prefill_s": 15.781,
+      "step_ms": 12.85,
+      "tok_s": 77.8,
+      "mem_gib": 76.7
+    }
+  ],
+  "avg_tok_s": 77.5,
+  "avg_step_ms": 12.91
+}
