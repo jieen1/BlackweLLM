@@ -112,8 +112,9 @@ class SparkinferPrefillWorkspace:
         window_left: int = -1,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
+        mode: str = "extend",
     ) -> None:
-        """Run extend-mode attention (prefill)."""
+        """Run extend/verify-mode attention (prefill or speculative verify)."""
         from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
         from sparkinfer.attention.paged.planner import create_paged_plan
         from sparkinfer.attention.paged._forward import paged_attention_forward
@@ -125,7 +126,7 @@ class SparkinferPrefillWorkspace:
             v_descale = self._descale
 
         ws = PagedAttentionWorkspace.for_tensors(
-            mode="extend", q=q, k_cache=k_cache, v_cache=v_cache, use_cuda_graph=False
+            mode=mode, q=q, k_cache=k_cache, v_cache=v_cache, use_cuda_graph=False
         )
 
         plan = create_paged_plan(
@@ -135,7 +136,7 @@ class SparkinferPrefillWorkspace:
             page_table,
             cache_seqlens,
             cu_seqlens_q,
-            mode="extend",
+            mode=mode,
             enable_cuda_graph=False,
             window_left=window_left,
         )
@@ -404,5 +405,6 @@ class SparkinferAttentionImpl:
             window_left=attn_metadata.window_left,
             k_descale=k_descale,
             v_descale=v_descale,
+            mode=getattr(attn_metadata, "mode", "extend"),
         )
         return output

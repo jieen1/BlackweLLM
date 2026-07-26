@@ -624,7 +624,7 @@ class LagunaBackend:
             causal=True,
         )
 
-    def _build_sparkinfer_metadata(self, common_meta, window_left: int = -1):
+    def _build_sparkinfer_metadata(self, common_meta, window_left: int = -1, mode: str | None = None):
         """Convert CommonAttentionMetadata to SparkinferAttnMetadata."""
         from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
 
@@ -634,8 +634,10 @@ class LagunaBackend:
         query_start_loc = common_meta.query_start_loc  # GPU [num_reqs+1]
         num_actual_tokens = common_meta.num_actual_tokens
 
+        if mode is None:
+            mode = "extend" if num_actual_tokens > num_reqs else "decode"
         return SparkinferAttnMetadata(
-            mode="extend" if num_actual_tokens > num_reqs else "decode",
+            mode=mode,
             page_table=block_table.int(),
             cache_seqlens=seq_lens.int(),
             cu_seqlens_q=query_start_loc.int(),

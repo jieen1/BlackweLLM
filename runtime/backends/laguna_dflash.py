@@ -1251,11 +1251,11 @@ class DFlashEngine:
         from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
         attn_metadata_dict = {}
         slot_mapping_dict = {}
-        full_spark_meta = backend._build_sparkinfer_metadata(full_meta, window_left=-1)
+        full_spark_meta = backend._build_sparkinfer_metadata(full_meta, window_left=-1, mode="verify")
         swa_spark_meta = None
         if swa_meta is not None:
             swa_wl = backend._swa_window - 1 if backend._swa_window > 0 else -1
-            swa_spark_meta = backend._build_sparkinfer_metadata(swa_meta, window_left=swa_wl)
+            swa_spark_meta = backend._build_sparkinfer_metadata(swa_meta, window_left=swa_wl, mode="verify")
         for group_key, layer_names in backend._layer_groups.items():
             wl = group_key[0]
             is_swa = wl >= 0
