@@ -365,8 +365,10 @@ class DFlashEngine:
 
         The draft graph has a fixed 16-token query shape and is safe across
         ring-relative KV lengths after address-aware rebinding.  Main-model
-        verify remains eager: Sparkinfer does not yet update qo=16 graph
-        worklists when SWA ring alignment changes at a page boundary.
+        verify CG uses sparkinfer's update_prefill_graph_replay_metadata to
+        recompute the worklist (block_valid_mask, kv_chunk_size,
+        window_start_tokens) on each replay, fixing the stale-worklist bug
+        that previously caused acceptance collapse at SWA page boundaries.
         """
         self._verify_cg = None
         self._draft_cg = None
@@ -374,10 +376,12 @@ class DFlashEngine:
 
         if self._use_cuda_graph:
             self._capture_draft_cg()
+            if os.environ.get("QSR_VERIFY_CUDA_GRAPH", "1") == "1":
+                self._capture_verify_cg()
             self._cg_captured = True
 
     def _capture_verify_cg(self) -> None:
-        """Experimental main-model verify graph; not enabled in production."""
+        """Capture main-model verify graph (M=16 extend planner with runtime worklist update)."""
         from runtime.backends.laguna_cuda_graph import LagunaCudaGraphVerify
 
         try:

@@ -659,12 +659,19 @@ class LagunaCudaGraphVerify:
             pos = kv_len + j
             self._slot_mapping[j] = (full_base + pos // bs) * bs + pos % bs
 
-        # Copy runtime metadata to workspaces
+        # Update runtime metadata AND worklist for CG replay.
+        # update_prefill_graph_replay_metadata copies page_table/cache_seqlens
+        # then runs a Triton kernel to recompute block_valid_mask,
+        # kv_chunk_size, and window_start_tokens from the new KV lengths.
+        # Without this, the worklist stays frozen at capture-time values
+        # and SWA ring alignment changes produce wrong attention output.
         for group_key, ws in self._extend_workspaces.items():
-            ws._copy_runtime_metadata(
+            wl = group_key[0]
+            ws.update_prefill_graph_replay_metadata(
                 self._page_tables[group_key],
                 self._cache_seqlens[group_key],
-                self._cu_seqlens_q)
+                self._cu_seqlens_q,
+                window_left=wl)
 
     def capture(self) -> None:
         """Warmup → capture the verify forward."""
