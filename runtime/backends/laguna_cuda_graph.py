@@ -608,7 +608,15 @@ class LagunaCudaGraphVerify:
         self._patch_impls_for_cg()
 
     def _fill_buffers(self, slot: int, token_ids: list[int], kv_len: int) -> None:
-        """Fill input buffers for verify replay."""
+        """Fill input buffers for verify replay.
+
+        Vectorized (was a per-element Python loop writing up to
+        blocks_per_slot ~1024 scalar tensor elements per replay at 64K
+        context -- torch.profiler showed this alone as ~1100 aten::copy_
+        calls / ~180ms of CPU dispatch overhead per replay, dwarfing the
+        ~40ms of actual GPU kernel time. See notes/2026-07-27-dflash-
+        profiling-and-optimization.md.
+        """
         backend = self.backend
         nt = self.num_tokens
         bs = self.block_size
@@ -616,10 +624,11 @@ class LagunaCudaGraphVerify:
         new_kv_len = kv_len + nt
 
         # Input IDs and positions
-        for i, tok in enumerate(token_ids[:nt]):
-            self._input_ids[i] = tok
-        for i in range(nt):
-            self._positions[i] = kv_len + i
+        self._input_ids[:nt] = torch.tensor(
+            token_ids[:nt], dtype=self._input_ids.dtype, device=self.device
+        )
+        pos_range = torch.arange(kv_len, kv_len + nt, dtype=torch.long, device=self.device)
+        self._positions[:nt] = pos_range
 
         # Full-attention: page table and slot mapping
         full_base = phys * self.blocks_per_slot
@@ -637,28 +646,26 @@ class LagunaCudaGraphVerify:
                 aligned_len = new_kv_len - aligned_start
                 n_ring = min(-(-aligned_len // bs), self._ring_blocks_per_slot)
                 pt = self._page_tables[group_key]
-                for j in range(n_ring):
-                    actual_pos = aligned_start + j * bs
-                    ring_block = (actual_pos % ring_slots) // bs
-                    pt[0, j] = ring_base + ring_block
+                block_starts = torch.arange(
+                    aligned_start, aligned_start + n_ring * bs, bs,
+                    dtype=torch.long, device=self.device,
+                )
+                pt[0, :n_ring] = (ring_base + (block_starts % ring_slots) // bs).to(pt.dtype)
                 self._cache_seqlens[group_key][0] = aligned_len
                 # SWA slot mapping: ring-wrapped
-                for j in range(nt):
-                    pos = kv_len + j
-                    ring_block = (pos % ring_slots) // bs
-                    ring_off = pos % bs
-                    self._swa_slot_mapping[j] = (ring_base + ring_block) * bs + ring_off
+                ring_block = (pos_range % ring_slots) // bs
+                ring_off = pos_range % bs
+                self._swa_slot_mapping[:nt] = (ring_base + ring_block) * bs + ring_off
             else:
                 # Full attention: sequential blocks
                 pt = self._page_tables[group_key]
-                for j in range(n_blocks_full):
-                    pt[0, j] = full_base + j
+                pt[0, :n_blocks_full] = torch.arange(
+                    full_base, full_base + n_blocks_full, dtype=pt.dtype, device=self.device
+                )
                 self._cache_seqlens[group_key][0] = new_kv_len
 
         # Full-attention slot mapping
-        for j in range(nt):
-            pos = kv_len + j
-            self._slot_mapping[j] = (full_base + pos // bs) * bs + pos % bs
+        self._slot_mapping[:nt] = (full_base + pos_range // bs) * bs + pos_range % bs
 
         # Update runtime metadata AND worklist for CG replay.
         # update_prefill_graph_replay_metadata copies page_table/cache_seqlens

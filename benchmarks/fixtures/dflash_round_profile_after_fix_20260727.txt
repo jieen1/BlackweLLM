@@ -1,0 +1,106 @@
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'full_attention', 'sliding_attention'}
+[transformers] The tokenizer you are loading from '/home/bot/.cache/huggingface/hub/models--poolside--Laguna-S-2.1-NVFP4/snapshots/07614121b31898586430f189d27a25a0be310843/' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'full_attention', 'sliding_attention'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'full_attention', 'sliding_attention'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'full_attention', 'sliding_attention'}
+INFO 07-27 07:39:34 [model.py:619] Resolved architecture: LagunaForCausalLM
+INFO 07-27 07:39:34 [model.py:1776] Using max model len 67840
+INFO 07-27 07:39:34 [scheduler.py:252] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 07-27 07:39:34 [vllm.py:1089] Asynchronous scheduling is enabled.
+WARNING 07-27 07:39:34 [vllm.py:1143] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 07-27 07:39:34 [vllm.py:1191] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 07-27 07:39:34 [kernel.py:292] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 07-27 07:39:34 [vllm.py:1370] Cudagraph is disabled under eager mode
+INFO 07-27 07:39:34 [compilation.py:312] Enabled custom fusions: norm_quant, act_quant
+INFO 07-27 07:39:34 [parallel_state.py:1607] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://127.0.0.1:47873 backend=nccl
+INFO 07-27 07:39:35 [parallel_state.py:1942] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+INFO 07-27 07:39:36 [cuda.py:476] Using FLASHINFER attention backend out of potential backends: ['FLASHINFER', 'TRITON_ATTN'].
+INFO 07-27 07:39:36 [nvfp4.py:285] Using 'FLASHINFER_CUTLASS' NvFp4 MoE backend out of potential backends: ['FLASHINFER_TRTLLM', 'FLASHINFER_CUTEDSL', 'FLASHINFER_CUTEDSL_BATCHED', 'FLASHINFER_CUTLASS', 'VLLM_CUTLASS', 'MARLIN', 'HUMMING', 'EMULATION'].
+INFO 07-27 07:39:37 [weight_utils.py:849] Filesystem type for checkpoints: EXT4. Checkpoint size: 66.98 GiB. Available RAM: 19.87 GiB.
+INFO 07-27 07:39:37 [weight_utils.py:879] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre) and the checkpoint size (66.98 GiB) exceeds 90% of available RAM (19.87 GiB).
+Loading safetensors checkpoint shards:   0% Completed | 0/15 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:   7% Completed | 1/15 [00:02<00:41,  2.99s/it]
+Loading safetensors checkpoint shards:  13% Completed | 2/15 [00:07<00:49,  3.79s/it]
+Loading safetensors checkpoint shards:  20% Completed | 3/15 [00:12<00:55,  4.59s/it]
+Loading safetensors checkpoint shards:  27% Completed | 4/15 [00:18<00:54,  4.94s/it]
+Loading safetensors checkpoint shards:  33% Completed | 5/15 [00:23<00:49,  4.99s/it]
+Loading safetensors checkpoint shards:  40% Completed | 6/15 [00:27<00:42,  4.70s/it]
+Loading safetensors checkpoint shards:  47% Completed | 7/15 [00:32<00:37,  4.73s/it]
+Loading safetensors checkpoint shards:  53% Completed | 8/15 [00:37<00:33,  4.80s/it]
+Loading safetensors checkpoint shards:  60% Completed | 9/15 [00:42<00:29,  4.88s/it]
+Loading safetensors checkpoint shards:  67% Completed | 10/15 [00:47<00:24,  4.92s/it]
+Loading safetensors checkpoint shards:  73% Completed | 11/15 [00:52<00:19,  4.95s/it]
+Loading safetensors checkpoint shards:  80% Completed | 12/15 [00:57<00:14,  4.90s/it]
+Loading safetensors checkpoint shards:  87% Completed | 13/15 [01:01<00:09,  4.70s/it]
+Loading safetensors checkpoint shards:  93% Completed | 14/15 [01:06<00:04,  4.81s/it]
+Loading safetensors checkpoint shards: 100% Completed | 15/15 [01:06<00:00,  3.48s/it]
+Loading safetensors checkpoint shards: 100% Completed | 15/15 [01:06<00:00,  4.46s/it]
+
+INFO 07-27 07:40:44 [default_loader.py:430] Loading weights took 68.03 seconds
+INFO 07-27 07:40:44 [nvfp4.py:543] Using MoEPrepareAndFinalizeNoDPEPModular
+INFO 07-27 07:41:56 [model.py:619] Resolved architecture: DFlashLagunaForCausalLM
+INFO 07-27 07:41:56 [model.py:1776] Using max model len 262144
+INFO 07-27 07:41:56 [speculative.py:1042] Overriding draft model max model len from 262144 to 67840
+INFO 07-27 07:41:56 [model.py:619] Resolved architecture: DFlashLagunaForCausalLM
+INFO 07-27 07:41:56 [model.py:1776] Using max model len 656
+WARNING 07-27 07:41:56 [vllm.py:1143] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 07-27 07:41:56 [vllm.py:1191] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 07-27 07:41:56 [kernel.py:292] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+WARNING 07-27 07:41:56 [vllm.py:1696] max_num_scheduled_tokens is set to 256 based on the speculative decoding settings. This may lead to suboptimal performance. Consider increasing max_num_batched_tokens to accommodate the additional draft token slots, or decrease num_speculative_tokens or max_num_seqs.
+INFO 07-27 07:41:56 [vllm.py:1370] Cudagraph is disabled under eager mode
+WARNING 07-27 07:41:56 [vllm.py:1143] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 07-27 07:41:56 [vllm.py:1191] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 07-27 07:41:56 [kernel.py:292] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 07-27 07:41:56 [vllm.py:1370] Cudagraph is disabled under eager mode
+WARNING 07-27 07:41:56 [laguna.py:389] Laguna config has sliding_attention layers but neither `swa_rope_parameters` nor a nested per-layer-type `rope_parameters` — SWA layers will reuse the global rope. If the checkpoint was trained with distinct SWA rope (theta / partial_rotary_factor), regenerate its HF config to include either form.
+INFO 07-27 07:41:56 [weight_utils.py:849] Filesystem type for checkpoints: EXT4. Checkpoint size: 2.08 GiB. Available RAM: 19.90 GiB.
+INFO 07-27 07:41:56 [weight_utils.py:872] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  4.96it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  4.95it/s]
+
+INFO 07-27 07:41:58 [default_loader.py:430] Loading weights took 1.22 seconds
+prefilling...
+prefill done, capturing CG...
+CG captured: draft=True verify=True
+
+acceptance this run: 1
+{
+  "draft_replay": {
+    "mean_ms": 3.5877642472585043,
+    "min_ms": 3.21561598777771,
+    "max_ms": 4.896128177642822,
+    "n": 30
+  },
+  "verify_replay": {
+    "mean_ms": 37.82751592000326,
+    "min_ms": 36.280094146728516,
+    "max_ms": 39.93580627441406,
+    "n": 30
+  },
+  "accept_reject_sync": {
+    "mean_ms": 0.49871040185292564,
+    "min_ms": 0.35206401348114014,
+    "max_ms": 0.7353919744491577,
+    "n": 30
+  },
+  "draft_kv_precompute": {
+    "mean_ms": 0.853043203552564,
+    "min_ms": 0.48476800322532654,
+    "max_ms": 1.277951955795288,
+    "n": 30
+  },
+  "bookkeeping": {
+    "mean_ms": 0.4963573296864828,
+    "min_ms": 0.35020801424980164,
+    "max_ms": 0.6599680185317993,
+    "n": 30
+  },
+  "round_total": {
+    "mean_ms": 44.16234770033043,
+    "min_ms": 42.32448599941563,
+    "max_ms": 46.96847799641546,
+    "n": 30
+  }
+}
+[rank0]:[W727 07:42:16.486828131 ProcessGroupNCCL.cpp:1624] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())

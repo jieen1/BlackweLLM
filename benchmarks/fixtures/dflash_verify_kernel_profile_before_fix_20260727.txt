@@ -1,0 +1,126 @@
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'full_attention', 'sliding_attention'}
+[transformers] The tokenizer you are loading from '/home/bot/.cache/huggingface/hub/models--poolside--Laguna-S-2.1-NVFP4/snapshots/07614121b31898586430f189d27a25a0be310843/' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'full_attention', 'sliding_attention'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'full_attention', 'sliding_attention'}
+[transformers] Unrecognized keys in `rope_parameters` for 'rope_type'='default': {'full_attention', 'sliding_attention'}
+INFO 07-27 07:33:03 [model.py:619] Resolved architecture: LagunaForCausalLM
+INFO 07-27 07:33:03 [model.py:1776] Using max model len 67840
+INFO 07-27 07:33:03 [scheduler.py:252] Chunked prefill is enabled with max_num_batched_tokens=2048.
+INFO 07-27 07:33:03 [vllm.py:1089] Asynchronous scheduling is enabled.
+WARNING 07-27 07:33:03 [vllm.py:1143] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 07-27 07:33:03 [vllm.py:1191] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 07-27 07:33:03 [kernel.py:292] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 07-27 07:33:03 [vllm.py:1370] Cudagraph is disabled under eager mode
+INFO 07-27 07:33:03 [compilation.py:312] Enabled custom fusions: norm_quant, act_quant
+INFO 07-27 07:33:04 [parallel_state.py:1607] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://127.0.0.1:46115 backend=nccl
+INFO 07-27 07:33:04 [parallel_state.py:1942] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+INFO 07-27 07:33:05 [cuda.py:476] Using FLASHINFER attention backend out of potential backends: ['FLASHINFER', 'TRITON_ATTN'].
+INFO 07-27 07:33:05 [nvfp4.py:285] Using 'FLASHINFER_CUTLASS' NvFp4 MoE backend out of potential backends: ['FLASHINFER_TRTLLM', 'FLASHINFER_CUTEDSL', 'FLASHINFER_CUTEDSL_BATCHED', 'FLASHINFER_CUTLASS', 'VLLM_CUTLASS', 'MARLIN', 'HUMMING', 'EMULATION'].
+INFO 07-27 07:33:06 [weight_utils.py:849] Filesystem type for checkpoints: EXT4. Checkpoint size: 66.98 GiB. Available RAM: 20.12 GiB.
+INFO 07-27 07:33:06 [weight_utils.py:879] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre) and the checkpoint size (66.98 GiB) exceeds 90% of available RAM (20.12 GiB).
+Loading safetensors checkpoint shards:   0% Completed | 0/15 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards:   7% Completed | 1/15 [00:02<00:35,  2.52s/it]
+Loading safetensors checkpoint shards:  13% Completed | 2/15 [00:05<00:37,  2.88s/it]
+Loading safetensors checkpoint shards:  20% Completed | 3/15 [00:10<00:46,  3.89s/it]
+Loading safetensors checkpoint shards:  27% Completed | 4/15 [00:16<00:49,  4.51s/it]
+Loading safetensors checkpoint shards:  33% Completed | 5/15 [00:20<00:45,  4.59s/it]
+Loading safetensors checkpoint shards:  40% Completed | 6/15 [00:25<00:41,  4.61s/it]
+Loading safetensors checkpoint shards:  47% Completed | 7/15 [00:30<00:37,  4.69s/it]
+Loading safetensors checkpoint shards:  53% Completed | 8/15 [00:35<00:33,  4.72s/it]
+Loading safetensors checkpoint shards:  60% Completed | 9/15 [00:39<00:27,  4.55s/it]
+Loading safetensors checkpoint shards:  67% Completed | 10/15 [00:44<00:23,  4.68s/it]
+Loading safetensors checkpoint shards:  73% Completed | 11/15 [00:49<00:18,  4.72s/it]
+Loading safetensors checkpoint shards:  80% Completed | 12/15 [00:53<00:14,  4.73s/it]
+Loading safetensors checkpoint shards:  87% Completed | 13/15 [00:58<00:09,  4.68s/it]
+Loading safetensors checkpoint shards:  93% Completed | 14/15 [01:03<00:04,  4.76s/it]
+Loading safetensors checkpoint shards: 100% Completed | 15/15 [01:03<00:00,  3.43s/it]
+Loading safetensors checkpoint shards: 100% Completed | 15/15 [01:03<00:00,  4.25s/it]
+
+INFO 07-27 07:34:10 [default_loader.py:430] Loading weights took 65.01 seconds
+INFO 07-27 07:34:10 [nvfp4.py:543] Using MoEPrepareAndFinalizeNoDPEPModular
+INFO 07-27 07:35:20 [model.py:619] Resolved architecture: DFlashLagunaForCausalLM
+INFO 07-27 07:35:20 [model.py:1776] Using max model len 262144
+INFO 07-27 07:35:20 [speculative.py:1042] Overriding draft model max model len from 262144 to 67840
+INFO 07-27 07:35:20 [model.py:619] Resolved architecture: DFlashLagunaForCausalLM
+INFO 07-27 07:35:20 [model.py:1776] Using max model len 656
+WARNING 07-27 07:35:20 [vllm.py:1143] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 07-27 07:35:20 [vllm.py:1191] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 07-27 07:35:20 [kernel.py:292] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+WARNING 07-27 07:35:20 [vllm.py:1696] max_num_scheduled_tokens is set to 256 based on the speculative decoding settings. This may lead to suboptimal performance. Consider increasing max_num_batched_tokens to accommodate the additional draft token slots, or decrease num_speculative_tokens or max_num_seqs.
+INFO 07-27 07:35:20 [vllm.py:1370] Cudagraph is disabled under eager mode
+WARNING 07-27 07:35:20 [vllm.py:1143] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 07-27 07:35:20 [vllm.py:1191] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 07-27 07:35:20 [kernel.py:292] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['vllm_c', 'native'], fused_add_rms_norm=['vllm_c', 'native'])
+INFO 07-27 07:35:20 [vllm.py:1370] Cudagraph is disabled under eager mode
+WARNING 07-27 07:35:20 [laguna.py:389] Laguna config has sliding_attention layers but neither `swa_rope_parameters` nor a nested per-layer-type `rope_parameters` — SWA layers will reuse the global rope. If the checkpoint was trained with distinct SWA rope (theta / partial_rotary_factor), regenerate its HF config to include either form.
+INFO 07-27 07:35:20 [weight_utils.py:849] Filesystem type for checkpoints: EXT4. Checkpoint size: 2.08 GiB. Available RAM: 19.92 GiB.
+INFO 07-27 07:35:20 [weight_utils.py:872] Auto-prefetch is disabled because the filesystem (EXT4) is not a recognized network FS (NFS/Lustre). If you want to force prefetching, start vLLM with --safetensors-load-strategy=prefetch.
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  4.73it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  4.73it/s]
+
+INFO 07-27 07:35:21 [default_loader.py:430] Loading weights took 1.32 seconds
+prefilling...
+CG captured: draft=True verify=True
+warmup done, profiling...
+USDT:2026-07-27 07:35:39 704889:704889 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-07-27 07:35:42 704889:704889 SyncActivityProfilerHandler.cpp:59] profiler_stop
+
+===== TOP 40 CUDA KERNELS BY TOTAL TIME (over 10 replays) =====
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+kernel_cutlass_kernel_sparkinfermoe_sharedkernelssil...         0.00%       0.000us         0.00%       0.000us       0.000us     215.687ms        58.79%     215.687ms     458.909us           470  
+kernel_cutlass_kernel_sparkinferattentionpagedforwar...         0.00%       0.000us         0.00%       0.000us       0.000us      39.083ms        10.65%      39.083ms      81.422us           480  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_s1616...         0.00%       0.000us         0.00%       0.000us       0.000us      18.801ms         5.12%      18.801ms      38.370us           490  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us      18.572ms         5.06%      18.572ms      48.874us           380  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us       8.310ms         2.27%       8.310ms      14.085us           590  
+                                            aten::copy_         4.62%     105.777ms        79.74%        1.825s     164.560us       6.086ms         1.66%       6.088ms       0.549us         11090  
+                       Memcpy HtoD (Pageable -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us       5.995ms         1.63%       5.995ms       0.545us         11010  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_s1616...         0.00%       0.000us         0.00%       0.000us       0.000us       5.919ms         1.61%       5.919ms       6.296us           940  
+void at::native::radixSortKVInPlace<-2, -1, 32, 32, ...         0.00%       0.000us         0.00%       0.000us       0.000us       5.759ms         1.57%       5.759ms      12.252us           470  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us       3.955ms         1.08%       3.955ms     395.530us            10  
+void cutlass::Kernel2<cutlass_80_wmma_tensorop_bf16_...         0.00%       0.000us         0.00%       0.000us       0.000us       2.869ms         0.78%       2.869ms       3.020us           950  
+void cublasLt::splitKreduce_kernel<32, 16, int, floa...         0.00%       0.000us         0.00%       0.000us       0.000us       2.707ms         0.74%       2.707ms       1.893us          1430  
+void at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us       2.407ms         0.66%       2.407ms       2.534us           950  
+void vllm::moe::topkGating<8, 256, 4, 16, 32, int, f...         0.00%       0.000us         0.00%       0.000us       0.000us       2.227ms         0.61%       2.227ms       4.738us           470  
+kernel_cutlass_kernel_sparkinferattentionpagedmergeP...         0.00%       0.000us         0.00%       0.000us       0.000us       2.202ms         0.60%       2.202ms       4.588us           480  
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us       2.191ms         0.60%       2.191ms       1.166us          1880  
+                                       _rms_norm_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       2.080ms         0.57%       2.080ms       2.145us           970  
+                                          memcpy32_post         0.00%       0.000us         0.00%       0.000us       0.000us       2.037ms         0.56%       2.037ms       0.859us          2370  
+                             _fused_add_rms_norm_kernel         0.00%       0.000us         0.00%       0.000us       0.000us       1.950ms         0.53%       1.950ms       2.032us           960  
+void vllm::rotary_embedding_kernel<c10::BFloat16, c1...         0.00%       0.000us         0.00%       0.000us       0.000us       1.916ms         0.52%       1.916ms       3.992us           480  
+void at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us       1.878ms         0.51%       1.878ms       1.956us           960  
+void cublasLt::splitKreduce_kernel<32, 16, int, __nv...         0.00%       0.000us         0.00%       0.000us       0.000us       1.798ms         0.49%       1.798ms       1.893us           950  
+paged_workspace.update_prefill_graph_replay_metadata...         0.00%       0.000us         0.00%       0.000us       0.000us       1.770ms         0.48%       1.770ms      88.509us            20  
+void at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us       1.401ms         0.38%       1.401ms       1.490us           940  
+void vllm::reshape_and_cache_flash_kernel<__nv_bfloa...         0.00%       0.000us         0.00%       0.000us       0.000us       1.273ms         0.35%       1.273ms       2.652us           480  
+void at::native::index_elementwise_kernel<128, 4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       1.242ms         0.34%       1.242ms       2.642us           470  
+void at::native::index_elementwise_kernel<128, 4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       1.235ms         0.34%       1.235ms       2.628us           470  
+void at::native::index_elementwise_kernel<128, 4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       1.185ms         0.32%       1.185ms       2.521us           470  
+void at::native::elementwise_kernel<128, 4, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us       1.157ms         0.32%       1.157ms       2.411us           480  
+void at::native::vectorized_elementwise_kernel<2, at...         0.00%       0.000us         0.00%       0.000us       0.000us       1.080ms         0.29%       1.080ms       1.149us           940  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     940.986us         0.26%     940.986us       1.960us           480  
+void at::native::_scatter_gather_elementwise_kernel<...         0.00%       0.000us         0.00%       0.000us       0.000us     913.889us         0.25%     913.889us       1.944us           470  
+void at::native::vectorized_elementwise_kernel<2, at...         0.00%       0.000us         0.00%       0.000us       0.000us     792.573us         0.22%     792.573us       0.843us           940  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     772.259us         0.21%     772.259us       0.822us           940  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     719.053us         0.20%     719.053us       1.498us           480  
+kernel_cutlass_kernel_sparkinfermoe_sharedkernelsw4a...         0.00%       0.000us         0.00%       0.000us       0.000us     711.595us         0.19%     711.595us       1.514us           470  
+void at_cuda_detail::cub::detail::scan::DeviceScanKe...         0.00%       0.000us         0.00%       0.000us       0.000us     704.754us         0.19%     704.754us       1.499us           470  
+void (anonymous namespace)::elementwise_kernel_with_...         0.00%       0.000us         0.00%       0.000us       0.000us     660.639us         0.18%     660.639us       0.703us           940  
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     653.882us         0.18%     653.882us       1.362us           480  
+void at::native::unrolled_elementwise_kernel<at::nat...         0.00%       0.000us         0.00%       0.000us       0.000us     600.498us         0.16%     600.498us       1.278us           470  
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  
+Self CPU time total: 2.289s
+Self CUDA time total: 366.873ms
+
+
+===== CATEGORY ROLLUP (per single verify replay, ms) =====
+moe            :   21.954 ms/replay  ( 58.5%)
+gemm_dense     :    6.293 ms/replay  ( 16.8%)
+attention      :    4.457 ms/replay  ( 11.9%)
+other          :    3.389 ms/replay  (  9.0%)
+memcpy_memset  :    1.001 ms/replay  (  2.7%)
+norm           :    0.403 ms/replay  (  1.1%)
+TOTAL          :   37.497 ms/replay
+[rank0]:[W727 07:35:49.898426144 ProcessGroupNCCL.cpp:1624] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
