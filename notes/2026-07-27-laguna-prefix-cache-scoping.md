@@ -71,15 +71,21 @@ KV(ring buffer,SWA window)、CUDA Graph 捕获对固定地址的依赖(`laguna_c
 - 规模上比这次 session 已经做的所有事情(复现、vLLM 版本决策、sparkinfer 合并)都大,
   不适合在无人盯着的后台任务里一次性冲完,尤其是涉及 CUDA Graph 地址失效这种已经
   出过真实事故的雷区。
-- 价值取决于真实流量模式(sequential 多轮 vs 同轮 fan-out),而 Laguna 目前**连
-  这个用量数据都没有**(`server/engine.py`目前甚至没有为 Laguna 记录 prompt 前缀
-  重叠率——`DirectModelRunner`当年的 P0 之前就先加了这个埋点)。建议的第一步反而是
-  **先加埋点、看真实命中潜力有多大,再决定值不值得投入 L-P0**,而不是假设"多轮
-  对话场景一定值得做"就直接动手。
+- 价值取决于真实流量模式(sequential 多轮 vs 同轮 fan-out)。
+
+**更正(2026-07-27,同一天晚些时候)**:上面这句"Laguna 连这个用量数据都没有"是
+错的,没有仔细核实就下的结论。`server/engine.py._log_prefix_overlap`(656 行)其实
+在**共享的 `_step_sync` 准入路径**里,和后端无关——它只比较原始 prompt token
+(同轮之间 `same_round_overlap_tokens`,以及和 `self._recent_prompts` 滚动历史的
+`history_overlap_tokens`),完全不依赖 `reconcile_prefix_hit` 或任何后端专属的缓存
+机制。实测验证过:两个共享前 11 个 token 的 Laguna 请求,`/debug/stats` 正确记录
+`history_overlap_tokens: 11`。**这个埋点已经在跑,不需要新加**,建议的"先加埋点"
+这一步可以跳过,直接进入"攒一段真实流量、看 `prefix_overlap_same_round_events`/
+`prefix_overlap_history_events` 数字大不大"这一步。
 
 ## 建议的下一步(如果要推进)
 
-先做最小、最安全的一步:在 `server/engine.py` 的 Laguna 准入路径加上前缀重叠率的
-只读埋点(照抄 DirectModelRunner P0 之前用过的做法),跑一段时间真实/模拟流量,
-拿到数据再决定 L-P0 值不值得投入。这一步本身工作量很小、零行为风险,可以作为
-独立小任务先做。
+前缀重叠率埋点已经存在(见上面的更正),不需要再加。下一步是让 Laguna 后端真正
+跑一段有代表性的真实/模拟流量,观察 `/debug/stats` 的 `prefix_overlap_same_round_
+events`/`prefix_overlap_history_events` 积累的数字大不大,用真实数据决定 L-P0
+值不值得投入,而不是假设"多轮对话场景一定值得做"就直接动手。
