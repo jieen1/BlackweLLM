@@ -547,7 +547,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         created = int(time.time())
 
         async def _sse():
-            proc = StreamProcessor(engine.tok)
+            proc = StreamProcessor(engine.tok, thinking_capable=engine.backend_name == "qwen36")
             final_result = None
             first_token_t = None
             # First chunk: role announcement (matches vLLM format)
@@ -1150,7 +1150,7 @@ async def anthropic_messages(request: Request):
         import json as _json
 
         async def _anthropic_sse():
-            proc = StreamProcessor(engine.tok)
+            proc = StreamProcessor(engine.tok, thinking_capable=engine.backend_name == "qwen36")
             final_result = None
             first_token_t = None
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"

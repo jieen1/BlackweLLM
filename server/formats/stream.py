@@ -43,10 +43,15 @@ class StreamProcessor:
         visible_text, tool_calls = proc.finalize()
     """
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, thinking_capable: bool = True):
         self._tok = tokenizer
         self._all_ids: list[int] = []
-        self._thinking_done = False
+        self._thinking_capable = thinking_capable
+        # Non-thinking backends (e.g. Laguna) never emit a <think> block, so
+        # there is no thinking phase to wait through -- start "done" so
+        # drain_content() treats every token as immediately visible content
+        # instead of stalling forever waiting for a </think> that never comes.
+        self._thinking_done = not thinking_capable
         self._tool_call_started = False
         self._emitted_len = 0
         self._thinking_emitted_len = 0
@@ -74,8 +79,11 @@ class StreamProcessor:
         # Strip U+FFFD from stray byte-level BPE tokens (Qwen3.6 vocab has
         # ~14 tokens that decode to incomplete UTF-8 / replacement chars).
         decoded = decoded.replace("\ufffd", "")
-        # Prepend <think> since the chat template already injected it in the prompt
-        if not decoded.startswith(_THINK_OPEN):
+        # Prepend <think> since the chat template already injected it in the
+        # prompt -- only for thinking-capable backends. For a backend that
+        # never emits <think> at all, synthesizing one here would make every
+        # downstream "still thinking" check see it as permanently open.
+        if self._thinking_capable and not decoded.startswith(_THINK_OPEN):
             self._cached_raw = _THINK_OPEN + "\n" + decoded
         else:
             self._cached_raw = decoded
@@ -285,8 +293,9 @@ class StreamProcessor:
     def finalize(self) -> tuple[str, list[dict]]:
         """Called after stream ends. Returns (visible_text, tool_calls)."""
         raw = self._tok.decode(self._all_ids, skip_special_tokens=True)
-        # Prepend <think> for consistent processing
-        if not raw.startswith(_THINK_OPEN):
+        # Prepend <think> for consistent processing -- thinking-capable
+        # backends only (see the matching guard in _get_raw()).
+        if self._thinking_capable and not raw.startswith(_THINK_OPEN):
             raw = _THINK_OPEN + "\n" + raw
         visible = strip_thinking(raw)
         visible_text, tool_calls = parse_tool_calls(visible)

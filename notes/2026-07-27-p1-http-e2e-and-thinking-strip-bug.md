@@ -84,17 +84,38 @@ JIT 编译路径的一次性开销(本次 session 之前也见过好几次同类
 - 真实 HTTP 服务器起停正常(`QSR_SERVER_MODEL_BACKEND=laguna
   QSR_SERVER_ENABLE_CUDAGRAPH=1`,capacity=1,num_slots=2),`/health` 就绪检测正常。
 
+## 更新(同一天):流式路径的同类 bug——比最初以为的更严重,已修复
+
+深入读完 `StreamProcessor` 全部代码后发现:问题不只是 `finalize()` 一处。
+`_get_raw()` 本身就无条件给非 thinking 输出拼接 `<think>` 前缀,导致
+`drain_content()` 的"Phase 1: detect thinking completion"检查(`elif _THINK_OPEN in
+raw: return []`)因为 `_THINK_OPEN` 永远在场,对不产生 `</think>` 的模型**永远判定
+"还在思考中"**——也就是说流式增量输出(`drain_content()`)对 Laguna 从头到尾一个
+字符都不会吐出来,不是只有收尾的 `finalize()` 出问题。`drain_thinking()` 倒是会把
+全部内容当"thinking"吐出来(OpenAI 格式路由到 `reasoning_content` 字段),但普通
+客户端只读 `content` 字段的话等于看不到任何输出。
+
+**修复**:给 `StreamProcessor.__init__` 加 `thinking_capable: bool = True` 参数:
+- `False` 时构造函数直接把 `_thinking_done` 置为 `True`(跳过整个"思考阶段"状态机)。
+- `_get_raw()` 和 `finalize()` 都改成只在 `thinking_capable` 时才做那个"合成 `<think>`
+  前缀"的动作。
+- `server/app.py` 两处构造点(`/v1/chat/completions`、`/v1/completions`,550/1153 行)
+  都传 `thinking_capable=engine.backend_name == "qwen36"`。
+
+**验证**:重新起服务(同样配置),`POST /v1/chat/completions` 带 `"stream": true`
+(prompt "What is the capital of France?..."):SSE 增量正确落在 `delta.content`
+(`"The"`→`" capital"`→`" of"`→`" France"`→`" is"`→`" Paris"`→`"."`),最后
+`finish_reason: "stop"`,不再有内容被吞掉或错标进 `reasoning_content`。
+`pytest tests/` 重跑:319 passed,同样那 3 个既有失败,无新增回归。
+
+`/v1/completions` 带 `stream:true` 仍然没有触发真正的 SSE(还是返回一次性 JSON)——
+这次没有深挖,可能是这个端点本身没接流式输出逻辑(和这次 bug 无关),留作独立
+遗留问题。
+
 ## 遗留问题
 
-1. **流式路径有同类风险,未修**:`server/formats/stream.py` 的 `StreamProcessor.
-   finalize()`(约 285-292 行)有几乎一样的模式("Prepend `<think>` for consistent
-   processing"),对非 thinking backend 的流式请求 finalize 阶段大概率会有同样的
-   吃空问题。增量 delta 路径(`get_delta`/等价方法)本身已经对"完全没有 think 标签"
-   做了优雅处理("should not happen with Qwen3.6 but handle gracefully"),只有
-   `finalize()` 没有。`StreamProcessor` 目前拿不到 `engine.backend_name`,修复需要
-   多线一个参数进去,这次没有顺手做——需要单独验证(这次测试发现 `/v1/completions`
-   带 `"stream": true` 时实际上没有走 SSE,返回的还是一次性 JSON,原因未查,可能是
-   这个端点本来就不支持流式,需要另外确认,不在这次范围内)。
+1. ~~流式路径同类 bug~~ 已修复(见上)。`/v1/completions` 端点本身似乎不支持
+   `stream:true`(返回非流式 JSON),原因未查,是否需要补上流式支持是独立问题。
 2. 只测了单请求、单 slot、`num_slots=2`(capacity=1 对应的最小配置)——没有测试并发
    多请求场景。
 3. `server/app.py` 默认的 `SERVER_MODEL_BACKEND` 仍是 `"qwen36"`,`SERVER_ENABLE_
