@@ -91,7 +91,7 @@ def _run_once(workload: str, target_output_len: int, blocks_per_slot: int) -> di
         speculative_config={"method": "mtp", "num_speculative_tokens": K, "attention_backend": "CUSTOM"},
     )
     runner = DirectModelRunner(
-        vllm_config, num_slots=CONCURRENCY, block_size=16, blocks_per_slot=blocks_per_slot
+        vllm_config, num_slots=CONCURRENCY, block_size=64, blocks_per_slot=blocks_per_slot
     )
 
     slots = list(range(CONCURRENCY))

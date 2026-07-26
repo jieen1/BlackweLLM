@@ -475,8 +475,8 @@ def _run_gpu_checks() -> dict:
     runner = DirectModelRunner(
         vllm_config,
         num_slots=8,
-        block_size=16,
-        blocks_per_slot=128,
+        block_size=64,
+        blocks_per_slot=32,
         enable_block_table=True,
         enable_prefix_cache=True,
         enable_cudagraph=False,

@@ -398,7 +398,7 @@ def _run_once() -> dict:
         speculative_config=SPECULATIVE_CONFIG,
     )
     runner = DirectModelRunner(
-        vllm_config, num_slots=7, block_size=16, blocks_per_slot=2560, enable_cudagraph=False
+        vllm_config, num_slots=7, block_size=64, blocks_per_slot=640, enable_cudagraph=False
     )
 
     result: dict = {}

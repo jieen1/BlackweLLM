@@ -35,7 +35,7 @@ def main():
 
     print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
     t0 = time.perf_counter()
-    backend = LagunaBackend(config, num_slots=4, block_size=16, blocks_per_slot=256)
+    backend = LagunaBackend(config, num_slots=4, block_size=64, blocks_per_slot=64)
     print(f"Loaded in {time.perf_counter()-t0:.1f}s", flush=True)
 
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)

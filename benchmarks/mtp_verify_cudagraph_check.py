@@ -231,8 +231,8 @@ def _run_once(enable_block_table: bool = False) -> dict:
     runner = DirectModelRunner(
         vllm_config,
         num_slots=num_slots,
-        block_size=16,
-        blocks_per_slot=128,
+        block_size=64,
+        blocks_per_slot=32,
         enable_cudagraph=True,
         enable_block_table=enable_block_table,
     )

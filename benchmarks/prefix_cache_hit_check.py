@@ -586,15 +586,15 @@ def _run_gpu_checks() -> dict:
         speculative_config=SPECULATIVE_CONFIG,
     )
     # num_slots=8: slots 0-3 producers/running, 4-7 hits/references (INV2 needs
-    # 4 producers + 4 hits in one batched call). blocks_per_slot=384
+    # 4 producers + 4 hits in one batched call). blocks_per_slot=96
     # (6144-token capacity) fits the 5000-token INV1 prompt + 22 decode rounds.
     # enable_cudagraph stays False -- INV5 parity runs in its own subprocess
     # (cudagraph_eager_parity_check builds its own graph-capturing runner).
     runner = DirectModelRunner(
         vllm_config,
         num_slots=8,
-        block_size=16,
-        blocks_per_slot=384,
+        block_size=64,
+        blocks_per_slot=96,
         enable_block_table=True,
         enable_prefix_cache=True,
         enable_persistent_prefix_cache=True,

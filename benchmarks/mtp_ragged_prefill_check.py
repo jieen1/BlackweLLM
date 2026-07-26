@@ -371,7 +371,7 @@ def _run_once() -> dict:
     # computed, see check 0's own docstring) and check1's 4 probe + 4 ref +
     # 4 margin-diag (only touched on a bootstrap mismatch).
     runner = DirectModelRunner(
-        vllm_config, num_slots=24, block_size=16, blocks_per_slot=2560, enable_cudagraph=False
+        vllm_config, num_slots=24, block_size=64, blocks_per_slot=640, enable_cudagraph=False
     )
 
     result: dict = {}

@@ -231,7 +231,7 @@ def main() -> int:
     )
     print("LOADING_MODEL", flush=True)
     t_load0 = time.perf_counter()
-    runner = DirectModelRunner(vllm_config, num_slots=4, block_size=16, blocks_per_slot=2560)
+    runner = DirectModelRunner(vllm_config, num_slots=4, block_size=64, blocks_per_slot=640)
     print(f"MODEL_LOADED elapsed_s={time.perf_counter() - t_load0:.1f}", flush=True)
 
     slots = [0, 1, 2, 3]

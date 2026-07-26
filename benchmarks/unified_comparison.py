@@ -76,7 +76,7 @@ def bench_ours(base_len, suffix_len, base_ids, suffix_ids, tok):
         gpu_memory_utilization=GPU_UTIL, enforce_eager=True,
         trust_remote_code=True).create_engine_config()
     from runtime.backends.laguna import LagunaBackend
-    backend = LagunaBackend(vc, num_slots=1, block_size=16, blocks_per_slot=bps)
+    backend = LagunaBackend(vc, num_slots=1, block_size=64, blocks_per_slot=bps)
     from runtime.backends.laguna_dflash import DFlashEngine
     engine = DFlashEngine(backend)
 

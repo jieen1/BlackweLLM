@@ -213,7 +213,7 @@ def _run_once() -> dict:
     vllm_config = build_vllm_config(
         model=MODEL, kv_cache_dtype="fp8_e4m3", max_model_len=2048, gpu_memory_utilization=0.5
     )
-    runner = DirectModelRunner(vllm_config, num_slots=CONCURRENCY, block_size=16, blocks_per_slot=128)
+    runner = DirectModelRunner(vllm_config, num_slots=CONCURRENCY, block_size=64, blocks_per_slot=32)
     tok = AutoTokenizer.from_pretrained(MODEL)
     prompt_ids = tok.encode(PROMPT, add_special_tokens=False)
 

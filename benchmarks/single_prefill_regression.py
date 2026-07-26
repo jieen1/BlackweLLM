@@ -49,7 +49,7 @@ def _run_once() -> dict:
         max_model_len=2048,
         gpu_memory_utilization=0.5,
     )
-    runner = DirectModelRunner(vllm_config, block_size=16, blocks_per_slot=128)
+    runner = DirectModelRunner(vllm_config, block_size=64, blocks_per_slot=32)
     tok = AutoTokenizer.from_pretrained(MODEL)
     prompt_ids = tok.encode(PROMPT, add_special_tokens=False)
 

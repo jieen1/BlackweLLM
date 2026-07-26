@@ -580,7 +580,7 @@ def _run_once() -> dict:
     )
     # 4 production + 6 dedicated reference + 6 spare margin-diag (lazy) slots.
     runner = DirectModelRunner(
-        vllm_config, num_slots=26, block_size=16, blocks_per_slot=2560, enable_cudagraph=False
+        vllm_config, num_slots=26, block_size=64, blocks_per_slot=640, enable_cudagraph=False
     )
 
     tok = AutoTokenizer.from_pretrained(MODEL)

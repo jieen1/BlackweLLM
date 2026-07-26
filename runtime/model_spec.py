@@ -37,7 +37,7 @@ class ModelSpec:
 
     # KV cache configuration
     kv_dtype: str = "fp8_e4m3"
-    block_size: int = 16
+    block_size: int = 64
 
     # Derived properties
     @property
@@ -72,7 +72,7 @@ class ModelSpec:
         mtp_attn_layer_names: list[str] | None = None,
         num_speculative_tokens: int = 0,
         kv_dtype: str = "fp8_e4m3",
-        block_size: int = 16,
+        block_size: int = 64,
     ) -> ModelSpec:
         """Construct from runner initialization parameters."""
         return cls(

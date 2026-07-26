@@ -35,11 +35,11 @@ def main():
     cfg = build_vllm_config(model=MODEL, kv_cache_dtype="fp8_e4m3",
                             max_model_len=min(P + max_suffix + max_tokens + 2048, 262144),
                             gpu_memory_utilization=0.85, speculative_config=SPECULATIVE_CONFIG)
-    runner = DirectModelRunner(cfg, num_slots=2, block_size=16,
+    runner = DirectModelRunner(cfg, num_slots=2, block_size=64,
                                blocks_per_slot=blocks_per_slot, enable_block_table=True,
                                enable_prefix_cache=True, enable_persistent_prefix_cache=True,
                                enable_cudagraph=False)
-    block_size = 16
+    block_size=64
     G = ((P - 1) // block_size) * block_size
     gdn0 = runner.gdn_layer_names[0]
 

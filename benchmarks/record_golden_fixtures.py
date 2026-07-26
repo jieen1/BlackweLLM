@@ -108,7 +108,7 @@ def main() -> None:
     runner = DirectModelRunner(
         config,
         num_slots=num_slots,
-        block_size=16,
+        block_size=64,
         blocks_per_slot=blocks_per_slot,
         enable_block_table=True,
         enable_prefix_cache=False,

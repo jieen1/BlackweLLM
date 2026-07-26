@@ -54,7 +54,7 @@ def _run_once() -> dict:
     vllm_config = build_vllm_config(
         model=MODEL, kv_cache_dtype="fp8_e4m3", max_model_len=2048, gpu_memory_utilization=0.5
     )
-    runner = DirectModelRunner(vllm_config, num_slots=2, block_size=16, blocks_per_slot=2560)
+    runner = DirectModelRunner(vllm_config, num_slots=2, block_size=64, blocks_per_slot=640)
     tok = AutoTokenizer.from_pretrained(MODEL)
 
     detour_slot = 0

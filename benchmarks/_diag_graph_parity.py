@@ -22,7 +22,7 @@ def main():
     config = args.create_engine_config()
 
     from runtime.backends.laguna import LagunaBackend
-    backend = LagunaBackend(config, num_slots=4, block_size=16, blocks_per_slot=512)
+    backend = LagunaBackend(config, num_slots=4, block_size=64, blocks_per_slot=128)
 
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)

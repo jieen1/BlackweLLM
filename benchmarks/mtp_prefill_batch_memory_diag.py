@@ -108,8 +108,8 @@ def main():
     runner = DirectModelRunner(
         vllm_config,
         num_slots=args.concurrency,
-        block_size=16,
-        blocks_per_slot=2560,
+        block_size=64,
+        blocks_per_slot=640,
         enable_cudagraph=False,
     )
 

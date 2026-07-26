@@ -30,7 +30,7 @@ def main():
     vllm_config = engine_args.create_engine_config()
 
     from runtime.backends.laguna import LagunaBackend
-    backend = LagunaBackend(vllm_config, num_slots=1, blocks_per_slot=8448)
+    backend = LagunaBackend(vllm_config, num_slots=1, blocks_per_slot=2112)
 
     from runtime.backends.laguna_dflash import DFlashEngine
     engine = DFlashEngine(backend)

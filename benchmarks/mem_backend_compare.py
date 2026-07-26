@@ -33,7 +33,7 @@ def test_backend(moe_backend):
     
     t0 = time.perf_counter()
     from runtime.backends.laguna import LagunaBackend
-    backend = LagunaBackend(vllm_config, num_slots=1, blocks_per_slot=8448)
+    backend = LagunaBackend(vllm_config, num_slots=1, blocks_per_slot=2112)
     t_load = time.perf_counter() - t0
     
     mem_after_load = gpu_mem_mb()

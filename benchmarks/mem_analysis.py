@@ -35,7 +35,7 @@ def main():
     
     m0 = mem_mb()
     from runtime.backends.laguna import LagunaBackend
-    backend = LagunaBackend(vllm_config, num_slots=1, blocks_per_slot=8448)
+    backend = LagunaBackend(vllm_config, num_slots=1, blocks_per_slot=2112)
     m1 = mem_mb()
     print(f"[1] After model load: alloc={m1:.0f} MB (+{m1-m0:.0f} MB)")
     

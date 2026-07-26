@@ -26,13 +26,13 @@ class TestModelSpecConstruction:
             attn_layer_names=["l.0", "l.3", "l.6"],
             gdn_layer_names=["l.1", "l.2", "l.4", "l.5"],
             kv_dtype="fp8_e4m3",
-            block_size=16,
+            block_size=64,
         )
         assert spec.num_attn_layers == 3
         assert spec.num_gdn_layers == 4
         assert spec.num_layers == 7
         assert spec.kv_dtype == "fp8_e4m3"
-        assert spec.block_size == 16
+        assert spec.block_size == 64
 
     def test_frozen_immutability(self):
         spec = ModelSpec(
@@ -54,7 +54,7 @@ class TestModelSpecConstruction:
         assert spec.mtp_model_id is None
         assert spec.num_speculative_tokens == 0
         assert spec.kv_dtype == "fp8_e4m3"
-        assert spec.block_size == 16
+        assert spec.block_size == 64
         assert spec.has_mtp is False
 
 

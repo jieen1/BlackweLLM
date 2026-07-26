@@ -87,7 +87,7 @@ def run_backend(backend, x_fp4, w_fp4, x_bs, w_bs, alpha, pad_cols, M, N, K):
             torch.bfloat16,
             use_8x4_sf_layout=use_8x4,
             backend=backend,
-            block_size=16,
+            block_size=64,
             use_nvfp4=True,
         )
 

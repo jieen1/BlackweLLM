@@ -314,7 +314,7 @@ def _check_append_only_growth() -> dict:
 
     errors = []
     pool = BlockPool(num_blocks=50, reserved=1)
-    runner = _StubRunner(num_slots=2, block_size=16, blocks_per_slot=4, pool=pool)  # capacity 64 tokens/slot
+    runner = _StubRunner(num_slots=2, block_size=64, blocks_per_slot=1, pool=pool)  # capacity 64 tokens/slot
 
     DirectModelRunner._ensure_blocks(runner, 0, 5)  # needs 1 page
     if len(runner.block_table[0]) != 1:
@@ -344,7 +344,7 @@ def _check_append_only_growth() -> dict:
     if len(runner.block_table[0]) != 3:
         errors.append(f"expected 3 blocks after _ensure_blocks(0, 33), got {runner.block_table[0]}")
 
-    # Per-slot capacity ceiling (blocks_per_slot=4 -> 64 tokens) must still
+    # Per-slot capacity ceiling (blocks_per_slot=1 -> 64 tokens) must still
     # be enforced, and must raise BEFORE consuming a block from the pool.
     free_before = pool.num_free_blocks()
     raised = False
@@ -365,7 +365,7 @@ def _check_reset_slot_frees_blocks() -> dict:
 
     errors = []
     pool = BlockPool(num_blocks=50, reserved=1)
-    runner = _StubRunner(num_slots=2, block_size=16, blocks_per_slot=4, pool=pool)
+    runner = _StubRunner(num_slots=2, block_size=64, blocks_per_slot=1, pool=pool)
 
     DirectModelRunner._ensure_blocks(runner, 0, 40)  # 3 pages
     held = list(runner.block_table[0])
@@ -414,7 +414,7 @@ def _check_fragmentation_after_churn() -> dict:
     # slot 0 = the slot under test, slot 1 = a concurrent slot whose own
     # allocation pressure forces slot 0's block_table to be non-contiguous --
     # the real fragmentation scenario this phase exists to prove safe.
-    runner = _StubRunner(num_slots=2, block_size=16, blocks_per_slot=8, pool=pool)  # capacity 128 tokens/slot
+    runner = _StubRunner(num_slots=2, block_size=64, blocks_per_slot=2, pool=pool)  # capacity 128 tokens/slot
 
     # Step 1: slot 0 grows by one block (its first physical id).
     DirectModelRunner._ensure_blocks(runner, 0, 10)

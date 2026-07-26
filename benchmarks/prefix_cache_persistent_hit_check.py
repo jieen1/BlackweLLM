@@ -848,15 +848,15 @@ def _run_gpu_checks() -> dict:
         speculative_config=SPECULATIVE_CONFIG,
     )
     # num_slots=8: slots 0-3 for produce/hit, 4-7 for independent cold
-    # references / baselines. blocks_per_slot=384 (6144-token capacity) fits the
+    # references / baselines. blocks_per_slot=96 (6144-token capacity) fits the
     # 5000-token prompt + decode. enable_cudagraph stays False -- this gate
     # targets persistent-hit CORRECTNESS (INV1/3/4, R1); CUDA-graph parity over
     # hit-populated tables is INV5, scoped to P3.3.
     runner = DirectModelRunner(
         vllm_config,
         num_slots=8,
-        block_size=16,
-        blocks_per_slot=384,
+        block_size=64,
+        blocks_per_slot=96,
         enable_block_table=True,
         enable_prefix_cache=True,
         enable_persistent_prefix_cache=True,

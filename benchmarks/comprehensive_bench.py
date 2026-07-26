@@ -42,7 +42,7 @@ def main():
     print(f"\n[1] Loading model... (mem before: {gpu_mem_mb():.0f} MB)")
     t0 = time.perf_counter()
     from runtime.backends.laguna import LagunaBackend
-    backend = LagunaBackend(vllm_config, num_slots=1, blocks_per_slot=8448)
+    backend = LagunaBackend(vllm_config, num_slots=1, blocks_per_slot=2112)
     t_load = time.perf_counter() - t0
     print(f"  Loaded in {t_load:.1f}s, mem after: {gpu_mem_mb():.0f} MB")
 

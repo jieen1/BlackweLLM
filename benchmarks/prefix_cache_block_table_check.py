@@ -145,7 +145,7 @@ def _run_numeric_equivalence() -> dict:
     # CapturedBatchDecodeGraph(batch_size=2)'s num_slots >= 2*batch_size
     # requirement below.
     runner = DirectModelRunner(
-        vllm_config, num_slots=4, block_size=16, blocks_per_slot=64, enable_block_table=False
+        vllm_config, num_slots=4, block_size=64, blocks_per_slot=16, enable_block_table=False
     )
     tok = AutoTokenizer.from_pretrained(MODEL)
     prompt_ids = tok.encode(PROMPT, add_special_tokens=False)

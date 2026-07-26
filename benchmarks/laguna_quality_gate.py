@@ -53,7 +53,7 @@ args = EngineArgs(model=MODEL, max_model_len=4096, gpu_memory_utilization=0.85,
                   enforce_eager=True, dtype="bfloat16", disable_log_stats=True,
                   async_scheduling=False)
 config = args.create_engine_config()
-backend = LagunaBackend(config, num_slots=4, block_size=16, blocks_per_slot=512)
+backend = LagunaBackend(config, num_slots=4, block_size=64, blocks_per_slot=128)
 
 results = []
 for prompt in PROMPTS:

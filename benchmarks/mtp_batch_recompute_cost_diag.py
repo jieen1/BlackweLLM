@@ -113,7 +113,7 @@ def _run_once() -> dict:
         gpu_memory_utilization=0.85,
         speculative_config={"method": "mtp", "num_speculative_tokens": K, "attention_backend": "CUSTOM"},
     )
-    runner = DirectModelRunner(vllm_config, num_slots=CONCURRENCY, block_size=16, blocks_per_slot=2560)
+    runner = DirectModelRunner(vllm_config, num_slots=CONCURRENCY, block_size=64, blocks_per_slot=640)
 
     all_rounds = []
     for batch_start in range(0, len(prompts), CONCURRENCY):

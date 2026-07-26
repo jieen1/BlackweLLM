@@ -101,7 +101,7 @@ def main() -> int:
         speculative_config={"method": "mtp", "num_speculative_tokens": K, "attention_backend": "CUSTOM"},
     )
     runner = DirectModelRunner(
-        vllm_config, num_slots=8, block_size=16, blocks_per_slot=2560, enable_cudagraph=False,
+        vllm_config, num_slots=8, block_size=64, blocks_per_slot=640, enable_cudagraph=False,
     )
     print(f"\n=== after model load: nvidia-smi {_nvidia_smi_mib()} MiB ===", flush=True)
 

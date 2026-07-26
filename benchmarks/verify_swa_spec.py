@@ -9,7 +9,7 @@ from runtime.backends.laguna import LagunaBackend
 MODEL = "poolside/Laguna-S-2.1-NVFP4"
 config = EngineArgs(model=MODEL, max_model_len=8192, gpu_memory_utilization=0.85,
                     enforce_eager=True, dtype="bfloat16", disable_log_stats=True).create_engine_config()
-backend = LagunaBackend(config, num_slots=1, block_size=16, blocks_per_slot=256)
+backend = LagunaBackend(config, num_slots=1, block_size=64, blocks_per_slot=64)
 sfc = config.compilation_config.static_forward_context
 from collections import Counter
 specs = {}

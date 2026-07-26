@@ -49,6 +49,24 @@ from runtime.mtp_accept import determine_accept_reject_from_predictions
 logger = logging.getLogger("qwen_sm120_runtime.dflash")
 
 
+def _ring_prefix_reuse_is_safe(
+    cached_kv_len: int,
+    prefix_len: int,
+    ring_specs: tuple[tuple[int, int], ...],
+) -> bool:
+    """Whether every ring still retains the prefix boundary's attention window.
+
+    A ring with ``capacity - window`` spare positions can survive that many
+    appended KV writes without overwriting the old prefix window.  Rewinding
+    farther cannot be repaired by recomputing one window: that recomputation
+    itself needs an even older window which the ring no longer contains.
+    """
+    rewind = cached_kv_len - prefix_len
+    if prefix_len <= 0 or rewind < 0:
+        return False
+    return all(rewind <= max(0, capacity - window) for capacity, window in ring_specs)
+
+
 def _greedy_accept_reject(
     verify_argmax: list[int],
     draft_tokens: list[int],
@@ -1036,11 +1054,26 @@ class DFlashEngine:
         """
         backend = self.backend
         prompt_len = len(prompt_ids)
+        cached_kv_len = backend.slot_kv_len[slot]
 
         # Prefix cache: find matching prefix in cached KV
         prefix_len = 0
         if enable_prefix_cache:
             prefix_len = backend.find_prefix_match(slot, prompt_ids)
+            ring_specs = (
+                (backend._ring_slots_per_slot, backend._swa_window),
+                (self._draft_blocks_per_slot * self.block_size, DRAFT_WINDOW),
+            )
+            if prefix_len > 0 and not _ring_prefix_reuse_is_safe(
+                cached_kv_len,
+                prefix_len,
+                ring_specs,
+            ):
+                logger.info(
+                    "Prefix cache MISS: rewinding %d KV positions exceeds ring history",
+                    cached_kv_len - prefix_len,
+                )
+                prefix_len = 0
 
         if prefix_len > 0 and prefix_len < prompt_len:
             # Partial match: continue from cached prefix
@@ -1051,7 +1084,9 @@ class DFlashEngine:
                 prompt_len - prefix_len,
             )
         elif prefix_len >= prompt_len:
-            # Full match: no prefill needed
+            # Full match: keep the retained prompt-boundary ring state intact.
+            # The safety check above guarantees later generation has not
+            # overwritten the attention window needed at this boundary.
             logger.info(
                 "Prefix cache FULL HIT: %d/%d tokens cached",
                 prefix_len,
@@ -1064,10 +1099,6 @@ class DFlashEngine:
                 kv_tensor.zero_()
 
         t0 = time.perf_counter()
-
-        # Always zero draft KV — it will be recomputed from aux hidden states
-        for kv_tensor in self._draft_kv_caches.values():
-            kv_tensor.zero_()
 
         if prefix_len > 0:
             # Continue from cached prefix

@@ -227,7 +227,7 @@ D1_CTX32K_FIXTURE = PromptFixture(
 # extension pattern as the two fixtures above -- NOT the official W2/W2-S
 # line, same caveat applies. NOTE (found while wiring this up, see the
 # 2026-07-18 §16 safety note): this runtime's own benchmark scripts
-# hardcode `blocks_per_slot=2560` with `block_size=16` (40960-token/slot
+# hardcode `blocks_per_slot=640` with `block_size=64` (40960-token/slot
 # capacity ceiling) -- a single 65536-token prompt already exceeds that
 # ceiling on its own (prefill alone, before any generation), independent
 # of concurrency. This fixture is built anyway (cheap, CPU-only, useful

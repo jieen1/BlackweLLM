@@ -213,7 +213,7 @@ def main() -> None:
 
     t0 = time.perf_counter()
     config = build_config(args.mode, mml)
-    backend = LagunaBackend(config, num_slots=4, block_size=16, blocks_per_slot=(mml + 15) // 16)
+    backend = LagunaBackend(config, num_slots=4, block_size=64, blocks_per_slot=(mml + 15) // 16)
     print(f"Backend loaded in {time.perf_counter()-t0:.1f}s", flush=True)
 
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)

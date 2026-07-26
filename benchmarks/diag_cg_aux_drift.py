@@ -39,7 +39,7 @@ def main():
     print("Loading backend...", flush=True)
     t0 = time.time()
     from runtime.backends.laguna import LagunaBackend
-    backend = LagunaBackend(vllm_config, num_slots=1, blocks_per_slot=8448)
+    backend = LagunaBackend(vllm_config, num_slots=1, blocks_per_slot=2112)
     print(f"  loaded in {time.time()-t0:.1f}s, mem={gpu_mem_mb():.0f}MB", flush=True)
 
     print("Initializing DFlash engine...", flush=True)

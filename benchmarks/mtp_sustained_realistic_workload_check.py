@@ -731,7 +731,7 @@ def _run_once(duration_s: float, capacity: int, num_slots: int, pool_size: int, 
     runner = DirectModelRunner(
         vllm_config,
         num_slots=num_slots,
-        block_size=16,
+        block_size=64,
         blocks_per_slot=blocks_per_slot,
         enable_cudagraph=True,
     )

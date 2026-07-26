@@ -216,7 +216,7 @@ def main():
     from runtime.backends.laguna import LagunaBackend
 
     t0 = time.perf_counter()
-    backend = LagunaBackend(config, num_slots=4, block_size=16, blocks_per_slot=512)
+    backend = LagunaBackend(config, num_slots=4, block_size=64, blocks_per_slot=128)
     load_time = time.perf_counter() - t0
     gpu_mem = torch.cuda.max_memory_allocated() / 1024**2
     print(f"  Loaded in {load_time:.1f}s, GPU mem: {gpu_mem:.0f} MiB")

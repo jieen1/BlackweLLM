@@ -797,15 +797,15 @@ def _run_gpu_checks() -> dict:
         speculative_config=SPECULATIVE_CONFIG,
     )
     # num_slots=6 (active/admit/reference slots for the pressure cases);
-    # blocks_per_slot=1408 (22528-token capacity) fits the 20000-token
+    # blocks_per_slot=352 (22528-token capacity) fits the 20000-token
     # chunk-boundary prompt plus decode. enable_cudagraph stays False -- this
     # gate targets eviction/populate CORRECTNESS (INV2/3/9, R4/5/7/8); CUDA-graph
     # parity over hit tables is INV5, scoped to P3.3.
     runner = DirectModelRunner(
         vllm_config,
         num_slots=6,
-        block_size=16,
-        blocks_per_slot=1408,
+        block_size=64,
+        blocks_per_slot=352,
         enable_block_table=True,
         enable_prefix_cache=True,
         enable_persistent_prefix_cache=True,

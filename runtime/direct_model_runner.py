@@ -297,7 +297,7 @@ class DirectModelRunner:
         vllm_config: VllmConfig,
         *,
         num_slots: int = NUM_SLOTS,
-        block_size: int = 16,
+        block_size: int = 64,
         blocks_per_slot: int = 128,
         num_blocks: int | None = None,
         auto_profile_blocks: bool = False,

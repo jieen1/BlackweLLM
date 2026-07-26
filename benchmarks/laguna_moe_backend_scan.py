@@ -66,7 +66,7 @@ def run_one(backend_name: str, batches: list[int], steps: int, warmup: int) -> d
     config = args.create_engine_config()
 
     t0 = time.perf_counter()
-    backend = LagunaBackend(config, num_slots=4, block_size=16, blocks_per_slot=256)
+    backend = LagunaBackend(config, num_slots=4, block_size=64, blocks_per_slot=64)
     load_s = time.perf_counter() - t0
 
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)

@@ -83,6 +83,33 @@ class TestDFlashConstants:
         assert DRAFT_HEAD_DIM == 128
 
 
+class TestRingPrefixReuse:
+    """Prefix rewind is valid only while every ring retains the old window."""
+
+    def _is_safe(self, cached_kv_len, prefix_len, ring_specs):
+        pytest.importorskip("numpy")
+        pytest.importorskip("torch")
+        from runtime.backends.laguna_dflash import _ring_prefix_reuse_is_safe
+
+        return _ring_prefix_reuse_is_safe(cached_kv_len, prefix_len, ring_specs)
+
+    def test_exact_boundary_is_safe(self):
+        assert self._is_safe(4096, 4096, ((640, 512), (640, 512)))
+
+    def test_rewind_within_spare_capacity_is_safe(self):
+        assert self._is_safe(4224, 4096, ((640, 512), (640, 512)))
+
+    def test_rewind_past_spare_capacity_is_unsafe(self):
+        assert not self._is_safe(4225, 4096, ((640, 512), (640, 512)))
+
+    def test_tightest_ring_controls_reuse(self):
+        assert not self._is_safe(4160, 4096, ((640, 512), (544, 512)))
+
+    def test_invalid_prefix_is_unsafe(self):
+        assert not self._is_safe(4096, 0, ((640, 512),))
+        assert not self._is_safe(4096, 4097, ((640, 512),))
+
+
 class TestGreedyAcceptReject:
     """Exercise the REAL accept/reject function shared by _accept_reject
     (CUDA Graph path), _verify (eager path), and generate_verify_only

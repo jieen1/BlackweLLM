@@ -69,7 +69,7 @@ def main() -> int:
         gpu_memory_utilization=0.85,
         speculative_config={"method": "mtp", "num_speculative_tokens": K, "attention_backend": "CUSTOM"},
     )
-    runner = DirectModelRunner(vllm_config, num_slots=CONCURRENCY, block_size=16, blocks_per_slot=2560)
+    runner = DirectModelRunner(vllm_config, num_slots=CONCURRENCY, block_size=64, blocks_per_slot=640)
 
     if args.mode == "nosplit":
         # Exactly this project's PRE-2026-07-17-fix behavior: a single

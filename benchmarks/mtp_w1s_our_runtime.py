@@ -95,7 +95,7 @@ def _run_once(max_tokens: int, concurrency: int, fixture_key: str, num_requests:
         gpu_memory_utilization=0.85,
         speculative_config={"method": "mtp", "num_speculative_tokens": K, "attention_backend": "CUSTOM"},
     )
-    runner = DirectModelRunner(vllm_config, num_slots=concurrency, block_size=16, blocks_per_slot=2560)
+    runner = DirectModelRunner(vllm_config, num_slots=concurrency, block_size=64, blocks_per_slot=640)
 
     per_trajectory: list[dict] = []
     t_start = time.perf_counter()

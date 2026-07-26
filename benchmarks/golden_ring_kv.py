@@ -45,8 +45,8 @@ def main():
     backend = LagunaBackend(
         vllm_config,
         num_slots=2,
-        block_size=16,
-        blocks_per_slot=512,  # 8192 tokens
+        block_size=64,
+        blocks_per_slot=128,  # 8192 tokens
     )
     load_time = time.time() - t0
     logger.info("Model loaded in %.1fs", load_time)

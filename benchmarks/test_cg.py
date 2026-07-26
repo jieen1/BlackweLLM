@@ -27,7 +27,7 @@ print(f"Config: ctx={CTX}, bps={bps}, max_len={max_len}", flush=True)
 vc = EngineArgs(model=MODEL, dtype="bfloat16", max_model_len=max_len,
     gpu_memory_utilization=0.92, enforce_eager=True, trust_remote_code=True).create_engine_config()
 from runtime.backends.laguna import LagunaBackend
-backend = LagunaBackend(vc, num_slots=1, block_size=16, blocks_per_slot=bps)
+backend = LagunaBackend(vc, num_slots=1, block_size=64, blocks_per_slot=bps)
 from runtime.backends.laguna_dflash import DFlashEngine
 engine = DFlashEngine(backend)
 

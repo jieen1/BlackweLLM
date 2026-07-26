@@ -47,7 +47,7 @@ def _run_once() -> dict:
         gpu_memory_utilization=0.6,
         speculative_config=SPECULATIVE_CONFIG,
     )
-    runner = DirectModelRunner(vllm_config, num_slots=8, block_size=16, blocks_per_slot=2560)
+    runner = DirectModelRunner(vllm_config, num_slots=8, block_size=64, blocks_per_slot=640)
 
     slots = [0, 1, 2, 3]
     prompt_ids_per_slot = [tok.encode(p, add_special_tokens=False) for p in FOUR_PROMPTS]

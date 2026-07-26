@@ -75,7 +75,7 @@ def _run_once() -> dict:
     plain_config = build_vllm_config(
         model=MODEL, kv_cache_dtype="fp8_e4m3", max_model_len=2048, gpu_memory_utilization=0.35
     )
-    plain_runner = DirectModelRunner(plain_config, num_slots=2, block_size=16, blocks_per_slot=2560)
+    plain_runner = DirectModelRunner(plain_config, num_slots=2, block_size=64, blocks_per_slot=640)
     plain_logits, plain_hidden = plain_runner._forward(
         0, prompt_ids, start_pos=0, is_decode=False, return_hidden=True
     )
@@ -88,7 +88,7 @@ def _run_once() -> dict:
         gpu_memory_utilization=0.35,
         speculative_config=SPECULATIVE_CONFIG,
     )
-    mtp_runner = DirectModelRunner(mtp_config, num_slots=3, block_size=16, blocks_per_slot=2560)
+    mtp_runner = DirectModelRunner(mtp_config, num_slots=3, block_size=64, blocks_per_slot=640)
 
     if mtp_runner.mtp_model is None:
         return {"passed": False, "error": "mtp_model did not load despite speculative_config"}

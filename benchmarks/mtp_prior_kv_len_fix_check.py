@@ -166,7 +166,7 @@ def _run_once() -> dict:
         gpu_memory_utilization=0.5,
         speculative_config={"method": "mtp", "num_speculative_tokens": 3, "attention_backend": "CUSTOM"},
     )
-    runner = DirectModelRunner(vllm_config, num_slots=4, block_size=16, blocks_per_slot=2560)
+    runner = DirectModelRunner(vllm_config, num_slots=4, block_size=64, blocks_per_slot=640)
 
     result = {}
     result["invariant_k3"] = _check_invariant_for_k(runner, tok, slot=0, k=3)

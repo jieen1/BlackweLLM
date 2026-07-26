@@ -112,7 +112,7 @@ def _run_once(batch: int, varlen: bool, steps: int, reuse: bool, mtp_qo_len: int
     # "rewound" to an earlier point, so reusing the REF slots after the
     # fact would silently verify against the WRONG (too-advanced) state.
     total_slots = batch * 2 if mtp_qo_len > 1 else batch
-    runner = DirectModelRunner(vllm_config, num_slots=total_slots, block_size=16, blocks_per_slot=128)
+    runner = DirectModelRunner(vllm_config, num_slots=total_slots, block_size=64, blocks_per_slot=32)
     tok = AutoTokenizer.from_pretrained(MODEL)
 
     numbers = _assign_numbers(batch)

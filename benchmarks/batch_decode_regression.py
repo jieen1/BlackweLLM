@@ -73,7 +73,7 @@ def _run_once(batch: int, varlen: bool) -> dict:
     # reference group, the second `batch` are the batched-call group --
     # kept fully independent (disjoint physical slots) so neither call's
     # cache-state mutation confounds the other.
-    runner = DirectModelRunner(vllm_config, num_slots=2 * batch, block_size=16, blocks_per_slot=128)
+    runner = DirectModelRunner(vllm_config, num_slots=2 * batch, block_size=64, blocks_per_slot=32)
     tok = AutoTokenizer.from_pretrained(MODEL)
 
     prompt_pool = VARLEN_PROMPTS if varlen else PROMPTS

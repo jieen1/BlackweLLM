@@ -28,7 +28,7 @@ SM120_VLLM_INTEGRATION = "/home/bot/project/sm120-flash-attention/vllm_integrati
 MODEL = "unsloth/Qwen3.6-27B-NVFP4"
 
 # W1 = 4096in/1024out = 5120 total; W2 = 32768in/1024out = 33792 total.
-# block_size=16 kept unchanged (matches every existing test); blocks_per_slot
+# block_size=64 kept unchanged (matches every existing test); blocks_per_slot
 # bumped so 16 * blocks_per_slot covers W2 with margin.
 BLOCK_SIZE = 16
 BLOCKS_PER_SLOT = 2560  # 16 * 2560 = 40960 tokens/slot capacity

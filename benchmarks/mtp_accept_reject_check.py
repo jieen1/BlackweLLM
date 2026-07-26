@@ -59,7 +59,7 @@ def _run_once() -> dict:
     # One slot per scenario (all-accept, reject-at-1, reject-at-0), each
     # prefilled identically and independently -- avoids any cross-scenario
     # state interference.
-    runner = DirectModelRunner(vllm_config, num_slots=3, block_size=16, blocks_per_slot=2560)
+    runner = DirectModelRunner(vllm_config, num_slots=3, block_size=64, blocks_per_slot=640)
     tok = AutoTokenizer.from_pretrained(MODEL)
     prompt_ids = tok.encode(PROMPT, add_special_tokens=False)
 
