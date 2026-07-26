@@ -527,3 +527,15 @@ Expected: acceptance >80% with verify CG enabled. If acceptance drops, set `QSR_
 1. **Full-prefix-hit bug**: warm r1/r2 acceptance collapse. Someone else investigating.
 2. **vLLM 0.26.0 comparison**: needs compilation + GPU time.
 3. **200K benchmark**: not yet run.
+
+---
+
+## ISSUE: Legacy split-k 未适配 188 SMs
+
+**优先级**: 低（仅影响 legacy Qwen3.6 自定义 attention 路径，当前生产用 Laguna/sparkinfer 不受影响）
+
+**问题**: `runtime/direct_model_runner.py:672` 的 `_DECODE_TARGET_SPLITS_PER_REQ = 32` 是在 SM=132 时调优的。实测 SM120 有 188 SMs，32×4KVH=128 CTAs 只填 68% SM。理论最优 ≈ 47 splits。
+
+**待办**: GPU 可用时做 split-k sweep（32/40/47/56），对比 decode latency。仅在 Qwen3.6 路径重新启用时才需要。
+
+**当前状态**: 已加注释标记，未改值。sparkinfer 动态查询 SM 数，Laguna 路径无此问题。
