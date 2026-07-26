@@ -1,5 +1,5 @@
 """Check if draft KV cache is populated and being read correctly."""
-import os, sys, time
+import os, sys
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
                       "/home/bot/project/qwen-sm120-runtime/.autotune_cache")
@@ -66,7 +66,7 @@ def main():
     torch.cuda.empty_cache()
 
     # Check draft KV cache after precompute
-    print(f"\n--- Draft KV cache after precompute ---")
+    print("\n--- Draft KV cache after precompute ---")
     for name, kv in list(engine._draft_kv_caches.items())[:2]:
         nonzero = (kv.view(torch.uint8) != 0).sum().item()
         total = kv.numel()

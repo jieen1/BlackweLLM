@@ -21,6 +21,8 @@ import types
 
 import pytest
 
+pytest.importorskip("torch")
+
 from server.engine import ServerEngine, classify_decode_slots
 
 

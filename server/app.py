@@ -166,9 +166,7 @@ async def _tokenize_encode(engine_ref, text):
     Qwen3.6 does not use BOS (add_special_tokens=False).
     """
     loop = asyncio.get_running_loop()
-    fn = functools.partial(
-        engine_ref.tok.encode, text, add_special_tokens=_IS_LAGUNA
-    )
+    fn = functools.partial(engine_ref.tok.encode, text, add_special_tokens=_IS_LAGUNA)
     return await loop.run_in_executor(None, fn)
 
 

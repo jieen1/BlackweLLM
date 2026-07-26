@@ -48,7 +48,7 @@ def main():
     # This isolates: is it FlashInfer's cudagraph kernel, or torch.cuda.CUDAGraph itself?
     from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
     from vllm.v1.attention.backends.flashinfer import FIDecode, FlashInferMetadata, fast_plan_decode
-    from runtime.compat_vllm import set_current_vllm_config, set_forward_context
+    from runtime.compat_vllm import set_forward_context
 
     backend.reset_slot(0)
     backend.prefill(0, prompt_ids)
@@ -137,7 +137,6 @@ def main():
     # === Variant 1: cudagraph FI wrapper + disable_split_kv=True ===
     from runtime.backends.laguna_cuda_graph import LagunaCudaGraphDecode
     # Monkey-patch to test disable_split_kv=True
-    import runtime.backends.laguna_cuda_graph as cg_mod
     original_run_plan = LagunaCudaGraphDecode._run_plan
 
     def patched_run_plan(self, slot_ids, kv_lengths):

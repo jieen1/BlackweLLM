@@ -3,8 +3,11 @@
 Tests the speculative decode accept/reject logic, buffer management,
 and configuration constants without requiring GPU or model weights.
 """
+
 import sys
 import types
+
+import pytest
 
 from runtime.backends.dflash_constants import (
     AUX_LAYER_IDS,
@@ -33,10 +36,16 @@ def setup_module() -> None:
     if "runtime.compat_vllm" not in sys.modules:
         stub = types.ModuleType("runtime.compat_vllm")
         for attr in [
-            "VllmConfig", "bind_kv_cache", "get_distributed_init_method",
-            "get_model", "get_open_port", "init_worker_distributed_environment",
-            "set_current_vllm_config", "set_forward_context",
-            "get_flashinfer_metadata_builder", "get_common_attn_metadata_cls",
+            "VllmConfig",
+            "bind_kv_cache",
+            "get_distributed_init_method",
+            "get_model",
+            "get_open_port",
+            "init_worker_distributed_environment",
+            "set_current_vllm_config",
+            "set_forward_context",
+            "get_flashinfer_metadata_builder",
+            "get_common_attn_metadata_cls",
             "init_flashinfer_workspace",
         ]:
             setattr(stub, attr, None)
@@ -82,6 +91,8 @@ class TestGreedyAcceptReject:
     logic can't silently drift out of sync with what these tests check."""
 
     def _accept_reject(self, verify_argmax, draft_tokens, bonus_token):
+        pytest.importorskip("numpy")
+        pytest.importorskip("torch")
         from runtime.backends.laguna_dflash import _greedy_accept_reject
 
         return _greedy_accept_reject(verify_argmax, draft_tokens, bonus_token)
@@ -135,7 +146,7 @@ class TestGreedyAcceptReject:
     def test_verify_argmax_from_logits_tensor(self):
         """End-to-end shape check: verify_argmax as produced by the real
         callers (Tensor.argmax(dim=-1).tolist()), not a hand-built list."""
-        import torch
+        torch = pytest.importorskip("torch")
 
         draft = [2, 4, 6]
         bonus = 0
@@ -157,6 +168,8 @@ class TestVerifyOnlyAcceptReject:
     """Lock the production verify-only state transition separately from legacy."""
 
     def _decide(self, all_argmax, draft_tokens, bonus_token=10):
+        pytest.importorskip("numpy")
+        pytest.importorskip("torch")
         from runtime.backends.laguna_dflash import _verify_only_accept_reject
 
         return _verify_only_accept_reject(all_argmax, draft_tokens, bonus_token)
@@ -198,6 +211,8 @@ class TestRingBlocksForDraft:
     inline formula that could silently diverge from it."""
 
     def test_draft_ring_blocks(self):
+        pytest.importorskip("numpy")
+        pytest.importorskip("torch")
         from runtime.backends.laguna import _ring_blocks_for_window
 
         # Draft needs: window-1 + qo_max positions + 1 extra block
@@ -208,6 +223,8 @@ class TestRingBlocksForDraft:
 
     def test_draft_kv_memory(self):
         """Draft KV cache should be small (~10-20 MB per slot)."""
+        pytest.importorskip("numpy")
+        pytest.importorskip("torch")
         from runtime.backends.laguna import _ring_blocks_for_window
 
         block_size = 16
@@ -224,6 +241,8 @@ class TestPrefillChunkRanges:
     """The final aux chunk must cover the complete draft SWA window."""
 
     def _ranges(self, prompt_len, chunk_tokens=8192, window=DRAFT_WINDOW):
+        pytest.importorskip("numpy")
+        pytest.importorskip("torch")
         from runtime.backends.laguna import _prefill_chunk_ranges
 
         return _prefill_chunk_ranges(

@@ -1,12 +1,11 @@
 """Discriminant: 8192 (single chunk) vs 8193 (triggers chunked) acceptance rate.
 Same context length, only variable is the chunked prefill path."""
-import os, sys, time
+import os, sys
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
                       "/home/bot/project/qwen-sm120-runtime/.autotune_cache")
 os.environ["QSR_DFLASH_CUDA_GRAPH"] = "0"  # eager for clean comparison
 sys.path.insert(0, "/home/bot/project/qwen-sm120-runtime")
-import torch
 
 def make_prompt(tokenizer, n):
     base = "The quick brown fox jumps over the lazy dog. "

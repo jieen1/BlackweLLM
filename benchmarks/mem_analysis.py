@@ -1,5 +1,5 @@
 """GPU memory breakdown analysis."""
-import os, sys, time, gc
+import os, sys
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
                       "/home/bot/project/qwen-sm120-runtime/.autotune_cache")

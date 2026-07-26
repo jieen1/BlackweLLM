@@ -268,9 +268,7 @@ def set_forward_context(
     """
     forward_context = ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
-        all_moe_layers=getattr(
-            vllm_config.compilation_config, "static_all_moe_layers", None
-        ),
+        all_moe_layers=getattr(vllm_config.compilation_config, "static_all_moe_layers", None),
         attn_metadata=attn_metadata,
         slot_mapping=slot_mapping or {},
         dp_metadata=None,
@@ -377,21 +375,25 @@ def compute_causal_conv1d_metadata(
 # init_workspace_manager initializes FlashInfer workspace buffers.
 # ---------------------------------------------------------------------------
 
+
 def get_flashinfer_metadata_builder():
     """Lazy import: FlashInferMetadataBuilder."""
     from vllm.v1.attention.backends.flashinfer import FlashInferMetadataBuilder
+
     return FlashInferMetadataBuilder
 
 
 def get_common_attn_metadata_cls():
     """Lazy import: CommonAttentionMetadata."""
     from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+
     return CommonAttentionMetadata
 
 
 def init_flashinfer_workspace(device):
     """Lazy import: init_workspace_manager."""
     from vllm.v1.worker.workspace import init_workspace_manager
+
     init_workspace_manager(device)
 
 

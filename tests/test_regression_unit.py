@@ -296,6 +296,7 @@ class TestContextCapacity:
     def test_256k_blocks_per_slot(self):
         import inspect
 
+        pytest.importorskip("torch")
         from server.engine import ServerEngine
 
         sig = inspect.signature(ServerEngine.__init__)

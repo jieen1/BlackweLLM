@@ -45,17 +45,17 @@ def main():
     print("\n[2] Initializing DFlash...")
     from runtime.backends.laguna_dflash import DFlashEngine
     engine = DFlashEngine(backend)
-    print(f"  DFlash ready")
+    print("  DFlash ready")
 
     # Check aux hidden state layers
     model = backend.model
-    print(f"\n[3] Model aux hidden state config:")
+    print("\n[3] Model aux hidden state config:")
     if hasattr(model, '_aux_hidden_state_layers'):
         print(f"  _aux_hidden_state_layers = {model._aux_hidden_state_layers}")
     elif hasattr(model, 'model') and hasattr(model.model, '_aux_hidden_state_layers'):
         print(f"  model.model._aux_hidden_state_layers = {model.model._aux_hidden_state_layers}")
     else:
-        print(f"  WARNING: no _aux_hidden_state_layers found!")
+        print("  WARNING: no _aux_hidden_state_layers found!")
         # Check all attributes
         for attr in dir(model):
             if 'aux' in attr.lower():
@@ -106,7 +106,7 @@ def main():
     torch.cuda.empty_cache()
 
     # Run 5 speculative steps with detailed logging
-    print(f"\n[5] Speculative decode steps (detailed):")
+    print("\n[5] Speculative decode steps (detailed):")
     last_token = first_token
     total_accepted = 0
     total_draft = 0
@@ -159,7 +159,7 @@ def main():
     print(f"\n  Overall: {total_accepted}/{total_draft} = {total_accepted/max(total_draft,1):.1%}")
 
     # Check draft KV cache state
-    print(f"\n[6] Draft KV cache state:")
+    print("\n[6] Draft KV cache state:")
     for name, kv in engine._draft_kv_caches.items():
         nonzero = (kv != 0).sum().item()
         total = kv.numel()

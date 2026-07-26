@@ -45,7 +45,7 @@ def main():
 
     # === Test A: Use eager builder's own wrapper but with graph-style manual plan ===
     # This tests if our _run_plan parameters differ from builder.build()
-    from runtime.compat_vllm import set_current_vllm_config, set_forward_context
+    from runtime.compat_vllm import set_forward_context
     from vllm.v1.attention.backends.flashinfer import FIDecode, FlashInferMetadata, fast_plan_decode
 
     backend.reset_slot(0)

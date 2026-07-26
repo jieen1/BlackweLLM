@@ -98,7 +98,7 @@ def main():
         print(f"  Prompt: {len(prompt_ids)} tokens")
 
         # Warmup generate (captures CGs on first call)
-        print(f"  [Warmup] Running generate (CG capture)...")
+        print("  [Warmup] Running generate (CG capture)...")
         t_w0 = time.perf_counter()
         _, warm_stats = engine.generate(prompt_ids, max_tokens=max_tokens)
         t_warm = time.perf_counter() - t_w0
@@ -110,7 +110,7 @@ def main():
               f"draft_cg={engine._draft_cg is not None}")
 
         # Measured generate (all CGs active)
-        print(f"  [Measured] Running generate (all CGs)...")
+        print("  [Measured] Running generate (all CGs)...")
         t_m0 = time.perf_counter()
         tokens, stats = engine.generate(prompt_ids, max_tokens=max_tokens)
         t_meas = time.perf_counter() - t_m0
@@ -125,7 +125,7 @@ def main():
         print(f"  [Measured] ITL: {itl:.2f}ms")
 
         # Baseline (no DFlash, eager decode)
-        print(f"  [Baseline] Running eager decode...")
+        print("  [Baseline] Running eager decode...")
         slot = 0
         backend.reset_slot(slot)
         torch.cuda.empty_cache()

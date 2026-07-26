@@ -17,7 +17,7 @@ WINDOW = 512
 RING_BLOCKS = math.ceil((WINDOW - 1) / BLOCK_SIZE) + 1  # cdiv(511,16)+1 = 32+1 = 33
 RING_SLOTS = RING_BLOCKS * BLOCK_SIZE  # 528
 
-print(f"=== Ring Buffer Math ===")
+print("=== Ring Buffer Math ===")
 print(f"block_size={BLOCK_SIZE}, window={WINDOW}")
 print(f"ring_blocks={RING_BLOCKS}, ring_slots={RING_SLOTS}")
 print()
@@ -38,7 +38,7 @@ for P in [0, 1, 100, 511, 512, 1000, 4096, 131071]:
     unique_slots = set(slots)
     assert len(unique_slots) == len(slots), \
         f"P={P}: collision! {len(slots)} positions but {len(unique_slots)} unique slots"
-print(f"✓ No ring slot collisions within window for test positions")
+print("✓ No ring slot collisions within window for test positions")
 
 # Verify: block table for decode covers the window
 def decode_block_table(P, ring_base):
@@ -66,7 +66,7 @@ def decode_block_table(P, ring_base):
     
     return seq_len, n_blocks, ring_blocks_used
 
-print(f"\n=== Decode Block Table Analysis ===")
+print("\n=== Decode Block Table Analysis ===")
 for P in [0, 100, 511, 512, 1000, 4096, 131071]:
     seq_len, n_blocks, ring_blocks_used = decode_block_table(P, 0)
     contiguous = (len(ring_blocks_used) == max(ring_blocks_used) - min(ring_blocks_used) + 1)
@@ -78,7 +78,7 @@ for P in [0, 100, 511, 512, 1000, 4096, 131071]:
 # KEY INSIGHT: ring blocks are NOT always contiguous (wrap-around case).
 # FlashInfer's block_table is an array of physical block indices.
 # We can build it to map logical block j → the correct ring block.
-print(f"\n=== Block Table Construction (handle wrap-around) ===")
+print("\n=== Block Table Construction (handle wrap-around) ===")
 
 def build_swa_block_table(P, ring_base, ring_blocks_total):
     """Build FlashInfer block_table for SWA layer at decode position P.
@@ -111,7 +111,7 @@ for P in [0, 100, 511, 512, 1000, 4096, 131071]:
     print(f"  P={P:>6d}: seq_len={seq_len:>4d}, block_table={bt[:5]}{'...' if len(bt)>5 else ''} (len={len(bt)})")
 
 # Verify: slot_mapping for decode write
-print(f"\n=== Slot Mapping for Decode Write ===")
+print("\n=== Slot Mapping for Decode Write ===")
 def decode_slot_mapping(P, ring_base):
     """Slot mapping for writing KV at position P in ring buffer."""
     ring_block = (P % RING_SLOTS) // BLOCK_SIZE
@@ -125,7 +125,7 @@ for P in [0, 100, 511, 512, 1000, 131071]:
     print(f"  P={P:>6d}: ring_block={ring_block:>2d}, offset={offset:>2d}, slot_mapping={sm}")
 
 # Verify: prefill slot_mapping (ring buffer write for all positions)
-print(f"\n=== Prefill Ring Write Verification ===")
+print("\n=== Prefill Ring Write Verification ===")
 PROMPT_LEN = 1000
 print(f"Prompt length: {PROMPT_LEN}")
 print(f"After prefill, ring contains positions [{PROMPT_LEN - WINDOW}, {PROMPT_LEN - 1}]")
@@ -148,7 +148,7 @@ if all_correct:
 
 # Verify: decode block table at P=1000 covers the right positions
 seq_len, bt = build_swa_block_table(999, ring_base=0, ring_blocks_total=RING_BLOCKS)
-print(f"\n  Decode at P=999 (after prefill of 1000):")
+print("\n  Decode at P=999 (after prefill of 1000):")
 print(f"  seq_len={seq_len}, block_table len={len(bt)}")
 # Verify each virtual block maps to correct ring block
 for j, phys_block in enumerate(bt):
@@ -157,9 +157,9 @@ for j, phys_block in enumerate(bt):
     expected_ring_block = (actual_start % RING_SLOTS) // BLOCK_SIZE
     assert phys_block == expected_ring_block, \
         f"Block {j}: got {phys_block}, expected {expected_ring_block}"
-print(f"  ✓ All block table entries map to correct ring blocks")
+print("  ✓ All block table entries map to correct ring blocks")
 
-print(f"\n=== Memory Savings ===")
+print("\n=== Memory Savings ===")
 # Per-layer KV per block: 2(K+V) * 8 heads * 128 dim * 1 byte (FP8) * block_size
 kv_per_block = 2 * 8 * 128 * 1 * BLOCK_SIZE  # bytes
 print(f"KV per block per layer: {kv_per_block} bytes = {kv_per_block/1024:.1f} KiB")
@@ -168,7 +168,7 @@ print(f"KV per block per layer: {kv_per_block} bytes = {kv_per_block/1024:.1f} K
 full_blocks = 8192
 full_per_layer = full_blocks * kv_per_block
 full_36_layers = 36 * full_per_layer
-print(f"\nFull allocation (128K, 8192 blocks/slot):")
+print("\nFull allocation (128K, 8192 blocks/slot):")
 print(f"  Per SWA layer: {full_per_layer/1024**3:.3f} GiB")
 print(f"  36 SWA layers: {full_36_layers/1024**3:.3f} GiB")
 
@@ -188,4 +188,4 @@ print(f"\nFull attention (12 layers, unchanged): {full_attn_12/1024**3:.3f} GiB"
 print(f"Total KV before: {(full_36_layers + full_attn_12)/1024**3:.3f} GiB")
 print(f"Total KV after:  {(ring_36_layers + full_attn_12)/1024**3:.3f} GiB")
 
-print(f"\n=== ALL CHECKS PASSED ===")
+print("\n=== ALL CHECKS PASSED ===")

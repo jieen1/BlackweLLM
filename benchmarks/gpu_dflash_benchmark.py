@@ -19,7 +19,6 @@ os.environ.setdefault("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
 
 sys.path.insert(0, "/home/bot/project/qwen-sm120-runtime")
 
-import torch
 
 
 def build_vllm_config():

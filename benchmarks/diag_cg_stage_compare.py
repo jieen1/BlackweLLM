@@ -1,6 +1,6 @@
 """Compare CG vs eager at each stage of speculative decode step.
 Isolates: decode aux → combine → draft → verify."""
-import os, sys, time
+import os, sys
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
                       "/home/bot/project/qwen-sm120-runtime/.autotune_cache")
@@ -67,7 +67,7 @@ def main():
     
     # Run 5 speculative steps, comparing CG vs eager at each stage
     print(f"\n{'='*70}")
-    print(f"Per-stage CG vs Eager comparison (5 steps)")
+    print("Per-stage CG vs Eager comparison (5 steps)")
     print(f"{'='*70}")
     
     last_token = first_token

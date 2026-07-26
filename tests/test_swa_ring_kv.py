@@ -2,9 +2,12 @@
 
 No GPU or model weights required.
 """
+
 import math
 import sys
 import types
+
+import pytest
 
 # Stub out runtime.compat_vllm to avoid vllm import, and import the pure
 # functions this file needs -- done in setup_module()/teardown_module(),
@@ -41,10 +44,16 @@ def setup_module() -> None:
 
     _compat = types.ModuleType("runtime.compat_vllm")
     for attr in [
-        "VllmConfig", "bind_kv_cache", "get_distributed_init_method",
-        "get_model", "get_open_port", "init_worker_distributed_environment",
-        "set_current_vllm_config", "set_forward_context",
-        "get_flashinfer_metadata_builder", "get_common_attn_metadata_cls",
+        "VllmConfig",
+        "bind_kv_cache",
+        "get_distributed_init_method",
+        "get_model",
+        "get_open_port",
+        "init_worker_distributed_environment",
+        "set_current_vllm_config",
+        "set_forward_context",
+        "get_flashinfer_metadata_builder",
+        "get_common_attn_metadata_cls",
         "init_flashinfer_workspace",
     ]:
         setattr(_compat, attr, None)
@@ -67,23 +76,31 @@ class TestRingBlocksFormula:
     """Verify ring_blocks = cdiv(window - 1 + qo_max, block_size) + 1."""
 
     def test_qo1_window512_bs16(self):
+        pytest.importorskip("numpy")
+        pytest.importorskip("torch")
         from runtime.backends.laguna import _ring_blocks_for_window
 
         assert _ring_blocks_for_window(512, 16, qo_max=1) == 33
 
     def test_qo16_window512_bs16(self):
+        pytest.importorskip("numpy")
+        pytest.importorskip("torch")
         from runtime.backends.laguna import _ring_blocks_for_window
 
         # 审查阻断①: DFlash verify qo=16
         assert _ring_blocks_for_window(512, 16, qo_max=16) == 34
 
     def test_default_qo_max_is_16(self):
+        pytest.importorskip("numpy")
+        pytest.importorskip("torch")
         from runtime.backends.laguna import SWA_QO_MAX, _ring_blocks_for_window
 
         assert SWA_QO_MAX == 16
         assert _ring_blocks_for_window(512, 16) == 34
 
     def test_ring_slots_cover_max_span(self):
+        pytest.importorskip("numpy")
+        pytest.importorskip("torch")
         from runtime.backends.laguna import _ring_blocks_for_window
 
         window, bs, qo_max = 512, 16, 16
@@ -93,6 +110,8 @@ class TestRingBlocksFormula:
         assert ring_slots >= max_span
 
     def test_various_windows(self):
+        pytest.importorskip("numpy")
+        pytest.importorskip("torch")
         from runtime.backends.laguna import _ring_blocks_for_window
 
         for window in [128, 256, 512, 1024, 2048]:
@@ -205,6 +224,8 @@ class TestSlabCopyLogic:
 
 class TestPhysicalSlot:
     def test_offset(self):
+        pytest.importorskip("numpy")
+        pytest.importorskip("torch")
         from runtime.backends.laguna import RESERVED_PHYSICAL_SLOTS, _physical_slot
 
         assert _physical_slot(0) == RESERVED_PHYSICAL_SLOTS

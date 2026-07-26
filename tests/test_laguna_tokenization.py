@@ -6,11 +6,13 @@
 - EOS 是 (2, 24)，不是 Qwen 的 (151643, 151645)
 - prompt ids 断言函数能正确检测分歧
 """
+
 from __future__ import annotations
 
 import pytest
 
 # ── prompt ids 断言函数（与 quality gate 共用逻辑）──
+
 
 def assert_prompt_ids_equal(
     prompt: str,
@@ -93,6 +95,7 @@ class TestLagunaTokenizerBOS:
     def _load_tokenizer(self):
         try:
             from transformers import AutoTokenizer
+
             self.tokenizer = AutoTokenizer.from_pretrained(
                 "poolside/Laguna-S-2.1-NVFP4", trust_remote_code=True
             )

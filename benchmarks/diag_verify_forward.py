@@ -1,5 +1,5 @@
 """Compare main model: sequential decode (qo=1) vs parallel verify (qo=16)."""
-import os, sys, time
+import os, sys
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
                       "/home/bot/project/qwen-sm120-runtime/.autotune_cache")
@@ -45,7 +45,7 @@ def main():
     print(f"First token: {first_token} = '{tokenizer.decode([first_token])}'")
     
     # Sequential decode: get 16 tokens one by one (ground truth)
-    print(f"\n--- Sequential decode (qo=1, ground truth) ---")
+    print("\n--- Sequential decode (qo=1, ground truth) ---")
     seq_tokens = [first_token]
     for i in range(15):
         tok = backend.decode(slot, seq_tokens[-1])
@@ -60,7 +60,7 @@ def main():
     
     # Now try parallel forward with qo=16
     # Use the same tokens as input (teacher forcing)
-    print(f"\n--- Parallel forward (qo=16, teacher forcing) ---")
+    print("\n--- Parallel forward (qo=16, teacher forcing) ---")
     kv_len = backend.slot_kv_len[slot]
     print(f"kv_len before verify: {kv_len}")
     
@@ -69,7 +69,6 @@ def main():
     print(f"Verify input: {verify_input}")
     
     # Call _forward_main_with_aux with qo_len=16
-    from runtime.backends.laguna_dflash import DFlashEngine
     # We need the engine for _forward_main_with_aux, but let's use backend directly
     # Actually let's just call the backend's forward path
     
@@ -130,7 +129,7 @@ def main():
     # Compare: parallel_argmax[i] should predict seq_tokens[i+1]
     # logits[0] predicts what comes after verify_input[0] = first_token
     # So logits[0] should == seq_tokens[1]
-    print(f"\n--- Comparison ---")
+    print("\n--- Comparison ---")
     print(f"{'Pos':<4} {'Expected':<10} {'Got':<10} {'Match':<6}")
     matches = 0
     for i in range(15):

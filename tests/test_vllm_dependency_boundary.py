@@ -12,7 +12,6 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-
 _ROOT = Path(__file__).resolve().parents[1]
 
 # Each entry is an existing migration site.  Remove entries as their callers
@@ -39,9 +38,7 @@ def _imports_package(path: Path, package: str) -> bool:
             ):
                 return True
         elif isinstance(node, ast.ImportFrom):
-            if node.module == package or (
-                node.module and node.module.startswith(f"{package}.")
-            ):
+            if node.module == package or (node.module and node.module.startswith(f"{package}.")):
                 return True
     return False
 

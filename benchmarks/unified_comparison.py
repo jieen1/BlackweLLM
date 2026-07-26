@@ -290,7 +290,7 @@ def main():
         print(f"  Base: {len(base_ids)} tok, Suffix: {len(suffix_ids)} tok")
 
         # BlackweLLM
-        print(f"\n[BlackweLLM] DFlash + CG + prefix cache")
+        print("\n[BlackweLLM] DFlash + CG + prefix cache")
         try:
             r = bench_ours(len(base_ids), len(suffix_ids), base_ids, suffix_ids, tok)
             all_results["benchmarks"].append(r)
@@ -303,7 +303,7 @@ def main():
         time.sleep(5)
 
         # vLLM (separate process)
-        print(f"\n[vLLM] DFlash + CG + auto kernel + prefix caching")
+        print("\n[vLLM] DFlash + CG + auto kernel + prefix caching")
         try:
             r = bench_vllm_subprocess(len(base_ids), len(suffix_ids))
             all_results["benchmarks"].append(r)

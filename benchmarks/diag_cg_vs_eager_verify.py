@@ -1,5 +1,5 @@
 """Compare CG verify vs eager verify logits position by position."""
-import os, sys, time
+import os, sys
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
                       "/home/bot/project/qwen-sm120-runtime/.autotune_cache")

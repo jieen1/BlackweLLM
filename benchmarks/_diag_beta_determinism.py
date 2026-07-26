@@ -37,7 +37,7 @@ def main():
     print(f"First token: {first} = {tokenizer.decode([first])!r}")
 
     kv_len = backend.slot_kv_len[0]
-    print(f"\n=== β-v2: always-plan, same input 3x replay ===")
+    print("\n=== β-v2: always-plan, same input 3x replay ===")
 
     logits_list = []
     tokens_list = []
@@ -56,7 +56,7 @@ def main():
             print(f"  Run {i} vs {j}: bit-exact={'✅' if bit_exact else '❌'}  max_diff={max_diff}")
 
     # Compare with eager
-    print(f"\n=== Eager reference ===")
+    print("\n=== Eager reference ===")
     backend.reset_slot(0)
     backend.prefill(0, prompt_ids)
     eager_logits = backend._forward([0], [first], [kv_len], qo_len=1, is_decode=True)[0].clone()
@@ -72,7 +72,7 @@ def main():
         print(f"  Graph run {i} vs eager: bit-exact={'✅' if bit_exact else '❌'}  max_diff={max_diff:.4f}  cosine={cos:.6f}")
 
     # Multi-step determinism: 20 tokens, twice
-    print(f"\n=== Multi-step determinism (20 tokens × 2 runs) ===")
+    print("\n=== Multi-step determinism (20 tokens × 2 runs) ===")
     def run_decode(n_steps):
         cg.reset()
         backend.reset_slot(0)

@@ -44,16 +44,16 @@ _AUTOTUNE_M4 = {
     # Qwen3.6 shapes (original autotune)
     34816: _CFG_D,  # gate_up_proj: 128×256p
     17408: _CFG_D,  # down_proj_attn: 128×256p
-    6144: _CFG_B,   # out_proj: 128×128p
-    5120: _CFG_B,   # down_proj / in_proj_qkvz: 128×128p
-    96: _CFG_B,     # in_proj_ba: 128×128p
+    6144: _CFG_B,  # out_proj: 128×128p
+    5120: _CFG_B,  # down_proj / in_proj_qkvz: 128×128p
+    96: _CFG_B,  # in_proj_ba: 128×128p
     # Laguna-S-2.1 shapes (M=1 decode)
     100352: _CFG_D,  # lm_head: 128×256p (large N)
-    12288: _CFG_D,   # shared expert gate/up: 128×256p
-    11264: _CFG_D,   # QKV proj (72Q layers): 128×256p
-    8192: _CFG_A,    # QKV proj (48Q layers): 128×128
-    3072: _CFG_B,    # O proj / shared down: 128×128p
-    72: _CFG_B,      # g_proj: 128×128p
+    12288: _CFG_D,  # shared expert gate/up: 128×256p
+    11264: _CFG_D,  # QKV proj (72Q layers): 128×256p
+    8192: _CFG_A,  # QKV proj (48Q layers): 128×128
+    3072: _CFG_B,  # O proj / shared down: 128×128p
+    72: _CFG_B,  # g_proj: 128×128p
 }
 
 

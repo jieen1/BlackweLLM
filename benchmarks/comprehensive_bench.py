@@ -2,7 +2,7 @@
 
 Usage: /home/bot/.venvs/vllm/bin/python benchmarks/comprehensive_bench.py
 """
-import os, sys, time, json, gc
+import os, sys, time, json
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
                       "/home/bot/project/qwen-sm120-runtime/.autotune_cache")
@@ -46,7 +46,7 @@ def main():
     t_load = time.perf_counter() - t0
     print(f"  Loaded in {t_load:.1f}s, mem after: {gpu_mem_mb():.0f} MB")
 
-    print(f"\n[2] Initializing DFlash...")
+    print("\n[2] Initializing DFlash...")
     from runtime.backends.laguna_dflash import DFlashEngine
     engine = DFlashEngine(backend)
     print(f"  DFlash ready, mem: {gpu_mem_mb():.0f} MB")
@@ -68,7 +68,7 @@ def main():
         print(f"  Prompt: {len(prompt)} tokens, mem before: {gpu_mem_mb():.0f} MB")
 
         # Warmup (CG capture)
-        print(f"  Warmup...")
+        print("  Warmup...")
         t_w0 = time.perf_counter()
         _, ws = engine.generate(prompt, max_tokens=128)
         t_warm = time.perf_counter() - t_w0
@@ -78,7 +78,7 @@ def main():
         print(f"  Mem after warmup: {gpu_mem_mb():.0f} MB")
 
         # Measured
-        print(f"  Measured (256 tokens)...")
+        print("  Measured (256 tokens)...")
         tokens, stats = engine.generate(prompt, max_tokens=256)
         itl = stats['decode_ms'] / max(stats['num_tokens'] - 1, 1)
         print(f"  Result: {stats['tok_per_s']:.1f} tok/s, accept={stats['acceptance_rate']:.1%}, "
@@ -88,7 +88,7 @@ def main():
         print(f"  Mem: {gpu_mem_mb():.0f} MB")
 
         # Baseline
-        print(f"  Baseline (eager, 128 tokens)...")
+        print("  Baseline (eager, 128 tokens)...")
         slot = 0
         backend.reset_slot(slot)
         torch.cuda.empty_cache()
