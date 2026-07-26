@@ -711,7 +711,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # injected by the prompt), which we wrap and strip below.
     _non_thinking = bool(
         req.chat_template_kwargs and req.chat_template_kwargs.get("enable_thinking") is False
-    )
+    ) or engine.backend_name != "qwen36"
     reasoning_content = None
     if _non_thinking:
         text = raw_text.replace("\ufffd", "").strip()
@@ -787,12 +787,20 @@ async def completions(req: CompletionRequest, request: Request):
         top_logprobs=req.top_logprobs or 0,
     )
     _raw_comp = await _tokenize_decode(engine, result["committed_token_ids"])
-    _raw_comp_full = (
-        _raw_comp
-        if _raw_comp.startswith(chr(60) + "think" + chr(62))
-        else (chr(60) + "think" + chr(62) + "\n" + _raw_comp)
-    )
-    text = strip_thinking(_raw_comp_full)
+    if engine.backend_name != "qwen36":
+        # Non-thinking backends (e.g. Laguna) never emit a <think> block, so
+        # there is no reasoning to strip -- wrapping in a synthetic <think>
+        # prefix here would make strip_thinking's unclosed-block rule eat the
+        # entire response (see notes/2026-07-27-*.md for the real request
+        # that surfaced this as an empty completion).
+        text = _raw_comp.replace("�", "").strip()
+    else:
+        _raw_comp_full = (
+            _raw_comp
+            if _raw_comp.startswith(chr(60) + "think" + chr(62))
+            else (chr(60) + "think" + chr(62) + "\n" + _raw_comp)
+        )
+        text = strip_thinking(_raw_comp_full)
     metrics.record_request(
         "completions",
         result["prompt_tokens"],
@@ -1300,12 +1308,18 @@ async def anthropic_messages(request: Request):
         sampling_params=sampling_params,
     )
     _raw_anth = await _tokenize_decode(engine, result["committed_token_ids"])
-    _raw_anth_full = (
-        _raw_anth
-        if _raw_anth.startswith(chr(60) + "think" + chr(62))
-        else (chr(60) + "think" + chr(62) + "\n" + _raw_anth)
-    )
-    text = strip_thinking(_raw_anth_full)
+    if engine.backend_name != "qwen36":
+        # Non-thinking backends (e.g. Laguna) never emit a <think> block --
+        # see the matching guard in /v1/completions for why unconditionally
+        # wrapping in a synthetic <think> prefix would eat the whole response.
+        text = _raw_anth.replace("�", "").strip()
+    else:
+        _raw_anth_full = (
+            _raw_anth
+            if _raw_anth.startswith(chr(60) + "think" + chr(62))
+            else (chr(60) + "think" + chr(62) + "\n" + _raw_anth)
+        )
+        text = strip_thinking(_raw_anth_full)
     metrics.record_request(
         "messages",
         result["prompt_tokens"],
