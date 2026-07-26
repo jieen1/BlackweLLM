@@ -15,6 +15,7 @@ Usage:
     from runtime.nvfp4_cudnn_patch import patch_nvfp4_to_cudnn
     patch_nvfp4_to_cudnn()  # call after model loading
 """
+
 from __future__ import annotations
 
 import logging

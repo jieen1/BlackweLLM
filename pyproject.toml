@@ -25,13 +25,16 @@ target-version = "py310"
 select = ["E", "F", "I", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
-# benchmarks/ holds diagnostic microbench/probe/repro scripts that
-# deliberately use compact one-liners and scratch variables. Keep the
-# bug-catching rules active (F821 undefined-name, F811 redefinition,
+# benchmarks/ and tests/debug/ hold diagnostic microbench/probe/repro/debug
+# scripts that deliberately use compact one-liners, scratch variables,
+# env-var-before-import setup (E402), short loop variable names (E741), and
+# broad except blocks to keep printing partial diagnostics on failure (E722).
+# Keep the bug-catching rules active (F821 undefined-name, F811 redefinition,
 # F401 unused-import, E9xx syntax) but relax pure style rules so that
 # `ruff check .` stays green and enforceable for the production packages
 # (runtime/, server/, loader/, model/, oracle/).
-"benchmarks/*" = ["E501", "E701", "E702", "I001", "F841"]
+"benchmarks/*" = ["E401", "E402", "E501", "E701", "E702", "E722", "E741", "I001", "F841"]
+"tests/debug/*" = ["E401", "E402", "E501", "E701", "E702", "E722", "E741", "I001", "F841"]
 
 [tool.setuptools.packages.find]
 include = ["benchmarks*", "loader*", "model*", "oracle*", "runtime*", "server*"]

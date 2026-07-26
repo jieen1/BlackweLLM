@@ -1,5 +1,5 @@
 """Test layer 11 (max gs=17024) — folding vs alpha precision at fp16 boundary."""
-import os, sys, time
+import os, sys
 os.environ["USE_LIBUV"] = "0"; os.environ["HF_HUB_OFFLINE"] = "1"
 sys.path.insert(0, "/home/bot/project/qwen-sm120-runtime")
 import torch, torch.nn.functional as F
@@ -96,7 +96,7 @@ cmp("ALPHA vs truth", alpha_out, truth)
 cmp("ALPHA vs FOLD", alpha_out, fold_out)
 
 # Per-expert: below vs above 16384
-print(f"\nPer-expert (below vs above fp16 boundary 16384):")
+print("\nPer-expert (below vs above fp16 boundary 16384):")
 print(f"  {'E':>4} {'gs':>8} {'truth':>10} {'fold':>10} {'alpha':>10} {'f/t':>8} {'a/t':>8}")
 for eid in test_experts:
     g = raw["gate_gs"][eid].item()

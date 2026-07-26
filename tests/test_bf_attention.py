@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import pytest
-import torch
-import torch.nn as nn
 
-from runtime.backends.bf_attention import (
+torch = pytest.importorskip("torch")
+nn = pytest.importorskip("torch.nn")
+
+from runtime.backends.bf_attention import (  # noqa: E402
     BFAttention,
     bf_attn_context,
     clear_bf_attn_context,

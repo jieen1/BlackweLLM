@@ -117,7 +117,7 @@ def main():
     }
     with open("benchmarks/fixtures/decode_profile_64k.json", "w") as f:
         json.dump(results_data, f, indent=2)
-    print(f"\nSaved to benchmarks/fixtures/decode_profile_64k.json")
+    print("\nSaved to benchmarks/fixtures/decode_profile_64k.json")
 
 if __name__ == "__main__":
     main()

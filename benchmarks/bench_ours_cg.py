@@ -1,5 +1,5 @@
 """BlackweLLM benchmark with CUDA Graph enabled."""
-import gc, json, os, sys, time, subprocess
+import json, os, sys, time, subprocess
 os.environ["USE_LIBUV"]="0"; os.environ["HF_HUB_OFFLINE"]="1"
 os.environ["QSR_DFLASH_CUDA_GRAPH"]="1"
 sys.path.insert(0, "/home/bot/project/qwen-sm120-runtime")

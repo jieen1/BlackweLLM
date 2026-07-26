@@ -20,7 +20,6 @@ os.environ.setdefault("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
 
 sys.path.insert(0, "/home/bot/project/qwen-sm120-runtime")
 
-import torch
 
 
 def build_vllm_config():
@@ -76,7 +75,7 @@ def test_dflash_engine():
     assert len(aux) == 6, f"Expected 6 aux hidden states, got {len(aux)}"
     for i, h in enumerate(aux):
         assert h.shape == (32, 3072), f"Aux[{i}] shape: {h.shape}, expected (32, 3072)"
-    print(f"  ✓ Aux hidden states: 6 × [32, 3072]")
+    print("  ✓ Aux hidden states: 6 × [32, 3072]")
     backend.reset_slot(0)
 
     # Step 4: Test draft forward

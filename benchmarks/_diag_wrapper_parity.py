@@ -41,7 +41,7 @@ def main():
     # --- Metadata from eager path ---
     backend._fill_decode_buffers([0], [first], [kv_len])
     common_meta = backend._build_common_attn_metadata([0], [kv_len], [1], True)
-    print(f"\n=== Eager metadata ===")
+    print("\n=== Eager metadata ===")
     print(f"  seq_lens: {common_meta.seq_lens.tolist()}")
     print(f"  num_actual_tokens: {common_meta.num_actual_tokens}")
     print(f"  block_table_tensor[0,:5]: {common_meta.block_table_tensor[0,:5].tolist()}")
@@ -57,7 +57,7 @@ def main():
     backend.prefill(0, prompt_ids)
     graph_result = cg.replay([0], [first], [kv_len])
     graph_logits = cg._logits[0].clone()
-    print(f"\n=== Graph metadata (after replay) ===")
+    print("\n=== Graph metadata (after replay) ===")
     print(f"  input_ids: {cg._input_ids[:1].tolist()}")
     print(f"  positions: {cg._positions[:1].tolist()}")
     print(f"  slot_mapping[:5]: {cg._slot_mapping[:5].tolist()}")
@@ -73,7 +73,7 @@ def main():
     print(f"\nGraph vs eager: cos={cos:.6f}  max_diff={max_diff:.4f}")
 
     # --- sm_scale / window_left comparison ---
-    print(f"\n=== Builder params ===")
+    print("\n=== Builder params ===")
     for gk, builder in backend._metadata_builders.items():
         print(f"  builder[{gk}]: sm_scale={builder.sm_scale}, window_left={builder.window_left}, "
               f"num_qo_heads={builder.num_qo_heads}, num_kv_heads={builder.num_kv_heads}, "
@@ -84,14 +84,14 @@ def main():
         print(f"    kv_cache_dtype={builder.kv_cache_dtype}")
 
     # --- Eager builder's internal decode wrapper params ---
-    print(f"\n=== Eager decode wrapper ===")
+    print("\n=== Eager decode wrapper ===")
     for gk, builder in backend._metadata_builders.items():
         w = builder._decode_wrapper
         if w is not None:
             print(f"  wrapper[{gk}]: _sm_scale={w._sm_scale}, is_cuda_graph={w.is_cuda_graph_enabled}")
 
     # --- Graph wrapper params ---
-    print(f"\n=== Graph decode wrapper ===")
+    print("\n=== Graph decode wrapper ===")
     for gk, w in cg._decode_wrappers.items():
         print(f"  wrapper[{gk}]: _sm_scale={w._sm_scale}, is_cuda_graph={w.is_cuda_graph_enabled}")
 

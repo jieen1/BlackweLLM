@@ -1,5 +1,5 @@
 """Phase 1 FIX: correct runtime-alpha path + compare with folding + truth."""
-import os, sys, time
+import os, sys
 os.environ["USE_LIBUV"] = "0"
 os.environ["HF_HUB_OFFLINE"] = "1"
 sys.path.insert(0, "/home/bot/project/qwen-sm120-runtime")

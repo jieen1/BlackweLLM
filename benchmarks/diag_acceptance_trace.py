@@ -1,5 +1,5 @@
 """Trace acceptance: show draft vs verify tokens for first N steps."""
-import os, sys, time
+import os, sys
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
                       "/home/bot/project/qwen-sm120-runtime/.autotune_cache")
@@ -63,7 +63,7 @@ def main():
     
     # Trace first 10 speculative steps
     print(f"\n{'='*80}")
-    print(f"Tracing speculative decode steps (eager mode, no CG)")
+    print("Tracing speculative decode steps (eager mode, no CG)")
     print(f"{'='*80}")
     
     last_token = first_token

@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from runtime.backends.laguna_sparkinfer_moe import (
     SparkinferMoEModel, load_moe_layer_weights, prepare_sparkinfer_layer,
     SparkinferMoELayer, _find_checkpoint,
-    NUM_EXPERTS, TOP_K, HIDDEN_SIZE, INTERMEDIATE_SIZE,
+    NUM_EXPERTS, TOP_K, HIDDEN_SIZE,
 )
 from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
 
@@ -147,7 +147,7 @@ def main():
         times_g = sorted([s.elapsed_time(e) * 1000 for s, e in zip(starts, ends)])
         print(f"  Graph M=1: median={times_g[N//2]:.0f}us min={times_g[0]:.0f}us "
               f"47L@median={times_g[N//2]*47/1000:.1f}ms")
-        print(f"  ✓ CUDA graph capture works")
+        print("  ✓ CUDA graph capture works")
     except Exception as e:
         print(f"  ✗ CUDA graph failed: {e}")
 

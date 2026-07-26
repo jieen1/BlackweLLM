@@ -33,7 +33,6 @@ def main():
     from runtime.backends.laguna import LagunaBackend
     backend = LagunaBackend(vllm_config, num_slots=1, blocks_per_slot=8448)
     from runtime.backends.laguna_dflash import DFlashEngine
-    from runtime.backends.dflash_constants import NUM_SPECULATIVE_TOKENS
     engine = DFlashEngine(backend)
 
     from transformers import AutoTokenizer

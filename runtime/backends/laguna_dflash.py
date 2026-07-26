@@ -19,6 +19,7 @@ Pipeline per speculative step:
 4. Main verify (16 tokens) → accept/reject
 5. Accept N tokens → next step starts from token N+1
 """
+
 from __future__ import annotations
 
 import logging
@@ -26,17 +27,13 @@ import os
 import time
 from typing import Any
 
-import numpy as np
 import torch
 
 from runtime.backends.bf_attention import bf_attn_context
 from runtime.backends.dflash_constants import (
     AUX_LAYER_IDS,
     DFLASH_MODEL_PATH,
-    DRAFT_HEAD_DIM,
-    DRAFT_NUM_KV_HEADS,
     DRAFT_NUM_LAYERS,
-    DRAFT_NUM_QO_HEADS,
     DRAFT_WINDOW,
     MASK_TOKEN_ID,
     NUM_QUERY_PER_REQ,
@@ -44,7 +41,6 @@ from runtime.backends.dflash_constants import (
 )
 from runtime.backends.laguna import LagunaBackend, _physical_slot, _ring_blocks_for_window
 from runtime.compat_vllm import (
-    VllmConfig,
     set_current_vllm_config,
     set_forward_context,
 )
@@ -152,7 +148,9 @@ class DFlashEngine:
 
         logger.info(
             "DFlashEngine initialized: K=%d speculative tokens, draft %d layers, cuda_graph=%s",
-            NUM_SPECULATIVE_TOKENS, DRAFT_NUM_LAYERS, self._use_cuda_graph,
+            NUM_SPECULATIVE_TOKENS,
+            DRAFT_NUM_LAYERS,
+            self._use_cuda_graph,
         )
 
     def _load_draft_model(self, model_path: str | None) -> Any:
@@ -250,9 +248,7 @@ class DFlashEngine:
         if not self._draft_layer_names:
             # Fallback: discover from draft model directly
             draft_inner = (
-                self.draft_model.model
-                if hasattr(self.draft_model, "model")
-                else self.draft_model
+                self.draft_model.model if hasattr(self.draft_model, "model") else self.draft_model
             )
             if hasattr(draft_inner, "layers"):
                 for layer in draft_inner.layers:
@@ -280,30 +276,33 @@ class DFlashEngine:
             attn = self._draft_attn_layers[name]
             # Self-allocated: [blocks, 2, bs, kv_heads, head_dim], FP8 as uint8
             shape = (total_blocks, 2, self.block_size, attn.num_kv_heads, attn.head_size)
-            self._draft_kv_caches[name] = torch.zeros(
-                shape, dtype=torch.uint8, device=self.device
-            )
+            self._draft_kv_caches[name] = torch.zeros(shape, dtype=torch.uint8, device=self.device)
 
         # Bind draft KV caches to draft attention layers
         bind_kv_cache(self._draft_kv_caches, self._draft_attn_layers, [])
         logger.info(
             "DFlash: draft KV allocated: %d blocks/slot × %d layers",
-            draft_blocks_per_slot, len(self._draft_layer_names),
+            draft_blocks_per_slot,
+            len(self._draft_layer_names),
         )
-
 
     def _patch_draft_sparkinfer(self) -> None:
         """Patch draft model attention layers to use sparkinfer (zero FlashInfer dep)."""
         from runtime.backends.laguna_sparkinfer_attn import SparkinferAttentionImpl
+
         for name in self._draft_layer_names:
             attn = self._draft_attn_layers[name]
             attn.impl = SparkinferAttentionImpl(
-                num_heads=attn.num_heads, head_size=attn.head_size,
-                scale=attn.head_size ** -0.5,
-                num_kv_heads=attn.num_kv_heads, window_left=DRAFT_WINDOW - 1,
+                num_heads=attn.num_heads,
+                head_size=attn.head_size,
+                scale=attn.head_size**-0.5,
+                num_kv_heads=attn.num_kv_heads,
+                window_left=DRAFT_WINDOW - 1,
             )
-        logger.info("DFlash: draft attention patched with sparkinfer (%d layers)",
-                    len(self._draft_layer_names))
+        logger.info(
+            "DFlash: draft attention patched with sparkinfer (%d layers)",
+            len(self._draft_layer_names),
+        )
 
     def _init_draft_metadata_builder(self) -> None:
         """Initialize FlashInfer metadata builder for draft model attention."""
@@ -362,6 +361,7 @@ class DFlashEngine:
     def _capture_verify_cg(self) -> None:
         """Experimental main-model verify graph; not enabled in production."""
         from runtime.backends.laguna_cuda_graph import LagunaCudaGraphVerify
+
         try:
             cg = LagunaCudaGraphVerify(self.backend, num_tokens=NUM_QUERY_PER_REQ)
             cg.capture()
@@ -369,7 +369,9 @@ class DFlashEngine:
             logger.info("DFlash: verify CG captured (M=%d)", NUM_QUERY_PER_REQ)
         except Exception as e:
             logger.warning("DFlash: verify CG capture failed: %s", e)
-            import traceback; traceback.print_exc()
+            import traceback
+
+            traceback.print_exc()
             self._verify_cg = None
 
     def _capture_draft_cg(self) -> None:
@@ -424,9 +426,7 @@ class DFlashEngine:
             backend._fill_decode_buffers(slot_ids, token_ids, kv_lengths)
 
         # Build attention metadata
-        common_meta = backend._build_common_attn_metadata(
-            slot_ids, kv_lengths, qo_lens, is_decode
-        )
+        common_meta = backend._build_common_attn_metadata(slot_ids, kv_lengths, qo_lens, is_decode)
 
         attn_metadata_dict: dict[str, Any] = {}
         slot_mapping_dict: dict[str, torch.Tensor] = {}
@@ -447,10 +447,17 @@ class DFlashEngine:
         for group_key, layer_names in backend._layer_groups.items():
             wl = group_key[0]
             is_swa_group = wl >= 0
-            meta = swa_spark_meta if (is_swa_group and swa_spark_meta is not None) else full_spark_meta
+            meta = (
+                swa_spark_meta if (is_swa_group and swa_spark_meta is not None) else full_spark_meta
+            )
+            sm = (
+                (swa_meta.slot_mapping if swa_meta else common_meta.slot_mapping)
+                if is_swa_group
+                else common_meta.slot_mapping
+            )
             for name in layer_names:
                 attn_metadata_dict[name] = meta
-                slot_mapping_dict[name] = common_meta.slot_mapping if not is_swa_group else (swa_meta.slot_mapping if swa_meta else common_meta.slot_mapping)
+                slot_mapping_dict[name] = sm
 
         # Build input tensors
         if is_decode:
@@ -460,22 +467,18 @@ class DFlashEngine:
             if num_reqs == 1:
                 flat_token_ids = token_ids
             else:
-                flat_token_ids = [
-                    tok for slot_tokens in token_ids for tok in slot_tokens
-                ]
-            input_ids = torch.tensor(
-                flat_token_ids, dtype=torch.long, device=self.device
-            )
+                flat_token_ids = [tok for slot_tokens in token_ids for tok in slot_tokens]
+            input_ids = torch.tensor(flat_token_ids, dtype=torch.long, device=self.device)
             positions_list = []
             for kv_len, qo in zip(kv_lengths, qo_lens):
                 positions_list.extend(range(kv_len, kv_len + qo))
-            positions = torch.tensor(
-                positions_list, dtype=torch.long, device=self.device
-            )
+            positions = torch.tensor(positions_list, dtype=torch.long, device=self.device)
 
         with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
             with set_forward_context(
-                attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict,
+                attn_metadata_dict,
+                backend.vllm_config,
+                slot_mapping=slot_mapping_dict,
                 skip_compiled=True,
             ):
                 result = backend.model.forward(input_ids, positions)
@@ -572,6 +575,7 @@ class DFlashEngine:
 
         # Build sparkinfer metadata for draft (extend mode, qo=16)
         from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
+
         draft_meta = SparkinferAttnMetadata(
             mode="extend",
             page_table=common_meta.block_table_tensor,
@@ -582,18 +586,15 @@ class DFlashEngine:
         )
 
         # Create metadata dict for all draft layers
-        attn_metadata_dict = {
-            name: draft_meta for name in self._draft_layer_names
-        }
+        attn_metadata_dict = {name: draft_meta for name in self._draft_layer_names}
         slot_mapping_dict = {
-            name: self._draft_slot_mapping[:num_tokens]
-            for name in self._draft_layer_names
+            name: self._draft_slot_mapping[:num_tokens] for name in self._draft_layer_names
         }
 
         # Run draft model forward
         with set_forward_context(
-            attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict
-        , skip_compiled=True):
+            attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict, skip_compiled=True
+        ):
             draft_hidden = self.draft_model(
                 input_ids=self._draft_input_ids[:num_tokens],
                 positions=self._draft_positions[:num_tokens],
@@ -624,9 +625,7 @@ class DFlashEngine:
         ring_block = (position % ring_slots) // bs
         ring_off = position % bs
         slot_mapping_val = (draft_base + ring_block) * bs + ring_off
-        context_positions = torch.tensor(
-            [position], dtype=torch.long, device=self.device
-        )
+        context_positions = torch.tensor([position], dtype=torch.long, device=self.device)
         context_slot_mapping = torch.tensor(
             [slot_mapping_val], dtype=torch.long, device=self.device
         )
@@ -645,7 +644,7 @@ class DFlashEngine:
     ) -> tuple[list[int], int]:
         """Greedy accept/reject from verify logits (CUDA Graph path)."""
         num_tokens = 1 + len(draft_tokens)
-        verify_argmax = verify_logits[:num_tokens - 1].argmax(dim=-1).tolist()
+        verify_argmax = verify_logits[: num_tokens - 1].argmax(dim=-1).tolist()
         return _greedy_accept_reject(verify_argmax, draft_tokens, bonus_token)
 
     def _verify(
@@ -662,7 +661,6 @@ class DFlashEngine:
 
         Returns (accepted_tokens, num_accepted).
         """
-        backend = self.backend
         num_tokens = 1 + len(draft_tokens)  # 16
         verify_tokens = [bonus_token] + draft_tokens
 
@@ -673,7 +671,7 @@ class DFlashEngine:
         # Greedy verification:
         # logits[i] predicts token at position kv_len + i + 1
         # logits[0] → should match draft_tokens[0]
-        verify_argmax = logits[:num_tokens - 1].argmax(dim=-1).tolist()
+        verify_argmax = logits[: num_tokens - 1].argmax(dim=-1).tolist()
         return _greedy_accept_reject(verify_argmax, draft_tokens, bonus_token)
 
     def _forward_verify(
@@ -698,6 +696,7 @@ class DFlashEngine:
 
         # Build full-attention metadata (standard contiguous blocks)
         from runtime.compat_vllm import get_common_attn_metadata_cls, set_current_vllm_config
+
         CommonAttentionMetadata = get_common_attn_metadata_cls()
 
         phys = _physical_slot(slot)
@@ -791,7 +790,9 @@ class DFlashEngine:
 
         with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
             with set_forward_context(
-                attn_metadata_dict, backend.vllm_config, slot_mapping=slot_mapping_dict,
+                attn_metadata_dict,
+                backend.vllm_config,
+                slot_mapping=slot_mapping_dict,
                 skip_compiled=True,
             ):
                 result = backend.model.forward(input_ids, positions)
@@ -832,9 +833,7 @@ class DFlashEngine:
         # Step 2: Combine hidden states and precompute context KV
         if aux_hidden_states is not None:
             combined_input = torch.cat(aux_hidden_states, dim=-1)  # [1, 18432]
-            combined = self.draft_model.combine_hidden_states(
-                combined_input
-            )  # [1, 3072]
+            combined = self.draft_model.combine_hidden_states(combined_input)  # [1, 3072]
             self._precompute_context_kv(slot, combined, kv_len)
 
         # Step 3: Draft forward → 15 draft tokens
@@ -847,13 +846,9 @@ class DFlashEngine:
         if self._verify_cg is not None:
             verify_tokens = [bonus_token] + draft_tokens
             verify_logits = self._verify_cg.replay(slot, verify_tokens, kv_len + 1)
-            accepted, num_accepted = self._accept_reject(
-                verify_logits, draft_tokens, bonus_token
-            )
+            accepted, num_accepted = self._accept_reject(verify_logits, draft_tokens, bonus_token)
         else:
-            accepted, num_accepted = self._verify(
-                slot, bonus_token, draft_tokens, kv_len + 1
-            )
+            accepted, num_accepted = self._verify(slot, bonus_token, draft_tokens, kv_len + 1)
 
         # Update slot state
         backend.slot_kv_len[slot] += num_accepted
@@ -888,8 +883,7 @@ class DFlashEngine:
         ring_slots = self._draft_blocks_per_slot * bs
 
         context_positions = torch.arange(
-            position_offset, position_offset + num_positions,
-            dtype=torch.long, device=self.device
+            position_offset, position_offset + num_positions, dtype=torch.long, device=self.device
         )
         slot_mappings = torch.zeros(num_positions, dtype=torch.long, device=self.device)
         for i in range(num_positions):
@@ -905,7 +899,8 @@ class DFlashEngine:
         )
         logger.info(
             "DFlash: precomputed context KV for %d positions (offset=%d)",
-            num_positions, position_offset,
+            num_positions,
+            position_offset,
         )
 
     def _lazy_capture_cg(self) -> None:
@@ -929,8 +924,12 @@ class DFlashEngine:
         Returns (tokens, stats).
         """
         return self.generate_verify_only(
-            prompt_ids, max_tokens, temperature, eos_tokens,
-            slot=slot, enable_prefix_cache=enable_prefix_cache,
+            prompt_ids,
+            max_tokens,
+            temperature,
+            eos_tokens,
+            slot=slot,
+            enable_prefix_cache=enable_prefix_cache,
         )
 
     def generate_legacy(
@@ -1047,13 +1046,16 @@ class DFlashEngine:
             # Partial match: continue from cached prefix
             logger.info(
                 "Prefix cache HIT: %d/%d tokens cached, prefilling %d suffix",
-                prefix_len, prompt_len, prompt_len - prefix_len,
+                prefix_len,
+                prompt_len,
+                prompt_len - prefix_len,
             )
         elif prefix_len >= prompt_len:
             # Full match: no prefill needed
             logger.info(
                 "Prefix cache FULL HIT: %d/%d tokens cached",
-                prefix_len, prompt_len,
+                prefix_len,
+                prompt_len,
             )
         else:
             # No match: full reset and prefill
@@ -1120,9 +1122,7 @@ class DFlashEngine:
 
             # Step 2: Accept/reject (single GPU→CPU sync for all 16 argmax)
             all_argmax = verify_logits[:NUM_QUERY_PER_REQ].argmax(dim=-1).tolist()
-            decision = _verify_only_accept_reject(
-                all_argmax, draft_tokens, bonus_token
-            )
+            decision = _verify_only_accept_reject(all_argmax, draft_tokens, bonus_token)
             num_accepted = decision["num_accepted"]
             new_tokens = decision["committed"]
             total_accepted += num_accepted
@@ -1145,8 +1145,7 @@ class DFlashEngine:
                 draft_base = phys * self._draft_blocks_per_slot
                 ring_slots = self._draft_blocks_per_slot * bs
                 context_positions = torch.arange(
-                    kv_len, kv_len + context_count,
-                    dtype=torch.long, device=self.device
+                    kv_len, kv_len + context_count, dtype=torch.long, device=self.device
                 )
                 ring_blocks = (context_positions % ring_slots) // bs
                 ring_offs = context_positions % bs
@@ -1166,7 +1165,7 @@ class DFlashEngine:
             for tok in new_tokens:
                 if tok in eos_tokens:
                     idx = len(tokens) - len(new_tokens) + new_tokens.index(tok)
-                    tokens = tokens[:idx + 1]
+                    tokens = tokens[: idx + 1]
                     found_eos = True
                     break
             if found_eos:
@@ -1213,6 +1212,7 @@ class DFlashEngine:
 
         # Build metadata (reuse existing _forward_verify logic)
         from runtime.compat_vllm import get_common_attn_metadata_cls, set_current_vllm_config
+
         CommonAttentionMetadata = get_common_attn_metadata_cls()
 
         phys = _physical_slot(slot)
@@ -1235,10 +1235,16 @@ class DFlashEngine:
         seq_lens = torch.tensor([new_kv_len], dtype=torch.int32, device=self.device)
 
         full_meta = CommonAttentionMetadata(
-            query_start_loc=qsl, query_start_loc_cpu=qsl_cpu,
-            seq_lens=seq_lens, num_reqs=1, num_actual_tokens=num_tokens,
-            max_query_len=num_tokens, max_seq_len=new_kv_len,
-            block_table_tensor=full_bt, slot_mapping=full_sm, causal=True,
+            query_start_loc=qsl,
+            query_start_loc_cpu=qsl_cpu,
+            seq_lens=seq_lens,
+            num_reqs=1,
+            num_actual_tokens=num_tokens,
+            max_query_len=num_tokens,
+            max_seq_len=new_kv_len,
+            block_table_tensor=full_bt,
+            slot_mapping=full_sm,
+            causal=True,
         )
 
         # SWA ring metadata
@@ -1248,14 +1254,17 @@ class DFlashEngine:
                 [slot], [kv_len], [num_tokens], False, swa_mode="verify_ring"
             )
 
-        from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
         attn_metadata_dict = {}
         slot_mapping_dict = {}
-        full_spark_meta = backend._build_sparkinfer_metadata(full_meta, window_left=-1, mode="verify")
+        full_spark_meta = backend._build_sparkinfer_metadata(
+            full_meta, window_left=-1, mode="verify"
+        )
         swa_spark_meta = None
         if swa_meta is not None:
             swa_wl = backend._swa_window - 1 if backend._swa_window > 0 else -1
-            swa_spark_meta = backend._build_sparkinfer_metadata(swa_meta, window_left=swa_wl, mode="verify")
+            swa_spark_meta = backend._build_sparkinfer_metadata(
+                swa_meta, window_left=swa_wl, mode="verify"
+            )
         for group_key, layer_names in backend._layer_groups.items():
             wl = group_key[0]
             is_swa = wl >= 0
@@ -1265,11 +1274,14 @@ class DFlashEngine:
                 slot_mapping_dict[name] = full_sm if not is_swa else swa_meta.slot_mapping
 
         from runtime.compat_vllm import set_forward_context
+
         with set_current_vllm_config(backend.vllm_config):
             with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
                 with set_forward_context(
-                    attn_metadata_dict, backend.vllm_config,
-                    slot_mapping=slot_mapping_dict, skip_compiled=True,
+                    attn_metadata_dict,
+                    backend.vllm_config,
+                    slot_mapping=slot_mapping_dict,
+                    skip_compiled=True,
                 ):
                     result = backend.model.forward(input_ids, positions)
 

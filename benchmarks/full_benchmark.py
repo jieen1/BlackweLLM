@@ -3,7 +3,7 @@
 
 Each context runs in a separate subprocess to avoid GPU memory leaks.
 """
-import json, os, subprocess, sys, time
+import json, os, subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -161,7 +161,7 @@ def main():
                 print(f"  FAILED: {err[:200]}")
                 results["contexts"][str(ctx)] = {"status": "FAILED", "error": err[:300]}
         except subprocess.TimeoutExpired:
-            print(f"  TIMEOUT")
+            print("  TIMEOUT")
             results["contexts"][str(ctx)] = {"status": "TIMEOUT"}
         except Exception as e:
             print(f"  ERROR: {e}")

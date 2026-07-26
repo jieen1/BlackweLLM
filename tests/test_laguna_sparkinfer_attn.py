@@ -5,10 +5,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-import torch
 
-from runtime.backends.laguna_cuda_graph import _SparkinferCGExtendImpl
-from runtime.backends.laguna_sparkinfer_attn import _paged_descale
+torch = pytest.importorskip("torch")
+
+from runtime.backends.laguna_cuda_graph import _SparkinferCGExtendImpl  # noqa: E402
+from runtime.backends.laguna_sparkinfer_attn import _paged_descale  # noqa: E402
 
 
 def test_paged_descale_normalizes_rank_zero_dflash_default_scale():

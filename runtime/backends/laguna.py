@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from runtime.backends.bf_attention import bf_attn_context
 from runtime.block_pool import ChunkedPrefillState
 from runtime.compat_vllm import (
     VllmConfig,
@@ -30,7 +31,6 @@ from runtime.compat_vllm import (
     set_current_vllm_config,
     set_forward_context,
 )
-from runtime.backends.bf_attention import bf_attn_context
 from runtime.logprobs import compute_logprobs
 from runtime.model_spec import ModelSpec
 from runtime.sampling import SamplingParams, make_generator, sample_from_logits
@@ -404,16 +404,17 @@ class LagunaBackend:
         After preparing sparkinfer weights for a layer, frees vLLM's copy of
         that layer's expert weights to avoid double memory usage.
         """
+        from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
+        from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+            fused_topk_bias,
+        )
+
         from runtime.backends.laguna_sparkinfer_moe import (
             SparkinferMoELayer,
             _find_checkpoint,
             load_moe_layer_weights,
             prepare_sparkinfer_layer,
             sparkinfer_version,
-        )
-        from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
-        from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
-            fused_topk_bias,
         )
 
         model = self.model
@@ -675,7 +676,9 @@ class LagunaBackend:
             causal=True,
         )
 
-    def _build_sparkinfer_metadata(self, common_meta, window_left: int = -1, mode: str | None = None):
+    def _build_sparkinfer_metadata(
+        self, common_meta, window_left: int = -1, mode: str | None = None
+    ):
         """Convert CommonAttentionMetadata to SparkinferAttnMetadata."""
         from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
 
@@ -847,7 +850,6 @@ class LagunaBackend:
         common_meta = self._build_common_attn_metadata(slot_ids, kv_lengths, qo_lens, is_decode)
 
         # Build sparkinfer attention metadata per group
-        from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
 
         attn_metadata_dict: dict[str, Any] = {}
         slot_mapping_dict: dict[str, torch.Tensor] = {}
@@ -1045,7 +1047,6 @@ class LagunaBackend:
         absolute kv_length; SWA layers use relative positions in scratch.
         """
         sfc = self.static_forward_context
-        bs = self.block_size
         chunk_tokens = self._prefill_chunk_tokens
         prompt_len = len(prompt_ids)
         window = self._swa_window
@@ -1280,8 +1281,6 @@ class LagunaBackend:
 
         common_meta = self._build_common_attn_metadata(slot_ids, kv_lengths, qo_lens, is_decode)
 
-        from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
-
         attn_metadata_dict: dict[str, Any] = {}
         slot_mapping_dict: dict[str, torch.Tensor] = {}
 
@@ -1422,8 +1421,9 @@ class LagunaBackend:
 
     def _patch_rmsnorm_triton(self):
         """Replace vLLM RMSNorm with Triton fused kernel (zero vLLM dependency)."""
-        from runtime.kernels.fused_rms_norm import fused_add_rms_norm, rms_norm
         from vllm.model_executor.layers.layernorm import RMSNorm
+
+        from runtime.kernels.fused_rms_norm import fused_add_rms_norm, rms_norm
 
         def _triton_forward(self_norm, x, residual=None):
             if residual is None:
@@ -1606,7 +1606,6 @@ class LagunaBackend:
             # Short suffix: single chunk with scratch
             sfc = self.static_forward_context
             window = self._swa_window
-            bs = self.block_size
 
             # Copy overlap from ring to scratch
             overlap = min(window, start_pos)

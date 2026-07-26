@@ -69,7 +69,7 @@ def test_backend(moe_backend):
         if dt not in dtype_counts:
             dtype_counts[dt] = 0
         dtype_counts[dt] += p.nelement() * p.element_size()
-    print(f"  Weight dtypes:")
+    print("  Weight dtypes:")
     for dt, sz in sorted(dtype_counts.items(), key=lambda x: -x[1]):
         print(f"    {dt}: {sz/1024**3:.2f} GB")
     
@@ -108,4 +108,4 @@ if __name__ == "__main__":
     
     with open("benchmarks/fixtures/mem_backend_compare.json", "w") as f:
         json.dump(results, f, indent=2)
-    print(f"\nSaved to benchmarks/fixtures/mem_backend_compare.json")
+    print("\nSaved to benchmarks/fixtures/mem_backend_compare.json")

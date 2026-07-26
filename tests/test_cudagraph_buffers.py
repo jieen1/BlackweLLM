@@ -1,60 +1,52 @@
 """CUDA Graph buffer 管理回归测试（CPU-only，不需要模型权重）。
 
-验证 fast_decode_plan 契约履行：
-- replay() 必须在 _run_plan 前把 indptr/last_page_len 拷到 GPU buffer
+自 SparkInfer CG 迁移（commit adcca60，"No FlashInfer dependency for attention
+anymore"）后，decode 不再有 fast_decode_plan/_fi_* CPU planning + H2D 拷贝；
+page_table/cache_seqlens 由 _fill_buffers() 直接以 GPU tensor 写入更新。
+验证的契约相应变为：
+
+- replay() 必须先 _fill_buffers() 再 _graph.replay()（否则 replay 用的是上一步的
+  stale metadata）
+- 每个 layer group 的 sparkinfer workspace 必须独立分配，不能共享
 - page-crossing 检测逻辑正确
 - indptr 累积和正确
 - last_page_len 计算正确
-- staging buffer 防竞态
 """
+
 from __future__ import annotations
 
 import inspect
 
+import pytest
 
-class TestFastDecodePlanContract:
-    """验证 replay() 履行了 fast_decode_plan 的调用方契约。"""
+
+class TestReplayContract:
+    """验证 replay() 履行了 SparkInfer CG decode 的调用方契约。"""
 
     def _get_replay_source(self) -> str:
+        pytest.importorskip("torch")
         from runtime.backends.laguna_cuda_graph import LagunaCudaGraphDecode
+
         return inspect.getsource(LagunaCudaGraphDecode.replay)
 
-    def test_indptr_gpu_copy_present(self):
-        """replay() 必须包含 _fi_indptr_gpu.copy_(_fi_indptr_cpu)。"""
+    def test_fill_buffers_before_graph_replay(self):
+        """replay() 必须先调用 _fill_buffers() 更新 page_table/cache_seqlens，再 replay 图。"""
         src = self._get_replay_source()
-        assert "_fi_indptr_gpu" in src and "copy_" in src, (
-            "replay() 缺少 _fi_indptr_gpu.copy_(_fi_indptr_cpu) — "
-            "fast_decode_plan cudagraph 模式不做 CPU→GPU 拷贝，调用方必须自己做"
+        idx_fill = src.find("_fill_buffers(")
+        idx_replay = src.find("_graph.replay()")
+        assert idx_fill != -1 and idx_replay != -1, (
+            "replay() 缺少 _fill_buffers()/_graph.replay() 调用"
         )
-
-    def test_last_page_len_gpu_copy_present(self):
-        """replay() 必须包含 _fi_last_page_len_gpu.copy_(_fi_last_page_len_cpu)。"""
-        src = self._get_replay_source()
-        assert "_fi_last_page_len_gpu" in src and "copy_" in src, (
-            "replay() 缺少 _fi_last_page_len_gpu.copy_(_fi_last_page_len_cpu) — "
-            "fast_decode_plan cudagraph 模式不做 CPU→GPU 拷贝，调用方必须自己做"
-        )
-
-    def test_gpu_copy_before_run_plan(self):
-        """GPU buffer 拷贝必须在 _run_plan 之前。"""
-        src = self._get_replay_source()
-        idx_indptr = src.find("_fi_indptr_gpu")
-        idx_lpl = src.find("_fi_last_page_len_gpu")
-        idx_plan = src.find("_run_plan")
-        assert idx_indptr < idx_plan, "indptr GPU 拷贝必须在 _run_plan 之前"
-        assert idx_lpl < idx_plan, "last_page_len GPU 拷贝必须在 _run_plan 之前"
-
-    def test_staging_buffer_exists(self):
-        """staging buffer 防止未来去掉 .item() 同步后的 pinned buffer 竞态。"""
-        from runtime.backends.laguna_cuda_graph import LagunaCudaGraphDecode
-        src = inspect.getsource(LagunaCudaGraphDecode.__init__)
-        assert "_fi_last_page_len_staging" in src, (
-            "缺少 staging buffer — 去掉 .item() 同步优化时会产生 pinned buffer 竞态"
+        assert idx_fill < idx_replay, (
+            "_fill_buffers() 必须在 _graph.replay() 之前调用，"
+            "否则 replay 用的是上一步的 stale page_table/cache_seqlens"
         )
 
     def test_no_priming_replay_in_capture(self):
         """capture() 不应包含 priming replay（已证明是同根因的 workaround）。"""
+        pytest.importorskip("torch")
         from runtime.backends.laguna_cuda_graph import LagunaCudaGraphDecode
+
         src = inspect.getsource(LagunaCudaGraphDecode.capture)
         assert "Prime" not in src and "priming" not in src.lower(), (
             "capture() 仍包含 priming replay — 根因修复后不再需要"
@@ -68,8 +60,14 @@ class TestBufferArithmetic:
         """last_page_len = new_kv % page_size, 0 → page_size。"""
         page_size = 16
         cases = [
-            (1, 1), (15, 15), (16, 16), (17, 1),
-            (31, 15), (32, 16), (33, 1), (256, 16),
+            (1, 1),
+            (15, 15),
+            (16, 16),
+            (17, 1),
+            (31, 15),
+            (32, 16),
+            (33, 1),
+            (256, 16),
         ]
         for new_kv, expected in cases:
             lpl = new_kv % page_size
@@ -80,7 +78,12 @@ class TestBufferArithmetic:
         """n_blocks = ceil(new_kv / page_size)。"""
         page_size = 16
         cases = [
-            (1, 1), (16, 1), (17, 2), (32, 2), (33, 3), (256, 16),
+            (1, 1),
+            (16, 1),
+            (17, 2),
+            (32, 2),
+            (33, 3),
+            (256, 16),
         ]
         for new_kv, expected in cases:
             n_blocks = (new_kv + page_size - 1) // page_size
@@ -121,16 +124,15 @@ class TestBufferArithmetic:
 
 
 class TestIndependentWorkspace:
-    """验证每个 cudagraph wrapper 有独立 workspace。"""
+    """验证每个 layer group 有独立的 sparkinfer workspace。"""
 
-    def test_workspace_not_shared_with_builder(self):
-        """_init_wrappers 必须为每个 wrapper 分配独立 workspace。"""
+    def test_workspace_independent_per_group(self):
+        """_init_workspaces 必须为每个 group_key 创建独立的 SparkinferDecodeWorkspace 实例。"""
+        pytest.importorskip("torch")
         from runtime.backends.laguna_cuda_graph import LagunaCudaGraphDecode
-        src = inspect.getsource(LagunaCudaGraphDecode._init_wrappers)
-        assert "torch.empty" in src or "torch.zeros" in src, (
-            "_init_wrappers 必须为每个 wrapper 分配独立 workspace，"
-            "不能共享 builder._get_workspace_buffer()"
-        )
-        assert "_get_workspace_buffer" not in src or "numel" in src, (
-            "workspace 大小可以参考 builder 的，但必须是新分配的独立 tensor"
+
+        src = inspect.getsource(LagunaCudaGraphDecode._init_workspaces)
+        assert "SparkinferDecodeWorkspace(" in src, (
+            "_init_workspaces 必须为每个 group 创建独立的 SparkinferDecodeWorkspace 实例，"
+            "不能跨 group 共享"
         )

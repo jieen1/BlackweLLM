@@ -237,9 +237,7 @@ class StreamProcessor:
                 func_name = visible[func_pos + len(func_open) : name_end].strip()
                 args_start = name_end + 1
                 args_end = visible.find(func_close, args_start)
-                args_so_far = (
-                    visible[args_start:] if args_end < 0 else visible[args_start:args_end]
-                )
+                args_so_far = visible[args_start:] if args_end < 0 else visible[args_start:args_end]
                 block_end = args_end + len(func_close) if args_end >= 0 else -1
             else:
                 # Poolside shape: bare NAME up to the first <arg_key> or the

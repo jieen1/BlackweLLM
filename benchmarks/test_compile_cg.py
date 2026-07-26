@@ -42,7 +42,7 @@ def main():
         compilation_config=comp_config,
     )
     
-    print(f"\n[1] Creating engine config...")
+    print("\n[1] Creating engine config...")
     t0 = time.time()
     vllm_config = engine_args.create_engine_config()
     print(f"    Config created in {time.time()-t0:.1f}s")
@@ -52,7 +52,7 @@ def main():
     # Load model via our backend
     from runtime.backends.laguna import LagunaBackend
     
-    print(f"\n[2] Loading model via LagunaBackend...")
+    print("\n[2] Loading model via LagunaBackend...")
     t0 = time.time()
     backend = LagunaBackend(
         vllm_config, num_slots=1, block_size=64, blocks_per_slot=1088)
@@ -60,7 +60,7 @@ def main():
     print(f"    Model loaded in {load_time:.1f}s")
     
     # Prefill a 64K prompt
-    print(f"\n[3] Prefilling 64K tokens...")
+    print("\n[3] Prefilling 64K tokens...")
     prompt_ids = list(range(1000, 1000 + 65536))
     t0 = time.time()
     first_token = backend.prefill(0, prompt_ids)
@@ -69,7 +69,7 @@ def main():
     print(f"    Prefill done: {prefill_time:.2f}s, first_token={first_token}, kv_len={kv_len}")
     
     # Capture CG
-    print(f"\n[4] Capturing CUDA Graph...")
+    print("\n[4] Capturing CUDA Graph...")
     t0 = time.time()
     backend._ensure_decode_cg()
     cg_time = time.time() - t0
@@ -77,7 +77,7 @@ def main():
     if backend._decode_cg is None:
         print("    CG capture FAILED! Falling back to eager decode.")
         # Benchmark eager decode
-        print(f"\n[5] Benchmarking EAGER decode (100 steps)...")
+        print("\n[5] Benchmarking EAGER decode (100 steps)...")
         tok = first_token
         cur_kv = kv_len
         for _ in range(10):
@@ -99,7 +99,7 @@ def main():
     print(f"    CG captured in {cg_time:.1f}s")
     
     # Benchmark decode
-    print(f"\n[5] Benchmarking CG decode (100 steps at 64K)...")
+    print("\n[5] Benchmarking CG decode (100 steps at 64K)...")
     cg = backend._decode_cg
     tok = first_token
     cur_kv = kv_len
@@ -124,7 +124,7 @@ def main():
     tok_per_s = n_steps / elapsed
     
     print(f"\n{'=' * 60}")
-    print(f"RESULTS (torch.compile + CG, 64K context):")
+    print("RESULTS (torch.compile + CG, 64K context):")
     print(f"  Step latency: {step_ms:.2f} ms")
     print(f"  Throughput:   {tok_per_s:.1f} tok/s")
     print(f"  Prefill:      {prefill_time:.2f}s")

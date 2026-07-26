@@ -22,7 +22,6 @@ logger = logging.getLogger("golden_ring_kv")
 import torch
 
 def main():
-    from runtime.compat_vllm import VllmConfig, set_current_vllm_config
 
     model_path = os.path.expanduser(
         "~/.cache/huggingface/hub/models--poolside--Laguna-S-2.1-NVFP4/"
