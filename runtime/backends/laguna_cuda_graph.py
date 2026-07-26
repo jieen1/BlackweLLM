@@ -18,7 +18,7 @@ from runtime.backends.bf_attention import bf_attn_context
 logger = logging.getLogger("qwen_sm120_runtime.laguna_cuda_graph")
 
 def _physical_slot(slot: int) -> int:
-    return slot + 1  # RESERVED_PHYSICAL_SLOTS = 1
+    return slot  # RESERVED_PHYSICAL_SLOTS = 0
 
 
 class SparkinferDecodeCGMetadata:
@@ -124,9 +124,12 @@ class LagunaCudaGraphDecode:
                 key_cache = key_cache.view(torch.float8_e4m3fn)
                 value_cache = value_cache.view(torch.float8_e4m3fn)
 
-            # Q and output buffers (will be set during capture from model internals)
-            # For now, use the workspace's dummy tensors — they'll be rebound
-            # during the actual capture when we know the real Q/output addresses.
+            # Bind real KV caches immediately to release dummy fp8 tensors
+            # allocated in SparkinferDecodeWorkspace.__init__ (~128 MB per
+            # full-attention workspace at 128K context).  Q and output are
+            # still rebound per-layer during capture from model internals.
+            ws._k_cache = key_cache
+            ws._v_cache = value_cache
 
     def _fill_buffers(
         self,
@@ -154,7 +157,7 @@ class LagunaCudaGraphDecode:
 
             if not is_swa:
                 for i in range(bs):
-                    phys = slot_ids[i] + 1
+                    phys = _physical_slot(slot_ids[i])
                     base = phys * bps
                     new_kv = kv_lengths[i] + 1
                     n_blocks = (new_kv + ps - 1) // ps
@@ -171,7 +174,7 @@ class LagunaCudaGraphDecode:
                 ring_slots = self._ring_slots_per_slot
                 window = self._swa_window
                 for i in range(bs):
-                    phys = slot_ids[i] + 1
+                    phys = _physical_slot(slot_ids[i])
                     ring_base = phys * rbps
                     pos = kv_lengths[i]
                     new_kv = pos + 1
@@ -195,7 +198,7 @@ class LagunaCudaGraphDecode:
         """Optimized fill for batch=1: minimal Python, pre-cached constants."""
         ps = self.block_size
         bps = self.blocks_per_slot
-        phys = slot + 1
+        phys = _physical_slot(slot)
         base = phys * bps
         new_kv = kv_len + 1
 

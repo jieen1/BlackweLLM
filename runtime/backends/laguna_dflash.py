@@ -39,7 +39,7 @@ from runtime.backends.dflash_constants import (
     NUM_QUERY_PER_REQ,
     NUM_SPECULATIVE_TOKENS,
 )
-from runtime.backends.laguna import LagunaBackend, _physical_slot, _ring_blocks_for_window
+from runtime.backends.laguna import LagunaBackend, RESERVED_PHYSICAL_SLOTS, _physical_slot, _ring_blocks_for_window
 from runtime.compat_vllm import (
     set_current_vllm_config,
     set_forward_context,
@@ -282,7 +282,7 @@ class DFlashEngine:
         )
 
         # Allocate KV cache for draft layers
-        num_phys = self.num_slots + 1  # +1 reserved
+        num_phys = self.num_slots + RESERVED_PHYSICAL_SLOTS
         draft_blocks_per_slot = _ring_blocks_for_window(
             DRAFT_WINDOW, self.block_size, NUM_QUERY_PER_REQ
         )

@@ -102,7 +102,7 @@ class TestBufferArithmetic:
         page_size = 16
         blocks_per_slot = 256
         slot_id = 0
-        phys = slot_id + 1
+        phys = slot_id  # RESERVED_PHYSICAL_SLOTS = 0
         base = phys * blocks_per_slot
         for pos in [0, 5, 15, 16, 17, 100]:
             sm = (base + pos // page_size) * page_size + pos % page_size

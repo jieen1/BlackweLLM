@@ -37,7 +37,7 @@ from runtime.sampling import SamplingParams, make_generator, sample_from_logits
 
 logger = logging.getLogger("qwen_sm120_runtime.laguna_backend")
 
-RESERVED_PHYSICAL_SLOTS = 1
+RESERVED_PHYSICAL_SLOTS = 0
 
 # Ring KV for SWA layers: parameterized for DFlash verify qo_max=16
 # Formula: cdiv(window - 1 + qo_max, block_size) + 1
@@ -579,7 +579,7 @@ class LagunaBackend:
                 full_base, full_base + n_blocks, dtype=torch.int32, device=self.device
             )
             if n_blocks < self.blocks_per_slot:
-                self._decode_block_table[i, n_blocks:] = 0
+                self._decode_block_table[i, n_blocks:] = full_base
             self._decode_slot_mapping[i] = (full_base + pos // bs) * bs + pos % bs
 
             # ── SWA ring block_table / slot_mapping ──
@@ -599,7 +599,7 @@ class LagunaBackend:
                     ring_block = (actual_pos % ring_slots) // bs
                     self._swa_decode_block_table[i, j] = ring_base + ring_block
                 if n_ring < self._ring_blocks_per_slot:
-                    self._swa_decode_block_table[i, n_ring:] = 0
+                    self._swa_decode_block_table[i, n_ring:] = ring_base
 
                 self._swa_decode_seq_lens[i] = aligned_len
 
