@@ -9,6 +9,39 @@ from __future__ import annotations
 import torch
 
 
+def determine_accept_reject_from_predictions(
+    draft_tokens: list[int],
+    predicted_tokens: list[int],
+) -> dict:
+    """Greedy accept/reject from already-sampled target token ids.
+
+    ``draft_tokens`` contains the pending anchor followed by K draft tokens.
+    ``predicted_tokens`` contains K verifier predictions plus the final target
+    bonus prediction.  ``num_accepted`` counts only matching draft tokens;
+    the recovery/bonus token is committed output but is never counted as an
+    accepted draft.
+    """
+    k = len(draft_tokens) - 1
+    if k < 0:
+        raise ValueError("draft_tokens must contain an anchor token")
+    if len(predicted_tokens) < k + 1:
+        raise ValueError(
+            "predicted_tokens must contain K verifier predictions plus one bonus "
+            f"(need {k + 1}, got {len(predicted_tokens)})"
+        )
+
+    committed: list[int] = []
+    for p in range(k):
+        predicted = predicted_tokens[p]
+        if predicted == draft_tokens[p + 1]:
+            committed.append(draft_tokens[p + 1])
+        else:
+            committed.append(predicted)
+            return {"num_accepted": p, "committed": committed, "rejected_at": p}
+    committed.append(predicted_tokens[k])
+    return {"num_accepted": k, "committed": committed, "rejected_at": None}
+
+
 def determine_accept_reject(draft_tokens: list[int], verify_logits) -> dict:
     """Greedy MTP accept/reject (2026-07-17, moved here from
     ``benchmarks/mtp_accept_reject_check.py`` so the real
@@ -20,17 +53,8 @@ def determine_accept_reject(draft_tokens: list[int], verify_logits) -> dict:
     recovery/bonus token), and the rejection position (``None`` if all K
     were accepted)."""
     k = len(draft_tokens) - 1
-    committed: list[int] = []
-    for p in range(k):
-        predicted = int(verify_logits[p].argmax(dim=-1).item())
-        if predicted == draft_tokens[p + 1]:
-            committed.append(draft_tokens[p + 1])
-        else:
-            committed.append(predicted)
-            return {"num_accepted": p, "committed": committed, "rejected_at": p}
-    bonus = int(verify_logits[k].argmax(dim=-1).item())
-    committed.append(bonus)
-    return {"num_accepted": k, "committed": committed, "rejected_at": None}
+    predicted_tokens = verify_logits[: k + 1].argmax(dim=-1).tolist()
+    return determine_accept_reject_from_predictions(draft_tokens, predicted_tokens)
 
 
 def determine_accept_reject_batch(

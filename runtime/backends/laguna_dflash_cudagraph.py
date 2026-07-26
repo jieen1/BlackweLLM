@@ -1,7 +1,7 @@
 """CUDA Graph wrapper for DFlash speculative decoding.
 
-Captures verify (M=16) and draft (M=16) forward passes as CUDA Graphs
-using FlashInfer prefill wrappers with use_cuda_graph=True.
+The legacy verify graph still has a FlashInfer implementation below, but the
+active DFlash draft graph uses Sparkinfer's paged-extend CUDA-graph path.
 
 Per speculative step:
 1. Main decode (M=1): LagunaCudaGraphDecode (existing)
@@ -327,7 +327,9 @@ class DFlashVerifyCudaGraph:
 class DFlashDraftCudaGraph:
     """CUDA Graph for draft model forward (M=16).
 
-    Draft model has 6 SWA layers (window=512). Uses ring buffer KV.
+    Draft model has 6 SWA layers (window=512). It uses the same Sparkinfer
+    paged-extend graph path as the main-model verify graph, with a ring KV
+    cache and no FlashInfer metadata or planning in the active graph path.
     """
 
     def __init__(self, engine) -> None:
@@ -343,49 +345,87 @@ class DFlashDraftCudaGraph:
         self._input_ids = torch.zeros(self.num_tokens, dtype=torch.long, device=self.device)
         self._positions = torch.zeros(self.num_tokens, dtype=torch.long, device=self.device)
 
-        # FlashInfer buffers for draft (all SWA)
+        # Sparkinfer runtime metadata for draft (all layers are SWA).
         max_pages = self._draft_blocks_per_slot
-        self._qo_indptr = torch.tensor([0, self.num_tokens], dtype=torch.int32, device=self.device)
-        self._kv_indptr_cpu = torch.zeros(2, dtype=torch.int32, pin_memory=True)
-        self._kv_indptr_gpu = torch.zeros(2, dtype=torch.int32, device=self.device)
-        self._kv_indices = torch.zeros(max_pages, dtype=torch.int32, device=self.device)
-        self._last_page_len_cpu = torch.zeros(1, dtype=torch.int32, pin_memory=True)
-        self._last_page_len_gpu = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self._page_table = torch.zeros(1, max_pages, dtype=torch.int32, device=self.device)
+        self._cache_seqlens = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self._cu_seqlens_q = torch.tensor(
+            [0, self.num_tokens], dtype=torch.int32, device=self.device
+        )
         self._slot_mapping = torch.zeros(self.num_tokens, dtype=torch.long, device=self.device)
 
-        self._wrapper = None
         self._workspace = None
+        self._metadata = None
+        self._attn_metadata_dict: dict[str, Any] | None = None
+        self._slot_mapping_dict: dict[str, torch.Tensor] | None = None
+        self._original_impls: dict[str, Any] = {}
         self._graph: torch.cuda.CUDAGraph | None = None
         self._logits: torch.Tensor | None = None
         self._captured = False
 
-    def _init_wrapper(self) -> None:
-        from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
-        from runtime.backends.dflash_constants import DRAFT_HEAD_DIM, DRAFT_NUM_KV_HEADS, DRAFT_NUM_QO_HEADS
-
-        # Get sm_scale and KV cache dtype from the first draft attention layer
-        # (kv_cache_torch_dtype is what _alloc_draft_kv_cache actually allocated
-        # the draft KV cache tensors with -- deriving from it here, rather than
-        # hardcoding, keeps this in sync if that ever stops being fp8).
-        first_attn = self.engine._draft_attn_layers[self.engine._draft_layer_names[0]]
-        self._sm_scale = first_attn.impl.scale
-        # kv_cache_torch_dtype returns uint8 for FP8 KV (vLLM internal storage),
-        # but FlashInfer plan needs the logical dtype.  Mirror the main-model CG
-        # logic (laguna_cuda_graph.py:241) which reads _cache_dtype_str.
-        _cache_str = getattr(self.engine.backend, "_cache_dtype_str", "")
-        self._kv_dtype = torch.float8_e4m3fn if "fp8" in _cache_str else torch.bfloat16
-
-        workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=self.device)
-        self._wrapper = BatchPrefillWithPagedKVCacheWrapper(
-            workspace,
-            "NHD",
-            use_cuda_graph=True,
-            qo_indptr_buf=self._qo_indptr,
-            paged_kv_indptr_buf=self._kv_indptr_gpu,
-            paged_kv_indices_buf=self._kv_indices,
-            paged_kv_last_page_len_buf=self._last_page_len_gpu,
+    def _init_workspace(self) -> None:
+        """Create a fixed-address Sparkinfer extend workspace for draft CG."""
+        from sparkinfer.attention.paged.planner import create_paged_plan
+        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+        from runtime.backends.dflash_constants import (
+            DRAFT_HEAD_DIM,
+            DRAFT_NUM_KV_HEADS,
+            DRAFT_NUM_QO_HEADS,
         )
+        from runtime.backends.laguna_cuda_graph import _SparkinferCGExtendMetadata
+
+        max_pages = self._draft_blocks_per_slot
+        q = torch.zeros(
+            self.num_tokens,
+            DRAFT_NUM_QO_HEADS,
+            DRAFT_HEAD_DIM,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        k_cache = torch.zeros(
+            max_pages,
+            self.block_size,
+            DRAFT_NUM_KV_HEADS,
+            DRAFT_HEAD_DIM,
+            dtype=torch.float8_e4m3fn,
+            device=self.device,
+        )
+        v_cache = torch.zeros_like(k_cache)
+        workspace = PagedAttentionWorkspace.for_tensors(
+            mode="extend",
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            use_cuda_graph=True,
+        )
+
+        max_kv = max_pages * self.block_size - 1
+        capture_page_table = torch.arange(
+            max_pages, dtype=torch.int32, device=self.device
+        ).unsqueeze(0)
+        capture_cache_seqlens = torch.tensor(
+            [max_kv], dtype=torch.int32, device=self.device
+        )
+        plan = create_paged_plan(
+            q,
+            k_cache,
+            v_cache,
+            capture_page_table,
+            capture_cache_seqlens,
+            self._cu_seqlens_q,
+            mode="extend",
+            enable_cuda_graph=True,
+            window_left=DRAFT_WINDOW - 1,
+        )
+        workspace._ensure_capacity(plan)
+        workspace._copy_runtime_metadata(
+            capture_page_table, capture_cache_seqlens, self._cu_seqlens_q
+        )
+        workspace._copy_plan_metadata(plan)
+        workspace._plan = plan
+
         self._workspace = workspace
+        self._metadata = _SparkinferCGExtendMetadata(workspace, self.num_tokens)
 
     def _fill_buffers(self, slot: int, kv_len: int) -> None:
         bs = self.block_size
@@ -403,16 +443,11 @@ class DFlashDraftCudaGraph:
         aligned_len = new_kv_len - aligned_start
         n_ring = min((aligned_len + bs - 1) // bs, self._draft_blocks_per_slot)
 
-        # Vectorized ring block indices
+        # Vectorized ring page table. The physical indices address the shared
+        # draft KV tensor directly; the Sparkinfer plan remains fixed.
         _ap = torch.arange(aligned_start, aligned_start + n_ring * bs, bs, device=self.device, dtype=torch.long)
-        self._kv_indices[:n_ring] = draft_base + (_ap % ring_slots) // bs
-
-        self._kv_indptr_cpu[0] = 0
-        self._kv_indptr_cpu[1] = n_ring
-        lpl = aligned_len % bs
-        self._last_page_len_cpu[0] = lpl if lpl != 0 else bs
-        self._kv_indptr_gpu[:2].copy_(self._kv_indptr_cpu[:2], non_blocking=True)
-        self._last_page_len_gpu[:1].copy_(self._last_page_len_cpu[:1], non_blocking=True)
+        self._page_table[0, :n_ring] = draft_base + (_ap % ring_slots) // bs
+        self._cache_seqlens[0] = aligned_len
 
         # Vectorized slot mapping -- reuse self._positions (same arange as
         # above, no need to recompute).
@@ -420,56 +455,33 @@ class DFlashDraftCudaGraph:
         _rb = (_sp % ring_slots) // bs
         _ro = _sp % bs
         self._slot_mapping[:self.num_tokens] = (draft_base + _rb) * bs + _ro
-
-    def _run_plan(self) -> None:
-        from runtime.backends.dflash_constants import DRAFT_HEAD_DIM, DRAFT_NUM_KV_HEADS, DRAFT_NUM_QO_HEADS
-
-        self._wrapper.plan(
-            qo_indptr=self._qo_indptr,
-            paged_kv_indptr=self._kv_indptr_gpu,
-            paged_kv_indices=self._kv_indices,
-            paged_kv_last_page_len=self._last_page_len_gpu,
-            num_qo_heads=DRAFT_NUM_QO_HEADS,
-            num_kv_heads=DRAFT_NUM_KV_HEADS,
-            head_dim_qk=DRAFT_HEAD_DIM,
-            page_size=self.block_size,
-            causal=True,
-            pos_encoding_mode="NONE",
-            window_left=DRAFT_WINDOW - 1,
-            logits_soft_cap=None,
-            q_data_type=torch.bfloat16,
-            kv_data_type=self._kv_dtype,
-            sm_scale=self._sm_scale,
-            disable_split_kv=True,
+        self._workspace._copy_runtime_metadata(
+            self._page_table, self._cache_seqlens, self._cu_seqlens_q
         )
+
+    def _patch_impls_for_cg(self) -> None:
+        """Temporarily bind draft attention to the Sparkinfer graph workspace."""
+        from runtime.backends.laguna_cuda_graph import _SparkinferCGExtendImpl
+
+        for name in self.engine._draft_layer_names:
+            attn = self.engine._draft_attn_layers[name]
+            self._original_impls[name] = attn.impl
+            attn.impl = _SparkinferCGExtendImpl(self._workspace, self.num_tokens)
+
+    def _restore_impls(self) -> None:
+        for name, impl in self._original_impls.items():
+            self.engine._draft_attn_layers[name].impl = impl
 
     def _build_metadata_and_forward(self) -> torch.Tensor:
         from runtime.compat_vllm import set_current_vllm_config, set_forward_context
-        from vllm.v1.attention.backends.flashinfer import FIPrefill, FlashInferMetadata
 
         engine = self.engine
-        metadata = FlashInferMetadata(
-            num_actual_tokens=self.num_tokens,
-            slot_mapping=self._slot_mapping[:self.num_tokens],
-            q_data_type_prefill=torch.bfloat16,
-            q_data_type_decode=torch.bfloat16,
-            num_decodes=0,
-            num_decode_tokens=0,
-            num_prefills=1,
-            num_prefill_tokens=self.num_tokens,
-            causal=True,
-            use_cascade=False,
-            prefill=FIPrefill(wrapper=self._wrapper),
-            decode=None,
-            cascade_wrapper=None,
-        )
-
-        attn_metadata_dict = {name: metadata for name in engine._draft_layer_names}
-        slot_mapping_dict = {name: self._slot_mapping[:self.num_tokens] for name in engine._draft_layer_names}
-
         with set_current_vllm_config(engine.vllm_config):
             with set_forward_context(
-                attn_metadata_dict, engine.vllm_config, slot_mapping=slot_mapping_dict
+                self._attn_metadata_dict,
+                engine.vllm_config,
+                slot_mapping=self._slot_mapping_dict,
+                skip_compiled=True,
             ):
                 draft_hidden = engine.draft_model(
                     input_ids=self._input_ids[:self.num_tokens],
@@ -490,31 +502,40 @@ class DFlashDraftCudaGraph:
             return
 
         logger.info("Capturing DFlash draft CUDA Graph (M=%d)...", self.num_tokens)
-        self._init_wrapper()
+        self._init_workspace()
+        self._patch_impls_for_cg()
+        self._attn_metadata_dict = {
+            name: self._metadata for name in self.engine._draft_layer_names
+        }
+        self._slot_mapping_dict = {
+            name: self._slot_mapping for name in self.engine._draft_layer_names
+        }
 
-        capture_kv = 2048
-        self._input_ids[0] = 1
-        self._input_ids[1:self.num_tokens] = MASK_TOKEN_ID
-        self._fill_buffers(0, capture_kv)
+        try:
+            capture_kv = 2048
+            self._input_ids[0] = 1
+            self._input_ids[1:self.num_tokens] = MASK_TOKEN_ID
+            self._fill_buffers(0, capture_kv)
 
-        side_stream = torch.cuda.Stream()
-        with torch.cuda.stream(side_stream):
-            for _ in range(3):
-                self._fill_buffers(0, capture_kv)
-                self._run_plan()
-                self._build_metadata_and_forward()
-        side_stream.synchronize()
+            side_stream = torch.cuda.Stream()
+            with torch.cuda.stream(side_stream):
+                for _ in range(3):
+                    self._fill_buffers(0, capture_kv)
+                    self._build_metadata_and_forward()
+            side_stream.synchronize()
 
-        self._fill_buffers(0, capture_kv)
-        self._run_plan()
+            self._fill_buffers(0, capture_kv)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self._logits = self._build_metadata_and_forward()
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            self._logits = self._build_metadata_and_forward()
-
-        self._graph = graph
-        self._captured = True
-        logger.info("DFlash draft CUDA Graph captured")
+            self._graph = graph
+            self._captured = True
+            logger.info("DFlash draft CUDA Graph captured (sparkinfer extend)")
+        finally:
+            # Replay executes the captured graph directly. Restore the eager
+            # Sparkinfer implementation so any fallback remains valid.
+            self._restore_impls()
 
     def replay(self, slot: int, bonus_token: int, kv_len: int) -> list[int]:
         """Replay draft graph. Returns 15 draft tokens."""
@@ -524,7 +545,6 @@ class DFlashDraftCudaGraph:
         self._input_ids[0] = bonus_token
         self._input_ids[1:self.num_tokens] = MASK_TOKEN_ID
         self._fill_buffers(slot, kv_len)
-        self._run_plan()
         self._graph.replay()
         # self._logits is already positions [1:num_tokens] -- see
         # _build_metadata_and_forward, which slices before compute_logits.

@@ -29,6 +29,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from runtime.backends.bf_attention import bf_attn_context
 from runtime.backends.dflash_constants import (
     AUX_LAYER_IDS,
     DFLASH_MODEL_PATH,
@@ -47,8 +48,8 @@ from runtime.compat_vllm import (
     set_current_vllm_config,
     set_forward_context,
 )
+from runtime.mtp_accept import determine_accept_reject_from_predictions
 
-from runtime.backends.bf_attention import bf_attn_context
 logger = logging.getLogger("qwen_sm120_runtime.dflash")
 
 
@@ -78,6 +79,26 @@ def _greedy_accept_reject(
             num_accepted += 1
             break
     return accepted, num_accepted
+
+
+def _verify_only_accept_reject(
+    all_argmax: list[int],
+    draft_tokens: list[int],
+    bonus_token: int,
+) -> dict:
+    """Resolve one verify-only round without conflating output and KV state."""
+    decision = determine_accept_reject_from_predictions(
+        [bonus_token] + draft_tokens,
+        all_argmax,
+    )
+    committed = decision["committed"]
+    return {
+        **decision,
+        # The old anchor and matching drafts were verifier inputs and now have
+        # valid target/draft context KV. The recovery/bonus remains pending.
+        "context_count": 1 + decision["num_accepted"],
+        "next_anchor": committed[-1],
+    }
 
 
 class DFlashEngine:
@@ -1099,27 +1120,32 @@ class DFlashEngine:
 
             # Step 2: Accept/reject (single GPU→CPU sync for all 16 argmax)
             all_argmax = verify_logits[:NUM_QUERY_PER_REQ].argmax(dim=-1).tolist()
-            accepted, num_accepted = _greedy_accept_reject(
-                all_argmax[:NUM_SPECULATIVE_TOKENS], draft_tokens, bonus_token
+            decision = _verify_only_accept_reject(
+                all_argmax, draft_tokens, bonus_token
             )
+            num_accepted = decision["num_accepted"]
+            new_tokens = decision["committed"]
             total_accepted += num_accepted
 
-            # Step 3: New bonus from pre-computed argmax (no extra sync)
-            new_bonus = all_argmax[num_accepted]
+            # The recovery token on rejection, or target bonus after a full
+            # accept, is the pending anchor for the next draft round.
+            new_bonus = decision["next_anchor"]
 
-            # Step 4: Precompute draft context KV from verify aux at accepted positions
-            if verify_aux is not None and num_accepted > 0:
-                # aux[0:num_accepted] at positions kv_len to kv_len+num_accepted-1
-                aux_slice = [a[:num_accepted] for a in verify_aux]
+            # The verifier wrote the old anchor plus every matching draft token.
+            # The recovery/bonus token remains pending and is not in KV yet.
+            context_count = decision["context_count"]
+
+            # Step 4: Precompute draft context KV from committed verifier inputs.
+            if verify_aux is not None:
+                aux_slice = [a[:context_count] for a in verify_aux]
                 combined_input = torch.cat(aux_slice, dim=-1)
                 combined = self.draft_model.combine_hidden_states(combined_input)
-                # Precompute at positions kv_len to kv_len+num_accepted-1
                 bs = self.block_size
                 phys = _physical_slot(slot)
                 draft_base = phys * self._draft_blocks_per_slot
                 ring_slots = self._draft_blocks_per_slot * bs
                 context_positions = torch.arange(
-                    kv_len, kv_len + num_accepted,
+                    kv_len, kv_len + context_count,
                     dtype=torch.long, device=self.device
                 )
                 ring_blocks = (context_positions % ring_slots) // bs
@@ -1130,8 +1156,7 @@ class DFlashEngine:
                 )
 
             # Step 5: Update state
-            new_tokens = accepted[1:]  # skip anchor (already committed)
-            backend.slot_kv_len[slot] += 1 + num_accepted  # anchor + accepted drafts
+            backend.slot_kv_len[slot] += context_count
             for tok in new_tokens:
                 backend.slot_committed_tokens[slot].append(tok)
             tokens.extend(new_tokens)
@@ -1151,9 +1176,9 @@ class DFlashEngine:
             bonus_token = new_bonus
             new_kv_len = backend.slot_kv_len[slot]
             if self._draft_cg is not None:
-                draft_tokens = self._draft_cg.replay(slot, bonus_token, new_kv_len - 1)
+                draft_tokens = self._draft_cg.replay(slot, bonus_token, new_kv_len)
             else:
-                draft_tokens = self._draft_forward(slot, bonus_token, new_kv_len - 1)
+                draft_tokens = self._draft_forward(slot, bonus_token, new_kv_len)
 
         t_total = time.perf_counter()
         # Prefix cache: preserve slot KV for next turn

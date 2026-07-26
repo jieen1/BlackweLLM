@@ -6,7 +6,11 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from runtime.mtp_accept import determine_accept_reject, determine_accept_reject_batch  # noqa: E402
+from runtime.mtp_accept import (  # noqa: E402
+    determine_accept_reject,
+    determine_accept_reject_batch,
+    determine_accept_reject_from_predictions,
+)
 
 
 class TestDetermineAcceptReject:
@@ -67,6 +71,43 @@ class TestDetermineAcceptReject:
         result = determine_accept_reject(draft_tokens, logits)
         assert result["num_accepted"] == 0
         assert result["committed"] == [99]
+
+
+class TestDetermineAcceptRejectFromPredictions:
+    """The single-sync DFlash path already has target argmax ids on the CPU."""
+
+    def test_first_reject_keeps_recovery_out_of_accepted_count(self):
+        result = determine_accept_reject_from_predictions(
+            [10, 20, 30, 40],
+            [99, 30, 40, 50],
+        )
+        assert result == {
+            "num_accepted": 0,
+            "committed": [99],
+            "rejected_at": 0,
+        }
+
+    def test_middle_reject_returns_matches_plus_recovery(self):
+        result = determine_accept_reject_from_predictions(
+            [10, 20, 30, 40],
+            [20, 99, 40, 50],
+        )
+        assert result == {
+            "num_accepted": 1,
+            "committed": [20, 99],
+            "rejected_at": 1,
+        }
+
+    def test_full_accept_appends_target_bonus(self):
+        result = determine_accept_reject_from_predictions(
+            [10, 20, 30, 40],
+            [20, 30, 40, 50],
+        )
+        assert result == {
+            "num_accepted": 3,
+            "committed": [20, 30, 40, 50],
+            "rejected_at": None,
+        }
 
 
 class TestDetermineAcceptRejectBatch:

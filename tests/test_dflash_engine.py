@@ -153,6 +153,45 @@ class TestGreedyAcceptReject:
         assert accepted == [0, 2, 5]
 
 
+class TestVerifyOnlyAcceptReject:
+    """Lock the production verify-only state transition separately from legacy."""
+
+    def _decide(self, all_argmax, draft_tokens, bonus_token=10):
+        from runtime.backends.laguna_dflash import _verify_only_accept_reject
+
+        return _verify_only_accept_reject(all_argmax, draft_tokens, bonus_token)
+
+    def test_first_reject(self):
+        decision = self._decide([99, 30, 40, 50], [20, 30, 40])
+        assert decision == {
+            "num_accepted": 0,
+            "committed": [99],
+            "rejected_at": 0,
+            "context_count": 1,
+            "next_anchor": 99,
+        }
+
+    def test_middle_reject(self):
+        decision = self._decide([20, 99, 40, 50], [20, 30, 40])
+        assert decision == {
+            "num_accepted": 1,
+            "committed": [20, 99],
+            "rejected_at": 1,
+            "context_count": 2,
+            "next_anchor": 99,
+        }
+
+    def test_full_accept_emits_target_bonus(self):
+        decision = self._decide([20, 30, 40, 50], [20, 30, 40])
+        assert decision == {
+            "num_accepted": 3,
+            "committed": [20, 30, 40, 50],
+            "rejected_at": None,
+            "context_count": 4,
+            "next_anchor": 50,
+        }
+
+
 class TestRingBlocksForDraft:
     """Verify draft KV cache sizing against the REAL ring-blocks formula
     (runtime.backends.laguna._ring_blocks_for_window), not a hand-copied
