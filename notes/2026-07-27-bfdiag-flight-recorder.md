@@ -325,6 +325,7 @@ len == kv_len + 1`,并且这个 +1 之后每一步都同步保持(`dflash_round`
 | `check_no_duplicate_ids` | 1 | 仅"这次调用内唯一"(见上方勘误),`BlockPool.allocate` 每次从空闲队列 `popleft` 一个块再从队列摘掉,同一次调用内不该有重复 id |
 | `check_kv_len_monotonic` | 1 | `dflash_round` 的 `context_count = 1 + num_accepted >= 1`,一轮内 `kv_len` 只增不减(重置是走独立的 `reset_slot`,不在轮内发生) |
 | `check_aux_hidden_alignment` | 2 | 见上方勘误:只断言 `aux_offset >= 0`(`dflash_prefill_bootstrap` 里 `aux_offset = prompt_len - aux_len`,若 `aux_len > prompt_len` 会算出负 offset,写 draft KV 时环形位置全错) |
+| `check_page_table_covers_seqlen` | 1 | **写了但没有接入任何集成点(不许碰该文件)**——见第 10 节,含真实的、当前生产配置下潜伏(未触发)的 bug |
 | `check_cg_replay_slot_consistency` | 2 | **写了但没有接入任何集成点**——见下方说明 |
 
 `check_cg_replay_slot_consistency(slot, replay_slot)` 没有被接入的原因:
@@ -373,6 +374,17 @@ invariants.py` 单独测试它作为纯函数的行为正确。
 6. **CPU 单测证明的 <100ns 只是"关闭状态"下的开销**——`QSR_TRACE=1` 时
    `RoundRing`/`Timeline` 的真实每轮开销(GPU event record 的实际耗时、
    `array.array` 写入在真实高频解码循环里的耗时)需要真实 profiling 数据。
+7. **`check_page_table_covers_seqlen`(第 10 节)从未在真实 CUDA Graph replay
+   上跑过**——`bfdiag/invariants/checks.py` 里的检查逻辑本身已经用真实
+   公式做过 CPU 反例测试(`tests/test_invariants.py`),但补丁**还没有
+   被贴进 `runtime/backends/laguna_cuda_graph.py`**(按约束不许碰这个
+   文件)。需要:(a) 用户/协调者把第 10 节的补丁贴上去;(b) 在真实 GPU
+   上,把 `QSR_ASSERT_LEVEL=1` 打开、故意把 `window`/`block_size` 调到
+   让 `min()` 真正裁剪的组合,确认 `InvariantViolation` 真的会在
+   `LagunaCudaGraphVerify._fill_buffers` 触发,而不是被某个我没读到的
+   上下文吞掉;(c) 确认生产配置(`QSR_ASSERT_LEVEL=1` 但用当前的
+   `block_size=64`/`128`)下补丁**不会**误报(CPU 侧数值已经验证过边界
+   是"恰好不裁剪",但真实 GPU 张量的 `.item()`/dtype 转换路径没有实测)。
 
 ## 9. 架构耦合:runtime 现在硬依赖 bfdiag(刻意决定,不是副作用)
 
@@ -419,23 +431,185 @@ runtime 的硬依赖。协调者复审时点名要求把这个决定写清楚,�
   ——没有意义,因为 `bfdiag` 本身就在同一个仓库里,不是外部包,"可选安装"
   这个概念不适用。
 
-## 10. 交付清单(文件路径)
+## 10. `check_page_table_covers_seqlen`:一个真实 bug 和它的接入补丁(未接线)
+
+2026-07-27,一个排查 `block_size` 64→128 迁移的子 agent 在
+`runtime/backends/laguna_cuda_graph.py` 里发现一个真实的、独立的 bug(不是
+当时那次接受率下降调查的成因,但值得永久断言守住)。**用户正在实时编辑
+`runtime/backends/laguna_cuda_graph.py`,本节只读该文件,不修改它** ——
+这里只提供可直接照抄的补丁文本。
+
+### bug 是什么
+
+`LagunaCudaGraphVerify._fill_buffers`(main 模型 verify CUDA Graph,
+M=16)的 SWA 分支里,`page_table` 实际填充的条目数被 `min()` 裁剪到环的
+物理容量,但 `cache_seqlens` 写入的是**裁剪前**的长度:
+
+```python
+# runtime/backends/laguna_cuda_graph.py:648, 654-655(原文,未改动)
+n_ring = min(-(-aligned_len // bs), self._ring_blocks_per_slot)  # 648:裁剪
+pt[0, :n_ring] = (ring_base + (block_starts % ring_slots) // bs).to(pt.dtype)  # 654:只填 n_ring 条
+self._cache_seqlens[group_key][0] = aligned_len  # 655:却声明未裁剪的长度
+```
+
+一旦 `cdiv(aligned_len, bs) > ring_blocks_per_slot`(窗口实际需要的页数
+超过环的物理容量),`min()` 会静默截断填充数,但 attention kernel 仍然
+按 `aligned_len` 声明的长度去读 `page_table`——读到的多余条目是上一次
+CUDA Graph capture/replay 残留的页号,可能指向别的 slot 的 KV。**症状是
+"输出看起来正常,但预测质量悄悄变差",没有崩溃可供定位。**
+
+当前生产配置(`block_size=64` 和 `block_size=128`,`window=512`,
+`qo_max=16`)刚好卡在 `cdiv(aligned_len,bs) == ring_blocks_per_slot` 的
+边界上(`_ring_blocks_for_window` 的 `+1` 冗余项刚好让 `min()` 恒为
+no-op),所以还没触发——见 `tests/test_invariants.py::
+TestRealCodeRegression::test_page_table_covers_seqlen_at_real_production_
+block_sizes` 用真实公式复现了这个边界。**只要对齐粒度/窗口大小再变一档,
+就会真的触发**——见同一个测试类里的
+`test_page_table_covers_seqlen_fires_when_alignment_outgrows_the_ring`。
+
+`LagunaCudaGraphDecode._fill_buffers`/`_fill_buffers_b1`(M=1 decode CG)
+的 SWA 分支,以及所有 full-attention 分支(两个类都有),**没有**这个
+`min()` 裁剪,`n_blocks`/`n_ring` 就是 `cdiv(...)` 本身,天然和
+`cache_seqlens` 一致——这三处不受影响,`checks.py` 的 docstring 和
+`test_invariants.py` 里各有一条测试直接演算证明。
+
+### 新增不变量:`check_page_table_covers_seqlen`
+
+```python
+def check_page_table_covers_seqlen(
+    group_key: object, cache_seqlens: int, n_filled_pages: int, page_size: int,
+) -> None:
+    """cdiv(cache_seqlens, page_size) <= n_filled_pages"""
+```
+
+`level=1`(纯宿主端整数运算)。语义:**page_table 里当前有效的条目数**
+(不是"这次调用物理写了几条"——`LagunaCudaGraphDecode` 有"`n_ring` 没变
+就跳过重写"的优化,跳过时有效条目数仍然是这次调用算出的 `n_ring`,因为
+跳过重写本身就是建立在"数量没变"这个前提上的)必须能覆盖
+`cache_seqlens` 声明的长度对应的页数。违反时的错误消息给出
+`cache_seqlens`(声明长度)、`page_size`、`pages_needed`(需要几页,
+`cdiv` 算出)、`n_filled_pages`(实际填了几页)、`deficit`(差多少)——
+一眼看出差在哪。完整 docstring(含每个分支的行号引用)见
+`bfdiag/invariants/checks.py`。
+
+### 反例测试
+
+`tests/test_invariants.py::TestRealCodeRegression` 新增 4 条(风格与之前
+那批一致,全部用真实公式,不 import `runtime.*` 以保持无 torch 也能跑):
+
+1. `test_page_table_covers_seqlen_at_real_production_block_sizes`
+   (parametrize `block_size` in `[64, 128]`)——用真实
+   `_ring_blocks_for_window` 公式算出生产配置下的边界值,断言**不触发**
+   (数值复现"刚好卡在边界"这句观察,不只是断言这句话)。
+2. `test_page_table_covers_seqlen_fires_when_alignment_outgrows_the_ring`
+   ——构造 `block_size=128`、需要 7 页但环只有 6 页容量的场景,断言
+   **触发**,并检查错误消息里 800/7/6/1(声明长度/需要页数/实际填充/
+   差额)这几个数字都在。
+3. `test_page_table_covers_seqlen_full_attention_never_clips` —— 遍历
+   多个 `new_kv` 值,断言 full-attention 路径永不触发。
+4. `test_page_table_covers_seqlen_swa_decode_class_never_clips_either`
+   —— 遍历多个 `kv_len` 值,断言 `LagunaCudaGraphDecode`(区别于
+   `LagunaCudaGraphVerify`)的 SWA 分支永不触发。
+
+`python -m pytest -q tests/test_invariants.py`:27 个用例全过(用
+`.venv/bin/python`,torch 2.11 + numpy,无 vllm)。
+
+### 接入补丁(可直接照抄,按下面顺序应用到 `runtime/backends/laguna_cuda_graph.py`)
+
+**必需(修真实 bug)—— `LagunaCudaGraphVerify._fill_buffers`,SWA 分支**
+
+文件顶部,`from vllm._custom_ops import reshape_and_cache_flash` 那一行
+(第 14 行)之后加一个空行 + 一行 import:
+
+```python
+from vllm._custom_ops import reshape_and_cache_flash
+
+from bfdiag.invariants import checks as bfdiag_checks
+```
+
+`_fill_buffers`(定义在第 611 行)里,第 655 行
+(`self._cache_seqlens[group_key][0] = aligned_len`)之后,同缩进(16 个
+空格,和第 655 行对齐)插入一行:
+
+```python
+                self._cache_seqlens[group_key][0] = aligned_len
+                bfdiag_checks.check_page_table_covers_seqlen(group_key, aligned_len, n_ring, bs)
+```
+
+**可选(纵深防御,给目前"天然正确"的三个分支也上保险,防止以后被改坏)**
+
+同一个 `_fill_buffers` 的 full-attention 分支(第 666 行之后,16 空格缩进):
+
+```python
+                self._cache_seqlens[group_key][0] = new_kv_len
+                bfdiag_checks.check_page_table_covers_seqlen(group_key, new_kv_len, n_blocks_full, bs)
+```
+
+`LagunaCudaGraphDecode._fill_buffers`(定义在第 137 行,batch>1 通用路径)
+—— full-attention 分支,第 172 行之后(20 空格缩进):
+
+```python
+                    self._cache_seqlens[group_key][i] = new_kv
+                    bfdiag_checks.check_page_table_covers_seqlen(group_key, new_kv, n_blocks, ps)
+```
+
+同一个函数的 SWA 分支,第 195 行之后(20 空格缩进):
+
+```python
+                    self._cache_seqlens[group_key][i] = aligned_len
+                    bfdiag_checks.check_page_table_covers_seqlen(group_key, aligned_len, n_ring, ps)
+```
+
+`LagunaCudaGraphDecode._fill_buffers_b1`(定义在第 200 行,batch=1 优化
+路径)—— full-attention 分支,第 223 行之后(16 空格缩进):
+
+```python
+                self._cache_seqlens[group_key][0] = new_kv
+                bfdiag_checks.check_page_table_covers_seqlen(group_key, new_kv, n_blocks, ps)
+```
+
+同一个函数的 SWA 分支,第 245 行之后(16 空格缩进):
+
+```python
+                self._cache_seqlens[group_key][0] = aligned_len
+                bfdiag_checks.check_page_table_covers_seqlen(group_key, aligned_len, n_ring, ps)
+```
+
+以上所有插入行在 `QSR_ASSERT_LEVEL=0`(默认)时都是
+`registry.check` 第一行 `if level > ASSERT_LEVEL: return` 直接返回,
+不做任何计算/不读 GPU 状态,和这份 notes 其余部分的"零开销"论证是同一套
+机制,不需要额外验证。行号均为本 worktree 2026-07-27 与 `main`
+fast-forward 合并后的行号(`git merge --ff-only main`,合并前 HEAD
+`49ec92b`,合并后 `0504a96`);如果用户那边的实时编辑已经挪动了这些行号,
+以「紧跟在对应的 `self._cache_seqlens[...] = ...` 赋值语句之后、同一
+缩进层级」为准,而不是死记行号。
+
+## 11. 交付清单(文件路径)
 
 - `bfdiag/__init__.py`、`bfdiag/trace/{__init__,events,ring,timing,dump,
   panel,cli}.py`、`bfdiag/invariants/{__init__,registry,checks}.py`
 - 集成 hook:`runtime/backends/laguna_dflash.py`(+23/-0)、
   `runtime/backends/laguna.py`(+8/-1)、`runtime/block_pool.py`(+3/-0)
 - 测试:`tests/test_bfdiag_ring.py`、`tests/test_bfdiag_trace.py`、
-  `tests/test_invariants.py`(共 47 个测试,全通过)
+  `tests/test_invariants.py`(共 7 条不变量、三个文件合计 59 个测试,
+  全通过——`check_page_table_covers_seqlen` 是第 7 条,只有测试,未接入
+  任何 runtime 文件,见第 10 节的补丁)
 - 本文件
 
-验证命令:
+验证命令(两套环境都验证过,结论一致):
 
 ```bash
+# 环境 A:本 worktree 默认 python(无 torch/numpy/vllm)
 python -m pytest -q tests/test_bfdiag_ring.py tests/test_bfdiag_trace.py tests/test_invariants.py
-python -m pytest -q   # 273 passed, 49 skipped, 2 failed(既存、与 bfdiag 无关)
+python -m pytest -q   # 279 passed, 49 skipped, 2 failed(既存、与 bfdiag 无关)
 /home/bot/.venvs/vllm/bin/ruff check bfdiag/ tests/test_bfdiag_ring.py tests/test_bfdiag_trace.py tests/test_invariants.py  # All checks passed!
 python -m ruff check .  # 45 errors(与改动前逐行 diff 一致,既存,非本任务引入)
+
+# 环境 B:主仓库 .venv(torch 2.11 + numpy,无 vllm)—— check_page_table_
+# covers_seqlen 那一轮改动用这套环境验证
+/home/bot/project/qwen-sm120-runtime/.venv/bin/python -m pytest -q tests/test_invariants.py  # 27 passed
+/home/bot/project/qwen-sm120-runtime/.venv/bin/python -m pytest -q --continue-on-collection-errors  # 602 passed(既存基线 596 passed + 本次新增 6 个测试;35 failed/2 errors 与改动前逐项比对一致,均因本环境未装 vllm,既存)
+/home/bot/project/qwen-sm120-runtime/.venv/bin/ruff check bfdiag/invariants/checks.py tests/test_invariants.py  # All checks passed!
 
 # 各模块自测(CPU-only,不碰 GPU)
 python -m bfdiag.trace.events
@@ -451,6 +625,8 @@ python -m bfdiag.trace.cli trace diff <run_a> <run_b> --bfdiag-dir <dir>
 
 优先级完成情况(按任务给的顺序):(a) ring+events+timing+CPU 单测——完成;
 (b) dump+`bf trace show` 面板——完成;(c) 引擎集成 hook——完成(但如第 8
-节所说,无法在本 sandbox 里真实验证);(d) 不变量断言——完成 5/6(第 6 个
-`check_cg_replay_slot_consistency` 写了但没接入,原因见第 7 节);(e) `bf
+节所说,无法在本 sandbox 里真实验证);(d) 不变量断言——7 条里 5 条已接入
+生产代码、2 条(`check_cg_replay_slot_consistency`、
+`check_page_table_covers_seqlen`)写好+测好但未接入(前者原因见第 7 节,
+后者的接入补丁见第 10 节,均因约束不许碰对应的 runtime 文件);(e) `bf
 trace diff`——完成。

@@ -116,6 +116,26 @@ class TestConcreteChecks:
         with pytest.raises(InvariantViolation):
             checks.check_cg_replay_slot_consistency(slot=2, replay_slot=3)
 
+    @pytest.mark.parametrize("assert_level", [1], indirect=True)
+    def test_page_table_covers_seqlen(self, assert_level):
+        # Enough pages filled to cover the declared length: fine, including
+        # the exact-boundary case (pages_needed == n_filled_pages).
+        checks.check_page_table_covers_seqlen(
+            "swa", cache_seqlens=128, n_filled_pages=1, page_size=128
+        )
+        checks.check_page_table_covers_seqlen(
+            "swa", cache_seqlens=129, n_filled_pages=2, page_size=128
+        )
+        with pytest.raises(InvariantViolation) as exc_info:
+            # Declares 129 tokens (needs 2 pages of 128) but only 1 page filled.
+            checks.check_page_table_covers_seqlen(
+                "swa", cache_seqlens=129, n_filled_pages=1, page_size=128
+            )
+        message = str(exc_info.value)
+        assert "cache_seqlens" in message and "129" in message
+        assert "pages_needed" in message and "n_filled_pages" in message
+        assert "deficit" in message
+
     @pytest.mark.parametrize("assert_level", [0], indirect=True)
     def test_all_concrete_checks_are_noops_at_level_0(self, assert_level):
         checks.check_committed_ahead_of_kv_by_one(slot=0, kv_len=1, committed_len=1)
@@ -124,6 +144,9 @@ class TestConcreteChecks:
         checks.check_kv_len_monotonic(slot=0, prev_kv_len=10, new_kv_len=1)
         checks.check_aux_hidden_alignment(slot=0, prompt_len=1, aux_len=999, aux_offset=-998)
         checks.check_cg_replay_slot_consistency(slot=1, replay_slot=2)
+        checks.check_page_table_covers_seqlen(
+            "swa", cache_seqlens=999, n_filled_pages=0, page_size=1
+        )
 
 
 class TestRealCodeRegression:
@@ -228,6 +251,120 @@ class TestRealCodeRegression:
         for num_accepted in range(k + 1):
             committed_n = num_accepted + 1
             checks.check_accepted_bound(0, committed_n, k)
+
+    @staticmethod
+    def _ring_blocks_for_window(window: int, block_size: int, qo_max: int = 16) -> int:
+        """Verbatim copy of ``runtime/backends/laguna.py:50``'s
+        ``_ring_blocks_for_window`` (``cdiv(window - 1 + qo_max, block_size)
+        + 1``) -- not imported because that module hard-imports torch/vllm
+        at module level; reproduced here so this test exercises the REAL
+        formula without needing the full runtime import chain (this repo's
+        own convention for CPU-only tests, see ``tests/test_dflash_engine.py``
+        stubbing ``runtime.compat_vllm`` for the same reason)."""
+        return -(-(window - 1 + qo_max) // block_size) + 1
+
+    @pytest.mark.parametrize("assert_level", [1], indirect=True)
+    @pytest.mark.parametrize("block_size", [64, 128])
+    def test_page_table_covers_seqlen_at_real_production_block_sizes(
+        self, assert_level, block_size
+    ):
+        """Mirrors ``LagunaCudaGraphVerify._fill_buffers``'s SWA branch
+        (``runtime/backends/laguna_cuda_graph.py:641-655``) at the two real
+        block sizes this runtime has actually shipped
+        (``notes/2026-07-27-block-size-128-migration-and-tie-break-noise.md``):
+        ``window=512`` (``DRAFT_WINDOW``/the main model's SWA window, both
+        512), ``qo_max=16`` (``NUM_QUERY_PER_REQ``). ``aligned_len``'s worst
+        case (maximum alignment slack) is ``(window - 1 + qo_max) + (bs -
+        1)`` -- one full window-plus-query-batch, plus up to ``bs - 1``
+        extra from floor-aligning ``window_start`` down to a block boundary.
+        At both real block sizes, ``cdiv(aligned_len, bs)`` lands EXACTLY on
+        ``ring_blocks_per_slot`` -- the coordinator's "生产配置下两者刚好卡
+        在边界上所以不触发" observation, reproduced numerically here rather
+        than just asserted in prose."""
+        window, qo_max = 512, 16
+        ring_blocks_per_slot = self._ring_blocks_for_window(window, block_size, qo_max)
+        worst_case_aligned_len = (window - 1 + qo_max) + (block_size - 1)
+        pages_needed = -(-worst_case_aligned_len // block_size)
+        assert pages_needed == ring_blocks_per_slot, (
+            "production sizing assumption changed -- re-derive the boundary"
+        )
+        # The real code's min() clip: min(pages_needed, ring_blocks_per_slot).
+        n_ring = min(pages_needed, ring_blocks_per_slot)
+        checks.check_page_table_covers_seqlen(
+            "swa", cache_seqlens=worst_case_aligned_len, n_filled_pages=n_ring, page_size=block_size
+        )
+
+    @pytest.mark.parametrize("assert_level", [1], indirect=True)
+    def test_page_table_covers_seqlen_fires_when_alignment_outgrows_the_ring(self, assert_level):
+        """One alignment-granularity step past the production boundary
+        (above): the window's real span needs 7 pages of 128 but the ring
+        was only ever sized (by ``_ring_blocks_for_window``) or clipped
+        (by ``LagunaCudaGraphVerify._fill_buffers``'s ``min()``, line 648)
+        to 6 -- the exact latent bug the coordinator found, reproduced with
+        concrete numbers instead of only the symbolic formula. This is the
+        scenario that produces "output looks fine but predictions quietly
+        degrade": the kernel reads page_table entries beyond index 6 that
+        were never (re)written for this slot/round."""
+        block_size = 128
+        ring_blocks_per_slot = 6  # sized for the real production boundary (see test above)
+        aligned_len = 800  # needs cdiv(800, 128) == 7 pages -- one more than the ring has
+        pages_needed = -(-aligned_len // block_size)
+        assert pages_needed == 7 and pages_needed > ring_blocks_per_slot
+        n_ring = min(pages_needed, ring_blocks_per_slot)  # the real code's clip: n_ring == 6
+        with pytest.raises(InvariantViolation) as exc_info:
+            checks.check_page_table_covers_seqlen(
+                "swa", cache_seqlens=aligned_len, n_filled_pages=n_ring, page_size=block_size
+            )
+        message = str(exc_info.value)
+        assert "800" in message  # declared length
+        assert "7" in message  # pages needed
+        assert "6" in message  # pages actually filled
+        assert "1" in message  # deficit
+
+    @pytest.mark.parametrize("assert_level", [1], indirect=True)
+    def test_page_table_covers_seqlen_full_attention_never_clips(self, assert_level):
+        """Full-attention branches (``LagunaCudaGraphDecode._fill_buffers``/
+        ``_fill_buffers_b1`` lines 161-174/216-224, and
+        ``LagunaCudaGraphVerify._fill_buffers`` lines 660-666) have no
+        ``min()`` cap anywhere: ``n_blocks = cdiv(new_kv, ps)`` is used
+        directly as both the fill count and the basis for ``cache_seqlens``
+        (``cache_seqlens = new_kv``), so ``cdiv(cache_seqlens, ps) ==
+        n_blocks`` always, for any ``new_kv``."""
+        block_size = 128
+        for new_kv in [1, 127, 128, 129, 5000, 65536]:
+            n_blocks = -(-new_kv // block_size)
+            checks.check_page_table_covers_seqlen(
+                "full", cache_seqlens=new_kv, n_filled_pages=n_blocks, page_size=block_size
+            )
+
+    @pytest.mark.parametrize("assert_level", [1], indirect=True)
+    def test_page_table_covers_seqlen_swa_decode_class_never_clips_either(self, assert_level):
+        """``LagunaCudaGraphDecode``'s SWA branch (``_fill_buffers``/
+        ``_fill_buffers_b1``, lines 175-198/225-247) computes ``n_ring =
+        cdiv(aligned_len, ps)`` with NO ``min()`` cap (unlike
+        ``LagunaCudaGraphVerify`` above) -- only ``LagunaCudaGraphVerify``
+        has the bug. The "only rewrite page_table if n_ring changed"
+        optimization (``if n_ring != self._swa_prev_n_blocks[i]:``, lines
+        188/237) doesn't matter for THIS invariant: whether or not this
+        call actually rewrote entries, the CURRENT valid count is always
+        this call's own ``n_ring`` (that's exactly why skipping the
+        rewrite is correct in the first place -- the count didn't change).
+        So passing this call's computed ``n_ring`` as ``n_filled_pages``
+        (not "count of entries this call physically wrote", which could be
+        0 on a cache-hit) is always correct here, and the check always
+        passes for any window/kv_len combination -- there is no clip to
+        trigger."""
+        block_size = 64
+        window = 512
+        for kv_len in [0, 1, 100, 511, 512, 513, 8192, 65536]:
+            new_kv = kv_len + 1
+            window_start = max(0, kv_len - window + 1)
+            aligned_start = (window_start // block_size) * block_size
+            aligned_len = new_kv - aligned_start
+            n_ring = -(-aligned_len // block_size)  # no min() cap in this class
+            checks.check_page_table_covers_seqlen(
+                "swa", cache_seqlens=aligned_len, n_filled_pages=n_ring, page_size=block_size
+            )
 
 
 class TestRecentTraceContextInMessage:
