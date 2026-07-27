@@ -25,7 +25,7 @@ import sys
 from typing import Any
 
 import torch
-from vllm._custom_ops import reshape_and_cache_flash
+from runtime.kernels.fused_kv_scatter import fused_kv_scatter
 
 logger = logging.getLogger("qwen_sm120_runtime.sparkinfer_attn")
 
@@ -343,10 +343,7 @@ class SparkinferAttentionImpl:
         """
         k_cache = kv_cache[0].view(torch.float8_e4m3fn)
         v_cache = kv_cache[1].view(torch.float8_e4m3fn)
-        reshape_and_cache_flash(
-            key, value, k_cache, v_cache, slot_mapping,
-            "fp8_e4m3", layer._k_scale, layer._v_scale,
-        )
+        fused_kv_scatter(key, value, k_cache, v_cache, slot_mapping, layer._k_scale, layer._v_scale)
 
     def forward(
         self,

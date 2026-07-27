@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from vllm._custom_ops import reshape_and_cache_flash
+from runtime.kernels.fused_kv_scatter import fused_kv_scatter
 
 from bfdiag.invariants import checks as bfdiag_checks
 
@@ -451,13 +451,10 @@ class _SparkinferCGDecodeImpl:
         pass
 
     def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
-        """Write K/V into paged cache via compiled C++ kernel (CG-safe)."""
+        """Write K/V into paged cache via fused Triton kernel (CG-safe)."""
         k_cache = kv_cache[0].view(torch.float8_e4m3fn)
         v_cache = kv_cache[1].view(torch.float8_e4m3fn)
-        reshape_and_cache_flash(
-            key, value, k_cache, v_cache, slot_mapping,
-            "fp8_e4m3", layer._k_scale, layer._v_scale,
-        )
+        fused_kv_scatter(key, value, k_cache, v_cache, slot_mapping, layer._k_scale, layer._v_scale)
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output, output_scale=None, output_block_scale=None):

@@ -18,7 +18,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from vllm._custom_ops import reshape_and_cache_flash
+from runtime.kernels.fused_kv_scatter import fused_kv_scatter
 
 logger = logging.getLogger("qwen_sm120_runtime.bf_attention")
 
@@ -158,18 +158,16 @@ class BFAttention(nn.Module):
                 f"BFAttention context is missing metadata or slot mapping for {self.layer_name!r}."
             )
 
-        # KV cache write via vLLM's compiled C++ reshape_and_cache_flash.
-        # Single kernel per layer instead of 6 Python ops (288→48 kernels/step).
+        # KV cache write via self-developed fused Triton kernel (replaces
+        # vLLM's compiled C++ reshape_and_cache_flash). Single kernel per
+        # layer instead of 6 Python ops (288→48 kernels/step).
         if sm is not None and k is not None and v is not None and self.kv_cache is not None:
             k_cache = self.kv_cache[0]
             v_cache = self.kv_cache[1]
             if k_cache.dtype == torch.uint8:
                 k_cache = k_cache.view(torch.float8_e4m3fn)
                 v_cache = v_cache.view(torch.float8_e4m3fn)
-            reshape_and_cache_flash(
-                k, v, k_cache, v_cache, sm,
-                self.kv_cache_dtype, self._k_scale, self._v_scale,
-            )
+            fused_kv_scatter(k, v, k_cache, v_cache, sm, self._k_scale, self._v_scale)
 
         # Sparkinfer attention forward
         self.impl.forward(self, q, k, v, self.kv_cache, meta, out)
