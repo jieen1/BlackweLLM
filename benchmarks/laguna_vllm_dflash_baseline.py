@@ -71,7 +71,7 @@ def make_prompt(tokenizer, target_tokens: int) -> str:
 
 def build_llm(moe_backend: str, max_model_len: int, num_seqs: int, k: int,
               dflash: bool = True, cuda_graph: bool = True,
-              gpu_mem_util: float = 0.85):
+              gpu_mem_util: float = 0.85, log_stats: bool = False):
     from vllm import LLM
     kwargs = dict(
         model=MODEL,
@@ -80,7 +80,7 @@ def build_llm(moe_backend: str, max_model_len: int, num_seqs: int, k: int,
         gpu_memory_utilization=gpu_mem_util,
         enforce_eager=not cuda_graph,
         dtype="bfloat16",
-        disable_log_stats=True,
+        disable_log_stats=not log_stats,
         max_num_seqs=num_seqs,
     )
     if dflash:
@@ -91,7 +91,22 @@ def build_llm(moe_backend: str, max_model_len: int, num_seqs: int, k: int,
     return LLM(**kwargs)
 
 
-def measure(llm, prompts: list[str], max_tokens: int, num_seqs: int) -> dict:
+def _spec_decode_counter(llm, substr: str) -> float:
+    """Sum a Prometheus Counter metric (matched by substring) across labels.
+
+    Counters accumulate every engine step regardless of the periodic
+    logging interval (that interval only throttles the pretty-printed
+    log line), so this is accurate even for sub-second generate() calls.
+    """
+    total = 0.0
+    for m in llm.llm_engine.get_metrics():
+        if substr in m.name and hasattr(m, "value"):
+            total += m.value
+    return total
+
+
+def measure(llm, prompts: list[str], max_tokens: int, num_seqs: int,
+            log_stats: bool = False) -> dict:
     """Measure accepted tok/s for a batch of prompts (concurrent=num_seqs)."""
     from vllm import SamplingParams
     import torch
@@ -99,6 +114,10 @@ def measure(llm, prompts: list[str], max_tokens: int, num_seqs: int) -> dict:
     params = SamplingParams(max_tokens=max_tokens, temperature=0)
     # warmup
     llm.generate(prompts[:1], params)
+
+    if log_stats:
+        draft_before = _spec_decode_counter(llm, "spec_decode_num_draft_tokens")
+        accepted_before = _spec_decode_counter(llm, "spec_decode_num_accepted_tokens")
 
     reps = []
     for _ in range(3):
@@ -114,26 +133,35 @@ def measure(llm, prompts: list[str], max_tokens: int, num_seqs: int) -> dict:
     n_out = reps[[r[0] for r in reps].index(elapsed)][1]
     tps = n_out / elapsed
     itl_ms = elapsed / max(n_out // len(prompts), 1) * 1000
-    return {
+    result = {
         "wall_s": round(elapsed, 3),
         "total_out_tokens": n_out,
         "accepted_tok_s": round(tps, 1),
         "itl_ms_per_seq": round(itl_ms, 2),
         "num_seqs": num_seqs,
     }
+    if log_stats:
+        draft_after = _spec_decode_counter(llm, "spec_decode_num_draft_tokens")
+        accepted_after = _spec_decode_counter(llm, "spec_decode_num_accepted_tokens")
+        d_draft = draft_after - draft_before
+        d_accept = accepted_after - accepted_before
+        result["spec_decode_draft_tokens_delta"] = d_draft
+        result["spec_decode_accepted_tokens_delta"] = d_accept
+        result["acceptance_rate"] = round(d_accept / d_draft, 4) if d_draft else None
+    return result
 
 
 def run_config(moe_backend: str, ctx_list: list[int], num_seqs_list: list[int],
                max_tokens: int, k: int, max_model_len: int,
                dflash: bool = True, cuda_graph: bool = True,
-               gpu_mem_util: float = 0.85) -> dict:
+               gpu_mem_util: float = 0.85, log_stats: bool = False) -> dict:
     print(f"\n{'='*70}\n>>> moe_backend={moe_backend}  "
           f"(DFlash={'K'+str(k) if dflash else 'OFF'}, CUDA Graph={'ON' if cuda_graph else 'OFF'})",
           flush=True)
     t0 = time.perf_counter()
     try:
         llm = build_llm(moe_backend, max_model_len, max(num_seqs_list), k, dflash,
-                        cuda_graph, gpu_mem_util)
+                        cuda_graph, gpu_mem_util, log_stats=log_stats)
     except Exception as exc:  # noqa: BLE001
         msg = str(exc).split("\n")[0][:250]
         print(f"  LOAD FAILED: {msg}", flush=True)
@@ -151,10 +179,11 @@ def run_config(moe_backend: str, ctx_list: list[int], num_seqs_list: list[int],
         ctx_res = {}
         for ns in num_seqs_list:
             prompts = [prompt] * ns
-            r = measure(llm, prompts, max_tokens, ns)
+            r = measure(llm, prompts, max_tokens, ns, log_stats=log_stats)
             ctx_res[f"seqs{ns}"] = r
+            extra = f"  accept_rate={r['acceptance_rate']}" if log_stats else ""
             print(f"  ctx{actual_ctx} seqs={ns}: accepted={r['accepted_tok_s']} tok/s  "
-                  f"ITL={r['itl_ms_per_seq']}ms  out={r['total_out_tokens']}tok/{r['wall_s']}s", flush=True)
+                  f"ITL={r['itl_ms_per_seq']}ms  out={r['total_out_tokens']}tok/{r['wall_s']}s{extra}", flush=True)
         res["ctx"][f"ctx{actual_ctx}"] = ctx_res
 
     del llm
@@ -176,6 +205,9 @@ def main() -> None:
     ap.add_argument("--gpu-mem-util", type=float, default=0.85)
     ap.add_argument("--no-dflash", action="store_true", help="disable DFlash speculation")
     ap.add_argument("--enforce-eager", action="store_true", help="disable CUDA Graph")
+    ap.add_argument("--log-stats", action="store_true",
+                    help="enable vLLM stats and report spec-decode acceptance_rate "
+                         "(reads Prometheus counters, unaffected by log print interval)")
     ap.add_argument("--label", type=str, default="")
     ap.add_argument("--out", type=str,
                     default="benchmarks/fixtures/laguna_vllm_dflash_baseline.json")
@@ -188,7 +220,7 @@ def main() -> None:
     for be in args.moe_backends:
         r = run_config(be, args.ctx, args.num_seqs, args.max_tokens, args.k, args.max_model_len,
                    dflash=not args.no_dflash, cuda_graph=not args.enforce_eager,
-                   gpu_mem_util=args.gpu_mem_util)
+                   gpu_mem_util=args.gpu_mem_util, log_stats=args.log_stats)
         results["configs"].append(r)
 
     out = Path(args.out)
