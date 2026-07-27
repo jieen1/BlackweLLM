@@ -16,7 +16,7 @@ def _fused_kv_scatter_kernel(
     slot_mapping_ptr,
     k_scale_ptr, v_scale_ptr,
     stride_kt, stride_kh, stride_kd,
-    stride_ct, stride_ch, stride_cd,
+    stride_vt, stride_vh, stride_vd,
     stride_cb, stride_cs, stride_chh, stride_cdd,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
@@ -46,7 +46,7 @@ def _fused_kv_scatter_kernel(
         mask=mask_d, other=0.0,
     ).to(tl.float32)
     v_val = tl.load(
-        value_ptr + pid * stride_kt + hid * stride_kh + offs_d * stride_kd,
+        value_ptr + pid * stride_vt + hid * stride_vh + offs_d * stride_vd,
         mask=mask_d, other=0.0,
     ).to(tl.float32)
 
@@ -96,7 +96,7 @@ def fused_kv_scatter(
         slot_mapping,
         k_scale, v_scale,
         key.stride(0), key.stride(1), key.stride(2),
-        0, 0, 0,  # unused token-level strides for cache
+        value.stride(0), value.stride(1), value.stride(2),
         k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
