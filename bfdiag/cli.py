@@ -34,10 +34,32 @@ def _iter_subpackages() -> list[str]:
     return sorted(name for _, name, is_pkg in pkgutil.iter_modules(bfdiag.__path__) if is_pkg)
 
 
+def _candidate_module_names() -> list[str]:
+    """Registrar modules to try, across both platform packages.
+
+    ``bfdiag`` groups its subcommands into subpackages, each with a
+    ``cli`` module (``bfdiag.record.cli``, ``bfdiag.trace.cli``, ...).
+    ``bfprobe`` (the probe system) is flat instead, so its registrars are
+    top-level modules named ``cli`` or ``*_cli`` (``bfprobe.cli``,
+    ``bfprobe.scan_cli``). Both shapes land on the same
+    ``register(subparsers)`` contract, so ``bf`` exposes them as one CLI.
+    """
+    names = [f"bfdiag.{sub}.cli" for sub in _iter_subpackages()]
+    try:
+        import bfprobe
+    except Exception:  # noqa: BLE001 - bfprobe is optional at runtime
+        return names
+    names += sorted(
+        f"bfprobe.{name}"
+        for _, name, is_pkg in pkgutil.iter_modules(bfprobe.__path__)
+        if not is_pkg and (name == "cli" or name.endswith("_cli"))
+    )
+    return names
+
+
 def _discover_registrars(debug: bool) -> list[ModuleType]:
     registrars: list[ModuleType] = []
-    for sub in _iter_subpackages():
-        module_name = f"bfdiag.{sub}.cli"
+    for module_name in _candidate_module_names():
         try:
             module = importlib.import_module(module_name)
         except Exception as exc:  # noqa: BLE001 - sibling subpackages may not exist yet

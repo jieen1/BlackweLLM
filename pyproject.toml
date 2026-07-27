@@ -40,4 +40,13 @@ select = ["E", "F", "I", "UP"]
 "tests/debug/*" = ["E401", "E402", "E501", "E701", "E702", "E722", "E741", "I001", "F841"]
 
 [tool.setuptools.packages.find]
-include = ["bfdiag*", "benchmarks*", "loader*", "model*", "oracle*", "runtime*", "server*"]
+include = [
+  "bfdiag*",
+  "bfprobe*",
+  "benchmarks*",
+  "loader*",
+  "model*",
+  "oracle*",
+  "runtime*",
+  "server*",
+]

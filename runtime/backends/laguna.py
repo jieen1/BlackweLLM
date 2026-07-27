@@ -20,6 +20,7 @@ import numpy as np
 import torch
 
 from bfdiag.trace import ring as bfdiag_trace
+from bfprobe.routing import capture_routing
 from runtime.block_pool import ChunkedPrefillState
 from runtime.compat_vllm import (
     VllmConfig,
@@ -544,6 +545,7 @@ class LagunaBackend:
                         _renorm,
                         routed_scaling_factor=1.0,
                     )
+                    capture_routing(router_logits, topk_ids, topk_weights)  # bfprobe P-TOPK
                     routed_out = _si_layer.forward(hs, topk_ids, topk_weights)
                     if _shared is not None:
                         shared_out = _shared(hs)
