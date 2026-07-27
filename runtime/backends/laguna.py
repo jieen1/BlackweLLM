@@ -1640,17 +1640,25 @@ class LagunaBackend:
         self.slot_kv_len[slot] = 0
         self.slot_committed_tokens[slot] = []
         phys = _physical_slot(slot)
-        # Full-attention layers: clear blocks_per_slot blocks
+        # Full-attention layers: clear blocks_per_slot blocks.
+        # The block axis is dim 1 -- kv_cache is
+        # [2, num_blocks, block_size, num_kv_heads, head_dim] with dim 0
+        # being K/V (see the allocation above). Slicing dim 0 instead
+        # silently clamps to [0:2] for slot 0 (wiping EVERY slot's blocks)
+        # and yields an empty slice for every slot >= 1 (clearing nothing
+        # at all, so the previous request's KV leaks into the next one).
+        # It went unnoticed because DFlash pins capacity to 1, where
+        # num_blocks == blocks_per_slot makes both forms equivalent.
         full_start = phys * self.blocks_per_slot
         full_end = full_start + self.blocks_per_slot
         for name in self._full_layer_names:
-            self.kv_caches[name][full_start:full_end].zero_()
+            self.kv_caches[name][:, full_start:full_end].zero_()
         # SWA layers: clear only ring_blocks_per_slot blocks
         if self._ring_blocks_per_slot > 0:
             ring_start = phys * self._ring_blocks_per_slot
             ring_end = ring_start + self._ring_blocks_per_slot
             for name in self._swa_layer_names:
-                self.kv_caches[name][ring_start:ring_end].zero_()
+                self.kv_caches[name][:, ring_start:ring_end].zero_()
 
     def reconcile_prefix_hit(self, token_ids: list[int]) -> int:
         """E1 stub: Laguna has no persistent content-addressed prefix cache
