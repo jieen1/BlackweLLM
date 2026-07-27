@@ -159,6 +159,85 @@ def check_aux_hidden_alignment(slot: int, prompt_len: int, aux_len: int, aux_off
     )
 
 
+def check_page_table_covers_seqlen(
+    group_key: object,
+    cache_seqlens: int,
+    n_filled_pages: int,
+    page_size: int,
+) -> None:
+    """``cdiv(cache_seqlens, page_size) <= n_filled_pages`` -- the number of
+    page_table entries actually populated must be enough to cover the
+    sequence length the same replay call declares via ``cache_seqlens``.
+    Violating this means the attention kernel will read ``page_table``
+    entries beyond ``n_filled_pages`` that were never written for this
+    slot/round -- leftover page ids from a previous CUDA-Graph capture or a
+    DIFFERENT slot's replay, so the kernel silently attends to someone
+    else's KV. Symptom in production: output looks structurally fine but
+    predictions quietly degrade -- there is no crash to grep for.
+
+    This is a real, currently-latent bug, found by a sub-agent auditing the
+    block_size=64->128 migration (not the cause of the acceptance-rate
+    regression that investigation was chasing, but independently real):
+    ``runtime/backends/laguna_cuda_graph.py``'s
+    ``LagunaCudaGraphVerify._fill_buffers`` (the M=16 main-model verify
+    CUDA Graph), SWA branch::
+
+        n_ring = min(-(-aligned_len // bs), self._ring_blocks_per_slot)  # line 648, CLIPPED
+        pt[0, :n_ring] = (ring_base + (block_starts % ring_slots) // bs).to(pt.dtype)  # line 654
+        self._cache_seqlens[group_key][0] = aligned_len  # line 655, UNCLIPPED
+
+    ``n_ring`` is capped at ``self._ring_blocks_per_slot`` (the ring's
+    physical capacity) before it's used as the fill count, but
+    ``cache_seqlens`` is set to the raw, uncapped ``aligned_len``. Whenever
+    ``cdiv(aligned_len, bs) > ring_blocks_per_slot`` (the window's real span
+    needs more pages than the ring physically has), the ``min()`` silently
+    truncates the fill while the kernel is still told the longer length.
+    Today's production block_size=64 and block_size=128 configs both land
+    ``cdiv(aligned_len, bs)`` EXACTLY equal to ``ring_blocks_per_slot``
+    (``_ring_blocks_for_window``'s ``+ 1`` fudge term is sized so the
+    ``min()`` is a no-op at the currently-used block sizes) -- that's why
+    this hasn't manifested yet; it is one alignment-granularity change away
+    from firing for real.
+
+    Contrast with the two branches that do NOT have this bug (both provably
+    exact, by construction, with today's code -- no clip exists in either):
+
+    - Full-attention, both ``LagunaCudaGraphDecode._fill_buffers``/
+      ``_fill_buffers_b1`` (lines 161-174, 216-224) and
+      ``LagunaCudaGraphVerify._fill_buffers`` (lines 660-666): ``n_blocks =
+      cdiv(new_kv, ps)`` with NO cap, and ``cache_seqlens = new_kv`` -- the
+      two are always equal.
+    - SWA in ``LagunaCudaGraphDecode._fill_buffers``/``_fill_buffers_b1``
+      (lines 175-198, 225-247): ``n_ring = cdiv(aligned_len, ps)`` with NO
+      cap either (unlike the Verify class above) -- ``cache_seqlens =
+      aligned_len`` always equals ``cdiv(cache_seqlens, ps)`` pages needed.
+
+    ``n_filled_pages`` means the CURRENT valid entry count in ``page_table``
+    after this call returns, NOT "how many entries this specific call
+    physically rewrote". ``LagunaCudaGraphDecode`` only rewrites
+    ``page_table`` when ``n_ring`` (or ``n_blocks``) differs from the
+    previous call's value (``if n_ring != self._swa_prev_n_blocks[i]:``,
+    lines 188/237) -- on a cache-hit call that skips the rewrite,
+    ``n_filled_pages`` is still ``n_ring`` (this call's own requirement),
+    because the skip is only correct precisely because the previously
+    written entries already numbered ``n_ring`` (the count didn't change,
+    by the ``if``'s own condition). Pass this call's computed page count
+    (``n_ring``/``n_blocks``), not a rewrite-happened flag."""
+    pages_needed = -(-cache_seqlens // page_size)  # cdiv
+    deficit = max(0, pages_needed - n_filled_pages)
+    check(
+        1,
+        "page_table_covers_seqlen",
+        pages_needed <= n_filled_pages,
+        group_key=group_key,
+        cache_seqlens=cache_seqlens,
+        page_size=page_size,
+        pages_needed=pages_needed,
+        n_filled_pages=n_filled_pages,
+        deficit=deficit,
+    )
+
+
 def check_cg_replay_slot_consistency(slot: int, replay_slot: int) -> None:
     """DFlash's verify/draft CUDA Graphs recompute their physical KV address
     fresh from the ``slot`` argument on every ``replay()`` call
@@ -229,6 +308,17 @@ if __name__ == "__main__":
     check_cg_replay_slot_consistency(slot=2, replay_slot=2)
     try:
         check_cg_replay_slot_consistency(slot=2, replay_slot=3)
+        raise AssertionError("expected InvariantViolation")
+    except InvariantViolation:
+        pass
+
+    # Real production boundary (block_size=64, ring_blocks_per_slot=10 from
+    # _ring_blocks_for_window(512, 64)): the min() clip is a no-op here.
+    check_page_table_covers_seqlen("swa", cache_seqlens=590, n_filled_pages=10, page_size=64)
+    # A widened alignment granularity that needs 7 pages but the ring was
+    # only ever sized/clipped to 6: exactly the latent bug.
+    try:
+        check_page_table_covers_seqlen("swa", cache_seqlens=800, n_filled_pages=6, page_size=128)
         raise AssertionError("expected InvariantViolation")
     except InvariantViolation:
         pass
