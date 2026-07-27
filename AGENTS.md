@@ -44,6 +44,51 @@ Keep environment setup, CUDA/toolchain versions, and model-location variables
 in `README.md` or dedicated developer documentation. Do not make unit tests require
 downloading model weights unless explicitly marked as integration tests.
 
+## Diagnostics — read this before debugging anything
+
+This machine has **one GPU and no parallelism**; a test run costs minutes. The
+only lever on iteration speed is **how much each GPU run tells you**. A
+diagnostics platform (`bfdiag`, CLI entry point `bf`) exists for exactly this.
+**Full guide: `docs/diagnostics-guide.md` — read it before writing any
+diagnostic code.**
+
+Three rules that override habit:
+
+1. **Do not write another one-off script under `benchmarks/`.** There are
+   already 144 of them (32710 lines) with zero compounding value. Submit
+   experiments to the warm engine instead: `bf exec <script>`.
+2. **Run `bf diff <A> <B>` before comparing any two numbers.** On 2026-07-27
+   two acceptance rates (1.000 vs 0.687) were compared as evidence the backend
+   had caught up with vLLM; the two runs had used different prompts, and a full
+   day was lost. `bf diff` prints the config delta and refuses to call
+   incomparable runs comparable.
+3. **When something fails, read the existing trace first — do not re-run.** The
+   flight recorder is on-by-default-cheap; the failing run's per-round history
+   is already on disk. Re-running costs minutes and may not reproduce.
+
+Symptom → tool:
+
+| Symptom | Sequence |
+|---|---|
+| Acceptance rate dropped | `bf diff` → `bf trace show` (**reject_position histogram** — its *shape* separates several distinct bug classes) → `bf divergence` |
+| Garbage output / NaN | `QSR_ASSERT_LEVEL=1` re-run → `bf trace show` → `bf divergence` |
+| Suddenly slower | `bf diff` → `bf trace show` (CG hit rate, eager-fallback reasons, round-time outliers) |
+| Intermittent, won't reproduce | `bf trace show <failing run>` — do not re-run |
+
+Key env vars: `QSR_TRACE=1` (flight recorder), `QSR_ASSERT_LEVEL=1`
+(invariant assertions), `QSR_BFDIAG_DIR` (artifact root).
+
+**Warm engine vs cold start** — using the wrong one produces plausible but
+false numbers with no error: the warm engine (`bf exec`) is valid for
+steady-state decode performance, acceptance rates, and numerical experiments.
+It is **not** valid for cold-prefill performance, OOM/memory-pressure limits,
+or any **load-time** config (`block_size`, `capacity`,
+`gpu_memory_utilization`, `max_model_len`, quantization backend) — those are
+fixed when the model loads and require a fresh process.
+
+`bfdiag` is pure-stdlib and `runtime/` imports it at module level; keep it
+free of third-party dependencies and of import-time side effects.
+
 ## Coding Style & Naming Conventions
 
 Use Python with four-space indentation, `snake_case` for modules/functions,
