@@ -662,6 +662,7 @@ def _build_provider(args: argparse.Namespace) -> EngineProvider:
             model_path=args.model_path,
             num_slots=args.num_slots,
             blocks_per_slot=args.blocks_per_slot,
+            block_size=args.block_size,
             dtype=args.dtype,
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory_utilization,
@@ -679,6 +680,7 @@ def _add_provider_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--num-slots", type=int, default=1)
     parser.add_argument("--blocks-per-slot", type=int, default=4096)
+    parser.add_argument("--block-size", type=int, default=64)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--max-model-len", type=int, default=131072)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)

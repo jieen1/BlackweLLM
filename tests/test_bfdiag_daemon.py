@@ -356,6 +356,7 @@ class TestCliSubprocessLifecycle:
                 model_path=None,
                 num_slots=1,
                 blocks_per_slot=4096,
+                block_size=64,
                 dtype="bfloat16",
                 max_model_len=131072,
                 gpu_memory_utilization=0.88,
@@ -420,6 +421,7 @@ class TestCliSubprocessLifecycle:
                 model_path=None,
                 num_slots=2,  # DIFFERENT from the running instance's 1
                 blocks_per_slot=4096,
+                block_size=64,
                 dtype="bfloat16",
                 max_model_len=131072,
                 gpu_memory_utilization=0.88,
@@ -648,6 +650,7 @@ class TestHotColdBoundary:
         provider = LagunaEngineProvider(
             num_slots=2,
             blocks_per_slot=2048,
+            block_size=128,
             dtype="float16",
             max_model_len=8192,
             gpu_memory_utilization=0.5,
@@ -657,6 +660,7 @@ class TestHotColdBoundary:
             "model_path": provider.describe()["model_path"],
             "num_slots": 2,
             "blocks_per_slot": 2048,
+            "block_size": 128,
             "dtype": "float16",
             "max_model_len": 8192,
             "gpu_memory_utilization": 0.5,

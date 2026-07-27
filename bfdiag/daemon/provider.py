@@ -51,6 +51,7 @@ LOAD_TIME_CONFIG_KEYS: frozenset[str] = frozenset(
         "model_path",
         "num_slots",
         "blocks_per_slot",
+        "block_size",
         "dtype",
         "max_model_len",
         "gpu_memory_utilization",
@@ -307,6 +308,7 @@ class LagunaEngineProvider:
         model_path: str | None = None,
         num_slots: int = 1,
         blocks_per_slot: int = 4096,
+        block_size: int = 64,
         dtype: str = "bfloat16",
         max_model_len: int = 131072,
         gpu_memory_utilization: float = 0.88,
@@ -315,6 +317,7 @@ class LagunaEngineProvider:
         self._model_path = model_path or _DEFAULT_LAGUNA_MODEL_PATH
         self._num_slots = num_slots
         self._blocks_per_slot = blocks_per_slot
+        self._block_size = block_size
         self._dtype = dtype
         self._max_model_len = max_model_len
         self._gpu_memory_utilization = gpu_memory_utilization
@@ -351,6 +354,7 @@ class LagunaEngineProvider:
             vllm_config,
             num_slots=self._num_slots,
             blocks_per_slot=self._blocks_per_slot,
+            block_size=self._block_size,
         )
         self._engine = DFlashEngine(self._backend, dflash_model_path=self._dflash_model_path)
         self._tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -378,6 +382,7 @@ class LagunaEngineProvider:
             "model_revision": _extract_revision(self._model_path),
             "num_slots": self._num_slots,
             "blocks_per_slot": self._blocks_per_slot,
+            "block_size": self._block_size,
             # See LOAD_TIME_CONFIG_KEYS: every key here is fixed at
             # construction time -- ``requires_cold_restart(this, requested)``
             # is how ``bf daemon start``'s reuse-detection tells "identical
@@ -387,6 +392,7 @@ class LagunaEngineProvider:
                 "model_path": self._model_path,
                 "num_slots": self._num_slots,
                 "blocks_per_slot": self._blocks_per_slot,
+                "block_size": self._block_size,
                 "dtype": self._dtype,
                 "max_model_len": self._max_model_len,
                 "gpu_memory_utilization": self._gpu_memory_utilization,
