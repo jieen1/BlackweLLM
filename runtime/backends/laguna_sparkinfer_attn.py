@@ -1,8 +1,14 @@
 """SparkInfer paged attention — full replacement for FlashInfer in Laguna.
 
 Handles both prefill (extend mode) and decode (CG mode) for all layer groups:
-- Full attention: window_left=-1, 24 Q heads, 8 KV heads, head_dim=128
-- SWA: window_left=511, same head config
+- Full attention: window_left=-1, 48 Q heads, 8 KV heads (gqa_group_size=6), head_dim=128
+- SWA: window_left=511, 72 Q heads, 8 KV heads (gqa_group_size=9), head_dim=128
+
+These are the real unsharded weight shapes (verified against the checkpoint's
+safetensors tensors directly, not the config). Production runs TP=1 (no tensor
+parallelism implemented), so these are also the shapes seen at runtime -- not
+the TP=2-sharded num_kv_heads=4 that some upstream sparkinfer kernel
+specializations are tuned for.
 
 KV cache layout: vLLM stores [2, num_blocks, block_size, num_kv_heads, head_dim].
 After unbind(0): k_cache/v_cache = [num_blocks, block_size, num_kv_heads, head_dim]
@@ -27,7 +33,8 @@ _BF_SPARKINFER_PATH = os.environ.get("BF_SPARKINFER_PATH", "/home/bot/project/sp
 if _BF_SPARKINFER_PATH and _BF_SPARKINFER_PATH not in sys.path:
     sys.path.insert(0, _BF_SPARKINFER_PATH)
 
-PAGE_SIZE = 64  # Must match LagunaBackend.block_size
+PAGE_SIZE = 64  # Default for SparkinferDecodeWorkspace.page_size; callers should
+# pass the real LagunaBackend.block_size explicitly (64 or 128 both supported).
 
 
 def _paged_descale(
@@ -173,6 +180,7 @@ class SparkinferDecodeWorkspace:
         max_pages: int,
         window_left: int = -1,
         device: str = "cuda",
+        page_size: int = PAGE_SIZE,
     ):
         from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
         from sparkinfer.attention.paged.planner import create_paged_plan
@@ -183,12 +191,13 @@ class SparkinferDecodeWorkspace:
         self.max_pages = max_pages
         self.window_left = window_left
         self.device = torch.device(device)
+        self.page_size = page_size
 
         # Dummy tensors for workspace creation (real ones bound at capture)
         self._q = torch.zeros(1, num_q_heads, head_dim, dtype=torch.bfloat16, device=self.device)
         self._k_cache = torch.zeros(
             max_pages,
-            PAGE_SIZE,
+            page_size,
             num_kv_heads,
             head_dim,
             dtype=torch.float8_e4m3fn,
@@ -196,7 +205,7 @@ class SparkinferDecodeWorkspace:
         )
         self._v_cache = torch.zeros(
             max_pages,
-            PAGE_SIZE,
+            page_size,
             num_kv_heads,
             head_dim,
             dtype=torch.float8_e4m3fn,
@@ -228,7 +237,7 @@ class SparkinferDecodeWorkspace:
             max_pages, dtype=torch.int32, device=self.device
         ).unsqueeze(0)
         capture_cache_seqlens = torch.tensor(
-            [max_pages * PAGE_SIZE - 1], dtype=torch.int32, device=self.device
+            [max_pages * page_size - 1], dtype=torch.int32, device=self.device
         )
         cu_seqlens_q = torch.tensor([0, 1], dtype=torch.int32, device=self.device)
         self._workspace._copy_runtime_metadata(
