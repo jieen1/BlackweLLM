@@ -477,6 +477,17 @@ class DFlashDraftCudaGraph:
         self._page_table[0, :n_ring] = draft_base + (_ap % ring_slots) // bs
         self._cache_seqlens[0] = aligned_len
 
+        import os as _os
+        if _os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+            import logging as _logging
+            _logger = _logging.getLogger("qwen_sm120_runtime.laguna_dflash_cudagraph")
+            pt = self._page_table[0, :n_ring].tolist()
+            _logger.warning(
+                "CHUNK_CHECK draft_fill_buffers bs=%d kv_len=%d window_start=%d "
+                "aligned_start=%d aligned_len=%d n_ring=%d page_table=%s",
+                bs, kv_len, window_start, aligned_start, aligned_len, n_ring, pt,
+            )
+
         # Vectorized slot mapping -- reuse self._positions (same arange as
         # above, no need to recompute).
         _sp = self._positions[: self.num_tokens]
@@ -575,4 +586,19 @@ class DFlashDraftCudaGraph:
         # self._logits is already positions [1:num_tokens] -- see
         # _build_metadata_and_forward, which slices before compute_logits.
         draft_tokens = self._logits.argmax(dim=-1)
+
+        import os as _os
+        if _os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+            import logging as _logging
+            _logger = _logging.getLogger("qwen_sm120_runtime.laguna_dflash_cudagraph")
+            last_logits = self._logits[-1].float()
+            top2 = torch.topk(last_logits, 2)
+            _logger.warning(
+                "CHUNK_CHECK draft_logits bs=%d kv_len=%d last_pos_top1=%d(%.6f) "
+                "top2=%d(%.6f) margin=%.6f",
+                self.block_size, kv_len, int(top2.indices[0]), float(top2.values[0]),
+                int(top2.indices[1]), float(top2.values[1]),
+                float(top2.values[0] - top2.values[1]),
+            )
+
         return draft_tokens.tolist()

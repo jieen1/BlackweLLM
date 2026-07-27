@@ -97,7 +97,8 @@ class LagunaCudaGraphDecode:
 
             ws = SparkinferDecodeWorkspace(
                 num_q_heads=nqh, num_kv_heads=nkvh, head_dim=128,
-                max_pages=max_pages, window_left=wl, device=str(self.device))
+                max_pages=max_pages, window_left=wl, device=str(self.device),
+                page_size=self.block_size)
 
             self._decode_workspaces[group_key] = ws
             self._page_tables[group_key] = ws.page_table

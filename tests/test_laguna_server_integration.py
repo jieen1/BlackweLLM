@@ -141,7 +141,7 @@ class TestLagunaBackendE1Surface:
         """A stale 16-token launcher must fail before allocating GPU state."""
         from runtime.backends.laguna import LagunaBackend
 
-        with pytest.raises(ValueError, match="block_size=64"):
+        with pytest.raises(ValueError, match=r"block_size in \(64, 128\)"):
             LagunaBackend(None, block_size=16)
 
     def test_reconcile_prefix_hit_is_permanent_miss(self):

@@ -909,6 +909,35 @@ class DFlashEngine:
         draft_base = phys * self._draft_blocks_per_slot
         ring_slots = self._draft_blocks_per_slot * bs
 
+        # A chunked-prefill final chunk can be much larger than the draft
+        # ring's capacity (chunk_len is sized for the *main* model's SWA
+        # window/prefetch, independent of the draft ring, which only needs
+        # to hold DRAFT_WINDOW-ish positions). Writing more positions than
+        # ring_slots means multiple positions alias the same ring slot;
+        # advanced-indexing assignment on CUDA does not guarantee "last
+        # write wins" for duplicate destination indices, so the ring could
+        # end up with a scrambled mix of stale and fresh KV instead of the
+        # intended most-recent-window content. Only the last ring_slots
+        # positions matter going forward (older ones would be overwritten
+        # by the ring wrap anyway), so clip to them -- this also guarantees
+        # every slot_mapping in this call is unique, sidestepping the
+        # duplicate-index hazard entirely rather than relying on it being
+        # benign.
+        if num_positions > ring_slots:
+            drop = num_positions - ring_slots
+            combined = combined[drop:]
+            position_offset += drop
+            num_positions = ring_slots
+
+        if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+            logger.warning(
+                "CHUNK_CHECK combined_stats bs=%d shape=%s mean=%.6g std=%.6g "
+                "first_row_mean=%.6g last_row_mean=%.6g",
+                bs, tuple(combined.shape), combined.float().mean().item(),
+                combined.float().std().item(), combined[0].float().mean().item(),
+                combined[-1].float().mean().item(),
+            )
+
         context_positions = torch.arange(
             position_offset, position_offset + num_positions, dtype=torch.long, device=self.device
         )
@@ -919,11 +948,38 @@ class DFlashEngine:
             ring_off = pos % bs
             slot_mappings[i] = (draft_base + ring_block) * bs + ring_off
 
+        if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+            n_unique = torch.unique(slot_mappings).numel()
+            logger.warning(
+                "CHUNK_CHECK draft_kv_precompute bs=%d num_positions=%d ring_slots=%d "
+                "position_offset=%d n_unique_slot_mappings=%d (dup=%d)",
+                bs, num_positions, ring_slots, position_offset, n_unique,
+                num_positions - n_unique,
+            )
+
         self.draft_model.precompute_and_store_context_kv(
             combined,
             context_positions,
             slot_mappings,
         )
+
+        if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+            name0 = self._draft_layer_names[0]
+            kv = self._draft_kv_caches[name0]
+            sample_idx = [0, num_positions // 2, num_positions - 1]
+            for i in sample_idx:
+                sm = int(slot_mappings[i].item())
+                blk, off = sm // bs, sm % bs
+                k_val = kv[0, blk, off].float()
+                v_val = kv[1, blk, off].float()
+                logger.warning(
+                    "CHUNK_CHECK draft_kv_readback bs=%d i=%d pos=%d slot_mapping=%d "
+                    "block=%d off=%d k_abs_sum=%.6g v_abs_sum=%.6g k_nonzero=%s",
+                    bs, i, position_offset + i, sm, blk, off,
+                    k_val.abs().sum().item(), v_val.abs().sum().item(),
+                    bool((k_val != 0).any().item()),
+                )
+
         logger.info(
             "DFlash: precomputed context KV for %d positions (offset=%d)",
             num_positions,
@@ -1125,6 +1181,12 @@ class DFlashEngine:
                 aux_offset = prompt_len - aux_len
             else:
                 aux_offset = prompt_len - aux_len
+            if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+                logger.warning(
+                    "CHUNK_CHECK generate_verify_only prompt_len=%d prefix_len=%d "
+                    "aux_len=%d aux_offset=%d n_aux_tensors=%d",
+                    prompt_len, prefix_len, aux_len, aux_offset, len(aux_hidden_states),
+                )
             self._bulk_precompute_context_kv(slot, aux_hidden_states, aux_len, aux_offset)
 
         del aux_hidden_states
@@ -1138,6 +1200,12 @@ class DFlashEngine:
             draft_tokens = self._draft_cg.replay(slot, bonus_token, kv_len)
         else:
             draft_tokens = self._draft_forward(slot, bonus_token, kv_len)
+
+        if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+            logger.warning(
+                "CHUNK_CHECK initial_draft bs=%d bonus_token=%d kv_len=%d draft_tokens=%s",
+                self.block_size, bonus_token, kv_len, draft_tokens,
+            )
 
         tokens = [first_token]
         total_draft = 0
@@ -1174,6 +1242,14 @@ class DFlashEngine:
             # The verifier wrote the old anchor plus every matching draft token.
             # The recovery/bonus token remains pending and is not in KV yet.
             context_count = decision["context_count"]
+
+            if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+                logger.warning(
+                    "CHUNK_CHECK round bs=%d num_steps=%d kv_len=%d bonus_token=%d "
+                    "draft_tokens=%s num_accepted=%d new_tokens=%s new_bonus=%d",
+                    self.block_size, num_steps, kv_len, bonus_token, draft_tokens,
+                    num_accepted, new_tokens, new_bonus,
+                )
 
             # Step 4: Precompute draft context KV from committed verifier inputs.
             if verify_aux is not None:

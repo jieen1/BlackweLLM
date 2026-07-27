@@ -118,14 +118,29 @@ class LagunaBackend:
         block_size: int = 64,
         blocks_per_slot: int = 1088,
     ) -> None:
-        # The active sparkinfer paged-attention integration has a fixed
-        # 64-token page layout (including its CUDA-graph workspaces).  Fail
-        # before model loading instead of reaching its opaque planner error
-        # after allocating all weights and KV cache.
-        if block_size != 64:
+        # e66d254 (2026-07-26) pinned this to 64 because the sparkinfer
+        # version at the time only supported 64-token pages. sparkinfer
+        # master (merged 2026-07-27, notes/2026-07-27-sparkinfer-branch-
+        # master-canonical.md) supports both 64 and 128 throughout its
+        # planner/workspace/traits stack. Note: 128 does NOT unlock
+        # sparkinfer's Laguna-specific kernel traits (select_paged_forward_
+        # traits_from_plan) -- those additionally require num_kv_heads==4
+        # (a TP=2 shard count), but this runtime is TP=1 with num_kv_heads=8,
+        # so none of those traits ever fire regardless of page_size (see
+        # notes/2026-07-27-laguna-real-shapes-correction-and-page-size-
+        # migration-plan.md). Correctness verified against sparkinfer's own
+        # reference at Laguna's real shapes (cos>=0.999991 for both page
+        # sizes, see notes/2026-07-27-verify-cg-mode-fix-and-block-size-
+        # eval.md) and against a deep numerical bisection that traced an
+        # apparent accept-rate regression down to a genuine floating-point
+        # tie-break flip, not a correctness bug (notes/2026-07-27-block-
+        # size-128-migration-and-tie-break-noise.md). Fail fast on anything
+        # else before model loading instead of reaching sparkinfer's opaque
+        # planner error after allocating all weights.
+        if block_size not in (64, 128):
             raise ValueError(
-                "LagunaBackend requires block_size=64 for sparkinfer paged attention; "
-                f"got {block_size}."
+                "LagunaBackend requires block_size in (64, 128) for sparkinfer "
+                f"paged attention; got {block_size}."
             )
 
         import os as _os
@@ -932,6 +947,94 @@ class LagunaBackend:
         logits = self.model.compute_logits(hidden_states)
         return logits
 
+    def _debug_check_ring_to_scratch_copy(
+        self, slot: int, abs_start: int, count: int, chunk_idx: int
+    ) -> None:
+        """TEMP diagnostic (QSR_DEBUG_CHUNK_CHECK=1): mirror of
+        _debug_check_scratch_to_ring_copy for the other copy direction
+        (ring->scratch overlap at the start of a chunk). Destination is
+        always scratch[0:count) per _copy_ring_to_scratch's contract.
+        """
+        if not self._swa_layer_names:
+            return
+        bs = self.block_size
+        ring_slots = self._ring_slots_per_slot
+        phys = _physical_slot(slot)
+        ring_base = phys * self._ring_blocks_per_slot
+        name = self._swa_layer_names[0]
+        ring = self.kv_caches[name]
+        scratch = self._swa_scratch[name]
+        verbose = os.environ.get("QSR_DEBUG_CHUNK_CHECK") == "2"
+        max_abs_diff = 0.0
+        n_mismatch = 0
+        sample_positions = sorted(set([0, count - 1] + list(range(0, count, max(1, count // 8)))))
+        for i in sample_positions:
+            a_pos = abs_start + i
+            s_pos = i
+            ring_slot_idx = a_pos % ring_slots
+            rb, ro = ring_slot_idx // bs + ring_base, ring_slot_idx % bs
+            sb, so = s_pos // bs, s_pos % bs
+            rv = ring[:, rb, ro].float()
+            sv = scratch[:, sb, so].float()
+            diff = (sv - rv).abs().max().item()
+            max_abs_diff = max(max_abs_diff, diff)
+            if diff > 0:
+                n_mismatch += 1
+        status = "OK" if max_abs_diff == 0.0 else "MISMATCH"
+        if status == "MISMATCH" or verbose:
+            logger.warning(
+                "CHUNK_CHECK chunk=%d bs=%d ring[%d:%d)->scratch[0:%d) status=%s "
+                "max_abs_diff=%.6g n_mismatch=%d/%d",
+                chunk_idx, bs, abs_start, abs_start + count, count, status,
+                max_abs_diff, n_mismatch, len(sample_positions),
+            )
+
+    def _debug_check_scratch_to_ring_copy(
+        self, slot: int, scratch_start: int, abs_start: int, count: int, chunk_idx: int
+    ) -> None:
+        """TEMP diagnostic (QSR_DEBUG_CHUNK_CHECK=1): verify _copy_scratch_to_ring
+        actually landed the right values at the right ring addresses, by
+        independently re-deriving both addresses token-by-token (no slab
+        batching, so this can't share a bug with the code under test) and
+        diffing. Self-consistent within one run -- doesn't need cross-
+        block_size comparison. Prints only on mismatch or always if
+        QSR_DEBUG_CHUNK_CHECK=2.
+        """
+        if not self._swa_layer_names:
+            return
+        bs = self.block_size
+        ring_slots = self._ring_slots_per_slot
+        phys = _physical_slot(slot)
+        ring_base = phys * self._ring_blocks_per_slot
+        name = self._swa_layer_names[0]
+        ring = self.kv_caches[name]
+        scratch = self._swa_scratch[name]
+        verbose = os.environ.get("QSR_DEBUG_CHUNK_CHECK") == "2"
+        max_abs_diff = 0.0
+        n_mismatch = 0
+        sample_positions = sorted(set([0, count - 1] + list(range(0, count, max(1, count // 8)))))
+        for i in sample_positions:
+            s_pos = scratch_start + i
+            a_pos = abs_start + i
+            sb, so = s_pos // bs, s_pos % bs
+            ring_slot_idx = a_pos % ring_slots
+            rb, ro = ring_slot_idx // bs + ring_base, ring_slot_idx % bs
+            sv = scratch[:, sb, so].float()
+            rv = ring[:, rb, ro].float()
+            diff = (sv - rv).abs().max().item()
+            max_abs_diff = max(max_abs_diff, diff)
+            if diff > 0:
+                n_mismatch += 1
+        status = "OK" if max_abs_diff == 0.0 else "MISMATCH"
+        if status == "MISMATCH" or verbose:
+            logger.warning(
+                "CHUNK_CHECK chunk=%d bs=%d scratch[%d:%d)->ring[%d:%d) status=%s "
+                "max_abs_diff=%.6g n_mismatch=%d/%d",
+                chunk_idx, bs, scratch_start, scratch_start + count,
+                abs_start, abs_start + count, status, max_abs_diff, n_mismatch,
+                len(sample_positions),
+            )
+
     def _prefill_with_swa_scratch(self, slot: int, prompt_ids: list[int]) -> torch.Tensor:
         """Run prefill with SWA layers rebound to scratch, then copy to ring."""
         sfc = self.static_forward_context
@@ -1220,7 +1323,8 @@ class LagunaBackend:
                 PREFILL_CHUNK,
                 min_final_tokens=window,
             )
-            for chunk_start, chunk_end in chunk_ranges:
+            debug_chunk_check = os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2")
+            for _chunk_idx, (chunk_start, chunk_end) in enumerate(chunk_ranges):
                 chunk = prompt_ids[chunk_start:chunk_end]
                 chunk_len = len(chunk)
                 is_last = chunk_end == prompt_len
@@ -1229,6 +1333,15 @@ class LagunaBackend:
                 overlap = min(window, chunk_start) if self._swa_scratch else 0
                 if overlap > 0:
                     self._copy_ring_to_scratch(slot, chunk_start - overlap, overlap)
+                    if debug_chunk_check:
+                        self._debug_check_ring_to_scratch_copy(
+                            slot, chunk_start - overlap, overlap, _chunk_idx
+                        )
+                if debug_chunk_check:
+                    logger.warning(
+                        "CHUNK_CHECK chunk=%d bs=%d chunk_start=%d chunk_end=%d overlap=%d",
+                        _chunk_idx, self.block_size, chunk_start, chunk_end, overlap,
+                    )
 
                 # Rebind SWA to scratch for this chunk
                 if self._swa_scratch:
@@ -1268,6 +1381,10 @@ class LagunaBackend:
                         self._copy_scratch_to_ring(
                             slot, copy_scratch_start, copy_abs_start, copy_count
                         )
+                        if debug_chunk_check:
+                            self._debug_check_scratch_to_ring_copy(
+                                slot, copy_scratch_start, copy_abs_start, copy_count, _chunk_idx
+                            )
                 finally:
                     # Always rebind SWA layers back to ring (审查 P3a)
                     if self._swa_scratch:
