@@ -82,3 +82,8 @@ result = {
     "rounds": rounds,
 }
 print(json.dumps(result, indent=2))
+
+light_log_path = os.environ.get("QSR_DEBUG_LOGITS_LIGHT_PATH")
+if light_log_path:
+    from runtime.backends.laguna_dflash_cudagraph import dump_light_log
+    dump_light_log(light_log_path)
