@@ -4,7 +4,9 @@ Loads Laguna NVFP4 checkpoint weights directly from safetensors,
 prepares them for sparkinfer, and provides a clean forward() API.
 
 Dependency: sparkinfer (editable install from jieen1/sparkinfer fork,
-branch blackforge-main, or BF_SPARKINFER_PATH env fallback).
+branch master -- blackforge-main was merged into origin/master 2026-07-27
+and is no longer the canonical branch -- or BF_SPARKINFER_PATH env
+fallback).
 
 Scale convention (verified cosine≥0.993 vs reference, all M=1..128):
   - w13 data order: [up, gate] with w13_layout="w13"
