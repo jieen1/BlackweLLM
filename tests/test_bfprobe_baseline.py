@@ -15,7 +15,13 @@ import math
 
 import pytest
 
-from bfprobe.baseline import (
+# Every assertion below is pure CPU arithmetic, but bfprobe.baseline imports
+# Signature from bfprobe.reduce, which is where the Triton signature kernel
+# lives -- so the import chain needs torch + triton to be installed.
+pytest.importorskip("torch")
+pytest.importorskip("triton")
+
+from bfprobe.baseline import (  # noqa: E402
     Baseline,
     BaselineEntry,
     BaselineFingerprint,
@@ -26,7 +32,7 @@ from bfprobe.baseline import (
     record_baseline,
     save_baseline,
 )
-from bfprobe.reduce import Signature
+from bfprobe.reduce import Signature  # noqa: E402
 
 
 class TestDepthGrowthModel:
@@ -146,9 +152,7 @@ class TestJudge:
     def test_nan_is_always_fatal_regardless_of_depth(self):
         for layer in (0, 5, 17, 47):
             entry = self._entry(layer=layer)
-            current = Signature(
-                absmax=1.0, l2=10.0, mean=0.1, nan_count=1, inf_count=0, numel=100
-            )
+            current = Signature(absmax=1.0, l2=10.0, mean=0.1, nan_count=1, inf_count=0, numel=100)
             verdict = judge(entry, current)
             assert verdict.out_of_band, f"layer {layer} should be fatal on nan_count>0"
             assert any("nan_count" in reason for reason in verdict.reasons)
@@ -156,9 +160,7 @@ class TestJudge:
     def test_inf_is_always_fatal_regardless_of_depth(self):
         for layer in (0, 5, 17, 47):
             entry = self._entry(layer=layer)
-            current = Signature(
-                absmax=1.0, l2=10.0, mean=0.1, nan_count=0, inf_count=1, numel=100
-            )
+            current = Signature(absmax=1.0, l2=10.0, mean=0.1, nan_count=0, inf_count=1, numel=100)
             verdict = judge(entry, current)
             assert verdict.out_of_band, f"layer {layer} should be fatal on inf_count>0"
             assert any("inf_count" in reason for reason in verdict.reasons)

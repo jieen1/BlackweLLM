@@ -72,9 +72,10 @@ def test_moe_out_never_relaxes_tighter_than_attn_out() -> None:
     # noise) than attention; the depth model must preserve that ordering at
     # every depth, not just at layer 0.
     for layer_idx in (0, 1, 17, 47):
-        assert threshold_for(MOE_OUT, layer_idx).min_cosine <= threshold_for(
-            ATTN_OUT, layer_idx
-        ).min_cosine
+        assert (
+            threshold_for(MOE_OUT, layer_idx).min_cosine
+            <= threshold_for(ATTN_OUT, layer_idx).min_cosine
+        )
 
 
 def test_env_override_forces_min_cosine_uniformly(monkeypatch: pytest.MonkeyPatch) -> None:

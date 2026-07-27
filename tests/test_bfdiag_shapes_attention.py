@@ -179,7 +179,10 @@ def test_swa_attention_call_shapes_and_diagnostics():
 
 
 def test_empty_tensors_shapes_and_dtypes():
-    import torch
+    # Everything above this point is pure arithmetic; only empty_tensors()
+    # actually allocates, so torch is required from here on but not for the
+    # rest of the module.
+    torch = pytest.importorskip("torch")
 
     from bfdiag.shapes.attention import full_attention_call
 
@@ -207,6 +210,8 @@ def test_empty_tensors_shapes_and_dtypes():
 
 
 def test_empty_tensors_refuses_cuda():
+    pytest.importorskip("torch")
+
     from bfdiag.shapes.attention import full_attention_call
 
     call = full_attention_call(

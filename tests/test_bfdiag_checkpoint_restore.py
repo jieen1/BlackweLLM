@@ -20,11 +20,15 @@ import json
 from pathlib import Path
 
 import pytest
-import torch
-from safetensors.torch import load_file, save_file
 
-from bfdiag.checkpoint import restore, state, store, verify
-from bfdiag.checkpoint.testing import FakeBackend, FakeDFlashEngine
+# The fakes are pure Python, but bfdiag.checkpoint imports torch at module
+# scope for the tensor save/restore path.
+torch = pytest.importorskip("torch")
+_safetensors_torch = pytest.importorskip("safetensors.torch")
+load_file, save_file = _safetensors_torch.load_file, _safetensors_torch.save_file
+
+from bfdiag.checkpoint import restore, state, store, verify  # noqa: E402
+from bfdiag.checkpoint.testing import FakeBackend, FakeDFlashEngine  # noqa: E402
 
 
 def _fresh_engine(**kwargs) -> FakeDFlashEngine:

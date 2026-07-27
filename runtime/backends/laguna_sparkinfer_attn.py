@@ -123,10 +123,10 @@ class SparkinferPrefillWorkspace:
         mode: str = "extend",
     ) -> None:
         """Run extend/verify-mode attention (prefill or speculative verify)."""
-        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
-        from sparkinfer.attention.paged.planner import create_paged_plan
         from sparkinfer.attention.paged._forward import paged_attention_forward
         from sparkinfer.attention.paged._scratch import build_paged_attention_binding
+        from sparkinfer.attention.paged.planner import create_paged_plan
+        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
 
         if k_descale is None:
             k_descale = self._descale
@@ -183,7 +183,6 @@ class SparkinferDecodeWorkspace:
         page_size: int = PAGE_SIZE,
     ):
         from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
-        from sparkinfer.attention.paged.planner import create_paged_plan
 
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
@@ -344,8 +343,14 @@ class SparkinferAttentionImpl:
         k_cache = kv_cache[0].view(torch.float8_e4m3fn)
         v_cache = kv_cache[1].view(torch.float8_e4m3fn)
         reshape_and_cache_flash(
-            key, value, k_cache, v_cache, slot_mapping,
-            "fp8_e4m3", layer._k_scale, layer._v_scale,
+            key,
+            value,
+            k_cache,
+            v_cache,
+            slot_mapping,
+            "fp8_e4m3",
+            layer._k_scale,
+            layer._v_scale,
         )
 
     def forward(

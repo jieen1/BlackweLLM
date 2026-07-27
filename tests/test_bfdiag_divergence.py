@@ -101,9 +101,7 @@ def test_injected_bias_at_a_different_submodule_is_still_pinpointed() -> None:
 
 def test_no_bias_at_all_means_no_divergence() -> None:
     oracle, _ = _build_traces()
-    identical_candidate = {
-        layer_idx: dict(submodules) for layer_idx, submodules in oracle.items()
-    }
+    identical_candidate = {layer_idx: dict(submodules) for layer_idx, submodules in oracle.items()}
     report = scan_layers(oracle, identical_candidate)
 
     assert not report.has_divergence
