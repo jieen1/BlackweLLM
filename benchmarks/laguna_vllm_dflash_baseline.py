@@ -51,8 +51,10 @@ def gpu_mem_mib() -> float:
         return -1.0
 
 
-def make_prompt(tokenizer, target_tokens: int) -> str:
-    base = "The quick brown fox jumps over the lazy dog near the river bank. "
+DEFAULT_BASE_TEXT = "The quick brown fox jumps over the lazy dog near the river bank. "
+
+
+def make_prompt(tokenizer, target_tokens: int, base: str = DEFAULT_BASE_TEXT) -> str:
     words = (base * (target_tokens // 10 + 2)).split()
     lo, hi, best = 1, len(words), len(words)
     while lo <= hi:
@@ -154,7 +156,8 @@ def measure(llm, prompts: list[str], max_tokens: int, num_seqs: int,
 def run_config(moe_backend: str, ctx_list: list[int], num_seqs_list: list[int],
                max_tokens: int, k: int, max_model_len: int,
                dflash: bool = True, cuda_graph: bool = True,
-               gpu_mem_util: float = 0.85, log_stats: bool = False) -> dict:
+               gpu_mem_util: float = 0.85, log_stats: bool = False,
+               base_text: str = DEFAULT_BASE_TEXT) -> dict:
     print(f"\n{'='*70}\n>>> moe_backend={moe_backend}  "
           f"(DFlash={'K'+str(k) if dflash else 'OFF'}, CUDA Graph={'ON' if cuda_graph else 'OFF'})",
           flush=True)
@@ -173,7 +176,7 @@ def run_config(moe_backend: str, ctx_list: list[int], num_seqs_list: list[int],
     res = {"moe_backend": moe_backend, "dflash": dflash, "cuda_graph": cuda_graph,
            "load_s": round(load_s, 1), "ctx": {}}
     for ctx in ctx_list:
-        prompt = make_prompt(tok, ctx)
+        prompt = make_prompt(tok, ctx, base=base_text)
         actual_ctx = len(tok.encode(prompt))
         print(f"  --- ctx actual={actual_ctx} tokens ---", flush=True)
         ctx_res = {}
@@ -209,6 +212,12 @@ def main() -> None:
                     help="enable vLLM stats and report spec-decode acceptance_rate "
                          "(reads Prometheus counters, unaffected by log print interval)")
     ap.add_argument("--label", type=str, default="")
+    ap.add_argument("--base-text", type=str, default=DEFAULT_BASE_TEXT,
+                    help="repeated phrase used to build the synthetic prompt; override "
+                         "to match another benchmark's exact acceptance-rate regime "
+                         "(e.g. our own ab_dflash_verify_cg_vs_eager.py uses a shorter "
+                         "phrase without 'near the river bank' and gets a materially "
+                         "different acceptance rate at the same ctx)")
     ap.add_argument("--out", type=str,
                     default="benchmarks/fixtures/laguna_vllm_dflash_baseline.json")
     args = ap.parse_args()
@@ -220,7 +229,8 @@ def main() -> None:
     for be in args.moe_backends:
         r = run_config(be, args.ctx, args.num_seqs, args.max_tokens, args.k, args.max_model_len,
                    dflash=not args.no_dflash, cuda_graph=not args.enforce_eager,
-                   gpu_mem_util=args.gpu_mem_util, log_stats=args.log_stats)
+                   gpu_mem_util=args.gpu_mem_util, log_stats=args.log_stats,
+                   base_text=args.base_text)
         results["configs"].append(r)
 
     out = Path(args.out)
