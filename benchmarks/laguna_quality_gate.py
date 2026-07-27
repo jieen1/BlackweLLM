@@ -239,7 +239,11 @@ def main():
 
     if not all_match:
         sys.exit(1)
+    return all_match
 
 
 if __name__ == "__main__":
-    main()
+    from bfdiag.record import run_record  # demo: bf run-record integration
+
+    with run_record(script=__file__) as rec:
+        rec.metric("ab_match_all", 1.0 if main() else 0.0)
