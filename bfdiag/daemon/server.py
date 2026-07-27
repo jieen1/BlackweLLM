@@ -36,6 +36,16 @@ writeup):
   itself for that alone (per spec: never let one experiment's bug kill or
   poison the whole daemon by itself -- the canary on the *next* exec is
   what catches it if the exception left bad state behind).
+* Idle-TTL auto-release: this machine has exactly one GPU and its human
+  owner also needs it. A daemon that just sits there loaded forever after
+  the last experiment is a real cost, not a convenience. ``--idle-ttl-s``
+  (default 900s / 15 minutes) tracks time since the last *completed*
+  ``exec``/``reset`` (NOT ``ping``/``status`` -- a polling script must
+  never be able to keep the daemon alive forever) and, once exceeded,
+  unloads the provider and shuts the daemon down on its own, handing the
+  GPU back. ``--idle-ttl-s 0`` disables this (an explicit choice to hold
+  the GPU indefinitely). The idle check never fires while a job is
+  actually running (state ``BUSY``) -- a long experiment is not "idle".
 """
 
 from __future__ import annotations
@@ -65,11 +75,30 @@ from bfdiag.daemon.provider import EngineProvider, FakeEngineProvider, LagunaEng
 logger = logging.getLogger("bfdiag.daemon")
 
 DEFAULT_TIMEOUT_S = 30.0
+DEFAULT_IDLE_TTL_S = 900.0  # 15 minutes -- see module docstring's idle-TTL bullet
 _STATES = ("STARTING", "READY", "BUSY", "TAINTED", "STOPPED")
 
 
 class AlreadyRunningError(RuntimeError):
     """Another daemon process already holds the single-instance lock."""
+
+
+class ManualClock:
+    """Injectable fake clock: a callable returning a manually-advanced,
+    monotonic-like float. Passed as ``Daemon(..., clock=...)`` so idle-TTL
+    tests can fast-forward through a 900-second default without an
+    equivalent 900 real seconds of ``time.sleep`` -- see
+    ``tests/test_bfdiag_daemon.py``'s idle-TTL tests. Never used by
+    production code (``Daemon``'s default ``clock=time.monotonic``)."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self._now = start
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
 
 
 def bfdiag_dir() -> Path:
@@ -184,6 +213,16 @@ def _run_with_timeout(
     )
 
 
+def _safe_memory_snapshot(provider: EngineProvider) -> dict[str, Any]:
+    """``provider.memory_snapshot()``, never allowed to break ``exec`` --
+    a snapshot is diagnostic sugar, not something that should turn a
+    working experiment into a failure if it raises."""
+    try:
+        return provider.memory_snapshot()
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"error": str(exc)}
+
+
 class Daemon:
     """The warm daemon server. See module docstring for the design."""
 
@@ -197,6 +236,9 @@ class Daemon:
         restart_on_taint: bool = True,
         canary_prompt_ids: list[int] | None = None,
         canary_steps: int | None = None,
+        idle_ttl_s: float | None = None,
+        idle_check_interval_s: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._provider_factory = provider_factory
         self._provider: EngineProvider = provider_factory()
@@ -220,16 +262,27 @@ class Daemon:
             steps=canary_steps if canary_steps is not None else DEFAULT_CANARY_STEPS,
             enabled=self._canary_enabled,
         )
+        self._idle_ttl_s = (
+            idle_ttl_s
+            if idle_ttl_s is not None
+            else float(os.environ.get("QSR_BFD_IDLE_TTL_S", str(DEFAULT_IDLE_TTL_S)))
+        )
+        self._idle_check_interval_s = idle_check_interval_s
+        self._clock = clock
 
         self._state = "STARTING"
         self._provider_lock = threading.Lock()
         self._jobs: queue.Queue[_Job | None] = queue.Queue()
         self._shutdown_event = threading.Event()
         self._worker_thread: threading.Thread | None = None
+        self._idle_watchdog_thread: threading.Thread | None = None
         self._listen_sock: socket.socket | None = None
         self._lock_fd: int | None = None
         self._restart_count = 0
+        self._exec_count = 0
         self._started_at: float | None = None
+        self._started_clock_ts: float | None = None
+        self._last_activity_ts: float = self._clock()
 
     # -- lifecycle -----------------------------------------------------
 
@@ -252,15 +305,23 @@ class Daemon:
         self._provider.load()
         self._set_state("READY")
         self._started_at = time.time()
+        self._started_clock_ts = self._clock()
+        self._last_activity_ts = self._clock()
         self._worker_thread = threading.Thread(
             target=self._worker_loop, name="bfdiag-worker", daemon=True
         )
         self._worker_thread.start()
+        if self._idle_ttl_s > 0:
+            self._idle_watchdog_thread = threading.Thread(
+                target=self._idle_watchdog_loop, name="bfdiag-idle-watchdog", daemon=True
+            )
+            self._idle_watchdog_thread.start()
         logger.info(
-            "bfdiag daemon ready: socket=%s canary=%s timeout_s=%s",
+            "bfdiag daemon ready: socket=%s canary=%s timeout_s=%s idle_ttl_s=%s",
             self._socket_path,
             self._canary_enabled,
             self._default_timeout_s,
+            self._idle_ttl_s if self._idle_ttl_s > 0 else "disabled",
         )
 
     def serve_forever(self) -> None:
@@ -297,6 +358,8 @@ class Daemon:
         self._jobs.put(None)
         if self._worker_thread is not None:
             self._worker_thread.join(timeout=5.0)
+        if self._idle_watchdog_thread is not None:
+            self._idle_watchdog_thread.join(timeout=5.0)
         if self._listen_sock is not None:
             with contextlib.suppress(OSError):
                 self._listen_sock.close()
@@ -322,6 +385,46 @@ class Daemon:
                 "(only one daemon may own the GPU at a time)"
             ) from exc
         self._lock_fd = fd
+
+    # -- idle-TTL watchdog: give the GPU back when nobody is using it -----
+
+    def _idle_watchdog_loop(self) -> None:
+        """Polls every ``idle_check_interval_s``; once ``idle_s`` (time
+        since the last completed ``exec``/``reset`` -- ``ping``/``status``
+        never count) reaches ``idle_ttl_s``, unloads the provider and
+        shuts the daemon down. Never fires while a job is actually running
+        (``state == "BUSY"``) -- a long-running experiment is not "idle".
+        Uses ``self._shutdown_event.wait(...)`` instead of ``time.sleep``
+        so a manual ``shutdown``/``bf daemon stop`` wakes this thread
+        immediately instead of leaving it to poll out its last interval.
+        """
+        while not self._shutdown_event.wait(self._idle_check_interval_s):
+            if self._read_state() == "BUSY":
+                continue
+            idle_s = self._clock() - self._read_last_activity()
+            if idle_s >= self._idle_ttl_s:
+                logger.warning(
+                    "bfdiag daemon: idle for %.1fs >= --idle-ttl-s=%.1fs, "
+                    "auto-shutting down to release the GPU",
+                    idle_s,
+                    self._idle_ttl_s,
+                )
+                self._auto_shutdown_for_idle()
+                break
+
+    def _auto_shutdown_for_idle(self) -> None:
+        with contextlib.suppress(Exception):
+            self._provider.unload()
+        self._shutdown_event.set()
+        self._jobs.put(None)
+
+    def _read_last_activity(self) -> float:
+        with self._provider_lock:
+            return self._last_activity_ts
+
+    def _bump_activity(self) -> None:
+        with self._provider_lock:
+            self._last_activity_ts = self._clock()
 
     # -- connection handling ---------------------------------------------
 
@@ -384,6 +487,13 @@ class Daemon:
                     "state": self._read_state(),
                 }
             finally:
+                # Idle clock restarts when a job FINISHES, not when it was
+                # submitted -- a single exec running longer than
+                # idle_ttl_s must not make the daemon look "idle" the
+                # instant it completes (see _idle_watchdog_loop's BUSY
+                # guard for the other half of this: it never fires mid-job
+                # either, so a long job is never mistaken for idleness).
+                self._bump_activity()
                 job.done.set()
 
     def _execute_job(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -440,7 +550,14 @@ class Daemon:
                     "run_id": run_id,
                 }
 
+        with self._provider_lock:
+            self._exec_count += 1
         self._set_state("BUSY")
+        # Memory snapshot BEFORE the code runs -- see notes' "memory
+        # visibility" section: a lone tok/s number from a long-lived hot
+        # daemon is not comparable to another one unless the caching
+        # allocator's state at measurement time is recorded alongside it.
+        memory_before = _safe_memory_snapshot(self._provider)
         prev_run_id = os.environ.get("QSR_BFDIAG_RUN_ID")
         os.environ["QSR_BFDIAG_RUN_ID"] = run_id
         try:
@@ -455,6 +572,10 @@ class Daemon:
                 os.environ.pop("QSR_BFDIAG_RUN_ID", None)
             else:
                 os.environ["QSR_BFDIAG_RUN_ID"] = prev_run_id
+        # ...and AFTER, taken before any taint/restart bookkeeping so a
+        # timed-out call's "after" snapshot still reflects the provider
+        # that was actually abandoned, not a freshly-restarted one.
+        memory_after = _safe_memory_snapshot(self._provider)
 
         if outcome.timed_out:
             self._set_state("TAINTED")
@@ -467,6 +588,8 @@ class Daemon:
                 "elapsed_s": outcome.elapsed_s,
                 "state": self._read_state(),
                 "run_id": run_id,
+                "memory_before": memory_before,
+                "memory_after": memory_after,
             }
 
         self._set_state("READY")
@@ -479,6 +602,8 @@ class Daemon:
             "elapsed_s": outcome.elapsed_s,
             "state": self._read_state(),
             "run_id": run_id,
+            "memory_before": memory_before,
+            "memory_after": memory_after,
         }
 
     def _maybe_restart(self) -> None:
@@ -507,6 +632,12 @@ class Daemon:
         with self._provider_lock:
             provider_desc = self._provider.describe()
             state = self._state
+            last_activity = self._last_activity_ts
+            exec_count = self._exec_count
+        now = self._clock()
+        since_cold_start = (
+            now - self._started_clock_ts if self._started_clock_ts is not None else None
+        )
         return {
             "state": state,
             "pid": os.getpid(),
@@ -514,26 +645,50 @@ class Daemon:
             "canary_enabled": self._canary_enabled,
             "default_timeout_s": self._default_timeout_s,
             "restart_count": self._restart_count,
+            "exec_count": exec_count,
             "started_at": self._started_at,
+            "since_cold_start_s": since_cold_start,
+            "idle_s": now - last_activity,
+            "idle_ttl_s": self._idle_ttl_s,
             "provider": provider_desc,
         }
 
 
 def _build_provider(args: argparse.Namespace) -> EngineProvider:
     if args.provider == "fake":
-        return FakeEngineProvider()
+        return FakeEngineProvider(num_slots=args.num_slots)
     if args.provider == "laguna":
-        return LagunaEngineProvider(model_path=args.model_path, num_slots=args.num_slots)
+        return LagunaEngineProvider(
+            model_path=args.model_path,
+            num_slots=args.num_slots,
+            blocks_per_slot=args.blocks_per_slot,
+            dtype=args.dtype,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+        )
     raise ValueError(f"unknown provider {args.provider!r}")
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="bfdiag-daemon")
+def _add_provider_args(parser: argparse.ArgumentParser) -> None:
+    """Shared between this module's own ``main()`` and ``cli.py``'s
+    ``bf daemon start`` so the two never drift out of sync on what a
+    Laguna load-time config actually looks like (see provider.py's
+    ``LOAD_TIME_CONFIG_KEYS``)."""
     parser.add_argument("--provider", choices=["fake", "laguna"], default="fake")
     parser.add_argument("--socket", default=None)
     parser.add_argument("--model-path", default=None)
     parser.add_argument("--num-slots", type=int, default=1)
+    parser.add_argument("--blocks-per-slot", type=int, default=4096)
+    parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument("--max-model-len", type=int, default=131072)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
     parser.add_argument("--no-canary", action="store_true")
+    parser.add_argument("--idle-ttl-s", type=float, default=None)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="bfdiag-daemon")
+    _add_provider_args(parser)
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -547,6 +702,7 @@ def main(argv: list[str] | None = None) -> int:
         provider_factory=lambda: _build_provider(args),
         socket_path=socket_path,
         canary_enabled=canary_enabled,
+        idle_ttl_s=args.idle_ttl_s,
     )
     try:
         daemon.serve_forever()

@@ -27,8 +27,14 @@ import pytest
 
 from bfdiag.daemon import cli
 from bfdiag.daemon.client import Client, DaemonNotRunning
-from bfdiag.daemon.provider import FakeEngineProvider
-from bfdiag.daemon.server import AlreadyRunningError, Daemon
+from bfdiag.daemon.provider import (
+    LOAD_TIME_ENV_VARS,
+    FakeEngineProvider,
+    LagunaEngineProvider,
+    requires_cold_restart,
+)
+from bfdiag.daemon.queue import check_sweep_is_hot_safe, submit
+from bfdiag.daemon.server import AlreadyRunningError, Daemon, ManualClock
 
 
 @pytest.fixture
@@ -349,7 +355,12 @@ class TestCliSubprocessLifecycle:
                 socket=str(socket_path),
                 model_path=None,
                 num_slots=1,
+                blocks_per_slot=4096,
+                dtype="bfloat16",
+                max_model_len=131072,
+                gpu_memory_utilization=0.88,
                 no_canary=False,
+                idle_ttl_s=None,
                 wait_s=2.0,
             )
             rc = cli._cmd_daemon_start(args)
@@ -366,3 +377,326 @@ class TestCliSubprocessLifecycle:
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     proc.wait(timeout=5.0)
             shutil.rmtree(socket_dir, ignore_errors=True)
+
+    def test_daemon_start_refuses_reuse_on_load_config_mismatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ):
+        """The one real GPU this machine has must never get silently
+        reconfigured out from under a running daemon: `bf daemon start`
+        with a DIFFERENT load-time config than what's already running must
+        refuse to just "reuse" it."""
+        monkeypatch.setenv("QSR_BFDIAG_DIR", str(tmp_path))
+        socket_dir = Path(tempfile.mkdtemp())
+        socket_path = socket_dir / "d.sock"
+        repo_root = Path(__file__).resolve().parents[1]
+
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "bfdiag.daemon.server",
+                "--provider",
+                "fake",
+                "--socket",
+                str(socket_path),
+                "--num-slots",
+                "1",
+            ],
+            cwd=str(repo_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            client = Client(socket_path=socket_path, timeout_s=5.0)
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not client.is_running():
+                time.sleep(0.1)
+            assert client.is_running()
+
+            args = argparse.Namespace(
+                provider="fake",
+                socket=str(socket_path),
+                model_path=None,
+                num_slots=2,  # DIFFERENT from the running instance's 1
+                blocks_per_slot=4096,
+                dtype="bfloat16",
+                max_model_len=131072,
+                gpu_memory_utilization=0.88,
+                no_canary=False,
+                idle_ttl_s=None,
+                wait_s=2.0,
+            )
+            rc = cli._cmd_daemon_start(args)
+            captured = capsys.readouterr()
+
+            assert rc == 1
+            assert "DIFFERENT load-time config" in captured.err
+            assert "num_slots" in captured.err
+            # The running daemon must be completely unaffected.
+            assert client.status().result["provider"]["load_config"]["num_slots"] == 1
+        finally:
+            with contextlib.suppress(DaemonNotRunning):
+                client.shutdown()
+            if proc.poll() is None:
+                proc.terminate()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5.0)
+            shutil.rmtree(socket_dir, ignore_errors=True)
+
+
+class TestIdleTTL:
+    """Idle-TTL auto-release: the whole point is that a human owns this
+    GPU too. Uses ManualClock throughout so tests fast-forward through a
+    900-second default TTL without 900 real seconds of sleeping."""
+
+    def test_idle_ttl_triggers_auto_shutdown(self, daemon_factory):
+        clock = ManualClock()
+        daemon, client = daemon_factory(clock=clock, idle_ttl_s=10.0, idle_check_interval_s=0.02)
+        assert client.ping().ok is True
+
+        clock.advance(11.0)
+        deadline = time.monotonic() + 2.0
+        while daemon._read_state() != "STOPPED" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert daemon._read_state() == "STOPPED"
+        assert not daemon._socket_path.exists()
+        assert daemon._provider._unload_count == 1
+
+    def test_activity_resets_the_idle_timer(self, daemon_factory):
+        clock = ManualClock()
+        daemon, client = daemon_factory(
+            clock=clock, idle_ttl_s=10.0, idle_check_interval_s=0.02, canary_enabled=False
+        )
+
+        clock.advance(8.0)
+        assert client.exec_code("result = 1").ok is True  # bumps the timer back to "now"
+        time.sleep(0.1)  # let the watchdog poll at least once
+
+        clock.advance(8.0)  # 8s since the exec above -- still under the 10s ttl
+        time.sleep(0.1)
+        assert daemon._read_state() != "STOPPED"
+
+        clock.advance(3.0)  # now 11s since the last activity -- past the ttl
+        deadline = time.monotonic() + 2.0
+        while daemon._read_state() != "STOPPED" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert daemon._read_state() == "STOPPED"
+
+    def test_ping_and_status_do_not_reset_the_idle_timer(self, daemon_factory):
+        clock = ManualClock()
+        daemon, client = daemon_factory(clock=clock, idle_ttl_s=5.0, idle_check_interval_s=0.02)
+
+        clock.advance(4.0)
+        for _ in range(5):  # a polling script hammering ping/status ...
+            assert client.ping().ok is True
+            assert client.status().ok is True
+        clock.advance(2.0)  # ... must not have kept the daemon alive past its ttl
+
+        deadline = time.monotonic() + 2.0
+        while daemon._read_state() != "STOPPED" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert daemon._read_state() == "STOPPED"
+
+    def test_idle_ttl_zero_disables_auto_shutdown(self, daemon_factory):
+        clock = ManualClock()
+        daemon, client = daemon_factory(clock=clock, idle_ttl_s=0.0, idle_check_interval_s=0.02)
+        assert daemon._idle_watchdog_thread is None
+
+        clock.advance(10_000_000.0)
+        time.sleep(0.1)
+        assert client.ping().ok is True
+        assert daemon._read_state() != "STOPPED"
+
+    def test_idle_check_never_fires_mid_job_and_resets_on_completion(self, daemon_factory):
+        clock = ManualClock()
+        daemon, client = daemon_factory(
+            clock=clock, idle_ttl_s=5.0, idle_check_interval_s=0.02, canary_enabled=False
+        )
+        # The clock already reads "expired" relative to the ttl BEFORE any
+        # job starts -- if the BUSY guard didn't work, the watchdog would
+        # shut the daemon down out from under the running experiment.
+        clock.advance(10.0)
+
+        done = threading.Event()
+
+        def _submit_slow() -> None:
+            client.exec_code("import time\ntime.sleep(0.3)", timeout_s=5.0)
+            done.set()
+
+        thread = threading.Thread(target=_submit_slow)
+        thread.start()
+        time.sleep(0.1)  # let it actually become BUSY
+        assert daemon._read_state() == "BUSY"
+        time.sleep(0.15)  # several watchdog polls while still BUSY
+        assert daemon._read_state() == "BUSY"  # never yanked mid-job
+        assert client.socket_path.exists()
+
+        thread.join(timeout=5.0)
+        assert done.is_set()
+        # Completion resets the idle clock to "now" -- immediately after,
+        # the daemon must still be alive (idle_s ~= 0), not stopped.
+        assert daemon._read_state() != "STOPPED"
+
+        clock.advance(6.0)  # now genuinely idle past the ttl
+        deadline = time.monotonic() + 2.0
+        while daemon._read_state() != "STOPPED" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert daemon._read_state() == "STOPPED"
+
+    def test_status_exposes_idle_and_cold_start_fields(self, daemon_factory):
+        clock = ManualClock()
+        _daemon, client = daemon_factory(clock=clock, idle_ttl_s=100.0, idle_check_interval_s=1.0)
+
+        status = client.status().result
+        assert status["idle_ttl_s"] == 100.0
+        assert status["idle_s"] == pytest.approx(0.0, abs=0.01)
+        assert status["since_cold_start_s"] == pytest.approx(0.0, abs=0.01)
+        assert status["exec_count"] == 0
+
+        clock.advance(5.0)
+        status = client.status().result
+        assert status["idle_s"] == pytest.approx(5.0, abs=0.01)
+        assert status["since_cold_start_s"] == pytest.approx(5.0, abs=0.01)
+
+    def test_exec_count_increments_only_on_actual_execution(self, daemon_factory):
+        clock = ManualClock()
+        daemon, client = daemon_factory(clock=clock, idle_ttl_s=100.0, canary_enabled=False)
+        client.exec_code("result = 1")
+        client.exec_code("result = 2")
+        assert daemon.status()["exec_count"] == 2
+        # ping/status/reset must never count as an "experiment executed".
+        client.ping()
+        client.status()
+        client.reset()
+        assert daemon.status()["exec_count"] == 2
+
+
+class TestMemorySnapshots:
+    def test_exec_response_includes_memory_snapshots(self, daemon_factory):
+        _daemon, client = daemon_factory()
+        response = client.exec_code("result = 1")
+        assert response.memory_before == {
+            "kind": "fake",
+            "allocated_bytes": None,
+            "reserved_bytes": None,
+            "num_alloc_retries": None,
+            "fragmentation_ratio": None,
+        }
+        assert response.memory_after == response.memory_before
+
+    def test_non_exec_ops_carry_no_memory_snapshot(self, daemon_factory):
+        _daemon, client = daemon_factory()
+        assert client.ping().memory_before is None
+        assert client.status().memory_before is None
+        assert client.reset().memory_before is None
+
+
+class TestHotColdBoundary:
+    """The other half of protecting the one shared GPU: some config is
+    fixed the instant the engine is constructed, and pretending otherwise
+    (silently sweeping it through an already-loaded hot daemon) produces
+    measurements that look real but never actually changed anything."""
+
+    def test_requires_cold_restart_detects_a_changed_key(self):
+        current = {"num_slots": 1, "dtype": "bfloat16"}
+        requested = {"num_slots": 4, "dtype": "bfloat16"}
+        assert requires_cold_restart(current, requested) == ["num_slots"]
+
+    def test_requires_cold_restart_no_diff_is_empty(self):
+        cfg = {"num_slots": 1, "dtype": "bfloat16"}
+        assert requires_cold_restart(cfg, dict(cfg)) == []
+
+    def test_requires_cold_restart_ignores_unlocked_keys(self):
+        current = {"num_slots": 1, "some_unlocked_thing": "a"}
+        requested = {"num_slots": 1, "some_unlocked_thing": "b"}
+        assert requires_cold_restart(current, requested) == []
+
+    def test_requires_cold_restart_missing_on_one_side_counts_as_changed(self):
+        current = {"num_slots": 1}
+        requested = {"num_slots": 1, "dtype": "bfloat16"}
+        assert requires_cold_restart(current, requested) == ["dtype"]
+
+    def test_requires_cold_restart_both_missing_is_not_changed(self):
+        assert requires_cold_restart({}, {}) == []
+
+    def test_requires_cold_restart_custom_locked_keys(self):
+        current = {"a": 1, "b": 2}
+        requested = {"a": 1, "b": 99}
+        assert requires_cold_restart(current, requested, locked_keys=frozenset({"a"})) == []
+        assert requires_cold_restart(current, requested, locked_keys=frozenset({"b"})) == ["b"]
+
+    def test_load_time_env_vars_are_the_audited_set(self):
+        # Documents the exact, code-verified list (see provider.py's
+        # comment citing runtime/backends/laguna*.py line numbers) --
+        # changing this set should be a deliberate, reviewed edit.
+        assert LOAD_TIME_ENV_VARS == {
+            "QSR_PREFILL_CHUNK",
+            "QSR_DECODE_CUDA_GRAPH",
+            "QSR_DFLASH_CUDA_GRAPH",
+            "QSR_VERIFY_CUDA_GRAPH",
+        }
+
+    def test_fake_provider_describe_exposes_load_config(self):
+        provider = FakeEngineProvider(num_slots=3)
+        assert provider.describe()["load_config"] == {"num_slots": 3}
+
+    def test_laguna_provider_describe_exposes_load_config_without_gpu(self):
+        # Constructing LagunaEngineProvider only sets plain-Python
+        # attributes (all torch/runtime imports are deferred into method
+        # bodies) -- __init__ + describe() is safe with zero GPU/torch.
+        provider = LagunaEngineProvider(
+            num_slots=2,
+            blocks_per_slot=2048,
+            dtype="float16",
+            max_model_len=8192,
+            gpu_memory_utilization=0.5,
+        )
+        load_config = provider.describe()["load_config"]
+        assert load_config == {
+            "model_path": provider.describe()["model_path"],
+            "num_slots": 2,
+            "blocks_per_slot": 2048,
+            "dtype": "float16",
+            "max_model_len": 8192,
+            "gpu_memory_utilization": 0.5,
+            "dflash_model_path": None,
+        }
+
+    def test_check_sweep_is_hot_safe_allows_ordinary_sweeps(self):
+        check_sweep_is_hot_safe(["QSR_ASSERT_LEVEL=0,2"])  # must not raise
+
+    def test_check_sweep_is_hot_safe_rejects_load_time_env_var(self):
+        with pytest.raises(ValueError, match="load-time-locked"):
+            check_sweep_is_hot_safe(["QSR_DFLASH_CUDA_GRAPH=0,1"])
+
+    def test_submit_refuses_load_time_sweep_before_touching_the_client(self, tmp_path: Path):
+        script = tmp_path / "script.py"
+        script.write_text("result = 1\n")
+
+        class _PoisonClient:
+            def exec_code(self, *args, **kwargs):
+                raise AssertionError("submit() must not reach the client for an unsafe sweep")
+
+        with pytest.raises(ValueError, match="load-time-locked"):
+            submit(script, ["QSR_DECODE_CUDA_GRAPH=0,1"], client=_PoisonClient())
+
+    def test_run_cold_runs_one_independent_process_per_sweep_variant(self, tmp_path: Path):
+        results_file = tmp_path / "results.txt"
+        script = tmp_path / "cold_script.py"
+        script.write_text(
+            "import os\n"
+            f"with open({str(results_file)!r}, 'a') as f:\n"
+            "    f.write(os.environ.get('MYVAR', 'MISSING') + chr(10))\n"
+        )
+        args = argparse.Namespace(script=str(script), cold=True, sweep=["MYVAR=a,b,c"])
+        rc = cli._cmd_run(args)
+        assert rc == 0
+        assert results_file.read_text().splitlines() == ["a", "b", "c"]
+
+    def test_run_requires_explicit_cold_flag_at_the_argparse_level(self):
+        parser = argparse.ArgumentParser(prog="bf")
+        subparsers = parser.add_subparsers(dest="command", required=True)
+        cli.register(subparsers)
+        with pytest.raises(SystemExit):
+            parser.parse_args(["run", "script.py"])  # missing --cold

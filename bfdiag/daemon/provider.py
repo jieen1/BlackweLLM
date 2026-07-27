@@ -20,6 +20,16 @@ Two concrete providers:
 
 See ``notes/2026-07-27-bfdiag-warm-daemon.md`` for the full GPU-validation
 TODO list this class needs before it can be trusted in production use.
+
+This module also draws the hot/cold boundary that the rest of bfdiag has
+to respect: ``LOAD_TIME_CONFIG_KEYS`` / ``LOAD_TIME_ENV_VARS`` name the
+configuration that is fixed the moment ``LagunaBackend``/``DFlashEngine``
+are constructed (block/slot layout, dtype, memory budget, and a handful of
+env vars read exactly once inside their ``__init__``), and
+``requires_cold_restart`` is the pure function that turns "does this
+sweep/reconfiguration actually need a fresh process" into a yes/no list of
+keys, instead of a silent, wrong measurement in an engine that never
+actually picked up the change.
 """
 
 from __future__ import annotations
@@ -31,6 +41,67 @@ _DEFAULT_LAGUNA_MODEL_PATH = (
     "~/.cache/huggingface/hub/models--poolside--Laguna-S-2.1-NVFP4/"
     "snapshots/07614121b31898586430f189d27a25a0be310843/"
 )
+
+#: LagunaEngineProvider constructor kwargs that are fixed the instant
+#: LagunaBackend/DFlashEngine are constructed -- changing any of these on a
+#: live daemon requires a fresh process (``bf daemon stop`` + ``start``, or
+#: ``bf run --cold``), never a hot re-``load()``.
+LOAD_TIME_CONFIG_KEYS: frozenset[str] = frozenset(
+    {
+        "model_path",
+        "num_slots",
+        "blocks_per_slot",
+        "dtype",
+        "max_model_len",
+        "gpu_memory_utilization",
+        "dflash_model_path",
+    }
+)
+
+#: Environment variables confirmed (by reading the current runtime/
+#: source, not guessed) to be read exactly once inside
+#: LagunaBackend.__init__/DFlashEngine.__init__ -- runtime/backends/
+#: laguna.py:305 (QSR_PREFILL_CHUNK), :342 (QSR_DECODE_CUDA_GRAPH);
+#: runtime/backends/laguna_dflash.py:168 (QSR_DFLASH_CUDA_GRAPH), :384
+#: (QSR_VERIFY_CUDA_GRAPH). Setting any of these on an already-loaded hot
+#: daemon has NO effect on the running engine -- see queue.py's sweep
+#: guard, which refuses to silently sweep one of these through a hot
+#: daemon and produce measurements that never actually changed anything.
+LOAD_TIME_ENV_VARS: frozenset[str] = frozenset(
+    {
+        "QSR_PREFILL_CHUNK",
+        "QSR_DECODE_CUDA_GRAPH",
+        "QSR_DFLASH_CUDA_GRAPH",
+        "QSR_VERIFY_CUDA_GRAPH",
+    }
+)
+
+_MISSING = object()
+
+
+def requires_cold_restart(
+    current_cfg: dict[str, Any],
+    requested_cfg: dict[str, Any],
+    locked_keys: frozenset[str] | None = None,
+) -> list[str]:
+    """Pure function: which keys in ``locked_keys`` (default
+    ``LOAD_TIME_CONFIG_KEYS``) differ between ``current_cfg`` (e.g. a
+    running daemon's ``describe()["load_config"]``) and ``requested_cfg``
+    (e.g. the config a new ``bf daemon start`` invocation asked for)?
+
+    A non-empty return means "you cannot hot-swap this into the running
+    engine -- it needs a cold restart" (stop the daemon and start a new
+    one, or use ``bf run --cold``). An empty return means every locked key
+    already matches, so reusing the running daemon as-is is safe.
+    """
+    keys = locked_keys if locked_keys is not None else LOAD_TIME_CONFIG_KEYS
+    changed = [
+        key
+        for key in keys
+        if (key in current_cfg or key in requested_cfg)
+        and current_cfg.get(key, _MISSING) != requested_cfg.get(key, _MISSING)
+    ]
+    return sorted(changed)
 
 
 @runtime_checkable
@@ -88,6 +159,23 @@ class EngineProvider(Protocol):
         code, e.g. ``{"engine": ..., "backend": ..., "provider": self}``."""
         ...
 
+    def unload(self) -> None:
+        """Release the loaded engine and its GPU memory. Called by the
+        daemon's idle-TTL watchdog before the process exits, so the GPU is
+        actually handed back rather than merely left idle-but-allocated
+        until whatever eventually kills the process gets around to it."""
+        ...
+
+    def memory_snapshot(self) -> dict[str, Any]:
+        """JSON-safe GPU memory snapshot (allocated/reserved bytes,
+        alloc-retry count, a fragmentation indicator, ...), taken by the
+        daemon immediately before and after every ``exec``. A tok/s number
+        from a long-lived hot daemon is not comparable to another one
+        without this: the caching allocator's layout drifts as more
+        experiments run -- see notes/2026-07-27-bfdiag-warm-daemon.md's
+        memory-visibility section."""
+        ...
+
 
 class FakeEngineProvider:
     """Deterministic, pure-Python, CPU-only fake engine.
@@ -107,11 +195,13 @@ class FakeEngineProvider:
         self,
         *,
         model_revision: str = "fake-v1",
+        num_slots: int = 1,
         load_delay_s: float = 0.0,
         fail_health_after: int | None = None,
         crash_on_reset: bool = False,
     ) -> None:
         self._model_revision = model_revision
+        self._num_slots = num_slots
         self._load_delay_s = load_delay_s
         self._fail_health_after = fail_health_after
         self._crash_on_reset = crash_on_reset
@@ -119,6 +209,7 @@ class FakeEngineProvider:
         self._dirty = 0
         self._call_count = 0
         self._load_count = 0
+        self._unload_count = 0
 
     def load(self) -> None:
         if self._load_delay_s:
@@ -132,6 +223,10 @@ class FakeEngineProvider:
             raise RuntimeError("FakeEngineProvider: simulated crash during reset()")
         self._dirty = 0
 
+    def unload(self) -> None:
+        self._loaded = False
+        self._unload_count += 1
+
     def describe(self) -> dict[str, Any]:
         return {
             "kind": "fake",
@@ -139,7 +234,23 @@ class FakeEngineProvider:
             "model_revision": self._model_revision,
             "calls": self._call_count,
             "load_count": self._load_count,
+            "unload_count": self._unload_count,
             "dirty": self._dirty,
+            # Nothing about the fake provider is actually load-time locked
+            # (there is no real engine underneath it), but num_slots is
+            # exposed here so hot/cold-boundary tests
+            # (requires_cold_restart, the daemon-reuse config check) have
+            # something real to compare without needing torch/GPU.
+            "load_config": {"num_slots": self._num_slots},
+        }
+
+    def memory_snapshot(self) -> dict[str, Any]:
+        return {
+            "kind": "fake",
+            "allocated_bytes": None,
+            "reserved_bytes": None,
+            "num_alloc_retries": None,
+            "fragmentation_ratio": None,
         }
 
     def is_healthy(self) -> bool:
@@ -267,10 +378,59 @@ class LagunaEngineProvider:
             "model_revision": _extract_revision(self._model_path),
             "num_slots": self._num_slots,
             "blocks_per_slot": self._blocks_per_slot,
+            # See LOAD_TIME_CONFIG_KEYS: every key here is fixed at
+            # construction time -- ``requires_cold_restart(this, requested)``
+            # is how ``bf daemon start``'s reuse-detection tells "identical
+            # config, safe to keep using this daemon" from "you're asking
+            # for a different engine, stop this one first".
+            "load_config": {
+                "model_path": self._model_path,
+                "num_slots": self._num_slots,
+                "blocks_per_slot": self._blocks_per_slot,
+                "dtype": self._dtype,
+                "max_model_len": self._max_model_len,
+                "gpu_memory_utilization": self._gpu_memory_utilization,
+                "dflash_model_path": self._dflash_model_path,
+            },
         }
 
     def is_healthy(self) -> bool:
         return self._backend is not None and self._engine is not None
+
+    def unload(self) -> None:
+        """Drop the loaded engine/backend/tokenizer and release GPU
+        memory. NEVER RUN -- see class docstring. Called by the daemon's
+        idle-TTL watchdog right before the process exits; the whole point
+        is that the GPU is actually freed at that moment rather than only
+        whenever the OS eventually reclaims a dead process's memory."""
+        import gc
+
+        import torch
+
+        self._engine = None
+        self._backend = None
+        self._tokenizer = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def memory_snapshot(self) -> dict[str, Any]:
+        """``torch.cuda.memory_stats()``-derived snapshot. NEVER RUN -- see
+        class docstring; read together with any tok/s number this daemon
+        produces, per notes/2026-07-27-bfdiag-warm-daemon.md."""
+        import torch
+
+        stats = torch.cuda.memory_stats()
+        allocated = stats.get("allocated_bytes.all.current", 0)
+        reserved = stats.get("reserved_bytes.all.current", 0)
+        num_alloc_retries = stats.get("num_alloc_retries", 0)
+        fragmentation_ratio = (reserved - allocated) / reserved if reserved else 0.0
+        return {
+            "kind": "laguna",
+            "allocated_bytes": allocated,
+            "reserved_bytes": reserved,
+            "num_alloc_retries": num_alloc_retries,
+            "fragmentation_ratio": fragmentation_ratio,
+        }
 
     def generate(
         self,
@@ -336,7 +496,7 @@ def _extract_revision(model_path: str) -> str:
 
 
 if __name__ == "__main__":
-    fake = FakeEngineProvider()
+    fake = FakeEngineProvider(num_slots=2)
     fake.load()
     baseline = fake.generate([1, 2, 3], 8)
     print("baseline:", baseline)
@@ -344,3 +504,14 @@ if __name__ == "__main__":
     print("polluted:", fake.generate([1, 2, 3], 8))
     fake.reset()
     print("post-reset matches baseline:", fake.generate([1, 2, 3], 8) == baseline)
+    print("memory_snapshot:", fake.memory_snapshot())
+
+    current = fake.describe()["load_config"]
+    print("requires_cold_restart (same cfg):", requires_cold_restart(current, current))
+    print(
+        "requires_cold_restart (num_slots 2 -> 4):",
+        requires_cold_restart(current, {"num_slots": 4}),
+    )
+
+    fake.unload()
+    print("unloaded, is_healthy:", fake.is_healthy())

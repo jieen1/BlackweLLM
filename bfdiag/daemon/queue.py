@@ -18,6 +18,15 @@ bfdiag subsystems' run recorders can key off ``QSR_BFDIAG_RUN_ID`` the same
 way a single ``bf exec`` call would. To avoid clobbering another agent's
 run-record schema in the same directory, this module only ever writes
 files prefixed ``queue_*`` there.
+
+**Hot/cold boundary (hard requirement)**: some env vars are read exactly
+once when the Laguna backend/DFlash engine are constructed (see
+``provider.LOAD_TIME_ENV_VARS``) -- sweeping one of those through an
+already-loaded hot daemon changes nothing in the running engine and would
+silently produce N identical, meaningless "variants". ``submit()`` refuses
+outright (raises ``ValueError``) rather than doing that; use
+``bf run --cold --sweep ...`` (``cli.py``/``_cmd_run``) instead, which
+starts one independent process per variant.
 """
 
 from __future__ import annotations
@@ -30,6 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from bfdiag.daemon.client import Client
+from bfdiag.daemon.provider import LOAD_TIME_ENV_VARS
 from bfdiag.daemon.server import bfdiag_dir
 
 
@@ -60,6 +70,25 @@ def expand_sweeps(specs: list[str]) -> list[dict[str, str]]:
         names.append(name)
         value_lists.append(values)
     return [dict(zip(names, combo, strict=True)) for combo in itertools.product(*value_lists)]
+
+
+def check_sweep_is_hot_safe(specs: list[str]) -> None:
+    """Refuse (``ValueError``) any ``--sweep`` spec whose variable name is
+    one of ``provider.LOAD_TIME_ENV_VARS`` -- see module docstring. This
+    is a hard requirement: producing N identical "variants" because the
+    swept variable was actually locked in at engine-construction time is
+    strictly worse than erroring, because it looks like real data.
+    """
+    swept_names = (parse_sweep(spec)[0] for spec in specs)
+    locked = sorted(name for name in swept_names if name in LOAD_TIME_ENV_VARS)
+    if locked:
+        raise ValueError(
+            f"--sweep touches load-time-locked variable(s) {locked}: these are read once "
+            "when the engine is constructed, so sweeping them through an already-loaded "
+            "hot daemon would silently produce identical, meaningless variants. Use "
+            "`bf run --cold --sweep ...` instead, which starts one independent process "
+            "per variant."
+        )
 
 
 def make_run_id(prefix: str = "run") -> str:
@@ -109,7 +138,12 @@ def submit(
     ``--sweep`` specs (or once, with no overlay, if ``sweeps`` is falsy),
     FIFO through the warm daemon. Each variant's request/response is
     recorded under ``.bfdiag/runs/<run_id>/queue_{request,response}.json``.
+
+    Raises ``ValueError`` immediately (before running anything) if any
+    ``--sweep`` targets a load-time-locked env var -- see
+    ``check_sweep_is_hot_safe``.
     """
+    check_sweep_is_hot_safe(sweeps or [])
     path = Path(script_path).resolve()
     if not path.is_file():
         raise FileNotFoundError(script_path)
