@@ -70,3 +70,83 @@ def compare_values(
         cosine_similarity=cosine,
         top_k_agreement=len(expected_top & actual_top) / k,
     )
+
+
+# ---------------------------------------------------------------------------
+# Additive extensions for bfdiag's divergence scanner (bfdiag/divergence/).
+# These do not change any behavior or signature above; they reuse the same
+# private helpers (``_as_values``, ``_top_indices``) to add composite
+# top-1/top-5 rank agreement and a depth-independent relative-error scale,
+# both needed by bfdiag.divergence.scan.scan_layers.
+# ---------------------------------------------------------------------------
+
+
+def top_k_agreements(
+    reference: Iterable[float] | Any,
+    candidate: Iterable[float] | Any,
+    *,
+    ks: tuple[int, ...] = (1, 5, 10),
+) -> dict[int, float]:
+    """Rank agreement at several ``k`` values in a single pass over the data.
+
+    Equivalent to calling ``compare_values(...).top_k_agreement`` once per
+    ``k``, but only sorts each side once per requested ``k`` instead of once
+    per ``compare_values`` call.
+    """
+    expected = _as_values(reference)
+    actual = _as_values(candidate)
+    if not expected:
+        raise ValueError("cannot compare an empty activation")
+    if len(expected) != len(actual):
+        raise ValueError("reference and candidate sizes differ")
+    agreements: dict[int, float] = {}
+    for k in ks:
+        bounded_k = min(k, len(expected))
+        expected_top = set(_top_indices(expected, bounded_k))
+        actual_top = set(_top_indices(actual, bounded_k))
+        agreements[k] = len(expected_top & actual_top) / bounded_k
+    return agreements
+
+
+def activation_rms(values: Iterable[float] | Any) -> float:
+    """Root-mean-square magnitude of a captured activation.
+
+    Used to turn an absolute ``max_abs_error`` into a depth-independent
+    relative error: hidden-state magnitude grows with decoder depth (residual
+    stream accumulation), so a fixed absolute-error bar would misfire at
+    shallow layers and go blind at deep ones.
+    """
+    data = _as_values(values)
+    if not data:
+        raise ValueError("cannot measure an empty activation")
+    return sqrt(fsum(value * value for value in data) / len(data))
+
+
+@dataclass(frozen=True)
+class LayerComparison:
+    """``ComparisonResult`` plus fixed top-1/top-5 rank agreement.
+
+    This is the composite shape ``bfdiag.divergence.scan`` needs for its
+    pass/fail judgement (cosine + relative error + top-1 + top-5), built
+    entirely out of this module's existing primitives.
+    """
+
+    comparison: ComparisonResult
+    top1_agreement: float
+    top5_agreement: float
+
+
+def compare_activation(
+    reference: Iterable[float] | Any,
+    candidate: Iterable[float] | Any,
+    *,
+    top_k: int = 10,
+) -> LayerComparison:
+    """``compare_values`` plus fixed top-1/top-5 rank agreement."""
+    comparison = compare_values(reference, candidate, top_k=top_k)
+    agreements = top_k_agreements(reference, candidate, ks=(1, 5))
+    return LayerComparison(
+        comparison=comparison,
+        top1_agreement=agreements[1],
+        top5_agreement=agreements[5],
+    )
