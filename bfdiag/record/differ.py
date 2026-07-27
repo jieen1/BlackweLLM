@@ -31,6 +31,13 @@ DEFAULT_COMPARABLE_FIELDS: tuple[str, ...] = (
     "fingerprint.workload.greedy",
     "fingerprint.workload.block_size",
     "fingerprint.workload.max_model_len",
+    # QSR_FORCE_SYNC (see bfdiag/determinism.py) breaks DFlash's async
+    # pipeline on purpose -- any perf metric is meaningless if only one side
+    # of a comparison had it on. Nested under `extra` (not a first-class
+    # `fingerprint.determinism.*` path) because the determinism report is
+    # carried in `Fingerprint.extra["determinism"]`, not a dedicated schema
+    # field -- see bfdiag/record/fingerprint.py's capture_determinism().
+    "fingerprint.extra.determinism.force_sync",
 )
 
 _FINGERPRINT_PREFIX = "fingerprint."

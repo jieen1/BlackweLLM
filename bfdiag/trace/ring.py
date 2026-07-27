@@ -12,6 +12,15 @@ full rationale):
   field is a scalar write into a preallocated ``array.array`` column (int64
   via ``'q'``, int8 via ``'b'``). Dicts/strings/JSON only get built in
   ``snapshot()``, which is dump-time only.
+  The one deliberate exception is ``QSR_FORCE_SYNC`` (see
+  ``bfdiag/determinism.py``): when that debug-only switch is on,
+  ``begin_round``/``mark`` (and therefore ``finish_round``/
+  ``finish_dflash_round``, which call ``mark`` internally) each do one
+  ``torch.cuda.synchronize()`` -- an intentional, opt-in, default-off
+  reintroduction of exactly the GPU sync this module otherwise avoids, for
+  debugging only. Off by default, it costs the same single boolean check as
+  the ``TRACE_ENABLED`` guard below; on, it is loud about the tradeoff (see
+  that module).
 - No numpy: this repo's own dev environment doesn't install numpy (it's
   gated behind the ``cuda`` extra, see pyproject.toml), and
   ``runtime/block_pool.py`` already sets the precedent of using stdlib
@@ -52,6 +61,7 @@ from array import array
 from pathlib import Path
 from typing import Any
 
+import bfdiag.determinism as determinism
 from bfdiag.trace import events
 from bfdiag.trace.timing import Timeline
 
@@ -113,6 +123,12 @@ class RoundRing:
     # -- hot path -----------------------------------------------------------
 
     def begin_round(self, slot: int, kv_len_before: int) -> int:
+        # QSR_FORCE_SYNC (see bfdiag/determinism.py): sync *before* stamping
+        # this round's start time, so the previous round's async GPU work
+        # (and any pending error from it) is fully resolved before this
+        # round's clock starts -- default-off, single boolean check.
+        if determinism.FORCE_SYNC:
+            determinism.maybe_sync()
         row = self._cursor
         self._cursor += 1
         if self._cursor == self.capacity:
@@ -131,6 +147,14 @@ class RoundRing:
         count = self._mark_count[row]
         if count >= events.MAX_MARKS_PER_ROUND:
             return
+        # QSR_FORCE_SYNC: sync *before* capturing this mark's timestamp, so
+        # (a) the timestamp only lands once every kernel up to this phase
+        # boundary has actually finished, and (b) any pending async CUDA
+        # error from those kernels raises right here instead of at some
+        # later, unrelated synchronizing call. Default-off (single boolean
+        # check); auto-degrades to a no-op with no CUDA (see maybe_sync()).
+        if determinism.FORCE_SYNC:
+            determinism.maybe_sync()
         self._timer.mark(row, count)
         self._phase_codes[row * events.MAX_MARKS_PER_ROUND + count] = phase
         self._mark_count[row] = count + 1
@@ -148,7 +172,7 @@ class RoundRing:
         bonus_token: int,
         mem_allocated: int = 0,
     ) -> None:
-        self.mark(row, phase)
+        self.mark(row, phase)  # inherits the QSR_FORCE_SYNC check above
         self._cols["path"][row] = int(path)
         self._cols["cg_miss_reason"][row] = int(cg_miss_reason)
         self._cols["draft_tokens_n"][row] = draft_tokens_n
@@ -251,7 +275,11 @@ def finish_dflash_round(
     site: translates the real ``_verify_only_accept_reject`` decision dict
     (``num_accepted``/``rejected_at``) into ring-buffer fields, so the
     integration hook in ``runtime/backends/laguna_dflash.py`` stays a single
-    call instead of duplicating this translation inline."""
+    call instead of duplicating this translation inline.
+
+    Also inherits the ``QSR_FORCE_SYNC`` check (see ``RoundRing.mark``): this
+    calls ``finish_round``, which calls ``self.mark(row, phase)`` as its
+    first action -- no separate sync call is needed here."""
     if verify_cg_hit:
         path = events.Path.CG_REPLAY
         reason = events.CgMissReason.NONE

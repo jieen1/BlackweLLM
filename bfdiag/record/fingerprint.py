@@ -24,6 +24,7 @@ from importlib import metadata as _importlib_metadata
 from pathlib import Path
 from typing import Any
 
+from bfdiag import determinism as _determinism
 from bfdiag.record.schema import (
     Fingerprint,
     GitRepoInfo,
@@ -176,6 +177,28 @@ def _pkg_version(dist_name: str) -> str | None:
         return None
 
 
+def capture_determinism() -> dict[str, Any]:
+    """Read-only snapshot of ``QSR_FORCE_SYNC``/``QSR_DETERMINISTIC`` mode --
+    "what mode was this run actually in", for the fingerprint. Never raises
+    (same defensive contract as every other ``capture_*`` here) and never
+    mutates process state: uses ``determinism.apply(mutate=False)``, so
+    taking a fingerprint never itself reseeds RNGs or flips torch's
+    deterministic-algorithms flag as a side effect.
+
+    Nested under ``Fingerprint.extra["determinism"]`` rather than a new
+    top-level ``Fingerprint`` field, specifically to avoid touching
+    ``bfdiag/record/schema.py`` (out of scope for this change) -- see
+    ``notes/2026-07-27-bfdiag-determinism-and-sync.md``. This is also why
+    ``bfdiag.record.differ.DEFAULT_COMPARABLE_FIELDS`` references it as
+    ``fingerprint.extra.determinism.force_sync`` rather than
+    ``fingerprint.determinism.force_sync``.
+    """
+    try:
+        return _determinism.apply(mutate=False).to_dict()
+    except Exception:  # noqa: BLE001 - a fingerprint capture must never raise
+        return {}
+
+
 def capture_python() -> PythonInfo:
     return PythonInfo(
         version=sys.version.split()[0],
@@ -223,6 +246,11 @@ def capture(
         merged_extra["model_extra"] = model_extra
     if workload_extra:
         merged_extra["workload_extra"] = workload_extra
+    # Always recorded (not just when QSR_DETERMINISTIC/QSR_FORCE_SYNC are on)
+    # so `bf diff` can catch "these two runs differ in determinism mode"
+    # regardless of which side turned anything on. Computed last so it wins
+    # over an (unlikely) caller-supplied "determinism" key in `extra`.
+    merged_extra["determinism"] = capture_determinism()
 
     return Fingerprint(
         git=capture_git(repo_paths),

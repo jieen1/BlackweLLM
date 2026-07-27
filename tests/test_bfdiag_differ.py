@@ -162,6 +162,11 @@ def test_default_comparable_fields_cover_the_documented_set() -> None:
         "workload.greedy",
         "workload.block_size",
         "workload.max_model_len",
+        # Added by the bfdiag determinism/force-sync work (2026-07-27): see
+        # bfdiag/determinism.py + bfdiag/record/fingerprint.py's
+        # capture_determinism(). QSR_FORCE_SYNC breaks the async pipeline on
+        # purpose, so it must gate comparability like every other field here.
+        "extra.determinism.force_sync",
     }
     leaves = {p[len("fingerprint.") :] for p in DEFAULT_COMPARABLE_FIELDS}
     assert leaves == expected_leaves
