@@ -162,6 +162,12 @@ def test_default_comparable_fields_cover_the_documented_set() -> None:
         "workload.greedy",
         "workload.block_size",
         "workload.max_model_len",
+        # Added 2026-07-27 after a real incident: a warm daemon defaulting to
+        # blocks_per_slot=4096 was compared against a cold-start script
+        # deriving 130, acceptance 0.6754 vs 0.452525, and `bf diff` called
+        # them comparable because neither field was listed here.
+        "workload.blocks_per_slot",
+        "workload.capacity",
         # Added by the bfdiag determinism/force-sync work (2026-07-27): see
         # bfdiag/determinism.py + bfdiag/record/fingerprint.py's
         # capture_determinism(). QSR_FORCE_SYNC breaks the async pipeline on
@@ -170,6 +176,35 @@ def test_default_comparable_fields_cover_the_documented_set() -> None:
     }
     leaves = {p[len("fingerprint.") :] for p in DEFAULT_COMPARABLE_FIELDS}
     assert leaves == expected_leaves
+
+
+def test_differ_flags_the_warm_daemon_blocks_per_slot_incident() -> None:
+    """The second real incident this tool exists to prevent.
+
+    A warm daemon ran with ``blocks_per_slot=4096`` (its own silent
+    default) while the cold-start script derived 130 from the context
+    length. Everything else -- prompt, block_size, K, greedy -- matched, so
+    the two acceptance rates (0.6754 vs 0.452525) looked directly
+    comparable, and the 0.22 gap looked like the block_size=64->128
+    regression under investigation. ``blocks_per_slot`` sets sparkinfer's
+    decode-workspace ``max_pages``, so it moves float reduction order and
+    therefore acceptance; it must gate comparability.
+    """
+    same_prompt = "7e3a" * 8
+    warm = _record(
+        "warmdaemon1", prompt_hash=same_prompt, acceptance_rate=0.6754, blocks_per_slot=4096
+    )
+    cold = _record(
+        "coldstart01", prompt_hash=same_prompt, acceptance_rate=0.452525, blocks_per_slot=130
+    )
+
+    result = diff_records(warm, cold)
+
+    assert result.comparable is False
+    assert [b.path for b in result.comparability_breaks] == [
+        "fingerprint.workload.blocks_per_slot"
+    ]
+    assert "NOT COMPARABLE" in format_text(result)
 
 
 # --- config diff -----------------------------------------------------------

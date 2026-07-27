@@ -31,6 +31,15 @@ DEFAULT_COMPARABLE_FIELDS: tuple[str, ...] = (
     "fingerprint.workload.greedy",
     "fingerprint.workload.block_size",
     "fingerprint.workload.max_model_len",
+    # blocks_per_slot sets the sparkinfer decode workspace's max_pages, so it
+    # can shift kernel tiling and float reduction order -- i.e. it moves
+    # acceptance rate, not just memory. capacity (concurrent slots) changes
+    # batching and the CUDA-Graph eligibility branch. Both were missing here
+    # on 2026-07-27, which is why `bf diff` did NOT flag a warm-daemon run
+    # (blocks_per_slot=4096) against a cold-start run (blocks_per_slot=130)
+    # whose acceptance rates differed by 0.22.
+    "fingerprint.workload.blocks_per_slot",
+    "fingerprint.workload.capacity",
     # QSR_FORCE_SYNC (see bfdiag/determinism.py) breaks DFlash's async
     # pipeline on purpose -- any perf metric is meaningless if only one side
     # of a comparison had it on. Nested under `extra` (not a first-class

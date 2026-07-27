@@ -72,6 +72,15 @@ class WorkloadInfo:
     block_size: int | None = None
     capacity: int | None = None
     max_model_len: int | None = None
+    # Blocks reserved per slot. NOT a capacity knob: it sets the
+    # sparkinfer decode workspace's ``max_pages`` for full-attention
+    # groups (``runtime/backends/laguna_cuda_graph.py``), which can change
+    # kernel tiling and hence float reduction order. On 2026-07-27 a warm
+    # daemon defaulting to 4096 was compared against a cold-start script
+    # deriving 130, and the acceptance rates (0.6754 vs 0.452525) were
+    # treated as comparable. Recorded separately from ``capacity``
+    # (concurrent slots) because they mean different things.
+    blocks_per_slot: int | None = None
 
 
 def _dataclass_field_names(dc_type: type) -> set[str]:
