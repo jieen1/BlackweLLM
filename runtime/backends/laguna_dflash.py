@@ -1199,10 +1199,14 @@ class DFlashEngine:
         bonus_token = first_token
         kv_len = backend.slot_kv_len[slot]  # = prompt_len
 
+        _force_sync = os.environ.get("QSR_DEBUG_FORCE_SYNC") == "1"
+
         if self._draft_cg is not None:
             draft_tokens = self._draft_cg.replay(slot, bonus_token, kv_len)
         else:
             draft_tokens = self._draft_forward(slot, bonus_token, kv_len)
+        if _force_sync:
+            torch.cuda.synchronize()
 
         if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
             logger.warning(
@@ -1230,9 +1234,34 @@ class DFlashEngine:
                 verify_logits, verify_aux = self._forward_verify_with_aux(
                     slot, verify_tokens, kv_len, len(verify_tokens)
                 )
+            if _force_sync:
+                torch.cuda.synchronize()
 
             # Step 2: Accept/reject (single GPU→CPU sync for all 16 argmax)
             all_argmax = verify_logits[:NUM_QUERY_PER_REQ].argmax(dim=-1).tolist()
+            if _force_sync:
+                torch.cuda.synchronize()
+
+            verify_dump_path = os.environ.get("QSR_DEBUG_VERIFY_LOGITS_FILE")
+            if verify_dump_path:
+                vl = verify_logits[:NUM_QUERY_PER_REQ].float()
+                vtop2 = vl.topk(2, dim=-1)
+                vpositions = []
+                for j in range(vl.shape[0]):
+                    vpositions.append({
+                        "top1_tok": int(vtop2.indices[j, 0]),
+                        "top1_val": round(float(vtop2.values[j, 0]), 6),
+                        "top2_tok": int(vtop2.indices[j, 1]),
+                        "top2_val": round(float(vtop2.values[j, 1]), 6),
+                    })
+                import json as _json
+                with open(verify_dump_path, "a") as _f:
+                    _f.write(_json.dumps({
+                        "bs": self.block_size, "kv_len": kv_len,
+                        "bonus_token": bonus_token, "draft_tokens": draft_tokens,
+                        "positions": vpositions,
+                    }) + "\n")
+
             decision = _verify_only_accept_reject(all_argmax, draft_tokens, bonus_token)
             num_accepted = decision["num_accepted"]
             new_tokens = decision["committed"]
@@ -1272,6 +1301,8 @@ class DFlashEngine:
                 self.draft_model.precompute_and_store_context_kv(
                     combined, context_positions, slot_mappings
                 )
+            if _force_sync:
+                torch.cuda.synchronize()
 
             # Step 5: Update state
             backend.slot_kv_len[slot] += context_count
@@ -1297,6 +1328,8 @@ class DFlashEngine:
                 draft_tokens = self._draft_cg.replay(slot, bonus_token, new_kv_len)
             else:
                 draft_tokens = self._draft_forward(slot, bonus_token, new_kv_len)
+            if _force_sync:
+                torch.cuda.synchronize()
 
         t_total = time.perf_counter()
         # Prefix cache: preserve slot KV for next turn

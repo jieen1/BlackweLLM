@@ -26,6 +26,21 @@ from runtime.backends.laguna import LagunaBackend, _physical_slot
 
 logger = logging.getLogger("qwen_sm120_runtime.dflash_cudagraph")
 
+from runtime.backends.laguna_cuda_graph import _debug_swa_align_gran
+
+# TEMP diagnostic accumulator for QSR_DEBUG_LOGITS_LIGHT=1 (see
+# DFlashDraftCudaGraph.replay()). Module-level so a driver script can dump
+# it after generation without threading a handle through the engine.
+_LIGHT_LOG: list[tuple[int, int, int, list[int]]] = []
+
+
+def dump_light_log(path: str) -> None:
+    import json
+    with open(path, "w") as f:
+        for bs, kv_len, bonus_token, draft_tokens in _LIGHT_LOG:
+            f.write(json.dumps({"bs": bs, "kv_len": kv_len, "bonus_token": bonus_token,
+                                 "draft_tokens": draft_tokens}) + "\n")
+
 
 class DFlashVerifyCudaGraph:
     """CUDA Graph for main model verify forward (M=16).
@@ -461,7 +476,8 @@ class DFlashDraftCudaGraph:
         )
 
         window_start = max(0, kv_len - DRAFT_WINDOW + 1)
-        aligned_start = (window_start // bs) * bs
+        align_gran = _debug_swa_align_gran() or bs
+        aligned_start = (window_start // align_gran) * align_gran
         aligned_len = new_kv_len - aligned_start
         n_ring = min((aligned_len + bs - 1) // bs, self._draft_blocks_per_slot)
 
@@ -579,6 +595,35 @@ class DFlashDraftCudaGraph:
         if self._graph is None:
             return []
 
+        import os as _os
+        dump_kv_len = _os.environ.get("QSR_DEBUG_RING_DUMP_KV_LEN")
+        # >= (not ==) and a one-shot latch: round-boundary kv_len values are
+        # accept-count-dependent and may not land on an exact requested
+        # value, so dump at the first replay whose kv_len reaches the
+        # threshold instead of requiring an exact hit.
+        if (
+            dump_kv_len is not None
+            and kv_len >= int(dump_kv_len)
+            and not getattr(self, "_ring_dump_done", False)
+        ):
+            self._ring_dump_done = True
+            dump_path = _os.environ.get("QSR_DEBUG_RING_DUMP_PATH")
+            name0 = self.engine._draft_layer_names[0]
+            kv = self.engine._draft_kv_caches[name0]
+            phys = _physical_slot(slot)
+            base = phys * self._draft_blocks_per_slot
+            ring_raw = kv[:, base:base + self._draft_blocks_per_slot]
+            if ring_raw.dtype == torch.uint8:
+                ring_raw = ring_raw.view(torch.float8_e4m3fn)
+            ring_slice = ring_raw.float().clone().cpu()
+            torch.save({"kv_len": kv_len, "block_size": self.block_size,
+                        "draft_blocks_per_slot": self._draft_blocks_per_slot,
+                        "ring": ring_slice}, dump_path)
+            import logging as _logging
+            _logging.getLogger("qwen_sm120_runtime.laguna_dflash_cudagraph").warning(
+                "RING_DUMP saved kv_len=%d bs=%d shape=%s to %s",
+                kv_len, self.block_size, tuple(ring_slice.shape), dump_path)
+
         self._input_ids[0] = bonus_token
         self._input_ids[1 : self.num_tokens] = MASK_TOKEN_ID
         self._fill_buffers(slot, kv_len)
@@ -586,19 +631,18 @@ class DFlashDraftCudaGraph:
         # self._logits is already positions [1:num_tokens] -- see
         # _build_metadata_and_forward, which slices before compute_logits.
         draft_tokens = self._logits.argmax(dim=-1)
+        result = draft_tokens.tolist()
 
         import os as _os
-        if _os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
-            import logging as _logging
-            _logger = _logging.getLogger("qwen_sm120_runtime.laguna_dflash_cudagraph")
-            last_logits = self._logits[-1].float()
-            top2 = torch.topk(last_logits, 2)
-            _logger.warning(
-                "CHUNK_CHECK draft_logits bs=%d kv_len=%d last_pos_top1=%d(%.6f) "
-                "top2=%d(%.6f) margin=%.6f",
-                self.block_size, kv_len, int(top2.indices[0]), float(top2.values[0]),
-                int(top2.indices[1]), float(top2.values[1]),
-                float(top2.values[0] - top2.values[1]),
-            )
+        if _os.environ.get("QSR_DEBUG_LOGITS_LIGHT") == "1":
+            # Minimal-overhead variant: accumulate in RAM (no extra GPU ops
+            # beyond what `result` already required, no per-call file I/O),
+            # dump once at the very end via _dump_light_log(). Earlier
+            # instrumentation here (per-call topk+float+file write) was
+            # found to perturb the very race-condition-sensitive timing
+            # under investigation -- this variant exists to test whether a
+            # near-zero-overhead observer still reproduces the same result
+            # as a fully uninstrumented run.
+            _LIGHT_LOG.append((self.block_size, kv_len, bonus_token, result))
 
-        return draft_tokens.tolist()
+        return result

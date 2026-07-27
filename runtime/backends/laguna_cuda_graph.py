@@ -7,17 +7,31 @@ No CPU plan, no H2D copies, no Python dispatch per step.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
 
 from vllm._custom_ops import reshape_and_cache_flash
 
+from bfdiag.invariants import checks as bfdiag_checks
+
 if TYPE_CHECKING:
     from runtime.backends.laguna import LagunaBackend
 
 from runtime.backends.bf_attention import bf_attn_context
 logger = logging.getLogger("qwen_sm120_runtime.laguna_cuda_graph")
+
+def _debug_swa_align_gran() -> int:
+    """QSR_DEBUG_SWA_ALIGN_GRANULARITY: diagnostic-only override for the SWA
+    ring's window_start rounding granularity (normally == block_size). Read
+    per-call (not cached) so it can be toggled across `bf exec` calls in a
+    resident daemon without a reload -- block_size itself stays a load-time
+    constant, but this knob isolates "alignment slack" as a variable
+    independent of it. 0/unset = disabled (use block_size, production
+    behavior).
+    """
+    return int(os.environ.get("QSR_DEBUG_SWA_ALIGN_GRANULARITY", "0"))
 
 def _physical_slot(slot: int) -> int:
     return slot  # RESERVED_PHYSICAL_SLOTS = 0
@@ -643,7 +657,8 @@ class LagunaCudaGraphVerify:
                 ring_base = phys * self._ring_blocks_per_slot
                 ring_slots = self._ring_slots_per_slot
                 window_start = max(0, kv_len - self._swa_window + 1)
-                aligned_start = (window_start // bs) * bs
+                align_gran = _debug_swa_align_gran() or bs
+                aligned_start = (window_start // align_gran) * align_gran
                 aligned_len = new_kv_len - aligned_start
                 n_ring = min(-(-aligned_len // bs), self._ring_blocks_per_slot)
                 pt = self._page_tables[group_key]
@@ -653,6 +668,7 @@ class LagunaCudaGraphVerify:
                 )
                 pt[0, :n_ring] = (ring_base + (block_starts % ring_slots) // bs).to(pt.dtype)
                 self._cache_seqlens[group_key][0] = aligned_len
+                bfdiag_checks.check_page_table_covers_seqlen(group_key, aligned_len, n_ring, bs)
                 # SWA slot mapping: ring-wrapped
                 ring_block = (pos_range % ring_slots) // bs
                 ring_off = pos_range % bs
@@ -771,6 +787,23 @@ class LagunaCudaGraphVerify:
             raise RuntimeError("Verify CG not captured")
         self._fill_buffers(slot, token_ids, kv_len)
         self._graph.replay()
+
+        dump_kv_len = os.environ.get("QSR_DEBUG_AUX_DUMP_KV_LEN")
+        if (
+            dump_kv_len is not None
+            and kv_len >= int(dump_kv_len)
+            and not getattr(self, "_aux_dump_done", False)
+            and self._aux_hidden_states is not None
+        ):
+            self._aux_dump_done = True
+            dump_path = os.environ.get("QSR_DEBUG_AUX_DUMP_PATH")
+            torch.save({
+                "kv_len": kv_len, "block_size": self.block_size,
+                "aux": [t.float().clone().cpu() for t in self._aux_hidden_states],
+            }, dump_path)
+            logger.warning("AUX_DUMP saved kv_len=%d bs=%d n_layers=%d to %s",
+                            kv_len, self.block_size, len(self._aux_hidden_states), dump_path)
+
         return self._logits, self._aux_hidden_states
 
 

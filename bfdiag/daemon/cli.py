@@ -48,6 +48,7 @@ def _register_daemon(subparsers: argparse._SubParsersAction) -> None:
     start_parser.add_argument("--model-path", default=None)
     start_parser.add_argument("--num-slots", type=int, default=1)
     start_parser.add_argument("--blocks-per-slot", type=int, default=4096)
+    start_parser.add_argument("--block-size", type=int, default=64)
     start_parser.add_argument("--dtype", default="bfloat16")
     start_parser.add_argument("--max-model-len", type=int, default=131072)
     start_parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
@@ -154,6 +155,7 @@ def _requested_load_config(args: argparse.Namespace) -> dict[str, object]:
         "model_path": args.model_path,
         "num_slots": args.num_slots,
         "blocks_per_slot": args.blocks_per_slot,
+        "block_size": args.block_size,
         "dtype": args.dtype,
         "max_model_len": args.max_model_len,
         "gpu_memory_utilization": args.gpu_memory_utilization,
@@ -210,6 +212,8 @@ def _cmd_daemon_start(args: argparse.Namespace) -> int:
         str(socket_path),
         "--blocks-per-slot",
         str(args.blocks_per_slot),
+        "--block-size",
+        str(args.block_size),
         "--dtype",
         args.dtype,
         "--max-model-len",
