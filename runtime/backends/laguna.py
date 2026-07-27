@@ -907,7 +907,17 @@ class LagunaBackend:
                 attn_metadata_dict,
                 self.vllm_config,
                 slot_mapping=slot_mapping_dict,
-                skip_compiled=not is_decode,
+                # `skip_compiled=not is_decode` (402dedf) let decode dispatch
+                # through vLLM's @support_torch_compile wrapper for a ~0.7ms
+                # fusion win, only ever exercised at num_reqs=1 -- decode CG
+                # now owns that fast path. The eager fallback here only runs
+                # when CG is ineligible (batch-size mismatch, non-greedy,
+                # logprobs), and at num_reqs>1 the compiled dispatch hits a
+                # torch._dynamo "data-dependent expression" guard failure and
+                # crashes every multi-slot eager decode request. Always skip
+                # compilation here; this path's job is correctness, not the
+                # marginal fusion benefit.
+                skip_compiled=True,
             ):
                 result = self.model.forward(input_ids, positions)
 
