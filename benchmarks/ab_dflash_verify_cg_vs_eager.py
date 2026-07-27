@@ -20,6 +20,9 @@ MODEL = os.path.expanduser(
 CTX = 65536
 MAX_TOKENS = 256
 
+from bfdiag.record import auto_record  # demo: zero-invasion bf run-record integration
+_bf = auto_record(script=__file__, workload={"prompt_len": CTX, "k": 15, "greedy": True, "block_size": 64})
+
 from transformers import AutoTokenizer
 tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
 BASE_TEXT = "The quick brown fox jumps over the lazy dog. "
@@ -63,4 +66,5 @@ result = {
     "verify_cg_active": engine._verify_cg is not None,
     "rounds": rounds,
 }
+_bf.metric("acceptance_rate", rounds[-1]["acceptance_rate"])
 print(json.dumps(result, indent=2))
