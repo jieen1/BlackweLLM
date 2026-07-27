@@ -72,10 +72,16 @@ class TestConcreteChecks:
     citation each one is grounded in."""
 
     @pytest.mark.parametrize("assert_level", [1], indirect=True)
-    def test_kv_len_matches_committed_tokens(self, assert_level):
-        checks.check_kv_len_matches_committed(slot=0, kv_len=10, committed_len=10)
+    def test_committed_ahead_of_kv_by_one(self, assert_level):
+        # The real relationship is +1, NOT equality -- see
+        # TestRealCodeRegression below for why equality was wrong.
+        checks.check_committed_ahead_of_kv_by_one(slot=0, kv_len=10, committed_len=11)
         with pytest.raises(InvariantViolation):
-            checks.check_kv_len_matches_committed(slot=0, kv_len=10, committed_len=9)
+            checks.check_committed_ahead_of_kv_by_one(slot=0, kv_len=10, committed_len=10)
+        with pytest.raises(InvariantViolation):
+            checks.check_committed_ahead_of_kv_by_one(slot=0, kv_len=10, committed_len=9)
+        with pytest.raises(InvariantViolation):
+            checks.check_committed_ahead_of_kv_by_one(slot=0, kv_len=10, committed_len=12)
 
     @pytest.mark.parametrize("assert_level", [1], indirect=True)
     def test_accepted_bound(self, assert_level):
@@ -101,11 +107,8 @@ class TestConcreteChecks:
     def test_aux_hidden_alignment(self, assert_level):
         checks.check_aux_hidden_alignment(slot=0, prompt_len=100, aux_len=40, aux_offset=60)
         with pytest.raises(InvariantViolation):
-            # aux_len > prompt_len -> negative offset, real bug class
+            # aux_len > prompt_len -> negative offset, the real bug class
             checks.check_aux_hidden_alignment(slot=0, prompt_len=100, aux_len=140, aux_offset=-40)
-        with pytest.raises(InvariantViolation):
-            # offset/len don't add back up to prompt_len
-            checks.check_aux_hidden_alignment(slot=0, prompt_len=100, aux_len=40, aux_offset=50)
 
     @pytest.mark.parametrize("assert_level", [2], indirect=True)
     def test_cg_replay_slot_consistency(self, assert_level):
@@ -115,12 +118,116 @@ class TestConcreteChecks:
 
     @pytest.mark.parametrize("assert_level", [0], indirect=True)
     def test_all_concrete_checks_are_noops_at_level_0(self, assert_level):
-        checks.check_kv_len_matches_committed(slot=0, kv_len=1, committed_len=2)
+        checks.check_committed_ahead_of_kv_by_one(slot=0, kv_len=1, committed_len=1)
         checks.check_accepted_bound(slot=0, committed_n=999, k=15)
         checks.check_no_duplicate_ids("x", [1, 1, 1])
         checks.check_kv_len_monotonic(slot=0, prev_kv_len=10, new_kv_len=1)
         checks.check_aux_hidden_alignment(slot=0, prompt_len=1, aux_len=999, aux_offset=-998)
         checks.check_cg_replay_slot_consistency(slot=1, replay_slot=2)
+
+
+class TestRealCodeRegression:
+    """Every invariant here was re-derived from scratch against the actual
+    formulas in runtime/backends/laguna.py and runtime/backends/
+    laguna_dflash.py after a coordinator review caught
+    ``check_committed_ahead_of_kv_by_one`` shipped as a wrong equality check
+    (would have fired on every DFlash round in production). Each test below
+    plugs the REAL code's formula through the check and, where the old
+    version was wrong, shows it disagreeing with reality -- so a future edit
+    that reintroduces the same mistake fails a test instead of shipping."""
+
+    @pytest.mark.parametrize("assert_level", [1], indirect=True)
+    def test_prefill_produces_committed_len_kv_len_plus_one_not_equal(self, assert_level):
+        """Mirrors runtime/backends/laguna.py's prefill (and its 4 sibling
+        variants, all identical in shape): after sampling ``first_token``,
+        ``slot_kv_len[slot] = len(prompt_ids)`` while
+        ``slot_committed_tokens[slot] = list(prompt_ids) + [first_token]``."""
+        prompt_ids = list(range(100))  # len(prompt_ids) == 100
+        first_token = 12345
+
+        kv_len = len(prompt_ids)
+        committed_tokens = [*prompt_ids, first_token]
+        committed_len = len(committed_tokens)
+
+        assert committed_len == kv_len + 1  # the real relationship
+        old_buggy_condition = kv_len == committed_len
+        assert old_buggy_condition is False, (
+            "the original (wrong) check would have asserted this False "
+            "condition True and raised on every real post-prefill state"
+        )
+
+        # The fixed check accepts the real state; a hypothetical revert to
+        # equality would reject it (proven above), which is exactly the
+        # false-positive-on-every-round bug the coordinator caught.
+        checks.check_committed_ahead_of_kv_by_one(0, kv_len, committed_len)
+
+    @pytest.mark.parametrize("assert_level", [1], indirect=True)
+    def test_dflash_round_preserves_the_plus_one_gap_for_every_accept_count(self, assert_level):
+        """Mirrors dflash_round: ``slot_kv_len[slot] += context_count`` where
+        ``context_count = 1 + num_accepted`` (``_verify_only_accept_reject``,
+        ``laguna_dflash.py``), immediately followed by appending
+        ``len(committed) == context_count`` tokens -- same increment on both
+        sides, every round, for every possible ``num_accepted`` in 0..K."""
+        kv_len, committed_len = 100, 101  # post-prefill starting state
+        k = 15
+        for num_accepted in range(k + 1):
+            context_count = 1 + num_accepted
+            kv_len += context_count
+            committed_len += context_count  # len(committed) == context_count
+            # Should never raise: the +1 gap is preserved by construction.
+            checks.check_committed_ahead_of_kv_by_one(0, kv_len, committed_len)
+        assert committed_len == kv_len + 1
+
+    @pytest.mark.parametrize("assert_level", [1], indirect=True)
+    def test_decode_batch_sampled_preserves_the_plus_one_gap(self, assert_level):
+        """Mirrors decode_batch_sampled's non-DFlash path: both
+        ``slot_kv_len[slot] += 1`` and one token appended to
+        ``slot_committed_tokens[slot]`` -- same +1 increment on both sides."""
+        kv_len, committed_len = 50, 51
+        for _ in range(10):
+            kv_len += 1
+            committed_len += 1
+            checks.check_committed_ahead_of_kv_by_one(0, kv_len, committed_len)
+
+    def test_aux_offset_plus_aux_len_equals_prompt_len_is_tautological(self):
+        """The removed clause (``aux_offset + aux_len == prompt_len``) was a
+        re-derivation of ``aux_offset``'s own defining formula
+        (``aux_offset = prompt_len - aux_len``, laguna_dflash.py) computed at
+        the call site -- plugging that definition back in is true for every
+        integer pair, valid or not, so it never added discriminating power.
+        Demonstrated directly: it holds even for the invalid case the real
+        check DOES catch (aux_len > prompt_len)."""
+        for prompt_len, aux_len in [(100, 40), (100, 100), (100, 0), (100, 140), (1, 999)]:
+            aux_offset = prompt_len - aux_len
+            assert aux_offset + aux_len == prompt_len  # true unconditionally, valid or not
+        # The ONE clause that actually distinguishes valid from invalid:
+        assert (100 - 40) >= 0  # valid: aux_len <= prompt_len
+        assert (100 - 140) < 0  # invalid: aux_len > prompt_len -- this is the real bug class
+
+    @pytest.mark.parametrize("assert_level", [1], indirect=True)
+    def test_no_duplicate_ids_does_not_check_across_separate_calls(self, assert_level):
+        """Documents the within-call-only scope as a test, not just prose:
+        two separate ``allocate``-style calls returning overlapping ids each
+        individually pass (this check cannot and does not claim to catch
+        cross-call aliasing -- that's ``BlockPool``'s own hard ``ref_cnt``
+        RuntimeErrors, not this invariant)."""
+        checks.check_no_duplicate_ids("call_1", [5, 6, 7])
+        checks.check_no_duplicate_ids("call_2", [7, 8, 9])  # 7 repeats across calls: not caught
+        with pytest.raises(InvariantViolation):
+            checks.check_no_duplicate_ids("call_3", [7, 7])  # repeats WITHIN one call: caught
+
+    @pytest.mark.parametrize("assert_level", [1], indirect=True)
+    def test_accepted_bound_matches_every_real_committed_length(self, assert_level):
+        """``len(committed) == num_accepted + 1`` always (see
+        ``determine_accept_reject_from_predictions``: both the early-return-
+        on-reject branch and the full-accept branch append exactly one
+        token per loop iteration up to and including position
+        ``num_accepted``) -- so the real ``committed_n`` never even
+        approaches, let alone exceeds, ``k + 1``."""
+        k = 15
+        for num_accepted in range(k + 1):
+            committed_n = num_accepted + 1
+            checks.check_accepted_bound(0, committed_n, k)
 
 
 class TestRecentTraceContextInMessage:

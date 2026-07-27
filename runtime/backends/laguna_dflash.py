@@ -1356,7 +1356,7 @@ class DFlashEngine:
         for tok in committed:
             backend.slot_committed_tokens[slot].append(tok)
         bfdiag_checks.check_kv_len_monotonic(slot, kv_len, backend.slot_kv_len[slot])
-        bfdiag_checks.check_kv_len_matches_committed(
+        bfdiag_checks.check_committed_ahead_of_kv_by_one(
             slot, backend.slot_kv_len[slot], len(backend.slot_committed_tokens[slot])
         )
         if bfdiag_trace.TRACE_ENABLED:

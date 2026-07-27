@@ -224,8 +224,9 @@ schema,这次在 `events.py` 里留了三个字段(`RoundEvent` 上,默认值
 - `1316-1317`:verify(CG 或 eager)算完之后,mark `PHASE_VERIFY`。
 - `1324`:`context_count`/`committed` 算出之后,`check_accepted_bound`
   不变量。
-- `1358-1363`:`slot_kv_len`/`slot_committed_tokens` 更新之后,
-  `check_kv_len_monotonic` + `check_kv_len_matches_committed` 两个不变量 +
+- `1358-1361`:`slot_kv_len`/`slot_committed_tokens` 更新之后,
+  `check_kv_len_monotonic` + `check_committed_ahead_of_kv_by_one` 两个
+  不变量(后者 2026-07-27 经协调者复审改名+改公式,见第 7 节开头的勘误)+
   mark `PHASE_COMMIT`。
 - `1370-1378`:draft-for-next-round 算完之后(这是这一轮的最后一步),
   `finish_dflash_round`(把 `_verify_only_accept_reject` 的 decision dict
@@ -262,13 +263,68 @@ API:`bfdiag.invariants.registry.check(level, name, cond, **ctx)`,
 `bfdiag.trace.ring.get_ring().snapshot()` 的尾部)——让报错本身是一份
 小型现场报告。
 
+### 勘误(2026-07-27,协调者复审发现,已修复)
+
+第一版把 `slot_kv_len[slot]` 和 `len(slot_committed_tokens[slot])` 的关系
+写成了**相等**(`check_kv_len_matches_committed`,断言 `kv_len ==
+committed_len`)。这是**假的**——真实关系是 `committed_len == kv_len + 1`,
+错误版本会在 `QSR_ASSERT_LEVEL>=1` 时**每一轮都抛** `InvariantViolation`,
+比完全没有这个断言还糟(会让人误以为引擎有簿记 bug)。反证(均为真实代码,
+`runtime/backends/laguna.py`):`prefill`(1123-1124 行)、`prefill_sampled`
+(1137-1138)、`prefill_with_aux`(1269-1270,DFlash 实际走的 prefill 路径)、
+增量续算路径(1709)、chunked 变体(1814-1815)—— 5 处结构完全一致:
+
+```python
+self.slot_kv_len[slot] = len(prompt_ids)  # 或 prompt_len,同一个数
+self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
+```
+
+`first_token` 是刚从 prompt 的 forward 里采样出来的**输出**,还没有作为
+输入跑过 forward,KV 里没有它的位置——所以 prefill 一结束就是 `committed_
+len == kv_len + 1`,并且这个 +1 之后每一步都同步保持(`dflash_round`:
+`slot_kv_len[slot] += context_count`,`context_count = 1 + num_accepted`,
+`len(committed) == context_count`,两边增量相同;`decode_batch_sampled`
+同理,两边都 +1)。已改名为 `check_committed_ahead_of_kv_by_one`,断言
+改成 `committed_len == kv_len + 1`,docstring 里写清楚了这 5 处代码引用。
+`tests/test_invariants.py::TestRealCodeRegression` 新增了专门的回归测试
+(用真实公式复现 prefill/round 后的状态,并直接证明"旧断言在这个真实状态
+上就是 False"),防止以后又被错改回相等。
+
+同一次复审顺带重新推导了其余 5 个不变量(判据:能不能找到真实代码路径
+构成反例),额外发现并修了一处**假阳性防护但零判别力**的问题:
+
+- `check_aux_hidden_alignment` 原来断言 `aux_offset >= 0 and aux_offset +
+  aux_len == prompt_len` 两个子句。第二个子句是 `aux_offset = prompt_len -
+  aux_len`(调用点已经这么算出 `aux_offset`)这个定义式的**同义反复**——
+  代入定义回去,`(prompt_len - aux_len) + aux_len == prompt_len` 对任意
+  整数恒成立,合法/非法输入都一样,**不提供任何判别力**,只是看起来像是
+  在多验证一件事。已删掉这个子句,只保留真正有意义的 `aux_offset >= 0`
+  (等价于 `aux_len <= prompt_len`)。`tests/test_invariants.py::
+  TestRealCodeRegression::test_aux_offset_plus_aux_len_equals_prompt_len_
+  is_tautological` 直接演算证明了这一点。
+- `check_no_duplicate_ids` 的 docstring 补充澄清了"这次调用内唯一"和
+  "全局/跨调用唯一"是两个不同命题(协调者点名要求确认的一点)——这个
+  函数**只**验证前者(`BlockPool.allocate(n)` 一次调用返回的 `ids` 内部
+  不重复);跨调用/跨 slot 的别名问题由 `allocate`/`free` 自己的硬编码
+  `RuntimeError`(`ref_cnt` 检查)负责,不是这个不变量的职责,新测试
+  `test_no_duplicate_ids_does_not_check_across_separate_calls` 把这个
+  范围边界显式测出来了。
+- `check_accepted_bound`(协调者点 4 要求确认的参数命名)——`k` 传的是
+  `len(draft_tokens)`,和 docstring 里的 `K` 一致,**确认无误,未改**。
+- `check_kv_len_monotonic`——`context_count = 1 + num_accepted >= 1`
+  在 `dflash_round` 里恒成立,`new_kv_len >= prev_kv_len` 这个断言本身
+  没有反例(它比真实情况"严格递增"更宽松,但宽松的方向是安全的,不会
+  漏判——只是没有用严格 `>` 那么"贴合"),**确认无误,未改**。
+- `check_cg_replay_slot_consistency`——**未接入任何集成点**,原因不变
+  (见下方说明),纯函数行为本身没有反例,**确认无误,未改**。
+
 | 函数 | level | 依据 |
 |---|---|---|
-| `check_kv_len_matches_committed` | 1 | `laguna.py` 的 `slot_kv_len`/`slot_committed_tokens` 是两份独立维护的状态,`dflash_round` 每轮同步推进(`slot_kv_len[slot] += context_count` 紧跟着往 `slot_committed_tokens[slot]` append `context_count` 个 token,`context_count == len(committed)`) |
-| `check_accepted_bound` | 1 | `determine_accept_reject_from_predictions` 的循环只跑 `range(k)`,`num_accepted` 天然 0..k,`len(committed) == num_accepted+1 <= k+1` |
-| `check_no_duplicate_ids` | 1 | `BlockPool.allocate` 每次从空闲队列 `popleft` 一个块再从队列摘掉,理论上不该有重复 id;真发生重复说明同一物理块被摊派给了两个活跃 slot |
+| `check_committed_ahead_of_kv_by_one` | 1 | 见上方勘误:`committed_len == kv_len + 1`(不是相等!),`laguna.py` 5 处 prefill 变体 + `dflash_round`/`decode_batch_sampled` 每轮同步推进保持这个 +1 offset |
+| `check_accepted_bound` | 1 | `determine_accept_reject_from_predictions` 的循环只跑 `range(k)`,`num_accepted` 天然 0..k,`len(committed) == num_accepted+1 <= k+1`(实际上恒等于,`<=` 是保守写法,按原任务要求的形式) |
+| `check_no_duplicate_ids` | 1 | 仅"这次调用内唯一"(见上方勘误),`BlockPool.allocate` 每次从空闲队列 `popleft` 一个块再从队列摘掉,同一次调用内不该有重复 id |
 | `check_kv_len_monotonic` | 1 | `dflash_round` 的 `context_count = 1 + num_accepted >= 1`,一轮内 `kv_len` 只增不减(重置是走独立的 `reset_slot`,不在轮内发生) |
-| `check_aux_hidden_alignment` | 2 | `dflash_prefill_bootstrap` 里 `aux_offset = prompt_len - aux_len`,若 `aux_len > prompt_len` 会算出负 offset,写 draft KV 时环形位置全错 |
+| `check_aux_hidden_alignment` | 2 | 见上方勘误:只断言 `aux_offset >= 0`(`dflash_prefill_bootstrap` 里 `aux_offset = prompt_len - aux_len`,若 `aux_len > prompt_len` 会算出负 offset,写 draft KV 时环形位置全错) |
 | `check_cg_replay_slot_consistency` | 2 | **写了但没有接入任何集成点**——见下方说明 |
 
 `check_cg_replay_slot_consistency(slot, replay_slot)` 没有被接入的原因:
@@ -318,7 +374,52 @@ invariants.py` 单独测试它作为纯函数的行为正确。
    `RoundRing`/`Timeline` 的真实每轮开销(GPU event record 的实际耗时、
    `array.array` 写入在真实高频解码循环里的耗时)需要真实 profiling 数据。
 
-## 9. 交付清单(文件路径)
+## 9. 架构耦合:runtime 现在硬依赖 bfdiag(刻意决定,不是副作用)
+
+`runtime/backends/laguna.py:22`(`from bfdiag.trace import ring as
+bfdiag_trace`)和 `runtime/block_pool.py:15`(`from bfdiag.invariants import
+checks as bfdiag_checks`)都是**模块级** import。这意味着从现在起,**生产
+runtime 没有 bfdiag 包就 import 不起来**——诊断包从"旁路挂件"变成了
+runtime 的硬依赖。协调者复审时点名要求把这个决定写清楚,不能是改代码时的
+无意识副作用。
+
+**这是刻意的决定,理由**:
+
+1. 同一个仓库、同一次发布,不存在"运行时里有 runtime 没有 bfdiag"的部署
+   场景——两者一起 `git clone`/一起打包,没有独立分发 bfdiag 的需求。
+2. `bfdiag` 本身**零第三方依赖**(只用标准库 `array`/`json`/`argparse`/
+   `dataclasses`/`enum`,可选地探测 `torch`——没装也不报错),import
+   `bfdiag.trace.ring`/`bfdiag.invariants.checks` 本身不会引入任何新的
+   第三方依赖链、不会拖慢 runtime 的 import 时间(纯 Python 模块级代码,
+   没有重量级初始化)。
+3. `QSR_TRACE=0`/`QSR_ASSERT_LEVEL=0`(默认)时,这两个模块 import 期间
+   **没有任何副作用**:不构造 `RoundRing`(见 `ring.py` 的 `_ring =
+   RoundRing(...) if TRACE_ENABLED else None`),不探测 CUDA,不建目录、
+   不开文件。这是这个决定成立的**前提条件**,不是可有可无的优点——如果
+   bfdiag 的 import 本身有副作用(哪怕只是"建个目录"),把它做成硬依赖
+   就是一个更危险的决定。
+
+**如果将来要解耦(比如 bfdiag 要支持被完全移除、或者 runtime 要单独分发给
+不需要诊断功能的场景)**,不需要现在做,但路径应该是:
+
+- **方案 A(推荐)**:runtime 侧维护一个极薄的 no-op 默认("空对象"模式)
+  ——`runtime/backends/laguna.py` 顶部不再 `import bfdiag`,而是 `try:
+  from bfdiag.trace import ring as bfdiag_trace; except ImportError:
+  bfdiag_trace = _NoOpTrace()`(`_NoOpTrace` 只需要 `TRACE_ENABLED =
+  False` 一个属性,因为所有集成点都先判断这个 flag 才调用其他方法)。
+  这样 bfdiag 缺失时行为退化成"诊断功能不可用",而不是 import 失败。
+- **方案 B**:把耦合方向反过来,用依赖注入——runtime 在 `LagunaBackend.
+  __init__` 时接受一个可选的 `trace_hooks` 参数(默认 `None`,内部用同样
+  的 `_NoOpTrace`),由**调用方**(`server/engine.py` 或 CLI 入口)决定
+  要不要 `import bfdiag` 再传进去。这样 `runtime/` 包本身完全不 import
+  `bfdiag`,耦合被推到组装层。比方案 A 干净,但改动面更大(所有集成点
+  从"读全局单例"变成"读实例属性"),这次没有做,留作以后需要真正解耦时
+  再权衡。
+- **不推荐**:把 `bfdiag` 作为 `pyproject.toml` 的 optional-dependency
+  ——没有意义,因为 `bfdiag` 本身就在同一个仓库里,不是外部包,"可选安装"
+  这个概念不适用。
+
+## 10. 交付清单(文件路径)
 
 - `bfdiag/__init__.py`、`bfdiag/trace/{__init__,events,ring,timing,dump,
   panel,cli}.py`、`bfdiag/invariants/{__init__,registry,checks}.py`
