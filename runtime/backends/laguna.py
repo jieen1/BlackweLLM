@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from bfdiag.trace import ring as bfdiag_trace
 from runtime.block_pool import ChunkedPrefillState
 from runtime.compat_vllm import (
     VllmConfig,
@@ -1432,7 +1433,12 @@ class LagunaBackend:
         forward -- this is the path ``ServerEngine._step_sync`` actually
         calls, so it is what makes CUDA Graph decode reach real requests.
         """
-        if self._decode_cg_batch_eligible(slot_ids, params_list, return_logprobs):
+        _bf_cg_ok = self._decode_cg_batch_eligible(slot_ids, params_list, return_logprobs)
+        if bfdiag_trace.TRACE_ENABLED:
+            bfdiag_trace.record_decode_batch_path(
+                slot_ids, kv_lengths, self._decode_cg, _bf_cg_ok, return_logprobs, params_list
+            )
+        if _bf_cg_ok:
             next_tokens = self._decode_cg.replay(slot_ids, token_ids, kv_lengths)
             for i, slot in enumerate(slot_ids):
                 self.slot_kv_len[slot] += 1

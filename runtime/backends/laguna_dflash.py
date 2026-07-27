@@ -29,6 +29,9 @@ from typing import Any
 
 import torch
 
+from bfdiag.invariants import checks as bfdiag_checks
+from bfdiag.trace import events as bfdiag_events
+from bfdiag.trace import ring as bfdiag_trace
 from runtime.backends.bf_attention import bf_attn_context
 from runtime.backends.dflash_constants import (
     AUX_LAYER_IDS,
@@ -1256,6 +1259,7 @@ class DFlashEngine:
         if aux_hidden_states is not None:
             aux_len = aux_hidden_states[0].shape[0]
             aux_offset = prompt_len - aux_len
+            bfdiag_checks.check_aux_hidden_alignment(slot, prompt_len, aux_len, aux_offset)
             self._bulk_precompute_context_kv(slot, aux_hidden_states, aux_len, aux_offset)
         del aux_hidden_states
 
@@ -1300,6 +1304,7 @@ class DFlashEngine:
         backend = self.backend
         bonus_token = anchor
         kv_len = backend.slot_kv_len[slot]
+        _bf_row = bfdiag_trace.begin_round(slot, kv_len) if bfdiag_trace.TRACE_ENABLED else -1
 
         verify_tokens = [bonus_token] + draft_tokens
         if self._verify_cg is not None:
@@ -1308,12 +1313,15 @@ class DFlashEngine:
             verify_logits, verify_aux = self._forward_verify_with_aux(
                 slot, verify_tokens, kv_len, len(verify_tokens)
             )
+        if bfdiag_trace.TRACE_ENABLED:
+            bfdiag_trace.mark(_bf_row, bfdiag_events.PHASE_VERIFY)
 
         all_argmax = verify_logits[:NUM_QUERY_PER_REQ].argmax(dim=-1).tolist()
         decision = _verify_only_accept_reject(all_argmax, draft_tokens, bonus_token)
         committed = decision["committed"]
         new_bonus = decision["next_anchor"]
         context_count = decision["context_count"]
+        bfdiag_checks.check_accepted_bound(slot, len(committed), len(draft_tokens))
 
         logprobs_list = None
         if return_logprobs:
@@ -1347,12 +1355,27 @@ class DFlashEngine:
         backend.slot_kv_len[slot] += context_count
         for tok in committed:
             backend.slot_committed_tokens[slot].append(tok)
+        bfdiag_checks.check_kv_len_monotonic(slot, kv_len, backend.slot_kv_len[slot])
+        bfdiag_checks.check_kv_len_matches_committed(
+            slot, backend.slot_kv_len[slot], len(backend.slot_committed_tokens[slot])
+        )
+        if bfdiag_trace.TRACE_ENABLED:
+            bfdiag_trace.mark(_bf_row, bfdiag_events.PHASE_COMMIT)
 
         new_kv_len = backend.slot_kv_len[slot]
         if self._draft_cg is not None:
             next_draft_tokens = self._draft_cg.replay(slot, new_bonus, new_kv_len)
         else:
             next_draft_tokens = self._draft_forward(slot, new_bonus, new_kv_len)
+        if bfdiag_trace.TRACE_ENABLED:
+            bfdiag_trace.finish_dflash_round(
+                _bf_row,
+                self._verify_cg is not None,
+                self._use_cuda_graph,
+                len(draft_tokens),
+                decision,
+                new_bonus,
+            )
 
         result = {
             "committed": committed,

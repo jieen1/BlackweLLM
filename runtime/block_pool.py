@@ -12,6 +12,8 @@ import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from bfdiag.invariants import checks as bfdiag_checks
+
 # something about index 0 (padding/NULL_BLOCK_ID-adjacent) makes the model
 # read/write the wrong state. Fix: reserve physical index 0 permanently
 # and offset every logical slot by +1 when computing a physical address.
@@ -398,6 +400,7 @@ class BlockPool:
                 )
             block.ref_cnt = 1
             ids.append(block.block_id)
+        bfdiag_checks.check_no_duplicate_ids("block_pool.allocate", ids)
         return ids
 
     def free(self, block_ids: list[int]) -> None:
