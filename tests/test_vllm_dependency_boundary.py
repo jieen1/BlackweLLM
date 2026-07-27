@@ -21,6 +21,20 @@ _APPROVED_DIRECT_IMPORT_FILES = {
     "runtime/backends/laguna.py",
     "runtime/backends/laguna_dflash.py",
     "runtime/backends/laguna_dflash_cudagraph.py",
+    # Added 2026-07-27: these three call vllm._custom_ops.reshape_and_cache_flash
+    # directly. runtime/kernels/fused_kv_scatter.py was written as a drop-in
+    # Triton replacement but is NOT yet safe to wire in -- swapping it in and
+    # bit-exact-testing against benchmarks/ab_dflash_block_size_64_vs_128.py
+    # (bs=64, ctx=10240) collapsed DFlash's accept rate from the established
+    # 0.718182 baseline to 0.028839 (deterministic, not a race). Given DFlash's
+    # demonstrated extreme sensitivity to any numeric difference (see
+    # notes/2026-07-27-block-size-128-accept-rate-root-cause-CLOSED.md), this
+    # needs a dedicated numerical debugging pass before it can replace the
+    # vLLM call, not a quick wire-in. Tracked as follow-up work under the
+    # vLLM-removal plan (notes/2026-07-27-vllm-complete-removal-implementation-plan.md).
+    "runtime/backends/bf_attention.py",
+    "runtime/backends/laguna_cuda_graph.py",
+    "runtime/backends/laguna_sparkinfer_attn.py",
 }
 
 _APPROVED_DIRECT_FLASHINFER_IMPORT_FILES = {
