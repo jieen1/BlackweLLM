@@ -145,6 +145,13 @@ SERVER_KV_CACHE_DTYPE = os.environ.get(
 )
 SERVER_GPU_MEM_UTIL = float(os.environ.get("QSR_SERVER_GPU_MEM_UTIL", "0.85"))
 SERVER_PRODUCTION = os.environ.get("QSR_SERVER_PRODUCTION", "1") != "0"
+# DFlash speculative decoding (2026-07-27, notes/2026-07-27-dflash-server-
+# integration.md): default OFF even for Laguna. Unlike SERVER_ENABLE_CUDAGRAPH
+# above, this is a same-day integration of a capability that loads an extra
+# draft model (real additional GPU memory) and hard-requires capacity=1
+# (ServerEngine raises otherwise) -- opt-in via QSR_SERVER_ENABLE_DFLASH=1
+# until it has run in production for a while, not flipped on by default yet.
+SERVER_ENABLE_DFLASH = os.environ.get("QSR_SERVER_ENABLE_DFLASH", "0") != "0"
 
 engine: ServerEngine | None = None
 
@@ -331,6 +338,7 @@ async def lifespan(app: FastAPI):
         enable_prefix_cache=SERVER_ENABLE_PREFIX_CACHE,
         enable_session_affinity=SERVER_ENABLE_SESSION_AFFINITY,
         session_ttl_s=SERVER_SESSION_TTL_S,
+        enable_dflash=SERVER_ENABLE_DFLASH,
         gpu_memory_utilization=SERVER_GPU_MEM_UTIL,
         production=SERVER_PRODUCTION,
     )
@@ -881,6 +889,11 @@ def main() -> None:
         default=SERVER_SESSION_TTL_S,
         help="Warm-slot retention TTL in seconds for session affinity (P4b). Default 30.0.",
     )
+    parser.add_argument(
+        "--dflash",
+        action="store_true",
+        help="Enable DFlash speculative decoding (Laguna backend only, requires --capacity 1).",
+    )
     args = parser.parse_args()
 
     # P4b: refuse --session-affinity together with --no-prefix-cache -- a clean
@@ -890,6 +903,8 @@ def main() -> None:
         parser.error(
             "--session-affinity requires the prefix cache (cannot combine with --no-prefix-cache)"
         )
+    if args.dflash and args.capacity != 1:
+        parser.error("--dflash requires --capacity 1 (DFlash's CUDA Graphs are single-slot)")
 
     os.environ["QSR_SERVER_CAPACITY"] = str(args.capacity)
     os.environ["QSR_SERVER_NUM_SLOTS"] = str(args.num_slots)
@@ -901,6 +916,8 @@ def main() -> None:
     if args.session_affinity:
         os.environ["QSR_SERVER_ENABLE_SESSION_AFFINITY"] = "1"
     os.environ["QSR_SERVER_SESSION_TTL_S"] = str(args.session_ttl_s)
+    if args.dflash:
+        os.environ["QSR_SERVER_ENABLE_DFLASH"] = "1"
 
     uvicorn.run("server.app:app", host=args.host, port=args.port, log_level="info")
 

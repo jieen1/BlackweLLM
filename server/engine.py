@@ -27,7 +27,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dataclass_replace
 from typing import Any
 
 from runtime.sampling import SamplingParams
@@ -219,6 +219,7 @@ class ServerEngine:
         enable_prefix_cache: bool = True,
         enable_session_affinity: bool = False,
         session_ttl_s: float = 30.0,
+        enable_dflash: bool = False,
         gpu_memory_utilization: float = 0.85,
         idle_sleep_s: float = 0.005,
         production: bool = True,
@@ -228,13 +229,31 @@ class ServerEngine:
         if backend not in self._BACKENDS:
             raise ValueError(f"backend={backend!r} must be one of {self._BACKENDS}")
         self.backend_name = backend
+        self.enable_dflash = enable_dflash
         # Instance-level overrides of the class defaults above: Qwen keeps
         # the exact original values (MODEL/K unshadowed), Laguna gets its
-        # own model id and a zero MTP lookahead margin (no speculative
-        # decoding for this backend yet).
+        # own model id; K stays 0 unless DFlash is enabled below (Laguna's
+        # own decode has no speculative lookahead otherwise).
         if backend != "qwen36":
             self.MODEL = self._BACKEND_MODEL_ID[backend]
             self.K = 0
+
+        if enable_dflash:
+            if backend == "qwen36":
+                raise ValueError("enable_dflash is only supported for backend='laguna'")
+            if capacity != 1:
+                # DFlashEngine's draft/verify CUDA Graphs are captured for a
+                # single physical slot (runtime/backends/laguna_dflash.py
+                # DFlashEngine._init_buffers) -- a capacity>1 batch would
+                # replay the same graph for multiple real requests, reading/
+                # writing the wrong physical slot's KV cache.
+                raise ValueError(
+                    f"enable_dflash requires capacity=1 (DFlash's CUDA Graphs are "
+                    f"captured for one physical slot), got capacity={capacity}"
+                )
+            from runtime.backends.dflash_constants import NUM_SPECULATIVE_TOKENS
+
+            self.K = NUM_SPECULATIVE_TOKENS
 
         if production:
             min_slots = capacity + (capacity if enable_cudagraph else 0)
@@ -431,6 +450,33 @@ class ServerEngine:
                     "Laguna decode CUDA Graph capture failed or disabled "
                     "(QSR_DECODE_CUDA_GRAPH); falling back to eager decode"
                 )
+        if self.enable_dflash:
+            # Wire DFlash speculative decoding into the shared MTP-shaped
+            # decode path: self.runner.spec.has_mtp flips True so
+            # classify_decode_slots (server/engine.py) routes greedy
+            # requests to mtp_verify_and_commit_batch, which
+            # LagunaBackend now implements by delegating to
+            # DFlashEngine.dflash_round per slot. Non-greedy requests are
+            # unaffected -- classify_decode_slots still routes them through
+            # decode_batch_sampled. Must run before start()'s admission loop
+            # (same "capture before any real slot use" requirement as
+            # _ensure_decode_cg above): DFlashEngine.__init__ captures its
+            # own draft/verify CUDA Graphs, which scribble dummy warmup data
+            # into physical slots.
+            from runtime.backends.laguna_dflash import DFlashEngine
+
+            dflash = DFlashEngine(self.runner)
+            self.runner._dflash = dflash
+            self.runner.spec = dataclass_replace(
+                self.runner.spec,
+                mtp_model_id=dflash.draft_model.__class__.__name__,
+                num_speculative_tokens=self.K,
+            )
+            logger.info(
+                "DFlash speculative decoding wired: K=%d, cuda_graph=%s",
+                self.K,
+                dflash._use_cuda_graph,
+            )
         logger.info(
             "Laguna model loaded on engine thread: num_slots=%d blocks_per_slot=%d "
             "max_context=%d tokens/slot",

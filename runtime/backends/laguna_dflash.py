@@ -1238,6 +1238,132 @@ class DFlashEngine:
         }
         return tokens, stats
 
+    def dflash_prefill_bootstrap(self, slot: int, prompt_ids: list[int]) -> dict:
+        """E1: DFlash-aware prefill for ServerEngine's admission path.
+
+        Mirrors ``generate_verify_only``'s prefill + initial-draft bootstrap
+        (no prefix-cache reuse -- matches ``LagunaBackend.prefill_chunked_begin``'s
+        existing simplicity; Laguna prefix caching is a separate, unbuilt
+        roadmap item per ``reconcile_prefix_hit``). Returns the same
+        ``{"anchor": int, "draft_tokens": list[int]}`` shape
+        ``prefill_chunked_begin`` already returns for the non-DFlash path, so
+        callers don't need to special-case it.
+        """
+        backend = self.backend
+        prompt_len = len(prompt_ids)
+        first_token, aux_hidden_states = backend.prefill_with_aux(slot, prompt_ids)
+
+        if aux_hidden_states is not None:
+            aux_len = aux_hidden_states[0].shape[0]
+            aux_offset = prompt_len - aux_len
+            self._bulk_precompute_context_kv(slot, aux_hidden_states, aux_len, aux_offset)
+        del aux_hidden_states
+
+        bonus_token = first_token
+        kv_len = backend.slot_kv_len[slot]
+        if self._draft_cg is not None:
+            draft_tokens = self._draft_cg.replay(slot, bonus_token, kv_len)
+        else:
+            draft_tokens = self._draft_forward(slot, bonus_token, kv_len)
+
+        if self._use_cuda_graph and not self._cg_captured:
+            self._lazy_capture_cg()
+
+        return {"anchor": bonus_token, "draft_tokens": draft_tokens}
+
+    def dflash_round(
+        self,
+        slot: int,
+        anchor: int,
+        draft_tokens: list[int],
+        *,
+        return_logprobs: bool = False,
+        top_logprobs: int = 0,
+    ) -> dict:
+        """E1: one draft+verify+accept round for ServerEngine's per-step decode
+        loop -- the step-wise sibling of ``generate_verify_only``'s while-loop
+        body, extracted so ``ServerEngine._step_sync`` can drive DFlash one
+        round per engine step instead of running a whole generation
+        to completion. Matches the decision-dict contract
+        ``DirectModelRunner.mtp_verify_and_commit_batch`` already returns
+        (``committed``/``num_accepted``/``next_anchor``/``next_draft_tokens``[/``logprobs``])
+        so ``LagunaBackend.mtp_verify_and_commit_batch`` can hand this straight
+        to the existing, unmodified ``_step_sync`` greedy-MTP branch.
+
+        EOS/max_tokens truncation is intentionally NOT done here -- the caller
+        (``_step_sync``) already walks ``committed`` looking for EOS / the
+        length limit for the qwen36 MTP path, and applies unchanged here. A
+        drafted-but-never-consumed next round when the caller stops after
+        this one is harmless (the physical slot's KV/committed-token state
+        gets reset before its next real use).
+        """
+        backend = self.backend
+        bonus_token = anchor
+        kv_len = backend.slot_kv_len[slot]
+
+        verify_tokens = [bonus_token] + draft_tokens
+        if self._verify_cg is not None:
+            verify_logits, verify_aux = self._verify_cg.replay_with_aux(slot, verify_tokens, kv_len)
+        else:
+            verify_logits, verify_aux = self._forward_verify_with_aux(
+                slot, verify_tokens, kv_len, len(verify_tokens)
+            )
+
+        all_argmax = verify_logits[:NUM_QUERY_PER_REQ].argmax(dim=-1).tolist()
+        decision = _verify_only_accept_reject(all_argmax, draft_tokens, bonus_token)
+        committed = decision["committed"]
+        new_bonus = decision["next_anchor"]
+        context_count = decision["context_count"]
+
+        logprobs_list = None
+        if return_logprobs:
+            from runtime.logprobs import compute_logprobs
+
+            logprobs_list = [
+                compute_logprobs(verify_logits[p].unsqueeze(0), [committed[p]], top_k=top_logprobs)[
+                    0
+                ]
+                for p in range(len(committed))
+            ]
+
+        if verify_aux is not None:
+            aux_slice = [a[:context_count] for a in verify_aux]
+            combined_input = torch.cat(aux_slice, dim=-1)
+            combined = self.draft_model.combine_hidden_states(combined_input)
+            bs = self.block_size
+            phys = _physical_slot(slot)
+            draft_base = phys * self._draft_blocks_per_slot
+            ring_slots = self._draft_blocks_per_slot * bs
+            context_positions = torch.arange(
+                kv_len, kv_len + context_count, dtype=torch.long, device=self.device
+            )
+            ring_blocks = (context_positions % ring_slots) // bs
+            ring_offs = context_positions % bs
+            slot_mappings = (draft_base + ring_blocks) * bs + ring_offs
+            self.draft_model.precompute_and_store_context_kv(
+                combined, context_positions, slot_mappings
+            )
+
+        backend.slot_kv_len[slot] += context_count
+        for tok in committed:
+            backend.slot_committed_tokens[slot].append(tok)
+
+        new_kv_len = backend.slot_kv_len[slot]
+        if self._draft_cg is not None:
+            next_draft_tokens = self._draft_cg.replay(slot, new_bonus, new_kv_len)
+        else:
+            next_draft_tokens = self._draft_forward(slot, new_bonus, new_kv_len)
+
+        result = {
+            "committed": committed,
+            "num_accepted": decision["num_accepted"],
+            "next_anchor": new_bonus,
+            "next_draft_tokens": next_draft_tokens,
+        }
+        if logprobs_list is not None:
+            result["logprobs"] = logprobs_list
+        return result
+
     def _forward_verify_with_aux(
         self,
         slot: int,

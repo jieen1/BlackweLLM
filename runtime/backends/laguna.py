@@ -370,10 +370,12 @@ class LagunaBackend:
         self.num_speculative_tokens = 0
         model_id = getattr(vllm_config.model_config, "model", "poolside/Laguna-S-2.1-NVFP4")
         architecture = getattr(hf_config, "architectures", ["LagunaForCausalLM"])[0]
-        # E1: no MTP draft model and no GDN layers -- Laguna has neither
-        # speculative decoding (DFlash is planned, roadmap L3, not wired
-        # into this backend yet) nor a GDN/SSM recursive state; every
+        # E1: no GDN layers -- Laguna has no GDN/SSM recursive state, every
         # discovered layer is a (full or sliding-window) attention layer.
+        # MTP fields start empty; ServerEngine._load_laguna_model flips them
+        # (via dataclasses.replace on self.spec) once a DFlashEngine is
+        # wired up via self._dflash, so classify_decode_slots routes greedy
+        # requests through the MTP-shaped mtp_verify_and_commit_batch path.
         self.spec = ModelSpec.from_runner_init(
             model_id=model_id,
             architecture=architecture,
@@ -384,6 +386,11 @@ class LagunaBackend:
             kv_dtype=cache_dtype_str,
             block_size=block_size,
         )
+        # E1: set by ServerEngine._load_laguna_model to a DFlashEngine
+        # instance when speculative decoding is enabled for this backend
+        # (requires capacity == 1 -- DFlash's draft/verify CUDA Graphs are
+        # captured for a single physical slot, see DFlashEngine._init_buffers).
+        self._dflash: Any = None
         self.num_qo_heads = sfc[self.attn_layer_names[0]].num_heads
         self.num_kv_heads = sfc[self.attn_layer_names[0]].num_kv_heads
         self.head_dim = sfc[self.attn_layer_names[0]].head_size
@@ -1537,13 +1544,52 @@ class LagunaBackend:
             return ChunkedPrefillState(done=True, result={})
         result: dict[int, dict] = {}
         for slot, prompt in zip(slots, prompts_per_slot):
-            first_token = self.prefill(slot, prompt)
-            result[slot] = {"anchor": first_token, "draft_tokens": []}
+            if self._dflash is not None:
+                result[slot] = self._dflash.dflash_prefill_bootstrap(slot, prompt)
+            else:
+                first_token = self.prefill(slot, prompt)
+                result[slot] = {"anchor": first_token, "draft_tokens": []}
         return ChunkedPrefillState(done=True, result=result)
 
     def prefill_chunked_step(self, state: ChunkedPrefillState) -> bool:
         """Laguna prefill is never incremental; state is always already done."""
         return state.done
+
+    def mtp_verify_and_commit_batch(
+        self,
+        slots: list[int],
+        anchors: dict[int, int],
+        drafts: dict[int, list[int]],
+        *,
+        return_logprobs: bool = False,
+        top_logprobs: int = 0,
+    ) -> dict[int, dict]:
+        """E1: DFlash's sibling of ``DirectModelRunner.mtp_verify_and_commit_batch``,
+        called by the SAME ``ServerEngine._step_sync`` greedy-MTP branch
+        (``classify_decode_slots`` routes here once ``self.spec.has_mtp`` is
+        true -- see ``self._dflash`` / ``ServerEngine._load_laguna_model``).
+
+        DFlash's draft/verify CUDA Graphs are captured for exactly one
+        physical slot (see ``DFlashEngine._init_buffers``), so this only
+        ever runs with ``len(slots) == 1`` in practice --
+        ``ServerEngine.__init__`` requires ``capacity == 1`` whenever DFlash
+        is enabled. The loop below still handles >1 slots correctly (just
+        sequentially, no batched replay) rather than silently assuming the
+        constraint, in case that capacity guard is ever loosened without
+        updating this method.
+        """
+        if self._dflash is None:
+            raise RuntimeError("mtp_verify_and_commit_batch called without a DFlashEngine wired up")
+        return {
+            slot: self._dflash.dflash_round(
+                slot,
+                anchors[slot],
+                drafts[slot],
+                return_logprobs=return_logprobs,
+                top_logprobs=top_logprobs,
+            )
+            for slot in slots
+        }
 
     def _ensure_decode_cg(self) -> None:
         """Lazily capture M=1 decode CUDA Graph on first use."""
