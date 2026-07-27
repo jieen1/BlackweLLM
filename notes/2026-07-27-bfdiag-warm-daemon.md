@@ -19,10 +19,17 @@ bfdiag/daemon/client.py                  # Client:Unix socket 客户端
 bfdiag/daemon/queue.py                   # bf submit:FIFO + 笛卡尔积 env 扫描
 bfdiag/daemon/cli.py                     # register(subparsers) 挂载 daemon/exec/repl/submit
 tests/test_bfdiag_protocol.py            # 21 个用例,纯编解码
-tests/test_bfdiag_daemon.py              # 17 个用例,daemon 全生命周期(FakeEngineProvider)
+tests/test_bfdiag_daemon.py              # 41 个用例,daemon 全生命周期 + idle-TTL + 热/冷边界(FakeEngineProvider)
 tests/test_bfdiag_canary.py              # 11 个用例,金丝雀 + 失败重启集成测试
 notes/2026-07-27-bfdiag-warm-daemon.md   # 本文件
 ```
+
+**2026-07-27 补充**(协调者反馈,同一天):加了 idle-TTL 自动释放
+(§7)、热/冷边界的产品化(§8,`requires_cold_restart` + `bf submit` 扫描
+守卫 + `bf run --cold`)、显存快照可见性(§9),并把"热态 vs 冷启动零假设"
+提到 GPU 待办清单(§10)第一位。三件事共享同一个动机:**这台机器只有一块
+GPU,用户本人也要用它**——daemon 不能无限期占着卡,不能让扫描静默产生假
+数据,不能让"热引擎跑久了显存布局变了"这件事对使用者不可见。
 
 验证方式(均在本 worktree 根目录执行):
 
@@ -40,12 +47,13 @@ QSR_BFDIAG_DIR=/tmp/x python -m bfdiag.daemon.cli exec -c "result = 1 + 1"
 QSR_BFDIAG_DIR=/tmp/x python -m bfdiag.daemon.cli daemon stop
 ```
 
-结果:`ruff check .` 全绿;`pytest -q`(全仓库)275 passed, 49 skipped, 2 failed——
-这 2 个失败是**改动前就存在**的基线失败(`test_regression_unit.py` 的一个用例、
-`test_vllm_dependency_boundary.py` 的迁移台账断言),都在 `runtime/` 里、都不是我
-改的文件,任务约束也明确不让碰 `runtime/`,所以原样记录、不处理。改动前的基线是
-`226 passed, 49 skipped, 2 failed`(同样 2 个),`275-226=49` 正好等于我新增的用
-例数,说明没有引入新的回归。
+结果:`ruff check .` 全绿;`pytest -q`(全仓库)299 passed, 49 skipped, 2
+failed——这 2 个失败是**改动前就存在**的基线失败(`test_regression_unit.py`
+的一个用例、`test_vllm_dependency_boundary.py` 的迁移台账断言),都在
+`runtime/` 里、都不是我改的文件,任务约束也明确不让碰 `runtime/`,所以原样
+记录、不处理。改动前的基线是 `226 passed, 49 skipped, 2 failed`(同样 2
+个),`299-226=73` 正好等于我新增的用例总数(首版 49 个 + 补充需求新增 24
+个),说明没有引入新的回归。
 
 ## 2. 协议设计
 
@@ -156,8 +164,8 @@ restarts` 覆盖"`reset()` 本身抛异常"这条崩溃恢复路径。
 
 ## 6. 端到端验证情况(全部 FakeEngineProvider / --provider fake)
 
-- 单元测试:协议编解码(21)、daemon 生命周期/并发/超时/单实例锁/协议健壮性
-  (17)、金丝雀 + 失败重启(11),共 49 个,全绿。
+- 单元测试:协议编解码(21)、daemon 生命周期/并发/超时/单实例锁/协议健壮性/
+  idle-TTL/显存快照/热冷边界(41)、金丝雀 + 失败重启(11),共 73 个,全绿。
 - 手动 smoke test(§1 的命令):`bf daemon start --provider fake` → `status`
   → `exec -c` → `exec <file>` → `submit --sweep` (2 变体,`.bfdiag/runs/
   <run_id>/queue_{request,response}.json` 落盘正确)→ 再次 `daemon start`
@@ -167,44 +175,160 @@ restarts` 覆盖"`reset()` 本身抛异常"这条崩溃恢复路径。
   `python -m bfdiag.daemon.server --provider fake` 子进程,走完整的
   start→ping→status→exec→shutdown,验证的是 `bf daemon start` 实际驱动的那条
   子进程生命周期路径——但全程 `--provider fake`,不会 import torch。
+- 补充需求(idle-TTL/热冷边界/显存快照)额外手动验证过一遍真实子进程场景:
+  `--idle-ttl-s 3` 的 daemon 在两条命令之间的间隙里**真的自己退出了**(日志
+  `idle for 3.8s >= --idle-ttl-s=3.0s, auto-shutting down to release the
+  GPU`),`bf submit --sweep 'QSR_DFLASH_CUDA_GRAPH=0,1'` 真的报错退出
+  (exit=2)而不是静默跑,`bf run --cold --sweep 'MYVAR=x,y'` 真的起了两个
+  独立进程、各自读到自己的环境变量值。
 
-## 7. 需要 GPU 才能验证的待办清单(下一步串行安排的唯一依据)
+## 7. Idle-TTL 自动释放
+
+`server.py::Daemon` 新增 `--idle-ttl-s`(默认 **900 秒**,`QSR_BFD_IDLE_TTL_S`
+环境变量可覆盖,`0` 表示禁用)。语义:
+
+- 计时基准是**最近一次跑完的 `exec`/`reset`**——不是"收到请求"的那一刻,是
+  "处理完"的那一刻(`_worker_loop` 在 `job.done.set()` 之前调
+  `_bump_activity()`)。这样一个跑得比 TTL 还久的实验,不会在它自己跑完的瞬间
+  就被判定为"已经空闲了 TTL 那么久"。
+- **`ping`/`status` 绝不重置计时器**——它们走 `_handle_immediate`,根本不经过
+  `_submit_and_wait`/`_execute_job`,所以一个轮询脚本天然不可能让 daemon 永远
+  活着。
+- 空闲检测**在 `state == "BUSY"` 时永远跳过**(`_idle_watchdog_loop` 的第一个
+  判断),这是防止"一个正常跑着的长实验被空闲看门狗当场拔线"的硬保证——不依赖
+  时钟推算,而是直接看当前状态。
+- 触发后:`provider.unload()`(新加进 `EngineProvider` 协议的方法,释放
+  显存)→ 设置 `_shutdown_event` → 复用已有的 `shutdown` 清理路径(socket
+  unlink、`flock` 释放、worker 线程退出)。`python -m bfdiag.daemon.server`
+  跑在真实子进程里时,`serve_forever()` 返回后 `main()` 也跟着返回,进程自然
+  退出——不需要额外的 `os._exit()`。
+
+**可注入时钟**(`server.py::ManualClock`):`Daemon(..., clock=...)` 默认
+`time.monotonic`,测试传一个 `ManualClock()` 进去,`clock.advance(seconds)`
+瞬间"快进",不需要真的 `sleep` 900 秒。`tests/test_bfdiag_daemon.py::
+TestIdleTTL` 七个用例覆盖:超时触发关闭、活动重置计时器、ping/status 不重置、
+`--idle-ttl-s 0` 禁用、忙碌期间永不触发 + 完成后计时器归零、`status` 暴露
+`idle_s`/`idle_ttl_s`、`exec_count` 只在真正执行时才加一。
+
+## 8. 热/冷边界的产品化
+
+用户问"性能测试能不能直接在热引擎里跑",答案分两类,这一版把边界做进了代码
+而不是只写在文档里:
+
+- **热引擎可靠**:稳态 decode 性能、接受率、精度实验、换 prompt/换 K/换
+  运行时开关。
+- **热引擎不可靠、必须冷启动**:冷启动 prefill 性能(见
+  `notes/2026-07-20-cold-prefill-allocation-sensitivity-investigation.md`)、
+  load-time 配置(`block_size`/容量/`gpu_memory_utilization`/
+  `max_model_len`/量化后端)、显存压力/OOM 边界、首次 CUDA Graph 捕获耗时。
+
+**代码里的边界**(`provider.py`):
+
+- `LOAD_TIME_CONFIG_KEYS`:`LagunaEngineProvider` 构造函数参数里,构造完就
+  锁死、只能靠重启才能改的那一组(`model_path`/`num_slots`/`blocks_per_slot`/
+  `dtype`/`max_model_len`/`gpu_memory_utilization`/`dflash_model_path`)。
+  `describe()["load_config"]` 把这组值暴露出来,`bf daemon status` 能直接
+  看到当前 daemon 是用什么配置起的。
+- `LOAD_TIME_ENV_VARS`:读代码(不是猜)确认的、`LagunaBackend`/`DFlashEngine`
+  构造时**只读一次**的环境变量——`QSR_PREFILL_CHUNK`(`laguna.py:305`)、
+  `QSR_DECODE_CUDA_GRAPH`(`laguna.py:342`)、`QSR_DFLASH_CUDA_GRAPH`
+  (`laguna_dflash.py:168`)、`QSR_VERIFY_CUDA_GRAPH`(`laguna_dflash.py:384`)。
+  这几个之所以重要,是因为原始的 `bf submit --sweep` 例子里就有一个
+  (`QSR_DFLASH_CUDA_GRAPH=0,1`)——在热 daemon 里扫这个变量,构造时已经读过
+  一次的布尔值根本不会因为之后改了 env var 而变化,扫出来的"4 个变体"里至少
+  一半是同一个引擎配置跑出来的两份完全相同的假数据,而且从表面上完全看不
+  出来。
+- `requires_cold_restart(current_cfg, requested_cfg, locked_keys=None) ->
+  list[str]`:纯函数,比较两个 config 字典在锁定 key 上的差异,返回不一致的
+  key 列表(空列表 = 可以安全热复用)。两处用到:
+  1. `bf daemon start` 检测到已有实例时,不再只看 `ping().ok`,还会拿当前
+     CLI 请求的配置和正在跑的 daemon 的 `load_config` 比一遍——配置对不上就
+     **拒绝复用**(打印哪些 key 不一致,提示先 `bf daemon stop`),而不是像
+     以前那样默默复用一个配置早就不一样的旧 daemon。
+  2. `queue.check_sweep_is_hot_safe(specs)`:`bf submit --sweep` 一旦扫到
+     `LOAD_TIME_ENV_VARS` 里的变量名,`submit()` **在联系 daemon 之前**就
+     直接 `raise ValueError`,清楚说明原因并指向 `bf run --cold`。这是硬性
+     要求的落地:宁可报错,不能静默产生一份"看起来是 4 组不同配置、实际上
+     只有 2 组真数据"的结果。
+- `bf run --cold <script> [--sweep ...]`(`cli.py::_cmd_run`):不经过
+  daemon,`--cold` 是**必须显式传的** argparse 必填 flag(测试专门验证过缺省
+  会被 argparse 拒绝),每个 sweep 变体起一个独立的 `subprocess.run([sys.
+  executable, script], env=...)` 真实进程,跑完退出——这才是 load-time 配置
+  扫描的正路,替代了"热 daemon 里硬扫、数字看着像真的但其实没变"的陷阱。
+
+## 9. 显存可见性
+
+热引擎跑得越久,PyTorch caching allocator 越可能碎片化,第 50 个实验的显存
+布局不等于刚启动那一刻——孤立的一个 tok/s 数字在热引擎里因此是不可比的,必须
+连同当时的显存状态一起看。落地方式:
+
+- `EngineProvider` 协议新增 `memory_snapshot() -> dict`。`server.py::_do_exec`
+  在每次 `exec` **前后各调一次**(`_safe_memory_snapshot`,失败也不会弄坏
+  exec 本身),写进 `Response.memory_before`/`memory_after`(`protocol.py`
+  新增的两个字段)。
+- `FakeEngineProvider.memory_snapshot()` 返回一个占位字典(`allocated_bytes`
+  等全部是 `None`,只是为了让协议/daemon 路径端到端可测)。
+  `LagunaEngineProvider.memory_snapshot()`——**代码照写,一次没跑过**——读
+  `torch.cuda.memory_stats()`,取 `allocated_bytes.all.current`/
+  `reserved_bytes.all.current`/`num_alloc_retries`,算一个简单的碎片率
+  `(reserved - allocated) / reserved`。
+- `status()` 新增 `exec_count`(真正执行过的实验数,`ping`/`status`/`reset`
+  都不算)和 `since_cold_start_s`(距**进程**上次真正冷启动过去多久,不随
+  进程内的 TAINTED 重启而归零——那是 provider 对象级别的重建,不是这里想追踪
+  的"进程/CUDA context 活了多久")。
+- **给使用指南的直接结论**:任何从这个 daemon 里拿到的 tok/s、ITL 数字,报告
+  的时候都应该带上当时的 `memory_before`/`memory_after`(或者至少
+  `exec_count`/`since_cold_start_s`)——两次测量如果 `fragmentation_ratio`
+  差异很大,那两次数字本身就不该被当成同一个基准去比较,这不是噪声,是
+  热引擎的真实副作用。
+
+## 10. 需要 GPU 才能验证的待办清单(下一步串行安排的唯一依据)
 
 `LagunaEngineProvider`、`session.reset_laguna_engine`、以及金丝雀在真实
 Laguna+DFlash 引擎上的行为,**一次都没有运行过**——都是照着当前 `runtime/`
 源码(直接 `Read`/`codegraph_explore` 核对过,不是拍脑袋写的)写出来的。上 GPU
-之后必须按下面顺序逐条过一遍,漏一项就可能漏一个真实 bug:
+之后必须按下面顺序逐条过一遍,漏一项就可能漏一个真实 bug。**第 1 条是这份
+清单里最重要的一条,必须排最前面**:
 
-1. **`LagunaEngineProvider.load()` 能不能跑通**:构造 `EngineArgs` → 加载
+1. **零假设:同一个 benchmark,daemon 热态跑 vs 冷启动跑,差异必须在噪声内
+   (建议 p50 相对偏差 < 1%)**。具体做法:选一个现有的、有基线的 benchmark
+   (比如 `benchmarks/` 下测 tok/s 或 ITL 的某个脚本),(a) 冷启动跑一次拿到
+   基线,(b) 在热 daemon 里、已经跑过若干个"无关"实验之后(模拟真实使用场景,
+   不是刚 `load()` 完就测),`bf exec` 同一段测量代码,(c) 对比两次的 p50(以
+   及 §9 提到的显存快照)。**如果差异显著,那就是"热引擎不适合测这类性能"的
+   实证,不是要去调参数消除的噪声**——必须把这个结论写进使用指南(哪些指标
+   只能在热引擎测、哪些必须冷启动测,§8 目前只是"设计上认为"的分类,这一条
+   验证的是"设计上认为"是否等于"实测如此")。不能假设它没问题就跳过这一条。
+2. **`LagunaEngineProvider.load()` 能不能跑通**:构造 `EngineArgs` → 加载
    `LagunaBackend` → 构造 `DFlashEngine`(权重加载 + draft 模型 + CUDA Graph
    捕获)→ `AutoTokenizer.from_pretrained` → `self.reset()`。这一串照抄自
    `benchmarks/diag_acceptance_v2.py::build_vllm_config`,但从没跑过,模型
    路径、`dtype`、`gpu_memory_utilization` 等默认值都需要在真机上确认仍然有效
    (`benchmarks/` 下的脚本这几周改动很快,详见 git log)。
-2. **`load()` 末尾的 `self.reset()` 是否真的把 slot 0/尾部 slot 清干净了**:
+3. **`load()` 末尾的 `self.reset()` 是否真的把 slot 0/尾部 slot 清干净了**:
    验证方法——`load()` 跑完之后,不做任何 reset,直接 dump 一次
    `backend.kv_caches[name][phys_slot_range]` 的统计量(比如非零元素数量),
    确认握手前确实有残留;再验证 `reset()` 之后变干净。这是 §5 表格第 2 行的
    直接验证。
-3. **金丝雀在真实引擎上首次记录的基线是否稳定**:连续跑 3~5 次
+4. **金丝雀在真实引擎上首次记录的基线是否稳定**:连续跑 3~5 次
    `LagunaEngineProvider.generate(DEFAULT_CANARY_PROMPT_IDS, DEFAULT_CANARY_
    STEPS)`(中间穿插 `reset()`),确认 token 序列逐位相同——如果模型本身在
    `enforce_eager=True`/CUDA Graph 混合模式下有任何非确定性(比如某个 kernel
    没有完全关掉 TF32/某个 reduce 顺序不固定),金丝雀本身就会误报,需要先确认
    "干净状态下重复调用是确定的"这个前提成立。
-4. **`enable_prefix_cache=False` 是否真的完全绕开了 `find_prefix_match`**:
+5. **`enable_prefix_cache=False` 是否真的完全绕开了 `find_prefix_match`**:
    验证同一个 slot 连续跑两个不同的 fixed prompt,确认第二次是完整重新
    prefill(而不是复用),可以加日志观察 `backend.find_prefix_match` 是否被
    跳过、或者用不同长度的 prompt 观察 prefill 耗时是否符合"从 0 开始"的预期。
-5. **`generate_verify_only` 返回的 `tokens` 是否只包含新生成的部分**(不含
+6. **`generate_verify_only` 返回的 `tokens` 是否只包含新生成的部分**(不含
    prompt):`LagunaEngineProvider.generate()`/canary 都假设返回值就是"生成的
    延续部分",这个假设需要用一次已知输出的短 prompt 验证。
-6. **draft KV cache 不清零是否真的不影响结果**——§5 表格第 3 行提到的假设。
+7. **draft KV cache 不清零是否真的不影响结果**——§5 表格第 3 行提到的假设。
    建议:先用现有 `benchmarks/diag_acceptance_v2.py` 的方法论(不同长度 prompt
    轮跑),对比"清零 draft KV"和"不清零"两种情况下 acceptance rate 是否一致;
    如果一致,`reset_laguna_engine` 里保留 zero_() 只是防御性开销;如果不一致,
    说明这一步是必要的、而且现有其它诊断脚本里可能还有没加这行的,需要回头排查。
-7. **超时放弃 + 进程内重启在真实 CUDA 场景下的实际后果**(§3 提到的告警):
+8. **超时放弃 + 进程内重启在真实 CUDA 场景下的实际后果**(§3 提到的告警):
    人为制造一次"卡住"(比如给一个诊断脚本传一个会死循环/挂起的 kernel 调用),
    验证——(a) 客户端确实在 `timeout_s` 附近拿到超时响应而不是等到进程 hang;
    (b) `_maybe_restart` 现造的新 `LagunaEngineProvider` 在旧线程仍占着显存时
@@ -212,22 +336,32 @@ Laguna+DFlash 引擎上的行为,**一次都没有运行过**——都是照着�
    daemon 进程(而不是信任进程内重启),需要的话在 `server.py` 加一个"重启也
    失败就 `os._exit()`,让外层脚本/`systemd`/`bf daemon start` 的下一次调用
    重新拉起整个进程"的兜底路径——当前实现里没有这一层,是已知缺口。
-8. **单实例 flock 在多 agent 排队用同一块 GPU 时的实际表现**:目前只在单进程
+9. **单实例 flock 在多 agent 排队用同一块 GPU 时的实际表现**:目前只在单进程
    内用 `AlreadyRunningError` 验证过语义,没有在"两个真实终端同时跑
    `bf daemon start --provider laguna`"的场景下人工验证过锁文件路径、权限、
    NFS/网络文件系统(如果 `.bfdiag/` 真的建在网络盘上,`flock` 的语义可能不
    可靠)等边界情况。
-9. **`bf daemon start --provider laguna` 的 `--wait-s` 默认值(10s)对真实
+10. **`bf daemon start --provider laguna` 的 `--wait-s` 默认值(10s)对真实
    冷启动(权重加载 26.76s + draft 模型 3.97s + CUDA Graph 捕获,参考
    `our_server.log:39,49`)显然不够**——当前行为是超时后打印"still starting"
    并返回 0,不是 bug,但需要在真实环境里确认这个"打印提示、不阻塞"的行为
    符合预期,而不是应该把默认 `--wait-s` 调大或做成异步轮询。
-10. **`describe()` 里的 `model_revision`(`_extract_revision`)对真实 HF
+11. **`describe()` 里的 `model_revision`(`_extract_revision`)对真实 HF
     缓存路径的解析是否正确**:只在字符串上测试过
     `.../snapshots/<hash>/` 模式,没有对着真实 `~/.cache/huggingface/hub/...`
     路径跑过 `os.path.expanduser` 之后的最终形态。
+12. **`LagunaEngineProvider.unload()`/`memory_snapshot()` 从未跑过**:
+    `unload()` 里 `del` 引用 + `gc.collect()` + `torch.cuda.empty_cache()`
+    这套组合拳是否真的把显存还给了系统(而不是被某个我没想到的地方持有的
+    引用挡住),以及 idle-TTL 触发 `unload()` 之后进程退出前这段时间窗口
+    (`_stop()` 还要做 socket/`flock` 清理)会不会有其它代码路径意外碰
+    already-unloaded 的 `self._engine`/`self._backend`(理论上不会,因为
+    `unload()` 只在关闭序列的最后调用,但从未实测)。`memory_snapshot()`
+    里 `torch.cuda.memory_stats()` 的具体 key 名(`allocated_bytes.all.
+    current` 等)需要对着实际安装的 torch 版本核实一遍,不同版本这些 key
+    名曾经变过。
 
-## 8. 已知限制 / 遗留问题
+## 11. 已知限制 / 遗留问题
 
 - **`bfdiag/cli.py` 的 dispatcher 约定是假设的**:另一个 agent 拥有
   `bfdiag/cli.py`,规格只给了 `register(subparsers) -> None` 这一个签名,没有
@@ -236,7 +370,7 @@ Laguna+DFlash 引擎上的行为,**一次都没有运行过**——都是照着�
   `cli.py` 用别的分发约定(比如按 `args.command` 手工 if/elif),需要合并时对
   一下接口,我自己的 `if __name__ == "__main__":` 里就是照这个假设写的,可以
   直接跑通作为参考实现。
-- **超时放弃后的"进程内重启"不是真正的进程级重启**,§3/§7 第 7 条已经说得
+- **超时放弃后的"进程内重启"不是真正的进程级重启**,§3/§10 第 8 条已经说得
   很清楚:真实 CUDA 卡死场景下这条恢复路径大概率不够,需要 GPU 验证后决定要
   不要加一层"重启也失败就 `os._exit()`"的兜底。
 - **金丝雀目前只覆盖 DFlash 的 eager/verify-only 路径**,不覆盖
@@ -246,6 +380,21 @@ Laguna+DFlash 引擎上的行为,**一次都没有运行过**——都是照着�
   发生在 replay 特有的 buffer 里而不是 KV cache/slot 计数器上,今天的金丝雀
   不一定能测出来。这是一个已知的覆盖面缺口,不是遗漏,只是本任务优先级
   (a)(b)(c) 排在前面,没有时间做到 (c) 之外的加固。
+- **§8 的"热引擎可靠 vs 必须冷启动"分类目前是设计判断,不是实测结论**——
+  §10 第 1 条(零假设验证)就是专门用来证伪或证实这个分类的,在那条跑完之前,
+  不应该把 §8 的分类当成"已验证"来对外宣传。
+- **idle-TTL 触发的进程退出依赖 `main()` 正常返回**:真实子进程
+  (`python -m bfdiag.daemon.server`)下这条路径已经手动验证过(见 §6 最后一
+  条),但如果未来有人把 `Daemon` 嵌到一个不通过 `main()`/`serve_forever()`
+  的宿主进程里(比如某种进程内嵌入式用法),需要自己确保 `_auto_shutdown_
+  for_idle` 触发后宿主也会跟着退出——`Daemon` 本身只负责释放 GPU 和停止
+  accept 循环,不会主动 `sys.exit()` 整个宿主进程。
+- **`requires_cold_restart`/`LOAD_TIME_CONFIG_KEYS`/`LOAD_TIME_ENV_VARS` 是
+  两套独立的 key 空间**,分别对应"构造函数参数"和"读一次的环境变量",刻意
+  没有合并成一套,因为 `bf daemon start` 的复用检测(比较 CLI 参数)和
+  `bf submit --sweep` 的守卫(比较环境变量名)本来就是不同粒度的问题——如果
+  以后 Laguna 侧新增了"读环境变量决定的 load-time 参数"(而不是构造函数
+  参数),需要同时更新两套集合,不会自动同步。
 - **`.bfdiag/runs/<run_id>/` 下的文件命名**:`queue.py` 只写
   `queue_request.json`/`queue_response.json`,刻意加前缀避免和其它 3 个
   agent 的 run-record 模块打架;如果最终合并后发现命名冲突或者希望统一 schema,

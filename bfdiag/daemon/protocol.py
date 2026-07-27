@@ -33,6 +33,8 @@ _RESPONSE_FIELD_ORDER = (
     "elapsed_s",
     "state",
     "run_id",
+    "memory_before",
+    "memory_after",
 )
 
 
@@ -105,6 +107,10 @@ class Response:
     exec'd code raised; ``error`` is a short daemon-side message (protocol
     errors, timeouts, canary refusals); ``state`` is the daemon's state
     (``READY``/``BUSY``/``TAINTED``/...) after handling this request.
+    ``memory_before``/``memory_after`` are GPU memory snapshots taken
+    immediately around an ``exec`` (``None`` for other ops) -- see
+    ``EngineProvider.memory_snapshot()``; a tok/s number from a long-lived
+    hot daemon is not comparable across experiments without these.
     """
 
     ok: bool
@@ -116,6 +122,8 @@ class Response:
     elapsed_s: float = 0.0
     state: str | None = None
     run_id: str | None = None
+    memory_before: dict[str, Any] | None = None
+    memory_after: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

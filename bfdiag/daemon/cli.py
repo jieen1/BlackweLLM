@@ -14,23 +14,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 from bfdiag.daemon.client import Client, DaemonNotRunning
-from bfdiag.daemon.queue import format_results, submit
+from bfdiag.daemon.provider import LOAD_TIME_CONFIG_KEYS, requires_cold_restart
+from bfdiag.daemon.queue import expand_sweeps, format_results, submit
 from bfdiag.daemon.server import default_socket_path
 
 
 def register(subparsers: argparse._SubParsersAction) -> None:
-    """Mount ``daemon``, ``exec``, ``repl``, ``submit`` onto the shared
-    top-level argparse subparsers object."""
+    """Mount ``daemon``, ``exec``, ``repl``, ``submit``, ``run`` onto the
+    shared top-level argparse subparsers object."""
     _register_daemon(subparsers)
     _register_exec(subparsers)
     _register_repl(subparsers)
     _register_submit(subparsers)
+    _register_run(subparsers)
 
 
 def _register_daemon(subparsers: argparse._SubParsersAction) -> None:
@@ -44,7 +47,17 @@ def _register_daemon(subparsers: argparse._SubParsersAction) -> None:
     start_parser.add_argument("--socket", default=None)
     start_parser.add_argument("--model-path", default=None)
     start_parser.add_argument("--num-slots", type=int, default=1)
+    start_parser.add_argument("--blocks-per-slot", type=int, default=4096)
+    start_parser.add_argument("--dtype", default="bfloat16")
+    start_parser.add_argument("--max-model-len", type=int, default=131072)
+    start_parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
     start_parser.add_argument("--no-canary", action="store_true")
+    start_parser.add_argument(
+        "--idle-ttl-s",
+        type=float,
+        default=None,
+        help="auto-shutdown after this many idle seconds (default 900; 0 disables)",
+    )
     start_parser.add_argument(
         "--wait-s", type=float, default=10.0, help="how long to wait for readiness before returning"
     )
@@ -93,6 +106,29 @@ def _register_submit(subparsers: argparse._SubParsersAction) -> None:
     submit_parser.set_defaults(func=_cmd_submit)
 
 
+def _register_run(subparsers: argparse._SubParsersAction) -> None:
+    run_parser = subparsers.add_parser(
+        "run",
+        help="run a script as an independent cold-start process (no daemon involved)",
+    )
+    run_parser.add_argument("script", help="path to a Python script")
+    run_parser.add_argument(
+        "--cold",
+        action="store_true",
+        required=True,
+        help="explicit: this is the only mode today (a real, from-scratch process per run)",
+    )
+    run_parser.add_argument(
+        "--sweep",
+        action="append",
+        default=[],
+        metavar="NAME=v1,v2,...",
+        help="Cartesian-product env-var sweep; repeatable. Unlike `bf submit`, load-time "
+        "config IS safe to sweep here -- each variant gets its own fresh process",
+    )
+    run_parser.set_defaults(func=_cmd_run)
+
+
 # -- daemon start/status/stop ---------------------------------------------
 
 
@@ -109,11 +145,53 @@ def _print_status(client: Client) -> None:
     print(json.dumps(response.result, indent=2, default=str))
 
 
+def _requested_load_config(args: argparse.Namespace) -> dict[str, object]:
+    """The load-time config this CLI invocation is asking for, in the same
+    key-space as ``LagunaEngineProvider.describe()["load_config"]`` (see
+    ``provider.LOAD_TIME_CONFIG_KEYS``) -- used to decide whether reusing
+    an already-running daemon is actually safe."""
+    return {
+        "model_path": args.model_path,
+        "num_slots": args.num_slots,
+        "blocks_per_slot": args.blocks_per_slot,
+        "dtype": args.dtype,
+        "max_model_len": args.max_model_len,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+    }
+
+
 def _cmd_daemon_start(args: argparse.Namespace) -> int:
     socket_path = Path(args.socket) if args.socket else default_socket_path()
     client = Client(socket_path=socket_path)
     try:
         if client.ping().ok:
+            running_status = client.status().result
+            running_cfg = running_status.get("provider", {}).get("load_config", {})
+            requested_cfg = _requested_load_config(args)
+            # Only compare keys the running provider actually tracks (a
+            # FakeEngineProvider's load_config is deliberately sparse --
+            # missing-there means "not meaningful for this provider", not
+            # "a requested change"), and treat an unset --model-path
+            # (None) as "keep whatever's already loaded", not a deliberate
+            # override attempt.
+            comparable_requested_cfg = {
+                key: value for key, value in requested_cfg.items() if key in running_cfg
+            }
+            if requested_cfg.get("model_path") is None:
+                comparable_requested_cfg.pop("model_path", None)
+            mismatched = requires_cold_restart(
+                running_cfg, comparable_requested_cfg, locked_keys=LOAD_TIME_CONFIG_KEYS
+            )
+            if mismatched:
+                print(
+                    f"bf daemon start: a daemon is already running at {socket_path} but with "
+                    f"a DIFFERENT load-time config for {mismatched} -- reusing it would silently "
+                    "keep serving the OLD config, not the one just requested. Run "
+                    "`bf daemon stop` first, then start again with the new config.",
+                    file=sys.stderr,
+                )
+                _print_status(client)
+                return 1
             print(f"bfdiag daemon already running at {socket_path} (reusing).")
             _print_status(client)
             return 0
@@ -130,6 +208,14 @@ def _cmd_daemon_start(args: argparse.Namespace) -> int:
         args.provider,
         "--socket",
         str(socket_path),
+        "--blocks-per-slot",
+        str(args.blocks_per_slot),
+        "--dtype",
+        args.dtype,
+        "--max-model-len",
+        str(args.max_model_len),
+        "--gpu-memory-utilization",
+        str(args.gpu_memory_utilization),
     ]
     if args.model_path:
         cmd += ["--model-path", args.model_path]
@@ -137,6 +223,8 @@ def _cmd_daemon_start(args: argparse.Namespace) -> int:
         cmd += ["--num-slots", str(args.num_slots)]
     if args.no_canary:
         cmd.append("--no-canary")
+    if args.idle_ttl_s is not None:
+        cmd += ["--idle-ttl-s", str(args.idle_ttl_s)]
 
     with open(log_path, "ab") as log_file:
         subprocess.Popen(
@@ -278,6 +366,35 @@ def _cmd_submit(args: argparse.Namespace) -> int:
     print(f"bf submit: {len(results)} variant(s) run:")
     print(format_results(results))
     return 0 if all(r.ok for r in results) else 1
+
+
+# -- run --cold -------------------------------------------------------------
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    """Cold path for load-time config sweeps: no daemon, each variant is a
+    genuinely independent ``python script.py`` process. This is the
+    counterpart ``bf submit`` points to when a sweep touches a
+    load-time-locked variable (see ``queue.check_sweep_is_hot_safe``)."""
+    script_path = Path(args.script).resolve()
+    if not script_path.is_file():
+        print(f"bf run: no such file: {script_path}", file=sys.stderr)
+        return 2
+    try:
+        overlays = expand_sweeps(args.sweep)
+    except ValueError as exc:
+        print(f"bf run: {exc}", file=sys.stderr)
+        return 2
+
+    exit_codes: list[int] = []
+    for overlay in overlays:
+        env = dict(os.environ)
+        env.update(overlay)
+        label = ",".join(f"{k}={v}" for k, v in overlay.items()) or "(no sweep)"
+        print(f"bf run --cold: {label}")
+        result = subprocess.run([sys.executable, str(script_path)], env=env, check=False)
+        exit_codes.append(result.returncode)
+    return 0 if all(code == 0 for code in exit_codes) else 1
 
 
 if __name__ == "__main__":
