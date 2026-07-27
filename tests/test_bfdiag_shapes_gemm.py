@@ -7,6 +7,8 @@ obtained.
 
 from __future__ import annotations
 
+import pytest
+
 from bfdiag.shapes.gemm import (
     draft_attention_gemms,
     draft_dense_gemms,
@@ -14,9 +16,15 @@ from bfdiag.shapes.gemm import (
     draft_qkv_proj_gemm,
     target_dense_gemms,
 )
-from bfdiag.shapes.model import load_draft_config, load_laguna_config
+from bfdiag.shapes.model import (
+    DEFAULT_DRAFT_MODEL_ID,
+    DEFAULT_MODEL_ID,
+    load_draft_config,
+    load_laguna_config,
+)
 
 
+@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
 def test_target_attention_proj_gemms_match_real_weight_shapes():
     """Real weights on this machine:
     layer 0 (full):    q_proj=[6144,3072] k/v_proj=[1024,3072] o_proj=[3072,6144] g_proj=[48,3072]
@@ -41,6 +49,7 @@ def test_target_attention_proj_gemms_match_real_weight_shapes():
         assert g.m == 7
 
 
+@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
 def test_target_dense_mlp_and_moe_gemms_match_real_weight_shapes():
     """layer 0 dense mlp: gate/up=[12288,3072] down=[3072,12288]
     router gate: [256,3072]; shared_expert: gate/up=[1024,3072] down=[3072,1024]
@@ -61,6 +70,7 @@ def test_target_dense_mlp_and_moe_gemms_match_real_weight_shapes():
     assert gemms["lm_head"].weight_shape == (100352, 3072)
 
 
+@pytest.mark.requires_hf_snapshot(DEFAULT_DRAFT_MODEL_ID)
 def test_draft_qkv_proj_is_fused_and_matches_real_weight_shape():
     """Real draft checkpoint: self_attn.qkv_proj.weight = [11264, 3072]
     (72*128 q + 8*128 k + 8*128 v = 9216 + 1024 + 1024), a real architecture
@@ -72,6 +82,7 @@ def test_draft_qkv_proj_is_fused_and_matches_real_weight_shape():
     assert gemm.m == 3
 
 
+@pytest.mark.requires_hf_snapshot(DEFAULT_DRAFT_MODEL_ID)
 def test_draft_attention_gemms_match_real_weight_shapes():
     draft = load_draft_config()
     gemms = {g.name: g for g in draft_attention_gemms(draft, num_tokens=1)}
@@ -80,6 +91,7 @@ def test_draft_attention_gemms_match_real_weight_shapes():
     assert gemms["draft.g_proj"].weight_shape == (72, 3072)
 
 
+@pytest.mark.requires_hf_snapshot(DEFAULT_DRAFT_MODEL_ID)
 def test_draft_fc_gemm_matches_real_weight_shape():
     """Real draft checkpoint: fc.weight = [3072, 18432] = [hidden, 6*hidden]
     (EAGLE-style fusion of the 6 aux hidden states)."""
@@ -89,6 +101,7 @@ def test_draft_fc_gemm_matches_real_weight_shape():
     assert gemm.k == 6 * 3072
 
 
+@pytest.mark.requires_hf_snapshot(DEFAULT_DRAFT_MODEL_ID)
 def test_draft_dense_gemms_has_no_lm_head():
     """The draft checkpoint has no lm_head/embed_tokens tensor -- it reuses
     the target model's tied lm_head. draft_dense_gemms must not invent one."""

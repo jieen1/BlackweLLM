@@ -117,9 +117,7 @@ SERVER_BLOCKS_PER_SLOT = int(
 # eager decode_batch_sampled is no longer the only path exercised in
 # production. QSR_SERVER_ENABLE_CUDAGRAPH=0 / --no-cudagraph still rolls
 # back to eager.
-SERVER_ENABLE_CUDAGRAPH = (
-    os.environ.get("QSR_SERVER_ENABLE_CUDAGRAPH", "1") != "0"
-)
+SERVER_ENABLE_CUDAGRAPH = os.environ.get("QSR_SERVER_ENABLE_CUDAGRAPH", "1") != "0"
 # P4a (notes/prefix-cache-design.md sec 5-P4): the prefix-cache rollback
 # spine, plumbed straight into ServerEngine(enable_prefix_cache=...). Default
 # ON (this is THE product value -- warm prefix hits served across requests);
@@ -728,9 +726,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     # tokens ARE the answer -- there is no reasoning to strip. In thinking mode
     # the tokens start with the reasoning body (the opening  tag was
     # injected by the prompt), which we wrap and strip below.
-    _non_thinking = bool(
-        req.chat_template_kwargs and req.chat_template_kwargs.get("enable_thinking") is False
-    ) or engine.backend_name != "qwen36"
+    _non_thinking = (
+        bool(req.chat_template_kwargs and req.chat_template_kwargs.get("enable_thinking") is False)
+        or engine.backend_name != "qwen36"
+    )
     reasoning_content = None
     if _non_thinking:
         text = raw_text.replace("\ufffd", "").strip()

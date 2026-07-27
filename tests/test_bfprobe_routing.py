@@ -92,8 +92,12 @@ def test_multiple_layers_preserve_call_order_for_offline_reconstruction():
     # this fixed call order (no explicit layer index is emitted) to
     # reconstruct the (round, layer, token) grid.
     site_sequence = [site_id for site_id, _ in stub.recorded_tensors]
-    assert site_sequence == [
-        routing.SITE_ROUTER_LOGITS,
-        routing.SITE_TOPK_IDS,
-        routing.SITE_TOPK_WEIGHTS,
-    ] * 3
+    assert (
+        site_sequence
+        == [
+            routing.SITE_ROUTER_LOGITS,
+            routing.SITE_TOPK_IDS,
+            routing.SITE_TOPK_WEIGHTS,
+        ]
+        * 3
+    )

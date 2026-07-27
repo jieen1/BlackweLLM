@@ -10,7 +10,10 @@ requires-python = ">=3.10"
 
 [project.optional-dependencies]
 cuda = ["numpy>=2,<3", "safetensors>=0.6.2", "torch==2.11.0"]
-dev = ["pytest>=8", "ruff>=0.8"]
+# numpy is a *test* dependency here, not a runtime one: the CPU-only bfprobe
+# routing/comparator tests build their synthetic fixtures with plain numpy
+# arrays and need no GPU, so CI must be able to import it to run them.
+dev = ["numpy>=2,<3", "pytest>=8", "ruff>=0.8"]
 serving = ["requests>=2.31", "transformers>=4.45", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
 vllm-provider = ["vllm==0.26.0"]
 
@@ -23,6 +26,11 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# notes/ holds prose plus the occasional verbatim snapshot of third-party
+# source (e.g. the archived vLLM sm120_gqa backend backup) kept for
+# reference. Those snapshots are deliberately byte-for-byte copies, so
+# linting or reformatting them would destroy the thing they exist to record.
+extend-exclude = ["notes"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]

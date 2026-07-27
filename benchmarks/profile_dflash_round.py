@@ -33,7 +33,7 @@ def make_ids(n):
 from runtime.compat_vllm import EngineArgs
 from runtime.backends.laguna import LagunaBackend
 from runtime.backends.laguna_dflash import DFlashEngine
-from runtime.backends.dflash_constants import NUM_SPECULATIVE_TOKENS, NUM_QUERY_PER_REQ
+from runtime.backends.dflash_constants import NUM_QUERY_PER_REQ
 from runtime.backends.laguna_dflash import (
     _verify_only_accept_reject,
     _physical_slot,

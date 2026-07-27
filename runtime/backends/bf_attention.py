@@ -17,7 +17,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-
 from vllm._custom_ops import reshape_and_cache_flash
 
 logger = logging.getLogger("qwen_sm120_runtime.bf_attention")
@@ -167,8 +166,14 @@ class BFAttention(nn.Module):
                 k_cache = k_cache.view(torch.float8_e4m3fn)
                 v_cache = v_cache.view(torch.float8_e4m3fn)
             reshape_and_cache_flash(
-                k, v, k_cache, v_cache, sm,
-                self.kv_cache_dtype, self._k_scale, self._v_scale,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                sm,
+                self.kv_cache_dtype,
+                self._k_scale,
+                self._v_scale,
             )
 
         # Sparkinfer attention forward

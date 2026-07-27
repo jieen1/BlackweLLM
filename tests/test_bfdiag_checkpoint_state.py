@@ -6,10 +6,14 @@ estimate table. Nothing here touches the GPU -- ``state.py`` has zero
 
 from __future__ import annotations
 
-import torch
+import pytest
 
-from bfdiag.checkpoint import state
-from bfdiag.checkpoint.testing import FakeBackend, FakeDFlashEngine
+# The fakes are pure Python, but bfdiag.checkpoint imports torch at module
+# scope for the tensor save/restore path.
+torch = pytest.importorskip("torch")
+
+from bfdiag.checkpoint import state  # noqa: E402
+from bfdiag.checkpoint.testing import FakeBackend, FakeDFlashEngine  # noqa: E402
 
 # --- declarative checklist ---------------------------------------------------
 

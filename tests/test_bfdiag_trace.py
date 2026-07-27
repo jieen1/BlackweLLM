@@ -97,10 +97,7 @@ class TestDumpReadRoundtrip:
 class TestPanelStats:
     def _rows(self) -> list[RoundEvent]:
         ring = _make_ring(
-            [
-                {"kv_len_before": i, "accepted_n": 15, "reject_position": -1}
-                for i in range(5)
-            ]
+            [{"kv_len_before": i, "accepted_n": 15, "reject_position": -1} for i in range(5)]
             + [{"kv_len_before": 5, "accepted_n": 2, "reject_position": 2}]
         )
         return ring.snapshot()

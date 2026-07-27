@@ -23,10 +23,9 @@ from runtime.backends.dflash_constants import (
     NUM_QUERY_PER_REQ,
 )
 from runtime.backends.laguna import LagunaBackend, _physical_slot
+from runtime.backends.laguna_cuda_graph import _debug_swa_align_gran
 
 logger = logging.getLogger("qwen_sm120_runtime.dflash_cudagraph")
-
-from runtime.backends.laguna_cuda_graph import _debug_swa_align_gran
 
 # TEMP diagnostic accumulator for QSR_DEBUG_LOGITS_LIGHT=1 (see
 # DFlashDraftCudaGraph.replay()). Module-level so a driver script can dump
@@ -36,10 +35,20 @@ _LIGHT_LOG: list[tuple[int, int, int, list[int]]] = []
 
 def dump_light_log(path: str) -> None:
     import json
+
     with open(path, "w") as f:
         for bs, kv_len, bonus_token, draft_tokens in _LIGHT_LOG:
-            f.write(json.dumps({"bs": bs, "kv_len": kv_len, "bonus_token": bonus_token,
-                                 "draft_tokens": draft_tokens}) + "\n")
+            f.write(
+                json.dumps(
+                    {
+                        "bs": bs,
+                        "kv_len": kv_len,
+                        "bonus_token": bonus_token,
+                        "draft_tokens": draft_tokens,
+                    }
+                )
+                + "\n"
+            )
 
 
 class DFlashVerifyCudaGraph:
@@ -494,14 +503,22 @@ class DFlashDraftCudaGraph:
         self._cache_seqlens[0] = aligned_len
 
         import os as _os
+
         if _os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
             import logging as _logging
+
             _logger = _logging.getLogger("qwen_sm120_runtime.laguna_dflash_cudagraph")
             pt = self._page_table[0, :n_ring].tolist()
             _logger.warning(
                 "CHUNK_CHECK draft_fill_buffers bs=%d kv_len=%d window_start=%d "
                 "aligned_start=%d aligned_len=%d n_ring=%d page_table=%s",
-                bs, kv_len, window_start, aligned_start, aligned_len, n_ring, pt,
+                bs,
+                kv_len,
+                window_start,
+                aligned_start,
+                aligned_len,
+                n_ring,
+                pt,
             )
 
         # Vectorized slot mapping -- reuse self._positions (same arange as
@@ -596,6 +613,7 @@ class DFlashDraftCudaGraph:
             return []
 
         import os as _os
+
         dump_kv_len = _os.environ.get("QSR_DEBUG_RING_DUMP_KV_LEN")
         # >= (not ==) and a one-shot latch: round-boundary kv_len values are
         # accept-count-dependent and may not land on an exact requested
@@ -612,17 +630,28 @@ class DFlashDraftCudaGraph:
             kv = self.engine._draft_kv_caches[name0]
             phys = _physical_slot(slot)
             base = phys * self._draft_blocks_per_slot
-            ring_raw = kv[:, base:base + self._draft_blocks_per_slot]
+            ring_raw = kv[:, base : base + self._draft_blocks_per_slot]
             if ring_raw.dtype == torch.uint8:
                 ring_raw = ring_raw.view(torch.float8_e4m3fn)
             ring_slice = ring_raw.float().clone().cpu()
-            torch.save({"kv_len": kv_len, "block_size": self.block_size,
-                        "draft_blocks_per_slot": self._draft_blocks_per_slot,
-                        "ring": ring_slice}, dump_path)
+            torch.save(
+                {
+                    "kv_len": kv_len,
+                    "block_size": self.block_size,
+                    "draft_blocks_per_slot": self._draft_blocks_per_slot,
+                    "ring": ring_slice,
+                },
+                dump_path,
+            )
             import logging as _logging
+
             _logging.getLogger("qwen_sm120_runtime.laguna_dflash_cudagraph").warning(
                 "RING_DUMP saved kv_len=%d bs=%d shape=%s to %s",
-                kv_len, self.block_size, tuple(ring_slice.shape), dump_path)
+                kv_len,
+                self.block_size,
+                tuple(ring_slice.shape),
+                dump_path,
+            )
 
         self._input_ids[0] = bonus_token
         self._input_ids[1 : self.num_tokens] = MASK_TOKEN_ID
@@ -634,6 +663,7 @@ class DFlashDraftCudaGraph:
         result = draft_tokens.tolist()
 
         import os as _os
+
         if _os.environ.get("QSR_DEBUG_LOGITS_LIGHT") == "1":
             # Minimal-overhead variant: accumulate in RAM (no extra GPU ops
             # beyond what `result` already required, no per-call file I/O),

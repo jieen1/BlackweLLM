@@ -27,7 +27,8 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field, replace as dataclass_replace
+from dataclasses import dataclass, field
+from dataclasses import replace as dataclass_replace
 from typing import Any
 
 from runtime.sampling import SamplingParams
@@ -561,9 +562,7 @@ class ServerEngine:
         if not self._ready_event.wait(timeout=600):
             raise RuntimeError("Engine thread failed to initialize model within 600s")
         if self._load_error is not None:
-            raise RuntimeError(
-                "Engine thread failed during model loading"
-            ) from self._load_error
+            raise RuntimeError("Engine thread failed during model loading") from self._load_error
 
     async def stop(self) -> None:
         self._stop = True
