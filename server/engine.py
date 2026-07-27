@@ -241,16 +241,17 @@ class ServerEngine:
         if enable_dflash:
             if backend == "qwen36":
                 raise ValueError("enable_dflash is only supported for backend='laguna'")
-            if capacity != 1:
-                # DFlashEngine's draft/verify CUDA Graphs are captured for a
-                # single physical slot (runtime/backends/laguna_dflash.py
-                # DFlashEngine._init_buffers) -- a capacity>1 batch would
-                # replay the same graph for multiple real requests, reading/
-                # writing the wrong physical slot's KV cache.
-                raise ValueError(
-                    f"enable_dflash requires capacity=1 (DFlash's CUDA Graphs are "
-                    f"captured for one physical slot), got capacity={capacity}"
-                )
+            # DFlashEngine's draft/verify CUDA Graphs are captured against ONE
+            # set of scratch buffers (runtime/backends/laguna_dflash_cudagraph.py
+            # / laguna_cuda_graph.py LagunaCudaGraphVerify), not a batch-shaped
+            # buffer like decode CG's LagunaCudaGraphDecode. Concurrency
+            # (capacity>1) is supported by re-addressing those shared buffers
+            # per call (_fill_buffers(slot, ...) recomputes every offset from
+            # `slot` before each replay) and processing the round's active
+            # slots with one sequential CUDA Graph replay per slot -- correct
+            # per-slot isolation (verified: notes/2026-07-27-dflash-multi-slot-
+            # concurrency.md), but N sequential single-token-batch replays,
+            # not one batched N-wide replay like decode CG. No capacity cap.
             from runtime.backends.dflash_constants import NUM_SPECULATIVE_TOKENS
 
             self.K = NUM_SPECULATIVE_TOKENS
@@ -328,6 +329,7 @@ class ServerEngine:
 
         # -- engine thread state --
         self._ready_event = threading.Event()
+        self._load_error: BaseException | None = None
         self._engine_thread: threading.Thread | None = None
         self._asyncio_loop: asyncio.AbstractEventLoop | None = None
         self._stop = False
@@ -558,6 +560,10 @@ class ServerEngine:
         self._engine_thread.start()
         if not self._ready_event.wait(timeout=600):
             raise RuntimeError("Engine thread failed to initialize model within 600s")
+        if self._load_error is not None:
+            raise RuntimeError(
+                "Engine thread failed during model loading"
+            ) from self._load_error
 
     async def stop(self) -> None:
         self._stop = True
@@ -858,8 +864,17 @@ class ServerEngine:
         here), then runs the continuous-batching loop until stopped."""
         try:
             self._load_model()
-        except Exception:
+        except Exception as exc:
             logger.exception("FATAL: model loading failed on engine thread")
+            # Bug found 2026-07-27 testing DFlash capacity>1 (an oversized
+            # blocks_per_slot triggered a real draft-model-load CUDA OOM):
+            # this branch set _ready_event without recording the failure, so
+            # start()'s wait() returned normally and the server came up
+            # "healthy" (/health -> 200) with the engine thread already
+            # exited -- every real request would hang forever, since
+            # _step_sync never runs. Record the exception so start() can
+            # re-raise and fail the server startup loudly instead.
+            self._load_error = exc
             self._ready_event.set()
             return
         self._ready_event.set()

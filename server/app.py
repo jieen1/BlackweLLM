@@ -892,7 +892,13 @@ def main() -> None:
     parser.add_argument(
         "--dflash",
         action="store_true",
-        help="Enable DFlash speculative decoding (Laguna backend only, requires --capacity 1).",
+        help=(
+            "Enable DFlash speculative decoding (Laguna backend only). Any "
+            "--capacity is supported; DFlash's CUDA Graphs replay once per "
+            "active slot per round (not batched), so throughput scales "
+            "sub-linearly with capacity -- see notes/2026-07-27-dflash-"
+            "multi-slot-concurrency.md."
+        ),
     )
     args = parser.parse_args()
 
@@ -903,8 +909,6 @@ def main() -> None:
         parser.error(
             "--session-affinity requires the prefix cache (cannot combine with --no-prefix-cache)"
         )
-    if args.dflash and args.capacity != 1:
-        parser.error("--dflash requires --capacity 1 (DFlash's CUDA Graphs are single-slot)")
 
     os.environ["QSR_SERVER_CAPACITY"] = str(args.capacity)
     os.environ["QSR_SERVER_NUM_SLOTS"] = str(args.num_slots)
