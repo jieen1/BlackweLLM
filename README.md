@@ -292,7 +292,7 @@ The deployed production runtime (`~/vllm_server/vllm_ctl.sh`) currently runs
 ## Metrics & Observability
 
 `GET /metrics` exposes Prometheus metrics in the vLLM naming convention
-(`vllm:*`), scraped by the local Prometheus container. They cover speed
+(`blackwellm:*`), scraped by the local Prometheus container. They cover speed
 (`e2e_request_latency_seconds`, `time_to_first_token_seconds`,
 `request_time_per_output_token_seconds`, prompt/generation token histograms
 and throughput counters), stability/reliability (`num_requests_running`,

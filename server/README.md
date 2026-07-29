@@ -65,7 +65,7 @@ runtime. The default **16384 ⇒ 262144-token (256K) ceiling**. The KV cache is
 a single shared `BlockPool` of ~40000 blocks (sized in `engine.py`
 `_load_model` to fit the GPU with headroom for activations/GDN snapshots);
 blocks are allocated FROM that pool ON DEMAND per slot, not reserved up front,
-so idle `vllm:kv_cache_used_blocks` is 0. Two simultaneous 256K requests
+so idle `blackwellm:kv_cache_used_blocks` is 0. Two simultaneous 256K requests
 (2 × 16384 = 32768 blocks) fit within the pool with spare for the prefix
 cache. The previous deployed value (4200 ⇒ 67200) wrongly rejected real
 long-context requests (e.g. `prompt 25843 + max_tokens 64000`); see
@@ -82,8 +82,8 @@ bundle, skip re-prefilling the cached prefix. The hit depth `L` and the
 prefill tokens saved are reported by `/debug/stats` under
 `prefix_cache_hits` / `prefix_cache_misses` / `prefix_cache_hit_rate` /
 `prefix_cache_hit_L_samples` / `prefix_cache_hit_tokens_saved`, and the
-counters are exported as `vllm:prefix_cache_hits_total` /
-`vllm:prefix_cache_misses_total` / `vllm:prefix_cache_hit_rate`.
+counters are exported as `blackwellm:prefix_cache_hits_total` /
+`blackwellm:prefix_cache_misses_total` / `blackwellm:prefix_cache_hit_rate`.
 
 `--no-prefix-cache` (or `QSR_SERVER_ENABLE_PREFIX_CACHE=0`) rolls back to
 the pre-P4a server **byte-for-byte**. `_finish_request` still does an
@@ -111,7 +111,7 @@ zero-restore signal).
 ## Metrics
 
 `GET /metrics` returns Prometheus text in the vLLM naming convention
-(`vllm:*`, all labelled `model_name`), scraped by the local Prometheus
+(`blackwellm:*`, all labelled `model_name`), scraped by the local Prometheus
 (`~/vllm_server` docker `vllm-prometheus`, job `vllm`, 15s interval).
 
 **Performance / speed** (the core focus; app-layer, recorded per request in
@@ -120,42 +120,42 @@ zero-restore signal).
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `vllm:e2e_request_latency_seconds` | histogram | request received → response complete |
-| `vllm:time_to_first_token_seconds` | histogram | streaming time to first generated token (TTFT) |
-| `vllm:request_time_per_output_token_seconds` | histogram | `(e2e − ttft) / (gen_tokens − 1)` (TPOT) |
-| `vllm:request_prompt_tokens` | histogram | prompt-length distribution |
-| `vllm:request_generation_tokens` | histogram | generation-length distribution |
-| `vllm:prompt_tokens_total` | counter | total prompt tokens processed (throughput) |
-| `vllm:generation_tokens_total` | counter | total generation tokens produced (throughput) |
+| `blackwellm:e2e_request_latency_seconds` | histogram | request received → response complete |
+| `blackwellm:time_to_first_token_seconds` | histogram | streaming time to first generated token (TTFT) |
+| `blackwellm:request_time_per_output_token_seconds` | histogram | `(e2e − ttft) / (gen_tokens − 1)` (TPOT) |
+| `blackwellm:request_prompt_tokens` | histogram | prompt-length distribution |
+| `blackwellm:request_generation_tokens` | histogram | generation-length distribution |
+| `blackwellm:prompt_tokens_total` | counter | total prompt tokens processed (throughput) |
+| `blackwellm:generation_tokens_total` | counter | total generation tokens produced (throughput) |
 
 **Stability / reliability:**
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `vllm:num_requests_running` | gauge | requests currently generating |
-| `vllm:num_requests_waiting` | gauge | requests queued for a slot |
-| `vllm:num_free_slots` | gauge | free production slots |
-| `vllm:request_success_total` | counter | successful requests by `endpoint` + `finish_reason` (`stop`/`length`/`tool_calls`) |
-| `vllm:request_errors_total` | counter | rejected/failed requests by `endpoint` + status `code` (400 capacity/invalid, 500 internal) |
-| `vllm:requests_completed_total` | counter | engine-level completed requests |
-| `vllm:kv_cache_usage_perc` | gauge | KV cache utilisation (0–1) |
-| `vllm:kv_cache_total_blocks` / `vllm:kv_cache_used_blocks` | gauge | KV block pool size / in use |
-| `vllm:capacity_tokens_per_slot` | gauge | live per-slot context ceiling (256K = 262144) |
+| `blackwellm:num_requests_running` | gauge | requests currently generating |
+| `blackwellm:num_requests_waiting` | gauge | requests queued for a slot |
+| `blackwellm:num_free_slots` | gauge | free production slots |
+| `blackwellm:request_success_total` | counter | successful requests by `endpoint` + `finish_reason` (`stop`/`length`/`tool_calls`) |
+| `blackwellm:request_errors_total` | counter | rejected/failed requests by `endpoint` + status `code` (400 capacity/invalid, 500 internal) |
+| `blackwellm:requests_completed_total` | counter | engine-level completed requests |
+| `blackwellm:kv_cache_usage_perc` | gauge | KV cache utilisation (0–1) |
+| `blackwellm:kv_cache_total_blocks` / `blackwellm:kv_cache_used_blocks` | gauge | KV block pool size / in use |
+| `blackwellm:capacity_tokens_per_slot` | gauge | live per-slot context ceiling (256K = 262144) |
 
 **Accuracy / correctness:**
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `vllm:bootstrap_checks_ok_total` | counter | speculative prefills matching the independent reference prefill |
-| `vllm:bootstrap_checks_failed_total` | counter | speculative prefills that DIVERGED from reference (non-zero = correctness problem) |
-| `vllm:prefix_cache_hit_rate` | gauge | prefix-cache hit rate (warm-restart correctness + speed) |
-| `vllm:prefix_cache_hits_total` / `vllm:prefix_cache_misses_total` | counter | prefix-cache hits / misses |
+| `blackwellm:bootstrap_checks_ok_total` | counter | speculative prefills matching the independent reference prefill |
+| `blackwellm:bootstrap_checks_failed_total` | counter | speculative prefills that DIVERGED from reference (non-zero = correctness problem) |
+| `blackwellm:prefix_cache_hit_rate` | gauge | prefix-cache hit rate (warm-restart correctness + speed) |
+| `blackwellm:prefix_cache_hits_total` / `blackwellm:prefix_cache_misses_total` | counter | prefix-cache hits / misses |
 
 Useful PromQL:
-- p50/p99 latency: `histogram_quantile(0.99, sum(rate(vllm:e2e_request_latency_seconds_bucket[5m])) by (le))`
-- p99 TTFT: `histogram_quantile(0.99, sum(rate(vllm:time_to_first_token_seconds_bucket[5m])) by (le))`
-- output throughput (tok/s): `sum(rate(vllm:generation_tokens_total[1m]))`
-- error rate: `sum(rate(vllm:request_errors_total[5m])) / sum(rate(vllm:request_success_total[5m]) + rate(vllm:request_errors_total[5m]))`
+- p50/p99 latency: `histogram_quantile(0.99, sum(rate(blackwellm:e2e_request_latency_seconds_bucket[5m])) by (le))`
+- p99 TTFT: `histogram_quantile(0.99, sum(rate(blackwellm:time_to_first_token_seconds_bucket[5m])) by (le))`
+- output throughput (tok/s): `sum(rate(blackwellm:generation_tokens_total[1m]))`
+- error rate: `sum(rate(blackwellm:request_errors_total[5m])) / sum(rate(blackwellm:request_success_total[5m]) + rate(blackwellm:request_errors_total[5m]))`
 
 ## Raw I/O logging
 

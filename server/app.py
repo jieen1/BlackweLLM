@@ -899,7 +899,7 @@ async def list_models():
 
 @app.get("/metrics")
 async def metrics_endpoint():
-    """Prometheus-compatible metrics (vLLM naming convention)."""
+    """Prometheus-compatible metrics in the BlackweLLM namespace."""
     assert engine is not None
     runner = engine.runner
     pool = runner.block_pool
@@ -913,44 +913,44 @@ async def metrics_endpoint():
     num_free_slots = len(engine.free_slots)
 
     lines = [
-        "# HELP vllm:num_requests_running Number of requests currently running.",
-        "# TYPE vllm:num_requests_running gauge",
-        f'vllm:num_requests_running{{model_name="{engine.MODEL}"}} {num_running}',
-        "# HELP vllm:num_requests_waiting Number of requests waiting to be processed.",
-        "# TYPE vllm:num_requests_waiting gauge",
-        f'vllm:num_requests_waiting{{model_name="{engine.MODEL}"}} {num_waiting}',
-        "# HELP vllm:kv_cache_usage_perc KV cache usage percentage.",
-        "# TYPE vllm:kv_cache_usage_perc gauge",
-        f'vllm:kv_cache_usage_perc{{model_name="{engine.MODEL}"}} {kv_usage:.4f}',
-        "# HELP vllm:num_free_slots Number of free production slots.",
-        "# TYPE vllm:num_free_slots gauge",
-        f'vllm:num_free_slots{{model_name="{engine.MODEL}"}} {num_free_slots}',
-        "# HELP vllm:capacity_tokens_per_slot Max tokens per slot.",
-        "# TYPE vllm:capacity_tokens_per_slot gauge",
-        f'vllm:capacity_tokens_per_slot{{model_name="{engine.MODEL}"}} '
+        "# HELP blackwellm:num_requests_running Number of requests currently running.",
+        "# TYPE blackwellm:num_requests_running gauge",
+        f'blackwellm:num_requests_running{{model_name="{engine.MODEL}"}} {num_running}',
+        "# HELP blackwellm:num_requests_waiting Number of requests waiting to be processed.",
+        "# TYPE blackwellm:num_requests_waiting gauge",
+        f'blackwellm:num_requests_waiting{{model_name="{engine.MODEL}"}} {num_waiting}',
+        "# HELP blackwellm:kv_cache_usage_perc KV cache usage percentage.",
+        "# TYPE blackwellm:kv_cache_usage_perc gauge",
+        f'blackwellm:kv_cache_usage_perc{{model_name="{engine.MODEL}"}} {kv_usage:.4f}',
+        "# HELP blackwellm:num_free_slots Number of free production slots.",
+        "# TYPE blackwellm:num_free_slots gauge",
+        f'blackwellm:num_free_slots{{model_name="{engine.MODEL}"}} {num_free_slots}',
+        "# HELP blackwellm:capacity_tokens_per_slot Max tokens per slot.",
+        "# TYPE blackwellm:capacity_tokens_per_slot gauge",
+        f'blackwellm:capacity_tokens_per_slot{{model_name="{engine.MODEL}"}} '
         f"{engine.capacity_tokens_per_slot}",
-        "# HELP vllm:requests_completed_total Total completed requests.",
-        "# TYPE vllm:requests_completed_total counter",
-        f'vllm:requests_completed_total{{model_name="{engine.MODEL}"}} '
+        "# HELP blackwellm:requests_completed_total Total completed requests.",
+        "# TYPE blackwellm:requests_completed_total counter",
+        f'blackwellm:requests_completed_total{{model_name="{engine.MODEL}"}} '
         f"{engine.stats.get('requests_completed', 0)}",
-        "# HELP vllm:prefix_cache_hit_rate Prefix cache hit rate.",
-        "# TYPE vllm:prefix_cache_hit_rate gauge",
-        f'vllm:prefix_cache_hit_rate{{model_name="{engine.MODEL}"}} '
+        "# HELP blackwellm:prefix_cache_hit_rate Prefix cache hit rate.",
+        "# TYPE blackwellm:prefix_cache_hit_rate gauge",
+        f'blackwellm:prefix_cache_hit_rate{{model_name="{engine.MODEL}"}} '
         f"{engine.stats.get('prefix_cache_hit_rate', 0.0):.4f}",
-        "# HELP vllm:prefix_cache_hits_total Prefix cache hits.",
-        "# TYPE vllm:prefix_cache_hits_total counter",
-        f'vllm:prefix_cache_hits_total{{model_name="{engine.MODEL}"}} '
+        "# HELP blackwellm:prefix_cache_hits_total Prefix cache hits.",
+        "# TYPE blackwellm:prefix_cache_hits_total counter",
+        f'blackwellm:prefix_cache_hits_total{{model_name="{engine.MODEL}"}} '
         f"{engine.stats.get('prefix_cache_hits', 0)}",
-        "# HELP vllm:prefix_cache_misses_total Prefix cache misses.",
-        "# TYPE vllm:prefix_cache_misses_total counter",
-        f'vllm:prefix_cache_misses_total{{model_name="{engine.MODEL}"}} '
+        "# HELP blackwellm:prefix_cache_misses_total Prefix cache misses.",
+        "# TYPE blackwellm:prefix_cache_misses_total counter",
+        f'blackwellm:prefix_cache_misses_total{{model_name="{engine.MODEL}"}} '
         f"{engine.stats.get('prefix_cache_misses', 0)}",
-        "# HELP vllm:kv_cache_total_blocks Total KV cache blocks.",
-        "# TYPE vllm:kv_cache_total_blocks gauge",
-        f'vllm:kv_cache_total_blocks{{model_name="{engine.MODEL}"}} {total_blocks}',
-        "# HELP vllm:kv_cache_used_blocks Used KV cache blocks.",
-        "# TYPE vllm:kv_cache_used_blocks gauge",
-        f'vllm:kv_cache_used_blocks{{model_name="{engine.MODEL}"}} {used_blocks}',
+        "# HELP blackwellm:kv_cache_total_blocks Total KV cache blocks.",
+        "# TYPE blackwellm:kv_cache_total_blocks gauge",
+        f'blackwellm:kv_cache_total_blocks{{model_name="{engine.MODEL}"}} {total_blocks}',
+        "# HELP blackwellm:kv_cache_used_blocks Used KV cache blocks.",
+        "# TYPE blackwellm:kv_cache_used_blocks gauge",
+        f'blackwellm:kv_cache_used_blocks{{model_name="{engine.MODEL}"}} {used_blocks}',
     ]
 
     # Accuracy/correctness signal: the admission bootstrap check re-runs each
@@ -958,19 +958,21 @@ async def metrics_endpoint():
     # first committed token. A non-zero failure count means the MTP path
     # diverged from the greedy reference output (a real correctness problem).
     lines.append(
-        "# HELP vllm:bootstrap_checks_ok_total Speculative prefills matching the reference prefill."
+        "# HELP blackwellm:bootstrap_checks_ok_total "
+        "Speculative prefills matching the reference prefill."
     )
-    lines.append("# TYPE vllm:bootstrap_checks_ok_total counter")
+    lines.append("# TYPE blackwellm:bootstrap_checks_ok_total counter")
     lines.append(
-        f'vllm:bootstrap_checks_ok_total{{model_name="{engine.MODEL}"}} '
+        f'blackwellm:bootstrap_checks_ok_total{{model_name="{engine.MODEL}"}} '
         f"{engine.stats.get('bootstrap_checks_ok', 0)}"
     )
     lines.append(
-        "# HELP vllm:bootstrap_checks_failed_total Speculative prefills diverged from reference."
+        "# HELP blackwellm:bootstrap_checks_failed_total "
+        "Speculative prefills diverged from reference."
     )
-    lines.append("# TYPE vllm:bootstrap_checks_failed_total counter")
+    lines.append("# TYPE blackwellm:bootstrap_checks_failed_total counter")
     lines.append(
-        f'vllm:bootstrap_checks_failed_total{{model_name="{engine.MODEL}"}} '
+        f'blackwellm:bootstrap_checks_failed_total{{model_name="{engine.MODEL}"}} '
         f"{engine.stats.get('bootstrap_checks_failed', 0)}"
     )
 

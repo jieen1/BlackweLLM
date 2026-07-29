@@ -119,9 +119,9 @@ class TestRequestTracer:
         tracer.request_admitted("r1", slot=0, prompt_len=10)
         tracer.request_finished("r1", "stop")
         output = tracer.render_prometheus()
-        assert "vllm:trace_total_requests" in output
-        assert "vllm:trace_active_requests" in output
-        assert "vllm:trace_slow_requests" in output
+        assert "blackwellm:trace_total_requests" in output
+        assert "blackwellm:trace_active_requests" in output
+        assert "blackwellm:trace_slow_requests" in output
 
     def test_max_rounds_per_trace(self):
         tracer = RequestTracer(enabled=True, max_rounds_per_trace=3)

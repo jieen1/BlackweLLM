@@ -242,21 +242,22 @@ class RequestTracer:
         """Render tracing stats as Prometheus gauges."""
         stats = self.get_stats()
         lines = [
-            "# HELP vllm:trace_total_requests Total traced requests",
-            "# TYPE vllm:trace_total_requests counter",
-            f'vllm:trace_total_requests{{model_name="{model_name}"}} {stats["total_requests"]}',
-            "# HELP vllm:trace_active_requests Currently active traced requests",
-            "# TYPE vllm:trace_active_requests gauge",
-            f'vllm:trace_active_requests{{model_name="{model_name}"}} {stats["active"]}',
-            "# HELP vllm:trace_slow_requests Requests exceeding slow threshold",
-            "# TYPE vllm:trace_slow_requests counter",
-            f'vllm:trace_slow_requests{{model_name="{model_name}"}} {stats["slow_count"]}',
-            "# HELP vllm:trace_avg_total_ms Average request total time",
-            "# TYPE vllm:trace_avg_total_ms gauge",
-            f'vllm:trace_avg_total_ms{{model_name="{model_name}"}} {stats["avg_total_ms"]}',
-            "# HELP vllm:trace_avg_tokens_per_sec Average decode throughput per request",
-            "# TYPE vllm:trace_avg_tokens_per_sec gauge",
-            f'vllm:trace_avg_tokens_per_sec{{model_name="{model_name}"}} '
+            "# HELP blackwellm:trace_total_requests Total traced requests",
+            "# TYPE blackwellm:trace_total_requests counter",
+            f'blackwellm:trace_total_requests{{model_name="{model_name}"}} '
+            f'{stats["total_requests"]}',
+            "# HELP blackwellm:trace_active_requests Currently active traced requests",
+            "# TYPE blackwellm:trace_active_requests gauge",
+            f'blackwellm:trace_active_requests{{model_name="{model_name}"}} {stats["active"]}',
+            "# HELP blackwellm:trace_slow_requests Requests exceeding slow threshold",
+            "# TYPE blackwellm:trace_slow_requests counter",
+            f'blackwellm:trace_slow_requests{{model_name="{model_name}"}} {stats["slow_count"]}',
+            "# HELP blackwellm:trace_avg_total_ms Average request total time",
+            "# TYPE blackwellm:trace_avg_total_ms gauge",
+            f'blackwellm:trace_avg_total_ms{{model_name="{model_name}"}} {stats["avg_total_ms"]}',
+            "# HELP blackwellm:trace_avg_tokens_per_sec Average decode throughput per request",
+            "# TYPE blackwellm:trace_avg_tokens_per_sec gauge",
+            f'blackwellm:trace_avg_tokens_per_sec{{model_name="{model_name}"}} '
             f"{stats['avg_tokens_per_sec']}",
         ]
         return "\n".join(lines)

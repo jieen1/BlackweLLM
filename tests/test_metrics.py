@@ -117,9 +117,9 @@ class TestRenderPrometheus:
         M.record_request("/v1/chat", 10, 5, "stop", 1.0)
         lines = M.render("test-model")
         text = "\n".join(lines)
-        assert "vllm:e2e_request_latency_seconds" in text
-        assert "vllm:prompt_tokens_total" in text
-        assert "vllm:request_success_total" in text
+        assert "blackwellm:e2e_request_latency_seconds" in text
+        assert "blackwellm:prompt_tokens_total" in text
+        assert "blackwellm:request_success_total" in text
 
 
 class TestD2Metrics:
@@ -159,9 +159,9 @@ class TestD2Metrics:
         M.record_prefix_cache_hit(4)
         M.record_slot_kv_usage(0, 10, 100)
         output = M.render_d2_metrics()
-        assert "vllm:mtp_accepted_tokens" in output
-        assert "vllm:prefix_cache_hits_total" in output
-        assert "vllm:slot_kv_usage_fraction" in output
+        assert "blackwellm:mtp_accepted_tokens" in output
+        assert "blackwellm:prefix_cache_hits_total" in output
+        assert "blackwellm:slot_kv_usage_fraction" in output
 
     def test_render_d2_no_data(self):
         M.mtp_acceptance_histogram.series.clear()
@@ -170,5 +170,5 @@ class TestD2Metrics:
         M._prefix_cache_hit_depth_sum = 0
         M._slot_kv_usage.clear()
         output = M.render_d2_metrics()
-        assert "vllm:prefix_cache_hits_total 0" in output
-        assert "vllm:prefix_cache_misses_total 0" in output
+        assert "blackwellm:prefix_cache_hits_total 0" in output
+        assert "blackwellm:prefix_cache_misses_total 0" in output

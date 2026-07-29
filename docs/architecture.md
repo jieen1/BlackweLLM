@@ -414,7 +414,7 @@ flowchart TD
 
 ## 11. 可观测性
 
-Prometheus 指标沿用 vLLM 命名约定（`vllm:*`），现有看板可直接复用；实现为零依赖的手写 histogram/counter。
+Prometheus 指标使用 BlackweLLM 命名空间（`blackwellm:*`）；实现为零依赖的手写 histogram/counter。
 
 | 维度 | 指标（节选） |
 |---|---|
