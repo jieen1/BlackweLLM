@@ -108,7 +108,7 @@ class LagunaCudaGraphDecode:
                 max_pages = self._ring_blocks_per_slot
             else:
                 # +1 margin: verify M=16 tokens can push past the last block boundary
-                max_pages = self.blocks_per_slot + 2
+                max_pages = self.blocks_per_slot + 16  # margin for generated tokens beyond prompt
 
             ws = SparkinferDecodeWorkspace(
                 num_q_heads=nqh, num_kv_heads=nkvh, head_dim=128,
@@ -541,7 +541,7 @@ class LagunaCudaGraphVerify:
                 max_pages = self._ring_blocks_per_slot
             else:
                 # +1 margin: verify M=16 tokens can push past the last block boundary
-                max_pages = self.blocks_per_slot + 2
+                max_pages = self.blocks_per_slot + 16  # margin for generated tokens beyond prompt
 
             # Dummy tensors for workspace creation
             q = torch.zeros(nt, nqh, 128, dtype=torch.bfloat16, device=self.device)
