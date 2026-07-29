@@ -1,0 +1,101 @@
+{
+  "schema": "laguna_m16_64k_baseline_v1",
+  "purpose": "Versioned evidence ledger for the 64K Laguna DFlash M=16 performance program. Do not compare fields across contracts or throughput units.",
+  "metric_definitions": {
+    "completion_tok_s": "completion tokens divided by timed decode wall time; this is the canonical 300+ gate.",
+    "accepted_counter_tok_s": "speculative accepted-token counter divided by wall time; report alongside completion_tok_s but never compare it directly with completion_tok_s.",
+    "acceptance_rate": "accepted draft tokens divided by draft tokens; a scenario-quality guard, not an optimization objective."
+  },
+  "quality_policy": {
+    "fixed_regression_prompt": "Output hash must remain identical and acceptance must not regress from the recorded prompt baseline.",
+    "ordinary_conversation": "Acceptance must be >= 0.70; approximately 0.80 is a healthy target. Do not change prompts or generation semantics to inflate acceptance."
+  },
+  "canonical_runtime_contract": {
+    "name": "fd33368-full-comparison-ours-64k",
+    "entrypoint": "bfdiag.workloads.run_historical_dflash_prefix_cache_m16",
+    "command": "PYTHONPATH=$PWD $PY -m bfdiag.cli exec --socket $PWD/.bfdiag/bfd.sock --timeout-s 900 -c 'from bfdiag.workloads import run_historical_dflash_prefix_cache_m16; print(run_historical_dflash_prefix_cache_m16(engine, tokenizer))'",
+    "prompt_tokens": 65536,
+    "base_tokens": 55536,
+    "suffix_tokens": 10000,
+    "prompt_hash": "49731059723cda41887735698bffe5d73ed7b12c3b411bce685bd31be936038d",
+    "base_prompt_hash": "7e1b8b5ce96789370f3ac64bbcd41625d4730c9740f01081562513c3305548e5",
+    "max_tokens": 256,
+    "greedy": true,
+    "dflash_k": 15,
+    "cuda_graph": true,
+    "prefix_cache": true,
+    "block_size": 64,
+    "blocks_per_slot": 1536,
+    "max_model_len": 262144,
+    "gpu_memory_utilization": 0.9,
+    "cold_rounds": 3,
+    "warm_rounds": 3
+  },
+  "runtime_records": {
+    "historical_300_target": {
+      "source": "benchmarks/fixtures/full_comparison_ours.json",
+      "git_commit": "fd33368",
+      "completion_tok_s": {
+        "cold": [298.20962623492295, 289.0895193838708, 293.8321086719851],
+        "warm_steady": [305.54021075085774, 306.50140503123515]
+      },
+      "acceptance_rate": 0.8962962962962963,
+      "notes": [
+        "warm round 0 (55.54 tok/s, 10.9% acceptance) is a known prefix-state anomaly and is excluded from the steady warm target.",
+        "This is the first 300+ gate: completion_tok_s >= 300 on the canonical contract."
+      ]
+    },
+    "current_verified_baseline": {
+      "bfdiag_run": "8e9255937cae",
+      "git_commit": "957144f633ed709f7058403d6059668fec55758d",
+      "completion_tok_s": {
+        "cold": [242.90483062758162, 235.6966414044233, 240.78771826723352],
+        "warm": [230.95338275517344, 228.98005706801655, 233.8381930489127]
+      },
+      "decode_ms": {
+        "cold": [1049.7938609996709, 1081.899166999392, 1059.0241139998398],
+        "warm": [1104.1189220004526, 1113.6341010005708, 1090.4976499996337]
+      },
+      "acceptance_rate": 0.9080459770114943,
+      "tokens_per_step": 14.166666666666666,
+      "steps": 18,
+      "output_sha256": "c6c79fb8b43707ae3690117b1d5fc227986424172b9b8872f75e3c0a1e6e1627",
+      "notes": [
+        "All six output hashes match.",
+        "The old ee8c88850e16 record has a broken git/environment fingerprint, so it is evidence only for output/contract recovery, not a formal bf diff peer."
+      ]
+    }
+  },
+  "vllm_reference": {
+    "name": "vLLM Laguna M=16 64K quick-brown warm-prefix reference",
+    "source_files": [
+      "/tmp/laguna-vllm-m16-64k-20260728/throughput_baseline.json",
+      "/tmp/laguna-vllm-m16-64k-20260728/profile_summary.json",
+      "/tmp/laguna-vllm-m16-64k-20260728/profile_capture/contract.json"
+    ],
+    "prompt_tokens": 65536,
+    "prompt_hash": "501c19f22bb6244b2d008ffab1e05ad53406c4f587ba4c6c097b4871a283af85",
+    "max_tokens": 256,
+    "greedy": true,
+    "dflash_k": 15,
+    "prefix_cache": true,
+    "cuda_graph_mode": "PIECEWISE",
+    "completion_tok_s": [267.7104941446554, 277.10269445659304, 293.05685699223835],
+    "accepted_counter_tok_s": [247.84135590735679, 256.5364788523928, 271.30654338734564],
+    "acceptance_rate": 0.6869565217391305,
+    "output_sha256": "6cc485161445d1a2381a678a74434410633b98e18261fadaf33af6ebcc80a3e6",
+    "profile": {
+      "gpu_generation_ms_per_m16_step": 41.3803355,
+      "nvfp4_grouped_moe_gemm_ms_per_m16_step": 13.6209105,
+      "flashinfer_attention_ms_per_m16_step": 2.1585316666666667,
+      "raw_trace_sha256": "9242ffb2377637e686e1668257e7dafa69486cc5f4937a0c8697aedf0ff34052"
+    },
+    "comparability": "The prompt differs from the canonical runtime contract. Use this as a kernel/quick-brown reference only. A runtime run with this exact prompt hash, prefix cache on, and both throughput units is required before claiming an end-to-end vLLM win."
+  },
+  "gates": {
+    "first_performance_gate": "completion_tok_s >= 300 on canonical_runtime_contract with output and quality gates passing",
+    "vllm_win_gate": "completion_tok_s >= 330 on the exact quick-brown vLLM contract with output/quality gates passing; 330 is >12.5% above the recorded vLLM best completion throughput of 293.06",
+    "vllm_stretch_gate": "completion_tok_s >= 350 on the exact quick-brown vLLM contract with output/quality gates passing; 350 is about 19.4% above the recorded vLLM best completion throughput of 293.06",
+    "dflash_value_gate": "On the exact runtime prompt and hot/cold state, runtime+DFlash must materially exceed runtime without DFlash; otherwise acceptance must not be used to claim a DFlash performance win."
+  }
+}
