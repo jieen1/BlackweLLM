@@ -94,6 +94,12 @@ class StreamProcessor:
     def thinking_done(self) -> bool:
         return self._thinking_done
 
+    def _visible_text(self, raw: str) -> str:
+        """Apply thinking filtering only for a thinking-capable model."""
+        if self._thinking_capable:
+            return strip_thinking(raw)
+        return raw
+
     def drain_thinking(self) -> list[str]:
         """Return thinking text deltas since last call.
 
@@ -145,7 +151,7 @@ class StreamProcessor:
                 # but handle gracefully
                 self._thinking_done = True
 
-        visible = strip_thinking(raw)
+        visible = self._visible_text(raw)
 
         # Check for tool call XML start
         tc_start = find_tool_call_start(visible)
@@ -205,7 +211,7 @@ class StreamProcessor:
             return []
 
         raw = self._get_raw()
-        visible = strip_thinking(raw)
+        visible = self._visible_text(raw)
         deltas = []
 
         tc_open = "<tool_call>"
@@ -297,6 +303,6 @@ class StreamProcessor:
         # backends only (see the matching guard in _get_raw()).
         if self._thinking_capable and not raw.startswith(_THINK_OPEN):
             raw = _THINK_OPEN + "\n" + raw
-        visible = strip_thinking(raw)
+        visible = self._visible_text(raw)
         visible_text, tool_calls = parse_tool_calls(visible)
         return visible_text, tool_calls

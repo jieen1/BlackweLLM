@@ -586,18 +586,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 proc.add_tokens(item)
                 if first_token_t is None and item:
                     first_token_t = time.perf_counter()
-                # Stream thinking as reasoning_content (vLLM compatible)
-                for td in proc.drain_thinking():
-                    chunk = {
-                        "id": cmpl_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [
-                            {"index": 0, "delta": {"reasoning_content": td}, "finish_reason": None}
-                        ],
-                    }
-                    yield f"data: {_json.dumps(chunk)}\n\n"
                 for delta in proc.drain_content():
                     chunk = {
                         "id": cmpl_id,
@@ -1171,15 +1159,6 @@ async def anthropic_messages(request: Request):
                 proc.add_tokens(item)
                 if first_token_t is None and item:
                     first_token_t = time.perf_counter()
-
-                # Advance the thinking state machine but do NOT emit thinking
-                # blocks.  We cannot produce the cryptographic signature that
-                # the official Anthropic API attaches via signature_delta;
-                # Claude Desktop validates it and DROPS every content block
-                # that follows an invalid thinking block -- including tool_use
-                # (e.g. AskUserQuestion), which is why the user's selection
-                # was lost as "(no content)".
-                proc.drain_thinking()
 
                 for delta in proc.drain_content():
                     if not text_open:
