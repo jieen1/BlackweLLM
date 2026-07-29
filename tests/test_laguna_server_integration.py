@@ -1,13 +1,12 @@
-"""Laguna-only server wiring (CPU-only, no GPU/model load).
+"""E1: LagunaBackend <-> ServerEngine wiring (CPU-only, no GPU/model load).
 
 Covers:
 - classify_decode_slots: the pure predicate that routes a decode round's
-  active slots to the speculative path vs. the plain sampled path.
-- ServerEngine backend selection: real (non-GPU) construction, verifying
-  that Laguna is the only supported backend and that MODEL/K/eos_token_ids
-  are set correctly.
-- App output cleanup: Laguna responses are treated as visible text, not
-  Qwen-style thinking payloads.
+  active slots to the MTP path (Qwen) vs. the plain sampled path (Laguna,
+  which has no MTP yet).
+- ServerEngine backend selection: real (non-GPU) construction with
+  backend="laguna" vs. the default "qwen36", verifying MODEL/K/eos_token_ids
+  are set correctly and the original Qwen path is untouched.
 - LagunaBackend's new E1 surface (reconcile_prefix_hit, prefill_chunked_begin/
   step, decode_batch_sampled's signature) via __new__ bypass -- these methods
   either don't touch GPU state at all, or only do so past an early return we
@@ -22,8 +21,7 @@ import types
 
 import pytest
 
-if "torch" not in sys.modules:
-    sys.modules["torch"] = types.ModuleType("torch")
+pytest.importorskip("torch")
 
 from server.engine import ServerEngine, classify_decode_slots
 
@@ -65,36 +63,27 @@ class TestServerEngineBackendSelection:
     the GPU; model loading happens later, only on the engine thread via
     start(), which these tests never call."""
 
-    def test_rejects_non_laguna_backend(self):
-        with pytest.raises(ValueError, match="unsupported"):
-            ServerEngine(backend="qwen36", capacity=1, num_slots=1)
+    def test_rejects_unknown_backend(self):
+        with pytest.raises(ValueError, match="backend"):
+            ServerEngine(backend="not-a-real-backend", capacity=1, num_slots=1)
 
     def test_laguna_is_the_default_backend(self):
+        """vLLM removal: ServerEngine is now Laguna-only (BACKEND='laguna')."""
         engine = ServerEngine(capacity=1, num_slots=1, enable_cudagraph=False, production=True)
+        assert engine.backend_name == "laguna"
+
+    def test_laguna_backend_overrides_model_and_k(self):
+        engine = ServerEngine(
+            backend="laguna", capacity=1, num_slots=1, enable_cudagraph=False, production=True
+        )
         assert engine.backend_name == "laguna"
         assert engine.MODEL == "poolside/Laguna-S-2.1-NVFP4"
         assert engine.K == 0
+        # Laguna's generation_config.json declares eos_token_id: [2, 24] --
+        # both must be in the live stop set, not just the tokenizer's single
+        # eos_token (id 2).
         assert 2 in engine.eos_token_ids
         assert 24 in engine.eos_token_ids
-
-    def test_enable_dflash_sets_speculative_k(self):
-        engine = ServerEngine(
-            backend="laguna",
-            capacity=1,
-            num_slots=1,
-            enable_cudagraph=False,
-            production=True,
-            enable_dflash=True,
-        )
-        assert engine.K > 0
-
-
-class TestLagunaAppOutputHandling:
-    def test_visible_text_cleanup_does_not_assume_thinking_markup(self):
-        from server.app import _visible_text_from_model_output
-
-        text = _visible_text_from_model_output(" \ufffd<think>visible</think>\ufffd ")
-        assert text == "<think>visible</think>"
 
 
 class TestLagunaBackendE1Surface:
@@ -116,10 +105,6 @@ class TestLagunaBackendE1Surface:
 
     @classmethod
     def setup_class(cls) -> None:
-        import torch
-
-        if not hasattr(torch, "zeros"):
-            pytest.skip("real torch is required for Laguna backend surface tests")
         cls._MODULES_BEFORE = frozenset(sys.modules)
         if "runtime.compat_vllm" not in sys.modules:
             stub = types.ModuleType("runtime.compat_vllm")

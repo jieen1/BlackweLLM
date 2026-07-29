@@ -374,19 +374,15 @@ class ServerEngine:
         replay side.
         """
         from runtime.backends.laguna import LagunaBackend
-        from runtime.compat_vllm import EngineArgs
+        from runtime.laguna_config import build_laguna_config
 
         max_model_len = self.blocks_per_slot * self.block_size
-        args = EngineArgs(
+        vllm_config = build_laguna_config(
             model=self.MODEL,
             max_model_len=max_model_len,
             gpu_memory_utilization=self._gpu_memory_utilization,
             dtype="bfloat16",
-            disable_log_stats=True,
-            async_scheduling=False,
-            moe_backend=os.environ.get("QSR_MOE_BACKEND", "marlin"),
         )
-        vllm_config = args.create_engine_config()
         self._prefill_chunk_size = 512  # unused: Laguna prefill is one-shot (see LagunaBackend)
         self.runner = LagunaBackend(
             vllm_config,

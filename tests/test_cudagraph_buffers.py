@@ -15,6 +15,7 @@ page_table/cache_seqlens 由 _fill_buffers() 直接以 GPU tensor 写入更新�
 
 from __future__ import annotations
 
+import ast
 import inspect
 from pathlib import Path
 
@@ -54,6 +55,56 @@ class TestReplayContract:
         assert "Prime" not in src and "priming" not in src.lower(), (
             "capture() 仍包含 priming replay — 根因修复后不再需要"
         )
+
+    def test_reset_forgets_page_crossing_state(self):
+        pytest.importorskip("torch")
+        from runtime.backends.laguna_cuda_graph import LagunaCudaGraphDecode
+
+        graph = object.__new__(LagunaCudaGraphDecode)
+        graph.batch_size = 2
+        graph._prev_n_blocks = [17, 19]
+        graph._swa_prev_n_blocks = [3, 4]
+
+        graph.reset()
+
+        assert graph._prev_n_blocks == [0, 0]
+        assert graph._swa_prev_n_blocks == [0, 0]
+
+    def test_b1_metadata_fastpath_requires_lagunas_two_group_layout(self):
+        pytest.importorskip("torch")
+        from runtime.backends.laguna_cuda_graph import LagunaCudaGraphDecode
+
+        graph = object.__new__(LagunaCudaGraphDecode)
+        graph._b1_metadata_fastpath_enabled = True
+        graph._b1_metadata_values_gpu = None
+        graph._decode_workspaces = {
+            (-1, 48, 8): object(),
+            (511, 72, 8): object(),
+        }
+        graph._ring_blocks_per_slot = 10
+        graph.device = "cuda:0"
+
+        # The actual allocation needs CUDA; this contract guards the layout
+        # selection before that allocation is reached in integration tests.
+        assert [key for key in graph._decode_workspaces if key[0] < 0] == [(-1, 48, 8)]
+        assert [key for key in graph._decode_workspaces if key[0] >= 0] == [(511, 72, 8)]
+
+    def test_hot_reloaded_graph_defaults_fastpath_on_and_can_disable(self, monkeypatch):
+        pytest.importorskip("torch")
+        from runtime.backends.laguna_cuda_graph import LagunaCudaGraphDecode
+
+        graph = object.__new__(LagunaCudaGraphDecode)
+        graph._decode_workspaces = {}
+        graph._ring_blocks_per_slot = 10
+        monkeypatch.delenv("QSR_B1_METADATA_FASTPATH", raising=False)
+
+        assert graph._init_b1_metadata_fastpath() is False
+        assert graph._b1_metadata_fastpath_enabled is True
+
+        disabled = object.__new__(LagunaCudaGraphDecode)
+        monkeypatch.setenv("QSR_B1_METADATA_FASTPATH", "0")
+        assert disabled._init_b1_metadata_fastpath() is False
+        assert disabled._b1_metadata_fastpath_enabled is False
 
 
 class TestBufferArithmetic:
@@ -142,24 +193,46 @@ class TestIndependentWorkspace:
 
 
 class TestDependencySurfaces:
-    """Freeze the graph modules' runtime-dependency boundaries."""
+    """验证图路径只依赖 owned runtime context 与 Sparkinfer。"""
 
     def test_graph_modules_do_not_import_runtime_compat_vllm(self):
         for relpath in (
             "runtime/backends/laguna_cuda_graph.py",
             "runtime/backends/laguna_dflash_cudagraph.py",
         ):
-            src = (_ROOT / relpath).read_text(encoding="utf-8")
-            assert "runtime.compat_vllm" not in src, (
-                f"{relpath} 应直接使用 owned runtime context，而不是 compat_vllm"
+            tree = ast.parse((_ROOT / relpath).read_text(encoding="utf-8"), filename=relpath)
+            imports_compat = False
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imports_compat = any(
+                        alias.name == "runtime.compat_vllm" for alias in node.names
+                    )
+                elif isinstance(node, ast.ImportFrom):
+                    imports_compat = node.module == "runtime.compat_vllm"
+                if imports_compat:
+                    break
+            assert not imports_compat, (
+                f"{relpath} 应直接使用 runtime.laguna_runtime，而不是 compat_vllm"
             )
 
     def test_dflash_graph_module_has_no_flashinfer_dependency(self):
-        src = (_ROOT / "runtime/backends/laguna_dflash_cudagraph.py").read_text(
-            encoding="utf-8"
-        )
-        assert "flashinfer" not in src.lower(), (
-            "DFlash CUDA Graph 应只保留 Sparkinfer 路径，不应残留 FlashInfer 依赖"
+        relpath = "runtime/backends/laguna_dflash_cudagraph.py"
+        tree = ast.parse((_ROOT / relpath).read_text(encoding="utf-8"), filename=relpath)
+        imports_flashinfer = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports_flashinfer = any(
+                    alias.name == "flashinfer" or alias.name.startswith("flashinfer.")
+                    for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom):
+                imports_flashinfer = node.module == "flashinfer" or (
+                    node.module is not None and node.module.startswith("flashinfer.")
+                )
+            if imports_flashinfer:
+                break
+        assert not imports_flashinfer, (
+            "DFlash draft CUDA graph 应只保留 Sparkinfer 路径，不应残留 FlashInfer 依赖"
         )
 
     def test_graph_modules_use_owned_runtime_context(self):

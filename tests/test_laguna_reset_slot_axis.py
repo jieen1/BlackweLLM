@@ -78,6 +78,6 @@ def test_single_slot_is_unchanged_by_the_fix() -> None:
     the old (dim-0) and new (dim-1) slicings clear the same elements, so
     every DFlash/benchmark run today is bit-identical either way."""
     old, new = _kv_cache(num_slots=1), _kv_cache(num_slots=1)
-    old[0:BLOCKS_PER_SLOT].zero_()  # the buggy form, clamped to [0:2]
+    old[0 : BLOCKS_PER_SLOT].zero_()  # the buggy form, clamped to [0:2]
     _zero_slot(new, 0)
     assert torch.equal(old, new)

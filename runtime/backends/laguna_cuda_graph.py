@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from runtime.kernels.fused_kv_scatter import fused_kv_scatter
+from runtime.kernels.cg_decode_metadata import write_laguna_b1_decode_metadata
 
 from bfdiag.invariants import checks as bfdiag_checks
 
@@ -93,6 +94,52 @@ class LagunaCudaGraphDecode:
         # ── DFlash aux hidden states (captured in graph) ──
         self._aux_hidden_states: list[torch.Tensor] | None = None
 
+        # Default only for the exact Laguna B=1 layout (one full-attention
+        # group plus one SWA group).  Set QSR_B1_METADATA_FASTPATH=0 to
+        # restore scalar metadata writes while diagnosing a regression.
+        self._b1_metadata_fastpath_enabled = os.environ.get(
+            "QSR_B1_METADATA_FASTPATH", "1"
+        ) != "0"
+        self._b1_metadata_values_cpu: torch.Tensor | None = None
+        self._b1_metadata_values_gpu: torch.Tensor | None = None
+        self._b1_full_group: tuple | None = None
+        self._b1_swa_group: tuple | None = None
+
+    def _init_b1_metadata_fastpath(self) -> bool:
+        """Allocate the pinned staging pair for the fixed Laguna B=1 layout."""
+        # A resident daemon can rebind this class onto a graph captured by an
+        # older implementation; initialize newly introduced state lazily so
+        # the hot-reload path never requires a model reload.
+        if not hasattr(self, "_b1_metadata_values_gpu"):
+            self._b1_metadata_fastpath_enabled = os.environ.get(
+                "QSR_B1_METADATA_FASTPATH", "1"
+            ) != "0"
+            self._b1_metadata_values_cpu = None
+            self._b1_metadata_values_gpu = None
+            self._b1_full_group = None
+            self._b1_swa_group = None
+        if not self._b1_metadata_fastpath_enabled:
+            return False
+        if self._b1_metadata_values_gpu is not None:
+            return True
+
+        full_groups = [
+            key for key in self._decode_workspaces
+            if not (key[0] >= 0 and self._ring_blocks_per_slot > 0)
+        ]
+        swa_groups = [
+            key for key in self._decode_workspaces
+            if key[0] >= 0 and self._ring_blocks_per_slot > 0
+        ]
+        if len(full_groups) != 1 or len(swa_groups) != 1:
+            return False
+
+        self._b1_full_group = full_groups[0]
+        self._b1_swa_group = swa_groups[0]
+        self._b1_metadata_values_cpu = torch.empty(2, dtype=torch.long, pin_memory=True)
+        self._b1_metadata_values_gpu = torch.empty(2, dtype=torch.long, device=self.device)
+        return True
+
     def _init_workspaces(self) -> None:
         """Create sparkinfer decode workspaces per layer group."""
         from runtime.backends.laguna_sparkinfer_attn import SparkinferDecodeWorkspace
@@ -107,8 +154,7 @@ class LagunaCudaGraphDecode:
             if is_swa:
                 max_pages = self._ring_blocks_per_slot
             else:
-                # +1 margin: verify M=16 tokens can push past the last block boundary
-                max_pages = self.blocks_per_slot + 16  # margin for generated tokens beyond prompt
+                max_pages = self.blocks_per_slot + 16  # margin for generated tokens
 
             ws = SparkinferDecodeWorkspace(
                 num_q_heads=nqh, num_kv_heads=nkvh, head_dim=128,
@@ -220,6 +266,32 @@ class LagunaCudaGraphDecode:
         base = phys * bps
         new_kv = kv_len + 1
 
+        if self._init_b1_metadata_fastpath():
+            assert self._b1_metadata_values_cpu is not None
+            assert self._b1_metadata_values_gpu is not None
+            assert self._b1_full_group is not None
+            assert self._b1_swa_group is not None
+
+            self._b1_metadata_values_cpu[0] = token_id
+            self._b1_metadata_values_cpu[1] = kv_len
+            self._b1_metadata_values_gpu.copy_(self._b1_metadata_values_cpu, non_blocking=True)
+            write_laguna_b1_decode_metadata(
+                self._b1_metadata_values_gpu,
+                self._input_ids,
+                self._positions,
+                self._slot_mapping,
+                self._swa_slot_mapping,
+                self._cache_seqlens[self._b1_full_group],
+                self._cache_seqlens[self._b1_swa_group],
+                full_slot_base=base,
+                swa_ring_base=phys * self._ring_blocks_per_slot,
+                ring_slots=self._ring_slots_per_slot,
+                swa_window=self._swa_window,
+                block_size=ps,
+            )
+            self._update_b1_page_tables(slot, kv_len, new_kv)
+            return
+
         # Scalar writes (each is a tiny CUDA memcpy, ~2us each)
         self._input_ids[0] = token_id
         self._positions[0] = kv_len
@@ -261,6 +333,36 @@ class LagunaCudaGraphDecode:
                 rb_dec = (kv_len % ring_slots) // ps
                 ro_dec = kv_len % ps
                 self._swa_slot_mapping[0] = (ring_base + rb_dec) * ps + ro_dec
+
+    def _update_b1_page_tables(self, slot: int, kv_len: int, new_kv: int) -> None:
+        """Apply only the rare page-table writes omitted by the fused fast path."""
+        assert self._b1_full_group is not None
+        assert self._b1_swa_group is not None
+        ps = self.block_size
+        phys = _physical_slot(slot)
+
+        n_blocks = (new_kv + ps - 1) // ps
+        if n_blocks != self._prev_n_blocks[0]:
+            self._prev_n_blocks[0] = n_blocks
+            base = phys * self.blocks_per_slot
+            self._page_tables[self._b1_full_group][0, :n_blocks] = torch.arange(
+                base, base + n_blocks, dtype=torch.int32, device=self.device
+            )
+
+        window_start = max(0, kv_len - self._swa_window + 1)
+        aligned_start = (window_start // ps) * ps
+        aligned_len = new_kv - aligned_start
+        n_ring = (aligned_len + ps - 1) // ps
+        if n_ring != self._swa_prev_n_blocks[0]:
+            self._swa_prev_n_blocks[0] = n_ring
+            ring_base = phys * self._ring_blocks_per_slot
+            ring_slots = self._ring_slots_per_slot
+            page_table = self._page_tables[self._b1_swa_group]
+            for index in range(n_ring):
+                actual = aligned_start + index * ps
+                ring_block = (actual % ring_slots) // ps
+                page_table[0, index] = ring_base + ring_block
+
 
     def _build_metadata_and_forward(self) -> torch.Tensor:
         """Build sparkinfer CG metadata and run forward."""
@@ -408,6 +510,11 @@ class LagunaCudaGraphDecode:
         next_tokens = self.replay(slot_ids, token_ids, kv_lengths)
         return next_tokens, self._aux_hidden_states
 
+    def reset(self) -> None:
+        """Forget per-slot page-table state before a fresh generation."""
+        self._prev_n_blocks = [0] * self.batch_size
+        self._swa_prev_n_blocks = [0] * self.batch_size
+
     def generate(
         self,
         slot: int,
@@ -540,8 +647,7 @@ class LagunaCudaGraphVerify:
             if is_swa:
                 max_pages = self._ring_blocks_per_slot
             else:
-                # +1 margin: verify M=16 tokens can push past the last block boundary
-                max_pages = self.blocks_per_slot + 16  # margin for generated tokens beyond prompt
+                max_pages = self.blocks_per_slot + 16  # margin for generated tokens
 
             # Dummy tensors for workspace creation
             q = torch.zeros(nt, nqh, 128, dtype=torch.bfloat16, device=self.device)
