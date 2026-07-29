@@ -14,6 +14,8 @@ import importlib.util
 import os
 import sys
 
+import torch
+
 
 class _BlockVllm(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname: str, path=None, target=None):
@@ -33,11 +35,19 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--blocks-per-slot", type=int, default=128)
+    parser.add_argument(
+        "--memory-prefill-tokens",
+        type=int,
+        default=0,
+        help="After the functional gate, prefill tokens and report CUDA memory (0 disables)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    if args.memory_prefill_tokens < 0:
+        raise ValueError("--memory-prefill-tokens must be non-negative")
     if args.block_vllm:
         sys.meta_path.insert(0, _BlockVllm())
     elif importlib.util.find_spec("vllm") is not None:
@@ -86,6 +96,21 @@ def main() -> None:
             enable_prefix_cache=False,
             slot=0,
         )
+        memory_after_prefill = None
+        if args.memory_prefill_tokens:
+            repetitions = -(-args.memory_prefill_tokens // len(prompt_ids))
+            long_prompt_ids = (prompt_ids * repetitions)[: args.memory_prefill_tokens]
+            backend.reset_slot(0)
+            backend.prefill(0, long_prompt_ids)
+            torch.cuda.synchronize()
+            scratch = backend._swa_scratch
+            memory_after_prefill = {
+                "prompt_tokens": len(long_prompt_ids),
+                "allocated_bytes": torch.cuda.memory_allocated(),
+                "reserved_bytes": torch.cuda.memory_reserved(),
+                "swa_scratch_bytes": 0 if scratch is None else scratch.nbytes,
+                "swa_scratch_shape": None if scratch is None else list(scratch.shape),
+            }
         loaded_vllm = sorted(
             name for name in sys.modules if name == "vllm" or name.startswith("vllm.")
         )
@@ -97,6 +122,7 @@ def main() -> None:
                 "captured_batch_size": captured_batch_size,
                 "dflash_acceptance": dflash_stats["acceptance_rate"],
                 "dflash_tok_per_s": dflash_stats["tok_per_s"],
+                "memory_after_prefill": memory_after_prefill,
                 "vllm_modules": loaded_vllm,
             }
         )
