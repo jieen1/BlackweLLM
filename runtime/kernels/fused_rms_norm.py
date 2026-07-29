@@ -159,3 +159,29 @@ def rms_norm(
         num_warps=8,
     )
     return out.view(orig_shape)
+
+
+class TritonRMSNorm(torch.nn.Module):
+    """nn.Module wrapper so this kernel can drop directly into a model graph.
+
+    Mirrors the two call shapes vLLM's ``RMSNorm(CustomOp)`` supports and
+    that ``LagunaDecoderLayer``/``LagunaModel`` rely on:
+    ``forward(x)`` (no residual, first call) -> normed tensor;
+    ``forward(x, residual)`` -> ``(normed_output, new_residual)`` tuple.
+    No CustomOp base class, no ``dispatch_forward()`` binding -- this is
+    meant for code that owns its own module construction and can just
+    call the Triton kernel directly (see runtime/model/laguna_model.py).
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            return rms_norm(x, self.weight, self.eps)
+        return fused_add_rms_norm(x, residual, self.weight, self.eps)

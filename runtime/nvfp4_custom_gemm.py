@@ -47,13 +47,12 @@ _AUTOTUNE_M4 = {
     6144: _CFG_B,  # out_proj: 128×128p
     5120: _CFG_B,  # down_proj / in_proj_qkvz: 128×128p
     96: _CFG_B,  # in_proj_ba: 128×128p
-    # Laguna-S-2.1 shapes (autotune 2026-07-29, M=1/4/16 verified)
-    100352: _CFG_D,  # lm_head: 128×256p (all M)
-    12288: _CFG_D,  # dense gate/up: M=1/4→128×256p, M=16→128×128p (use M4 default)
-    11264: _CFG_D,  # QKV proj (72Q layers): 128×256p (all M)
-    8192: _CFG_A,  # QKV proj (48Q layers): M=1/4→128×128, M=16→128×256p (use M4 default)
-    3072: _CFG_B,  # O proj / shared down: 128×128p (all M)
-    1024: _CFG_A,  # shared expert gate/up: M=16→128×128 (non-persistent)
+    # Laguna-S-2.1 shapes (M=1 decode)
+    100352: _CFG_D,  # lm_head: 128×256p (large N)
+    12288: _CFG_D,  # shared expert gate/up: 128×256p
+    11264: _CFG_D,  # QKV proj (72Q layers): 128×256p
+    8192: _CFG_A,  # QKV proj (48Q layers): 128×128
+    3072: _CFG_B,  # O proj / shared down: 128×128p
     72: _CFG_B,  # g_proj: 128×128p
 }
 
