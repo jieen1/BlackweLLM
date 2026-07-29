@@ -1,10 +1,10 @@
 # Server
 
-The server exposes the fixed-slot engine (`server/engine.py`'s
-`ServerEngine`, a thin continuous-batching wrapper around the ONE
-production-validated `DirectModelRunner` runtime in
-`runtime/direct_model_runner.py`) through OpenAI- AND Anthropic-compatible
-interfaces. Do not add multi-model or multi-GPU routing here.
+The server exposes the fixed-slot Laguna engine (`server/engine.py`'s
+`ServerEngine`, a continuous-batching wrapper around
+`runtime.backends.laguna.LagunaBackend`) through OpenAI- AND
+Anthropic-compatible interfaces. It has no vLLM runtime dependency; do not
+add multi-model or multi-GPU routing here.
 
 ## Endpoints
 
@@ -19,7 +19,7 @@ interfaces. Do not add multi-model or multi-GPU routing here.
   Desktop calls this before sending).
 - `GET /v1/models` — model card; `max_model_len` reports the live per-slot
   context ceiling (`capacity_tokens_per_slot`).
-- `GET /metrics` — Prometheus exposition (vLLM naming; see **Metrics** below).
+- `GET /metrics` — Prometheus exposition in the `blackwellm:*` namespace.
 - `GET /health` — liveness + slot occupancy.
 - `GET /debug/stats` — the engine's admission/round counters plus the P0
   prompt-prefix-overlap, P4a prefix-cache hit-rate, and P4b session-affinity

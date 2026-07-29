@@ -169,34 +169,27 @@ due to slot-wedge risk at 16K+ token generations. Full methodology in
 ```
 blackwellm/
 ├── runtime/                  # Core inference engine
-│   ├── direct_model_runner.py   # Qwen3.6 prefill, decode, MTP verify
-│   ├── block_pool.py             # Paging + content-addressed prefix cache
-│   ├── cuda_graphs.py            # CUDA Graph capture/replay
-│   ├── compat_vllm.py            # Single-point vLLM dependency consolidation
-│   └── backends/laguna.py       # Laguna-S-2.1 backend (sparkinfer MoE)
+│   ├── laguna_config.py          # Laguna-specific runtime/cache/draft config
+│   ├── laguna_runtime.py         # Owned forward context and cache bindings
+│   ├── model/                    # Self-built Laguna and DFlash model graphs
+│   └── backends/laguna.py        # Laguna-S-2.1 backend (SparkInfer MoE)
 ├── server/                   # HTTP server (OpenAI + Anthropic API)
 │   ├── app.py                   # FastAPI endpoints + /metrics
 │   └── engine.py                # Admission, MTP loop, prefix cache
 ├── model/                    # Model architecture config
 ├── loader/                   # Weight loading (safetensors, NVFP4)
-├── kernels/                  # CUDA kernel docs (sources in sm120-flash-attention)
+├── kernels/                  # Owned SM120 kernel sources and build targets
 ├── benchmarks/               # Reproducible perf & correctness checks
 ├── tests/                    # Unit tests (CPU-only)
 └── oracle/                   # vLLM reference comparison utilities
 ```
 
-The CUDA attention kernel lives in
-[sm120-flash-attention](https://github.com/jieen1/sm120-flash-attention),
-integrated via vLLM's custom attention backend registration.
-
-This repository holds the **runtime and serving layer**: the fixed-slot
-scheduler, hybrid KV/GDN cache, MTP verify loop, prefix cache, and the
-OpenAI/Anthropic-compatible server. The Qwen3.6 model graph and the SM120
-CUDA kernels are provided by vLLM plus the `sm120-flash-attention`
-integration, which this runtime drives as a library (see
-`runtime/direct_model_runner.py`). That is why `model/` (config only) and
-`kernels/` (documentation only) are intentionally thin here. All vLLM
-imports in the production path go through `runtime/compat_vllm.py`.
+This repository contains the **Laguna runtime and serving layer**: fixed-slot
+scheduling, self-built Laguna/DFlash model graphs, owned CUDA Graph lifecycle,
+SparkInfer attention/MoE integration, and the OpenAI/Anthropic-compatible
+server. Production code does not import, package, or require vLLM. The
+`oracle/` directory is deliberately excluded from production distributions and
+holds only offline migration-reference utilities.
 
 > **Naming:** the product and GitHub repo are **BlackweLLM** (formerly
 > BlackForge); the package directory is historically `qwen-sm120-runtime`;
@@ -218,15 +211,11 @@ git clone https://github.com/jieen1/BlackweLLM.git
 cd BlackweLLM
 python -m pip install -e '.[dev,serving]'
 
-# Add this only after the pinned vLLM provider build is available.
-# It is intentionally optional so CPU-only development and tests never
-# trigger a vLLM build.
+# GPU runtime dependencies; this does not install vLLM.
 python -m pip install -e '.[cuda,dev,serving]'
 
-# Build the custom CUDA attention kernel (separate repo)
-cd /path/to/sm120-flash-attention/kernel
-export CUDA_HOME=/usr/local/cuda
-python setup.py build_ext --inplace
+# Install the pinned local SparkInfer provider required by Laguna.
+python -m pip install -e /path/to/sparkinfer
 ```
 
 ### Running the Server
@@ -236,8 +225,7 @@ QSR_SERVER_PRODUCTION=1 \
 QSR_SERVER_CAPACITY=2 \
 QSR_SERVER_NUM_SLOTS=2 \
 QSR_SERVER_BLOCKS_PER_SLOT=16384 \
-QSR_SERVED_MODEL_NAME="qwen3.6" \
-SM120_VLLM_INTEGRATION=/path/to/sm120-flash-attention/vllm_integration \
+QSR_SERVED_MODEL_NAME="laguna-s-2.1" \
 python -m server.app --host 0.0.0.0 --port 8000
 ```
 
@@ -268,31 +256,29 @@ python -m pytest tests/ -q
 
 | Env Variable | Default | Description |
 |-------------|---------|-------------|
-| `QSR_SERVER_CAPACITY` | `4` | Max concurrent requests |
-| `QSR_SERVER_NUM_SLOTS` | `8` | Total internal slots |
-| `QSR_SERVER_BLOCKS_PER_SLOT` | `16384` | KV blocks per slot (×16 = tokens) ⇒ 256K context |
+| `QSR_SERVER_CAPACITY` | `1` | Max concurrent Laguna requests |
+| `QSR_SERVER_NUM_SLOTS` | `2` | Total internal slots (one CG warmup slot) |
+| `QSR_SERVER_BLOCKS_PER_SLOT` | `2048` | KV blocks per slot (×64 = tokens) ⇒ 128K context |
 | `QSR_SERVER_PRODUCTION` | `1` | Production mode: skip validation slots |
 | `QSR_DEBUG_REQUESTS` | `1` | Log raw request/response (input + output) for debugging |
 | `QSR_SERVED_MODEL_NAME` | model ID | Advertised model name(s) |
 | `QSR_SERVER_ENABLE_CUDAGRAPH` | `1` | Enable CUDA Graph capture |
-| `QSR_SERVER_ENABLE_PREFIX_CACHE` | `1` | Enable prefix caching |
-| `SM120_VLLM_INTEGRATION` | (auto) | Path to sm120-flash-attention integration |
+| `QSR_SERVER_ENABLE_PREFIX_CACHE` | `0` | Enable prefix caching |
 
 ### Context Length vs Concurrency (96 GB GPU)
 
 | `BLOCKS_PER_SLOT` | Context/Slot | Capacity | `NUM_SLOTS` (production) |
 |--------------------|-------------|----------|--------------------------|
-| 16384              | 256K        | 2        | 2                        |
-| 8192               | 128K        | 4        | 8                        |
-| 4200               | 67K         | 4        | 16                       |
+| 2048               | 128K        | 1        | 2                        |
 
-The deployed production runtime (`~/vllm_server/vllm_ctl.sh`) currently runs
-`CAPACITY=2`, `NUM_SLOTS=2`, `BLOCKS_PER_SLOT=16384` (256K).
+Use explicit environment overrides only after a cold capacity/VRAM validation;
+`block_size`, `blocks_per_slot`, and GPU memory utilisation are load-time
+parameters and cannot be compared through a warm daemon run.
 
 ## Metrics & Observability
 
-`GET /metrics` exposes Prometheus metrics in the vLLM naming convention
-(`blackwellm:*`), scraped by the local Prometheus container. They cover speed
+`GET /metrics` exposes Prometheus metrics in the `blackwellm:*` namespace.
+They cover speed
 (`e2e_request_latency_seconds`, `time_to_first_token_seconds`,
 `request_time_per_output_token_seconds`, prompt/generation token histograms
 and throughput counters), stability/reliability (`num_requests_running`,
@@ -361,16 +347,15 @@ BlackweLLM 是一个专为 NVIDIA Blackwell（SM120）GPU 打造的全栈推理�
 通过手写 CUDA attention kernel、FP8 KV cache、MTP 投机解码和 CUDA Graph
 捕获等深度优化，在 SM120 架构上实现极致推理性能。
 
-当前已适配 **Qwen3.6-27B**（NVFP4 量化），后续将支持更多模型。
+当前生产模型为 **Laguna-S-2.1**（NVFP4）。
 
 ### 核心优势
 
 - **自研 SM120 CUDA kernel** — 针对 Blackwell 硬件特性手写，decode attention
   比 FlashInfer 快 56%（128K 上下文，0.988ms vs 1.540ms）
 - **FP8 KV cache** — 显存占用减半，单卡 96GB 支持 256K 上下文
-- **MTP 投机解码** — 利用 Qwen3.6 内置 MTP 层，~50% 接受率，输出无损
-- **质量验证** — MMLU-Pro 84.5% vs 官方 86.2（噪声范围内），HumanEval+ 与
-  标准 vLLM 持平，工具调用/Agent/长上下文回归 100% 通过
+- **DFlash 投机解码** — Laguna draft/verify 路径，接受率由逐 prompt 回归门禁验证
+- **质量验证** — 生产 CUDA Graph、DFlash 接受率和 router 位级 oracle 均有独立门禁
 
 ### 性能数据
 
@@ -388,15 +373,18 @@ git clone https://github.com/jieen1/BlackweLLM.git
 cd BlackweLLM
 python -m pip install -e '.[dev,serving]'
 
-# 仅在已完成匹配版本的 vLLM provider 构建后安装；日常 CPU 开发不需要它。
+# GPU runtime dependencies; this does not install vLLM.
 python -m pip install -e '.[cuda,dev,serving]'
+
+# 安装 Laguna 依赖的本地 SparkInfer provider。
+python -m pip install -e /path/to/sparkinfer
 
 # 启动服务（256K 上下文，2 并发）
 QSR_SERVER_PRODUCTION=1 \
 QSR_SERVER_CAPACITY=2 \
 QSR_SERVER_NUM_SLOTS=2 \
 QSR_SERVER_BLOCKS_PER_SLOT=16384 \
-QSR_SERVED_MODEL_NAME="qwen3.6" \
+QSR_SERVED_MODEL_NAME="laguna-s-2.1" \
 python -m server.app --host 0.0.0.0 --port 8000
 ```
 
