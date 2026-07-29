@@ -232,7 +232,7 @@ def main():
             "k": NUM_SPECULATIVE_TOKENS,
             "block_size": g["backend"].block_size,
             "capacity": g["backend"].num_slots,
-            "max_model_len": g["backend"].vllm_config.model_config.max_model_len,
+            "max_model_len": g["backend"].runtime_config.model_config.max_model_len,
         },
         extra={
             "workload_extra": {
