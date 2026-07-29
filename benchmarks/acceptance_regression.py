@@ -245,7 +245,11 @@ def main():
         "summary": summary,
         "results": results,
     }
-    out = _REPO / "benchmarks" / "fixtures" / f"acceptance_regression_{time.strftime('%Y%m%d')}.json"
+    out = Path(os.environ.get(
+        "QSR_ACCEPTANCE_REGRESSION_OUT",
+        _REPO / "benchmarks" / "fixtures" / f"acceptance_regression_{time.strftime('%Y%m%d')}.json",
+    ))
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(fixture, indent=2, ensure_ascii=False))
     print(f"\nSaved: {out}")
 
