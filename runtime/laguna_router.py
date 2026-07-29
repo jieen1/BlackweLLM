@@ -20,6 +20,7 @@ ABI_VERSION = 1
 EXPERTS = 256
 TOP_K = 10
 TARGET_SM = "sm_120a"
+ROUTER_MODES = frozenset(("vllm", "native"))
 
 _KERNEL_DIR = Path(__file__).with_name("kernels")
 _GENERATED_DIR = _KERNEL_DIR / "_generated"
@@ -29,6 +30,23 @@ _MANIFEST_PATH = _GENERATED_DIR / "laguna_router_sm120.manifest.json"
 
 class LagunaRouterError(RuntimeError):
     """The fixed native router cannot satisfy its production contract."""
+
+
+def resolve_router_mode(value: str | None) -> str:
+    """Return the explicit temporary A/B router mode or reject typos early."""
+    mode = value or "vllm"
+    if mode not in ROUTER_MODES:
+        choices = ", ".join(sorted(ROUTER_MODES))
+        raise LagunaRouterError(f"invalid QSR_LAGUNA_ROUTER={mode!r}; expected one of: {choices}")
+    return mode
+
+
+def router_max_rows(prefill_chunk_tokens: int, num_slots: int, *, swa_qo_max: int) -> int:
+    """Compute the fixed router arena capacity before CUDA Graph capture."""
+    max_rows = max(prefill_chunk_tokens, swa_qo_max, num_slots)
+    if max_rows <= 0:
+        raise LagunaRouterError(f"Laguna router max rows must be positive, got {max_rows}")
+    return max_rows
 
 
 @dataclass(frozen=True)
@@ -68,6 +86,17 @@ def _load_manifest(path: Path) -> RouterManifest:
     return RouterManifest.from_json(value)
 
 
+def _require_sm120_cuda() -> None:
+    """Reject a matching artifact when the active CUDA device is not SM120."""
+    import torch
+
+    if not torch.cuda.is_available():
+        raise LagunaRouterError("Laguna router requires an available SM120 CUDA device")
+    capability = torch.cuda.get_device_capability()
+    if capability != (12, 0):
+        raise LagunaRouterError(f"Laguna router requires CUDA capability (12, 0), got {capability}")
+
+
 class LagunaRouterLibrary:
     """Loaded C ABI library with strict contract validation and no fallback."""
 
@@ -104,6 +133,7 @@ class LagunaRouterLibrary:
             )
         if _sha256(library_path) != manifest.library_sha256:
             raise LagunaRouterError("Laguna router library SHA256 does not match its manifest")
+        _require_sm120_cuda()
         try:
             library = ctypes.CDLL(str(library_path))
         except OSError as error:
@@ -146,6 +176,19 @@ class LagunaRouterLibrary:
         if status != 0:
             raise LagunaRouterError(f"Laguna router launch failed with status {status}")
         return topk_weights[:rows], topk_ids[:rows]
+
+
+class LagunaRouterArena:
+    """Address-stable caller-owned router outputs for one Laguna engine thread."""
+
+    def __init__(self, max_rows: int, device: Any) -> None:
+        if max_rows <= 0:
+            raise LagunaRouterError(f"Laguna router max rows must be positive, got {max_rows}")
+        import torch
+
+        self.max_rows = max_rows
+        self.weights = torch.empty((max_rows, TOP_K), dtype=torch.float32, device=device)
+        self.ids = torch.empty((max_rows, TOP_K), dtype=torch.int32, device=device)
 
 
 def _validate_tensors(

@@ -8,9 +8,13 @@ import pytest
 from runtime.laguna_router import (
     ABI_VERSION,
     TARGET_SM,
+    LagunaRouterArena,
     LagunaRouterError,
     LagunaRouterLibrary,
+    _require_sm120_cuda,
     artifact_paths,
+    resolve_router_mode,
+    router_max_rows,
 )
 
 
@@ -66,3 +70,37 @@ def test_loader_rejects_library_hash_mismatch_before_loading_library(tmp_path) -
 
     with pytest.raises(LagunaRouterError, match="SHA256"):
         LagunaRouterLibrary.load(library_path=library, manifest_path=manifest)
+
+
+def test_router_mode_defaults_to_vllm_and_accepts_native_for_ab_validation() -> None:
+    assert resolve_router_mode(None) == "vllm"
+    assert resolve_router_mode("native") == "native"
+
+
+def test_router_mode_rejects_an_unrecognized_ab_value() -> None:
+    with pytest.raises(LagunaRouterError, match="QSR_LAGUNA_ROUTER"):
+        resolve_router_mode("torch")
+
+
+def test_router_arena_capacity_is_fixed_from_prefill_verify_and_slots() -> None:
+    assert router_max_rows(8192, 4, swa_qo_max=16) == 8192
+    assert router_max_rows(8, 32, swa_qo_max=16) == 32
+
+
+def test_router_arena_constructor_rejects_nonpositive_capacity_without_cuda() -> None:
+    with pytest.raises(LagunaRouterError, match="max rows"):
+        LagunaRouterArena(0, "cuda")
+
+
+def test_sm120_guard_rejects_cpu_only_torch(monkeypatch) -> None:
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    monkeypatch.setitem(__import__("sys").modules, "torch", FakeTorch())
+    with pytest.raises(LagunaRouterError, match="available SM120"):
+        _require_sm120_cuda()
