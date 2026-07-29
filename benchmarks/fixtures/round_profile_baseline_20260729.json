@@ -1,0 +1,18 @@
+{
+  "date": "2026-07-29",
+  "label": "baseline_before_loop_opt",
+  "e2e": {
+    "tok_per_s": 365.7,
+    "itl_ms": 2.73,
+    "accept": 0.9608,
+    "round_ms": 41.0,
+    "prefill_ms": 789.0
+  },
+  "components": {
+    "verify_ms": 36.0,
+    "accept_ms": 0.6,
+    "ctx_kv_ms": 1.2,
+    "draft_ms": 3.9,
+    "total_ms": 41.6
+  }
+}
