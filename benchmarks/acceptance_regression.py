@@ -223,8 +223,33 @@ def main():
     print(f"Prompts: {len(SUITE)}  Warmup/measure: {WARMUP_ROUNDS}/{MEASURE_ROUNDS}")
     print("=" * 80)
 
-    results = run_suite(g["backend"], g["engine"], g["tokenizer"])
-    summary = summarize(results)
+    from bfdiag.record import run_record
+    from runtime.backends.dflash_constants import NUM_SPECULATIVE_TOKENS
+
+    with run_record(
+        script="bf exec: Laguna DFlash acceptance regression",
+        workload={
+            "k": NUM_SPECULATIVE_TOKENS,
+            "block_size": g["backend"].block_size,
+            "capacity": g["backend"].num_slots,
+            "max_model_len": g["backend"].vllm_config.model_config.max_model_len,
+        },
+        extra={
+            "workload_extra": {
+                "kind": "laguna-dflash-acceptance-regression",
+                "suite_version": SUITE_VERSION,
+                "warmup_rounds": WARMUP_ROUNDS,
+                "measure_rounds": MEASURE_ROUNDS,
+            }
+        },
+    ) as rec:
+        results = run_suite(g["backend"], g["engine"], g["tokenizer"])
+        summary = summarize(results)
+        for result in results:
+            rec.metric(f"accept_{result['label']}", result["accept"])
+            rec.metric(f"tok_s_{result['label']}", result["tok_s"])
+        rec.metric("accept_all_mean", summary["all"]["mean"])
+        rec.metric("accept_real_mean", summary["real_workload"]["mean"])
 
     print(f"\n{'='*80}")
     print("SUMMARY")

@@ -48,10 +48,7 @@ from runtime.backends.laguna import (
     _physical_slot,
     _ring_blocks_for_window,
 )
-from runtime.compat_vllm import (
-    set_current_vllm_config,
-    set_forward_context,
-)
+from runtime.laguna_runtime import LagunaAttentionMetadata, bind_laguna_kv_cache
 from runtime.mtp_accept import determine_accept_reject_from_predictions
 
 logger = logging.getLogger("qwen_sm120_runtime.dflash")
@@ -205,13 +202,12 @@ class DFlashEngine:
             max_model_len=DRAFT_WINDOW + NUM_QUERY_PER_REQ + 128,
         )
 
-        with set_current_vllm_config(draft_vllm_config):
-            from runtime.model_loading import load_laguna_dflash_draft_model
+        from runtime.model_loading import load_laguna_dflash_draft_model
 
-            draft_model = load_laguna_dflash_draft_model(
-                target_model=self.backend.model,
-                draft_vllm_config=draft_vllm_config,
-            )
+        draft_model = load_laguna_dflash_draft_model(
+            target_model=self.backend.model,
+            draft_vllm_config=draft_vllm_config,
+        )
 
         draft_model.eval()
         logger.info("DFlash draft model loaded from %s", model_path)
@@ -234,8 +230,6 @@ class DFlashEngine:
 
     def _alloc_draft_kv_cache(self) -> None:
         """Allocate KV cache for the draft model's 6 SWA layers."""
-        from runtime.compat_vllm import bind_kv_cache
-
         # Discover draft model's attention layers from static_forward_context
         sfc = self.vllm_config.compilation_config.static_forward_context
 
@@ -294,7 +288,7 @@ class DFlashEngine:
             self._draft_kv_caches[name] = torch.zeros(shape, dtype=torch.uint8, device=self.device)
 
         # Bind draft KV caches to draft attention layers
-        bind_kv_cache(self._draft_kv_caches, self._draft_attn_layers, [])
+        bind_laguna_kv_cache(self._draft_kv_caches, self._draft_attn_layers, [])
         logger.info(
             "DFlash: draft KV allocated: %d blocks/slot × %d layers",
             draft_blocks_per_slot,
@@ -382,26 +376,6 @@ class DFlashEngine:
             "DFlash: draft attention patched with sparkinfer (%d layers)",
             len(self._draft_layer_names),
         )
-
-    def _init_draft_metadata_builder(self) -> None:
-        """Initialize FlashInfer metadata builder for draft model attention."""
-        from runtime.compat_vllm import get_flashinfer_metadata_builder
-
-        FlashInferMetadataBuilder = get_flashinfer_metadata_builder()
-
-        # All draft layers share the same config (72 QO / 8 KV, SWA window=512)
-        first_attn = self._draft_attn_layers[self._draft_layer_names[0]]
-        kv_cache_spec = first_attn.get_kv_cache_spec(self.vllm_config)
-
-        with set_current_vllm_config(self.vllm_config):
-            self._draft_metadata_builder = FlashInferMetadataBuilder(
-                kv_cache_spec=kv_cache_spec,
-                layer_names=self._draft_layer_names,
-                vllm_config=self.vllm_config,
-                device=self.device,
-            )
-        self._draft_metadata_builder.disable_split_kv = True
-        logger.info("DFlash: FlashInfer metadata builder initialized for draft")
 
     def _init_buffers(self) -> None:
         """Pre-allocate buffers for the speculative decode loop."""
@@ -558,13 +532,7 @@ class DFlashEngine:
             positions = torch.tensor(positions_list, dtype=torch.long, device=self.device)
 
         with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
-            with set_forward_context(
-                attn_metadata_dict,
-                backend.vllm_config,
-                slot_mapping=slot_mapping_dict,
-                skip_compiled=True,
-            ):
-                result = backend.model.forward(input_ids, positions)
+            result = backend.model.forward(input_ids, positions)
 
         # Handle tuple return (hidden_states, aux_hidden_states)
         if isinstance(result, tuple):
@@ -577,15 +545,11 @@ class DFlashEngine:
         return logits, aux_hidden_states
 
     def _build_draft_attn_metadata(self, slot: int, kv_len: int, num_tokens: int):
-        """Build CommonAttentionMetadata for draft model forward.
+        """Build owned attention metadata for the draft-model forward.
 
         Draft KV cache is a ring buffer (SWA window=512). All positions
         must be wrapped modulo ring_slots to avoid OOB writes.
         """
-        from runtime.compat_vllm import get_common_attn_metadata_cls
-
-        CommonAttentionMetadata = get_common_attn_metadata_cls()
-
         bs = self.block_size
         phys = _physical_slot(slot)
         draft_base = phys * self._draft_blocks_per_slot
@@ -619,7 +583,7 @@ class DFlashEngine:
         self._draft_qsl[1] = num_tokens
         self._draft_qsl_cpu[1] = num_tokens
 
-        return CommonAttentionMetadata(
+        return LagunaAttentionMetadata(
             query_start_loc=self._draft_qsl[:2],
             query_start_loc_cpu=self._draft_qsl_cpu[:2],
             seq_lens=self._draft_seq_lens[:1],
@@ -683,17 +647,11 @@ class DFlashEngine:
         # Caught by an actual GPU run (RuntimeError: BFAttention was
         # called without a scoped attention context), not by inspection.
         with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
-            with set_forward_context(
-                attn_metadata_dict,
-                self.vllm_config,
-                slot_mapping=slot_mapping_dict,
-                skip_compiled=True,
-            ):
-                draft_hidden = self.draft_model(
-                    input_ids=self._draft_input_ids[:num_tokens],
-                    positions=self._draft_positions[:num_tokens],
-                    inputs_embeds=None,
-                )
+            draft_hidden = self.draft_model(
+                input_ids=self._draft_input_ids[:num_tokens],
+                positions=self._draft_positions[:num_tokens],
+                inputs_embeds=None,
+            )
 
         # Compute draft logits and sample greedily. Position 0's logits are
         # never used (only positions 1..15, the mask positions, predict the
@@ -789,10 +747,6 @@ class DFlashEngine:
         positions = torch.arange(kv_len, kv_len + num_tokens, dtype=torch.long, device=device)
 
         # Build full-attention metadata (standard contiguous blocks)
-        from runtime.compat_vllm import get_common_attn_metadata_cls, set_current_vllm_config
-
-        CommonAttentionMetadata = get_common_attn_metadata_cls()
-
         phys = _physical_slot(slot)
         new_kv_len = kv_len + num_tokens
         n_blocks_full = (new_kv_len + bs - 1) // bs
@@ -814,7 +768,7 @@ class DFlashEngine:
         qsl_cpu = torch.tensor([0, num_tokens], dtype=torch.int32)
         seq_lens = torch.tensor([new_kv_len], dtype=torch.int32, device=device)
 
-        full_meta = CommonAttentionMetadata(
+        full_meta = LagunaAttentionMetadata(
             query_start_loc=qsl,
             query_start_loc_cpu=qsl_cpu,
             seq_lens=seq_lens,
@@ -854,7 +808,7 @@ class DFlashEngine:
 
             ring_seq_lens = torch.tensor([aligned_len], dtype=torch.int32, device=device)
 
-            swa_meta = CommonAttentionMetadata(
+            swa_meta = LagunaAttentionMetadata(
                 query_start_loc=qsl,
                 query_start_loc_cpu=qsl_cpu,
                 seq_lens=ring_seq_lens,
@@ -876,20 +830,13 @@ class DFlashEngine:
             wl = group_key[0]
             is_swa = wl >= 0
             meta = swa_meta if (is_swa and swa_meta is not None) else full_meta
-            with set_current_vllm_config(backend.vllm_config):
-                metadata = builder.build(common_prefix_len=0, common_attn_metadata=meta)
+            metadata = builder.build(common_prefix_len=0, common_attn_metadata=meta)
             for name in backend._layer_groups[group_key]:
                 attn_metadata_dict[name] = metadata
                 slot_mapping_dict[name] = meta.slot_mapping
 
         with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
-            with set_forward_context(
-                attn_metadata_dict,
-                backend.vllm_config,
-                slot_mapping=slot_mapping_dict,
-                skip_compiled=True,
-            ):
-                result = backend.model.forward(input_ids, positions)
+            result = backend.model.forward(input_ids, positions)
 
         if isinstance(result, tuple):
             hidden_states = result[0]
@@ -1607,10 +1554,6 @@ class DFlashEngine:
         positions = torch.arange(kv_len, kv_len + num_tokens, dtype=torch.long, device=self.device)
 
         # Build metadata (reuse existing _forward_verify logic)
-        from runtime.compat_vllm import get_common_attn_metadata_cls, set_current_vllm_config
-
-        CommonAttentionMetadata = get_common_attn_metadata_cls()
-
         phys = _physical_slot(slot)
         new_kv_len = kv_len + num_tokens
         bs = backend.block_size
@@ -1630,7 +1573,7 @@ class DFlashEngine:
         qsl_cpu = torch.tensor([0, num_tokens], dtype=torch.int32)
         seq_lens = torch.tensor([new_kv_len], dtype=torch.int32, device=self.device)
 
-        full_meta = CommonAttentionMetadata(
+        full_meta = LagunaAttentionMetadata(
             query_start_loc=qsl,
             query_start_loc_cpu=qsl_cpu,
             seq_lens=seq_lens,
@@ -1669,17 +1612,8 @@ class DFlashEngine:
                 attn_metadata_dict[name] = meta
                 slot_mapping_dict[name] = full_sm if not is_swa else swa_meta.slot_mapping
 
-        from runtime.compat_vllm import set_forward_context
-
-        with set_current_vllm_config(backend.vllm_config):
-            with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
-                with set_forward_context(
-                    attn_metadata_dict,
-                    backend.vllm_config,
-                    slot_mapping=slot_mapping_dict,
-                    skip_compiled=True,
-                ):
-                    result = backend.model.forward(input_ids, positions)
+        with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
+            result = backend.model.forward(input_ids, positions)
 
         if isinstance(result, tuple):
             hidden_states, aux = result

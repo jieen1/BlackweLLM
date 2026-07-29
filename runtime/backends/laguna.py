@@ -24,13 +24,12 @@ from bfdiag.trace import ring as bfdiag_trace
 from bfprobe.routing import capture_routing
 from runtime.backends.bf_attention import bf_attn_context
 from runtime.block_pool import ChunkedPrefillState
-from runtime.compat_vllm import (
-    VllmConfig,
-    bind_kv_cache,
+from runtime.laguna_config import SelfBuiltVllmConfig
+from runtime.laguna_runtime import (
+    LagunaAttentionMetadata,
+    bind_laguna_kv_cache,
     get_distributed_init_method,
     get_open_port,
-    set_current_vllm_config,
-    set_forward_context,
 )
 from runtime.logprobs import compute_logprobs
 from runtime.model_spec import ModelSpec
@@ -113,7 +112,7 @@ class LagunaBackend:
 
     def __init__(
         self,
-        vllm_config: VllmConfig,
+        vllm_config: SelfBuiltVllmConfig,
         *,
         num_slots: int = 4,
         block_size: int = 64,
@@ -173,53 +172,22 @@ class LagunaBackend:
         patch_nvfp4_prefer_cutlass_direct()
         patch_nvfp4_custom_gemm()
 
-        # Load model
-        with set_current_vllm_config(vllm_config):
-            init_method = get_distributed_init_method("127.0.0.1", get_open_port())
-            # Minimal, nano-vllm-style torch.distributed.init_process_
-            # group() only -- verified (阶段8/任务#44) that nothing in
-            # this runtime's own code reads vLLM's GroupCoordinator/
-            # get_tp_group()/get_pp_group() state. 任务#46 removed the
-            # QSR_LAGUNA_MODEL_LOADER=vllm escape hatch (real
-            # init_worker_distributed_environment() + get_model()) that
-            # used to sit alongside this -- see notes doc 任务#46 for
-            # what it cost to keep working (a TP/PP GroupCoordinator gap
-            # in the mixed-loader case, plus a deeper lm_head/quant_
-            # method tying incompatibility) versus what it was actually
-            # for (a safety net during 任务#45's own validation, no
-            # longer needed once both paths were bit-exact confirmed).
-            from runtime.laguna_config import init_laguna_distributed_environment
+        # The self-built model has no vLLM global-config reader.  Establish
+        # the one-rank torch process group, then construct it directly.
+        init_method = get_distributed_init_method("127.0.0.1", get_open_port())
+        from runtime.laguna_config import init_laguna_distributed_environment
 
-            init_laguna_distributed_environment(
-                rank=0, distributed_init_method=init_method, local_rank=0
-            )
-            # runtime.model_loading.load_laguna_model() (see notes/2026-07-27
-            # -vllm-complete-removal-implementation-plan.md 阶段1) replaces
-            # get_model()'s registry lookup + weight loading orchestration.
-            # Still reuses vLLM's Linear/Embedding/Attention/FusedMoE classes
-            # (阶段2 scope). Default since 2026-07-28 after two bit-exact
-            # passes against the old get_model() path:
-            #   - benchmarks/_phase1_bitexact_validate.py: 167-token real
-            #     English prompt, single-chunk prefill, 32-round greedy
-            #     decode -- exact match.
-            #   - benchmarks/_phase1_bitexact_validate_long.py: 10240-token
-            #     real multi-paragraph text, multi-chunk prefill (crosses
-            #     the 8192-token QSR_PREFILL_CHUNK threshold), 128-round
-            #     greedy decode (forces multiple SWA ring wrap-arounds) --
-            #     exact match, zero mismatches across all 128 tokens.
-            from runtime.model_loading import load_laguna_model
+        init_laguna_distributed_environment(
+            rank=0, distributed_init_method=init_method, local_rank=0
+        )
+        from runtime.model_loading import load_laguna_model
 
-            self.model = load_laguna_model(vllm_config)
+        self.model = load_laguna_model(vllm_config)
         # Set IR op priority (fused RMSNorm C++ kernels) — normally done by worker init
         vllm_config.kernel_config.ir_op_priority.set_default()
 
         # Replace vLLM RMSNorm with our Triton fused kernel (zero vLLM dep)
         self._patch_rmsnorm_triton()
-
-        # Initialize workspace manager for MoE layers
-        from runtime.compat_vllm import init_flashinfer_workspace
-
-        init_flashinfer_workspace(self.device)
 
         # Patch MoE layers with the sparkinfer kernel (自研 kernel 集成,
         # zero vLLM dependency for the expert compute itself)
@@ -362,7 +330,7 @@ class LagunaBackend:
             shape = (2, n_blocks, block_size, layer.num_kv_heads, layer.head_size)
             self.kv_caches[name] = torch.zeros(shape, dtype=kv_dtype, device=self.device)
         runner_kv_caches: list[torch.Tensor] = []
-        bind_kv_cache(self.kv_caches, sfc, runner_kv_caches)
+        bind_laguna_kv_cache(self.kv_caches, sfc, runner_kv_caches)
         # Replace vLLM Attention modules with self-developed BFAttention
         from runtime.backends.bf_attention import replace_vllm_attention
 
@@ -489,7 +457,7 @@ class LagunaBackend:
         )
         self._laguna_router_library = LagunaRouterLibrary.load()
         self._laguna_router_arena = LagunaRouterArena(max_rows, self.device)
-        logger.info("Laguna native router A/B mode: fixed output arena rows=%d", max_rows)
+        logger.info("Laguna native router: fixed output arena rows=%d", max_rows)
 
     def _warmup_laguna_router(self, correction_bias: torch.Tensor) -> None:
         """Resolve the native module before CUDA Graph capture, never in forward."""
@@ -726,11 +694,7 @@ class LagunaBackend:
         qo_lens: list[int],
         is_decode: bool,
     ):
-        """Build CommonAttentionMetadata for full-attention layers."""
-        from runtime.compat_vllm import get_common_attn_metadata_cls
-
-        CommonAttentionMetadata = get_common_attn_metadata_cls()
-
+        """Build owned metadata for full-attention layers."""
         num_reqs = len(slot_ids)
         num_actual_tokens = sum(qo_lens)
         page_size = self.block_size
@@ -773,7 +737,7 @@ class LagunaBackend:
                 mappings.append(sm)
             slot_mapping = torch.cat(mappings) if len(mappings) > 1 else mappings[0]
 
-        return CommonAttentionMetadata(
+        return LagunaAttentionMetadata(
             query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens=seq_lens,
@@ -789,7 +753,7 @@ class LagunaBackend:
     def _build_sparkinfer_metadata(
         self, common_meta, window_left: int = -1, mode: str | None = None
     ):
-        """Convert CommonAttentionMetadata to SparkinferAttnMetadata."""
+        """Convert owned attention metadata to ``SparkinferAttnMetadata``."""
         from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
 
         num_reqs = common_meta.num_reqs
@@ -817,15 +781,11 @@ class LagunaBackend:
         is_decode: bool,
         swa_mode: str = "auto",
     ):
-        """Build CommonAttentionMetadata for SWA layers.
+        """Build owned attention metadata for SWA layers.
 
         swa_mode: explicit routing — "decode_ring", "verify_ring",
                   "prefill_scratch", or "auto" (infer from is_decode/qo).
         """
-        from runtime.compat_vllm import get_common_attn_metadata_cls
-
-        CommonAttentionMetadata = get_common_attn_metadata_cls()
-
         num_reqs = len(slot_ids)
         num_actual_tokens = sum(qo_lens)
         bs = self.block_size
@@ -922,7 +882,7 @@ class LagunaBackend:
                     mappings.append((ring_base + ring_block) * bs + ring_off)
             slot_mapping = torch.tensor(mappings, dtype=torch.long, device=self.device)
 
-        return CommonAttentionMetadata(
+        return LagunaAttentionMetadata(
             query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens=seq_lens,
@@ -956,7 +916,7 @@ class LagunaBackend:
         if is_decode and qo_len == 1:
             self._fill_decode_buffers(slot_ids, token_ids, kv_lengths)
 
-        # Build CommonAttentionMetadata
+        # Build owned attention metadata.
         common_meta = self._build_common_attn_metadata(slot_ids, kv_lengths, qo_lens, is_decode)
 
         # Build sparkinfer attention metadata per group
@@ -1008,23 +968,7 @@ class LagunaBackend:
             positions = torch.tensor(positions_list, dtype=torch.long, device=self.device)
 
         with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
-            with set_forward_context(
-                attn_metadata_dict,
-                self.vllm_config,
-                slot_mapping=slot_mapping_dict,
-                # `skip_compiled=not is_decode` (402dedf) let decode dispatch
-                # through vLLM's @support_torch_compile wrapper for a ~0.7ms
-                # fusion win, only ever exercised at num_reqs=1 -- decode CG
-                # now owns that fast path. The eager fallback here only runs
-                # when CG is ineligible (batch-size mismatch, non-greedy,
-                # logprobs), and at num_reqs>1 the compiled dispatch hits a
-                # torch._dynamo "data-dependent expression" guard failure and
-                # crashes every multi-slot eager decode request. Always skip
-                # compilation here; this path's job is correctness, not the
-                # marginal fusion benefit.
-                skip_compiled=True,
-            ):
-                result = self.model.forward(input_ids, positions)
+            result = self.model.forward(input_ids, positions)
 
         # Handle tuple return when aux_hidden_state_layers is set (DFlash)
         if isinstance(result, tuple):
@@ -1565,13 +1509,7 @@ class LagunaBackend:
             positions = torch.tensor(positions_list, dtype=torch.long, device=self.device)
 
         with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
-            with set_forward_context(
-                attn_metadata_dict,
-                self.vllm_config,
-                slot_mapping=slot_mapping_dict,
-                skip_compiled=True,
-            ):
-                result = self.model.forward(input_ids, positions)
+            result = self.model.forward(input_ids, positions)
 
         if isinstance(result, tuple):
             hidden_states, aux_hidden_states = result
