@@ -341,7 +341,7 @@ class LagunaAttentionSelfBuilt(nn.Module):
         # vLLM's Attention construction -- see runtime/model/
         # plain_attention.py's module docstring for the full evaluation
         # and exact attribute contract). bf_attention.py's
-        # replace_vllm_attention() discovers attention layers via
+        # replace_laguna_attention() discovers attention layers via
         # static_forward_context (now populated externally by
         # LagunaBackend.__init__, see laguna.py); this is the actual
         # compute-ownership boundary, not this class.

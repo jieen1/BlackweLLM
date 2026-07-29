@@ -299,7 +299,7 @@ class DFlashEngine:
         """Patch draft model attention layers to use sparkinfer (zero FlashInfer dep).
 
         阶段7-补充: also replaces each draft attention layer's whole module
-        with ``BFAttention`` (``replace_vllm_attention()``, same call the
+        with ``BFAttention`` (``replace_laguna_attention()``, same call the
         main model already goes through in ``LagunaBackend.__init__``) --
         previously this only swapped ``.impl``, leaving ``self.attn``
         itself as a real vLLM ``Attention`` instance (now
@@ -319,11 +319,11 @@ class DFlashEngine:
         real ``SparkinferAttentionImpl`` (with the draft-specific
         ``window_left=DRAFT_WINDOW - 1``, different from the main
         model's per-layer-group window) BEFORE calling
-        ``replace_vllm_attention()``, since it reads ``attn_layer.impl.
+        ``replace_laguna_attention()``, since it reads ``attn_layer.impl.
         scale``/``.window_left`` to construct each BFAttention -- same
         order LagunaBackend.__init__ already uses for the main model.
 
-        ``replace_vllm_attention()``'s default parent-resolution logic
+        ``replace_laguna_attention()``'s default parent-resolution logic
         (split ``layer_name`` on ``"."``, walk the model tree by those
         exact path components) does NOT work here and needs its
         ``resolve_parent`` override: draft attention layers are
@@ -341,7 +341,7 @@ class DFlashEngine:
         real attribute access, matching each layer's ``self_attn.attn``
         against ``self._draft_attn_layers`` by ``layer_name``.
         """
-        from runtime.backends.bf_attention import replace_vllm_attention
+        from runtime.backends.bf_attention import replace_laguna_attention
         from runtime.backends.laguna_sparkinfer_attn import SparkinferAttentionImpl
 
         for name in self._draft_layer_names:
@@ -366,7 +366,7 @@ class DFlashEngine:
         def _resolve_parent(layer_name: str) -> tuple[Any, str]:
             return parents_by_name[layer_name], "attn"
 
-        replace_vllm_attention(
+        replace_laguna_attention(
             self.draft_model,
             self._draft_attn_layers,
             self._draft_kv_caches,

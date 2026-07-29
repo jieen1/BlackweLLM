@@ -195,13 +195,13 @@ class BFAttention(nn.Module):
         return output
 
 
-def replace_vllm_attention(
+def replace_laguna_attention(
     model: nn.Module,
     sfc: dict[str, Any],
     kv_caches: dict[str, torch.Tensor],
     resolve_parent: Any = None,
 ) -> int:
-    """Replace all vLLM Attention modules in model with BFAttention.
+    """Replace Laguna attention placeholders in ``model`` with BFAttention.
 
     Walks the model tree, finds Attention instances registered in sfc,
     and replaces them with BFAttention that has the same config + our
@@ -232,7 +232,7 @@ def replace_vllm_attention(
         if not hasattr(attn_layer, "get_attn_backend"):
             continue
 
-        # Read config from the original vLLM Attention layer
+        # Read the placeholder's fixed Laguna attention geometry.
         num_heads = attn_layer.num_heads
         head_size = attn_layer.head_size
         num_kv_heads = attn_layer.num_kv_heads
@@ -284,5 +284,5 @@ def replace_vllm_attention(
 
         replaced += 1
 
-    logger.info("Replaced %d vLLM Attention modules with BFAttention", replaced)
+    logger.info("Replaced %d Laguna attention placeholders with BFAttention", replaced)
     return replaced

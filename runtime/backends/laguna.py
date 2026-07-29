@@ -387,9 +387,9 @@ class LagunaBackend:
         runner_kv_caches: list[torch.Tensor] = []
         bind_laguna_kv_cache(self.kv_caches, sfc, runner_kv_caches)
         # Replace vLLM Attention modules with self-developed BFAttention
-        from runtime.backends.bf_attention import replace_vllm_attention
+        from runtime.backends.bf_attention import replace_laguna_attention
 
-        replace_vllm_attention(self.model, sfc, self.kv_caches)
+        replace_laguna_attention(self.model, sfc, self.kv_caches)
 
         # ── Persistent prefill scratch for SWA layers ──
         # A decoder layer's SWA KV is copied to its ring immediately after
