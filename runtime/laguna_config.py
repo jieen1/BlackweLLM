@@ -54,10 +54,10 @@ from typing import Any
 
 import torch
 
-from vllm.transformers_utils.configs.laguna import LagunaConfig
+from transformers import AutoConfig
 
 # ---------------------------------------------------------------------------
-# LagunaConfig itself (vllm/transformers_utils/configs/laguna.py) is kept as
+# LagunaConfig is loaded from the checkpoint's custom code via transformers
 # a real vLLM import deliberately, NOT replaced with a from-scratch
 # transformers.AutoConfig.from_pretrained() call: it is a tiny (~120-line),
 # fully standalone `transformers.PretrainedConfig` subclass with zero further
@@ -193,7 +193,7 @@ class SelfBuiltModelConfig:
     guessed).
     """
 
-    hf_config: LagunaConfig
+    hf_config: object  # LagunaConfig from checkpoint
     dtype: torch.dtype
     model: str
     max_model_len: int
@@ -212,7 +212,7 @@ class SelfBuiltModelConfig:
     hf_overrides: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @property
-    def hf_text_config(self) -> LagunaConfig:
+    def hf_text_config(self) -> object:  # LagunaConfig
         # Real vLLM's get_hf_text_config() only differs from hf_config
         # itself for nested-text-config multimodal architectures (e.g.
         # a separate `.text_config`) -- Laguna is not one (verified: no
@@ -272,7 +272,7 @@ def build_laguna_config(
     validation paths, not vLLM's full CLI surface).
     """
     model_dir = Path(model)
-    hf_config = LagunaConfig.from_pretrained(model)
+    hf_config = AutoConfig.from_pretrained(model, trust_remote_code=True)
 
     checkpoint_config = json.loads((model_dir / "config.json").read_text())
     quantization_config = checkpoint_config.get("quantization_config")
