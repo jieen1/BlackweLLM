@@ -117,6 +117,7 @@ class LagunaModelSelfBuilt(nn.Module):
                     prefix=f"{prefix}.layers.{layer_idx}",
                     enable_eplb=vllm_config.parallel_config.enable_eplb,
                     layer_idx=layer_idx,
+                    max_model_len=vllm_config.model_config.max_model_len,
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]

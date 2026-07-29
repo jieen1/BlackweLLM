@@ -205,6 +205,7 @@ class LagunaAttentionSelfBuilt(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         max_position_embeddings: int = 131072,
+        max_model_len: int | None = None,
         head_dim: int | None = None,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
@@ -399,6 +400,7 @@ class LagunaDecoderLayerSelfBuilt(nn.Module):
         enable_eplb: bool = False,
         layer_idx: int | None = None,
         attention_prefix: str | None = None,
+        max_model_len: int | None = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
