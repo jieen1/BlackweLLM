@@ -41,7 +41,55 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="After the functional gate, prefill tokens and report CUDA memory (0 disables)",
     )
+    parser.add_argument(
+        "--server",
+        action="store_true",
+        help="Exercise ServerEngine startup and one DFlash request instead of the backend gate",
+    )
     return parser.parse_args()
+
+
+async def _verify_server(args: argparse.Namespace) -> None:
+    from server.engine import ServerEngine
+
+    class _SmokeServerEngine(ServerEngine):
+        MODEL = args.model
+
+    engine = _SmokeServerEngine(
+        capacity=1,
+        num_slots=1,
+        block_size=64,
+        blocks_per_slot=args.blocks_per_slot,
+        enable_cudagraph=False,
+        enable_dflash=True,
+        gpu_memory_utilization=0.80,
+    )
+    prompt_ids = engine.tok.encode(
+        "The quick brown fox jumps over the lazy dog. " * 32,
+        add_special_tokens=False,
+    )[:128]
+    try:
+        engine.start()
+        result = await engine.submit(prompt_ids, max_tokens=32)
+        loaded_vllm = sorted(
+            name for name in sys.modules if name == "vllm" or name.startswith("vllm.")
+        )
+        if loaded_vllm:
+            raise RuntimeError(f"Laguna server loaded vLLM modules: {loaded_vllm}")
+        print(
+            {
+                "result_tokens": len(result["committed_token_ids"]),
+                "engine_rounds": engine.stats["rounds"],
+                "requests_completed": engine.stats["requests_completed"],
+                "vllm_modules": loaded_vllm,
+            }
+        )
+    finally:
+        await engine.stop()
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def main() -> None:
@@ -59,6 +107,12 @@ def main() -> None:
     os.environ.setdefault("USE_LIBUV", "0")
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
+
+    if args.server:
+        import asyncio
+
+        asyncio.run(_verify_server(args))
+        return
 
     from transformers import AutoTokenizer
 
