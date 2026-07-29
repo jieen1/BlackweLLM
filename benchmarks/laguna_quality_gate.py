@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Laguna L2 质量链：oracle A/B 比对 + prompt ids 断言护栏。
+"""Laguna L2 质量链：native/oracle A/B 比对 + prompt ids 断言护栏。
 
 两条路径在独立子进程中运行，避免 vLLM 全局状态污染。
 
@@ -32,6 +32,7 @@ GREEDY_PROMPTS = [
 
 LAGUNA_EOS = (2, 24)
 MAX_DECODE_TOKENS = 80
+ORACLE_TIMEOUT_SECONDS = 1800
 
 BACKEND_SCRIPT = '''
 import json, os, sys
@@ -43,17 +44,22 @@ PROMPTS = {prompts!r}
 EOS = {eos!r}
 MAX_TOK = {max_tok!r}
 
-import torch
 from transformers import AutoTokenizer
-    from oracle.qwen36_vllm.vllm_compat import EngineArgs
 from runtime.backends.laguna import LagunaBackend
+from runtime.laguna_config import build_laguna_config
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-args = EngineArgs(model=MODEL, max_model_len=4096, gpu_memory_utilization=0.85,
-                  enforce_eager=True, dtype="bfloat16", disable_log_stats=True,
-                  async_scheduling=False)
-config = args.create_engine_config()
-backend = LagunaBackend(config, num_slots=4, block_size=64, blocks_per_slot=128)
+runtime_config = build_laguna_config(
+    MODEL,
+    max_model_len=4096,
+    gpu_memory_utilization=0.85,
+    enforce_eager=True,
+    dtype="bfloat16",
+    trust_remote_code=True,
+)
+backend = LagunaBackend(
+    runtime_config, num_slots=4, block_size=64, blocks_per_slot=128
+)
 
 results = []
 for prompt in PROMPTS:
@@ -83,23 +89,29 @@ MODEL = {model!r}
 PROMPTS = {prompts!r}
 MAX_TOK = {max_tok!r}
 
-from vllm import LLM, SamplingParams
-llm = LLM(model=MODEL, max_model_len=4096, gpu_memory_utilization=0.85,
-          enforce_eager=True, dtype="bfloat16", disable_log_stats=True)
-tokenizer = llm.get_tokenizer()
-params = SamplingParams(temperature=0, max_tokens=MAX_TOK)
+def main():
+    from vllm import LLM, SamplingParams
 
-results = []
-for prompt in PROMPTS:
-    ids = tokenizer.encode(prompt)
-    out = llm.generate([prompt], params)[0]
-    tokens = list(out.outputs[0].token_ids)
-    text = out.outputs[0].text
-    results.append({{"prompt": prompt, "prompt_ids": ids, "output_ids": tokens, "text": text[:200]}})
+    llm = LLM(model=MODEL, max_model_len=4096, gpu_memory_utilization=0.85,
+              enforce_eager=True, dtype="bfloat16", disable_log_stats=True)
+    tokenizer = llm.get_tokenizer()
+    params = SamplingParams(temperature=0, max_tokens=MAX_TOK)
 
-with open(sys.argv[1], "w") as f:
-    json.dump(results, f)
-print("vLLM done:", len(results), "prompts")
+    results = []
+    for prompt in PROMPTS:
+        ids = tokenizer.encode(prompt)
+        out = llm.generate([prompt], params)[0]
+        tokens = list(out.outputs[0].token_ids)
+        text = out.outputs[0].text
+        results.append({{"prompt": prompt, "prompt_ids": ids, "output_ids": tokens, "text": text[:200]}})
+
+    with open(sys.argv[1], "w") as f:
+        json.dump(results, f)
+    print("vLLM done:", len(results), "prompts")
+
+
+if __name__ == "__main__":
+    main()
 '''
 
 
@@ -128,12 +140,41 @@ def run_in_subprocess(script: str, label: str) -> list[dict]:
         print(f"\n{'='*60}")
         print(f"  Running {label} in subprocess...")
         print(f"{'='*60}")
+        child_env = os.environ.copy()
+        # FlashInfer's JIT invokes `ninja` by name.  The vLLM interpreter is
+        # intentionally addressed by an absolute path, so its sibling scripts
+        # are not otherwise guaranteed to be on PATH.
+        python_bin = str(Path(PYTHON).parent)
+        child_env["PATH"] = python_bin + os.pathsep + child_env.get("PATH", "")
+        # FlashInfer otherwise starts one memory-hungry nvcc process per CPU.
+        # The oracle host has 23 GiB of RAM; a two-job build avoids swap
+        # thrashing without changing either inference implementation.
+        child_env.setdefault("MAX_JOBS", "2")
         result = subprocess.run(
             [PYTHON, script_path, out_path],
-            capture_output=False,
-            timeout=600,
+            capture_output=True,
+            text=True,
+            timeout=ORACLE_TIMEOUT_SECONDS,
+            env=child_env,
         )
+        if result.stdout:
+            print(result.stdout, end="")
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr)
         if result.returncode != 0:
+            failure_report = os.environ.get("QSR_QUALITY_FAILURE_REPORT")
+            if failure_report:
+                Path(failure_report).write_text(
+                    json.dumps(
+                        {
+                            "label": label,
+                            "returncode": result.returncode,
+                            "stdout": result.stdout,
+                            "stderr": result.stderr,
+                        },
+                        indent=2,
+                    )
+                )
             print(f"❌ {label} failed with code {result.returncode}")
             sys.exit(1)
         with open(out_path) as f:
