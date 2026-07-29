@@ -27,10 +27,13 @@ import pytest
 
 from bfdiag.daemon import cli
 from bfdiag.daemon.client import Client, DaemonNotRunning
+from bfdiag.daemon.protocol import Response
 from bfdiag.daemon.provider import (
     LOAD_TIME_ENV_VARS,
     FakeEngineProvider,
     LagunaEngineProvider,
+    _rebind_instance_class,
+    _rebind_verify_graphs,
     requires_cold_restart,
 )
 from bfdiag.daemon.queue import check_sweep_is_hot_safe, submit
@@ -64,6 +67,78 @@ def daemon_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         with contextlib.suppress(Exception):
             shutil.rmtree(socket_dir, ignore_errors=True)
     time.sleep(0.1)
+
+
+class TestHotReloadMechanics:
+    def test_rebind_instance_class_uses_new_method_implementation(self):
+        class OldImplementation:
+            def marker(self):
+                return "old"
+
+        class NewImplementation:
+            def marker(self):
+                return "new"
+
+        instance = OldImplementation()
+        assert _rebind_instance_class(instance, NewImplementation, "test") is True
+        assert instance.marker() == "new"
+
+    def test_rebind_none_is_a_noop(self):
+        assert _rebind_instance_class(None, object, "optional") is False
+
+    def test_rebind_verify_graphs_includes_bounded_final_graphs(self):
+        class OldGraph:
+            pass
+
+        class NewGraph:
+            pass
+
+        class Engine:
+            _verify_cg = OldGraph()
+            _partial_verify_cgs = {7: OldGraph()}
+
+        engine = Engine()
+        assert _rebind_verify_graphs(engine, NewGraph) == [
+            "engine._verify_cg",
+            "engine._partial_verify_cgs[7]",
+        ]
+        assert isinstance(engine._verify_cg, NewGraph)
+        assert isinstance(engine._partial_verify_cgs[7], NewGraph)
+
+    def test_laguna_provider_reset_restores_prefill_implementation(self, monkeypatch):
+        provider = LagunaEngineProvider()
+        calls: list[str] = []
+
+        class Backend:
+            def _unpatch_impls_for_prefill(self):
+                calls.append("unpatch")
+
+        provider._backend = Backend()
+        provider._engine = object()
+        monkeypatch.setattr(
+            "bfdiag.daemon.session.reset_laguna_engine",
+            lambda engine: calls.append("reset"),
+        )
+
+        provider.reset()
+        assert calls == ["unpatch", "reset"]
+
+    def test_reload_command_reloads_provider_before_runtime(self, monkeypatch):
+        class ClientStub:
+            code: str | None = None
+
+            def exec_code(self, code, *, timeout_s):
+                self.code = code
+                assert timeout_s == 120.0
+                return Response(ok=True, result={"canary_tokens": 8})
+
+        client_stub = ClientStub()
+        monkeypatch.setattr(cli, "_client_for", lambda _args: client_stub)
+
+        assert cli._cmd_daemon_reload(argparse.Namespace(timeout_s=120.0)) == 0
+        assert "importlib.reload(provider_module)" in client_stub.code
+        assert "provider.__class__ = provider_module.LagunaEngineProvider" in client_stub.code
+        assert "provider.hot_reload_code()" in client_stub.code
 
 
 class TestLifecycle:
@@ -257,6 +332,38 @@ class TestTimeoutAndAbandonment:
         while daemon.status()["state"] == "BUSY" and time.monotonic() < deadline:
             time.sleep(0.02)
         assert daemon.status()["state"] == "TAINTED"
+
+        refused = client.exec_code("result = 1")
+        assert refused.ok is False
+        assert "TAINTED" in (refused.error or "")
+
+
+class TestTimeoutDefaults:
+    def test_laguna_process_default_is_long_but_fake_default_stays_fast(self):
+        from bfdiag.daemon.server import DEFAULT_LAGUNA_TIMEOUT_S, _resolve_default_timeout_s
+
+        assert _resolve_default_timeout_s("laguna", None) == DEFAULT_LAGUNA_TIMEOUT_S
+        assert _resolve_default_timeout_s("fake", None) is None
+        assert _resolve_default_timeout_s("laguna", 123.0) == 123.0
+
+    def test_device_provider_timeout_refuses_unsafe_in_process_recovery(self, daemon_factory):
+        load_count = {"n": 0}
+
+        class UnsafeDeviceLikeProvider(FakeEngineProvider):
+            allow_in_process_recovery_after_taint = False
+
+        def factory() -> UnsafeDeviceLikeProvider:
+            load_count["n"] += 1
+            return UnsafeDeviceLikeProvider()
+
+        daemon, client = daemon_factory(provider_factory=factory, canary_enabled=False)
+        response = client.exec_code("import time\ntime.sleep(5)", timeout_s=0.2)
+
+        assert response.ok is False
+        assert "stop this daemon" in (response.error or "")
+        assert daemon.status()["state"] == "TAINTED"
+        assert daemon.status()["restart_count"] == 0
+        assert load_count["n"] == 1
 
         refused = client.exec_code("result = 1")
         assert refused.ok is False

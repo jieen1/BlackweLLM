@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from bfdiag.shapes.model import DEFAULT_MODEL_ID, load_laguna_config
+from bfdiag.shapes.model import load_laguna_config
 from bfdiag.shapes.moe import (
     expert_projection_shapes,
     router_shapes,
@@ -17,7 +17,6 @@ from bfdiag.shapes.moe import (
 )
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
 def test_expert_projection_shapes_match_real_checkpoint():
     """Real checkpoint (read directly, safetensors header only):
     gate_proj/up_proj: weight_packed=[1024,1536] weight_scale=[1024,192]
@@ -34,7 +33,6 @@ def test_expert_projection_shapes_match_real_checkpoint():
     assert projs["down_proj"].weight_scale_shape == (3072, 64)
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
 def test_packing_halves_in_features_and_scale_divides_by_group_size():
     config = load_laguna_config()
     projs = expert_projection_shapes(config)
@@ -44,7 +42,6 @@ def test_packing_halves_in_features_and_scale_divides_by_group_size():
         assert proj.weight_packed_shape[0] == proj.out_features
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
 def test_stacked_expert_shapes_prepend_num_experts():
     config = load_laguna_config()
     stacked = stacked_expert_shapes(config)
@@ -54,7 +51,6 @@ def test_stacked_expert_shapes_prepend_num_experts():
     assert stacked["down_proj.weight_scale"] == (256, 3072, 64)
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
 def test_sparkinfer_w13_fuses_gate_and_up():
     """prepare_sparkinfer_layer concatenates [up_w, gate_w] along dim=1 --
     the fused w13 out-dim doubles moe_intermediate_size."""
@@ -64,7 +60,6 @@ def test_sparkinfer_w13_fuses_gate_and_up():
     assert w["w2_fp4"] == (256, 3072, 512)
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
 def test_router_shapes():
     config = load_laguna_config()
     r = router_shapes(config, num_tokens=5)
@@ -73,7 +68,6 @@ def test_router_shapes():
     assert r["topk_weights"] == (5, 10)
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
 def test_expert_projection_shapes_requires_group_size(monkeypatch):
     config = load_laguna_config()
     broken = config.__class__(
@@ -83,7 +77,6 @@ def test_expert_projection_shapes_requires_group_size(monkeypatch):
         expert_projection_shapes(broken)
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
 def test_expert_projection_shapes_requires_experts():
     """The DFlash draft model has num_experts=0 -- moe.py should refuse to
     derive expert shapes for it rather than silently returning something."""

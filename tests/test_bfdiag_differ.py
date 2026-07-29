@@ -30,7 +30,6 @@ from bfdiag.record.schema import (
 _COMMON_GIT = {
     "qwen-sm120-runtime": GitRepoInfo(sha="a" * 40, dirty=False, branch="main"),
     "sparkinfer": GitRepoInfo(sha="b" * 40, dirty=False, branch="main"),
-    "vllm": GitRepoInfo(sha="c" * 40, dirty=False, branch="main"),
 }
 
 
@@ -50,15 +49,13 @@ def _record(run_id: str, *, prompt_hash: str, acceptance_rate: float, **workload
         run_id=run_id,
         started_at="2026-07-27T10:00:00+00:00",
         finished_at="2026-07-27T10:05:00+00:00",
-        script="benchmarks/laguna_vllm_dflash_baseline.py",
+        script="bfdiag/workloads.py",
         argv=[],
         status="ok",
         fingerprint=Fingerprint(
             git=dict(_COMMON_GIT),
             env={},
-            python=PythonInfo(
-                version="3.12.3", torch="2.11.0", vllm="0.26.0", transformers="4.45.0"
-            ),
+            python=PythonInfo(version="3.12.3", torch="2.11.0", transformers="4.45.0"),
             model=ModelInfo(
                 path="poolside/Laguna-S-2.1-NVFP4", revision="0761412", dtype="bfloat16"
             ),
@@ -79,11 +76,11 @@ def test_differ_flags_the_2026_07_27_incident() -> None:
     run_ours = _record(
         "ours0000001", prompt_hash="9c02b1a2c3d4e5f60123456789abcdef", acceptance_rate=0.687
     )
-    run_vllm = _record(
-        "vllm0000001", prompt_hash="a3f1c2d3e4f5061728394a5b6c7d8e9f", acceptance_rate=1.000
+    run_other = _record(
+        "other000001", prompt_hash="a3f1c2d3e4f5061728394a5b6c7d8e9f", acceptance_rate=1.000
     )
 
-    result = diff_records(run_ours, run_vllm)
+    result = diff_records(run_ours, run_other)
 
     assert result.comparable is False
     assert [b.path for b in result.comparability_breaks] == ["fingerprint.workload.prompt_hash"]
@@ -145,10 +142,10 @@ def test_check_comparability_detects_each_default_field_independently() -> None:
 def test_check_comparability_flags_git_sha_drift() -> None:
     run_a = _record("gitA00000001", prompt_hash="same" * 8, acceptance_rate=1.0)
     run_b = _record("gitB00000001", prompt_hash="same" * 8, acceptance_rate=1.0)
-    run_b.fingerprint.git["vllm"] = GitRepoInfo(sha="d" * 40, dirty=False, branch="main")
+    run_b.fingerprint.git["sparkinfer"] = GitRepoInfo(sha="d" * 40, dirty=False, branch="main")
 
     breaks = check_comparability(run_a, run_b)
-    assert [b.path for b in breaks] == ["fingerprint.git.vllm.sha"]
+    assert [b.path for b in breaks] == ["fingerprint.git.sparkinfer.sha"]
 
 
 def test_default_comparable_fields_cover_the_documented_set() -> None:
@@ -157,7 +154,6 @@ def test_default_comparable_fields_cover_the_documented_set() -> None:
         "model.revision",
         "git.qwen-sm120-runtime.sha",
         "git.sparkinfer.sha",
-        "git.vllm.sha",
         "workload.k",
         "workload.greedy",
         "workload.block_size",
@@ -201,7 +197,9 @@ def test_differ_flags_the_warm_daemon_blocks_per_slot_incident() -> None:
     result = diff_records(warm, cold)
 
     assert result.comparable is False
-    assert [b.path for b in result.comparability_breaks] == ["fingerprint.workload.blocks_per_slot"]
+    assert [b.path for b in result.comparability_breaks] == [
+        "fingerprint.workload.blocks_per_slot"
+    ]
     assert "NOT COMPARABLE" in format_text(result)
 
 

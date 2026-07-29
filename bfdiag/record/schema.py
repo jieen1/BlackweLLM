@@ -49,7 +49,6 @@ class GpuInfo:
 class PythonInfo:
     version: str | None = None
     torch: str | None = None
-    vllm: str | None = None
     transformers: str | None = None
 
 
@@ -112,11 +111,15 @@ class Fingerprint:
     def from_dict(cls, data: dict[str, Any] | None) -> Fingerprint:
         data = data or {}
         git = {name: GitRepoInfo(**info) for name, info in (data.get("git") or {}).items()}
+        python_data = data.get("python") or {}
+        python_fields = _dataclass_field_names(PythonInfo)
         return cls(
             git=git,
             env=dict(data.get("env") or {}),
             gpu=GpuInfo(**(data.get("gpu") or {})),
-            python=PythonInfo(**(data.get("python") or {})),
+            # v1 records may contain the retired ``vllm`` package field.
+            # Ignore it while reading so diagnostic history stays usable.
+            python=PythonInfo(**{k: v for k, v in python_data.items() if k in python_fields}),
             model=ModelInfo(**(data.get("model") or {})),
             workload=WorkloadInfo(**(data.get("workload") or {})),
             extra=dict(data.get("extra") or {}),
@@ -173,7 +176,7 @@ class RunRecord:
 
     def get_path(self, dotted_key: str) -> Any:
         """Look up a dotted key, e.g. ``fingerprint.workload.prompt_hash`` or
-        ``fingerprint.git.vllm.sha``, against this record's full dict form.
+        ``fingerprint.git.sparkinfer.sha``, against this record's full dict form.
         Returns None for any missing intermediate key instead of raising.
         """
         node: Any = self.to_dict()

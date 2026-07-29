@@ -1,5 +1,5 @@
-"""fingerprint.capture() must never raise, even with no GPU, no sparkinfer
-checkout, and no vllm checkout -- that's the whole point of this module (see
+"""fingerprint.capture() must never raise, even with no GPU or sparkinfer
+checkout -- that's the whole point of this module (see
 ``notes/2026-07-27-bfdiag-run-records.md``).
 
 No test in this file ever invokes the real ``nvidia-smi`` binary: GPU
@@ -73,9 +73,9 @@ def test_capture_git_repo_dirty_checkout(tmp_path: Path) -> None:
 def test_capture_git_never_raises_when_all_repos_missing(tmp_path: Path) -> None:
     missing = str(tmp_path / "does-not-exist")
     result = fingerprint.capture_git(
-        {"qwen-sm120-runtime": missing, "sparkinfer": missing, "vllm": missing}
+        {"qwen-sm120-runtime": missing, "sparkinfer": missing}
     )
-    assert set(result) == {"qwen-sm120-runtime", "sparkinfer", "vllm"}
+    assert set(result) == {"qwen-sm120-runtime", "sparkinfer"}
     for info in result.values():
         assert info.sha is None
         assert info.dirty is None
@@ -85,9 +85,15 @@ def test_capture_git_honors_env_overrides(tmp_path: Path, monkeypatch) -> None:
     _init_repo(tmp_path)
     monkeypatch.setenv("QSR_REPO_SPARKINFER", str(tmp_path))
     result = fingerprint.capture_git(
-        {"qwen-sm120-runtime": "/no/such/path", "vllm": "/no/such/path"}
+        {"qwen-sm120-runtime": "/no/such/path"}
     )
     assert result["sparkinfer"].sha is not None
+
+
+def test_default_runtime_repo_path_is_the_executing_worktree() -> None:
+    assert fingerprint._repo_paths()["qwen-sm120-runtime"] == str(
+        Path(fingerprint.__file__).resolve().parents[2]
+    )
 
 
 # --- env -----------------------------------------------------------------
@@ -95,22 +101,18 @@ def test_capture_git_honors_env_overrides(tmp_path: Path, monkeypatch) -> None:
 
 def test_capture_env_filters_by_prefix(monkeypatch) -> None:
     monkeypatch.setenv("QSR_TEST_MARKER", "1")
-    monkeypatch.setenv("VLLM_TEST_MARKER", "2")
     monkeypatch.setenv("CUDA_TEST_MARKER", "3")
     monkeypatch.setenv("TORCH_TEST_MARKER", "4")
     monkeypatch.setenv("NVIDIA_TEST_MARKER", "5")
-    monkeypatch.setenv("FLASHINFER_TEST_MARKER", "6")
     monkeypatch.setenv("SOME_UNRELATED_VAR", "should-not-appear")
     monkeypatch.setenv("MY_QSR_FOO", "not a real prefix match, does not start with QSR_")
 
     env = fingerprint.capture_env()
 
     assert env["QSR_TEST_MARKER"] == "1"
-    assert env["VLLM_TEST_MARKER"] == "2"
     assert env["CUDA_TEST_MARKER"] == "3"
     assert env["TORCH_TEST_MARKER"] == "4"
     assert env["NVIDIA_TEST_MARKER"] == "5"
-    assert env["FLASHINFER_TEST_MARKER"] == "6"
     assert "SOME_UNRELATED_VAR" not in env
     assert "MY_QSR_FOO" not in env
 
@@ -168,7 +170,6 @@ def test_capture_python_version_matches_runtime() -> None:
     info = fingerprint.capture_python()
     assert info.version == sys.version.split()[0]
     assert info.torch is None or isinstance(info.torch, str)
-    assert info.vllm is None or isinstance(info.vllm, str)
     assert info.transformers is None or isinstance(info.transformers, str)
 
 
@@ -181,7 +182,7 @@ def test_capture_never_raises_with_everything_missing(tmp_path: Path, monkeypatc
     result = fingerprint.capture(
         model={"path": "/models/laguna"},
         workload={"k": 15, "greedy": True},
-        repo_paths={"qwen-sm120-runtime": missing, "sparkinfer": missing, "vllm": missing},
+        repo_paths={"qwen-sm120-runtime": missing, "sparkinfer": missing},
     )
     assert result.gpu == GpuInfo()
     for info in result.git.values():

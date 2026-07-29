@@ -34,6 +34,7 @@ actually picked up the change.
 
 from __future__ import annotations
 
+import importlib
 import time
 from typing import Any, Protocol, runtime_checkable
 
@@ -79,6 +80,54 @@ LOAD_TIME_ENV_VARS: frozenset[str] = frozenset(
 
 _MISSING = object()
 
+# Modules whose hot-path methods can be rebound on an already-loaded Laguna
+# instance.  Keep the dependency order: leaf helpers first, then the backend
+# and engine methods that import them at call time.
+HOT_RELOAD_MODULES: tuple[str, ...] = (
+    "bfdiag.workloads",
+    "runtime.backends.laguna_sparkinfer_moe",
+    "runtime.backends.laguna_sparkinfer_attn",
+    "runtime.backends.laguna_cuda_graph",
+    "runtime.backends.laguna_dflash_cudagraph",
+    "runtime.backends.laguna_dflash",
+    "runtime.backends.laguna",
+)
+
+
+def _rebind_instance_class(instance: Any, replacement: type[Any], label: str) -> bool:
+    """Switch a live no-slots instance to its reloaded implementation class.
+
+    CUDA tensors, loaded weights, and captured graph buffers remain owned by
+    the original Python object.  Only its method dispatch changes.  A class
+    layout mismatch is intentionally a hard error: silently retaining an old
+    implementation after a source edit would make a performance experiment
+    report the wrong code revision.
+    """
+    if instance is None:
+        return False
+    try:
+        instance.__class__ = replacement
+    except TypeError as exc:
+        raise RuntimeError(
+            f"hot reload cannot rebind {label} to {replacement.__module__}."
+            f"{replacement.__name__}; restart the daemon to apply this edit"
+        ) from exc
+    return True
+
+
+def _rebind_verify_graphs(engine: Any, replacement: type[Any]) -> list[str]:
+    """Rebind the fixed M=16 and bounded-final verify graph objects."""
+    rebound: list[str] = []
+    if _rebind_instance_class(
+        getattr(engine, "_verify_cg", None), replacement, "engine._verify_cg"
+    ):
+        rebound.append("engine._verify_cg")
+    for num_tokens, verify_cg in getattr(engine, "_partial_verify_cgs", {}).items():
+        label = f"engine._partial_verify_cgs[{num_tokens}]"
+        if _rebind_instance_class(verify_cg, replacement, label):
+            rebound.append(label)
+    return rebound
+
 
 def requires_cold_restart(
     current_cfg: dict[str, Any],
@@ -122,6 +171,11 @@ class EngineProvider(Protocol):
     actually depend on: ``generate()`` (fixed-prompt greedy decoding, used
     by the canary self-check and available to ad-hoc diagnostic code) and
     ``namespace()`` (the bindings injected into exec'd code's globals).
+
+    Providers backed by CUDA must also opt out of in-process recovery after
+    a taint.  A timed-out Python thread can still be executing a CUDA call;
+    swapping in a second provider in that process would let two runtimes
+    contend for the same GPU and cannot reclaim the first CUDA context.
     """
 
     def load(self) -> None:
@@ -191,6 +245,10 @@ class FakeEngineProvider:
     that runs ``generate()`` before and after a ``pollute()`` call will,
     correctly, observe two different token sequences.
     """
+
+    # The fake provider has no external device state or abandoned CUDA work,
+    # so its restart-on-taint tests can safely exercise the generic path.
+    allow_in_process_recovery_after_taint = True
 
     def __init__(
         self,
@@ -303,6 +361,12 @@ class LagunaEngineProvider:
     checked before trusting this in production use.
     """
 
+    # A timeout can leave a daemon exec thread running against this
+    # provider.  Do not load a second runtime in that same process: leave
+    # the daemon TAINTED so `bf daemon stop` ends the process and releases
+    # the old CUDA context before a fresh daemon is started.
+    allow_in_process_recovery_after_taint = False
+
     def __init__(
         self,
         model_path: str | None = None,
@@ -338,20 +402,19 @@ class LagunaEngineProvider:
 
         from runtime.backends.laguna import LagunaBackend
         from runtime.backends.laguna_dflash import DFlashEngine
-        from runtime.compat_vllm import EngineArgs
+        from runtime.laguna_config import build_laguna_config
 
         model_path = os.path.expanduser(self._model_path)
-        engine_args = EngineArgs(
-            model=model_path,
+        runtime_config = build_laguna_config(
+            model_path,
             dtype=self._dtype,
             max_model_len=self._max_model_len,
             gpu_memory_utilization=self._gpu_memory_utilization,
             enforce_eager=True,
             trust_remote_code=True,
         )
-        vllm_config = engine_args.create_engine_config()
         self._backend = LagunaBackend(
-            vllm_config,
+            runtime_config,
             num_slots=self._num_slots,
             blocks_per_slot=self._blocks_per_slot,
             block_size=self._block_size,
@@ -372,7 +435,90 @@ class LagunaEngineProvider:
             raise RuntimeError("LagunaEngineProvider.reset() called before load()")
         from bfdiag.daemon.session import reset_laguna_engine
 
+        # A historical M=1 decode workload captures a q=1 attention graph by
+        # temporarily patching the backend's attention implementations.  A
+        # long-lived daemon must never carry that specialized implementation
+        # into the next DFlash canary/prefill (which can have q>1).
+        self._backend._unpatch_impls_for_prefill()
         reset_laguna_engine(self._engine)
+
+    def hot_reload_code(self) -> dict[str, Any]:
+        """Apply hot-path source edits without reloading model weights.
+
+        This is deliberately narrow: it supports performance/correctness
+        iteration in the already-allocated Laguna backend, DFlash engine,
+        sparkinfer helpers, and CUDA-graph wrappers.  It does *not* support
+        constructor/layout changes, checkpoint/model-graph changes, or
+        load-time configuration changes; those require a cold daemon restart.
+
+        A fixed greedy canary is run before and after rebinding.  This catches
+        the dangerous case where an edit silently changes output while a
+        throughput experiment still looks faster.  The engine is reset around
+        both passes, so the canary itself cannot leak KV or draft-cache state
+        into the following ``bf exec`` experiment.
+        """
+        if self._backend is None or self._engine is None:
+            raise RuntimeError("LagunaEngineProvider.hot_reload_code() called before load()")
+
+        from bfdiag.daemon.canary import DEFAULT_CANARY_PROMPT_IDS, DEFAULT_CANARY_STEPS
+
+        before = self.generate(DEFAULT_CANARY_PROMPT_IDS, DEFAULT_CANARY_STEPS)
+        self.reset()
+        importlib.invalidate_caches()
+        modules = {
+            name: importlib.reload(importlib.import_module(name))
+            for name in HOT_RELOAD_MODULES
+        }
+
+        rebound: list[str] = []
+        if _rebind_instance_class(self._backend, modules["runtime.backends.laguna"].LagunaBackend, "backend"):
+            rebound.append("backend")
+        if _rebind_instance_class(self._engine, modules["runtime.backends.laguna_dflash"].DFlashEngine, "engine"):
+            rebound.append("engine")
+        if _rebind_instance_class(
+            getattr(self._backend, "_decode_cg", None),
+            modules["runtime.backends.laguna_cuda_graph"].LagunaCudaGraphDecode,
+            "backend._decode_cg",
+        ):
+            rebound.append("backend._decode_cg")
+        rebound.extend(
+            _rebind_verify_graphs(
+                self._engine,
+                modules["runtime.backends.laguna_cuda_graph"].LagunaCudaGraphVerify,
+            )
+        )
+        if _rebind_instance_class(
+            getattr(self._engine, "_draft_cg", None),
+            modules["runtime.backends.laguna_dflash_cudagraph"].DFlashDraftCudaGraph,
+            "engine._draft_cg",
+        ):
+            rebound.append("engine._draft_cg")
+
+        moe_class = modules["runtime.backends.laguna_sparkinfer_moe"].SparkinferMoELayer
+        for index, layer in enumerate(getattr(self._backend, "_moe_sparkinfer_layers", ())):
+            _rebind_instance_class(layer, moe_class, f"backend._moe_sparkinfer_layers[{index}]")
+        if getattr(self._backend, "_moe_sparkinfer_layers", ()):
+            rebound.append("backend._moe_sparkinfer_layers")
+
+        attn_module = modules["runtime.backends.laguna_sparkinfer_attn"]
+        for name, layer in getattr(self._backend, "static_forward_context", {}).items():
+            implementation = getattr(layer, "impl", None)
+            replacement = getattr(attn_module, type(implementation).__name__, None)
+            if replacement is not None and type(implementation).__module__ == attn_module.__name__:
+                _rebind_instance_class(implementation, replacement, f"attention[{name}].impl")
+        rebound.append("attention implementations")
+
+        self.reset()
+        after = self.generate(DEFAULT_CANARY_PROMPT_IDS, DEFAULT_CANARY_STEPS)
+        if after != before:
+            mismatch = next(index for index, pair in enumerate(zip(before, after)) if pair[0] != pair[1])
+            raise RuntimeError(
+                "hot reload canary mismatch at token "
+                f"{mismatch}: before={before[mismatch]}, after={after[mismatch]}; "
+                "daemon remains loaded but must not be used for performance claims"
+            )
+        self.reset()
+        return {"modules": list(HOT_RELOAD_MODULES), "rebound": rebound, "canary_tokens": len(after)}
 
     def describe(self) -> dict[str, Any]:
         return {

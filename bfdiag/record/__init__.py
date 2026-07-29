@@ -104,6 +104,32 @@ def _restore_env(previous: dict[str, str | None]) -> None:
             os.environ[key] = value
 
 
+def _reset_trace_for_record() -> Any | None:
+    """Start a fresh flight-recorder window when tracing is enabled.
+
+    The warm daemon stays alive across many ``run_record`` scopes, while the
+    trace ring is process-global.  Resetting here makes the trace belong to
+    this record rather than to an arbitrary mixture of a prior canary and
+    prior experiments.  The import remains deferred so ordinary CPU-only
+    records never import the trace machinery.
+    """
+    from bfdiag.trace import ring
+
+    if not ring.TRACE_ENABLED:
+        return None
+    ring.reset()
+    return ring
+
+
+def _write_record_trace(trace_ring: Any, store: RunStore, run_id: str) -> None:
+    """Flush a trace-enabled record before a long-lived daemon continues."""
+    from bfdiag.trace import dump
+
+    ring = trace_ring.get_ring()
+    if ring is not None:
+        dump.write_trace(ring, store.run_dir(run_id) / "trace.jsonl")
+
+
 @contextlib.contextmanager
 def run_record(
     *,
@@ -132,6 +158,7 @@ def run_record(
     )
     handle = RunHandle(record, active_store)
     env_tokens = _export_run_env(active_store, record.run_id)
+    trace_ring = _reset_trace_for_record()
     try:
         active_store.save(record)  # write a live record immediately, before the block runs
         yield handle
@@ -152,4 +179,6 @@ def run_record(
         record.finished_at = utc_now_iso()
         active_store.save(record)
     finally:
+        if trace_ring is not None:
+            _write_record_trace(trace_ring, active_store, record.run_id)
         _restore_env(env_tokens)

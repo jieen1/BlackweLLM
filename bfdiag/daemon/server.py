@@ -20,14 +20,11 @@ writeup):
   CUDA kernel from another thread -- that requires killing the OS
   process). Instead: the worker thread runs each exec in a short-lived
   daemon thread and ``join(timeout_s)``s it. If it doesn't finish in time,
-  the daemon (a) answers the client immediately with a timeout error,
-  (b) marks itself TAINTED, and (c) -- if configured -- "restarts" by
-  constructing a brand-new provider via the factory and swapping it in.
-  The abandoned thread keeps a reference to the OLD provider and can never
-  touch the new one; but note this is an in-process, Python-level
-  swap-and-reload, NOT a process-level restart, so it does not free GPU
-  memory or reclaim a genuinely hung CUDA context -- see notes' GPU
-  validation TODO list.
+  the daemon answers the client immediately and marks itself TAINTED. CUDA
+  providers remain TAINTED until their process is stopped and replaced;
+  they never load a second runtime alongside an abandoned GPU thread. Pure
+  Python providers may explicitly opt into the old in-process recovery path
+  for lifecycle tests.
 * Canary gating: every ``exec`` runs the canary check first (see
   ``canary.py``); a mismatch marks TAINTED and refuses to run the
   requested code at all, then restarts per the same policy as a timeout.
@@ -75,6 +72,7 @@ from bfdiag.daemon.provider import EngineProvider, FakeEngineProvider, LagunaEng
 logger = logging.getLogger("bfdiag.daemon")
 
 DEFAULT_TIMEOUT_S = 30.0
+DEFAULT_LAGUNA_TIMEOUT_S = 900.0
 DEFAULT_IDLE_TTL_S = 900.0  # 15 minutes -- see module docstring's idle-TTL bullet
 _STATES = ("STARTING", "READY", "BUSY", "TAINTED", "STOPPED")
 
@@ -579,10 +577,17 @@ class Daemon:
 
         if outcome.timed_out:
             self._set_state("TAINTED")
-            self._maybe_restart()
+            recovered = self._maybe_restart()
+            recovery = (
+                "provider recovered in-process"
+                if recovered
+                else "stop this daemon and start a fresh process before retrying"
+            )
             return {
                 "ok": False,
-                "error": f"exec timed out after {timeout_s}s; daemon marked TAINTED",
+                "error": (
+                    f"exec timed out after {timeout_s}s; daemon marked TAINTED; {recovery}"
+                ),
                 "stdout": outcome.stdout,
                 "stderr": outcome.stderr,
                 "elapsed_s": outcome.elapsed_s,
@@ -606,9 +611,16 @@ class Daemon:
             "memory_after": memory_after,
         }
 
-    def _maybe_restart(self) -> None:
+    def _maybe_restart(self) -> bool:
         if not self._restart_on_taint:
-            return
+            return False
+        if not getattr(self._provider, "allow_in_process_recovery_after_taint", False):
+            logger.error(
+                "bfdiag daemon: TAINTED provider %s requires process replacement; "
+                "refusing unsafe in-process restart",
+                type(self._provider).__name__,
+            )
+            return False
         logger.warning("bfdiag daemon: TAINTED, restarting provider")
         new_provider = self._provider_factory()
         new_provider.load()
@@ -616,6 +628,7 @@ class Daemon:
             self._provider = new_provider
             self._state = "READY"
         self._restart_count += 1
+        return True
 
     # -- status ------------------------------------------------------------
 
@@ -670,6 +683,14 @@ def _build_provider(args: argparse.Namespace) -> EngineProvider:
     raise ValueError(f"unknown provider {args.provider!r}")
 
 
+def _resolve_default_timeout_s(provider: str, configured: float | None) -> float | None:
+    """Keep normal interactive defaults for fake/CPU providers while giving
+    Laguna's complete fixed workloads enough time to finish."""
+    if configured is not None:
+        return configured
+    return DEFAULT_LAGUNA_TIMEOUT_S if provider == "laguna" else None
+
+
 def _add_provider_args(parser: argparse.ArgumentParser) -> None:
     """Shared between this module's own ``main()`` and ``cli.py``'s
     ``bf daemon start`` so the two never drift out of sync on what a
@@ -686,6 +707,15 @@ def _add_provider_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
     parser.add_argument("--no-canary", action="store_true")
     parser.add_argument("--idle-ttl-s", type=float, default=None)
+    parser.add_argument(
+        "--default-timeout-s",
+        type=float,
+        default=None,
+        help=(
+            "default per-exec timeout; Laguna defaults to 900 seconds so long "
+            "fixed-contract benchmarks cannot accidentally taint the daemon"
+        ),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -699,11 +729,13 @@ def main(argv: list[str] | None = None) -> int:
 
     socket_path = Path(args.socket) if args.socket else default_socket_path()
     canary_enabled = (not args.no_canary) and os.environ.get("QSR_BFD_CANARY", "1") != "0"
+    default_timeout_s = _resolve_default_timeout_s(args.provider, args.default_timeout_s)
 
     daemon = Daemon(
         provider_factory=lambda: _build_provider(args),
         socket_path=socket_path,
         canary_enabled=canary_enabled,
+        default_timeout_s=default_timeout_s,
         idle_ttl_s=args.idle_ttl_s,
     )
     try:

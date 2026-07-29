@@ -54,6 +54,12 @@ def _register_daemon(subparsers: argparse._SubParsersAction) -> None:
     start_parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
     start_parser.add_argument("--no-canary", action="store_true")
     start_parser.add_argument(
+        "--default-timeout-s",
+        type=float,
+        default=None,
+        help="default per-exec timeout (Laguna defaults to 900 seconds)",
+    )
+    start_parser.add_argument(
         "--idle-ttl-s",
         type=float,
         default=None,
@@ -71,6 +77,14 @@ def _register_daemon(subparsers: argparse._SubParsersAction) -> None:
     stop_parser = daemon_sub.add_parser("stop", help="stop the daemon")
     stop_parser.add_argument("--socket", default=None)
     stop_parser.set_defaults(func=_cmd_daemon_stop)
+
+    reload_parser = daemon_sub.add_parser(
+        "reload",
+        help="hot-reload supported Laguna runtime code without reloading weights",
+    )
+    reload_parser.add_argument("--socket", default=None)
+    reload_parser.add_argument("--timeout-s", type=float, default=120.0)
+    reload_parser.set_defaults(func=_cmd_daemon_reload)
 
 
 def _register_exec(subparsers: argparse._SubParsersAction) -> None:
@@ -227,6 +241,9 @@ def _cmd_daemon_start(args: argparse.Namespace) -> int:
         cmd += ["--num-slots", str(args.num_slots)]
     if args.no_canary:
         cmd.append("--no-canary")
+    default_timeout_s = getattr(args, "default_timeout_s", None)
+    if default_timeout_s is not None:
+        cmd += ["--default-timeout-s", str(default_timeout_s)]
     if args.idle_ttl_s is not None:
         cmd += ["--idle-ttl-s", str(args.idle_ttl_s)]
 
@@ -281,6 +298,39 @@ def _cmd_daemon_stop(args: argparse.Namespace) -> int:
         return 0
     print(f"bfdiag daemon: {response.result}")
     return 0 if response.ok else 1
+
+
+def _cmd_daemon_reload(args: argparse.Namespace) -> int:
+    """Reload supported hot-path modules through the single engine worker.
+
+    ``LagunaEngineProvider.hot_reload_code`` owns the reset and before/after
+    canary.  Sending it as an ordinary exec also preserves the daemon's FIFO,
+    pre-exec canary, and memory snapshots.
+    """
+    client = _client_for(args)
+    try:
+        response = client.exec_code(
+            "import importlib\n"
+            "import bfdiag.daemon.provider as provider_module\n"
+            "importlib.reload(provider_module)\n"
+            "provider.__class__ = provider_module.LagunaEngineProvider\n"
+            "result = provider.hot_reload_code()",
+            timeout_s=args.timeout_s,
+        )
+    except DaemonNotRunning as exc:
+        print(f"bf daemon reload: {exc}", file=sys.stderr)
+        return 1
+    if response.stdout:
+        sys.stdout.write(response.stdout)
+    if response.stderr:
+        sys.stderr.write(response.stderr)
+    if not response.ok:
+        print(f"bf daemon reload: FAILED ({response.error or 'see traceback'})", file=sys.stderr)
+        if response.traceback:
+            sys.stderr.write(response.traceback)
+        return 1
+    print(json.dumps(response.result, sort_keys=True))
+    return 0
 
 
 # -- exec -------------------------------------------------------------------

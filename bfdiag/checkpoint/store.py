@@ -87,7 +87,6 @@ HARD_FINGERPRINT_KEYS: tuple[str, ...] = (
 SOFT_FINGERPRINT_PATHS: tuple[str, ...] = (
     "git.qwen-sm120-runtime.sha",
     "git.sparkinfer.sha",
-    "git.vllm.sha",
 )
 
 

@@ -80,6 +80,14 @@ def test_enabled_probe_emits_all_three_tensors_in_order():
     assert emitted_weights is topk_weights
 
 
+def test_enabled_probe_skips_prefill_sized_routing_tensors():
+    routing.PROBE_ENABLED = True
+    stub.PROBE_ENABLED = True
+    router_logits, topk_ids, topk_weights = _synthetic_layer(num_tokens=17)
+    routing.capture_routing(router_logits, topk_ids, topk_weights)
+    assert stub.recorded_tensors == []
+
+
 def test_multiple_layers_preserve_call_order_for_offline_reconstruction():
     routing.PROBE_ENABLED = True
     stub.PROBE_ENABLED = True
@@ -92,12 +100,8 @@ def test_multiple_layers_preserve_call_order_for_offline_reconstruction():
     # this fixed call order (no explicit layer index is emitted) to
     # reconstruct the (round, layer, token) grid.
     site_sequence = [site_id for site_id, _ in stub.recorded_tensors]
-    assert (
-        site_sequence
-        == [
-            routing.SITE_ROUTER_LOGITS,
-            routing.SITE_TOPK_IDS,
-            routing.SITE_TOPK_WEIGHTS,
-        ]
-        * 3
-    )
+    assert site_sequence == [
+        routing.SITE_ROUTER_LOGITS,
+        routing.SITE_TOPK_IDS,
+        routing.SITE_TOPK_WEIGHTS,
+    ] * 3

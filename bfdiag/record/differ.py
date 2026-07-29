@@ -2,7 +2,7 @@
 
 The comparability check is the entire reason this tool exists. On
 2026-07-27 two acceptance-rate measurements were compared -- 1.000 vs
-0.687 -- and treated as evidence the backend had "caught up" with vLLM. They
+0.687 -- and treated as evidence the backend had caught up. They
 had used different prompts. Nobody noticed until a full day of investigation
 had been spent chasing the wrong hypothesis (see
 ``notes/2026-07-27-bfdiag-run-records.md``). ``check_comparability`` below,
@@ -26,7 +26,6 @@ DEFAULT_COMPARABLE_FIELDS: tuple[str, ...] = (
     "fingerprint.model.revision",
     "fingerprint.git.qwen-sm120-runtime.sha",
     "fingerprint.git.sparkinfer.sha",
-    "fingerprint.git.vllm.sha",
     "fingerprint.workload.k",
     "fingerprint.workload.greedy",
     "fingerprint.workload.block_size",
@@ -49,6 +48,10 @@ DEFAULT_COMPARABLE_FIELDS: tuple[str, ...] = (
     "fingerprint.extra.determinism.force_sync",
 )
 
+# SM/memory clocks are dynamic hardware observations, so they must not make
+# otherwise identical runs formally non-comparable.  They do, however, make a
+# throughput delta unsafe to attribute to code without a second controlled
+# sample.  Keep this separate from the hard configuration gate above.
 _FINGERPRINT_PREFIX = "fingerprint."
 
 

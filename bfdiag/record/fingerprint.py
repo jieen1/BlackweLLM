@@ -1,6 +1,6 @@
 """Capture the environment fingerprint that makes two runs comparable.
 
-Every function here is defensive: git missing, sparkinfer/vllm checkouts
+Every function here is defensive: git missing, a sparkinfer checkout
 absent, no GPU, no nvidia-smi -- none of it raises. Missing data becomes
 ``None`` and the caller gets a best-effort ``Fingerprint`` back. This is the
 whole point: ``bf diff`` needs to work on a laptop with no GPU just as well
@@ -36,20 +36,20 @@ from bfdiag.record.schema import (
 
 # Any environment variable whose name starts with one of these prefixes is
 # considered part of the fingerprint (per the shared bfdiag contract).
-ENV_PREFIXES: tuple[str, ...] = ("QSR_", "VLLM_", "CUDA_", "TORCH_", "NVIDIA_", "FLASHINFER_")
+ENV_PREFIXES: tuple[str, ...] = ("QSR_", "CUDA_", "TORCH_", "NVIDIA_")
 
 # Default sibling-repo locations, overridable by environment variable so CI
 # or another developer's machine can point elsewhere.
 _REPO_ENV_OVERRIDES: dict[str, str] = {
     "qwen-sm120-runtime": "QSR_REPO_QWEN_SM120_RUNTIME",
     "sparkinfer": "QSR_REPO_SPARKINFER",
-    "vllm": "QSR_REPO_VLLM",
 }
 
+_RUNTIME_ROOT = Path(__file__).resolve().parents[2]
+
 _DEFAULT_REPO_PATHS: dict[str, str] = {
-    "qwen-sm120-runtime": "/home/bot/project/qwen-sm120-runtime",
+    "qwen-sm120-runtime": str(_RUNTIME_ROOT),
     "sparkinfer": "/home/bot/project/sparkinfer",
-    "vllm": "/home/bot/vllm",
 }
 
 _GPU_CORE_FIELDS = (
@@ -104,11 +104,12 @@ def capture_git_repo(path: str | None) -> GitRepoInfo:
 
 
 def capture_git(repo_paths: dict[str, str] | None = None) -> dict[str, GitRepoInfo]:
-    """Fingerprint the three repos this runtime depends on.
+    """Fingerprint the two repos this runtime depends on.
 
-    Names match the shared bfdiag contract: qwen-sm120-runtime, sparkinfer,
-    vllm. Each is independently overridable via ``QSR_REPO_<NAME>`` or the
-    ``repo_paths`` argument, and independently tolerant of not existing.
+    The runtime root follows this installed source tree, so worktree runs
+    record the branch actually executing instead of their checkout's parent.
+    Each repository is independently overridable via ``QSR_REPO_<NAME>`` or
+    the ``repo_paths`` argument, and independently tolerant of not existing.
     """
     return {name: capture_git_repo(path) for name, path in _repo_paths(repo_paths).items()}
 
@@ -169,7 +170,7 @@ def capture_gpu() -> GpuInfo:
 
 def _pkg_version(dist_name: str) -> str | None:
     """Installed package version without importing the package itself --
-    safe to call even for heavy/CUDA-touching packages like torch/vllm.
+    safe to call even for heavy/CUDA-touching packages like torch.
     """
     try:
         return _importlib_metadata.version(dist_name)
@@ -203,7 +204,6 @@ def capture_python() -> PythonInfo:
     return PythonInfo(
         version=sys.version.split()[0],
         torch=_pkg_version("torch"),
-        vllm=_pkg_version("vllm"),
         transformers=_pkg_version("transformers"),
     )
 

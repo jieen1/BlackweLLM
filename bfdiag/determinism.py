@@ -167,6 +167,12 @@ AUTOTUNE_CACHE_DIRNAME = ".autotune_cache"
 # is a correctness fix, not a knob, and its default must not move.
 SPARKINFER_MOE_DETERMINISTIC_ENV = "SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT"
 
+# Experimental opt-in which keeps the deterministic physical-row assignment
+# required by dynamic_down_scale while retaining the atomic final reduction.
+# Like the original deterministic-output control, bfdiag only fingerprints
+# this setting; the runtime owns its default and semantics.
+SPARKINFER_MOE_STABLE_ROUTE_ROWS_ENV = "SPARKINFER_DYNAMIC_STABLE_ROUTE_ROWS"
+
 # Real env vars, verified in runtime/backends/laguna.py:359 and
 # runtime/backends/laguna_dflash.py:171,387 (grepped, not guessed) -- each is
 # read exactly once inside __init__/_init_cuda_graph. bfdiag/daemon/
@@ -361,6 +367,26 @@ def _observe_sparkinfer_moe_deterministic() -> BundleItem:
     return item
 
 
+def _observe_sparkinfer_moe_stable_route_rows() -> BundleItem:
+    value = os.environ.get(SPARKINFER_MOE_STABLE_ROUTE_ROWS_ENV)
+    return BundleItem(
+        name="sparkinfer_moe_stable_route_rows",
+        does=(
+            f"read-only observation of {SPARKINFER_MOE_STABLE_ROUTE_ROWS_ENV}; "
+            "the experimental hybrid mode keeps stable per-expert physical "
+            "row assignment while using atomic final output reduction"
+        ),
+        perf_cost="n/a (observation only; not controlled by this module)",
+        load_time=True,
+        status="observed_only",
+        detail=(
+            f"{SPARKINFER_MOE_STABLE_ROUTE_ROWS_ENV}={value!r}"
+            if value is not None
+            else f"{SPARKINFER_MOE_STABLE_ROUTE_ROWS_ENV} unset"
+        ),
+    )
+
+
 # -- item 4: fixed autotune cache directory ---------------------------------
 
 
@@ -483,6 +509,7 @@ def apply(
         _apply_torch_deterministic_algorithms(is_deterministic, mutate=mutate),
         _apply_seed_all(is_deterministic, seed_value, mutate=mutate),
         _observe_sparkinfer_moe_deterministic(),
+        _observe_sparkinfer_moe_stable_route_rows(),
         _apply_autotune_cache(is_deterministic, mutate=mutate),
         _apply_cuda_graph_disable(is_deterministic and disable_cuda_graph, mutate=mutate),
     ]
@@ -504,6 +531,7 @@ if __name__ == "__main__":
         "torch_deterministic_algorithms",
         "seed_all",
         "sparkinfer_moe_deterministic_output",
+        "sparkinfer_moe_stable_route_rows",
         "autotune_cache",
         "cuda_graph_disable",
     }

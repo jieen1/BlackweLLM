@@ -51,7 +51,7 @@ def test_run_record_to_dict_from_dict_round_trip() -> None:
     record = _make_record(
         finished_at=utc_now_iso(),
         fingerprint=Fingerprint(
-            git={"vllm": GitRepoInfo(sha="abc123", dirty=False, branch="main")}
+            git={"sparkinfer": GitRepoInfo(sha="abc123", dirty=False, branch="main")}
         ),
         metrics={"acceptance_rate": 0.687},
         artifacts={"profile": "runs/x/artifacts/profile.json"},
@@ -62,11 +62,22 @@ def test_run_record_to_dict_from_dict_round_trip() -> None:
 
 def test_run_record_get_path_dotted_lookup() -> None:
     record = _make_record(
-        fingerprint=Fingerprint(git={"vllm": GitRepoInfo(sha="deadbeef")}),
+        fingerprint=Fingerprint(git={"sparkinfer": GitRepoInfo(sha="deadbeef")}),
     )
-    assert record.get_path("fingerprint.git.vllm.sha") == "deadbeef"
-    assert record.get_path("fingerprint.git.vllm.branch") is None
+    assert record.get_path("fingerprint.git.sparkinfer.sha") == "deadbeef"
+    assert record.get_path("fingerprint.git.sparkinfer.branch") is None
     assert record.get_path("fingerprint.does.not.exist") is None
+
+
+def test_run_record_reads_legacy_vllm_python_field_without_reemitting_it() -> None:
+    record = RunRecord.from_dict(
+        {
+            "run_id": "legacyrecord",
+            "fingerprint": {"python": {"version": "3.12", "vllm": "0.26.0"}},
+        }
+    )
+    assert record.fingerprint.python.version == "3.12"
+    assert "vllm" not in record.fingerprint.to_dict()["python"]
 
 
 # --- store --------------------------------------------------------------
@@ -165,6 +176,25 @@ def test_run_record_success_path_persists_ok_status(store: RunStore) -> None:
     assert loaded.fingerprint.workload.k == 15
 
 
+def test_run_record_scopes_and_flushes_an_enabled_trace(monkeypatch, store: RunStore) -> None:
+    events: list[tuple[str, str | None]] = []
+    trace_ring = object()
+
+    monkeypatch.setattr(
+        "bfdiag.record._reset_trace_for_record",
+        lambda: events.append(("reset", None)) or trace_ring,
+    )
+    monkeypatch.setattr(
+        "bfdiag.record._write_record_trace",
+        lambda ring, active_store, run_id: events.append(("flush", run_id)),
+    )
+
+    with run_record(script="demo.py", store=store) as rec:
+        run_id = rec.run_id
+
+    assert events == [("reset", None), ("flush", run_id)]
+
+
 def test_run_record_exports_and_restores_env_vars(store: RunStore, monkeypatch) -> None:
     monkeypatch.delenv("QSR_BFDIAG_RUN_ID", raising=False)
     monkeypatch.delenv("QSR_RUN_RECORD", raising=False)
@@ -214,7 +244,11 @@ def test_run_record_artifact_registers_relpath(store: RunStore, tmp_path: Path) 
 
 
 def _run_adopt_subprocess(tmp_path: Path, body: str) -> subprocess.CompletedProcess:
-    script = f"import sys\nfrom bfdiag.record import auto_record\n{body}\n"
+    script = (
+        "import sys\n"
+        "from bfdiag.record import auto_record\n"
+        f"{body}\n"
+    )
     env = dict(os.environ)
     env["QSR_BFDIAG_DIR"] = str(tmp_path / ".bfdiag")
     env["PYTHONPATH"] = str(_REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")

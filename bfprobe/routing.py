@@ -28,6 +28,11 @@ Cost: 47 MoE layers x 16 verify tokens x 10 experts x (4+4) bytes ~= 60 KB
 per DFlash round, against a 44.16 ms/round budget -- 0.0001%, per
 ``notes/2026-07-27-probe-system-design-and-plan.md`` section 4.
 
+The probe deliberately captures only rows up to DFlash's M=16 verify
+shape. Capturing a full long-context prefill would retain 47 copies of
+``(65536, 256)`` router logits in the local bus and can OOM the diagnostic
+process; prefill routing is not a target of this probe.
+
 Ordering convention (no explicit layer index is emitted, to keep the hot
 path to one function call): ``capture_routing`` is called once per MoE
 layer per forward pass, and MoE layers are patched once, at model-load
@@ -52,6 +57,7 @@ except ImportError:
 SITE_ROUTER_LOGITS = 300
 SITE_TOPK_IDS = 301
 SITE_TOPK_WEIGHTS = 302
+MAX_CAPTURE_ROWS = 16
 
 
 def capture_routing(router_logits: Any, topk_ids: Any, topk_weights: Any) -> None:
@@ -70,6 +76,8 @@ def capture_routing(router_logits: Any, topk_ids: Any, topk_weights: Any) -> Non
         topk_weights: Renormalized routing weights, shape ``(M, top_k)``.
     """
     if not PROBE_ENABLED:
+        return
+    if topk_ids.shape[0] > MAX_CAPTURE_ROWS:
         return
     emit_tensor(SITE_ROUTER_LOGITS, router_logits)
     emit_tensor(SITE_TOPK_IDS, topk_ids)

@@ -18,8 +18,6 @@ import json
 import pytest
 
 from bfdiag.shapes.model import (
-    DEFAULT_DRAFT_MODEL_ID,
-    DEFAULT_MODEL_ID,
     LagunaConfigError,
     load_draft_config,
     load_laguna_config,
@@ -30,7 +28,6 @@ from bfdiag.shapes.model import (
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
 def test_real_config_layer_grouping():
     """Acceptance criterion #2: 12 full_attention + 36 sliding_attention,
     full layer positions exactly 0,4,8,...,44."""
@@ -41,7 +38,6 @@ def test_real_config_layer_grouping():
     assert len(config.full_layer_indices) + len(config.sliding_layer_indices) == 48
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
 def test_real_config_per_layer_heads():
     """Real per-layer head counts (safetensors-verified, see
     notes/2026-07-27-laguna-real-shapes-correction-and-page-size-migration-plan.md):
@@ -62,7 +58,6 @@ def test_real_config_per_layer_heads():
         assert config.heads_per_layer[i] == 72
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
 def test_real_config_moe_and_dense_layers():
     config = load_laguna_config()
     assert config.dense_mlp_layer_indices == (0,)
@@ -75,13 +70,11 @@ def test_real_config_moe_and_dense_layers():
     assert config.nvfp4_group_size == 16
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
 def test_real_config_kv_cache_dtype_is_fp8():
     config = load_laguna_config()
     assert config.kv_cache_dtype == "fp8_e4m3"
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_DRAFT_MODEL_ID)
 def test_real_draft_config():
     draft = load_draft_config()
     assert draft.num_hidden_layers == 6
@@ -92,7 +85,6 @@ def test_real_draft_config():
     assert len(draft.eagle_aux_hidden_state_layer_ids) == 6
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_DRAFT_MODEL_ID)
 def test_dflash_constants_agree_with_draft_config():
     """Cross-check the runtime's hardcoded dflash_constants.py against the
     real draft config.json -- exactly the kind of drift this package exists

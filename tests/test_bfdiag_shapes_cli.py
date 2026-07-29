@@ -10,10 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 
-import pytest
-
 from bfdiag.shapes.cli import diff_flat, register
-from bfdiag.shapes.model import DEFAULT_DRAFT_MODEL_ID, DEFAULT_MODEL_ID
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -48,8 +45,6 @@ def test_diff_flat_handles_missing_keys():
     assert unchanged == ["shared"]
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
-@pytest.mark.requires_hf_snapshot(DEFAULT_DRAFT_MODEL_ID)
 def test_cli_diff_64_vs_128_flags_ring_and_pages(capsys):
     rc, _ = _run(
         ["shapes", "--block-size", "64", "--block-size", "128", "--diff", "--kv-len", "65600"]
@@ -65,8 +60,6 @@ def test_cli_diff_64_vs_128_flags_ring_and_pages(capsys):
     assert "gemm/full.q_proj" not in out.split("-- unchanged")[0]
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
-@pytest.mark.requires_hf_snapshot(DEFAULT_DRAFT_MODEL_ID)
 def test_cli_diff_lists_gemm_and_moe_as_unchanged(capsys):
     rc, _ = _run(
         ["shapes", "--block-size", "64", "--block-size", "128", "--diff", "--kv-len", "65600"]
@@ -85,8 +78,6 @@ def test_cli_diff_requires_exactly_two_block_sizes(capsys):
     assert "exactly two" in err
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
-@pytest.mark.requires_hf_snapshot(DEFAULT_DRAFT_MODEL_ID)
 def test_cli_diff_no_change_when_same_block_size_twice(capsys):
     rc, _ = _run(["shapes", "--block-size", "64", "--block-size", "64", "--diff"])
     assert rc == 0
@@ -94,8 +85,6 @@ def test_cli_diff_no_change_when_same_block_size_twice(capsys):
     assert "(no shapes changed)" in out
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
-@pytest.mark.requires_hf_snapshot(DEFAULT_DRAFT_MODEL_ID)
 def test_cli_default_block_sizes_are_64_and_128(capsys):
     rc, _ = _run(["shapes", "--json"])
     assert rc == 0
@@ -124,8 +113,6 @@ def _split_json_objects(text: str) -> list[str]:
     return objs
 
 
-@pytest.mark.requires_hf_snapshot(DEFAULT_MODEL_ID)
-@pytest.mark.requires_hf_snapshot(DEFAULT_DRAFT_MODEL_ID)
 def test_cli_json_diff_output_is_valid_json(capsys):
     rc, _ = _run(
         [

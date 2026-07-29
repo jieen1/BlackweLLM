@@ -281,6 +281,7 @@ class TestApplyBundle:
         assert by_name["cuda_graph_disable"].status == "not_enabled"
         # observational item is unconditional, regardless of `deterministic`
         assert by_name["sparkinfer_moe_deterministic_output"].status == "observed_only"
+        assert by_name["sparkinfer_moe_stable_route_rows"].status == "observed_only"
         # nothing was actually mutated
         assert fake_torch.use_deterministic_algorithms_calls == []
         assert fake_torch.manual_seed_calls == []
@@ -365,17 +366,27 @@ class TestApplyBundle:
 
     def test_sparkinfer_item_observes_current_env_without_setting_it(self, monkeypatch):
         monkeypatch.delenv(determinism.SPARKINFER_MOE_DETERMINISTIC_ENV, raising=False)
+        monkeypatch.delenv(determinism.SPARKINFER_MOE_STABLE_ROUTE_ROWS_ENV, raising=False)
         report = determinism.apply(deterministic=True, mutate=True)
         item = {i.name: i for i in report.bundle}["sparkinfer_moe_deterministic_output"]
+        stable_item = {i.name: i for i in report.bundle}["sparkinfer_moe_stable_route_rows"]
         assert item.status == "observed_only"
         assert "unset" in item.detail
+        assert stable_item.status == "observed_only"
+        assert "unset" in stable_item.detail
         # bfdiag must never set this itself
         assert determinism.SPARKINFER_MOE_DETERMINISTIC_ENV not in os.environ
+        assert determinism.SPARKINFER_MOE_STABLE_ROUTE_ROWS_ENV not in os.environ
 
         monkeypatch.setenv(determinism.SPARKINFER_MOE_DETERMINISTIC_ENV, "1")
         report2 = determinism.apply(deterministic=True, mutate=True)
         item2 = {i.name: i for i in report2.bundle}["sparkinfer_moe_deterministic_output"]
         assert "1" in item2.detail
+
+        monkeypatch.setenv(determinism.SPARKINFER_MOE_STABLE_ROUTE_ROWS_ENV, "1")
+        report3 = determinism.apply(deterministic=True, mutate=True)
+        stable_item3 = {i.name: i for i in report3.bundle}["sparkinfer_moe_stable_route_rows"]
+        assert "1" in stable_item3.detail
 
 
 # --------------------------------------------------------------------------
