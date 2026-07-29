@@ -25,6 +25,7 @@ import sys
 from typing import Any
 
 import torch
+
 from runtime.kernels.fused_kv_scatter import fused_kv_scatter
 
 logger = logging.getLogger("qwen_sm120_runtime.sparkinfer_attn")
@@ -100,13 +101,46 @@ class SparkinferAttnMetadata:
 class SparkinferPrefillWorkspace:
     """Manages sparkinfer extend-mode workspaces for prefill (eager, no CG).
 
-    One workspace per layer group (full-attn vs SWA). Rebuilt per forward call
-    since prefill shapes vary. Overhead is minimal vs the actual compute.
+    One instance can be shared by all layers in an attention group. The
+    immutable planner metadata is identical for those layers within one model
+    forward, so it is prepared once and reused by the remaining layers. A
+    different metadata object always rebuilds the plan and uploads its runtime
+    metadata; this cache never crosses requests.
     """
 
     def __init__(self, device: torch.device):
         self.device = device
         self._descale = torch.ones(1, dtype=torch.float32, device=device)
+        self._workspace: Any | None = None
+        self._workspace_key: tuple[Any, ...] | None = None
+        self._prepared_metadata: object | None = None
+
+    @staticmethod
+    def _key(
+        *,
+        mode: str,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        window_left: int,
+    ) -> tuple[Any, ...]:
+        """Return the static contract which permits workspace reuse.
+
+        Runtime metadata is deliberately excluded: it is guarded by object
+        identity in ``_prepared_metadata`` and must be copied for every new
+        model forward.
+        """
+        return (
+            mode,
+            q.device,
+            q.dtype,
+            tuple(q.shape),
+            k_cache.dtype,
+            tuple(k_cache.shape),
+            v_cache.dtype,
+            tuple(v_cache.shape),
+            int(window_left),
+        )
 
     def forward(
         self,
@@ -121,37 +155,56 @@ class SparkinferPrefillWorkspace:
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
         mode: str = "extend",
+        plan_cache_key: object | None = None,
     ) -> None:
         """Run extend/verify-mode attention (prefill or speculative verify)."""
-        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
-        from sparkinfer.attention.paged.planner import create_paged_plan
         from sparkinfer.attention.paged._forward import paged_attention_forward
         from sparkinfer.attention.paged._scratch import build_paged_attention_binding
+        from sparkinfer.attention.paged.planner import create_paged_plan
+        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
 
         if k_descale is None:
             k_descale = self._descale
         if v_descale is None:
             v_descale = self._descale
 
-        ws = PagedAttentionWorkspace.for_tensors(
-            mode=mode, q=q, k_cache=k_cache, v_cache=v_cache, use_cuda_graph=False
-        )
-
-        plan = create_paged_plan(
-            q,
-            k_cache,
-            v_cache,
-            page_table,
-            cache_seqlens,
-            cu_seqlens_q,
+        workspace_key = self._key(
             mode=mode,
-            enable_cuda_graph=False,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
             window_left=window_left,
         )
-        ws._ensure_capacity(plan)
-        ws._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
-        ws._copy_plan_metadata(plan)
-        ws._plan = plan
+        if self._workspace_key != workspace_key:
+            self._workspace = PagedAttentionWorkspace.for_tensors(
+                mode=mode,
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                use_cuda_graph=False,
+            )
+            self._workspace_key = workspace_key
+            self._prepared_metadata = None
+
+        ws = self._workspace
+        assert ws is not None
+        if plan_cache_key is None or self._prepared_metadata is not plan_cache_key:
+            plan = create_paged_plan(
+                q,
+                k_cache,
+                v_cache,
+                page_table,
+                cache_seqlens,
+                cu_seqlens_q,
+                mode=mode,
+                enable_cuda_graph=False,
+                window_left=window_left,
+            )
+            ws._ensure_capacity(plan)
+            ws._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
+            ws._copy_plan_metadata(plan)
+            ws._plan = plan
+            self._prepared_metadata = plan_cache_key
 
         binding = build_paged_attention_binding(
             scratch=ws,
@@ -183,7 +236,6 @@ class SparkinferDecodeWorkspace:
         page_size: int = PAGE_SIZE,
     ):
         from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
-        from sparkinfer.attention.paged.planner import create_paged_plan
 
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
@@ -308,6 +360,7 @@ class SparkinferAttentionImpl:
         scale: float,
         num_kv_heads: int,
         window_left: int = -1,
+        prefill_workspace: SparkinferPrefillWorkspace | None = None,
         **kwargs,
     ):
         self.num_heads = num_heads
@@ -317,7 +370,7 @@ class SparkinferAttentionImpl:
         self.window_left = window_left
         self.kv_cache_dtype = "fp8_e4m3"
         self.supports_quant_query_input = False
-        self._prefill_ws: SparkinferPrefillWorkspace | None = None
+        self._prefill_ws = prefill_workspace
 
     def _get_prefill_ws(self, device: torch.device) -> SparkinferPrefillWorkspace:
         if self._prefill_ws is None:
@@ -410,5 +463,6 @@ class SparkinferAttentionImpl:
             k_descale=k_descale,
             v_descale=v_descale,
             mode=getattr(attn_metadata, "mode", "extend"),
+            plan_cache_key=attn_metadata,
         )
         return output

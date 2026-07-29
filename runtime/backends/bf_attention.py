@@ -101,6 +101,7 @@ class BFAttention(nn.Module):
         scale: float,
         window_left: int = -1,
         kv_cache_dtype: str = "fp8_e4m3",
+        prefill_workspace: Any = None,
     ):
         super().__init__()
         self.layer_name = layer_name
@@ -126,6 +127,7 @@ class BFAttention(nn.Module):
             scale=scale,
             num_kv_heads=num_kv_heads,
             window_left=window_left,
+            prefill_workspace=prefill_workspace,
         )
 
     def forward(
@@ -158,27 +160,34 @@ class BFAttention(nn.Module):
                 f"BFAttention context is missing metadata or slot mapping for {self.layer_name!r}."
             )
 
-        # KV cache write. For fp8/uint8 cache, use the fused Triton kernel
-        # (single kernel per layer instead of 6 Python ops). For bf16 cache,
-        # use a simple index_copy scatter.
+        # KV cache write via self-developed fused Triton kernel (replaces
+        # vLLM's compiled C++ reshape_and_cache_flash). Single kernel per
+        # layer instead of 6 Python ops (288→48 kernels/step).
+        #
+        # fused_kv_scatter is FP8-only (always divides by scale and casts
+        # to float8e4nv) -- production KV cache dtype is always FP8 (see
+        # SelfBuiltAttentionPlaceholder's hardcoded kv_cache_dtype="fp8",
+        # runtime/model/plain_attention.py), so that's the only path
+        # exercised end-to-end. The plain-write branch below restores the
+        # pre-4e99b7c "non-fp8 caches keep their native representation,
+        # unscaled" guarantee for any non-FP8 kv_cache_torch_dtype -- it
+        # was silently dropped when the scatter moved from 6 Python ops to
+        # this single fused kernel, since the kernel was written FP8-only.
         if sm is not None and k is not None and v is not None and self.kv_cache is not None:
             k_cache = self.kv_cache[0]
             v_cache = self.kv_cache[1]
-            if k_cache.dtype in (torch.uint8, torch.float8_e4m3fn):
+            is_fp8 = k_cache.dtype in (torch.uint8, torch.float8_e4m3fn)
+            if is_fp8:
                 if k_cache.dtype == torch.uint8:
                     k_cache = k_cache.view(torch.float8_e4m3fn)
                     v_cache = v_cache.view(torch.float8_e4m3fn)
                 fused_kv_scatter(k, v, k_cache, v_cache, sm, self._k_scale, self._v_scale)
             else:
-                # bf16/fp16 cache: simple scatter (no quantization)
-                valid = sm >= 0
-                if valid.any():
-                    block_size = k_cache.shape[1]
-                    valid_sm = sm[valid]
-                    block_idx = valid_sm // block_size
-                    block_off = valid_sm % block_size
-                    k_cache[block_idx, block_off] = k[valid]
-                    v_cache[block_idx, block_off] = v[valid]
+                block_size = k_cache.shape[1]
+                block_idx = sm // block_size
+                block_off = sm % block_size
+                k_cache[block_idx, block_off] = k.to(k_cache.dtype)
+                v_cache[block_idx, block_off] = v.to(v_cache.dtype)
 
         # Sparkinfer attention forward
         self.impl.forward(self, q, k, v, self.kv_cache, meta, out)
@@ -190,6 +199,7 @@ def replace_vllm_attention(
     model: nn.Module,
     sfc: dict[str, Any],
     kv_caches: dict[str, torch.Tensor],
+    resolve_parent: Any = None,
 ) -> int:
     """Replace all vLLM Attention modules in model with BFAttention.
 
@@ -197,9 +207,26 @@ def replace_vllm_attention(
     and replaces them with BFAttention that has the same config + our
     sparkinfer impl + self-allocated KV cache.
 
+    ``resolve_parent``, if given, is ``layer_name -> (parent_module,
+    attr_name)``, used instead of the default "split layer_name on '.'
+    and walk the model tree by those exact path components" logic. Needed
+    for DFlash's draft model (runtime/backends/laguna_dflash.py): its
+    attention layers are deliberately registered under a global-index
+    ``layer_name`` (e.g. ``"...layers.48.attn"``, offset past the main
+    model's 48 layers so both can share one static_forward_context
+    without key collisions -- see laguna_dflash_model.py's module
+    docstring) that does NOT match the draft model's own local module
+    tree (``draft_model.model.layers`` is only ever indices 0-5) -- the
+    default path-parsing logic would try to index ``layers[48]`` and
+    fail. Default (``None``) preserves the exact original behavior for
+    the main model, where layer_name IS the real path.
+
     Returns number of layers replaced.
     """
+    from runtime.backends.laguna_sparkinfer_attn import SparkinferPrefillWorkspace
+
     replaced = 0
+    prefill_workspaces: dict[tuple[int, int, int, int], SparkinferPrefillWorkspace] = {}
 
     for layer_name, attn_layer in sfc.items():
         if not hasattr(attn_layer, "get_attn_backend"):
@@ -211,6 +238,11 @@ def replace_vllm_attention(
         num_kv_heads = attn_layer.num_kv_heads
         scale = attn_layer.impl.scale if hasattr(attn_layer.impl, "scale") else head_size**-0.5
         window_left = getattr(attn_layer.impl, "window_left", -1)
+        workspace_key = (window_left, num_heads, num_kv_heads, head_size)
+        prefill_workspace = prefill_workspaces.get(workspace_key)
+        if prefill_workspace is None:
+            prefill_workspace = SparkinferPrefillWorkspace(torch.device("cuda"))
+            prefill_workspaces[workspace_key] = prefill_workspace
 
         # Create BFAttention replacement
         bf_attn = BFAttention(
@@ -221,6 +253,7 @@ def replace_vllm_attention(
             scale=scale,
             window_left=window_left,
             kv_cache_dtype=getattr(attn_layer, "kv_cache_dtype", "fp8_e4m3"),
+            prefill_workspace=prefill_workspace,
         )
 
         # Copy KV scales from original layer
@@ -233,14 +266,17 @@ def replace_vllm_attention(
         bf_attn.kv_cache = kv_caches[layer_name]
 
         # Replace in the model tree: find parent module and attribute name
-        parts = layer_name.split(".")
-        parent = model
-        for part in parts[:-1]:
-            if part.isdigit():
-                parent = parent[int(part)]
-            else:
-                parent = getattr(parent, part)
-        attr_name = parts[-1]
+        if resolve_parent is not None:
+            parent, attr_name = resolve_parent(layer_name)
+        else:
+            parts = layer_name.split(".")
+            parent = model
+            for part in parts[:-1]:
+                if part.isdigit():
+                    parent = parent[int(part)]
+                else:
+                    parent = getattr(parent, part)
+            attr_name = parts[-1]
         setattr(parent, attr_name, bf_attn)
 
         # Also update sfc to point to our BFAttention

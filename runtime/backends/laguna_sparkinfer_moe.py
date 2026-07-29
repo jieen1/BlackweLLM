@@ -19,7 +19,6 @@ Performance (SM120, E=256, K=3072, I=1024, top_k=10):
   - CUDA graph: ~38μs/layer → 1.8ms for 47 layers
   - vs CUTLASS eager: ~186μs/layer → 8.73ms for 47 layers
 """
-
 from __future__ import annotations
 
 import json
@@ -53,11 +52,6 @@ if _BF_SPARKINFER_PATH and _BF_SPARKINFER_PATH not in sys.path:
 
 try:
     from sparkinfer._lib.intrinsics import swizzle_block_scale
-
-    # Imported for its side effect only: it is the availability probe that
-    # makes a sparkinfer build without the public fused_moe surface fail here,
-    # with the actionable message below, instead of much deeper in a forward.
-    from sparkinfer.moe.fused_moe import is_supported as sparkinfer_is_supported  # noqa: F401
     from sparkinfer.moe.fused_moe._impl import (
         allocate_tp_moe_workspace_pool,
         build_tp_moe_fp4_binding,
@@ -73,22 +67,22 @@ except ImportError as exc:
 
 # Remove cutlass-dsl base_dsl from sys.path — it contains a torch.py
 # that shadows the real torch module in spawned subprocesses.
-sys.path[:] = [p for p in sys.path if "nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl" not in p]
+sys.path[:] = [
+    p for p in sys.path
+    if "nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl" not in p
+]
 
 
 def sparkinfer_version() -> str:
     """Return sparkinfer git commit sha for version stamping."""
     try:
         import sparkinfer
-
         pkg_dir = pathlib.Path(sparkinfer.__file__).parent
         git_dir = pkg_dir.parent / ".git"
         if git_dir.exists():
             result = subprocess.run(
                 ["git", "-C", str(git_dir.parent), "rev-parse", "--short", "HEAD"],
-                capture_output=True,
-                text=True,
-                timeout=5,
+                capture_output=True, text=True, timeout=5,
             )
             if result.returncode == 0:
                 return result.stdout.strip()
@@ -156,14 +150,84 @@ def load_moe_layer_weights(
         result[f"{name}_sf"] = torch.stack(
             [tensors[f"{prefix}.{e}.{proj}.weight_scale"] for e in range(NUM_EXPERTS)]
         ).to(device)
-        result[f"{name}_gs"] = (
-            torch.stack(
-                [tensors[f"{prefix}.{e}.{proj}.weight_global_scale"] for e in range(NUM_EXPERTS)]
-            )
-            .to(device)
-            .float()
-        )
+        result[f"{name}_gs"] = torch.stack(
+            [tensors[f"{prefix}.{e}.{proj}.weight_global_scale"] for e in range(NUM_EXPERTS)]
+        ).to(device).float()
     return result
+
+
+def load_moe_layer_activation_gscales(
+    ckpt: pathlib.Path,
+    layer_idx: int,
+) -> tuple[float, float]:
+    """Compute (a1_gscale, a2_gscale) directly from checkpoint per-expert
+    input_global_scale tensors -- replaces reading vLLM FusedMoE's
+    processed w13_input_scale/w2_input_scale (阶段6, vLLM removal plan).
+
+    Verified against the live FusedMoE-derived values before this was
+    written (not derived from reading vLLM's scheme code alone): for
+    layer 1, FusedMoE produced a1_gscale=2015.9998779296875,
+    a2_gscale=776.0; this function's formula reproduces both exactly.
+    Formula, worked out from vLLM's CompressedTensorsW4A4Nvfp4MoEMethod
+    (compressed_tensors_moe_w4a4_nvfp4.py): checkpoint stores raw
+    input_global_scale per expert per projection; vLLM's
+    process_weights_after_loading sets w13_input_scale =
+    1/input_global_scale (elementwise) with no merge, and
+    _patch_moe_sparkinfer's own a1g = 1/w13_input_scale.max() --
+    composing the two reciprocals: a1_gscale = min(raw gate_proj +
+    up_proj input_global_scale across all experts), a2_gscale =
+    min(raw down_proj input_global_scale across all experts). NOT max --
+    this is a double-reciprocal, easy to get backwards; that's why it was
+    verified against a live run rather than trusted from algebra alone.
+    """
+    from safetensors import safe_open
+
+    with open(ckpt / "model.safetensors.index.json") as f:
+        weight_map = json.load(f)["weight_map"]
+
+    prefix = f"model.layers.{layer_idx}.mlp.experts"
+    needed_keys = {
+        f"{prefix}.{eid}.{proj}.input_global_scale"
+        for eid in range(NUM_EXPERTS)
+        for proj in ("gate_proj", "up_proj", "down_proj")
+    }
+    needed_shards = {weight_map[k] for k in needed_keys}
+
+    values: dict[str, float] = {}
+    for shard in sorted(needed_shards):
+        with safe_open(str(ckpt / shard), framework="pt", device="cpu") as f:
+            for k in f.keys():
+                if k in needed_keys:
+                    values[k] = f.get_tensor(k).item()
+
+    gate_up = [
+        values[f"{prefix}.{e}.{proj}.input_global_scale"]
+        for e in range(NUM_EXPERTS)
+        for proj in ("gate_proj", "up_proj")
+    ]
+    down = [values[f"{prefix}.{e}.down_proj.input_global_scale"] for e in range(NUM_EXPERTS)]
+    return min(gate_up), min(down)
+
+
+def load_moe_layer_e_score_correction_bias(
+    ckpt: pathlib.Path,
+    layer_idx: int,
+    device: str | torch.device = "cuda",
+) -> torch.Tensor:
+    """Read one layer's [num_experts] e_score_correction_bias directly from
+    checkpoint. Single non-per-expert-indexed tensor (verified real key:
+    model.layers.N.mlp.experts.e_score_correction_bias, shape [256] f32) --
+    no reduction needed, unlike the gscales above.
+    """
+    from safetensors import safe_open
+
+    with open(ckpt / "model.safetensors.index.json") as f:
+        weight_map = json.load(f)["weight_map"]
+
+    key = f"model.layers.{layer_idx}.mlp.experts.e_score_correction_bias"
+    shard = weight_map[key]
+    with safe_open(str(ckpt / shard), framework="pt", device="cpu") as f:
+        return f.get_tensor(key).to(device).float()
 
 
 def prepare_sparkinfer_layer(
@@ -207,25 +271,17 @@ def prepare_sparkinfer_layer(
         a2_gscale_t = a2_gscale
 
     wplan = plan_sparkinfer_fp4_moe_weights(
-        quant_modes="nvfp4",
-        source_format="modelopt_nvfp4",
-        activation="silu",
-        params_dtype=torch.bfloat16,
-        num_experts=num_experts,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-        w13_layout="w13",
+        quant_modes="nvfp4", source_format="modelopt_nvfp4",
+        activation="silu", params_dtype=torch.bfloat16,
+        num_experts=num_experts, hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE, w13_layout="w13",
     )
     return prepare_sparkinfer_fp4_moe_weights(
         plan=wplan,
-        w1_global_scale=w1_alpha,
-        w2_global_scale=w2_alpha,
-        w1_fp4=w13_fp4,
-        w1_blockscale=w13_sf,
-        w2_fp4=raw["down_w"].clone().contiguous(),
-        w2_blockscale=down_sf_sw,
-        a1_gscale=a1_gscale_t,
-        a2_gscale=a2_gscale_t,
+        w1_global_scale=w1_alpha, w2_global_scale=w2_alpha,
+        w1_fp4=w13_fp4, w1_blockscale=w13_sf,
+        w2_fp4=raw["down_w"].clone().contiguous(), w2_blockscale=down_sf_sw,
+        a1_gscale=a1_gscale_t, a2_gscale=a2_gscale_t,
         params_dtype=torch.bfloat16,
     )
 
@@ -248,21 +304,13 @@ class SparkinferMoELayer:
         M = hidden.shape[0]
         if self._output_buf is None or self._output_buf.shape[0] < M:
             self._output_buf = torch.empty(
-                M,
-                HIDDEN_SIZE,
-                dtype=hidden.dtype,
-                device=self.device,
+                M, HIDDEN_SIZE, dtype=hidden.dtype, device=self.device,
             )
         out = self._output_buf[:M]
         binding = build_tp_moe_fp4_binding(
-            scratch=self.workspace,
-            a=hidden,
-            experts=self.experts,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids.to(torch.int32),
-            quant_mode="nvfp4",
-            input_scales_static=True,
-            output=out,
+            scratch=self.workspace, a=hidden, experts=self.experts,
+            topk_weights=topk_weights, topk_ids=topk_ids.to(torch.int32),
+            quant_mode="nvfp4", input_scales_static=True, output=out,
         )
         return sparkinfer_moe_fp4(binding=binding)
 
@@ -286,8 +334,7 @@ class SparkinferMoEModel:
         self.version = sparkinfer_version()
         logger.info(
             "SparkinferMoEModel init: %d layers, sparkinfer@%s",
-            len(self.layer_ids),
-            self.version,
+            len(self.layer_ids), self.version,
         )
 
     def load_layer(self, layer_idx: int) -> SparkinferMoELayer:
@@ -308,14 +355,11 @@ class SparkinferMoEModel:
         total = time.time() - t0
         logger.info(
             "All %d MoE layers loaded in %.1fs (%.1fs/layer)",
-            len(self.layer_ids),
-            total,
-            total / len(self.layer_ids),
+            len(self.layer_ids), total, total / len(self.layer_ids),
         )
 
     def forward_layer(
-        self,
-        layer_idx: int,
+        self, layer_idx: int,
         hidden: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -323,55 +367,3 @@ class SparkinferMoEModel:
         if layer_idx not in self.layers:
             self.load_layer(layer_idx)
         return self.layers[layer_idx].forward(hidden, topk_ids, topk_weights)
-
-
-def prepare_sparkinfer_layer_from_vllm(
-    w13_weight: torch.Tensor,
-    w13_weight_scale: torch.Tensor,
-    w13_weight_scale_2: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w2_weight_scale: torch.Tensor,
-    w2_weight_scale_2: torch.Tensor,
-    w13_input_scale: torch.Tensor,
-    w2_input_scale: torch.Tensor,
-    device: str | torch.device = "cuda",
-):
-    """Prepare sparkinfer weights from vLLM's already-loaded expert tensors.
-
-    vLLM's CUTLASS reformat stores:
-      w13_weight_scale_2 = (1/checkpoint_global_scale) * input_scale
-    sparkinfer computes runtime_alpha = w_global_scale / a_gscale,
-    so passing ws2 as w_global_scale and input_scale as a_gscale
-    yields runtime_alpha = 1/checkpoint_global_scale (correct dequant).
-
-    Block scales are used as-is (no folding).
-    """
-    num_experts = w13_weight.shape[0]
-
-    # vLLM's block scales are already in sparkinfer-compatible format;
-    # applying swizzle_block_scale would double-swizzle and corrupt them.
-    w13_sf = w13_weight_scale.clone().contiguous()
-    w2_sf = w2_weight_scale.clone().contiguous()
-
-    wplan = plan_sparkinfer_fp4_moe_weights(
-        quant_modes="nvfp4",
-        source_format="modelopt_nvfp4",
-        activation="silu",
-        params_dtype=torch.bfloat16,
-        num_experts=num_experts,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-        w13_layout="w13",
-    )
-    return prepare_sparkinfer_fp4_moe_weights(
-        plan=wplan,
-        w1_global_scale=w13_weight_scale_2.float().clone().contiguous(),
-        w2_global_scale=w2_weight_scale_2.float().clone().contiguous(),
-        w1_fp4=w13_weight.clone().contiguous(),
-        w1_blockscale=w13_sf,
-        w2_fp4=w2_weight.clone().contiguous(),
-        w2_blockscale=w2_sf,
-        a1_gscale=w13_input_scale.float().clone().contiguous(),
-        a2_gscale=w2_input_scale.float().clone().contiguous(),
-        params_dtype=torch.bfloat16,
-    )
