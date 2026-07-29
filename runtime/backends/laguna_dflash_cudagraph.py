@@ -67,7 +67,7 @@ class DFlashVerifyCudaGraph:
         self._positions = torch.zeros(self.num_tokens, dtype=torch.long, device=self.device)
 
         # Full-attention FlashInfer buffers
-        max_full_pages = self.blocks_per_slot
+        max_full_pages = self.blocks_per_slot + 1  # +1: verify M=16 can cross block boundary
         self._full_qo_indptr = torch.tensor(
             [0, self.num_tokens], dtype=torch.int32, device=self.device
         )
