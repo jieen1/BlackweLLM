@@ -1444,7 +1444,7 @@ class DFlashEngine:
                 for p in range(len(committed))
             ]
 
-        if verify_aux is not None:
+        if verify_aux is not None and context_count > 0:
             aux_slice = [a[:context_count] for a in verify_aux]
             combined_input = torch.cat(aux_slice, dim=-1)
             combined = self.draft_model.combine_hidden_states(combined_input)
@@ -1463,8 +1463,7 @@ class DFlashEngine:
             )
 
         backend.slot_kv_len[slot] += context_count
-        for tok in committed:
-            backend.slot_committed_tokens[slot].append(tok)
+        backend.slot_committed_tokens[slot].extend(committed)
         bfdiag_checks.check_kv_len_monotonic(slot, kv_len, backend.slot_kv_len[slot])
         bfdiag_checks.check_committed_ahead_of_kv_by_one(
             slot, backend.slot_kv_len[slot], len(backend.slot_committed_tokens[slot])
