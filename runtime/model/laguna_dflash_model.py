@@ -100,9 +100,9 @@ from runtime.model.plain_linear import PlainLinear
 class LagunaDraftModelSelfBuilt(nn.Module):
     """Self-built equivalent of vLLM's ``DFlashLagunaModel``."""
 
-    def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
+    def __init__(self, *, runtime_config: Any, prefix: str = "") -> None:
         super().__init__()
-        self.config = vllm_config.speculative_config.draft_model_config.hf_config
+        self.config = runtime_config.speculative_config.draft_model_config.hf_config
         config = self.config
         self.vocab_size = config.vocab_size
 
@@ -136,12 +136,14 @@ class LagunaDraftModelSelfBuilt(nn.Module):
         # than deleted, matching vLLM's own conditional exactly.
         self.has_separate_mask_embedding = False
 
-        target_layer_count = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
+        target_layer_count = runtime_config.model_config.get_num_layers(
+            runtime_config.parallel_config
+        )
         self.layers = nn.ModuleList(
             [
                 LagunaDecoderLayerSelfBuilt(
                     config=config,
-                    cache_config=vllm_config.cache_config,
+                    cache_config=runtime_config.cache_config,
                     quant_config=None,  # draft checkpoint is entirely unquantized
                     prefix=maybe_prefix(prefix, f"layers.{i}"),
                     layer_idx=i,
@@ -164,7 +166,7 @@ class LagunaDraftModelSelfBuilt(nn.Module):
 
         num_features = len(target_layer_ids)
         self.num_aux_slices = num_features
-        target_hidden_size = vllm_config.model_config.get_hidden_size()
+        target_hidden_size = runtime_config.model_config.get_hidden_size()
         fc_input_size = target_hidden_size * num_features
         self.aux_hidden_norms = nn.ModuleList(
             [
@@ -375,14 +377,14 @@ class LagunaDraftModelSelfBuilt(nn.Module):
 class LagunaDraftForCausalLMSelfBuilt(nn.Module):
     """Self-built equivalent of vLLM's ``DFlashLagunaForCausalLM``."""
 
-    def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
+    def __init__(self, *, runtime_config: Any, prefix: str = "") -> None:
         super().__init__()
-        self.config = vllm_config.speculative_config.draft_model_config.hf_config
+        self.config = runtime_config.speculative_config.draft_model_config.hf_config
         config = self.config
         if getattr(config, "draft_vocab_size", None) is None:
             raise ValueError("Laguna DFlash config requires `draft_vocab_size`.")
 
-        target_vocab_size = vllm_config.model_config.get_vocab_size()
+        target_vocab_size = runtime_config.model_config.get_vocab_size()
         if config.draft_vocab_size != target_vocab_size:
             raise ValueError(
                 "Laguna DFlash shares the target lm_head and requires "
@@ -396,7 +398,7 @@ class LagunaDraftForCausalLMSelfBuilt(nn.Module):
         self.has_own_lm_head = False
 
         self.model = LagunaDraftModelSelfBuilt(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+            runtime_config=runtime_config, prefix=maybe_prefix(prefix, "model")
         )
         # Placeholder -- replaced with the target model's lm_head object by
         # load_laguna_dflash_draft_model. No lm_head.* key in the checkpoint.

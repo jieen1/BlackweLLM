@@ -394,7 +394,7 @@ class LagunaCudaGraphDecode:
         with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
             with laguna_forward_context(
                 attn_metadata_dict,
-                backend.vllm_config,
+                backend.runtime_config,
                 slot_mapping=slot_mapping_dict,
                 skip_compiled=True,
             ):
@@ -875,7 +875,7 @@ class LagunaCudaGraphVerify:
                 with bf_attn_context(attn_meta, slot_mapping_dict):
                     with laguna_forward_context(
                         attn_meta,
-                        backend.vllm_config,
+                        backend.runtime_config,
                         slot_mapping=slot_mapping_dict,
                         skip_compiled=True,
                     ):
@@ -895,7 +895,7 @@ class LagunaCudaGraphVerify:
             with bf_attn_context(attn_meta, slot_mapping_dict):
                 with laguna_forward_context(
                     attn_meta,
-                    backend.vllm_config,
+                    backend.runtime_config,
                     slot_mapping=slot_mapping_dict,
                     skip_compiled=True,
                 ):

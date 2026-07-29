@@ -82,12 +82,12 @@ class LagunaModelSelfBuilt(nn.Module):
     still borrowed from vLLM.
     """
 
-    def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
+    def __init__(self, *, runtime_config: Any, prefix: str = "") -> None:
         super().__init__()
 
-        config = vllm_config.model_config.hf_config
-        cache_config = vllm_config.cache_config
-        quant_config = vllm_config.quant_config
+        config = runtime_config.model_config.hf_config
+        cache_config = runtime_config.cache_config
+        quant_config = runtime_config.quant_config
         self.config = config
         self.quant_config = quant_config
 
@@ -110,9 +110,9 @@ class LagunaModelSelfBuilt(nn.Module):
                     cache_config=cache_config,
                     quant_config=quant_config,
                     prefix=f"{prefix}.layers.{layer_idx}",
-                    enable_eplb=vllm_config.parallel_config.enable_eplb,
+                    enable_eplb=runtime_config.parallel_config.enable_eplb,
                     layer_idx=layer_idx,
-                    max_model_len=vllm_config.model_config.max_model_len,
+                    max_model_len=runtime_config.model_config.max_model_len,
                 )
                 for layer_idx in range(config.num_hidden_layers)
             ]
@@ -291,15 +291,15 @@ class LagunaForCausalLMSelfBuilt(nn.Module):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     }
 
-    def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
+    def __init__(self, *, runtime_config: Any, prefix: str = "") -> None:
         super().__init__()
-        config = vllm_config.model_config.hf_config
-        quant_config = vllm_config.quant_config
+        config = runtime_config.model_config.hf_config
+        quant_config = runtime_config.quant_config
         self.config = config
         self.quant_config = quant_config
 
         self.model = LagunaModelSelfBuilt(
-            vllm_config=vllm_config, prefix=_maybe_prefix(prefix, "model")
+            runtime_config=runtime_config, prefix=_maybe_prefix(prefix, "model")
         )
 
         self.lm_head = PlainLMHead(config.vocab_size, config.hidden_size)

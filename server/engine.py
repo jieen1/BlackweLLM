@@ -376,7 +376,7 @@ class ServerEngine:
         from runtime.laguna_config import build_laguna_config
 
         max_model_len = self.blocks_per_slot * self.block_size
-        vllm_config = build_laguna_config(
+        runtime_config = build_laguna_config(
             model=self.MODEL,
             max_model_len=max_model_len,
             gpu_memory_utilization=self._gpu_memory_utilization,
@@ -384,7 +384,7 @@ class ServerEngine:
         )
         self._prefill_chunk_size = 512  # unused: Laguna prefill is one-shot (see LagunaBackend)
         self.runner = LagunaBackend(
-            vllm_config,
+            runtime_config,
             num_slots=self.num_slots,
             block_size=self.block_size,
             blocks_per_slot=self.blocks_per_slot,

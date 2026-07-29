@@ -177,7 +177,7 @@ class LagunaBackend:
 
     def __init__(
         self,
-        vllm_config: LagunaRuntimeConfig,
+        runtime_config: LagunaRuntimeConfig,
         *,
         num_slots: int = 4,
         block_size: int = 64,
@@ -217,7 +217,7 @@ class LagunaBackend:
 
         torch.set_grad_enabled(False)
 
-        self.vllm_config = vllm_config
+        self.runtime_config = runtime_config
         self.num_slots = num_slots
         self.block_size = block_size
         self.blocks_per_slot = blocks_per_slot
@@ -240,9 +240,9 @@ class LagunaBackend:
         )
         from runtime.model_loading import load_laguna_model
 
-        self.model = load_laguna_model(vllm_config)
+        self.model = load_laguna_model(runtime_config)
         # Set IR op priority (fused RMSNorm C++ kernels) — normally done by worker init
-        vllm_config.kernel_config.ir_op_priority.set_default()
+        runtime_config.kernel_config.ir_op_priority.set_default()
 
         # Patch MoE layers with the sparkinfer kernel (自研 kernel 集成,
         # zero vLLM dependency for the expert compute itself)
@@ -260,7 +260,7 @@ class LagunaBackend:
         # completely unchanged.
         from runtime.model.plain_attention import SelfBuiltAttentionPlaceholder
 
-        sfc = vllm_config.compilation_config.static_forward_context
+        sfc = runtime_config.compilation_config.static_forward_context
         for name, module in self.model.named_modules():
             if isinstance(module, SelfBuiltAttentionPlaceholder):
                 sfc[name] = module
@@ -273,7 +273,7 @@ class LagunaBackend:
 
         # Group layers by (num_qo_heads, num_kv_heads, window_left)
         # Each group gets sparkinfer impl patched
-        hf_config = vllm_config.model_config.hf_config
+        hf_config = runtime_config.model_config.hf_config
         layer_types = getattr(hf_config, "layer_types", None)
         sliding_window = getattr(hf_config, "sliding_window", None)
 
@@ -331,7 +331,7 @@ class LagunaBackend:
             )
 
         # ── Classify layers: full attention vs SWA ──
-        cache_dtype_str = vllm_config.cache_config.cache_dtype
+        cache_dtype_str = runtime_config.cache_config.cache_dtype
         self._cache_dtype_str = cache_dtype_str
         self._full_layer_names: list[str] = []
         self._swa_layer_names: list[str] = []
@@ -468,7 +468,7 @@ class LagunaBackend:
 
         # Expose for engine compatibility
         self.num_speculative_tokens = 0
-        model_id = getattr(vllm_config.model_config, "model", "poolside/Laguna-S-2.1-NVFP4")
+        model_id = getattr(runtime_config.model_config, "model", "poolside/Laguna-S-2.1-NVFP4")
         architecture = getattr(hf_config, "architectures", ["LagunaForCausalLM"])[0]
         # E1: no GDN layers -- Laguna has no GDN/SSM recursive state, every
         # discovered layer is a (full or sliding-window) attention layer.
@@ -560,7 +560,7 @@ class LagunaBackend:
         from runtime.model.laguna_decoder import LagunaMoESelfBuilt
 
         model = self.model
-        hf_config = self.vllm_config.model_config.hf_config
+        hf_config = self.runtime_config.model_config.hf_config
         top_k = getattr(hf_config, "num_experts_per_tok", 10)
         renormalize = getattr(hf_config, "norm_topk_prob", True)
         softcap = getattr(hf_config, "moe_router_logit_softcapping", 0.0) or 0.0

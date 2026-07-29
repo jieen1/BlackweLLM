@@ -252,7 +252,7 @@ class DFlashDraftCudaGraph:
         with bf_attn_context(self._attn_metadata_dict, self._slot_mapping_dict):
             with laguna_forward_context(
                 self._attn_metadata_dict,
-                engine.vllm_config,
+                engine.runtime_config,
                 slot_mapping=self._slot_mapping_dict,
                 skip_compiled=True,
             ):

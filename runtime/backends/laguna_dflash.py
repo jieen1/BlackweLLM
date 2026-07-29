@@ -133,7 +133,7 @@ class DFlashEngine:
     ) -> None:
         self.backend = backend
         self.device = backend.device
-        self.vllm_config = backend.vllm_config
+        self.runtime_config = backend.runtime_config
         self.block_size = backend.block_size
         self.num_slots = backend.num_slots
 
@@ -194,8 +194,8 @@ class DFlashEngine:
         draft_hf_config = load_laguna_draft_hf_config(
             model_path,
         )
-        draft_vllm_config = build_laguna_dflash_config(
-            self.vllm_config,
+        draft_runtime_config = build_laguna_dflash_config(
+            self.runtime_config,
             model=model_path,
             hf_config=draft_hf_config,
             num_speculative_tokens=NUM_SPECULATIVE_TOKENS,
@@ -206,7 +206,7 @@ class DFlashEngine:
 
         draft_model = load_laguna_dflash_draft_model(
             target_model=self.backend.model,
-            draft_vllm_config=draft_vllm_config,
+            draft_runtime_config=draft_runtime_config,
         )
 
         draft_model.eval()
@@ -231,7 +231,7 @@ class DFlashEngine:
     def _alloc_draft_kv_cache(self) -> None:
         """Allocate KV cache for the draft model's 6 SWA layers."""
         # Discover draft model's attention layers from static_forward_context
-        sfc = self.vllm_config.compilation_config.static_forward_context
+        sfc = self.runtime_config.compilation_config.static_forward_context
 
         self._draft_layer_names: list[str] = []
         self._draft_attn_layers: dict[str, Any] = {}

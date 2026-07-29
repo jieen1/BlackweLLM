@@ -159,23 +159,22 @@ def _apply_kv_cache_scale_post_load(model: torch.nn.Module) -> None:
             module._v_scale.copy_(module.v_scale.detach().to(torch.float32))
 
 
-def load_laguna_model(vllm_config: Any) -> LagunaForCausalLMSelfBuilt:
+def load_laguna_model(runtime_config: Any) -> LagunaForCausalLMSelfBuilt:
     """Construct + load a Laguna model instance without vLLM's ``get_model()``.
 
-    Caller is responsible for the ``set_current_vllm_config(vllm_config)``
-    context and distributed init, exactly as ``LagunaBackend.__init__``
-    already does around its current ``get_model()`` call -- this function
-    only replaces what happens *inside* that context.
+    Distributed initialization is performed by ``LagunaBackend`` before this
+    call. The owned model receives its configuration explicitly; it does not
+    read a global vLLM context.
     """
-    model_config = vllm_config.model_config
-    load_config = vllm_config.load_config
-    device_config = vllm_config.device_config
+    model_config = runtime_config.model_config
+    load_config = runtime_config.load_config
+    device_config = runtime_config.device_config
 
     load_device = device_config.device if load_config.device is None else load_config.device
     target_device = torch.device(load_device)
 
     with _default_torch_dtype(model_config.dtype), target_device:
-        model = LagunaForCausalLMSelfBuilt(vllm_config=vllm_config)
+        model = LagunaForCausalLMSelfBuilt(runtime_config=runtime_config)
 
         loaded_param_names = model.load_weights(_iterate_safetensors_checkpoint(model_config.model))
         _assert_all_params_loaded(model, loaded_param_names)
@@ -187,26 +186,25 @@ def load_laguna_model(vllm_config: Any) -> LagunaForCausalLMSelfBuilt:
 
 def load_laguna_dflash_draft_model(
     target_model: LagunaForCausalLMSelfBuilt,
-    draft_vllm_config: Any,
+    draft_runtime_config: Any,
 ) -> LagunaDraftForCausalLMSelfBuilt:
     """Construct + load the DFlash draft model without vLLM's ``get_model()``
     / ``load_dflash_model()``. See runtime/model/laguna_dflash_model.py's
     module docstring for the two subtle wiring details this must get right
     (attention layer naming offset, Laguna-specific context-KV projection).
 
-    Caller is responsible for the ``set_current_vllm_config(draft_vllm_config)``
-    context, exactly as ``DFlashEngine._load_draft_model`` already does
-    around its current ``load_dflash_model()`` call.
+    Distributed initialization is already complete. The draft model receives
+    its configuration explicitly and does not read a global vLLM context.
     """
-    draft_model_config = draft_vllm_config.speculative_config.draft_model_config
-    load_config = draft_vllm_config.load_config
-    device_config = draft_vllm_config.device_config
+    draft_model_config = draft_runtime_config.speculative_config.draft_model_config
+    load_config = draft_runtime_config.load_config
+    device_config = draft_runtime_config.device_config
 
     load_device = device_config.device if load_config.device is None else load_config.device
     target_device = torch.device(load_device)
 
     with _default_torch_dtype(draft_model_config.dtype), target_device:
-        model = LagunaDraftForCausalLMSelfBuilt(vllm_config=draft_vllm_config)
+        model = LagunaDraftForCausalLMSelfBuilt(runtime_config=draft_runtime_config)
 
         loaded_param_names = model.load_weights(
             _iterate_safetensors_checkpoint(draft_model_config.model)
