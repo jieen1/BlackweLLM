@@ -12,16 +12,9 @@ requires-python = ">=3.10"
 cuda = ["numpy>=2,<3", "safetensors>=0.6.2", "torch==2.11.0"]
 dev = ["pytest>=8", "ruff>=0.8"]
 serving = ["requests>=2.31", "transformers>=4.45", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
-# Still required for server/runtime to actually start, not benchmarks-only --
-# not yet reducible to that. See tests/test_vllm_dependency_boundary.py for
-# the exact, currently-approved list of files with direct vLLM imports (11 in
-# runtime/, mostly deliberate: FusedMoE (kept by explicit decision, see
-# notes/2026-07-27-vllm-complete-removal-implementation-plan.md 阶段2),
-# VocabParallelEmbedding/ParallelLMHead/LogitsProcessor/SpeculativeConfig/
-# ModelConfig (self-build deferred, same notes doc 阶段2/阶段3), plus a few
-# CUDA-op call sites (bf_attention.py's reshape_and_cache_flash,
-# laguna_cuda_graph.py/laguna_dflash_cudagraph.py) predating this effort.
-vllm-provider = ["vllm==0.26.0"]
+# Only retained for the isolated Qwen3.6 migration oracle. Laguna production
+# installs use ``cuda,serving`` and must not resolve or import vLLM.
+oracle-vllm = ["vllm==0.26.0"]
 
 [project.scripts]
 bf = "bfdiag.cli:main"
