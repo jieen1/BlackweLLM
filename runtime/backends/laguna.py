@@ -1,6 +1,6 @@
 """E3: Laguna-S-2.1 Backend — direct model.forward() without vLLM's LLM engine.
 
-Loads the model via compat_vllm.get_model(), allocates KV caches, builds
+Loads the model via runtime.model_loading.load_laguna_model() (zero vLLM get_model() dependency), allocates KV caches, builds
 SparkInfer paged attention for prefill and decode.
 drives prefill/decode forward passes directly.
 
@@ -26,9 +26,7 @@ from runtime.compat_vllm import (
     VllmConfig,
     bind_kv_cache,
     get_distributed_init_method,
-    get_model,
     get_open_port,
-    init_worker_distributed_environment,
     set_current_vllm_config,
     set_forward_context,
 )
@@ -176,10 +174,10 @@ class LagunaBackend:
         # Load model
         with set_current_vllm_config(vllm_config):
             init_method = get_distributed_init_method("127.0.0.1", get_open_port())
-            init_worker_distributed_environment(
-                vllm_config, rank=0, distributed_init_method=init_method, local_rank=0
-            )
-            self.model = get_model(vllm_config=vllm_config)
+            from runtime.laguna_config import init_laguna_distributed_environment
+            init_laguna_distributed_environment(vllm_config, init_method)
+            from runtime.model_loading import load_laguna_model
+            self.model = load_laguna_model(vllm_config)
         # Set IR op priority (fused RMSNorm C++ kernels) — normally done by worker init
         vllm_config.kernel_config.ir_op_priority.set_default()
 

@@ -180,7 +180,7 @@ class DFlashEngine:
         )
 
     def _load_draft_model(self, model_path: str | None) -> Any:
-        """Load the DFlash draft model via vLLM's load_dflash_model."""
+        """Load the DFlash draft model via self-built loader (阶段3 vLLM removal)."""
         from vllm.config import ModelConfig, SpeculativeConfig
         from vllm.config import replace as vllm_replace
 
@@ -215,13 +215,13 @@ class DFlashEngine:
             speculative_config=spec_config,
         )
 
-        # Use vLLM's load_dflash_model which handles weight sharing
-        from vllm.v1.worker.gpu.spec_decode.dflash.utils import load_dflash_model
+        # Self-built DFlash draft model loader (阶段3, vLLM removal)
+        from runtime.model_loading import load_laguna_dflash_draft_model
 
         with set_current_vllm_config(draft_vllm_config):
-            draft_model = load_dflash_model(
+            draft_model = load_laguna_dflash_draft_model(
                 target_model=self.backend.model,
-                vllm_config=draft_vllm_config,
+                draft_vllm_config=draft_vllm_config,
             )
 
         draft_model.eval()
