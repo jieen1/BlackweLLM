@@ -104,16 +104,17 @@ SUITE = _make_suite()
 # ---------------------------------------------------------------------------
 MAX_TOKENS_SHORT = 128
 MAX_TOKENS_LONG = 256
-ROUNDS = 2  # repeat each prompt for stability
+WARMUP_ROUNDS = 1
+MEASURE_ROUNDS = 3
 
-def run_suite(backend, engine, tokenizer, rounds=ROUNDS):
+def run_suite(backend, engine, tokenizer, warmup_rounds=WARMUP_ROUNDS,
+              measure_rounds=MEASURE_ROUNDS):
     import torch
     results = []
     for label, category, builder in SUITE:
         prompt_ids = builder(tokenizer)
         max_tok = MAX_TOKENS_LONG if len(prompt_ids) > 30000 else MAX_TOKENS_SHORT
-        per_round = []
-        for r in range(rounds):
+        def run_once():
             backend.reset_slot(0)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -123,28 +124,32 @@ def run_suite(backend, engine, tokenizer, rounds=ROUNDS):
             )
             torch.cuda.synchronize()
             wall = time.perf_counter() - t0
-            per_round.append({
+            return {
                 "accept": stats["acceptance_rate"],
                 "tps": stats["tokens_per_step"],
                 "tok_s": stats["tok_per_s"],
                 "wall_s": round(wall, 3),
                 "steps": stats["num_steps"],
-            })
-        # Use best round (warmest)
-        best = max(per_round, key=lambda x: x["accept"])
+            }
+
+        warmup = [run_once() for _ in range(warmup_rounds)]
+        per_round = [run_once() for _ in range(measure_rounds)]
         avg_accept = sum(x["accept"] for x in per_round) / len(per_round)
+        tok_s = sorted(x["tok_s"] for x in per_round)[len(per_round) // 2]
+        tps = sorted(x["tps"] for x in per_round)[len(per_round) // 2]
         results.append({
             "label": label,
             "category": category,
             "prompt_len": len(prompt_ids),
-            "accept": round(best["accept"], 4),
+            "accept": round(avg_accept, 4),
             "accept_avg": round(avg_accept, 4),
-            "tps": round(best["tps"], 2),
-            "tok_s": round(best["tok_s"], 1),
+            "tps": round(tps, 2),
+            "tok_s": round(tok_s, 1),
+            "warmup": warmup,
             "rounds": per_round,
         })
-        print(f"  {label:25s} [{category:9s}]  accept={best['accept']*100:5.1f}%  "
-              f"tps={best['tps']:5.2f}  tok/s={best['tok_s']:6.1f}")
+        print(f"  {label:25s} [{category:9s}]  accept={avg_accept*100:5.1f}%  "
+              f"tps={tps:5.2f}  tok/s={tok_s:6.1f}")
     return results
 
 
@@ -215,7 +220,7 @@ def main():
 
     print("=" * 80)
     print(f"DFlash Acceptance Regression  (suite v{SUITE_VERSION})")
-    print(f"Prompts: {len(SUITE)}  Rounds/prompt: {ROUNDS}")
+    print(f"Prompts: {len(SUITE)}  Warmup/measure: {WARMUP_ROUNDS}/{MEASURE_ROUNDS}")
     print("=" * 80)
 
     results = run_suite(g["backend"], g["engine"], g["tokenizer"])
@@ -235,7 +240,8 @@ def main():
     fixture = {
         "date": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "suite_version": SUITE_VERSION,
-        "rounds": ROUNDS,
+        "warmup_rounds": WARMUP_ROUNDS,
+        "measure_rounds": MEASURE_ROUNDS,
         "summary": summary,
         "results": results,
     }
