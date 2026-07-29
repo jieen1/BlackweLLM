@@ -78,6 +78,30 @@ def _direct_import_files(package: str) -> set[str]:
     }
 
 
+def _dynamic_import_files(package: str) -> set[str]:
+    """Find literal ``importlib.import_module`` / ``__import__`` bypasses."""
+    observed: set[str] = set()
+    for directory in _PRODUCTION_SOURCE_DIRECTORIES:
+        for path in (_ROOT / directory).rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in _walk_runtime_reachable(tree):
+                if not isinstance(node, ast.Call) or not node.args:
+                    continue
+                target = node.args[0]
+                if not isinstance(target, ast.Constant) or not isinstance(target.value, str):
+                    continue
+                is_import = (
+                    isinstance(node.func, ast.Name) and node.func.id == "__import__"
+                ) or (
+                    isinstance(node.func, ast.Attribute) and node.func.attr == "import_module"
+                )
+                if is_import and (
+                    target.value == package or target.value.startswith(f"{package}.")
+                ):
+                    observed.add(path.relative_to(_ROOT).as_posix())
+    return observed
+
+
 def test_vllm_direct_imports_are_an_explicit_migration_ledger() -> None:
     observed = _direct_import_files("vllm")
 
@@ -89,6 +113,10 @@ def test_vllm_direct_imports_are_an_explicit_migration_ledger() -> None:
         "A dependency was removed; update the ledger to make the reduction explicit: "
         f"stale={sorted(_APPROVED_DIRECT_IMPORT_FILES - observed)}"
     )
+
+
+def test_vllm_dynamic_imports_are_forbidden_in_production() -> None:
+    assert _dynamic_import_files("vllm") == set()
 
 
 def test_flashinfer_direct_imports_are_an_explicit_migration_ledger() -> None:
