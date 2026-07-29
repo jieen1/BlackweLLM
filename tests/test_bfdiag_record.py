@@ -244,11 +244,7 @@ def test_run_record_artifact_registers_relpath(store: RunStore, tmp_path: Path) 
 
 
 def _run_adopt_subprocess(tmp_path: Path, body: str) -> subprocess.CompletedProcess:
-    script = (
-        "import sys\n"
-        "from bfdiag.record import auto_record\n"
-        f"{body}\n"
-    )
+    script = f"import sys\nfrom bfdiag.record import auto_record\n{body}\n"
     env = dict(os.environ)
     env["QSR_BFDIAG_DIR"] = str(tmp_path / ".bfdiag")
     env["PYTHONPATH"] = str(_REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")

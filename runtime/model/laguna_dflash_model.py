@@ -82,8 +82,8 @@ that a second fused kernel isn't worth the added risk here.
 
 from __future__ import annotations
 
-import typing
 from collections.abc import Iterable
+from typing import Any
 
 import torch
 from torch import nn
@@ -94,7 +94,6 @@ from runtime.model._prefix import maybe_prefix
 from runtime.model._weight_loading import default_weight_loader
 from runtime.model.laguna_decoder import LagunaDecoderLayerSelfBuilt
 from runtime.model.plain_embedding import PlainEmbedding, PlainLMHead, PlainLogitsProcessor
-
 from runtime.model.plain_linear import PlainLinear
 
 
@@ -129,9 +128,7 @@ class LagunaDraftModelSelfBuilt(nn.Module):
         # no mask_embedding key at all (has_separate_mask_embedding stays
         # False below) -- caught via real GPU validation, not by reading
         # the vLLM source carefully enough the first time.
-        self.register_buffer(
-            "mask_embedding", torch.zeros(config.hidden_size), persistent=False
-        )
+        self.register_buffer("mask_embedding", torch.zeros(config.hidden_size), persistent=False)
         # No `has_separate_mask_embedding`-triggering tensor in the real
         # checkpoint (verified: no `mask_embedding` key in the safetensors
         # file) -- stays False, embed_input_ids falls through to the plain
@@ -139,9 +136,7 @@ class LagunaDraftModelSelfBuilt(nn.Module):
         # than deleted, matching vLLM's own conditional exactly.
         self.has_separate_mask_embedding = False
 
-        target_layer_count = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
-        )
+        target_layer_count = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.layers = nn.ModuleList(
             [
                 LagunaDecoderLayerSelfBuilt(
@@ -153,9 +148,7 @@ class LagunaDraftModelSelfBuilt(nn.Module):
                     # Offset so static_forward_context names don't collide
                     # with the target model's own layers 0..47 -- see
                     # module docstring point 1.
-                    attention_prefix=maybe_prefix(
-                        prefix, f"layers.{i + target_layer_count}"
-                    ),
+                    attention_prefix=maybe_prefix(prefix, f"layers.{i + target_layer_count}"),
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -242,8 +235,7 @@ class LagunaDraftModelSelfBuilt(nn.Module):
         )
         for attn in layers_attn[1:]:
             assert (
-                attn.rotary_emb.head_size == self._rope_head_size
-                and attn.rotary_emb.is_neox_style
+                attn.rotary_emb.head_size == self._rope_head_size and attn.rotary_emb.is_neox_style
             ), "All draft layers must share RoPE parameters for context-KV precompute"
 
         self._num_attn_layers = len(layers_attn)

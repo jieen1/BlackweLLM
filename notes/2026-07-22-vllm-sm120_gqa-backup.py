@@ -87,13 +87,12 @@ from typing import ClassVar
 import torch
 import triton
 import triton.language as tl
-
 from vllm._custom_ops import reshape_and_cache_flash
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
-from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
+from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,

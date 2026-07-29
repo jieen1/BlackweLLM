@@ -13,6 +13,9 @@ from pathlib import Path
 
 import pytest
 
+pytest.importorskip("torch")
+pytest.importorskip("safetensors")
+
 from bfdiag.checkpoint import store
 from bfdiag.checkpoint.testing import FakeBackend, FakeDFlashEngine
 
@@ -46,9 +49,10 @@ def test_save_checkpoint_writes_manifest_and_tensors(tmp_path: Path) -> None:
     assert manifest.name == "ckpt-a"
     assert manifest.slot == 0
     assert manifest.slot_kv_len == kv_len_before_baseline
-    assert manifest.slot_committed_tokens == engine.backend.slot_committed_tokens[0][
-        : kv_len_before_baseline + 1
-    ]
+    assert (
+        manifest.slot_committed_tokens
+        == engine.backend.slot_committed_tokens[0][: kv_len_before_baseline + 1]
+    )
     assert (tmp_path / "ckpt-a" / "manifest.json").exists()
     assert (tmp_path / "ckpt-a" / "tensors.safetensors").exists()
     assert manifest.size_bytes["total"] > 0

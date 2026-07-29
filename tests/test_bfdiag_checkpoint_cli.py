@@ -28,6 +28,9 @@ from typing import Any
 
 import pytest
 
+pytest.importorskip("torch")
+pytest.importorskip("safetensors")
+
 from bfdiag.checkpoint import cli, store
 from bfdiag.checkpoint.testing import FakeBackend, FakeDFlashEngine
 from bfdiag.daemon.client import Client
@@ -260,8 +263,7 @@ def test_cli_save_and_restore_round_trip_via_real_daemon(
     assert rc == 0
 
     resp = real_daemon.exec_code(
-        "result = {'kv_len': backend.slot_kv_len[0], "
-        "'committed': backend.slot_committed_tokens[0]}"
+        "result = {'kv_len': backend.slot_kv_len[0], 'committed': backend.slot_committed_tokens[0]}"
     )
     assert resp.ok, resp.error
     # Restore ran with the default verify_after=True, which -- per the

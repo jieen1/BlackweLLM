@@ -6,7 +6,12 @@ estimate table. Nothing here touches the GPU -- ``state.py`` has zero
 
 from __future__ import annotations
 
-import torch
+# Optional torch is intentionally a collection-time skip in CPU-only CI.
+# ruff: noqa: E402, I001
+
+import pytest
+
+torch = pytest.importorskip("torch")
 
 from bfdiag.checkpoint import state
 from bfdiag.checkpoint.testing import FakeBackend, FakeDFlashEngine

@@ -197,9 +197,7 @@ def test_differ_flags_the_warm_daemon_blocks_per_slot_incident() -> None:
     result = diff_records(warm, cold)
 
     assert result.comparable is False
-    assert [b.path for b in result.comparability_breaks] == [
-        "fingerprint.workload.blocks_per_slot"
-    ]
+    assert [b.path for b in result.comparability_breaks] == ["fingerprint.workload.blocks_per_slot"]
     assert "NOT COMPARABLE" in format_text(result)
 
 

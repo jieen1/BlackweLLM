@@ -49,7 +49,7 @@ import contextlib
 import json
 from collections.abc import Generator
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any
 
 import torch
 from safetensors import safe_open
@@ -57,6 +57,7 @@ from safetensors import safe_open
 from runtime.model.laguna_dflash_model import LagunaDraftForCausalLMSelfBuilt
 from runtime.model.laguna_model import LagunaForCausalLMSelfBuilt
 from runtime.model.plain_attention import SelfBuiltAttentionPlaceholder
+
 
 @contextlib.contextmanager
 def _default_torch_dtype(dtype: torch.dtype) -> Generator[None, None, None]:
@@ -176,9 +177,7 @@ def load_laguna_model(vllm_config: Any) -> LagunaForCausalLMSelfBuilt:
     with _default_torch_dtype(model_config.dtype), target_device:
         model = LagunaForCausalLMSelfBuilt(vllm_config=vllm_config)
 
-        loaded_param_names = model.load_weights(
-            _iterate_safetensors_checkpoint(model_config.model)
-        )
+        loaded_param_names = model.load_weights(_iterate_safetensors_checkpoint(model_config.model))
         _assert_all_params_loaded(model, loaded_param_names)
 
         _apply_kv_cache_scale_post_load(model)

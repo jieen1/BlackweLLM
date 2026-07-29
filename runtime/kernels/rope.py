@@ -225,9 +225,7 @@ def compute_cos_sin_cache_yarn(
     inv_freq_mask = (
         1 - _yarn_linear_ramp_mask(low, high, rotary_dim // 2, torch.float, device)
     ) * extrapolation_factor
-    inv_freq = (
-        inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
-    )
+    inv_freq = inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
 
     t = torch.arange(original_max_position * scaling_factor, dtype=torch.float32, device=device)
     freqs = torch.einsum("i,j -> ij", t, inv_freq)

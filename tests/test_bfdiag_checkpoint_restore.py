@@ -16,12 +16,18 @@ fakes -- no GPU, no real ``runtime.*`` import.
 
 from __future__ import annotations
 
+# Optional tensor persistence dependencies are intentionally collection-time
+# skips in the CPU-only CI environment.
+# ruff: noqa: E402, I001
+
 import json
 from pathlib import Path
 
 import pytest
-import torch
-from safetensors.torch import load_file, save_file
+
+torch = pytest.importorskip("torch")
+pytest.importorskip("safetensors.torch")
+from safetensors.torch import load_file, save_file  # noqa: E402
 
 from bfdiag.checkpoint import restore, state, store, verify
 from bfdiag.checkpoint.testing import FakeBackend, FakeDFlashEngine

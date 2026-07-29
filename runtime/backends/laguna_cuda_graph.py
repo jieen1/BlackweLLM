@@ -4,6 +4,7 @@ SparkInfer's decode graph mode captures the metadata rebuild kernel IN the graph
 Per-step cost: GPU int32 writes (cache_seqlens + page_table on boundary) + replay.
 No CPU plan, no H2D copies, no Python dispatch per step.
 """
+
 from __future__ import annotations
 
 import logging
@@ -12,16 +13,17 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from runtime.kernels.fused_kv_scatter import fused_kv_scatter
-from runtime.kernels.cg_decode_metadata import write_laguna_b1_decode_metadata
-
 from bfdiag.invariants import checks as bfdiag_checks
+from runtime.kernels.cg_decode_metadata import write_laguna_b1_decode_metadata
+from runtime.kernels.fused_kv_scatter import fused_kv_scatter
 
 if TYPE_CHECKING:
     from runtime.backends.laguna import LagunaBackend
 
 from runtime.backends.bf_attention import bf_attn_context
+
 logger = logging.getLogger("qwen_sm120_runtime.laguna_cuda_graph")
+
 
 def _debug_swa_align_gran() -> int:
     """QSR_DEBUG_SWA_ALIGN_GRANULARITY: diagnostic-only override for the SWA
@@ -34,12 +36,14 @@ def _debug_swa_align_gran() -> int:
     """
     return int(os.environ.get("QSR_DEBUG_SWA_ALIGN_GRANULARITY", "0"))
 
+
 def _physical_slot(slot: int) -> int:
     return slot  # RESERVED_PHYSICAL_SLOTS = 0
 
 
 class SparkinferDecodeCGMetadata:
     """Metadata for CG decode: references pre-created sparkinfer decode workspace."""
+
     __slots__ = ("workspace", "num_actual_tokens", "window_left")
 
     def __init__(self, workspace, num_actual_tokens: int, window_left: int = -1):
@@ -97,9 +101,7 @@ class LagunaCudaGraphDecode:
         # Default only for the exact Laguna B=1 layout (one full-attention
         # group plus one SWA group).  Set QSR_B1_METADATA_FASTPATH=0 to
         # restore scalar metadata writes while diagnosing a regression.
-        self._b1_metadata_fastpath_enabled = os.environ.get(
-            "QSR_B1_METADATA_FASTPATH", "1"
-        ) != "0"
+        self._b1_metadata_fastpath_enabled = os.environ.get("QSR_B1_METADATA_FASTPATH", "1") != "0"
         self._b1_metadata_values_cpu: torch.Tensor | None = None
         self._b1_metadata_values_gpu: torch.Tensor | None = None
         self._b1_full_group: tuple | None = None
@@ -111,9 +113,9 @@ class LagunaCudaGraphDecode:
         # older implementation; initialize newly introduced state lazily so
         # the hot-reload path never requires a model reload.
         if not hasattr(self, "_b1_metadata_values_gpu"):
-            self._b1_metadata_fastpath_enabled = os.environ.get(
-                "QSR_B1_METADATA_FASTPATH", "1"
-            ) != "0"
+            self._b1_metadata_fastpath_enabled = (
+                os.environ.get("QSR_B1_METADATA_FASTPATH", "1") != "0"
+            )
             self._b1_metadata_values_cpu = None
             self._b1_metadata_values_gpu = None
             self._b1_full_group = None
@@ -124,12 +126,12 @@ class LagunaCudaGraphDecode:
             return True
 
         full_groups = [
-            key for key in self._decode_workspaces
+            key
+            for key in self._decode_workspaces
             if not (key[0] >= 0 and self._ring_blocks_per_slot > 0)
         ]
         swa_groups = [
-            key for key in self._decode_workspaces
-            if key[0] >= 0 and self._ring_blocks_per_slot > 0
+            key for key in self._decode_workspaces if key[0] >= 0 and self._ring_blocks_per_slot > 0
         ]
         if len(full_groups) != 1 or len(swa_groups) != 1:
             return False
@@ -157,18 +159,25 @@ class LagunaCudaGraphDecode:
                 max_pages = self.blocks_per_slot + 16  # margin for generated tokens
 
             ws = SparkinferDecodeWorkspace(
-                num_q_heads=nqh, num_kv_heads=nkvh, head_dim=128,
-                max_pages=max_pages, window_left=wl, device=str(self.device),
-                page_size=self.block_size)
+                num_q_heads=nqh,
+                num_kv_heads=nkvh,
+                head_dim=128,
+                max_pages=max_pages,
+                window_left=wl,
+                device=str(self.device),
+                page_size=self.block_size,
+            )
 
             self._decode_workspaces[group_key] = ws
             self._page_tables[group_key] = ws.page_table
             self._cache_seqlens[group_key] = ws.cache_seqlens
             self._cg_metadata[group_key] = SparkinferDecodeCGMetadata(
-                workspace=ws, num_actual_tokens=bs, window_left=wl)
+                workspace=ws, num_actual_tokens=bs, window_left=wl
+            )
 
-            logger.info("CG decode workspace: wl=%d qh=%d kvh=%d max_pages=%d",
-                        wl, nqh, nkvh, max_pages)
+            logger.info(
+                "CG decode workspace: wl=%d qh=%d kvh=%d max_pages=%d", wl, nqh, nkvh, max_pages
+            )
 
     def _bind_kv_caches(self) -> None:
         """Bind real KV cache tensors to workspaces (before capture)."""
@@ -176,8 +185,6 @@ class LagunaCudaGraphDecode:
         sfc = backend.static_forward_context
 
         for group_key, ws in self._decode_workspaces.items():
-            wl = group_key[0]
-            is_swa = wl >= 0 and self._ring_blocks_per_slot > 0
             # Use first layer in group to get KV cache
             first_name = backend._layer_groups[group_key][0]
             layer = sfc[first_name]
@@ -229,7 +236,8 @@ class LagunaCudaGraphDecode:
                         self._prev_n_blocks[i] = n_blocks
                         pt = self._page_tables[group_key]
                         pt[0, :n_blocks] = torch.arange(
-                            base, base + n_blocks, dtype=torch.int32, device=self.device)
+                            base, base + n_blocks, dtype=torch.int32, device=self.device
+                        )
                     self._cache_seqlens[group_key][i] = new_kv
                     pos = kv_lengths[i]
                     self._slot_mapping[i] = (base + pos // ps) * ps + pos % ps
@@ -306,7 +314,8 @@ class LagunaCudaGraphDecode:
                 if n_blocks != self._prev_n_blocks[0]:
                     self._prev_n_blocks[0] = n_blocks
                     self._page_tables[group_key][0, :n_blocks] = torch.arange(
-                        base, base + n_blocks, dtype=torch.int32, device=self.device)
+                        base, base + n_blocks, dtype=torch.int32, device=self.device
+                    )
                 self._cache_seqlens[group_key][0] = new_kv
                 self._slot_mapping[0] = base * ps + kv_len
             else:
@@ -363,7 +372,6 @@ class LagunaCudaGraphDecode:
                 ring_block = (actual % ring_slots) // ps
                 page_table[0, index] = ring_base + ring_block
 
-
     def _build_metadata_and_forward(self) -> torch.Tensor:
         """Build sparkinfer CG metadata and run forward."""
         from runtime.laguna_runtime import laguna_forward_context
@@ -385,8 +393,10 @@ class LagunaCudaGraphDecode:
 
         with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
             with laguna_forward_context(
-                attn_metadata_dict, backend.vllm_config,
-                slot_mapping=slot_mapping_dict, skip_compiled=True,
+                attn_metadata_dict,
+                backend.vllm_config,
+                slot_mapping=slot_mapping_dict,
+                skip_compiled=True,
             ):
                 result = backend.model.forward(self._input_ids[:bs], self._positions[:bs])
 
@@ -454,7 +464,7 @@ class LagunaCudaGraphDecode:
         sfc = backend.static_forward_context
 
         # Save original impls for prefill restore
-        if not hasattr(self, '_original_impls'):
+        if not hasattr(self, "_original_impls"):
             self._original_impls = {}
             for group_key, layer_names in backend._layer_groups.items():
                 for name in layer_names:
@@ -469,7 +479,7 @@ class LagunaCudaGraphDecode:
 
     def unpatch_impls(self) -> None:
         """Restore original attention impls (for prefill after CG capture)."""
-        if not hasattr(self, '_original_impls'):
+        if not hasattr(self, "_original_impls"):
             return
         sfc = self.backend.static_forward_context
         for name, impl in self._original_impls.items():
@@ -548,7 +558,7 @@ class _SparkinferCGDecodeImpl:
         self.num_heads = workspace.num_q_heads
         self.head_size = workspace.head_dim
         self.num_kv_heads = workspace.num_kv_heads
-        self.scale = workspace.head_dim ** -0.5
+        self.scale = workspace.head_dim**-0.5
         self.kv_cache_dtype = "fp8_e4m3"
         self.supports_quant_query_input = False
 
@@ -561,8 +571,18 @@ class _SparkinferCGDecodeImpl:
         v_cache = kv_cache[1].view(torch.float8_e4m3fn)
         fused_kv_scatter(key, value, k_cache, v_cache, slot_mapping, layer._k_scale, layer._v_scale)
 
-    def forward(self, layer, query, key, value, kv_cache, attn_metadata,
-                output, output_scale=None, output_block_scale=None):
+    def forward(
+        self,
+        layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output,
+        output_scale=None,
+        output_block_scale=None,
+    ):
         """Run sparkinfer decode attention (captured in CG)."""
         num_actual_tokens = attn_metadata.num_actual_tokens
         q = query[:num_actual_tokens]
@@ -598,7 +618,7 @@ class LagunaCudaGraphVerify:
     the extend kernel reads the runtime metadata inside a fixed query worklist.
     """
 
-    def __init__(self, backend: "LagunaBackend", num_tokens: int = 16) -> None:
+    def __init__(self, backend: LagunaBackend, num_tokens: int = 16) -> None:
         self.backend = backend
         self.num_tokens = num_tokens
         self.device = backend.device
@@ -631,8 +651,8 @@ class LagunaCudaGraphVerify:
 
     def _init_workspaces(self) -> None:
         """Create sparkinfer extend workspaces per layer group (CG mode)."""
-        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
         from sparkinfer.attention.paged.planner import create_paged_plan
+        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
 
         backend = self.backend
         nt = self.num_tokens
@@ -648,14 +668,16 @@ class LagunaCudaGraphVerify:
 
             # Dummy tensors for workspace creation
             q = torch.zeros(nt, nqh, 128, dtype=torch.bfloat16, device=self.device)
-            k_cache = torch.zeros(max_pages, self.block_size, nkvh, 128,
-                                  dtype=torch.float8_e4m3fn, device=self.device)
-            v_cache = torch.zeros(max_pages, self.block_size, nkvh, 128,
-                                  dtype=torch.float8_e4m3fn, device=self.device)
+            k_cache = torch.zeros(
+                max_pages, self.block_size, nkvh, 128, dtype=torch.float8_e4m3fn, device=self.device
+            )
+            v_cache = torch.zeros(
+                max_pages, self.block_size, nkvh, 128, dtype=torch.float8_e4m3fn, device=self.device
+            )
 
             ws = PagedAttentionWorkspace.for_tensors(
-                mode="verify", q=q, k_cache=k_cache, v_cache=v_cache,
-                use_cuda_graph=True)
+                mode="verify", q=q, k_cache=k_cache, v_cache=v_cache, use_cuda_graph=True
+            )
 
             # Create CG-compatible plan at max context
             max_kv = max_pages * self.block_size - 1
@@ -663,8 +685,16 @@ class LagunaCudaGraphVerify:
             cache_seqlens = torch.tensor([max_kv], dtype=torch.int32, device=self.device)
 
             plan = create_paged_plan(
-                q, k_cache, v_cache, page_table, cache_seqlens, self._cu_seqlens_q,
-                mode="verify", enable_cuda_graph=True, window_left=wl)
+                q,
+                k_cache,
+                v_cache,
+                page_table,
+                cache_seqlens,
+                self._cu_seqlens_q,
+                mode="verify",
+                enable_cuda_graph=True,
+                window_left=wl,
+            )
             ws._ensure_capacity(plan)
             ws._copy_runtime_metadata(page_table, cache_seqlens, self._cu_seqlens_q)
             ws._copy_plan_metadata(plan)
@@ -674,8 +704,9 @@ class LagunaCudaGraphVerify:
             self._page_tables[group_key] = page_table
             self._cache_seqlens[group_key] = cache_seqlens
 
-            logger.info("CG verify workspace: wl=%d qh=%d kvh=%d max_pages=%d",
-                        wl, nqh, nkvh, max_pages)
+            logger.info(
+                "CG verify workspace: wl=%d qh=%d kvh=%d max_pages=%d", wl, nqh, nkvh, max_pages
+            )
 
     def _bind_kv_caches(self) -> None:
         """Bind real KV cache tensors to workspaces."""
@@ -683,8 +714,6 @@ class LagunaCudaGraphVerify:
         sfc = backend.static_forward_context
 
         for group_key, ws in self._extend_workspaces.items():
-            wl = group_key[0]
-            is_swa = wl >= 0 and self._ring_blocks_per_slot > 0
             first_name = backend._layer_groups[group_key][0]
             layer = sfc[first_name]
             kv_cache = layer.kv_cache
@@ -700,7 +729,7 @@ class LagunaCudaGraphVerify:
         backend = self.backend
         sfc = backend.static_forward_context
 
-        if not hasattr(self, '_original_impls'):
+        if not hasattr(self, "_original_impls"):
             self._original_impls = {}
             for group_key, layer_names in backend._layer_groups.items():
                 for name in layer_names:
@@ -714,7 +743,7 @@ class LagunaCudaGraphVerify:
 
     def unpatch_impls(self) -> None:
         """Restore original attention impls."""
-        if not hasattr(self, '_original_impls'):
+        if not hasattr(self, "_original_impls"):
             return
         sfc = self.backend.static_forward_context
         for name, impl in self._original_impls.items():
@@ -734,7 +763,6 @@ class LagunaCudaGraphVerify:
         ~40ms of actual GPU kernel time. See notes/2026-07-27-dflash-
         profiling-and-optimization.md.
         """
-        backend = self.backend
         nt = self.num_tokens
         bs = self.block_size
         phys = _physical_slot(slot)
@@ -765,8 +793,11 @@ class LagunaCudaGraphVerify:
                 n_ring = min(-(-aligned_len // bs), self._ring_blocks_per_slot)
                 pt = self._page_tables[group_key]
                 block_starts = torch.arange(
-                    aligned_start, aligned_start + n_ring * bs, bs,
-                    dtype=torch.long, device=self.device,
+                    aligned_start,
+                    aligned_start + n_ring * bs,
+                    bs,
+                    dtype=torch.long,
+                    device=self.device,
                 )
                 pt[0, :n_ring] = (ring_base + (block_starts % ring_slots) // bs).to(pt.dtype)
                 self._cache_seqlens[group_key][0] = aligned_len
@@ -798,7 +829,8 @@ class LagunaCudaGraphVerify:
                 self._page_tables[group_key],
                 self._cache_seqlens[group_key],
                 self._cu_seqlens_q,
-                window_left=wl)
+                window_left=wl,
+            )
 
     def capture(self) -> None:
         """Warmup → capture the verify forward."""
@@ -807,8 +839,6 @@ class LagunaCudaGraphVerify:
 
         backend = self.backend
         nt = self.num_tokens
-        sfc = backend.static_forward_context
-
         logger.info("Capturing Laguna Verify CUDA Graph (M=%d, sparkinfer extend)", nt)
 
         self._init_workspaces()
@@ -844,14 +874,16 @@ class LagunaCudaGraphVerify:
                 self._fill_buffers(0, dummy_tokens, warmup_kv)
                 with bf_attn_context(attn_meta, slot_mapping_dict):
                     with laguna_forward_context(
-                        attn_meta, backend.vllm_config,
-                        slot_mapping=slot_mapping_dict, skip_compiled=True,
+                        attn_meta,
+                        backend.vllm_config,
+                        slot_mapping=slot_mapping_dict,
+                        skip_compiled=True,
                     ):
                         result = backend.model.forward(self._input_ids, self._positions)
                 if isinstance(result, tuple):
-                    hidden_states, aux = result
+                    hidden_states, _aux = result
                 else:
-                    hidden_states, aux = result, None
+                    hidden_states, _aux = result, None
                 backend.model.compute_logits(hidden_states)
         side_stream.synchronize()
 
@@ -862,8 +894,10 @@ class LagunaCudaGraphVerify:
         with torch.cuda.graph(graph):
             with bf_attn_context(attn_meta, slot_mapping_dict):
                 with laguna_forward_context(
-                    attn_meta, backend.vllm_config,
-                    slot_mapping=slot_mapping_dict, skip_compiled=True,
+                    attn_meta,
+                    backend.vllm_config,
+                    slot_mapping=slot_mapping_dict,
+                    skip_compiled=True,
                 ):
                     result = backend.model.forward(self._input_ids, self._positions)
             if isinstance(result, tuple):
@@ -899,19 +933,30 @@ class LagunaCudaGraphVerify:
         ):
             self._aux_dump_done = True
             dump_path = os.environ.get("QSR_DEBUG_AUX_DUMP_PATH")
-            torch.save({
-                "kv_len": kv_len, "block_size": self.block_size,
-                "aux": [t.float().clone().cpu() for t in self._aux_hidden_states],
-            }, dump_path)
-            logger.warning("AUX_DUMP saved kv_len=%d bs=%d n_layers=%d to %s",
-                            kv_len, self.block_size, len(self._aux_hidden_states), dump_path)
+            torch.save(
+                {
+                    "kv_len": kv_len,
+                    "block_size": self.block_size,
+                    "aux": [t.float().clone().cpu() for t in self._aux_hidden_states],
+                },
+                dump_path,
+            )
+            logger.warning(
+                "AUX_DUMP saved kv_len=%d bs=%d n_layers=%d to %s",
+                kv_len,
+                self.block_size,
+                len(self._aux_hidden_states),
+                dump_path,
+            )
 
         return self._logits, self._aux_hidden_states
 
 
 class _SparkinferCGExtendMetadata:
     """Lightweight metadata for CG extend impl."""
+
     __slots__ = ("workspace", "num_actual_tokens")
+
     def __init__(self, workspace, num_actual_tokens: int):
         self.workspace = workspace
         self.num_actual_tokens = num_actual_tokens
@@ -946,8 +991,18 @@ class _SparkinferCGExtendImpl:
         k_cache[block_idx, block_off] = (key / layer._k_scale).to(torch.float8_e4m3fn)
         v_cache[block_idx, block_off] = (value / layer._v_scale).to(torch.float8_e4m3fn)
 
-    def forward(self, layer, query, key, value, kv_cache, attn_metadata,
-                output, output_scale=None, output_block_scale=None):
+    def forward(
+        self,
+        layer,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output,
+        output_scale=None,
+        output_block_scale=None,
+    ):
         if attn_metadata is None:
             return output.fill_(0)
         num_actual_tokens = attn_metadata.num_actual_tokens
@@ -959,6 +1014,7 @@ class _SparkinferCGExtendImpl:
         out = output[:num_actual_tokens]
 
         from runtime.backends.laguna_sparkinfer_attn import _paged_descale
+
         if self._k_descale is None:
             self._k_descale = _paged_descale(
                 layer._k_scale,
@@ -971,16 +1027,20 @@ class _SparkinferCGExtendImpl:
                 num_kv_heads=int(value_cache.shape[2]),
             ).clone()
         else:
-            self._k_descale.copy_(_paged_descale(
-                layer._k_scale,
-                batch_size=1,
-                num_kv_heads=int(key_cache.shape[2]),
-            ))
-            self._v_descale.copy_(_paged_descale(
-                layer._v_scale,
-                batch_size=1,
-                num_kv_heads=int(value_cache.shape[2]),
-            ))
+            self._k_descale.copy_(
+                _paged_descale(
+                    layer._k_scale,
+                    batch_size=1,
+                    num_kv_heads=int(key_cache.shape[2]),
+                )
+            )
+            self._v_descale.copy_(
+                _paged_descale(
+                    layer._v_scale,
+                    batch_size=1,
+                    num_kv_heads=int(value_cache.shape[2]),
+                )
+            )
 
         # Model warmup forwards allocate fresh Q/output tensors.  The binding
         # holds their raw addresses, so caching the first warmup binding makes
@@ -997,10 +1057,17 @@ class _SparkinferCGExtendImpl:
             from sparkinfer.attention.paged._scratch import build_paged_attention_binding
 
             self._binding = build_paged_attention_binding(
-                scratch=self._ws, q=q, k_cache=key_cache, v_cache=value_cache,
-                output=out, k_descale=self._k_descale, v_descale=self._v_descale)
+                scratch=self._ws,
+                q=q,
+                k_cache=key_cache,
+                v_cache=value_cache,
+                output=out,
+                k_descale=self._k_descale,
+                v_descale=self._v_descale,
+            )
             self._binding_signature = binding_signature
 
         from sparkinfer.attention.paged._forward import paged_attention_forward
+
         paged_attention_forward(binding=self._binding)
         return output

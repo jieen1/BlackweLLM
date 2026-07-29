@@ -1,5 +1,8 @@
 """Comprehensive acceptance rate sweep across diverse prompts."""
-import time, torch, json, hashlib
+# ``bf exec`` injects these runtime objects into the script namespace.
+# They are intentionally not importable module globals.
+# ruff: noqa: F821
+import time, torch
 
 SLOT = 0
 MAX_TOKENS = 128

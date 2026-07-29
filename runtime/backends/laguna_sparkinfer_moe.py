@@ -19,6 +19,7 @@ Performance (SM120, E=256, K=3072, I=1024, top_k=10):
   - CUDA graph: ~38μs/layer → 1.8ms for 47 layers
   - vs CUTLASS eager: ~186μs/layer → 8.73ms for 47 layers
 """
+
 from __future__ import annotations
 
 import json
@@ -67,22 +68,22 @@ except ImportError as exc:
 
 # Remove cutlass-dsl base_dsl from sys.path — it contains a torch.py
 # that shadows the real torch module in spawned subprocesses.
-sys.path[:] = [
-    p for p in sys.path
-    if "nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl" not in p
-]
+sys.path[:] = [p for p in sys.path if "nvidia_cutlass_dsl/dsl_packages/cutlass/base_dsl" not in p]
 
 
 def sparkinfer_version() -> str:
     """Return sparkinfer git commit sha for version stamping."""
     try:
         import sparkinfer
+
         pkg_dir = pathlib.Path(sparkinfer.__file__).parent
         git_dir = pkg_dir.parent / ".git"
         if git_dir.exists():
             result = subprocess.run(
                 ["git", "-C", str(git_dir.parent), "rev-parse", "--short", "HEAD"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             if result.returncode == 0:
                 return result.stdout.strip()
@@ -150,9 +151,13 @@ def load_moe_layer_weights(
         result[f"{name}_sf"] = torch.stack(
             [tensors[f"{prefix}.{e}.{proj}.weight_scale"] for e in range(NUM_EXPERTS)]
         ).to(device)
-        result[f"{name}_gs"] = torch.stack(
-            [tensors[f"{prefix}.{e}.{proj}.weight_global_scale"] for e in range(NUM_EXPERTS)]
-        ).to(device).float()
+        result[f"{name}_gs"] = (
+            torch.stack(
+                [tensors[f"{prefix}.{e}.{proj}.weight_global_scale"] for e in range(NUM_EXPERTS)]
+            )
+            .to(device)
+            .float()
+        )
     return result
 
 
@@ -271,17 +276,25 @@ def prepare_sparkinfer_layer(
         a2_gscale_t = a2_gscale
 
     wplan = plan_sparkinfer_fp4_moe_weights(
-        quant_modes="nvfp4", source_format="modelopt_nvfp4",
-        activation="silu", params_dtype=torch.bfloat16,
-        num_experts=num_experts, hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE, w13_layout="w13",
+        quant_modes="nvfp4",
+        source_format="modelopt_nvfp4",
+        activation="silu",
+        params_dtype=torch.bfloat16,
+        num_experts=num_experts,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        w13_layout="w13",
     )
     return prepare_sparkinfer_fp4_moe_weights(
         plan=wplan,
-        w1_global_scale=w1_alpha, w2_global_scale=w2_alpha,
-        w1_fp4=w13_fp4, w1_blockscale=w13_sf,
-        w2_fp4=raw["down_w"].clone().contiguous(), w2_blockscale=down_sf_sw,
-        a1_gscale=a1_gscale_t, a2_gscale=a2_gscale_t,
+        w1_global_scale=w1_alpha,
+        w2_global_scale=w2_alpha,
+        w1_fp4=w13_fp4,
+        w1_blockscale=w13_sf,
+        w2_fp4=raw["down_w"].clone().contiguous(),
+        w2_blockscale=down_sf_sw,
+        a1_gscale=a1_gscale_t,
+        a2_gscale=a2_gscale_t,
         params_dtype=torch.bfloat16,
     )
 
@@ -347,9 +360,14 @@ class SparkinferMoELayer:
     ) -> torch.Tensor:
         out = self._output_arena.acquire(hidden)
         binding = build_tp_moe_fp4_binding(
-            scratch=self.workspace, a=hidden, experts=self.experts,
-            topk_weights=topk_weights, topk_ids=topk_ids.to(torch.int32),
-            quant_mode="nvfp4", input_scales_static=True, output=out,
+            scratch=self.workspace,
+            a=hidden,
+            experts=self.experts,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids.to(torch.int32),
+            quant_mode="nvfp4",
+            input_scales_static=True,
+            output=out,
         )
         return sparkinfer_moe_fp4(binding=binding)
 
@@ -373,7 +391,8 @@ class SparkinferMoEModel:
         self.version = sparkinfer_version()
         logger.info(
             "SparkinferMoEModel init: %d layers, sparkinfer@%s",
-            len(self.layer_ids), self.version,
+            len(self.layer_ids),
+            self.version,
         )
 
     def load_layer(self, layer_idx: int) -> SparkinferMoELayer:
@@ -394,11 +413,14 @@ class SparkinferMoEModel:
         total = time.time() - t0
         logger.info(
             "All %d MoE layers loaded in %.1fs (%.1fs/layer)",
-            len(self.layer_ids), total, total / len(self.layer_ids),
+            len(self.layer_ids),
+            total,
+            total / len(self.layer_ids),
         )
 
     def forward_layer(
-        self, layer_idx: int,
+        self,
+        layer_idx: int,
         hidden: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,

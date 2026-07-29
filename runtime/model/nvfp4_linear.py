@@ -208,9 +208,7 @@ class NvFp4Linear(nn.Module):
 
     # -- Weight loading -----------------------------------------------------
 
-    def load_shard(
-        self, param_name: str, loaded_weight: torch.Tensor, shard_idx: int = 0
-    ) -> None:
+    def load_shard(self, param_name: str, loaded_weight: torch.Tensor, shard_idx: int = 0) -> None:
         """Copy one checkpoint tensor into the right slice of a physical param.
 
         ``param_name`` in {"weight_packed", "weight_scale",
@@ -303,9 +301,7 @@ class NvFp4Linear(nn.Module):
         self.weight_scale = nn.Parameter(
             swizzle_blockscale(self.weight_scale.data), requires_grad=False
         )
-        padded_weight, weights_padding_bytes = pad_nvfp4_weight_for_cutlass(
-            self.weight_packed.data
-        )
+        padded_weight, weights_padding_bytes = pad_nvfp4_weight_for_cutlass(self.weight_packed.data)
         # Rename to match the GEMM call site below (no functional
         # difference from keeping "weight_packed" -- named "weight" only
         # because that's what forward() reads; vLLM's rename step existed
@@ -319,9 +315,7 @@ class NvFp4Linear(nn.Module):
     # -- Forward --------------------------------------------------------------
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        assert self._processed, (
-            "NvFp4Linear.forward called before process_weights_after_loading"
-        )
+        assert self._processed, "NvFp4Linear.forward called before process_weights_after_loading"
         from runtime.nvfp4_custom_gemm import custom_scaled_fp4_mm
 
         output_dtype = x.dtype

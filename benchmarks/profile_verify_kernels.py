@@ -1,5 +1,7 @@
 """Kernel-level profile of verify forward."""
-import torch, time
+# ``bf exec`` injects the live daemon objects used by this benchmark.
+# ruff: noqa: F821
+import torch
 
 # Setup
 ids = tokenizer.encode("The quick brown fox jumps over the lazy dog. " * 50000, add_special_tokens=False)[:65536]

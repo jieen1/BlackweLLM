@@ -466,14 +466,17 @@ class LagunaEngineProvider:
         self.reset()
         importlib.invalidate_caches()
         modules = {
-            name: importlib.reload(importlib.import_module(name))
-            for name in HOT_RELOAD_MODULES
+            name: importlib.reload(importlib.import_module(name)) for name in HOT_RELOAD_MODULES
         }
 
         rebound: list[str] = []
-        if _rebind_instance_class(self._backend, modules["runtime.backends.laguna"].LagunaBackend, "backend"):
+        if _rebind_instance_class(
+            self._backend, modules["runtime.backends.laguna"].LagunaBackend, "backend"
+        ):
             rebound.append("backend")
-        if _rebind_instance_class(self._engine, modules["runtime.backends.laguna_dflash"].DFlashEngine, "engine"):
+        if _rebind_instance_class(
+            self._engine, modules["runtime.backends.laguna_dflash"].DFlashEngine, "engine"
+        ):
             rebound.append("engine")
         if _rebind_instance_class(
             getattr(self._backend, "_decode_cg", None),
@@ -511,14 +514,20 @@ class LagunaEngineProvider:
         self.reset()
         after = self.generate(DEFAULT_CANARY_PROMPT_IDS, DEFAULT_CANARY_STEPS)
         if after != before:
-            mismatch = next(index for index, pair in enumerate(zip(before, after)) if pair[0] != pair[1])
+            mismatch = next(
+                index for index, pair in enumerate(zip(before, after)) if pair[0] != pair[1]
+            )
             raise RuntimeError(
                 "hot reload canary mismatch at token "
                 f"{mismatch}: before={before[mismatch]}, after={after[mismatch]}; "
                 "daemon remains loaded but must not be used for performance claims"
             )
         self.reset()
-        return {"modules": list(HOT_RELOAD_MODULES), "rebound": rebound, "canary_tokens": len(after)}
+        return {
+            "modules": list(HOT_RELOAD_MODULES),
+            "rebound": rebound,
+            "canary_tokens": len(after),
+        }
 
     def describe(self) -> dict[str, Any]:
         return {

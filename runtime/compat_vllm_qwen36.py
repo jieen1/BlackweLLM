@@ -33,6 +33,22 @@ anything (``runtime/metadata_builders.py``, ``runtime/cuda_graphs.py``,
 
 from __future__ import annotations
 
+import torch
+
+# ---------------------------------------------------------------------------
+# Re-exported: FLA chunk index helpers (GDN/Mamba linear-attention kernel
+# support -- runtime/metadata_builders.py). Not vLLM itself but an
+# upstream package vLLM's GDN code also depends on; Laguna has no GDN/
+# linear-attention layers, so this dependency is qwen36-exclusive too.
+# ---------------------------------------------------------------------------
+from fla.ops.utils.index import prepare_chunk_indices, prepare_chunk_offsets  # noqa: F401
+
+# ---------------------------------------------------------------------------
+# Re-exported: FLA chunk index helpers (GDN/Mamba linear-attention kernel
+# support -- runtime/metadata_builders.py). Not vLLM itself but an
+# upstream package vLLM's GDN code also depends on; Laguna has no GDN/
+# linear-attention layers, so this dependency is qwen36-exclusive too.
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Re-exported: SM120GQAMetadata / GDNAttentionMetadata (vLLM dataclasses,
 # isinstance-sensitive in vLLM's own GDN linear-attention layer code --
@@ -44,22 +60,17 @@ from __future__ import annotations
 # does duck-typed attribute access), but it's kept re-exported here
 # anyway since qwen36 is out of scope for re-evaluating this.
 # ---------------------------------------------------------------------------
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
-from vllm.v1.attention.backends.sm120_gqa import SM120GQAMetadata
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # Re-exported: attention backend registry (DirectModelRunner's own
 # SM120GQABackend registration -- runtime/direct_model_runner.py)
 # ---------------------------------------------------------------------------
-from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
-
-# ---------------------------------------------------------------------------
-# Re-exported: FLA chunk index helpers (GDN/Mamba linear-attention kernel
-# support -- runtime/metadata_builders.py). Not vLLM itself but an
-# upstream package vLLM's GDN code also depends on; Laguna has no GDN/
-# linear-attention layers, so this dependency is qwen36-exclusive too.
-# ---------------------------------------------------------------------------
-from fla.ops.utils.index import prepare_chunk_indices, prepare_chunk_offsets
+from vllm.v1.attention.backends.registry import (  # noqa: F401
+    AttentionBackendEnum,
+    register_backend,
+)
+from vllm.v1.attention.backends.sm120_gqa import SM120GQAMetadata  # noqa: F401
 
 FLA_CHUNK_SIZE: int = 64
 
@@ -72,8 +83,6 @@ FLA_CHUNK_SIZE: int = 64
 # 纯计算：numpy + torch tensor ops，零 vLLM 依赖。
 # 2026-07-22 实测验证 bit-exact。
 # ---------------------------------------------------------------------------
-
-import torch
 
 _PAD_SLOT_ID = -1
 

@@ -74,13 +74,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from runtime.kernels.fused_rms_norm import TritonRMSNorm
-# Module-level RoPE cache sharing: layers with identical (rotary_dim,
-# max_position, rope_type, rope_theta) share ONE cos_sin_cache tensor.
-# vLLM's get_model() does this implicitly via its RotaryEmbedding registry;
-# the self-built path must do it explicitly to avoid 54 separate allocations
-# (2.84 GB waste at 262144 positions).
-_ROPE_CACHE_REGISTRY: dict[tuple, torch.Tensor] = {}
-
 from runtime.kernels.rope import (
     SelfBuiltRotaryEmbedding,
     compute_cos_sin_cache_default,
@@ -89,6 +82,14 @@ from runtime.kernels.rope import (
 from runtime.model._prefix import maybe_prefix
 from runtime.model.plain_attention import SelfBuiltAttentionPlaceholder
 from runtime.model.plain_linear import PlainLinear
+
+# Module-level RoPE cache sharing: layers with identical (rotary_dim,
+# max_position, rope_type, rope_theta) share ONE cos_sin_cache tensor.
+# vLLM's get_model() does this implicitly via its RotaryEmbedding registry;
+# the self-built path must do it explicitly to avoid 54 separate allocations
+# (2.84 GB waste at 262144 positions).
+_ROPE_CACHE_REGISTRY: dict[tuple, torch.Tensor] = {}
+
 
 def _extract_layer_index(layer_name: str) -> int:
     """Narrowed port of vLLM's ``extract_layer_index`` (vllm/model_
@@ -128,9 +129,7 @@ class LagunaMLPSelfBuilt(nn.Module):
         self.up_proj = PlainLinear(hidden_size, intermediate_size, bias=False)
         self.down_proj = PlainLinear(intermediate_size, hidden_size, bias=False)
         if hidden_act != "silu":
-            raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported."
-            )
+            raise ValueError(f"Unsupported activation: {hidden_act}. Only silu is supported.")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj(x)
@@ -163,9 +162,7 @@ class LagunaMoESelfBuilt(nn.Module):
         self.config = config
         self.num_experts = config.num_experts
         self.top_k = config.num_experts_per_tok
-        self.routed_scaling_factor = float(
-            getattr(config, "moe_routed_scaling_factor", 1.0)
-        )
+        self.routed_scaling_factor = float(getattr(config, "moe_routed_scaling_factor", 1.0))
 
         # Router gate -- plain BF16 (checkpoint: "ignore": [..., "re:.*\\.mlp\\.gate$"]).
         self.gate = PlainLinear(config.hidden_size, config.num_experts, bias=False)
@@ -258,14 +255,10 @@ class LagunaAttentionSelfBuilt(nn.Module):
 
         sinks = None
         if attention_sink:
-            self.sink = torch.nn.Parameter(
-                torch.empty(self.num_heads, requires_grad=False)
-            )
+            self.sink = torch.nn.Parameter(torch.empty(self.num_heads, requires_grad=False))
             sinks = self.sink
 
-        layer_type = (
-            layer_types[layer_idx] if layer_types is not None else "full_attention"
-        )
+        layer_type = layer_types[layer_idx] if layer_types is not None else "full_attention"
         is_sliding = layer_type == "sliding_attention"
 
         top_rope = getattr(config, "rope_parameters", None) or {}
@@ -294,9 +287,14 @@ class LagunaAttentionSelfBuilt(nn.Module):
         rope_device = torch.empty(0).device
         # Build a cache key for RoPE sharing across layers
         if rope_scaling_type == "yarn":
-            _cache_key = ("yarn", rotary_dim, rope_base,
-                          rope_params["original_max_position_embeddings"],
-                          rope_params["factor"], max_position_embeddings)
+            _cache_key = (
+                "yarn",
+                rotary_dim,
+                rope_base,
+                rope_params["original_max_position_embeddings"],
+                rope_params["factor"],
+                max_position_embeddings,
+            )
         elif rope_scaling_type == "default":
             _cache_key = ("default", rotary_dim, rope_base, max_position_embeddings)
         else:
@@ -421,12 +419,8 @@ class LagunaDecoderLayerSelfBuilt(nn.Module):
             layer_idx = _extract_layer_index(prefix)
 
         layer_types = getattr(config, "layer_types", None)
-        is_sliding = (
-            layer_types is not None and layer_types[layer_idx] == "sliding_attention"
-        )
-        attention_sink = is_sliding and getattr(
-            config, "swa_attention_sink_enabled", False
-        )
+        is_sliding = layer_types is not None and layer_types[layer_idx] == "sliding_attention"
+        attention_sink = is_sliding and getattr(config, "swa_attention_sink_enabled", False)
 
         per_layer_heads = getattr(config, "num_attention_heads_per_layer", None)
         layer_num_heads = (
@@ -454,9 +448,7 @@ class LagunaDecoderLayerSelfBuilt(nn.Module):
             ),
         )
 
-        mlp_only_layers = (
-            [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
-        )
+        mlp_only_layers = [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers
         self.is_moe_layer = (
             (layer_idx not in mlp_only_layers)
             and (config.num_experts > 0)
@@ -479,9 +471,7 @@ class LagunaDecoderLayerSelfBuilt(nn.Module):
             )
 
         self.input_layernorm = TritonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = TritonRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.post_attention_layernorm = TritonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,

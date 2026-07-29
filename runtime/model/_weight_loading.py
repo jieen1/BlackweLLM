@@ -23,8 +23,7 @@ def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> N
         param.data.copy_(loaded_weight.view(param.shape))
     else:
         assert param.size() == loaded_weight.size(), (
-            f"Attempted to load weight ({loaded_weight.size()}) "
-            f"into parameter ({param.size()})"
+            f"Attempted to load weight ({loaded_weight.size()}) into parameter ({param.size()})"
         )
         param.data.copy_(loaded_weight)
 

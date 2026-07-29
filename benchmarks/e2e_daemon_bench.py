@@ -12,6 +12,8 @@ Measures:
 
 Saves results to benchmarks/fixtures/e2e_daemon_bench_<date>.json
 """
+# ``bf exec`` injects the live daemon objects used by this benchmark.
+# ruff: noqa: F821
 import json, time, os, statistics
 from datetime import datetime
 

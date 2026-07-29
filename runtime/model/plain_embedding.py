@@ -100,7 +100,7 @@ class PlainLMHead(nn.Module):
         )
         param.data.copy_(loaded_weight)
 
-    def tie_weights(self, embed_tokens: PlainEmbedding) -> "PlainLMHead":
+    def tie_weights(self, embed_tokens: PlainEmbedding) -> PlainLMHead:
         """Object-reference tie, matching vLLM's UnquantizedEmbeddingMethod.
         tie_weights exactly: `layer.weight = embed_tokens.weight` (same
         Parameter object, not a copy)."""

@@ -60,8 +60,8 @@ handoff note in this phase's final report. Do not wire this into
 
 from __future__ import annotations
 
-import typing
 from collections.abc import Iterable
+from typing import Any
 
 import torch
 from torch import nn
@@ -69,7 +69,6 @@ from torch import nn
 from runtime.kernels.fused_rms_norm import TritonRMSNorm
 from runtime.model._prefix import maybe_prefix as _maybe_prefix
 from runtime.model._weight_loading import default_weight_loader, remap_kv_scale_name
-
 from runtime.model.laguna_decoder import LagunaDecoderLayerSelfBuilt
 from runtime.model.plain_embedding import PlainEmbedding, PlainLMHead, PlainLogitsProcessor
 
@@ -155,17 +154,13 @@ class LagunaModelSelfBuilt(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        hidden_states = (
-            inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
-        )
+        hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_tokens(input_ids)
         residual = None
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
-            self._maybe_add_hidden_state(
-                aux_hidden_states, layer_idx + 1, hidden_states, residual
-            )
+            self._maybe_add_hidden_state(aux_hidden_states, layer_idx + 1, hidden_states, residual)
 
         hidden_states, _ = self.norm(hidden_states, residual)
         if len(aux_hidden_states) > 0:
@@ -234,9 +229,7 @@ class LagunaModelSelfBuilt(nn.Module):
                 if param is not None:
                     layer_heads_per_rank = param.shape[0]
                     layer_head_start = tp_rank * layer_heads_per_rank
-                    narrow_weight = loaded_weight.narrow(
-                        0, layer_head_start, layer_heads_per_rank
-                    )
+                    narrow_weight = loaded_weight.narrow(0, layer_head_start, layer_heads_per_rank)
                     param.data.copy_(narrow_weight)
                     loaded_params.add(name)
                 continue

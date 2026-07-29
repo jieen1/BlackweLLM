@@ -179,7 +179,7 @@ def test_swa_attention_call_shapes_and_diagnostics():
 
 
 def test_empty_tensors_shapes_and_dtypes():
-    import torch
+    torch = pytest.importorskip("torch")
 
     from bfdiag.shapes.attention import full_attention_call
 
@@ -207,6 +207,8 @@ def test_empty_tensors_shapes_and_dtypes():
 
 
 def test_empty_tensors_refuses_cuda():
+    pytest.importorskip("torch")
+
     from bfdiag.shapes.attention import full_attention_call
 
     call = full_attention_call(

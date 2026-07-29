@@ -22,6 +22,7 @@ import torch
 
 from bfdiag.trace import ring as bfdiag_trace
 from bfprobe.routing import capture_routing
+from runtime.backends.bf_attention import bf_attn_context
 from runtime.block_pool import ChunkedPrefillState
 from runtime.compat_vllm import (
     VllmConfig,
@@ -31,7 +32,6 @@ from runtime.compat_vllm import (
     set_current_vllm_config,
     set_forward_context,
 )
-from runtime.backends.bf_attention import bf_attn_context
 from runtime.logprobs import compute_logprobs
 from runtime.model_spec import ModelSpec
 from runtime.sampling import SamplingParams, make_generator, sample_from_logits
@@ -481,9 +481,14 @@ class LagunaBackend:
         run formula this replaces). Patches each MoE layer's forward to:
         router → sparkinfer → shared.
         """
+        from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
+        from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+            fused_topk_bias,
+        )
+
         from runtime.backends.laguna_sparkinfer_moe import (
-            SparkinferMoEOutputArena,
             SparkinferMoELayer,
+            SparkinferMoEOutputArena,
             _find_checkpoint,
             load_moe_layer_activation_gscales,
             load_moe_layer_e_score_correction_bias,
@@ -492,10 +497,6 @@ class LagunaBackend:
             sparkinfer_version,
         )
         from runtime.model.laguna_decoder import LagunaMoESelfBuilt
-        from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
-        from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
-            fused_topk_bias,
-        )
 
         model = self.model
         hf_config = self.vllm_config.model_config.hf_config
@@ -739,7 +740,9 @@ class LagunaBackend:
             causal=True,
         )
 
-    def _build_sparkinfer_metadata(self, common_meta, window_left: int = -1, mode: str | None = None):
+    def _build_sparkinfer_metadata(
+        self, common_meta, window_left: int = -1, mode: str | None = None
+    ):
         """Convert CommonAttentionMetadata to SparkinferAttnMetadata."""
         from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
 
@@ -911,7 +914,6 @@ class LagunaBackend:
         common_meta = self._build_common_attn_metadata(slot_ids, kv_lengths, qo_lens, is_decode)
 
         # Build sparkinfer attention metadata per group
-        from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
 
         attn_metadata_dict: dict[str, Any] = {}
         slot_mapping_dict: dict[str, torch.Tensor] = {}
@@ -1027,8 +1029,15 @@ class LagunaBackend:
             logger.warning(
                 "CHUNK_CHECK chunk=%d bs=%d ring[%d:%d)->scratch[0:%d) status=%s "
                 "max_abs_diff=%.6g n_mismatch=%d/%d",
-                chunk_idx, bs, abs_start, abs_start + count, count, status,
-                max_abs_diff, n_mismatch, len(sample_positions),
+                chunk_idx,
+                bs,
+                abs_start,
+                abs_start + count,
+                count,
+                status,
+                max_abs_diff,
+                n_mismatch,
+                len(sample_positions),
             )
 
     def _debug_check_scratch_to_ring_copy(
@@ -1072,8 +1081,15 @@ class LagunaBackend:
             logger.warning(
                 "CHUNK_CHECK chunk=%d bs=%d scratch[%d:%d)->ring[%d:%d) status=%s "
                 "max_abs_diff=%.6g n_mismatch=%d/%d",
-                chunk_idx, bs, scratch_start, scratch_start + count,
-                abs_start, abs_start + count, status, max_abs_diff, n_mismatch,
+                chunk_idx,
+                bs,
+                scratch_start,
+                scratch_start + count,
+                abs_start,
+                abs_start + count,
+                status,
+                max_abs_diff,
+                n_mismatch,
                 len(sample_positions),
             )
 
@@ -1207,7 +1223,6 @@ class LagunaBackend:
         absolute kv_length; SWA layers use relative positions in scratch.
         """
         sfc = self.static_forward_context
-        bs = self.block_size
         chunk_tokens = self._prefill_chunk_tokens
         prompt_len = len(prompt_ids)
         window = self._swa_window
@@ -1382,7 +1397,11 @@ class LagunaBackend:
                 if debug_chunk_check:
                     logger.warning(
                         "CHUNK_CHECK chunk=%d bs=%d chunk_start=%d chunk_end=%d overlap=%d",
-                        _chunk_idx, self.block_size, chunk_start, chunk_end, overlap,
+                        _chunk_idx,
+                        self.block_size,
+                        chunk_start,
+                        chunk_end,
+                        overlap,
                     )
 
                 # Rebind SWA to scratch for this chunk
@@ -1455,8 +1474,6 @@ class LagunaBackend:
             self._fill_decode_buffers(slot_ids, token_ids, kv_lengths)
 
         common_meta = self._build_common_attn_metadata(slot_ids, kv_lengths, qo_lens, is_decode)
-
-        from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
 
         attn_metadata_dict: dict[str, Any] = {}
         slot_mapping_dict: dict[str, torch.Tensor] = {}
@@ -1653,8 +1670,9 @@ class LagunaBackend:
         already-constructed instances. We must also rebind each instance's
         _forward_method after the class-level patch.
         """
-        from runtime.kernels.fused_rms_norm import fused_add_rms_norm, rms_norm
         from vllm.model_executor.layers.layernorm import RMSNorm
+
+        from runtime.kernels.fused_rms_norm import fused_add_rms_norm, rms_norm
 
         def _triton_forward(self_norm, x, residual=None):
             if residual is None:
@@ -1892,8 +1910,6 @@ class LagunaBackend:
             # Short suffix: single chunk with scratch
             sfc = self.static_forward_context
             window = self._swa_window
-            bs = self.block_size
-
             # Copy overlap from ring to scratch
             overlap = min(window, start_pos)
             if overlap > 0:

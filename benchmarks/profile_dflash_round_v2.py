@@ -1,4 +1,6 @@
 """Profile one DFlash round: where does time go?"""
+# ``bf exec`` injects the live daemon objects used by this benchmark.
+# ruff: noqa: F821
 import torch, time
 
 # Warm up with a short prompt
@@ -89,17 +91,17 @@ t_next_draft = time.perf_counter() - t6
 
 total_round = t_verify + t_accept + t_ctx_kv + t_next_draft
 print(f"\n{'='*60}")
-print(f"DFlash Round Profile (64K context)")
+print("DFlash Round Profile (64K context)")
 print(f"{'='*60}")
 print(f"  Prefill (64K):       {t_prefill*1000:8.1f} ms")
 print(f"  Draft KV precompute: {t_precompute*1000:8.1f} ms")
 print(f"  Initial draft:       {t_draft*1000:8.1f} ms")
-print(f"  ---")
+print("  ---")
 print(f"  Verify (M=16):       {t_verify*1000:8.1f} ms  ({t_verify/total_round*100:.0f}%)")
 print(f"  Accept/reject:       {t_accept*1000:8.1f} ms  ({t_accept/total_round*100:.0f}%)")
 print(f"  Context KV update:   {t_ctx_kv*1000:8.1f} ms  ({t_ctx_kv/total_round*100:.0f}%)")
 print(f"  Next draft:          {t_next_draft*1000:8.1f} ms  ({t_next_draft/total_round*100:.0f}%)")
-print(f"  ---")
+print("  ---")
 print(f"  ROUND TOTAL:         {total_round*1000:8.1f} ms")
 print(f"  Accepted this round: {decision['num_accepted']}/15")
 print(f"  Effective tok/s:     {(decision['num_accepted']+1)/total_round:.1f}")

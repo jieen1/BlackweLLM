@@ -27,7 +27,9 @@ def test_historical_m1_prompt_is_fixed_and_repeating():
     prompt = historical_m1_prompt_ids(205)
     assert prompt[:4] == [1000, 1001, 1002, 1003]
     assert prompt[99:102] == [1099, 1000, 1001]
-    assert len(historical_m1_prompt_ids(HISTORICAL_M1_CONTEXT_TOKENS)) == HISTORICAL_M1_CONTEXT_TOKENS
+    assert (
+        len(historical_m1_prompt_ids(HISTORICAL_M1_CONTEXT_TOKENS)) == HISTORICAL_M1_CONTEXT_TOKENS
+    )
     assert len(historical_m1_prompt_ids(HISTORICAL_M1_SUFFIX_TOKENS)) == HISTORICAL_M1_SUFFIX_TOKENS
 
 
@@ -44,7 +46,9 @@ def test_historical_dflash_prompt_is_tokenizer_derived_and_fixed_length():
             return [41, 42, 43]
 
     assert historical_dflash_m16_prompt_ids(Tokenizer(), 8) == [41, 42, 43, 41, 42, 43, 41, 42]
-    assert len(historical_dflash_m16_prompt_ids(Tokenizer())) == HISTORICAL_DFLASH_M16_CONTEXT_TOKENS
+    assert (
+        len(historical_dflash_m16_prompt_ids(Tokenizer())) == HISTORICAL_DFLASH_M16_CONTEXT_TOKENS
+    )
 
 
 def test_historical_dflash_prompt_rejects_invalid_length_or_empty_encoding():

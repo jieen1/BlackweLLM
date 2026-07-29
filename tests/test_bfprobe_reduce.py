@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import math
 
-import numpy as np
 import pytest
 
+np = pytest.importorskip("numpy")
 torch = pytest.importorskip("torch")
 
 from bfprobe.reduce import (  # noqa: E402

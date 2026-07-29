@@ -10,8 +10,12 @@ validate the comparator's logic, and none of these tests import torch.
 
 from __future__ import annotations
 
-import numpy as np
+# Numpy is an optional probe dependency in the CPU-only CI environment.
+# ruff: noqa: E402, I001
+
 import pytest
+
+np = pytest.importorskip("numpy")
 
 from bfprobe.routing_compare import LayerTokenCoord, compare_routing
 

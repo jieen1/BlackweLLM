@@ -4,6 +4,7 @@ Eliminates per-layer kernel overhead in CUDA Graph capture:
   Old: slot_mapping//bs → slot_mapping%bs → key/scale → .to(fp8) → scatterK → scatterV
   New: single fused kernel per layer
 """
+
 import torch
 import triton
 import triton.language as tl
@@ -11,13 +12,23 @@ import triton.language as tl
 
 @triton.jit
 def _fused_kv_scatter_kernel(
-    key_ptr, value_ptr,
-    k_cache_ptr, v_cache_ptr,
+    key_ptr,
+    value_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
     slot_mapping_ptr,
-    k_scale_ptr, v_scale_ptr,
-    stride_kt, stride_kh, stride_kd,
-    stride_vt, stride_vh, stride_vd,
-    stride_cb, stride_cs, stride_chh, stride_cdd,
+    k_scale_ptr,
+    v_scale_ptr,
+    stride_kt,
+    stride_kh,
+    stride_kd,
+    stride_vt,
+    stride_vh,
+    stride_vd,
+    stride_cb,
+    stride_cs,
+    stride_chh,
+    stride_cdd,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
     block_size: tl.constexpr,
@@ -43,11 +54,13 @@ def _fused_kv_scatter_kernel(
 
     k_val = tl.load(
         key_ptr + pid * stride_kt + hid * stride_kh + offs_d * stride_kd,
-        mask=mask_d, other=0.0,
+        mask=mask_d,
+        other=0.0,
     ).to(tl.float32)
     v_val = tl.load(
         value_ptr + pid * stride_vt + hid * stride_vh + offs_d * stride_vd,
-        mask=mask_d, other=0.0,
+        mask=mask_d,
+        other=0.0,
     ).to(tl.float32)
 
     k_fp8 = (k_val / k_scale).to(tl.float8e4nv)
@@ -56,11 +69,13 @@ def _fused_kv_scatter_kernel(
     cache_base = block_idx * stride_cb + block_off * stride_cs + hid * stride_chh
     tl.store(
         k_cache_ptr + cache_base + offs_d * stride_cdd,
-        k_fp8, mask=mask_d,
+        k_fp8,
+        mask=mask_d,
     )
     tl.store(
         v_cache_ptr + cache_base + offs_d * stride_cdd,
-        v_fp8, mask=mask_d,
+        v_fp8,
+        mask=mask_d,
     )
 
 
@@ -91,13 +106,23 @@ def fused_kv_scatter(
     BLOCK_D = triton.next_power_of_2(head_dim)
 
     _fused_kv_scatter_kernel[(num_tokens, num_kv_heads)](
-        key, value,
-        k_cache, v_cache,
+        key,
+        value,
+        k_cache,
+        v_cache,
         slot_mapping,
-        k_scale, v_scale,
-        key.stride(0), key.stride(1), key.stride(2),
-        value.stride(0), value.stride(1), value.stride(2),
-        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
+        k_scale,
+        v_scale,
+        key.stride(0),
+        key.stride(1),
+        key.stride(2),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        k_cache.stride(3),
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         block_size=block_size,

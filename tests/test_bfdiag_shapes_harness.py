@@ -8,8 +8,12 @@ to CPU, which would hide the mistake instead of surfacing it).
 
 from __future__ import annotations
 
+# Optional torch is intentionally a collection-time skip in CPU-only CI.
+# ruff: noqa: E402, I001
+
 import pytest
-import torch
+
+torch = pytest.importorskip("torch")
 
 from bfdiag.shapes.harness import (
     empty_from_shapes,

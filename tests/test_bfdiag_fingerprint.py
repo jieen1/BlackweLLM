@@ -72,9 +72,7 @@ def test_capture_git_repo_dirty_checkout(tmp_path: Path) -> None:
 
 def test_capture_git_never_raises_when_all_repos_missing(tmp_path: Path) -> None:
     missing = str(tmp_path / "does-not-exist")
-    result = fingerprint.capture_git(
-        {"qwen-sm120-runtime": missing, "sparkinfer": missing}
-    )
+    result = fingerprint.capture_git({"qwen-sm120-runtime": missing, "sparkinfer": missing})
     assert set(result) == {"qwen-sm120-runtime", "sparkinfer"}
     for info in result.values():
         assert info.sha is None
@@ -84,9 +82,7 @@ def test_capture_git_never_raises_when_all_repos_missing(tmp_path: Path) -> None
 def test_capture_git_honors_env_overrides(tmp_path: Path, monkeypatch) -> None:
     _init_repo(tmp_path)
     monkeypatch.setenv("QSR_REPO_SPARKINFER", str(tmp_path))
-    result = fingerprint.capture_git(
-        {"qwen-sm120-runtime": "/no/such/path"}
-    )
+    result = fingerprint.capture_git({"qwen-sm120-runtime": "/no/such/path"})
     assert result["sparkinfer"].sha is not None
 
 

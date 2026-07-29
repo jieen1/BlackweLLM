@@ -1,4 +1,5 @@
 """Small fused metadata update for Laguna's B=1 decode CUDA graph path."""
+
 from __future__ import annotations
 
 import torch
@@ -35,7 +36,10 @@ def _write_b1_decode_metadata(
     aligned_start = (window_start // block_size) * block_size
     tl.store(swa_cache_seqlens, new_kv - aligned_start)
     ring_position = kv_len % ring_slots
-    tl.store(swa_slot_mapping, (swa_ring_base + ring_position // block_size) * block_size + ring_position % block_size)
+    tl.store(
+        swa_slot_mapping,
+        (swa_ring_base + ring_position // block_size) * block_size + ring_position % block_size,
+    )
 
 
 def write_laguna_b1_decode_metadata(

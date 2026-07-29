@@ -117,6 +117,7 @@ import typing
 import torch
 from torch import nn
 
+
 class SelfBuiltAttentionPlaceholder(nn.Module):
     """TP=1 replacement for constructing a real ``vllm.model_executor.
     layers.attention.Attention`` instance. See module docstring for the
@@ -129,7 +130,7 @@ class SelfBuiltAttentionPlaceholder(nn.Module):
         head_size: int,
         scale: float,
         num_kv_heads: int,
-        cache_config: CacheConfig,
+        cache_config: typing.Any,
         quant_config: typing.Any,
         per_layer_sliding_window: int | None = None,
         prefix: str = "",
@@ -210,12 +211,8 @@ class SelfBuiltAttentionPlaceholder(nn.Module):
             # remapped to model.layers.N.self_attn.attn.{k,v}_scale by
             # vLLM's existing maybe_remap_kv_scale_name -- untouched,
             # still in use from runtime/model/laguna_model.py).
-            self.k_scale = nn.Parameter(
-                torch.ones(1, dtype=torch.float32), requires_grad=False
-            )
-            self.v_scale = nn.Parameter(
-                torch.ones(1, dtype=torch.float32), requires_grad=False
-            )
+            self.k_scale = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+            self.v_scale = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
 
     def get_attn_backend(self) -> None:
         """Never called -- duck-typed marker only. laguna.py's and

@@ -5,6 +5,7 @@ keeps its exact prompt construction, load-time geometry, reset sequence, and
 metric names in one reviewable place so ``bf diff`` can reject accidental
 apples-to-oranges comparisons.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -73,7 +74,9 @@ def historical_m1_prompt_ids(length: int) -> list[int]:
     return (chunk * ((length + len(chunk) - 1) // len(chunk)))[:length]
 
 
-def historical_dflash_m16_prompt_ids(tokenizer: Any, length: int = HISTORICAL_DFLASH_M16_CONTEXT_TOKENS) -> list[int]:
+def historical_dflash_m16_prompt_ids(
+    tokenizer: Any, length: int = HISTORICAL_DFLASH_M16_CONTEXT_TOKENS
+) -> list[int]:
     """Build the frozen tokenizer-derived DFlash prompt at an exact length."""
     if length < 0:
         raise ValueError("length must be non-negative")
@@ -108,9 +111,7 @@ def historical_dflash_prefix_prompt_ids(tokenizer: Any) -> tuple[list[int], list
 
 
 def _token_ids_hash(token_ids: list[int]) -> str:
-    return hashlib.sha256(
-        bytes().join(token.to_bytes(4, "little") for token in token_ids)
-    ).hexdigest()
+    return hashlib.sha256(b"".join(token.to_bytes(4, "little") for token in token_ids)).hexdigest()
 
 
 def reset_dflash_workload_state(engine: Any) -> None:
@@ -165,10 +166,11 @@ def check_dflash_server_step_parity(
                 ),
                 min(len(whole_tokens), len(stepped_tokens)),
             )
+            whole_token = whole_tokens[mismatch] if mismatch < len(whole_tokens) else None
+            stepped_token = stepped_tokens[mismatch] if mismatch < len(stepped_tokens) else None
             raise AssertionError(
                 "DFlash server-step parity diverged at token "
-                f"{mismatch}: whole={whole_tokens[mismatch] if mismatch < len(whole_tokens) else None} "
-                f"step={stepped_tokens[mismatch] if mismatch < len(stepped_tokens) else None}"
+                f"{mismatch}: whole={whole_token} step={stepped_token}"
             )
         return {"tokens": len(stepped_tokens), "parity": True}
     finally:
@@ -263,10 +265,19 @@ def check_dflash_verify_cg_parity(
                     ),
                     min(len(captured_decisions), len(eager_decisions)),
                 )
+                captured_decision = (
+                    captured_decisions[mismatch_step]
+                    if mismatch_step < len(captured_decisions)
+                    else None
+                )
+                eager_decision = (
+                    eager_decisions[mismatch_step]
+                    if mismatch_step < len(eager_decisions)
+                    else None
+                )
                 raise AssertionError(
                     "DFlash captured/eager verify parity diverged at step "
-                    f"{mismatch_step}: captured={captured_decisions[mismatch_step] if mismatch_step < len(captured_decisions) else None} "
-                    f"eager={eager_decisions[mismatch_step] if mismatch_step < len(eager_decisions) else None}"
+                    f"{mismatch_step}: captured={captured_decision} eager={eager_decision}"
                 )
             run_id = rec.run_id
     finally:
@@ -343,8 +354,7 @@ def diagnose_dflash_verify_cg_divergence(
         reset_dflash_workload_state(engine)
 
     shared_state = all(
-        captured[name] == eager[name]
-        for name in ("history", "kv_len", "anchor", "draft_tokens")
+        captured[name] == eager[name] for name in ("history", "kv_len", "anchor", "draft_tokens")
     )
     if not shared_state:
         raise AssertionError("DFlash paths diverged before the requested diagnostic step")
@@ -354,7 +364,9 @@ def diagnose_dflash_verify_cg_divergence(
     eager_top1 = eager["logits"].argmax(dim=-1)
     top1_mismatch = (captured_top1 != eager_top1).nonzero().flatten().tolist()
     aux_report = []
-    for index, (captured_aux, eager_aux) in enumerate(zip(captured["aux"] or [], eager["aux"] or [])):
+    for index, (captured_aux, eager_aux) in enumerate(
+        zip(captured["aux"] or [], eager["aux"] or [])
+    ):
         delta = captured_aux - eager_aux
         aux_report.append(
             {
@@ -467,9 +479,7 @@ def run_historical_m1_decode_cg(
                 "max_model_len": HISTORICAL_M1_MAX_MODEL_LEN,
                 "dflash": False,
                 "prefix_cache": False,
-                "b1_metadata_fastpath": bool(
-                    getattr(cg, "_b1_metadata_fastpath_enabled", False)
-                ),
+                "b1_metadata_fastpath": bool(getattr(cg, "_b1_metadata_fastpath_enabled", False)),
             },
         ) as rec:
             for index in range(rounds):
@@ -566,7 +576,9 @@ def profile_historical_m1_decode_cg(
             artifacts = default_store().artifacts_dir(rec.run_id)
             artifacts.mkdir(parents=True, exist_ok=True)
             table_path = artifacts / "cuda_profile.txt"
-            table_path.write_text(profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=80))
+            table_path.write_text(
+                profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=80)
+            )
             trace_path = artifacts / "cuda_profile.json"
             profiler.export_chrome_trace(str(trace_path))
             rec.artifact("cuda_profile_table", table_path)
@@ -701,9 +713,7 @@ def run_historical_dflash_m16(
                 while len(tokens) < max_tokens:
                     torch.cuda.synchronize()
                     step_start = time.perf_counter()
-                    decision = engine.dflash_round(
-                        0, state["anchor"], state["draft_tokens"]
-                    )
+                    decision = engine.dflash_round(0, state["anchor"], state["draft_tokens"])
                     torch.cuda.synchronize()
                     step_times_s.append(time.perf_counter() - step_start)
 
@@ -773,8 +783,6 @@ def profile_historical_dflash_m16(
     if warmup_rounds < 0:
         raise ValueError("warmup_rounds must be non-negative")
 
-    import torch
-
     backend = engine.backend
     expected = {
         "block_size": HISTORICAL_DFLASH_PREFIX_BLOCK_SIZE,
@@ -792,6 +800,8 @@ def profile_historical_dflash_m16(
                 f"{HISTORICAL_DFLASH_M16_CONTRACT} profiler requires {name}={value}, "
                 f"got {actual[name]}"
             )
+
+    import torch
 
     prompt_ids = historical_dflash_m16_prompt_ids(tokenizer)
     prompt_hash = _token_ids_hash(prompt_ids)
@@ -958,13 +968,19 @@ def profile_rms_norm_m16(
                 launch_fused(fused_out, residual_out, warps)
             torch.cuda.synchronize()
 
-            rms_start, rms_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            rms_start, rms_end = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
             rms_start.record()
             for _ in range(iterations):
                 launch_rms(rms_out, warps)
             rms_end.record()
 
-            fused_start, fused_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            fused_start, fused_end = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
             fused_start.record()
             for _ in range(iterations):
                 launch_fused(fused_out, residual_out, warps)
@@ -981,11 +997,14 @@ def profile_rms_norm_m16(
                 "fused_relative_rmse": relative_rmse(fused_out, fused_reference),
                 "residual_relative_rmse": relative_rmse(residual_out, residual_reference),
             }
-            if max(
-                result["rms_relative_rmse"],
-                result["fused_relative_rmse"],
-                result["residual_relative_rmse"],
-            ) > 1e-3:
+            if (
+                max(
+                    result["rms_relative_rmse"],
+                    result["fused_relative_rmse"],
+                    result["residual_relative_rmse"],
+                )
+                > 1e-3
+            ):
                 raise RuntimeError(f"RMSNorm numerical gate failed for num_warps={warps}: {result}")
             results.append(result)
             for name, value in result.items():
@@ -1033,8 +1052,7 @@ def run_historical_dflash_prefix_cache_m16(
     for name, value in expected.items():
         if actual[name] != value:
             raise ValueError(
-                f"{HISTORICAL_DFLASH_PREFIX_CONTRACT} requires {name}={value}, "
-                f"got {actual[name]}"
+                f"{HISTORICAL_DFLASH_PREFIX_CONTRACT} requires {name}={value}, got {actual[name]}"
             )
 
     base_ids, full_ids = historical_dflash_prefix_prompt_ids(tokenizer)
@@ -1079,7 +1097,8 @@ def run_historical_dflash_prefix_cache_m16(
             for scenario in ("cold", "warm"):
                 if scenario == "cold":
                     # Archived script reset before each cold round.
-                    setup = lambda: reset_dflash_workload_state(engine)
+                    def setup() -> None:
+                        reset_dflash_workload_state(engine)
                 else:
                     # Archived script populated the prefix once then retained
                     # target and draft KV for all warm rounds.
@@ -1092,7 +1111,9 @@ def run_historical_dflash_prefix_cache_m16(
                         enable_prefix_cache=True,
                     )
                     torch.cuda.synchronize()
-                    setup = lambda: None
+
+                    def setup() -> None:
+                        pass
 
                 for index in range(rounds):
                     setup()

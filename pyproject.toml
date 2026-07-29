@@ -47,6 +47,10 @@ select = ["E", "F", "I", "UP"]
 # (runtime/, server/, loader/, model/, oracle/).
 "benchmarks/*" = ["E401", "E402", "E501", "E701", "E702", "E722", "E741", "I001", "F841"]
 "tests/debug/*" = ["E401", "E402", "E501", "E701", "E702", "E722", "E741", "I001", "F841"]
+# Historical vLLM source snapshots are retained as investigation evidence,
+# not maintained production modules. Keep their lint gate limited to rules
+# that can catch accidental undefined names or syntax errors.
+"notes/2026-07-22-vllm-sm120_gqa-backup.py" = ["E501", "I001"]
 
 [tool.setuptools.packages.find]
 include = [
