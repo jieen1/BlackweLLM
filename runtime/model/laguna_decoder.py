@@ -74,6 +74,13 @@ import torch.nn.functional as F
 from torch import nn
 
 from runtime.kernels.fused_rms_norm import TritonRMSNorm
+# Module-level RoPE cache sharing: layers with identical (rotary_dim,
+# max_position, rope_type, rope_theta) share ONE cos_sin_cache tensor.
+# vLLM's get_model() does this implicitly via its RotaryEmbedding registry;
+# the self-built path must do it explicitly to avoid 54 separate allocations
+# (2.84 GB waste at 262144 positions).
+_ROPE_CACHE_REGISTRY: dict[tuple, torch.Tensor] = {}
+
 from runtime.kernels.rope import (
     SelfBuiltRotaryEmbedding,
     compute_cos_sin_cache_default,
@@ -293,7 +300,19 @@ class LagunaAttentionSelfBuilt(nn.Module):
         rotary_dim = int(self.head_dim * partial_rotary_factor)
         rope_dtype = torch.get_default_dtype()
         rope_device = torch.empty(0).device
+        # Build a cache key for RoPE sharing across layers
         if rope_scaling_type == "yarn":
+            _cache_key = ("yarn", rotary_dim, rope_base,
+                          rope_params["original_max_position_embeddings"],
+                          rope_params["factor"], max_position_embeddings)
+        elif rope_scaling_type == "default":
+            _cache_key = ("default", rotary_dim, rope_base, max_position_embeddings)
+        else:
+            _cache_key = None
+
+        if _cache_key is not None and _cache_key in _ROPE_CACHE_REGISTRY:
+            cos_sin_cache = _ROPE_CACHE_REGISTRY[_cache_key]
+        elif rope_scaling_type == "yarn":
             cos_sin_cache = compute_cos_sin_cache_yarn(
                 rotary_dim=rotary_dim,
                 original_max_position=rope_params["original_max_position_embeddings"],
@@ -322,6 +341,8 @@ class LagunaAttentionSelfBuilt(nn.Module):
                 "(sliding_attention layers, draft model) and 'yarn' "
                 "(full_attention layers), verified against the real checkpoint."
             )
+        if _cache_key is not None:
+            _ROPE_CACHE_REGISTRY[_cache_key] = cos_sin_cache
         self.rotary_emb = SelfBuiltRotaryEmbedding(
             head_size=self.head_dim, cos_sin_cache=cos_sin_cache, is_neox_style=True
         )
