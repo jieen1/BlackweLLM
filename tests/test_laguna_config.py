@@ -9,6 +9,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from runtime.laguna_config import (
+    LagunaRuntimeConfig,
     SelfBuiltCacheConfig,
     SelfBuiltCompilationConfig,
     SelfBuiltDeviceConfig,
@@ -17,14 +18,13 @@ from runtime.laguna_config import (
     SelfBuiltModelConfig,
     SelfBuiltParallelConfig,
     SelfBuiltQuantConfig,
-    SelfBuiltVllmConfig,
     build_laguna_config,
     build_laguna_dflash_config,
     load_laguna_draft_hf_config,
 )
 
 
-def _runtime_config() -> SelfBuiltVllmConfig:
+def _runtime_config() -> LagunaRuntimeConfig:
     model_config = SelfBuiltModelConfig(
         hf_config=SimpleNamespace(hidden_size=3072, vocab_size=151936, num_hidden_layers=48),
         dtype=torch.bfloat16,
@@ -37,7 +37,7 @@ def _runtime_config() -> SelfBuiltVllmConfig:
         tokenizer_mode="slow",
         seed=17,
     )
-    return SelfBuiltVllmConfig(
+    return LagunaRuntimeConfig(
         model_config=model_config,
         cache_config=SelfBuiltCacheConfig(),
         quant_config=SelfBuiltQuantConfig(),

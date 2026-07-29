@@ -29,7 +29,7 @@ from bfdiag.trace import ring as bfdiag_trace
 from bfprobe.routing import capture_routing
 from runtime.backends.bf_attention import bf_attn_context
 from runtime.block_pool import ChunkedPrefillState
-from runtime.laguna_config import SelfBuiltVllmConfig
+from runtime.laguna_config import LagunaRuntimeConfig
 from runtime.laguna_runtime import (
     LagunaAttentionMetadata,
     bind_laguna_kv_cache,
@@ -177,7 +177,7 @@ class LagunaBackend:
 
     def __init__(
         self,
-        vllm_config: SelfBuiltVllmConfig,
+        vllm_config: LagunaRuntimeConfig,
         *,
         num_slots: int = 4,
         block_size: int = 64,

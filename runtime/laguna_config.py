@@ -31,7 +31,7 @@ LOADER=vllm`` escape hatches (real ``vllm.config.VllmConfig`` via
 ``EngineArgs.create_engine_config()`` + real ``get_model()``/
 ``load_dflash_model()``) that used to run alongside this module have
 been removed entirely from ``runtime/backends/laguna.py``/
-``laguna_dflash.py`` -- this ``SelfBuiltVllmConfig`` is now the only
+``laguna_dflash.py`` -- this ``LagunaRuntimeConfig`` is now the only
 config Laguna's production path ever constructs. They served their
 purpose as a reference implementation during 任务#45's own bit-exact
 validation (both paths confirmed correct against real weights); kept
@@ -271,10 +271,8 @@ class LagunaDFlashConfig:
 
 
 @dataclasses.dataclass
-class SelfBuiltVllmConfig:
-    """Duck-typed stand-in for ``vllm.config.VllmConfig``, used only for
-    the ``selfbuilt`` (default) loader path -- see module docstring.
-    """
+class LagunaRuntimeConfig:
+    """Fixed, self-built configuration for Laguna's production runtime."""
 
     model_config: SelfBuiltModelConfig
     cache_config: SelfBuiltCacheConfig
@@ -305,7 +303,7 @@ def build_laguna_config(
     gpu_memory_utilization: float = 0.9,
     trust_remote_code: bool = False,
     enforce_eager: bool = False,
-) -> SelfBuiltVllmConfig:
+) -> LagunaRuntimeConfig:
     """Self-built replacement for ``EngineArgs(model=..., ...).
     create_engine_config()`` -- only the kwargs this runtime's real call
     sites actually pass (server/engine.py's ``_load_laguna_model``,
@@ -336,7 +334,7 @@ def build_laguna_config(
         tokenizer=str(model_dir),
         enforce_eager=enforce_eager,
     )
-    return SelfBuiltVllmConfig(
+    return LagunaRuntimeConfig(
         model_config=model_config,
         cache_config=SelfBuiltCacheConfig(),
         quant_config=SelfBuiltQuantConfig(kv_cache_scheme=kv_cache_scheme),
@@ -349,13 +347,13 @@ def build_laguna_config(
 
 
 def build_laguna_dflash_config(
-    runtime_config: SelfBuiltVllmConfig,
+    runtime_config: LagunaRuntimeConfig,
     *,
     model: str,
     hf_config: object,
     num_speculative_tokens: int,
     max_model_len: int,
-) -> SelfBuiltVllmConfig:
+) -> LagunaRuntimeConfig:
     """Return a DFlash-specific copy of a Laguna runtime configuration.
 
     The draft loader only consumes its checkpoint identity/configuration and
