@@ -278,4 +278,5 @@ def main():
     out.write_text(json.dumps(fixture, indent=2, ensure_ascii=False))
     print(f"\nSaved: {out}")
 
-main()
+if __name__ == "__main__":
+    main()
