@@ -156,7 +156,7 @@ def _compare_gdn_states(runner, slot_a: int, slot_b: int, sanity_bound: float) -
 
     import torch
 
-    from runtime.direct_model_runner import _physical_slot
+    from oracle.qwen36_vllm.direct_model_runner import _physical_slot
 
     phys_a, phys_b = _physical_slot(slot_a), _physical_slot(slot_b)
     per_layer = []
@@ -355,7 +355,7 @@ def _run_once() -> dict:
     from transformers import AutoTokenizer
 
     from benchmarks.workloads import W1_S_FIXTURE, load_prompt_token_ids
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     w1s_prompts = load_prompt_token_ids(W1_S_FIXTURE)
     ragged_prompts = [w1s_prompts[i][:length] for i, length in enumerate(RAGGED_LENGTHS)]

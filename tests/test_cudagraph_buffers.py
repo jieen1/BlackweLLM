@@ -209,8 +209,8 @@ class TestDependencySurfaces:
                         in {
                             "runtime.compat_vllm",
                             "runtime.compat_vllm_qwen36",
-                            "runtime.legacy_qwen36_vllm",
-                            "runtime.legacy_qwen36_attention",
+                            "oracle.qwen36_vllm.vllm_compat",
+                            "oracle.qwen36_vllm.attention_compat",
                         }
                         for alias in node.names
                     )
@@ -218,8 +218,8 @@ class TestDependencySurfaces:
                     imports_compat = node.module in {
                         "runtime.compat_vllm",
                         "runtime.compat_vllm_qwen36",
-                        "runtime.legacy_qwen36_vllm",
-                        "runtime.legacy_qwen36_attention",
+                        "oracle.qwen36_vllm.vllm_compat",
+                        "oracle.qwen36_vllm.attention_compat",
                     }
                 if imports_compat:
                     break

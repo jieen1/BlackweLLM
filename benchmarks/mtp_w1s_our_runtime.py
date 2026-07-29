@@ -77,7 +77,7 @@ def _run_once(max_tokens: int, concurrency: int, fixture_key: str, num_requests:
     import register_sm120_backend  # noqa: F401
 
     from benchmarks.workloads import W1_S_FIXTURE, W1_S_FIXTURE_N128, load_prompt_token_ids
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     fixture = {"n16": W1_S_FIXTURE, "n128": W1_S_FIXTURE_N128}[fixture_key]
     prompts = load_prompt_token_ids(fixture)

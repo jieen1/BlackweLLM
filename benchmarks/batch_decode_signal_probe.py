@@ -95,7 +95,7 @@ def _run_once(batch: int, varlen: bool, steps: int, reuse: bool, mtp_qo_len: int
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
 
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     vllm_config = build_vllm_config(
         model=MODEL,

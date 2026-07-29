@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import torch
 
-logger = logging.getLogger("qwen_sm120_runtime.nvfp4_custom_gemm")
+logger = logging.getLogger("qwen_sm120_oracle.qwen36_vllm.nvfp4_custom_gemm")
 
 _lib = None
 _patched = False
@@ -112,7 +112,7 @@ def custom_scaled_fp4_mm(
     """
     lib = _load_lib()
     if lib is None:
-        from runtime.legacy_qwen36_vllm import get_cutlass_scaled_fp4_mm
+        from oracle.qwen36_vllm.vllm_compat import get_cutlass_scaled_fp4_mm
 
         cutlass_scaled_fp4_mm = get_cutlass_scaled_fp4_mm()
         return cutlass_scaled_fp4_mm(a, b, block_scale_a, block_scale_b, alpha, out_dtype)
@@ -143,7 +143,7 @@ def custom_scaled_fp4_mm(
 
     if rc != 0:
         logger.warning("Custom GEMM failed (rc=%d) for M=%d N=%d K=%d, falling back", rc, m, n, k)
-        from runtime.legacy_qwen36_vllm import get_cutlass_scaled_fp4_mm
+        from oracle.qwen36_vllm.vllm_compat import get_cutlass_scaled_fp4_mm
 
         cutlass_scaled_fp4_mm = get_cutlass_scaled_fp4_mm()
         return cutlass_scaled_fp4_mm(a, b, block_scale_a, block_scale_b, alpha, out_dtype)
@@ -171,7 +171,7 @@ def patch_nvfp4_custom_gemm() -> bool:
         return False
 
     try:
-        from runtime.legacy_qwen36_vllm import get_nvfp4_custom_ops, get_nvfp4_cutlass_module
+        from oracle.qwen36_vllm.vllm_compat import get_nvfp4_custom_ops, get_nvfp4_cutlass_module
 
         ops = get_nvfp4_custom_ops()
 

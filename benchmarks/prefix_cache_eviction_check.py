@@ -94,7 +94,7 @@ NEAR_TIE_LOGIT_MARGIN = 2.0  # established methodology (R6).
 
 
 def _check_lru_middle_removal() -> dict:
-    from runtime.direct_model_runner import BlockPool
+    from oracle.qwen36_vllm.direct_model_runner import BlockPool
 
     errors = []
     # Build a queue in a known order: drain the construction queue, then append
@@ -127,7 +127,7 @@ def _check_lru_middle_removal() -> dict:
 
 
 def _check_evict_drops_hash() -> dict:
-    from runtime.direct_model_runner import BlockHash, BlockPool, hash_block_tokens
+    from oracle.qwen36_vllm.direct_model_runner import BlockHash, BlockPool, hash_block_tokens
 
     errors = []
     extra = ("fp8_e4m3",)
@@ -179,7 +179,7 @@ class _StubCheckpointOwner:
 
 
 def _check_lockstep_eviction() -> dict:
-    from runtime.direct_model_runner import (
+    from oracle.qwen36_vllm.direct_model_runner import (
         BlockHash,
         BlockPool,
         DirectModelRunner,
@@ -246,7 +246,7 @@ def _check_lockstep_eviction() -> dict:
 
 
 def _check_refcnt_never_evicted() -> dict:
-    from runtime.direct_model_runner import BlockHash, BlockPool, hash_block_tokens
+    from oracle.qwen36_vllm.direct_model_runner import BlockHash, BlockPool, hash_block_tokens
 
     errors = []
     extra = ("fp8_e4m3",)
@@ -281,7 +281,7 @@ def _check_refcnt_never_evicted() -> dict:
 
 
 def _check_byte_budget() -> dict:
-    from runtime.direct_model_runner import BlockPool, DirectModelRunner
+    from oracle.qwen36_vllm.direct_model_runner import BlockPool, DirectModelRunner
 
     errors = []
     per_bytes = 100
@@ -423,7 +423,7 @@ def _gdn_stack_compare(runner, slot_a: int, slot_b: int) -> tuple[bool, bool, fl
     (spec rows live in a separate address range, see ``_ssm_spec_row``)."""
     import torch
 
-    from runtime.direct_model_runner import _physical_slot
+    from oracle.qwen36_vllm.direct_model_runner import _physical_slot
 
     pa, pb = _physical_slot(slot_a), _physical_slot(slot_b)
     num_spec = runner.num_speculative_tokens or 0
@@ -787,7 +787,7 @@ def _run_gpu_checks() -> dict:
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
 
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     vllm_config = build_vllm_config(
         model=MODEL,

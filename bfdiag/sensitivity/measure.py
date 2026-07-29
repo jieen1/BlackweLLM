@@ -80,7 +80,7 @@ def run_one(perturbation: str, shape: LoadShape, model: str = DEFAULT_MODEL) -> 
     from bfdiag.sensitivity.perturbations import build
     from runtime.backends.laguna import LagunaBackend
     from runtime.backends.laguna_dflash import DFlashEngine
-    from runtime.legacy_qwen36_vllm import EngineArgs
+    from runtime.laguna_config import build_laguna_config
 
     torch.set_grad_enabled(False)
     model_path = os.path.expanduser(model)
@@ -91,16 +91,15 @@ def run_one(perturbation: str, shape: LoadShape, model: str = DEFAULT_MODEL) -> 
         prompt.extend(chunk)
     prompt = prompt[: shape.ctx]
 
-    args = EngineArgs(
-        model=model_path,
-        dtype="bfloat16",
-        max_model_len=shape.max_model_len,
-        gpu_memory_utilization=0.88,
-        enforce_eager=True,
-        trust_remote_code=True,
-    )
     backend = LagunaBackend(
-        args.create_engine_config(),
+        build_laguna_config(
+            model_path,
+            dtype="bfloat16",
+            max_model_len=shape.max_model_len,
+            gpu_memory_utilization=0.88,
+            enforce_eager=True,
+            trust_remote_code=True,
+        ),
         num_slots=1,
         block_size=shape.block_size,
         blocks_per_slot=shape.blocks_per_slot,

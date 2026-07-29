@@ -378,7 +378,7 @@ def _run_once(
         W1_S_FIXTURE_N128,
         load_prompt_token_ids,
     )
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     fixture = {
         "n16": W1_S_FIXTURE,
@@ -528,7 +528,7 @@ def main() -> int:
         "pieces instead of one giant forward covering the whole prompt -- "
         "bounds peak prefill activation memory to chunk_size*concurrency "
         "regardless of total prompt length (see "
-        "runtime.direct_model_runner.DirectModelRunner.mtp_prefill_batch's "
+        "oracle.qwen36_vllm.direct_model_runner.DirectModelRunner.mtp_prefill_batch's "
         "docstring and notes/2026-07-18-session-review-and-next-steps.md "
         "section 19). Requires --batched (the singular, non-batched path "
         "has no chunked prefill). Default None preserves every existing "

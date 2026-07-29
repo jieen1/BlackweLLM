@@ -101,7 +101,7 @@ PROMPT = "The capital of France is"
 
 
 def _check_arange_equivalence() -> dict:
-    from runtime.direct_model_runner import _initial_block_table, _physical_slot
+    from oracle.qwen36_vllm.direct_model_runner import _initial_block_table, _physical_slot
 
     mismatches = []
     for num_slots, blocks_per_slot in [(4, 128), (1, 1), (8, 2560), (16, 64)]:
@@ -131,7 +131,7 @@ def _run_numeric_equivalence() -> dict:
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
 
-    from runtime.direct_model_runner import (
+    from oracle.qwen36_vllm.direct_model_runner import (
         CapturedBatchDecodeGraph,
         DirectModelRunner,
         build_vllm_config,
@@ -227,7 +227,7 @@ def _run_numeric_equivalence() -> dict:
     # since that never depended on which physical ids were assigned.
     checks["graph_fill_buffers_kv_page_indptr_equal"] = bool(torch.equal(kv_page_indptr_off, kv_page_indptr_on))
 
-    from runtime.direct_model_runner import RESERVED_PHYSICAL_SLOTS
+    from oracle.qwen36_vllm.direct_model_runner import RESERVED_PHYSICAL_SLOTS
 
     num_pages_per_req = [
         (kv_len + 1 + runner.block_size - 1) // runner.block_size for kv_len in fill_kv_lengths

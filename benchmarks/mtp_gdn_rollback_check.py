@@ -49,7 +49,7 @@ def _run_once() -> dict:
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
 
-    from runtime.direct_model_runner import DirectModelRunner, _physical_slot, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, _physical_slot, build_vllm_config
 
     vllm_config = build_vllm_config(
         model=MODEL, kv_cache_dtype="fp8_e4m3", max_model_len=2048, gpu_memory_utilization=0.5

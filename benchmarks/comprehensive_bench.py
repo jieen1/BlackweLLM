@@ -27,7 +27,7 @@ def main():
     print(f"Comprehensive Benchmark (MoE={moe_backend})")
     print("=" * 70)
 
-from runtime.legacy_qwen36_vllm import EngineArgs
+    from oracle.qwen36_vllm.vllm_compat import EngineArgs
     model_path = os.path.expanduser(
         "~/.cache/huggingface/hub/models--poolside--Laguna-S-2.1-NVFP4/"
         "snapshots/07614121b31898586430f189d27a25a0be310843/"

@@ -9,7 +9,7 @@ upstream CUTLASS SM121 MMA op guard fix. This patch re-inserts it at the
 front of the priority list so it is chosen on SM120 hardware.
 
 Usage:
-    from runtime.nvfp4_b12x_patch import patch_nvfp4_prefer_b12x
+    from oracle.qwen36_vllm.nvfp4_b12x_patch import patch_nvfp4_prefer_b12x
     patch_nvfp4_prefer_b12x()  # call BEFORE get_model()
 """
 
@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import os
 
-logger = logging.getLogger("qwen_sm120_runtime.nvfp4_b12x_patch")
+logger = logging.getLogger("qwen_sm120_oracle.qwen36_vllm.nvfp4_b12x_patch")
 
 _patched = False
 
@@ -48,7 +48,7 @@ def patch_nvfp4_prefer_b12x() -> bool:
         return False
 
     try:
-        from runtime.legacy_qwen36_vllm import get_nvfp4_b12x_kernel_components
+        from oracle.qwen36_vllm.vllm_compat import get_nvfp4_b12x_kernel_components
 
         (
             _POSSIBLE_NVFP4_KERNELS,

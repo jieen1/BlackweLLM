@@ -10,7 +10,7 @@ frozen parameter (inference-only), so this is safe.
 
 Usage::
 
-    from runtime.gemma_norm_patch import patch_gemma_rms_norm
+    from oracle.qwen36_vllm.gemma_norm_patch import patch_gemma_rms_norm
     patch_gemma_rms_norm()
 """
 
@@ -28,10 +28,10 @@ def patch_gemma_rms_norm() -> None:
         return
     _patched = True
 
-    from runtime.legacy_qwen36_vllm import get_vllm_ir
+    from oracle.qwen36_vllm.vllm_compat import get_vllm_ir
 
     ir = get_vllm_ir()
-    from runtime.legacy_qwen36_vllm import get_gemma_rms_norm
+    from oracle.qwen36_vllm.vllm_compat import get_gemma_rms_norm
 
     GemmaRMSNorm = get_gemma_rms_norm()
 

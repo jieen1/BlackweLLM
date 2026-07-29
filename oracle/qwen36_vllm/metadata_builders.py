@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import torch
 
-from runtime.block_pool import _physical_slot, _ssm_spec_row
-from runtime.legacy_qwen36_attention import (
+from oracle.qwen36_vllm.attention_compat import (
     FLA_CHUNK_SIZE,
     GDNAttentionMetadata,
     SM120GQAMetadata,
@@ -17,6 +16,7 @@ from runtime.legacy_qwen36_attention import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
+from runtime.block_pool import _physical_slot, _ssm_spec_row
 
 
 def build_attention_metadata(

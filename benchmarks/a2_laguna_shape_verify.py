@@ -38,7 +38,7 @@ def main():
     from vllm import _custom_ops as ops
     from vllm.scalar_type import scalar_types
 
-    from runtime.nvfp4_custom_gemm import _load_lib, _select_config, custom_scaled_fp4_mm
+    from oracle.qwen36_vllm.nvfp4_custom_gemm import _load_lib, _select_config, custom_scaled_fp4_mm
 
     FLOAT4_E2M1_MAX = scalar_types.float4_e2m1f.max()
 

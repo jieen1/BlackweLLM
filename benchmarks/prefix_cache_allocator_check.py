@@ -118,7 +118,7 @@ class _StubRunner:
 
 
 def _check_alloc_free_correctness() -> dict:
-    from runtime.direct_model_runner import BlockPool
+    from oracle.qwen36_vllm.direct_model_runner import BlockPool
 
     errors = []
     pool = BlockPool(num_blocks=20, reserved=1)
@@ -165,7 +165,7 @@ def _check_alloc_free_correctness() -> dict:
 
 
 def _check_ref_cnt_bookkeeping() -> dict:
-    from runtime.direct_model_runner import BlockPool
+    from oracle.qwen36_vllm.direct_model_runner import BlockPool
 
     errors = []
     pool = BlockPool(num_blocks=10, reserved=1)
@@ -197,7 +197,7 @@ def _check_ref_cnt_bookkeeping() -> dict:
 
 
 def _check_free_queue_ordering() -> dict:
-    from runtime.direct_model_runner import BlockHash, BlockPool, hash_block_tokens
+    from oracle.qwen36_vllm.direct_model_runner import BlockHash, BlockPool, hash_block_tokens
 
     errors = []
     extra = ("fp8_e4m3",)
@@ -263,7 +263,7 @@ def _check_free_queue_ordering() -> dict:
 
 
 def _check_inv7_reserved_block_zero() -> dict:
-    from runtime.direct_model_runner import BlockPool
+    from oracle.qwen36_vllm.direct_model_runner import BlockPool
 
     errors = []
 
@@ -310,7 +310,7 @@ def _check_inv7_reserved_block_zero() -> dict:
 
 
 def _check_append_only_growth() -> dict:
-    from runtime.direct_model_runner import BlockPool, DirectModelRunner
+    from oracle.qwen36_vllm.direct_model_runner import BlockPool, DirectModelRunner
 
     errors = []
     pool = BlockPool(num_blocks=50, reserved=1)
@@ -361,7 +361,7 @@ def _check_append_only_growth() -> dict:
 
 
 def _check_reset_slot_frees_blocks() -> dict:
-    from runtime.direct_model_runner import BlockPool, DirectModelRunner
+    from oracle.qwen36_vllm.direct_model_runner import BlockPool, DirectModelRunner
 
     errors = []
     pool = BlockPool(num_blocks=50, reserved=1)
@@ -406,7 +406,7 @@ def _check_reset_slot_frees_blocks() -> dict:
 
 
 def _check_fragmentation_after_churn() -> dict:
-    from runtime.direct_model_runner import BlockPool, DirectModelRunner
+    from oracle.qwen36_vllm.direct_model_runner import BlockPool, DirectModelRunner
 
     errors = []
     details: dict[str, object] = {}

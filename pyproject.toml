@@ -49,10 +49,8 @@ select = ["E", "F", "I", "UP"]
 include = [
   "bfdiag*",
   "bfprobe*",
-  "benchmarks*",
   "loader*",
   "model*",
-  "oracle*",
   "runtime*",
   "server*",
 ]

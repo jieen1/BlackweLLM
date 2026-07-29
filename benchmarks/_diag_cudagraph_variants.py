@@ -22,7 +22,7 @@ def cos_sim(a, b):
     ).item()
 
 def main():
-    from runtime.legacy_qwen36_vllm import EngineArgs
+    from oracle.qwen36_vllm.vllm_compat import EngineArgs
     args = EngineArgs(
         model=MODEL, max_model_len=4096, gpu_memory_utilization=0.80,
         enforce_eager=True, dtype="bfloat16", disable_log_stats=True,
@@ -48,7 +48,7 @@ def main():
     # This isolates: is it FlashInfer's cudagraph kernel, or torch.cuda.CUDAGraph itself?
     from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
     from vllm.v1.attention.backends.flashinfer import FIDecode, FlashInferMetadata, fast_plan_decode
-    from runtime.legacy_qwen36_vllm import set_forward_context
+    from oracle.qwen36_vllm.vllm_compat import set_forward_context
 
     backend.reset_slot(0)
     backend.prefill(0, prompt_ids)

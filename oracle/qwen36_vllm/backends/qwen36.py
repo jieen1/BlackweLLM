@@ -17,15 +17,15 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from runtime.direct_model_runner import DirectModelRunner
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner
 
-from runtime.legacy_qwen36_vllm import set_forward_context
-from runtime.logprobs import compute_logprobs
-from runtime.metadata_builders import (
+from oracle.qwen36_vllm.metadata_builders import (
     _MAX_DECODE_QO_LEN,
     build_attention_metadata,
     build_attention_metadata_batch,
 )
+from oracle.qwen36_vllm.vllm_compat import set_forward_context
+from runtime.logprobs import compute_logprobs
 from runtime.mtp_accept import determine_accept_reject, determine_accept_reject_batch
 from server.metrics import (
     record_mtp_acceptance,

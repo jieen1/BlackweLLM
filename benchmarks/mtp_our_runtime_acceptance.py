@@ -72,7 +72,7 @@ def _run_once(workload: str, target_output_len: int, blocks_per_slot: int) -> di
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
 
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     cfg = WORKLOADS[workload]
     input_len = cfg["input_len"]

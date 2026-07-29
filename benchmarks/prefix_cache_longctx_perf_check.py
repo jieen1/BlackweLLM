@@ -183,7 +183,7 @@ def _run_correctness_hook(runner, prompt_ids: list[int], chunk_size: int) -> dic
     committed-rows exact, decode near-tie."""
     import torch
 
-    from runtime.direct_model_runner import _physical_slot
+    from oracle.qwen36_vllm.direct_model_runner import _physical_slot
 
     result: dict = {"checks": {}, "prompt_len": len(prompt_ids)}
     cold_slot, warm_slot = 0, 1
@@ -526,7 +526,7 @@ def main() -> int:
     import register_sm120_backend  # noqa: F401
 
     from benchmarks.workloads import CTX128K_FIXTURE, D1_CTX64K_FIXTURE, load_prompt_token_ids
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     fixture = {"ctx64k": D1_CTX64K_FIXTURE, "ctx128k": CTX128K_FIXTURE}[args.fixture]
     prompt_len = fixture.prompt_len

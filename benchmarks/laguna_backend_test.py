@@ -39,7 +39,7 @@ EXPECTED_FACT_FIRST_TOKEN = "Paris"
 
 def build_laguna_config(max_model_len: int = 4096):
     """Build VllmConfig for Laguna (FlashInfer backend, no SM120GQA)."""
-    from runtime.legacy_qwen36_vllm import EngineArgs
+    from oracle.qwen36_vllm.vllm_compat import EngineArgs
 
     args = EngineArgs(
         model=MODEL,

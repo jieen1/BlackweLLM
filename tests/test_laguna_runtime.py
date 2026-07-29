@@ -62,8 +62,8 @@ def test_laguna_runtime_modules_do_not_import_qwen_legacy_vllm() -> None:
             (isinstance(node, ast.ImportFrom) and node.module in {
                 "runtime.compat_vllm",
                 "runtime.compat_vllm_qwen36",
-                "runtime.legacy_qwen36_vllm",
-                "runtime.legacy_qwen36_attention",
+                "oracle.qwen36_vllm.vllm_compat",
+                "oracle.qwen36_vllm.attention_compat",
             })
             or (
                 isinstance(node, ast.Import)
@@ -72,8 +72,8 @@ def test_laguna_runtime_modules_do_not_import_qwen_legacy_vllm() -> None:
                     in {
                         "runtime.compat_vllm",
                         "runtime.compat_vllm_qwen36",
-                        "runtime.legacy_qwen36_vllm",
-                        "runtime.legacy_qwen36_attention",
+                        "oracle.qwen36_vllm.vllm_compat",
+                        "oracle.qwen36_vllm.attention_compat",
                     }
                     for alias in node.names
                 )

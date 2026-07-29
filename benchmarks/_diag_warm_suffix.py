@@ -24,7 +24,7 @@ def main():
     sys.path.insert(0, SM120_VLLM_INTEGRATION)
     import register_sm120_backend  # noqa
     from benchmarks.workloads import D1_CTX64K_FIXTURE, load_prompt_token_ids
-    from runtime.direct_model_runner import (DirectModelRunner, build_vllm_config,
+    from oracle.qwen36_vllm.direct_model_runner import (DirectModelRunner, build_vllm_config,
                                              _physical_slot)
     P = D1_CTX64K_FIXTURE.prompt_len
     prefix = load_prompt_token_ids(D1_CTX64K_FIXTURE)[0]

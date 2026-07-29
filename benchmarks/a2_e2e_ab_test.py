@@ -69,7 +69,7 @@ def main():
     sys.path.insert(0, "/home/bot/project/sm120-flash-attention/vllm_integration")
     import register_sm120_backend  # noqa: F401
 
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     cudnn = os.environ.get("QSR_A2_CUDNN", "0") != "0"
     b12x = os.environ.get("QSR_A2_B12X", "1") != "0"

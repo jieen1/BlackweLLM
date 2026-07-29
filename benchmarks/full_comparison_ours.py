@@ -63,7 +63,7 @@ def make_ids(target_len: int, use_suffix: bool = False) -> list[int]:
 
 def run_context(ctx_len: int):
     """Run warm + cold benchmarks for one context length."""
-    from runtime.legacy_qwen36_vllm import EngineArgs
+    from oracle.qwen36_vllm.vllm_compat import EngineArgs
     from runtime.backends.laguna import LagunaBackend
     from runtime.backends.laguna_dflash import DFlashEngine
 

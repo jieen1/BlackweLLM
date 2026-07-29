@@ -11,11 +11,11 @@ shared_expert projection from NVFP4 quantization -- all of these are
 plain BF16 on disk. Only ``experts.N.{gate,up,down}_proj`` (inside
 ``FusedMoE``, still vLLM-owned, see laguna_decoder.py) are NVFP4.
 This directly contradicts the original Phase 2 plan's assumption that
-these four module classes needed ``NvFp4Linear`` -- see nvfp4_linear.py's
+these four module classes replaced the unused NVFP4 linear prototype's
 docstring for the (still valid, just not applicable *here*) NVFP4 port;
 that class currently has no live call site in the Laguna production path.
 
-Same weight_loader-closure design as ``NvFp4Linear``: each Parameter gets
+Same weight_loader-closure design as the retired NVFP4 prototype: each Parameter gets
 a bound closure matching vLLM's ``weight_loader(param, loaded_weight,
 shard_id=None)`` convention, so the existing generic dispatch in
 ``LagunaModelSelfBuilt.load_weights`` (stacked_params_mapping for QKV,

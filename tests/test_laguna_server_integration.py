@@ -158,8 +158,8 @@ def test_server_engine_uses_laguna_owned_runtime_surface():
         """E1: both backends must accept the exact same positional/keyword
         shape so ServerEngine's call site works unmodified against either."""
         pytest.importorskip("vllm")
+        from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner
         from runtime.backends.laguna import LagunaBackend
-        from runtime.direct_model_runner import DirectModelRunner
 
         laguna_sig = inspect.signature(LagunaBackend.decode_batch_sampled)
         qwen_sig = inspect.signature(DirectModelRunner.decode_batch_sampled)

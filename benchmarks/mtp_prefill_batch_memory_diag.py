@@ -91,7 +91,7 @@ def main():
         W1_S_FIXTURE,
         load_prompt_token_ids,
     )
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     fixture = {"n16": W1_S_FIXTURE, "ctx16k": D1_CTX16K_FIXTURE, "ctx32k": D1_CTX32K_FIXTURE}[args.fixture]
     prompts = load_prompt_token_ids(fixture)[: args.concurrency]

@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from runtime.direct_model_runner import DirectModelRunner
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner
 
 from runtime.block_pool import _physical_slot
 

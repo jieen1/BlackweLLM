@@ -568,7 +568,7 @@ def _run_once() -> dict:
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
 
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     max_prompt_len = max(r[2] for r in REQUESTS)
     vllm_config = build_vllm_config(

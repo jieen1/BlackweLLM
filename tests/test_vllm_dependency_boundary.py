@@ -2,8 +2,8 @@
 
 This is intentionally a source-only test: it can run in a CPU-only
 environment without importing the runtime or requiring a local vLLM build.
-Direct vLLM and FlashInfer imports are legacy migration sites.  Their exact
-lists are frozen here so new production code cannot add another dependency
+Direct vLLM and FlashInfer imports are forbidden in production. Their exact
+empty ledgers are frozen here so new production code cannot add a dependency
 bypass silently.
 """
 
@@ -14,54 +14,9 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
 
-# Each entry is an existing migration site.  Remove entries as their callers
-# are moved behind the explicitly isolated Qwen legacy modules or replaced by
-# self-owned code.
-_APPROVED_DIRECT_IMPORT_FILES = {
-    "runtime/legacy_qwen36_vllm.py",
-    # Added 2026-07-28 (任务#42): the qwen36/DirectModelRunner-exclusive
-    # counterpart to legacy_qwen36_vllm.py -- GDNAttentionMetadata/
-    # SM120GQAMetadata/AttentionBackendEnum/register_backend/FLA chunk
-    # helpers/compute_causal_conv1d_metadata, split out of compat_vllm.py
-    # because their only real consumers (runtime/metadata_builders.py,
-    # runtime/cuda_graphs.py, runtime/direct_model_runner.py) are
-    # exclusively the qwen36 tenant (server/engine.py's _load_model()
-    # dispatches "laguna" to LagunaBackend, never DirectModelRunner) --
-    # having them as unconditional module-level imports in the SHARED
-    # compat_vllm.py meant Laguna's own import chain transitively required
-    # them too, purely as a file-sharing accident (found via a coordinator
-    # cross-check, not this project's own earlier audits). qwen3.6/
-    # DirectModelRunner itself was explicitly put out of scope for this
-    # whole vLLM-removal effort at 阶段0 ("qwen3.6(DirectModelRunner)路径
-    # 本次不动") -- this file is intentionally NOT part of that removal
-    # target, it exists so Laguna's ledger entries above don't have to
-    # carry qwen36's dependency weight.
-    "runtime/legacy_qwen36_attention.py",
-    # runtime/backends/laguna_dflash_cudagraph.py removed 2026-07-28
-    # (任务#41, vLLM removal plan 阶段8): its only vLLM/FlashInfer import
-    # was inside DFlashVerifyCudaGraph, a FlashInfer-based main-model
-    # verify CUDA graph -- re-verified (not just carried forward from the
-    # 阶段0 audit's suspicion) to have zero real callers since commit
-    # d4354e939e9 (2026-07-25); the active verify-CUDA-graph path is
-    # LagunaCudaGraphVerify (runtime/backends/laguna_cuda_graph.py,
-    # sparkinfer-only, never imported vLLM/FlashInfer). Deleted the dead
-    # class entirely rather than leave it on the ledger unused.
-    # runtime/model_loading.py, runtime/model/laguna_model.py,
-    # runtime/model/laguna_decoder.py, runtime/model/laguna_dflash_model.py
-    # removed 2026-07-28 (任务#41, vLLM removal plan 阶段8): their last
-    # remaining real vLLM imports (default_weight_loader/
-    # maybe_remap_kv_scale_name, fused_moe_make_expert_params_mapping,
-    # get_tensor_model_parallel_rank, extract_layer_index,
-    # set_default_torch_dtype) were all small, checkpoint/TP=1-specific
-    # utilities -- self-built narrowed ports (runtime/model/_weight_
-    # loading.py, runtime/model/laguna_decoder.py's _extract_layer_index,
-    # runtime/model_loading.py's _default_torch_dtype) or, for the MoE
-    # expert-params-mapping call, confirmed 100% dead weight and deleted
-    # outright (LagunaMoESelfBuilt has had no experts submodule to match
-    # against since 阶段6) rather than ported. runtime/model/plain_linear.py,
-    # plain_embedding.py, plain_attention.py, nvfp4_linear.py, and _prefix.py
-    # (same directory) already had zero vLLM imports by design.
-}
+# Qwen3.6's historical runner is archived under oracle/qwen36_vllm and is
+# excluded from production distributions. Runtime and server now have none.
+_APPROVED_DIRECT_IMPORT_FILES: set[str] = set()
 
 _APPROVED_DIRECT_FLASHINFER_IMPORT_FILES: set[str] = set()
 # Empty since 2026-07-28 (任务#41): laguna_dflash_cudagraph.py's only
@@ -146,3 +101,7 @@ def test_flashinfer_direct_imports_are_an_explicit_migration_ledger() -> None:
         "A dependency was removed; update the ledger to make the reduction explicit: "
         f"stale={sorted(_APPROVED_DIRECT_FLASHINFER_IMPORT_FILES - observed)}"
     )
+
+
+def test_production_code_does_not_import_archived_qwen_oracle() -> None:
+    assert not _direct_import_files("oracle.qwen36_vllm")

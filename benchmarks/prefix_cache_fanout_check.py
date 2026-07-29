@@ -127,7 +127,7 @@ def _check_reference_refcount() -> dict:
     """Focused unit assertion for ``BlockPool.reference`` + the ``ref_cnt > 1``
     free path (P2's new primitive; design doc sec 3.2 refcount rules, INV7/
     INV9, risk R10)."""
-    from runtime.direct_model_runner import BlockPool
+    from oracle.qwen36_vllm.direct_model_runner import BlockPool
 
     errors = []
     pool = BlockPool(num_blocks=20, reserved=1)
@@ -210,7 +210,7 @@ def _check_reference_refcount() -> dict:
 
 
 def _check_common_prefix() -> dict:
-    from runtime.direct_model_runner import DirectModelRunner
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner
 
     errors = []
     cases = [
@@ -459,7 +459,7 @@ def _run_gpu_checks() -> dict:
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
 
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     vllm_config = build_vllm_config(
         model=MODEL,

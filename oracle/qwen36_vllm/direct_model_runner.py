@@ -19,13 +19,13 @@ from __future__ import annotations
 
 import torch
 
-from runtime.legacy_qwen36_attention import (
+from oracle.qwen36_vllm.attention_compat import (
     AttentionBackendEnum,
     GDNAttentionMetadata,
     SM120GQAMetadata,
     register_backend,
 )
-from runtime.legacy_qwen36_vllm import (
+from oracle.qwen36_vllm.vllm_compat import (
     EngineArgs,
     VllmConfig,
     bind_kv_cache,
@@ -225,7 +225,7 @@ def allocate_fixed_slot_kv_caches(
     return kv_caches
 
 
-from runtime.metadata_builders import (  # noqa: E402
+from oracle.qwen36_vllm.metadata_builders import (  # noqa: E402
     build_attention_metadata,
     build_attention_metadata_batch,
     build_gdn_metadata,
@@ -239,13 +239,13 @@ def _install_triton_norm_ops_once() -> None:
     Must be called AFTER create_engine_config() because that call resets
     IR op priorities via KernelConfig.ir_op_priority.set_priority()."""
     try:
-        from runtime.triton_norm_ops import install_triton_norm_ops
+        from oracle.qwen36_vllm.triton_norm_ops import install_triton_norm_ops
 
         install_triton_norm_ops()
     except Exception:
         pass
     try:
-        from runtime.gemma_norm_patch import patch_gemma_rms_norm
+        from oracle.qwen36_vllm.gemma_norm_patch import patch_gemma_rms_norm
 
         patch_gemma_rms_norm()
     except Exception:
@@ -278,12 +278,15 @@ def build_vllm_config(
     return config
 
 
-from runtime.backends.qwen36 import Qwen36Backend  # noqa: E402
-from runtime.cuda_graphs import CapturedBatchDecodeGraph, CapturedMTPDraftStepGraph  # noqa: E402
-from runtime.gdn_state import GdnStateManager  # noqa: E402
+from oracle.qwen36_vllm.backends.qwen36 import Qwen36Backend  # noqa: E402
+from oracle.qwen36_vllm.cuda_graphs import (  # noqa: E402
+    CapturedBatchDecodeGraph,
+    CapturedMTPDraftStepGraph,
+)
+from oracle.qwen36_vllm.gdn_state import GdnStateManager  # noqa: E402
+from oracle.qwen36_vllm.prefix_cache import PrefixCacheOps  # noqa: E402
 from runtime.logprobs import compute_logprobs  # noqa: E402
 from runtime.model_spec import ModelSpec  # noqa: E402
-from runtime.prefix_cache import PrefixCacheOps  # noqa: E402
 from server.metrics import (  # noqa: E402
     record_prefix_cache_hit,
     record_prefix_cache_miss,
@@ -462,17 +465,17 @@ class DirectModelRunner:
         self._draft_step_graphs: dict[tuple[int, int], CapturedMTPDraftStepGraph] = {}
 
         # A2: prefer B12x NVFP4 kernel on SM120+ (bit-exact, ~6% faster)
-        from runtime.nvfp4_b12x_patch import patch_nvfp4_prefer_b12x
+        from oracle.qwen36_vllm.nvfp4_b12x_patch import patch_nvfp4_prefer_b12x
 
         patch_nvfp4_prefer_b12x()
 
         # A2: option to force direct CUTLASS (bypasses FlashInfer Python wrapper)
-        from runtime.nvfp4_cutlass_direct_patch import patch_nvfp4_prefer_cutlass_direct
+        from oracle.qwen36_vllm.nvfp4_cutlass_direct_patch import patch_nvfp4_prefer_cutlass_direct
 
         patch_nvfp4_prefer_cutlass_direct()
 
         # A2: 自研 SM120 NVFP4 GEMM kernel (per-shape tile config, bit-exact)
-        from runtime.nvfp4_custom_gemm import patch_nvfp4_custom_gemm
+        from oracle.qwen36_vllm.nvfp4_custom_gemm import patch_nvfp4_custom_gemm
 
         patch_nvfp4_custom_gemm()
 
@@ -484,7 +487,7 @@ class DirectModelRunner:
             self.model = get_model(vllm_config=vllm_config)
 
         # A2: patch NVFP4 GEMM to cuDNN backend (12.6% faster, bit-exact)
-        from runtime.nvfp4_cudnn_patch import patch_nvfp4_to_cudnn
+        from oracle.qwen36_vllm.nvfp4_cudnn_patch import patch_nvfp4_to_cudnn
 
         patch_nvfp4_to_cudnn()
 
@@ -543,7 +546,7 @@ class DirectModelRunner:
         self.mtp_attn_layer_names: list[str] = []
         self.num_speculative_tokens: int | None = None
         if vllm_config.speculative_config is not None:
-            from runtime.legacy_qwen36_vllm import load_eagle_model
+            from oracle.qwen36_vllm.vllm_compat import load_eagle_model
 
             names_before = set(sfc.keys())
             with set_current_vllm_config(vllm_config):

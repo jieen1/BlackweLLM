@@ -58,7 +58,7 @@ def main() -> int:
     import register_sm120_backend  # noqa: F401
 
     from benchmarks.workloads import W1_S_FIXTURE, load_prompt_token_ids
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     prompts = load_prompt_token_ids(W1_S_FIXTURE)[:CONCURRENCY]
 

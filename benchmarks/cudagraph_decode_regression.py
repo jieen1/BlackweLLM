@@ -1,5 +1,5 @@
 """CUDA Graph capture/replay correctness test for
-``runtime.direct_model_runner.CapturedBatchDecodeGraph`` (qo_len=1, fixed
+``oracle.qwen36_vllm.direct_model_runner.CapturedBatchDecodeGraph`` (qo_len=1, fixed
 batch_size=4 -- step 1 of the 2026-07-16 CUDA Graph round, MTP capture is
 a deliberately separate follow-on step per the coordinator's explicit
 staging).
@@ -137,7 +137,7 @@ def _run_once(enable_block_table: bool = False) -> dict:
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
 
-    from runtime.direct_model_runner import (
+    from oracle.qwen36_vllm.direct_model_runner import (
         CapturedBatchDecodeGraph,
         DirectModelRunner,
         build_vllm_config,

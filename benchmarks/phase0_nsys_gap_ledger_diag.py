@@ -74,7 +74,7 @@ def _run_one_round_inline(torch, runner, slots, anchors, drafts, r, log):
     """Inline replay of mtp_verify_and_commit_batch's real body (see module
     docstring for the exact line-range correspondence), with per-phase NVTX
     ranges + host timers. Returns (decisions, phase_times_ms)."""
-    from runtime.direct_model_runner import determine_accept_reject
+    from oracle.qwen36_vllm.direct_model_runner import determine_accept_reject
 
     phase = {}
 
@@ -217,7 +217,7 @@ def main() -> int:
     import register_sm120_backend  # noqa: F401
 
     from benchmarks.workloads import W1_S_FIXTURE, W1_S_FIXTURE_N128, load_prompt_token_ids
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     fixture = {"n16": W1_S_FIXTURE, "n128": W1_S_FIXTURE_N128}[args.fixture]
     prompts = load_prompt_token_ids(fixture)[:4]

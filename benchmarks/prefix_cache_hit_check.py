@@ -576,7 +576,7 @@ def _run_gpu_checks() -> dict:
         _run_inv1_case,
         _run_inv3_mismatched_prefix,
     )
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     vllm_config = build_vllm_config(
         model=MODEL,

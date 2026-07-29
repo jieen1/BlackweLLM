@@ -12,7 +12,7 @@ Benchmarked on RTX PRO 6000 Blackwell (188 SMs, 1338.8 GB/s peak):
 All outputs are bit-exact (torch.equal) vs CUTLASS — safe for greedy parity.
 
 Usage:
-    from runtime.nvfp4_cudnn_patch import patch_nvfp4_to_cudnn
+    from oracle.qwen36_vllm.nvfp4_cudnn_patch import patch_nvfp4_to_cudnn
     patch_nvfp4_to_cudnn()  # call after model loading
 """
 
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 
-logger = logging.getLogger("qwen_sm120_runtime.nvfp4_cudnn_patch")
+logger = logging.getLogger("qwen_sm120_oracle.qwen36_vllm.nvfp4_cudnn_patch")
 
 _patched = False
 
@@ -42,7 +42,7 @@ def patch_nvfp4_to_cudnn() -> bool:
         return False
 
     try:
-        from runtime.legacy_qwen36_vllm import get_nvfp4_cudnn_components
+        from oracle.qwen36_vllm.vllm_compat import get_nvfp4_cudnn_components
 
         flashinfer_scaled_fp4_mm, has_flashinfer = get_nvfp4_cudnn_components()
 
@@ -54,7 +54,7 @@ def patch_nvfp4_to_cudnn() -> bool:
         return False
 
     try:
-        from runtime.legacy_qwen36_vllm import (
+        from oracle.qwen36_vllm.vllm_compat import (
             get_nvfp4_cudnn_apply_dependencies,
             get_nvfp4_flashinfer_module,
         )

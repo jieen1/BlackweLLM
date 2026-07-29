@@ -88,7 +88,7 @@ def main() -> int:
     import register_sm120_backend  # noqa: F401
 
     from benchmarks.workloads import D1_CTX16K_FIXTURE, W1_S_FIXTURE, load_prompt_token_ids
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     prompts_16k = load_prompt_token_ids(D1_CTX16K_FIXTURE)[:4]
     prompts_4k = load_prompt_token_ids(W1_S_FIXTURE)[:4]

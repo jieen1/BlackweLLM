@@ -58,7 +58,7 @@ def gpu_mem_gib():
         return float(o.strip().split("\\n")[0]) / 1024
     except: return -1.0
 
-from runtime.legacy_qwen36_vllm import EngineArgs
+from oracle.qwen36_vllm.vllm_compat import EngineArgs
 from runtime.backends.laguna import LagunaBackend
 
 base_len = CTX

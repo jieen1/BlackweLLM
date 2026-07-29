@@ -94,7 +94,7 @@ NEAR_TIE_LOGIT_MARGIN = 2.0  # established methodology (R6): a real near-exact
 
 
 def _check_hash_chain_determinism() -> dict:
-    from runtime.direct_model_runner import BlockHash, hash_block_tokens
+    from oracle.qwen36_vllm.direct_model_runner import BlockHash, hash_block_tokens
 
     errors = []
     extra = ("fp8_e4m3",)
@@ -136,7 +136,7 @@ def _check_hash_chain_determinism() -> dict:
 
 
 def _check_index_keepalive() -> dict:
-    from runtime.direct_model_runner import BlockHash, BlockPool, hash_block_tokens
+    from oracle.qwen36_vllm.direct_model_runner import BlockHash, BlockPool, hash_block_tokens
 
     errors = []
     extra = ("fp8_e4m3",)
@@ -380,7 +380,7 @@ def _run_r1_gdn_layer0_exact(runner, tok, prompt_ids: list[int]) -> dict:
     full 48-layer stack is near-tie."""
     import torch
 
-    from runtime.direct_model_runner import _physical_slot
+    from oracle.qwen36_vllm.direct_model_runner import _physical_slot
 
     produce_slot, hit_slot, ref_slot = 0, 1, 4
     _clear_persistent_cache(runner)
@@ -658,7 +658,7 @@ def _gdn_layer0_committed_exact(runner, slot_a, slot_b) -> dict:
     mimic (R1)."""
     import torch
 
-    from runtime.direct_model_runner import _physical_slot
+    from oracle.qwen36_vllm.direct_model_runner import _physical_slot
 
     gdn0 = runner.gdn_layer_names[0]
     conv_state, ssm_state = runner.kv_caches[gdn0]
@@ -838,7 +838,7 @@ def _run_gpu_checks() -> dict:
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
 
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     vllm_config = build_vllm_config(
         model=MODEL,

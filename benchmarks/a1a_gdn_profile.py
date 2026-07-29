@@ -74,7 +74,7 @@ def main() -> None:
     sys.path.insert(0, "/home/bot/project/sm120-flash-attention/vllm_integration")
     import register_sm120_backend  # noqa: F401
 
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     print(f"Loading model ({MODEL})...")
     t0 = time.perf_counter()

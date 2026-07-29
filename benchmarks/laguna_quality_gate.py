@@ -45,7 +45,7 @@ MAX_TOK = {max_tok!r}
 
 import torch
 from transformers import AutoTokenizer
-    from runtime.legacy_qwen36_vllm import EngineArgs
+    from oracle.qwen36_vllm.vllm_compat import EngineArgs
 from runtime.backends.laguna import LagunaBackend
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)

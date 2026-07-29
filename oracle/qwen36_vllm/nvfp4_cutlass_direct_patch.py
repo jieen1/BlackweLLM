@@ -5,7 +5,7 @@ calls per decode round, this overhead is non-trivial. CutlassNvFp4LinearKernel
 calls cutlass_scaled_fp4_mm directly (C++ custom op), bypassing FlashInfer.
 
 Usage:
-    from runtime.nvfp4_cutlass_direct_patch import patch_nvfp4_prefer_cutlass_direct
+    from oracle.qwen36_vllm.nvfp4_cutlass_direct_patch import patch_nvfp4_prefer_cutlass_direct
     patch_nvfp4_prefer_cutlass_direct()  # call BEFORE get_model()
 """
 
@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import os
 
-logger = logging.getLogger("qwen_sm120_runtime.nvfp4_cutlass_direct_patch")
+logger = logging.getLogger("qwen_sm120_oracle.qwen36_vllm.nvfp4_cutlass_direct_patch")
 
 _patched = False
 
@@ -32,7 +32,7 @@ def patch_nvfp4_prefer_cutlass_direct() -> bool:
         return False
 
     try:
-        from runtime.legacy_qwen36_vllm import get_nvfp4_cutlass_kernel_components
+        from oracle.qwen36_vllm.vllm_compat import get_nvfp4_cutlass_kernel_components
 
         (
             _POSSIBLE_NVFP4_KERNELS,

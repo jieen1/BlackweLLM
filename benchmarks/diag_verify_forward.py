@@ -16,7 +16,7 @@ def make_prompt(tokenizer, n):
     return tokens[:n]
 
 def main():
-    from runtime.legacy_qwen36_vllm import EngineArgs
+    from oracle.qwen36_vllm.vllm_compat import EngineArgs
     model_path = os.path.expanduser(
         "~/.cache/huggingface/hub/models--poolside--Laguna-S-2.1-NVFP4/"
         "snapshots/07614121b31898586430f189d27a25a0be310843/"
@@ -73,7 +73,7 @@ def main():
     # Actually let's just call the backend's forward path
     
     # Build attention metadata for qo=16
-    from runtime.legacy_qwen36_vllm import set_forward_context, set_current_vllm_config
+    from oracle.qwen36_vllm.vllm_compat import set_forward_context, set_current_vllm_config
     
     num_reqs = 1
     qo_lens = [16]

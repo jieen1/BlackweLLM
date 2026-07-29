@@ -51,7 +51,7 @@ def run_recording(num_prompts: int, decode_steps: int, concurrency: int):
     sys.path.insert(0, "/home/bot/project/sm120-flash-attention/vllm_integration")
     import register_sm120_backend  # noqa: F401
 
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     fixture_path = os.path.join(_REPO_ROOT, "benchmarks/fixtures/w1s_prompts.json")
     with open(fixture_path) as f:

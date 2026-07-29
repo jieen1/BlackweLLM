@@ -108,7 +108,7 @@ def _make_suffix(base_prompt: list[int], suffix_len: int, salt: int = 0) -> list
 
 def _build_runner(fixture_prompt_len: int, suffix_len: int, max_tokens: int,
                   concurrency: int, gpu_mem_util: float, blocks_margin: int):
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     blocks_per_slot = -(-(fixture_prompt_len + suffix_len + max_tokens + 8) // 16) + blocks_margin
     max_model_len = min(
@@ -178,7 +178,7 @@ def _run_profiled_decode_steps(runner, slots, anchors, drafts, num_steps):
     """Run decode steps with per-component CUDA event timing via monkey-patching."""
     import torch
 
-    from runtime.direct_model_runner import determine_accept_reject_batch
+    from oracle.qwen36_vllm.direct_model_runner import determine_accept_reject_batch
 
     timings: list[StepTimings] = []
     cur_anchors = dict(anchors)
@@ -231,7 +231,7 @@ def _run_profiled_decode_steps(runner, slots, anchors, drafts, num_steps):
     # Patch
     _target = runner.backend if hasattr(runner, "backend") else runner
     _target.verify_batch_spec = timed_verify_batch_spec
-    import runtime.direct_model_runner as rm
+    import oracle.qwen36_vllm.direct_model_runner as rm
     rm.determine_accept_reject_batch = timed_accept_reject
     _target._mtp_sync_and_propose_batch = timed_mtp_sync_and_propose_batch
 

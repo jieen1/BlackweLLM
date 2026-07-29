@@ -18,7 +18,7 @@ os.environ["QSR_DFLASH_CUDA_GRAPH"] = "1"
 sys.path.insert(0, "/home/bot/project/qwen-sm120-runtime")
 
 def main():
-    from runtime.legacy_qwen36_vllm import EngineArgs
+    from oracle.qwen36_vllm.vllm_compat import EngineArgs
     model_path = os.path.expanduser(
         "~/.cache/huggingface/hub/models--poolside--Laguna-S-2.1-NVFP4/"
         "snapshots/07614121b31898586430f189d27a25a0be310843/"

@@ -10,7 +10,7 @@ with bfloat16 input.  The supports_args check must allow mixed dtypes.
 
 Usage – call once after create_engine_config()::
 
-    from runtime.triton_norm_ops import install_triton_norm_ops
+    from oracle.qwen36_vllm.triton_norm_ops import install_triton_norm_ops
     install_triton_norm_ops()
 """
 
@@ -188,7 +188,7 @@ def install_triton_norm_ops() -> None:
         return
     _installed = True
 
-    from runtime.legacy_qwen36_vllm import get_vllm_ir
+    from oracle.qwen36_vllm.vllm_compat import get_vllm_ir
 
     ir = get_vllm_ir()
 

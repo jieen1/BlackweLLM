@@ -38,7 +38,7 @@ def main():
 
     # ── Step 1: Apply CutlassDirect NVFP4 patch ──
     print("=== Step 1: Apply CutlassDirect NVFP4 patch ===")
-    from runtime.nvfp4_cutlass_direct_patch import patch_nvfp4_prefer_cutlass_direct
+    from oracle.qwen36_vllm.nvfp4_cutlass_direct_patch import patch_nvfp4_prefer_cutlass_direct
 
     patched = patch_nvfp4_prefer_cutlass_direct()
     print(f"  CutlassDirect patch applied: {patched}")

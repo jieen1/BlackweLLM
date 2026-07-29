@@ -74,7 +74,7 @@ tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
 prompt_ids = tok.encode(REAL_TEXT, add_special_tokens=False)
 print(f"prompt tokens: {len(prompt_ids)}", file=sys.stderr)
 
-from runtime.legacy_qwen36_vllm import EngineArgs
+from oracle.qwen36_vllm.vllm_compat import EngineArgs
 from runtime.backends.laguna import LagunaBackend
 from runtime.sampling import SamplingParams
 

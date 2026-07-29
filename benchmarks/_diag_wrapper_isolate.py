@@ -21,7 +21,7 @@ def cos_sim(a, b):
     ).item()
 
 def main():
-    from runtime.legacy_qwen36_vllm import EngineArgs
+    from oracle.qwen36_vllm.vllm_compat import EngineArgs
     args = EngineArgs(
         model=MODEL, max_model_len=4096, gpu_memory_utilization=0.80,
         enforce_eager=True, dtype="bfloat16", disable_log_stats=True,
@@ -45,7 +45,7 @@ def main():
 
     # === Test A: Use eager builder's own wrapper but with graph-style manual plan ===
     # This tests if our _run_plan parameters differ from builder.build()
-    from runtime.legacy_qwen36_vllm import set_forward_context
+    from oracle.qwen36_vllm.vllm_compat import set_forward_context
     from vllm.v1.attention.backends.flashinfer import FIDecode, FlashInferMetadata, fast_plan_decode
 
     backend.reset_slot(0)

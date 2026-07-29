@@ -711,7 +711,7 @@ def _run_once(duration_s: float, capacity: int, num_slots: int, pool_size: int, 
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
 
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     tok = AutoTokenizer.from_pretrained(MODEL)
 

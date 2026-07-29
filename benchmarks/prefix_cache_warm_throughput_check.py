@@ -174,7 +174,7 @@ def _capture_gdn_layer0(runner, slot: int) -> dict:
     """Clone slot's GDN layer-0 committed conv rows + column-0 ssm row (the
     load-bearing recurrent state the next prefill/decode reads). Fixed-size
     per slot (GDN is recurrent, not per-token), so this is cheap."""
-    from runtime.direct_model_runner import _physical_slot
+    from oracle.qwen36_vllm.direct_model_runner import _physical_slot
     gdn0 = runner.gdn_layer_names[0]
     conv_state, ssm_state = runner.kv_caches[gdn0]
     p = _physical_slot(slot)
@@ -190,7 +190,7 @@ def _compare_gdn_layer0(runner, slot: int, ref: dict) -> dict:
     """Compare slot's live GDN layer-0 state against a captured reference."""
     import torch
 
-    from runtime.direct_model_runner import _physical_slot
+    from oracle.qwen36_vllm.direct_model_runner import _physical_slot
     gdn0 = runner.gdn_layer_names[0]
     conv_state, ssm_state = runner.kv_caches[gdn0]
     p = _physical_slot(slot)
@@ -526,7 +526,7 @@ def _run_warm_perf(runner, prefixes: list[list[int]], suffix_len: int,
 def _build_runner(fixture_prompt_len: int, suffix_len: int, max_tokens: int,
                   concurrency: int, gpu_mem_util: float, blocks_margin: int):
     """Construct a DirectModelRunner sized for the warm turn (P+suffix+gen)."""
-    from runtime.direct_model_runner import DirectModelRunner, build_vllm_config
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
 
     # blocks_per_slot MUST cover the WARM turn (P + suffix + max_tokens) plus
     # MTP K=3 draft-ahead margin (+8), else "slot N kv_len {cap+K} exceeds cap".

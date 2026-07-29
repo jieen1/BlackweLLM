@@ -14,7 +14,7 @@ Findings that shape every design decision below:
   entry), every ``mlp.gate`` (MoE router), and every
   ``mlp.shared_expert.{gate,up,down}_proj``. All of these are plain BF16
   on disk -- NOT NVFP4. They use ``PlainLinear`` (runtime/model/
-  plain_linear.py), not ``NvFp4Linear``.
+  plain_linear.py), not the retired NVFP4 prototype.
 - ``config_groups.group_0.targets`` is exactly
   ``experts.[0-9]+.(gate_proj|up_proj|down_proj)`` -- NVFP4 quantization
   in this checkpoint applies ONLY to MoE routed-expert weights, i.e. only
@@ -48,7 +48,7 @@ argument are gone from this class as of this pass; ``_patch_moe_
 sparkinfer`` now reads its three inputs directly from the checkpoint
 instead of from a constructed-then-discarded FusedMoE instance.
 
-Consequently ``NvFp4Linear`` (runtime/model/nvfp4_linear.py, built earlier
+Consequently the unused NVFP4 linear prototype, built earlier
 in Phase 2 under the wrong assumption that these four classes needed it)
 still has no live call site in the Laguna production path.
 
@@ -111,7 +111,7 @@ class LagunaMLPSelfBuilt(nn.Module):
     every other layer is MoE, see module docstring). gate_proj/up_proj kept
     as separate ``PlainLinear`` matching vLLM's ``LagunaMLP`` layout
     (unrelated to the NVFP4 global-scale merge concern that motivated the
-    same split in ``NvFp4Linear`` -- this class is unquantized -- kept
+    same split used by the retired prototype -- this class is unquantized -- kept
     unstacked purely for structural parity with the vLLM reference and the
     checkpoint's own per-tensor key names)."""
 

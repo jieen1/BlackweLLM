@@ -39,7 +39,7 @@ def _run_once() -> dict:
     import register_sm120_backend  # noqa: F401
     from transformers import AutoTokenizer
 
-    from runtime.direct_model_runner import (
+    from oracle.qwen36_vllm.direct_model_runner import (
         DirectModelRunner,
         build_vllm_config,
         determine_accept_reject,

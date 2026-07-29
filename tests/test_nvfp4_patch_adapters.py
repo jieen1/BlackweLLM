@@ -1,7 +1,7 @@
-"""CPU-only regression tests for NVFP4 patch policy adapters.
+"""CPU-only regression tests for archived Qwen NVFP4 patch adapters.
 
-The patch modules must remain importable without vLLM.  They obtain upstream
-symbols only through ``runtime.legacy_qwen36_vllm`` when a patch is actually enabled.
+The oracle patch modules obtain upstream symbols only through
+``oracle.qwen36_vllm.vllm_compat`` when a patch is actually enabled.
 """
 
 from __future__ import annotations
@@ -13,14 +13,14 @@ import pytest
 
 
 def _install_compat_stub(monkeypatch, **symbols: object) -> None:
-    compat = types.ModuleType("runtime.legacy_qwen36_vllm")
+    compat = types.ModuleType("oracle.qwen36_vllm.vllm_compat")
     for name, value in symbols.items():
         setattr(compat, name, value)
-    monkeypatch.setitem(sys.modules, "runtime.legacy_qwen36_vllm", compat)
+    monkeypatch.setitem(sys.modules, "oracle.qwen36_vllm.vllm_compat", compat)
 
 
 def test_b12x_patch_uses_compat_registry(monkeypatch) -> None:
-    from runtime import nvfp4_b12x_patch
+    from oracle.qwen36_vllm import nvfp4_b12x_patch
 
     class PlatformEnum:
         CUDA = "cuda"
@@ -45,7 +45,7 @@ def test_b12x_patch_uses_compat_registry(monkeypatch) -> None:
 
 
 def test_cutlass_patch_uses_compat_registry(monkeypatch) -> None:
-    from runtime import nvfp4_cutlass_direct_patch
+    from oracle.qwen36_vllm import nvfp4_cutlass_direct_patch
 
     class PlatformEnum:
         CUDA = "cuda"
@@ -74,7 +74,7 @@ def test_cutlass_patch_uses_compat_registry(monkeypatch) -> None:
 
 
 def test_custom_gemm_disabled_path_does_not_import_compat(monkeypatch) -> None:
-    from runtime import nvfp4_custom_gemm
+    from oracle.qwen36_vllm import nvfp4_custom_gemm
 
     monkeypatch.setattr(nvfp4_custom_gemm, "_patched", False)
     monkeypatch.setenv("QSR_A2_CUSTOM_GEMM", "0")
@@ -93,13 +93,13 @@ def test_custom_gemm_disabled_path_does_not_import_compat(monkeypatch) -> None:
     ],
 )
 def test_custom_gemm_selects_the_frozen_nvfp4_tile_config(width, expected_config) -> None:
-    from runtime.nvfp4_custom_gemm import _select_config
+    from oracle.qwen36_vllm.nvfp4_custom_gemm import _select_config
 
     assert _select_config(width) == expected_config
 
 
 def test_cudnn_disabled_path_does_not_import_compat(monkeypatch) -> None:
-    from runtime import nvfp4_cudnn_patch
+    from oracle.qwen36_vllm import nvfp4_cudnn_patch
 
     monkeypatch.setattr(nvfp4_cudnn_patch, "_patched", False)
     monkeypatch.setenv("QSR_A2_CUDNN", "0")

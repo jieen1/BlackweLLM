@@ -11,11 +11,11 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    from runtime.direct_model_runner import DirectModelRunner
+    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner
 
+from oracle.qwen36_vllm.attention_compat import GDNAttentionMetadata, SM120GQAMetadata
+from oracle.qwen36_vllm.vllm_compat import set_forward_context
 from runtime.block_pool import RESERVED_PHYSICAL_SLOTS, _physical_slot, _ssm_spec_row
-from runtime.legacy_qwen36_attention import GDNAttentionMetadata, SM120GQAMetadata
-from runtime.legacy_qwen36_vllm import set_forward_context
 
 
 class CapturedBatchDecodeGraph:

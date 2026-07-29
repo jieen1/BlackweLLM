@@ -13,7 +13,7 @@ import torch
 MODEL = "poolside/Laguna-S-2.1-NVFP4"
 
 def main():
-    from runtime.legacy_qwen36_vllm import EngineArgs
+    from oracle.qwen36_vllm.vllm_compat import EngineArgs
     args = EngineArgs(
         model=MODEL, max_model_len=4096, gpu_memory_utilization=0.80,
         enforce_eager=True, dtype="bfloat16", disable_log_stats=True,

@@ -20,7 +20,7 @@ ids = []
 while len(ids) < CTX: ids.extend(chunk)
 ids = ids[:CTX]
 
-from runtime.legacy_qwen36_vllm import EngineArgs
+from oracle.qwen36_vllm.vllm_compat import EngineArgs
 max_len = max(CTX + 1024, 262144)
 bps = (CTX + 15) // 16 + 512
 print(f"Config: ctx={CTX}, bps={bps}, max_len={max_len}", flush=True)
