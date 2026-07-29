@@ -286,14 +286,58 @@ def prepare_sparkinfer_layer(
     )
 
 
+class SparkinferMoEOutputArena:
+    """Grow-only routed-expert output storage shared by sequential MoE layers.
+
+    The arena is deliberately opt-in.  A caller may share it only when it
+    consumes a layer's routed output before invoking the next layer that uses
+    the arena.  ``LagunaBackend._patch_moe_sparkinfer`` has that property: its
+    patched MoE forward immediately combines the routed output with the shared
+    expert into a distinct tensor on the single engine CUDA stream.
+    """
+
+    def __init__(self) -> None:
+        self._buffer: torch.Tensor | None = None
+
+    @property
+    def buffer(self) -> torch.Tensor | None:
+        """The backing allocation, exposed for diagnostics and tests."""
+        return self._buffer
+
+    def acquire(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Return a view sized for ``hidden`` without shrinking the allocation."""
+        batch_tokens = hidden.shape[0]
+        buffer = self._buffer
+        if (
+            buffer is None
+            or buffer.shape[0] < batch_tokens
+            or buffer.dtype != hidden.dtype
+            or buffer.device != hidden.device
+        ):
+            buffer = torch.empty(
+                batch_tokens,
+                HIDDEN_SIZE,
+                dtype=hidden.dtype,
+                device=hidden.device,
+            )
+            self._buffer = buffer
+        return buffer[:batch_tokens]
+
+
 class SparkinferMoELayer:
     """One MoE layer backed by sparkinfer kernel."""
 
-    def __init__(self, experts, workspace, device="cuda"):
+    def __init__(
+        self,
+        experts,
+        workspace,
+        device="cuda",
+        output_arena: SparkinferMoEOutputArena | None = None,
+    ):
         self.experts = experts
         self.workspace = workspace
         self.device = torch.device(device)
-        self._output_buf: torch.Tensor | None = None
+        self._output_arena = output_arena or SparkinferMoEOutputArena()
 
     def forward(
         self,
@@ -301,12 +345,7 @@ class SparkinferMoELayer:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
-        M = hidden.shape[0]
-        if self._output_buf is None or self._output_buf.shape[0] < M:
-            self._output_buf = torch.empty(
-                M, HIDDEN_SIZE, dtype=hidden.dtype, device=self.device,
-            )
-        out = self._output_buf[:M]
+        out = self._output_arena.acquire(hidden)
         binding = build_tp_moe_fp4_binding(
             scratch=self.workspace, a=hidden, experts=self.experts,
             topk_weights=topk_weights, topk_ids=topk_ids.to(torch.int32),

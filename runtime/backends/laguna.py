@@ -482,6 +482,7 @@ class LagunaBackend:
         router → sparkinfer → shared.
         """
         from runtime.backends.laguna_sparkinfer_moe import (
+            SparkinferMoEOutputArena,
             SparkinferMoELayer,
             _find_checkpoint,
             load_moe_layer_activation_gscales,
@@ -504,6 +505,13 @@ class LagunaBackend:
         apply_on_input = getattr(hf_config, "moe_apply_router_weight_on_input", False)
 
         workspace = allocate_tp_moe_workspace_pool()
+        # All patched forwards immediately consume routed output into a new
+        # routed-plus-shared tensor, and ServerEngine owns one CUDA execution
+        # thread.  One grow-only arena therefore replaces 47 long-prefill
+        # allocations without making standalone SparkinferMoEModel callers
+        # share output storage implicitly.
+        output_arena = SparkinferMoEOutputArena()
+        self._moe_sparkinfer_output_arena = output_arena
         ckpt = _find_checkpoint()
         logger.info(
             "sparkinfer MoE patch (checkpoint-direct, alpha path): sparkinfer@%s",
@@ -536,7 +544,14 @@ class LagunaBackend:
             a1g, a2g = load_moe_layer_activation_gscales(ckpt, layer_idx)
             si_experts = prepare_sparkinfer_layer(raw, self.device, a1_gscale=a1g, a2_gscale=a2g)
             del raw
-            si_layer = SparkinferMoELayer(si_experts, workspace, self.device)
+            si_layer = SparkinferMoELayer(
+                si_experts,
+                workspace,
+                self.device,
+                # A no-shared-expert configuration returns routed output
+                # directly, so it must retain private storage.
+                output_arena=output_arena if shared_expert is not None else None,
+            )
             self._moe_sparkinfer_layers.append(si_layer)
 
             def _make_patched_forward(
