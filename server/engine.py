@@ -23,7 +23,6 @@ import asyncio
 import collections
 import logging
 import os
-import sys
 import threading
 import time
 import uuid
@@ -68,20 +67,14 @@ def classify_decode_slots(
     grammar_slots: list[int],
     mtp_capable: bool,
 ) -> tuple[list[int], list[int]]:
-    """E1: split one round's active slots into (greedy_MTP, sampled).
+    """Split one round's active slots into (greedy_speculative, sampled).
 
-    MTP verify/commit only ever applies to a greedy request on an
-    MTP-capable backend. Everything else -- explicit sampling,
-    grammar-constrained structured output, or a backend with no
-    speculative decoding at all (e.g. Laguna, which has no MTP/DFlash
-    wired into this engine yet) -- goes through the plain per-step
-    ``decode_batch_sampled`` path. Greedy there is just temperature=0,
-    per B1, so this is not a behavior fork for those requests, only a
-    routing one.
-
-    For an MTP-capable backend this reproduces the original (pre-E1)
-    ``not sampled and not grammar`` / ``sampled or grammar`` split exactly,
-    so Qwen's decode round is unchanged.
+    Speculative verify/commit only ever applies to a greedy request on a
+    backend whose runner reports ``spec.has_mtp``. Everything else --
+    explicit sampling, grammar-constrained structured output, or Laguna
+    without DFlash wired up -- goes through the plain per-step
+    ``decode_batch_sampled`` path. Greedy there is just temperature=0, so
+    this is only a routing distinction.
     """
     if not mtp_capable:
         return [], list(active_slots)
@@ -91,17 +84,6 @@ def classify_decode_slots(
     sampled_slots = [s for s in active_slots if active[s].get("sampled") or s in grammar_slots]
     return greedy_slots, sampled_slots
 
-
-SM120_VLLM_INTEGRATION = os.environ.get(
-    "SM120_VLLM_INTEGRATION",
-    os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "..",
-        "..",
-        "sm120-flash-attention",
-        "vllm_integration",
-    ),
-)
 
 logger = logging.getLogger("qwen_sm120_server.engine")
 
@@ -185,38 +167,29 @@ class StreamChannel:
 
 class ServerEngine:
     """Owns the one ``DirectModelRunner`` instance, plus the admission and
-    MTP verify/commit bookkeeping for a live, continuously-batched service.
+    speculative verify/commit bookkeeping for a live, continuously-batched
+    service.
 
     Threading: a dedicated engine thread owns the CUDA context and runs all
     GPU operations. The asyncio event loop communicates via lock-free deques
     and os.pipe() wakeups for maximum throughput and minimum latency.
     """
 
-    MODEL = "unsloth/Qwen3.6-27B-NVFP4"
-    K = 3
-
-    # E1: model backends this engine knows how to load. "qwen36" is the
-    # existing production path (DirectModelRunner + MTP), unchanged.
-    # "laguna" drives LagunaBackend, which has no MTP/GDN -- its greedy
-    # decode goes through the same simple per-step sampled path as
-    # non-greedy requests (see classify_decode_slots).
-    _BACKENDS = ("qwen36", "laguna")
-    _BACKEND_MODEL_ID = {
-        "qwen36": "unsloth/Qwen3.6-27B-NVFP4",
-        "laguna": "poolside/Laguna-S-2.1-NVFP4",
-    }
+    MODEL = "poolside/Laguna-S-2.1-NVFP4"
+    K = 0
+    BACKEND = "laguna"
 
     def __init__(
         self,
         *,
-        backend: str = "qwen36",
-        capacity: int = 4,
-        num_slots: int = 8,
-        block_size: int = 16,
-        blocks_per_slot: int = 16384,
-        kv_cache_dtype: str = "fp8_e4m3",
+        backend: str = "laguna",
+        capacity: int = 1,
+        num_slots: int = 2,
+        block_size: int = 64,
+        blocks_per_slot: int = 4096,
+        kv_cache_dtype: str = "auto",
         enable_cudagraph: bool = True,
-        enable_prefix_cache: bool = True,
+        enable_prefix_cache: bool = False,
         enable_session_affinity: bool = False,
         session_ttl_s: float = 30.0,
         enable_dflash: bool = False,
@@ -226,21 +199,14 @@ class ServerEngine:
         watchdog_max_stale_rounds: int = 200,
         request_timeout_s: float = 600.0,
     ) -> None:
-        if backend not in self._BACKENDS:
-            raise ValueError(f"backend={backend!r} must be one of {self._BACKENDS}")
-        self.backend_name = backend
+        if backend != self.BACKEND:
+            raise ValueError(f"backend={backend!r} is unsupported; expected {self.BACKEND!r}")
+        self.backend_name = self.BACKEND
         self.enable_dflash = enable_dflash
-        # Instance-level overrides of the class defaults above: Qwen keeps
-        # the exact original values (MODEL/K unshadowed), Laguna gets its
-        # own model id; K stays 0 unless DFlash is enabled below (Laguna's
-        # own decode has no speculative lookahead otherwise).
-        if backend != "qwen36":
-            self.MODEL = self._BACKEND_MODEL_ID[backend]
-            self.K = 0
+        self.MODEL = self.__class__.MODEL
+        self.K = 0
 
         if enable_dflash:
-            if backend == "qwen36":
-                raise ValueError("enable_dflash is only supported for backend='laguna'")
             # DFlashEngine's draft/verify CUDA Graphs are captured against ONE
             # set of scratch buffers (runtime/backends/laguna_dflash_cudagraph.py
             # / laguna_cuda_graph.py LagunaCudaGraphVerify), not a batch-shaped
@@ -256,14 +222,23 @@ class ServerEngine:
 
             self.K = NUM_SPECULATIVE_TOKENS
 
+        # CUDA Graph slot budget:
+        # - Decode CG (M=1) captures against ONE slot (the last), not capacity
+        #   slots.  After capture the slot is reset before real use.
+        # - DFlash draft/verify CGs use shared scratch buffers and replay
+        #   sequentially per slot; they do NOT need extra physical slots.
+        # So: +1 slot for decode CG warmup (non-DFlash only), +0 for DFlash.
+        cg_extra = 0
+        if enable_cudagraph and not enable_dflash:
+            cg_extra = 1  # single warmup slot for M=1 decode CG capture
         if production:
-            min_slots = capacity + (capacity if enable_cudagraph else 0)
+            min_slots = capacity + cg_extra
         else:
-            min_slots = 3 * capacity + (capacity if enable_cudagraph else 0)
+            min_slots = 3 * capacity + cg_extra
         if num_slots < min_slots:
             raise ValueError(
                 f"num_slots={num_slots} must be >= {min_slots} for capacity={capacity}, "
-                f"enable_cudagraph={enable_cudagraph}"
+                f"enable_cudagraph={enable_cudagraph}, enable_dflash={enable_dflash}"
             )
         if enable_session_affinity and not enable_prefix_cache:
             raise ValueError("enable_session_affinity requires enable_prefix_cache")
@@ -292,31 +267,18 @@ class ServerEngine:
         # that transformers only loads with trust_remote_code=True; without it,
         # config validation falls onto a generic path that chokes on Laguna's
         # yarn rope_parameters (KeyError: 'original_max_position_embeddings').
-        # Scoped to non-Qwen backends so the Qwen path's call is byte-identical
-        # to before (trust_remote_code defaults to False either way).
-        self.tok = AutoTokenizer.from_pretrained(
-            self.MODEL, trust_remote_code=(self.backend_name != "qwen36")
-        )
+        self.tok = AutoTokenizer.from_pretrained(self.MODEL, trust_remote_code=True)
         self.eos_token_id = self.tok.eos_token_id
-        # E1: Laguna's generation_config.json declares TWO stop tokens
-        # ([2, 24], not just the tokenizer's single eos_token) -- the
-        # `.eos_token_id` scalar above only carries token 2 for either
-        # model. eos_token_ids is the actual stop set every comparison
-        # site should use; for Qwen it is exactly {self.eos_token_id},
-        # so behavior there is provably unchanged.
-        if self.backend_name != "qwen36":
-            try:
-                from transformers import GenerationConfig
+        try:
+            from transformers import GenerationConfig
 
-                gen_cfg_eos = GenerationConfig.from_pretrained(self.MODEL).eos_token_id
-            except Exception:
-                gen_cfg_eos = self.eos_token_id
-            if isinstance(gen_cfg_eos, (list, tuple, set)):
-                self.eos_token_ids = frozenset(int(e) for e in gen_cfg_eos)
-            else:
-                self.eos_token_ids = frozenset({int(gen_cfg_eos)})
+            gen_cfg_eos = GenerationConfig.from_pretrained(self.MODEL).eos_token_id
+        except Exception:
+            gen_cfg_eos = self.eos_token_id
+        if isinstance(gen_cfg_eos, (list, tuple, set)):
+            self.eos_token_ids = frozenset(int(e) for e in gen_cfg_eos)
         else:
-            self.eos_token_ids = frozenset({self.eos_token_id})
+            self.eos_token_ids = frozenset({int(gen_cfg_eos)})
 
         # -- high-performance request channel (asyncio → engine thread) --
         # deque is GIL-atomic for append/popleft; pipe provides instant wakeup
@@ -387,26 +349,17 @@ class ServerEngine:
 
     # -- model loading (engine thread only) --------------------------------
     def _load_model(self) -> None:
-        """Load model + create the runner. MUST run on engine thread.
-
-        E1: dispatches on ``self.backend_name``. "qwen36" is the original,
-        unmodified production path; "laguna" is the new E1 second tenant.
-        """
-        if self.backend_name == "laguna":
-            self._load_laguna_model()
-            return
-        self._load_qwen36_model()
+        """Load model + create the Laguna runner. MUST run on engine thread."""
+        self._load_laguna_model()
 
     def _load_laguna_model(self) -> None:
         """Load LagunaBackend. MUST run on engine thread.
 
-        No MTP (no draft model loaded), no persistent prefix cache / session
-        affinity (LagunaBackend.reconcile_prefix_hit is a permanent-miss
-        stub -- see runtime/backends/laguna.py). ``enable_prefix_cache`` /
-        ``enable_session_affinity`` are honored as passed (server/app.py
-        defaults them to False for this backend), not overridden here --
-        ServerEngine stays a thin, honest pass-through of whatever config
-        the caller chose.
+        No speculative draft model unless DFlash is enabled, and no
+        persistent prefix cache / session affinity unless the caller opts
+        in. ``enable_prefix_cache`` / ``enable_session_affinity`` are
+        honored as passed, not overridden here -- ServerEngine stays a
+        thin, honest pass-through of whatever config the caller chose.
 
         ``enable_cudagraph`` now does something for Laguna: when set, the
         M=1 decode CUDA Graph is captured right here, before ``start()``'s
@@ -486,69 +439,6 @@ class ServerEngine:
             self.blocks_per_slot,
             self.capacity_tokens_per_slot,
         )
-
-    def _load_qwen36_model(self) -> None:
-        """Load model + create DirectModelRunner. MUST run on engine thread."""
-        sys.path.insert(0, SM120_VLLM_INTEGRATION)
-        import register_sm120_backend  # noqa: F401
-
-        from runtime.direct_model_runner import (
-            _DEFAULT_PREFILL_CHUNK_SIZE,
-            DirectModelRunner,
-            build_vllm_config,
-        )
-
-        self._prefill_chunk_size = _DEFAULT_PREFILL_CHUNK_SIZE
-
-        from benchmarks.mtp_async_arrival_check import NEAR_TIE_LOGIT_MARGIN, _near_tie_margin_diag
-
-        self._near_tie_margin_diag = _near_tie_margin_diag
-        self.near_tie_logit_margin = NEAR_TIE_LOGIT_MARGIN
-
-        max_model_len = 262144
-        vllm_config = build_vllm_config(
-            model=self.MODEL,
-            kv_cache_dtype=self._kv_cache_dtype,
-            max_model_len=max_model_len,
-            gpu_memory_utilization=self._gpu_memory_utilization,
-            speculative_config={
-                "method": "mtp",
-                "num_speculative_tokens": self.K,
-                "attention_backend": "CUSTOM",
-            },
-        )
-        cache_kwargs: dict[str, bool] = {}
-        if self.enable_prefix_cache:
-            cache_kwargs = {
-                "enable_block_table": True,
-                "enable_prefix_cache": True,
-                "enable_persistent_prefix_cache": True,
-            }
-        # KV cache sizing for 256K context support:
-        # blocks_per_slot=16384 sets the per-slot MAX to 262144 tokens (256K).
-        # num_blocks is set conservatively to fit the GPU with headroom for
-        # forward-pass activations, GDN snapshots, and CUDA overhead.
-        # 80000 blocks * 0.52 MB/block = ~42 GB KV cache, leaving ~40 GB
-        # headroom on a 96 GB GPU after model weights (~17 GB).
-        # This supports 4 concurrent 256K slots (4 * 16384 = 65536 blocks)
-        # with ~14K blocks spare for prefix cache.
-        _num_blocks = 40000
-        self.runner = DirectModelRunner(
-            vllm_config,
-            num_slots=self.num_slots,
-            block_size=self.block_size,
-            blocks_per_slot=self.blocks_per_slot,
-            num_blocks=_num_blocks,
-            enable_cudagraph=self._enable_cudagraph,
-            **cache_kwargs,
-        )
-        logger.info(
-            "KV cache: %d blocks, blocks_per_slot=%d, max_context=%d tokens/slot",
-            self.runner.block_pool.num_blocks,
-            self.blocks_per_slot,
-            self.capacity_tokens_per_slot,
-        )
-        logger.info("model loaded on engine thread")
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> None:

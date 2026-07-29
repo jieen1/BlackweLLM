@@ -37,7 +37,7 @@ from runtime.sampling import SamplingParams
 from server import metrics
 from server.engine import ServerEngine
 from server.formats import anthropic as anthropic_format
-from server.formats import convert_tools_to_chat_template, strip_thinking
+from server.formats import convert_tools_to_chat_template
 from server.formats import openai as openai_format
 from server.formats.stream import StreamProcessor
 from server.tracing import tracer
@@ -73,42 +73,33 @@ DEFAULT_MAX_TOKENS = 16384
 # directly) since uvicorn's import-string app-loading convention
 # (``uvicorn.run("server.app:app", ...)``) needs ``app`` importable with
 # no constructor arguments.
-# E1: which model backend to serve. "qwen36" (default) is the original,
-# unmodified production path. "laguna" drives the new LagunaBackend second
-# tenant (roadmap Track E / L2) -- it has no CUDA Graph integration yet
-# (Lane 2 GPU work lives in runtime/backends/laguna_cuda_graph.py, not
-# wired into the engine), no persistent prefix cache, and no session
-# affinity, so those three default OFF for it below unless the operator
-# explicitly opts back in via the same env vars. It also has no SWA
-# ring-buffer KV yet (roadmap L2 TODO) -- every discovered attention layer,
-# including the 36 sliding-window ones, currently gets a KV cache sized for
-# the FULL context ceiling, so per-token memory cost is ~4x the roadmap L0
-# budget note's estimate (which assumed that optimization already existed).
-# SERVER_BLOCKS_PER_SLOT's Laguna default is sized conservatively for this
-# reality, not for the eventual ring-buffer-optimized budget.
-SERVER_MODEL_BACKEND = os.environ.get("QSR_SERVER_MODEL_BACKEND", "qwen36")
-_IS_LAGUNA = SERVER_MODEL_BACKEND == "laguna"
+SERVER_MODEL_BACKEND = os.environ.get("QSR_SERVER_MODEL_BACKEND", "laguna")
+if SERVER_MODEL_BACKEND != "laguna":
+    raise RuntimeError(
+        f"QSR_SERVER_MODEL_BACKEND={SERVER_MODEL_BACKEND!r} is unsupported; expected 'laguna'"
+    )
 
-SERVER_CAPACITY = int(os.environ.get("QSR_SERVER_CAPACITY", "1" if _IS_LAGUNA else "4"))
-# Laguna default bumped 1->2: ServerEngine requires num_slots >= capacity +
-# (capacity if enable_cudagraph else 0), and enable_cudagraph now defaults
-# on for Laguna (see SERVER_ENABLE_CUDAGRAPH below) -- capacity=1 needs the
-# extra slot for the CG capture's warmup writes.
-SERVER_NUM_SLOTS = int(os.environ.get("QSR_SERVER_NUM_SLOTS", "2" if _IS_LAGUNA else "8"))
-SERVER_BLOCK_SIZE = int(os.environ.get("QSR_SERVER_BLOCK_SIZE", "64" if _IS_LAGUNA else "16"))
+SERVER_CAPACITY = int(os.environ.get("QSR_SERVER_CAPACITY", "1"))
+# ServerEngine requires num_slots >= capacity + (capacity if enable_cudagraph
+# else 0), and enable_cudagraph defaults on -- capacity=1 needs the extra slot
+# for the decode-CG capture warmup writes.
+SERVER_NUM_SLOTS = int(os.environ.get("QSR_SERVER_NUM_SLOTS", "2"))
+SERVER_BLOCK_SIZE = int(os.environ.get("QSR_SERVER_BLOCK_SIZE", "64"))
 # 256K context support: Qwen uses 16384 × 16; Laguna's sparkinfer attention
 # uses 4096 × 64.  The Laguna default below is currently 128K/slot.
-# The KV cache pool size is now determined by GPU memory profiling (see
-# server/engine.py _load_model → profile_kv_cache_blocks), NOT by the old
-# fixed formula (num_slots + 1) * blocks_per_slot. blocks_per_slot is the
-# per-slot MAXIMUM context ceiling; the actual pool is sized to fit the GPU.
+# WARNING: Laguna allocates KV cache upfront as num_slots × blocks_per_slot
+# blocks (runtime/backends/laguna.py:291). gpu_memory_utilization does NOT
+# dynamically constrain this pool -- it only affects vLLM's internal profiling.
+# Size blocks_per_slot × num_slots to fit GPU memory:
+#   KV/token = 24 KiB (12 full-attn layers × 8 heads × 128 dim × FP8 × K/V)
+#   1 slot × 256K = 6.0 GiB;  4 slots × 256K = 24.0 GiB
 # The E2E check sets its OWN smaller blocks_per_slot (its prompts are moderate),
 # so it does not pay for the full long-context pool.
 # Laguna default (2048 × 64 = 128K/slot) is conservative pending the SWA
 # ring-buffer optimization above -- see notes/2026-07-23-laguna-server-
 # integration-plan.md for the memory math.
 SERVER_BLOCKS_PER_SLOT = int(
-    os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "2048" if _IS_LAGUNA else "16384")
+    os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "2048")
 )
 # Laguna default flipped 0->1 (2026-07-27): decode CUDA Graph is now wired
 # into decode_batch_sampled (runtime/backends/laguna.py's
@@ -126,7 +117,7 @@ SERVER_ENABLE_CUDAGRAPH = (
 # `python -m server.app --no-prefix-cache` (or QSR_SERVER_ENABLE_PREFIX_CACHE=0)
 # turns it off => byte-for-byte the old server.
 SERVER_ENABLE_PREFIX_CACHE = (
-    os.environ.get("QSR_SERVER_ENABLE_PREFIX_CACHE", "0" if _IS_LAGUNA else "1") != "0"
+    os.environ.get("QSR_SERVER_ENABLE_PREFIX_CACHE", "0") != "0"
 )
 # P4b session affinity (notes/2026-07-20-p4b-session-affinity-plan.md): opt-in
 # warm-slot retention. Default OFF => byte-for-byte P4a (without a session_id, or
@@ -140,9 +131,7 @@ SERVER_SESSION_TTL_S = float(os.environ.get("QSR_SERVER_SESSION_TTL_S", "30.0"))
 # Graph benchmarks so far ran without an explicit override (see
 # benchmarks/laguna_cudagraph_bench.py) -- don't claim fp8_e4m3 works here
 # until that's actually exercised on GPU.
-SERVER_KV_CACHE_DTYPE = os.environ.get(
-    "QSR_SERVER_KV_CACHE_DTYPE", "auto" if _IS_LAGUNA else "fp8_e4m3"
-)
+SERVER_KV_CACHE_DTYPE = os.environ.get("QSR_SERVER_KV_CACHE_DTYPE", "auto")
 SERVER_GPU_MEM_UTIL = float(os.environ.get("QSR_SERVER_GPU_MEM_UTIL", "0.85"))
 SERVER_PRODUCTION = os.environ.get("QSR_SERVER_PRODUCTION", "1") != "0"
 # DFlash speculative decoding (2026-07-27, notes/2026-07-27-dflash-server-
@@ -159,10 +148,8 @@ engine: ServerEngine | None = None
 async def _tokenize_chat(engine_ref, messages, tools=None, chat_template_kwargs=None):
     """Run apply_chat_template in a thread to avoid blocking the event loop.
 
-    ``chat_template_kwargs`` is forwarded verbatim to the Jinja template, so the
-    official Qwen3.6 ``{"enable_thinking": False}`` toggle (and any other template
-    option) is honored exactly as in stock vLLM. Without this the template always
-    defaults to thinking mode and the toggle sent by clients is silently ignored.
+    ``chat_template_kwargs`` is forwarded verbatim to the model's chat
+    template for compatibility with vLLM-style request payloads.
     """
     loop = asyncio.get_running_loop()
     fn = functools.partial(
@@ -180,11 +167,10 @@ async def _tokenize_chat(engine_ref, messages, tools=None, chat_template_kwargs=
 async def _tokenize_encode(engine_ref, text):
     """Run tokenizer encode in a thread.
 
-    Laguna requires BOS (add_special_tokens=True, the default).
-    Qwen3.6 does not use BOS (add_special_tokens=False).
+    Laguna requires BOS (``add_special_tokens=True``).
     """
     loop = asyncio.get_running_loop()
-    fn = functools.partial(engine_ref.tok.encode, text, add_special_tokens=_IS_LAGUNA)
+    fn = functools.partial(engine_ref.tok.encode, text, add_special_tokens=True)
     return await loop.run_in_executor(None, fn)
 
 
@@ -193,6 +179,11 @@ async def _tokenize_decode(engine_ref, token_ids):
     loop = asyncio.get_running_loop()
     fn = functools.partial(engine_ref.tok.decode, token_ids, skip_special_tokens=True)
     return await loop.run_in_executor(None, fn)
+
+
+def _visible_text_from_model_output(raw_text: str) -> str:
+    """Laguna responses are already visible text; strip replacement chars only."""
+    return raw_text.replace("\ufffd", "").strip()
 
 
 def _format_logprobs_openai(
@@ -410,8 +401,8 @@ class ChatCompletionRequest(BaseModel):
     response_format: dict | None = None
     logprobs: bool | None = False
     top_logprobs: int | None = None
-    # Forwarded to the chat template (e.g. {"enable_thinking": False} for
-    # non-thinking mode). Mirrors vLLM's chat_template_kwargs request field.
+    # Forwarded to the chat template for wire-compat with vLLM's
+    # chat_template_kwargs request field.
     chat_template_kwargs: dict | None = None
 
 
@@ -566,7 +557,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         created = int(time.time())
 
         async def _sse():
-            proc = StreamProcessor(engine.tok, thinking_capable=engine.backend_name == "qwen36")
+            proc = StreamProcessor(engine.tok, thinking_capable=False)
             final_result = None
             first_token_t = None
             # First chunk: role announcement (matches vLLM format)
@@ -605,18 +596,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 proc.add_tokens(item)
                 if first_token_t is None and item:
                     first_token_t = time.perf_counter()
-                # Stream thinking as reasoning_content (vLLM compatible)
-                for td in proc.drain_thinking():
-                    chunk = {
-                        "id": cmpl_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [
-                            {"index": 0, "delta": {"reasoning_content": td}, "finish_reason": None}
-                        ],
-                    }
-                    yield f"data: {_json.dumps(chunk)}\n\n"
+                proc.drain_thinking()
                 for delta in proc.drain_content():
                     chunk = {
                         "id": cmpl_id,
@@ -721,33 +701,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         top_logprobs=req.top_logprobs or 0,
     )
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
-    _THINK_OPEN = chr(60) + "think" + chr(62)
-    _THINK_CLOSE = chr(60) + "/think" + chr(62)
-    # Non-thinking mode (chat_template_kwargs={"enable_thinking": False}): the
-    # template already emitted a closed empty  block, so the generated
-    # tokens ARE the answer -- there is no reasoning to strip. In thinking mode
-    # the tokens start with the reasoning body (the opening  tag was
-    # injected by the prompt), which we wrap and strip below.
-    _non_thinking = bool(
-        req.chat_template_kwargs and req.chat_template_kwargs.get("enable_thinking") is False
-    ) or engine.backend_name != "qwen36"
-    reasoning_content = None
-    if _non_thinking:
-        text = raw_text.replace("\ufffd", "").strip()
-    else:
-        _raw_for_strip = (
-            raw_text if raw_text.startswith(_THINK_OPEN) else (_THINK_OPEN + "\n" + raw_text)
-        )
-        text = strip_thinking(_raw_for_strip)
-        _raw_with_think = (
-            raw_text if raw_text.startswith(_THINK_OPEN) else _THINK_OPEN + "\n" + raw_text
-        )
-        if _THINK_CLOSE in _raw_with_think:
-            start = _raw_with_think.index(_THINK_OPEN) + len(_THINK_OPEN)
-            if start < len(_raw_with_think) and _raw_with_think[start] == "\n":
-                start += 1
-            end = _raw_with_think.index(_THINK_CLOSE)
-            reasoning_content = _raw_with_think[start:end].strip().replace("\ufffd", "")
+    text = _visible_text_from_model_output(raw_text)
     metrics.record_request(
         "chat",
         result["prompt_tokens"],
@@ -771,8 +725,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         committed_token_ids=result["committed_token_ids"],
         prompt_token_ids=list(prompt_ids),
     )
-    if reasoning_content:
-        resp["choices"][0]["message"]["reasoning_content"] = reasoning_content
     if req.logprobs:
         resp["choices"][0]["logprobs"] = _format_logprobs_openai(
             engine,
@@ -806,20 +758,7 @@ async def completions(req: CompletionRequest, request: Request):
         top_logprobs=req.top_logprobs or 0,
     )
     _raw_comp = await _tokenize_decode(engine, result["committed_token_ids"])
-    if engine.backend_name != "qwen36":
-        # Non-thinking backends (e.g. Laguna) never emit a <think> block, so
-        # there is no reasoning to strip -- wrapping in a synthetic <think>
-        # prefix here would make strip_thinking's unclosed-block rule eat the
-        # entire response (see notes/2026-07-27-*.md for the real request
-        # that surfaced this as an empty completion).
-        text = _raw_comp.replace("�", "").strip()
-    else:
-        _raw_comp_full = (
-            _raw_comp
-            if _raw_comp.startswith(chr(60) + "think" + chr(62))
-            else (chr(60) + "think" + chr(62) + "\n" + _raw_comp)
-        )
-        text = strip_thinking(_raw_comp_full)
+    text = _visible_text_from_model_output(_raw_comp)
     metrics.record_request(
         "completions",
         result["prompt_tokens"],
@@ -893,8 +832,8 @@ def main() -> None:
         "--dflash",
         action="store_true",
         help=(
-            "Enable DFlash speculative decoding (Laguna backend only). Any "
-            "--capacity is supported; DFlash's CUDA Graphs replay once per "
+            "Enable DFlash speculative decoding. Any --capacity is supported; "
+            "DFlash's CUDA Graphs replay once per "
             "active slot per round (not batched), so throughput scales "
             "sub-linearly with capacity -- see notes/2026-07-27-dflash-"
             "multi-slot-concurrency.md."
@@ -1182,7 +1121,7 @@ async def anthropic_messages(request: Request):
         import json as _json
 
         async def _anthropic_sse():
-            proc = StreamProcessor(engine.tok, thinking_capable=engine.backend_name == "qwen36")
+            proc = StreamProcessor(engine.tok, thinking_capable=False)
             final_result = None
             first_token_t = None
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -1230,13 +1169,6 @@ async def anthropic_messages(request: Request):
                 if first_token_t is None and item:
                     first_token_t = time.perf_counter()
 
-                # Advance the thinking state machine but do NOT emit thinking
-                # blocks.  We cannot produce the cryptographic signature that
-                # the official Anthropic API attaches via signature_delta;
-                # Claude Desktop validates it and DROPS every content block
-                # that follows an invalid thinking block -- including tool_use
-                # (e.g. AskUserQuestion), which is why the user's selection
-                # was lost as "(no content)".
                 proc.drain_thinking()
 
                 for delta in proc.drain_content():
@@ -1340,18 +1272,7 @@ async def anthropic_messages(request: Request):
         sampling_params=sampling_params,
     )
     _raw_anth = await _tokenize_decode(engine, result["committed_token_ids"])
-    if engine.backend_name != "qwen36":
-        # Non-thinking backends (e.g. Laguna) never emit a <think> block --
-        # see the matching guard in /v1/completions for why unconditionally
-        # wrapping in a synthetic <think> prefix would eat the whole response.
-        text = _raw_anth.replace("�", "").strip()
-    else:
-        _raw_anth_full = (
-            _raw_anth
-            if _raw_anth.startswith(chr(60) + "think" + chr(62))
-            else (chr(60) + "think" + chr(62) + "\n" + _raw_anth)
-        )
-        text = strip_thinking(_raw_anth_full)
+    text = _visible_text_from_model_output(_raw_anth)
     metrics.record_request(
         "messages",
         result["prompt_tokens"],
