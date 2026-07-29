@@ -191,6 +191,21 @@ class TestIndependentWorkspace:
             "不能跨 group 共享"
         )
 
+    def test_graph_workspaces_use_shape_only_kv_contracts(self):
+        """CG planning must not allocate full dummy K/V caches before rebind."""
+        pytest.importorskip("torch")
+        from runtime.backends.laguna_cuda_graph import LagunaCudaGraphVerify
+        from runtime.backends.laguna_dflash_cudagraph import DFlashDraftCudaGraph
+        from runtime.backends.laguna_sparkinfer_attn import SparkinferDecodeWorkspace
+
+        for source in (
+            inspect.getsource(SparkinferDecodeWorkspace.__init__),
+            inspect.getsource(LagunaCudaGraphVerify._init_workspaces),
+            inspect.getsource(DFlashDraftCudaGraph._init_workspace),
+        ):
+            assert "PagedAttentionWorkspace.for_contract(" in source
+            assert "PagedAttentionWorkspace.for_tensors(" not in source
+
 
 class TestDependencySurfaces:
     """验证图路径只依赖 owned runtime context 与 Sparkinfer。"""

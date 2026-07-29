@@ -195,10 +195,9 @@ class LagunaCudaGraphDecode:
                 key_cache = key_cache.view(torch.float8_e4m3fn)
                 value_cache = value_cache.view(torch.float8_e4m3fn)
 
-            # Bind real KV caches immediately to release dummy fp8 tensors
-            # allocated in SparkinferDecodeWorkspace.__init__ (~128 MB per
-            # full-attention workspace at 128K context).  Q and output are
-            # still rebound per-layer during capture from model internals.
+            # Replace the zero-stride planning views with real cache storage
+            # before graph capture. Q and output are rebound per-layer during
+            # capture from model internals.
             ws._k_cache = key_cache
             ws._v_cache = value_cache
 
@@ -666,18 +665,28 @@ class LagunaCudaGraphVerify:
             else:
                 max_pages = self.blocks_per_slot + 16  # margin for generated tokens
 
-            # Dummy tensors for workspace creation
-            q = torch.zeros(nt, nqh, 128, dtype=torch.bfloat16, device=self.device)
-            k_cache = torch.zeros(
-                max_pages, self.block_size, nkvh, 128, dtype=torch.float8_e4m3fn, device=self.device
+            # Keep only shape-only K/V planning views until real cache
+            # storage is bound before capture.
+            ws = PagedAttentionWorkspace.for_contract(
+                mode="verify",
+                device=self.device,
+                dtype=torch.bfloat16,
+                kv_dtype=torch.float8_e4m3fn,
+                num_q_heads=nqh,
+                num_kv_heads=nkvh,
+                head_dim_qk=128,
+                head_dim_vo=128,
+                page_size=self.block_size,
+                max_total_q=nt,
+                num_cache_pages=max_pages,
+                use_cuda_graph=True,
             )
-            v_cache = torch.zeros(
-                max_pages, self.block_size, nkvh, 128, dtype=torch.float8_e4m3fn, device=self.device
-            )
-
-            ws = PagedAttentionWorkspace.for_tensors(
-                mode="verify", q=q, k_cache=k_cache, v_cache=v_cache, use_cuda_graph=True
-            )
+            assert ws._plan_q is not None
+            assert ws._plan_k_cache is not None
+            assert ws._plan_v_cache is not None
+            q = ws._plan_q
+            k_cache = ws._plan_k_cache
+            v_cache = ws._plan_v_cache
 
             # Create CG-compatible plan at max context
             max_kv = max_pages * self.block_size - 1

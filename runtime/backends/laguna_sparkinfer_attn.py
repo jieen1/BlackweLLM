@@ -245,27 +245,31 @@ class SparkinferDecodeWorkspace:
         self.device = torch.device(device)
         self.page_size = page_size
 
-        # Dummy tensors for workspace creation (real ones bound at capture)
-        self._q = torch.zeros(1, num_q_heads, head_dim, dtype=torch.bfloat16, device=self.device)
-        self._k_cache = torch.zeros(
-            max_pages,
-            page_size,
-            num_kv_heads,
-            head_dim,
-            dtype=torch.float8_e4m3fn,
+        # The planner only consumes shape, dtype, and device for this static
+        # contract. ``for_contract`` keeps those K/V views zero-stride until
+        # real cache storage is bound immediately before graph capture.
+        self._workspace = PagedAttentionWorkspace.for_contract(
+            mode="decode",
             device=self.device,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.float8_e4m3fn,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            page_size=page_size,
+            max_total_q=1,
+            num_cache_pages=max_pages,
+            use_cuda_graph=True,
         )
-        self._v_cache = torch.zeros(
-            max_pages,
-            page_size,
-            num_kv_heads,
-            head_dim,
-            dtype=torch.float8_e4m3fn,
-            device=self.device,
-        )
-        self._output = torch.zeros(
-            1, num_q_heads, head_dim, dtype=torch.bfloat16, device=self.device
-        )
+        assert self._workspace._plan_q is not None
+        assert self._workspace._plan_k_cache is not None
+        assert self._workspace._plan_v_cache is not None
+        assert self._workspace._plan_output is not None
+        self._q = self._workspace._plan_q
+        self._k_cache = self._workspace._plan_k_cache
+        self._v_cache = self._workspace._plan_v_cache
+        self._output = self._workspace._plan_output
         self._descale = torch.ones(1, dtype=torch.float32, device=self.device)
         self._k_descale = self._descale
         self._v_descale = self._descale
@@ -273,13 +277,6 @@ class SparkinferDecodeWorkspace:
         # Create graph-mode workspace with prepare_decode_graph_replay_state.
         # Requires sparkinfer commit 0a7b143+ (fixes capacity underestimation
         # for windowed attention with small page counts).
-        self._workspace = PagedAttentionWorkspace.for_tensors(
-            mode="decode",
-            q=self._q,
-            k_cache=self._k_cache,
-            v_cache=self._v_cache,
-            use_cuda_graph=True,
-        )
         self._workspace.prepare_decode_graph_replay_state(
             batch=1, max_page_table_width=max_pages, window_left=window_left
         )

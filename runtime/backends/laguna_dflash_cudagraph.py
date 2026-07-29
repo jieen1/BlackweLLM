@@ -126,29 +126,29 @@ class DFlashDraftCudaGraph:
         from runtime.backends.laguna_cuda_graph import _SparkinferCGExtendMetadata
 
         max_pages = self._draft_blocks_per_slot
-        q = torch.zeros(
-            self.num_tokens,
-            DRAFT_NUM_QO_HEADS,
-            DRAFT_HEAD_DIM,
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
-        k_cache = torch.zeros(
-            max_pages,
-            self.block_size,
-            DRAFT_NUM_KV_HEADS,
-            DRAFT_HEAD_DIM,
-            dtype=torch.float8_e4m3fn,
-            device=self.device,
-        )
-        v_cache = torch.zeros_like(k_cache)
-        workspace = PagedAttentionWorkspace.for_tensors(
+        # The workspace planner requires only structural tensor properties.
+        # Hold zero-stride views here and bind the draft's real KV cache before
+        # capture instead of allocating a full temporary cache.
+        workspace = PagedAttentionWorkspace.for_contract(
             mode="verify",
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
+            device=self.device,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.float8_e4m3fn,
+            num_q_heads=DRAFT_NUM_QO_HEADS,
+            num_kv_heads=DRAFT_NUM_KV_HEADS,
+            head_dim_qk=DRAFT_HEAD_DIM,
+            head_dim_vo=DRAFT_HEAD_DIM,
+            page_size=self.block_size,
+            max_total_q=self.num_tokens,
+            num_cache_pages=max_pages,
             use_cuda_graph=True,
         )
+        assert workspace._plan_q is not None
+        assert workspace._plan_k_cache is not None
+        assert workspace._plan_v_cache is not None
+        q = workspace._plan_q
+        k_cache = workspace._plan_k_cache
+        v_cache = workspace._plan_v_cache
 
         max_kv = max_pages * self.block_size - 1
         capture_page_table = torch.arange(
