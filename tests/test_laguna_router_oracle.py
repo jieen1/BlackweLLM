@@ -7,6 +7,7 @@ import pytest
 from tools.laguna_router_oracle import (
     DEFAULT_FAMILIES,
     DEFAULT_ROWS,
+    _load_live_logits,
     parse_families,
     parse_rows,
 )
@@ -38,3 +39,24 @@ def test_parse_families_accepts_a_subset() -> None:
 def test_parse_families_rejects_invalid_names(value: str) -> None:
     with pytest.raises(argparse.ArgumentTypeError):
         parse_families(value)
+
+
+def test_load_live_logits_accepts_the_production_gate_tensor_contract(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    path = tmp_path / "live.pt"
+    torch.save({"layer_1": torch.zeros((16, 256), dtype=torch.float32)}, path)
+
+    logits = _load_live_logits(torch, path)
+
+    assert tuple(logits) == ("layer_1",)
+    assert logits["layer_1"].shape == (16, 256)
+    assert logits["layer_1"].dtype == torch.float32
+
+
+def test_load_live_logits_rejects_an_invalid_gate_tensor(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    path = tmp_path / "invalid.pt"
+    torch.save({"layer_1": torch.zeros((16, 255), dtype=torch.float32)}, path)
+
+    with pytest.raises(ValueError, match="invalid live router logits"):
+        _load_live_logits(torch, path)

@@ -156,6 +156,25 @@ def _load_biases(torch: Any, checkpoint: Path | None) -> dict[str, Any]:
     }
 
 
+def _load_live_logits(torch: Any, path: Path) -> dict[str, Any]:
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError("live router logits must be a non-empty tensor mapping")
+    logits: dict[str, Any] = {}
+    for layer_name, tensor in sorted(payload.items()):
+        if (
+            not isinstance(layer_name, str)
+            or not layer_name.startswith("layer_")
+            or not isinstance(tensor, torch.Tensor)
+            or tensor.dtype != torch.float32
+            or tensor.ndim != 2
+            or tensor.shape[1] != EXPERTS
+        ):
+            raise ValueError(f"invalid live router logits for {layer_name!r}")
+        logits[layer_name] = tensor.contiguous()
+    return logits
+
+
 def _vllm_oracle(torch: Any, logits: Any, bias: Any) -> tuple[Any, Any]:
     from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
         fused_topk_bias,
@@ -241,6 +260,52 @@ def capture(args: argparse.Namespace) -> Path:
     return destination
 
 
+def capture_live(args: argparse.Namespace) -> Path:
+    """Freeze vLLM routing for logits recorded from a production forward."""
+    torch = _require_torch()
+    live_logits = _load_live_logits(torch, args.logits)
+    checkpoint_biases = _load_biases(torch, args.checkpoint)
+    unknown_layers = sorted(set(live_logits) - set(checkpoint_biases))
+    if unknown_layers:
+        raise ValueError(f"live router logits have no checkpoint bias: {unknown_layers}")
+
+    inputs: dict[str, Any] = {}
+    biases: dict[str, Any] = {}
+    references: dict[str, dict[str, Any]] = {}
+    for layer_name, cpu_logits in live_logits.items():
+        input_name = f"live-{layer_name}"
+        inputs[input_name] = cpu_logits
+        biases[layer_name] = checkpoint_biases[layer_name].cpu()
+        weights, ids = _vllm_oracle(
+            torch, cpu_logits.to(device="cuda"), checkpoint_biases[layer_name]
+        )
+        references[f"{input_name}:{layer_name}"] = {
+            "weights": weights.cpu(),
+            "ids": ids.cpu(),
+        }
+
+    torch.cuda.synchronize()
+    fingerprint_material = b"".join(
+        name.encode() + tensor.numpy().tobytes() for name, tensor in live_logits.items()
+    )
+    fingerprint = hashlib.sha256(fingerprint_material).hexdigest()[:16]
+    destination = args.output or _default_root() / f"live-{fingerprint}"
+    payload = {"inputs": inputs, "biases": biases, "references": references}
+    metadata = {
+        "artifact_version": 1,
+        "capture_git_sha": _git_sha(),
+        "experts": EXPERTS,
+        "top_k": TOP_K,
+        "fingerprint": fingerprint,
+        "kind": "live-production-router-logits",
+        "layers": sorted(live_logits),
+        "source_logits": str(args.logits),
+        "vllm_oracle": "fused_topk_bias(sigmoid, renormalize=True, routed_scaling_factor=1.0)",
+    }
+    _write_artifact(destination, payload, metadata)
+    return destination
+
+
 def verify(args: argparse.Namespace) -> dict[str, int]:
     """Compare the native C ABI with a frozen vLLM artifact exactly."""
     import torch
@@ -255,30 +320,27 @@ def verify(args: argparse.Namespace) -> dict[str, int]:
     payload = torch.load(payload_path, map_location="cpu", weights_only=True)
     router = LagunaRouterLibrary.load()
     checked = 0
-    for input_name, cpu_logits in payload["inputs"].items():
+    for reference_name, reference in payload["references"].items():
+        input_name, bias_name = reference_name.split(":", maxsplit=1)
+        cpu_logits = payload["inputs"][input_name]
         logits = cpu_logits.to(device="cuda", dtype=torch.float32)
         weights = torch.empty((logits.shape[0], TOP_K), dtype=torch.float32, device="cuda")
         ids = torch.empty((logits.shape[0], TOP_K), dtype=torch.int32, device="cuda")
-        for bias_name, cpu_bias in payload["biases"].items():
-            got_weights, got_ids = router.launch(
-                logits, cpu_bias.to(device="cuda", dtype=torch.float32), weights, ids
-            )
-            torch.cuda.synchronize()
-            reference = payload["references"][f"{input_name}:{bias_name}"]
-            expected_weights = reference["weights"]
-            expected_ids = reference["ids"]
-            if not torch.equal(got_ids.cpu(), expected_ids):
-                raise AssertionError(f"router ids differ for {input_name}:{bias_name}")
-            if not torch.equal(got_weights.cpu(), expected_weights):
-                raise AssertionError(f"router weights differ for {input_name}:{bias_name}")
-            sorted_ids = torch.sort(got_ids, dim=1).values
-            if logits.shape[0] and torch.any(sorted_ids[:, 1:] == sorted_ids[:, :-1]):
-                raise AssertionError(f"router duplicated an expert id for {input_name}:{bias_name}")
-            if not bool(torch.isfinite(got_weights).all()):
-                raise AssertionError(
-                    f"router produced non-finite weights for {input_name}:{bias_name}"
-                )
-            checked += 1
+        bias = payload["biases"][bias_name].to(device="cuda", dtype=torch.float32)
+        got_weights, got_ids = router.launch(logits, bias, weights, ids)
+        torch.cuda.synchronize()
+        expected_weights = reference["weights"]
+        expected_ids = reference["ids"]
+        if not torch.equal(got_ids.cpu(), expected_ids):
+            raise AssertionError(f"router ids differ for {reference_name}")
+        if not torch.equal(got_weights.cpu(), expected_weights):
+            raise AssertionError(f"router weights differ for {reference_name}")
+        sorted_ids = torch.sort(got_ids, dim=1).values
+        if logits.shape[0] and torch.any(sorted_ids[:, 1:] == sorted_ids[:, :-1]):
+            raise AssertionError(f"router duplicated an expert id for {reference_name}")
+        if not bool(torch.isfinite(got_weights).all()):
+            raise AssertionError(f"router produced non-finite weights for {reference_name}")
+        checked += 1
     return {"cases": checked, "rows": len(payload["inputs"]), "biases": len(payload["biases"])}
 
 
@@ -290,6 +352,12 @@ def _parser() -> argparse.ArgumentParser:
     capture_parser.add_argument("--families", type=parse_families, default=DEFAULT_FAMILIES)
     capture_parser.add_argument("--checkpoint", type=Path)
     capture_parser.add_argument("--output", type=Path)
+    live_parser = subparsers.add_parser(
+        "capture-live", help="freeze vLLM routing for production gate logits"
+    )
+    live_parser.add_argument("--logits", required=True, type=Path)
+    live_parser.add_argument("--checkpoint", type=Path)
+    live_parser.add_argument("--output", type=Path)
     verify_parser = subparsers.add_parser(
         "verify", help="verify native router against frozen output"
     )
@@ -301,6 +369,8 @@ def main() -> None:
     args = _parser().parse_args()
     if args.command == "capture":
         print(json.dumps({"artifact": str(capture(args))}, sort_keys=True))
+    elif args.command == "capture-live":
+        print(json.dumps({"artifact": str(capture_live(args))}, sort_keys=True))
     else:
         print(json.dumps(verify(args), sort_keys=True))
 
