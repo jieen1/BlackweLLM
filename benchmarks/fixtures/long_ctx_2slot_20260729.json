@@ -1,0 +1,60 @@
+{
+  "date": "2026-07-29T13:38:09.886767",
+  "results": [
+    {
+      "ctx_k": 4,
+      "slot": 0,
+      "decode_tok_s": 325.1,
+      "ttft_ms": 825.0,
+      "prefill_tok_s": 4965.0,
+      "itl_ms": 3.08,
+      "accept": 0.9852,
+      "tok_per_step": 14.11,
+      "wall_s": 1.2
+    },
+    {
+      "ctx_k": 64,
+      "slot": 0,
+      "decode_tok_s": 266.3,
+      "ttft_ms": 14487.0,
+      "prefill_tok_s": 4524.0,
+      "itl_ms": 3.75,
+      "accept": 0.9407,
+      "tok_per_step": 14.11,
+      "wall_s": 15.0
+    },
+    {
+      "ctx_k": 128,
+      "slot": 0,
+      "decode_tok_s": 257.0,
+      "ttft_ms": 37160.0,
+      "prefill_tok_s": 3527.0,
+      "itl_ms": 3.89,
+      "accept": 0.9556,
+      "tok_per_step": 14.11,
+      "wall_s": 37.7
+    },
+    {
+      "ctx_k": 4,
+      "slot": 1,
+      "decode_tok_s": 350.7,
+      "ttft_ms": 821.0,
+      "prefill_tok_s": 4991.0,
+      "itl_ms": 2.85,
+      "accept": 0.9852,
+      "tok_per_step": 14.11,
+      "wall_s": 1.2
+    },
+    {
+      "ctx_k": 200,
+      "slot": 0,
+      "decode_tok_s": 190.8,
+      "ttft_ms": 89903.0,
+      "prefill_tok_s": 2278.0,
+      "itl_ms": 5.24,
+      "accept": 0.9733,
+      "tok_per_step": 12.6,
+      "wall_s": 90.2
+    }
+  ]
+}
