@@ -180,7 +180,27 @@ class DFlashEngine:
         )
 
     def _load_draft_model(self, model_path: str | None) -> Any:
-        """Load the DFlash draft model via self-built loader (阶段3 vLLM removal)."""
+        """Load the DFlash draft model.
+
+        SpeculativeConfig/ModelConfig construction still goes through
+        vLLM's real dataclasses (config plumbing, not model code -- same
+        tier as VllmConfig/ModelConfig already accepted everywhere else in
+        this runtime, see notes/2026-07-27-vllm-complete-removal-
+        implementation-plan.md 阶段3). The draft model class itself is
+        always built + loaded by runtime.model_loading.
+        load_laguna_dflash_draft_model (self-built DFlashLagunaModel/
+        DFlashLagunaForCausalLM equivalent, see runtime/model/
+        laguna_dflash_model.py) -- 阶段3 replaced vLLM's load_dflash_model
+        (get_model() -> full registry lookup + AutoWeightsLoader) with
+        this after two bit-exact passes (benchmarks/
+        _phase3_dflash_bitexact_validate*.py). 任务#46 removed the
+        QSR_DFLASH_MODEL_LOADER=vllm escape hatch entirely (see notes doc
+        任务#46): it had accumulated real, never-fully-fixed regressions
+        (a TP/PP GroupCoordinator gap, and a deeper lm_head/quant_method
+        tying incompatibility between vLLM's load_dflash_model() and our
+        self-built PlainLMHead -- both found via 任务#45's GPU validation,
+        neither worth fixing in code about to be deleted).
+        """
         from vllm.config import ModelConfig, SpeculativeConfig
         from vllm.config import replace as vllm_replace
 
@@ -210,15 +230,20 @@ class DFlashEngine:
             enforce_eager=True,
         )
 
+        # vllm_replace(dataclass_instance, **kwargs) reconstructs
+        # type(dataclass_instance)(**merged_fields) -- verified directly
+        # against vllm.config.replace's real source, not assumed -- so it
+        # transparently produces ANOTHER SelfBuiltVllmConfig here, which
+        # load_laguna_dflash_draft_model (self-built, duck-typed) is fine
+        # with.
         draft_vllm_config = vllm_replace(
             self.vllm_config,
             speculative_config=spec_config,
         )
 
-        # Self-built DFlash draft model loader (阶段3, vLLM removal)
-        from runtime.model_loading import load_laguna_dflash_draft_model
-
         with set_current_vllm_config(draft_vllm_config):
+            from runtime.model_loading import load_laguna_dflash_draft_model
+
             draft_model = load_laguna_dflash_draft_model(
                 target_model=self.backend.model,
                 draft_vllm_config=draft_vllm_config,
@@ -313,7 +338,52 @@ class DFlashEngine:
         )
 
     def _patch_draft_sparkinfer(self) -> None:
-        """Patch draft model attention layers to use sparkinfer (zero FlashInfer dep)."""
+        """Patch draft model attention layers to use sparkinfer (zero FlashInfer dep).
+
+        阶段7-补充: also replaces each draft attention layer's whole module
+        with ``BFAttention`` (``replace_vllm_attention()``, same call the
+        main model already goes through in ``LagunaBackend.__init__``) --
+        previously this only swapped ``.impl``, leaving ``self.attn``
+        itself as a real vLLM ``Attention`` instance (now
+        ``SelfBuiltAttentionPlaceholder``). That was fine as long as
+        vLLM's own ``Attention.forward()`` handled the
+        get_forward_context()/custom-op bridge into ``.impl.forward()``,
+        but ``SelfBuiltAttentionPlaceholder`` doesn't implement that (see
+        its module docstring) -- it was only ever built to satisfy the
+        construction-time attribute contract, not to be called as a real
+        forward() target. Routing through BFAttention instead sidesteps
+        needing to replicate that bridge at all: BFAttention.forward()
+        already reads ``bf_attn_context`` (a lightweight context this
+        file already sets up around every draft-model forward call, see
+        e.g. the ``with bf_attn_context(...):`` blocks below -- it was
+        unused for the draft model until now, only ever consumed by the
+        main model's BFAttention layers). ``.impl`` must be set to the
+        real ``SparkinferAttentionImpl`` (with the draft-specific
+        ``window_left=DRAFT_WINDOW - 1``, different from the main
+        model's per-layer-group window) BEFORE calling
+        ``replace_vllm_attention()``, since it reads ``attn_layer.impl.
+        scale``/``.window_left`` to construct each BFAttention -- same
+        order LagunaBackend.__init__ already uses for the main model.
+
+        ``replace_vllm_attention()``'s default parent-resolution logic
+        (split ``layer_name`` on ``"."``, walk the model tree by those
+        exact path components) does NOT work here and needs its
+        ``resolve_parent`` override: draft attention layers are
+        registered under a global-index ``layer_name`` (e.g.
+        ``"...layers.48.attn"``, laguna_dflash_model.py's module
+        docstring explains why -- offset past the main model's 48 layers
+        so both share one static_forward_context without key collisions)
+        that doesn't match this draft model's own local module tree
+        (``self.draft_model.model.layers`` is only ever indices 0-5).
+        Confirmed by an actual GPU run, not spotted by inspection -- the
+        default logic raised ``IndexError: index 48 is out of range``
+        trying to index ``layers[48]``. Resolved the same way
+        ``_alloc_draft_kv_cache``'s fallback discovery branch above
+        already does it: walk ``draft_model.model.layers`` directly by
+        real attribute access, matching each layer's ``self_attn.attn``
+        against ``self._draft_attn_layers`` by ``layer_name``.
+        """
+        from runtime.backends.bf_attention import replace_vllm_attention
         from runtime.backends.laguna_sparkinfer_attn import SparkinferAttentionImpl
 
         for name in self._draft_layer_names:
@@ -325,6 +395,25 @@ class DFlashEngine:
                 num_kv_heads=attn.num_kv_heads,
                 window_left=DRAFT_WINDOW - 1,
             )
+
+        draft_inner = (
+            self.draft_model.model if hasattr(self.draft_model, "model") else self.draft_model
+        )
+        parents_by_name: dict[str, Any] = {}
+        for layer in draft_inner.layers:
+            self_attn = getattr(layer, "self_attn", None)
+            if self_attn is not None and hasattr(self_attn, "attn"):
+                parents_by_name[self_attn.attn.layer_name] = self_attn
+
+        def _resolve_parent(layer_name: str) -> tuple[Any, str]:
+            return parents_by_name[layer_name], "attn"
+
+        replace_vllm_attention(
+            self.draft_model,
+            self._draft_attn_layers,
+            self._draft_kv_caches,
+            resolve_parent=_resolve_parent,
+        )
         logger.info(
             "DFlash: draft attention patched with sparkinfer (%d layers)",
             len(self._draft_layer_names),
@@ -621,15 +710,26 @@ class DFlashEngine:
             name: self._draft_slot_mapping[:num_tokens] for name in self._draft_layer_names
         }
 
-        # Run draft model forward
-        with set_forward_context(
-            attn_metadata_dict, self.vllm_config, slot_mapping=slot_mapping_dict, skip_compiled=True
-        ):
-            draft_hidden = self.draft_model(
-                input_ids=self._draft_input_ids[:num_tokens],
-                positions=self._draft_positions[:num_tokens],
-                inputs_embeds=None,
-            )
+        # Run draft model forward. bf_attn_context added 阶段7-补充: draft
+        # attention layers are now BFAttention instances too (see
+        # _patch_draft_sparkinfer's docstring), which read this context
+        # instead of vLLM's real get_forward_context() -- this call site
+        # previously only set up set_forward_context because the real
+        # (now-replaced) Attention.forward() used that exclusively.
+        # Caught by an actual GPU run (RuntimeError: BFAttention was
+        # called without a scoped attention context), not by inspection.
+        with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
+            with set_forward_context(
+                attn_metadata_dict,
+                self.vllm_config,
+                slot_mapping=slot_mapping_dict,
+                skip_compiled=True,
+            ):
+                draft_hidden = self.draft_model(
+                    input_ids=self._draft_input_ids[:num_tokens],
+                    positions=self._draft_positions[:num_tokens],
+                    inputs_embeds=None,
+                )
 
         # Compute draft logits and sample greedily. Position 0's logits are
         # never used (only positions 1..15, the mask positions, predict the
@@ -902,7 +1002,6 @@ class DFlashEngine:
             num_positions: number of positions to precompute
             position_offset: absolute position offset (for chunked prefill)
         """
-        _debug_chunk = os.environ.get("QSR_DEBUG_CHUNK_CHECK")
         # Combine hidden states: [N, 18432] → [N, 3072]
         combined_input = torch.cat(aux_hidden_states, dim=-1)
         combined = self.draft_model.combine_hidden_states(combined_input)
@@ -933,36 +1032,31 @@ class DFlashEngine:
             position_offset += drop
             num_positions = ring_slots
 
-        if _debug_chunk in ("1", "2"):
+        if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
             logger.warning(
                 "CHUNK_CHECK combined_stats bs=%d shape=%s mean=%.6g std=%.6g "
                 "first_row_mean=%.6g last_row_mean=%.6g",
-                bs,
-                tuple(combined.shape),
-                combined.float().mean().item(),
-                combined.float().std().item(),
-                combined[0].float().mean().item(),
+                bs, tuple(combined.shape), combined.float().mean().item(),
+                combined.float().std().item(), combined[0].float().mean().item(),
                 combined[-1].float().mean().item(),
             )
 
         context_positions = torch.arange(
             position_offset, position_offset + num_positions, dtype=torch.long, device=self.device
         )
-        # Vectorized ring-buffer slot mapping (was Python for-loop, O(N) interpreter overhead)
-        ring_block = (context_positions % ring_slots) // bs
-        ring_off = context_positions % bs
-        slot_mappings = (draft_base + ring_block) * bs + ring_off
+        slot_mappings = torch.zeros(num_positions, dtype=torch.long, device=self.device)
+        for i in range(num_positions):
+            pos = position_offset + i
+            ring_block = (pos % ring_slots) // bs
+            ring_off = pos % bs
+            slot_mappings[i] = (draft_base + ring_block) * bs + ring_off
 
-        if _debug_chunk in ("1", "2"):
+        if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
             n_unique = torch.unique(slot_mappings).numel()
             logger.warning(
                 "CHUNK_CHECK draft_kv_precompute bs=%d num_positions=%d ring_slots=%d "
                 "position_offset=%d n_unique_slot_mappings=%d (dup=%d)",
-                bs,
-                num_positions,
-                ring_slots,
-                position_offset,
-                n_unique,
+                bs, num_positions, ring_slots, position_offset, n_unique,
                 num_positions - n_unique,
             )
 
@@ -972,7 +1066,7 @@ class DFlashEngine:
             slot_mappings,
         )
 
-        if _debug_chunk in ("1", "2"):
+        if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
             name0 = self._draft_layer_names[0]
             kv = self._draft_kv_caches[name0]
             sample_idx = [0, num_positions // 2, num_positions - 1]
@@ -984,14 +1078,8 @@ class DFlashEngine:
                 logger.warning(
                     "CHUNK_CHECK draft_kv_readback bs=%d i=%d pos=%d slot_mapping=%d "
                     "block=%d off=%d k_abs_sum=%.6g v_abs_sum=%.6g k_nonzero=%s",
-                    bs,
-                    i,
-                    position_offset + i,
-                    sm,
-                    blk,
-                    off,
-                    k_val.abs().sum().item(),
-                    v_val.abs().sum().item(),
+                    bs, i, position_offset + i, sm, blk, off,
+                    k_val.abs().sum().item(), v_val.abs().sum().item(),
                     bool((k_val != 0).any().item()),
                 )
 
@@ -1132,7 +1220,6 @@ class DFlashEngine:
 
         Returns (tokens, stats).
         """
-        _debug_chunk = os.environ.get("QSR_DEBUG_CHUNK_CHECK")
         backend = self.backend
         prompt_len = len(prompt_ids)
         cached_kv_len = backend.slot_kv_len[slot]
@@ -1197,15 +1284,11 @@ class DFlashEngine:
                 aux_offset = prompt_len - aux_len
             else:
                 aux_offset = prompt_len - aux_len
-            if _debug_chunk in ("1", "2"):
+            if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
                 logger.warning(
                     "CHUNK_CHECK generate_verify_only prompt_len=%d prefix_len=%d "
                     "aux_len=%d aux_offset=%d n_aux_tensors=%d",
-                    prompt_len,
-                    prefix_len,
-                    aux_len,
-                    aux_offset,
-                    len(aux_hidden_states),
+                    prompt_len, prefix_len, aux_len, aux_offset, len(aux_hidden_states),
                 )
             self._bulk_precompute_context_kv(slot, aux_hidden_states, aux_len, aux_offset)
 
@@ -1225,28 +1308,16 @@ class DFlashEngine:
         if _force_sync:
             torch.cuda.synchronize()
 
-        if _debug_chunk in ("1", "2"):
+        if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
             logger.warning(
                 "CHUNK_CHECK initial_draft bs=%d bonus_token=%d kv_len=%d draft_tokens=%s",
-                self.block_size,
-                bonus_token,
-                kv_len,
-                draft_tokens,
+                self.block_size, bonus_token, kv_len, draft_tokens,
             )
 
         tokens = [first_token]
         total_draft = 0
         total_accepted = 0
         num_steps = 0
-
-        # ── Cache loop-invariant values (avoid per-iteration lookups) ──
-        _debug_logits_file = os.environ.get("QSR_DEBUG_VERIFY_LOGITS_FILE")
-        _phys = _physical_slot(slot)
-        _draft_base = _phys * self._draft_blocks_per_slot
-        _ring_slots = self._draft_blocks_per_slot * self.block_size
-        _bs = self.block_size
-        # Pre-allocate position buffer (max 16 positions per round)
-        _pos_buf = torch.arange(0, NUM_QUERY_PER_REQ, dtype=torch.long, device=self.device)
 
         while len(tokens) < max_tokens:
             num_steps += 1
@@ -1271,34 +1342,25 @@ class DFlashEngine:
             if _force_sync:
                 torch.cuda.synchronize()
 
-            if _debug_logits_file:
+            verify_dump_path = os.environ.get("QSR_DEBUG_VERIFY_LOGITS_FILE")
+            if verify_dump_path:
                 vl = verify_logits[:NUM_QUERY_PER_REQ].float()
                 vtop2 = vl.topk(2, dim=-1)
                 vpositions = []
                 for j in range(vl.shape[0]):
-                    vpositions.append(
-                        {
-                            "top1_tok": int(vtop2.indices[j, 0]),
-                            "top1_val": round(float(vtop2.values[j, 0]), 6),
-                            "top2_tok": int(vtop2.indices[j, 1]),
-                            "top2_val": round(float(vtop2.values[j, 1]), 6),
-                        }
-                    )
+                    vpositions.append({
+                        "top1_tok": int(vtop2.indices[j, 0]),
+                        "top1_val": round(float(vtop2.values[j, 0]), 6),
+                        "top2_tok": int(vtop2.indices[j, 1]),
+                        "top2_val": round(float(vtop2.values[j, 1]), 6),
+                    })
                 import json as _json
-
                 with open(verify_dump_path, "a") as _f:
-                    _f.write(
-                        _json.dumps(
-                            {
-                                "bs": self.block_size,
-                                "kv_len": kv_len,
-                                "bonus_token": bonus_token,
-                                "draft_tokens": draft_tokens,
-                                "positions": vpositions,
-                            }
-                        )
-                        + "\n"
-                    )
+                    _f.write(_json.dumps({
+                        "bs": self.block_size, "kv_len": kv_len,
+                        "bonus_token": bonus_token, "draft_tokens": draft_tokens,
+                        "positions": vpositions,
+                    }) + "\n")
 
             decision = _verify_only_accept_reject(all_argmax, draft_tokens, bonus_token)
             num_accepted = decision["num_accepted"]
@@ -1313,18 +1375,12 @@ class DFlashEngine:
             # The recovery/bonus token remains pending and is not in KV yet.
             context_count = decision["context_count"]
 
-            if _debug_chunk in ("1", "2"):
+            if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
                 logger.warning(
                     "CHUNK_CHECK round bs=%d num_steps=%d kv_len=%d bonus_token=%d "
                     "draft_tokens=%s num_accepted=%d new_tokens=%s new_bonus=%d",
-                    self.block_size,
-                    num_steps,
-                    kv_len,
-                    bonus_token,
-                    draft_tokens,
-                    num_accepted,
-                    new_tokens,
-                    new_bonus,
+                    self.block_size, num_steps, kv_len, bonus_token, draft_tokens,
+                    num_accepted, new_tokens, new_bonus,
                 )
 
             # Step 4: Precompute draft context KV from committed verifier inputs.
@@ -1332,10 +1388,16 @@ class DFlashEngine:
                 aux_slice = [a[:context_count] for a in verify_aux]
                 combined_input = torch.cat(aux_slice, dim=-1)
                 combined = self.draft_model.combine_hidden_states(combined_input)
-                context_positions = _pos_buf[:context_count] + kv_len
-                ring_blocks = (context_positions % _ring_slots) // _bs
-                ring_offs = context_positions % _bs
-                slot_mappings = (_draft_base + ring_blocks) * _bs + ring_offs
+                bs = self.block_size
+                phys = _physical_slot(slot)
+                draft_base = phys * self._draft_blocks_per_slot
+                ring_slots = self._draft_blocks_per_slot * bs
+                context_positions = torch.arange(
+                    kv_len, kv_len + context_count, dtype=torch.long, device=self.device
+                )
+                ring_blocks = (context_positions % ring_slots) // bs
+                ring_offs = context_positions % bs
+                slot_mappings = (draft_base + ring_blocks) * bs + ring_offs
                 self.draft_model.precompute_and_store_context_kv(
                     combined, context_positions, slot_mappings
                 )
