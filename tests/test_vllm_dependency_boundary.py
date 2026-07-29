@@ -13,6 +13,7 @@ import ast
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
+_PRODUCTION_SOURCE_DIRECTORIES = ("runtime", "server", "bfdiag")
 
 # Qwen3.6's historical runner is archived under oracle/qwen36_vllm and is
 # excluded from production distributions. Runtime and server now have none.
@@ -71,7 +72,7 @@ def _imports_package(path: Path, package: str) -> bool:
 def _direct_import_files(package: str) -> set[str]:
     return {
         path.relative_to(_ROOT).as_posix()
-        for directory in ("runtime", "server")
+        for directory in _PRODUCTION_SOURCE_DIRECTORIES
         for path in (_ROOT / directory).rglob("*.py")
         if _imports_package(path, package)
     }
