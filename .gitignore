@@ -41,6 +41,7 @@ evalplus_*.log
 *.so
 *.o
 *.a
+runtime/kernels/_generated/
 
 # Pytest
 .pytest_cache/
