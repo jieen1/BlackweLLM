@@ -932,7 +932,7 @@ class DFlashEngine:
             position_offset += drop
             num_positions = ring_slots
 
-        if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+        if _debug_chunk in ("1", "2"):
             logger.warning(
                 "CHUNK_CHECK combined_stats bs=%d shape=%s mean=%.6g std=%.6g "
                 "first_row_mean=%.6g last_row_mean=%.6g",
@@ -949,7 +949,7 @@ class DFlashEngine:
         ring_off = context_positions % bs
         slot_mappings = (draft_base + ring_block) * bs + ring_off
 
-        if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+        if _debug_chunk in ("1", "2"):
             n_unique = torch.unique(slot_mappings).numel()
             logger.warning(
                 "CHUNK_CHECK draft_kv_precompute bs=%d num_positions=%d ring_slots=%d "
@@ -964,7 +964,7 @@ class DFlashEngine:
             slot_mappings,
         )
 
-        if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+        if _debug_chunk in ("1", "2"):
             name0 = self._draft_layer_names[0]
             kv = self._draft_kv_caches[name0]
             sample_idx = [0, num_positions // 2, num_positions - 1]
@@ -1182,7 +1182,7 @@ class DFlashEngine:
                 aux_offset = prompt_len - aux_len
             else:
                 aux_offset = prompt_len - aux_len
-            if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+            if _debug_chunk in ("1", "2"):
                 logger.warning(
                     "CHUNK_CHECK generate_verify_only prompt_len=%d prefix_len=%d "
                     "aux_len=%d aux_offset=%d n_aux_tensors=%d",
@@ -1206,7 +1206,7 @@ class DFlashEngine:
         if _force_sync:
             torch.cuda.synchronize()
 
-        if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+        if _debug_chunk in ("1", "2"):
             logger.warning(
                 "CHUNK_CHECK initial_draft bs=%d bonus_token=%d kv_len=%d draft_tokens=%s",
                 self.block_size, bonus_token, kv_len, draft_tokens,
@@ -1216,6 +1216,16 @@ class DFlashEngine:
         total_draft = 0
         total_accepted = 0
         num_steps = 0
+
+        # ── Cache loop-invariant values (avoid per-iteration lookups) ──
+        _debug_chunk = os.environ.get("QSR_DEBUG_CHUNK_CHECK")
+        _debug_logits_file = os.environ.get("QSR_DEBUG_VERIFY_LOGITS_FILE")
+        _phys = _physical_slot(slot)
+        _draft_base = _phys * self._draft_blocks_per_slot
+        _ring_slots = self._draft_blocks_per_slot * self.block_size
+        _bs = self.block_size
+        # Pre-allocate position buffer (max 16 positions per round)
+        _pos_buf = torch.arange(0, NUM_QUERY_PER_REQ, dtype=torch.long, device=self.device)
 
         while len(tokens) < max_tokens:
             num_steps += 1
@@ -1240,8 +1250,7 @@ class DFlashEngine:
             if _force_sync:
                 torch.cuda.synchronize()
 
-            verify_dump_path = os.environ.get("QSR_DEBUG_VERIFY_LOGITS_FILE")
-            if verify_dump_path:
+            if _debug_logits_file:
                 vl = verify_logits[:NUM_QUERY_PER_REQ].float()
                 vtop2 = vl.topk(2, dim=-1)
                 vpositions = []
@@ -1273,7 +1282,7 @@ class DFlashEngine:
             # The recovery/bonus token remains pending and is not in KV yet.
             context_count = decision["context_count"]
 
-            if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+            if _debug_chunk in ("1", "2"):
                 logger.warning(
                     "CHUNK_CHECK round bs=%d num_steps=%d kv_len=%d bonus_token=%d "
                     "draft_tokens=%s num_accepted=%d new_tokens=%s new_bonus=%d",
@@ -1282,20 +1291,14 @@ class DFlashEngine:
                 )
 
             # Step 4: Precompute draft context KV from committed verifier inputs.
-            if verify_aux is not None:
+            if verify_aux is not None and context_count > 0:
                 aux_slice = [a[:context_count] for a in verify_aux]
                 combined_input = torch.cat(aux_slice, dim=-1)
                 combined = self.draft_model.combine_hidden_states(combined_input)
-                bs = self.block_size
-                phys = _physical_slot(slot)
-                draft_base = phys * self._draft_blocks_per_slot
-                ring_slots = self._draft_blocks_per_slot * bs
-                context_positions = torch.arange(
-                    kv_len, kv_len + context_count, dtype=torch.long, device=self.device
-                )
-                ring_blocks = (context_positions % ring_slots) // bs
-                ring_offs = context_positions % bs
-                slot_mappings = (draft_base + ring_blocks) * bs + ring_offs
+                context_positions = _pos_buf[:context_count] + kv_len
+                ring_blocks = (context_positions % _ring_slots) // _bs
+                ring_offs = context_positions % _bs
+                slot_mappings = (_draft_base + ring_blocks) * _bs + ring_offs
                 self.draft_model.precompute_and_store_context_kv(
                     combined, context_positions, slot_mappings
                 )
@@ -1304,8 +1307,7 @@ class DFlashEngine:
 
             # Step 5: Update state
             backend.slot_kv_len[slot] += context_count
-            for tok in new_tokens:
-                backend.slot_committed_tokens[slot].append(tok)
+            backend.slot_committed_tokens[slot].extend(new_tokens)
             tokens.extend(new_tokens)
 
             # Check EOS
