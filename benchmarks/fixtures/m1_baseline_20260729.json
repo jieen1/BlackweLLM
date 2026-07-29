@@ -1,0 +1,38 @@
+{
+  "date": "2026-07-29T14:57:25.559181",
+  "git_head": "d3db0aa",
+  "results": {
+    "M1_4K": {
+      "ctx_k": 4,
+      "decode_tok_s": 3.8,
+      "itl_ms": 260.41,
+      "ttft_ms": 887.0,
+      "prefill_tok_s": 4617.0,
+      "tokens": 127
+    },
+    "M1_16K": {
+      "ctx_k": 16,
+      "decode_tok_s": 1.7,
+      "itl_ms": 587.3,
+      "ttft_ms": 3406.0,
+      "prefill_tok_s": 4811.0,
+      "tokens": 127
+    },
+    "M1_64K": {
+      "ctx_k": 64,
+      "decode_tok_s": 3.6,
+      "itl_ms": 279.06,
+      "ttft_ms": 17350.0,
+      "prefill_tok_s": 3777.0,
+      "tokens": 127
+    },
+    "M1_128K": {
+      "ctx_k": 128,
+      "decode_tok_s": 1.6,
+      "itl_ms": 635.66,
+      "ttft_ms": 43918.0,
+      "prefill_tok_s": 2984.0,
+      "tokens": 127
+    }
+  }
+}
