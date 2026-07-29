@@ -65,6 +65,15 @@ def test_laguna_runtime_modules_do_not_import_compat_vllm() -> None:
         ), f"{relative_path} must use runtime.laguna_runtime, not compat_vllm"
 
 
+def test_laguna_backend_has_no_dead_vllm_patch_hooks() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "runtime" / "backends" / "laguna.py"
+    ).read_text(encoding="utf-8")
+
+    assert "patch_nvfp4_" not in source
+    assert "_patch_rmsnorm_triton" not in source
+
+
 def test_laguna_backend_import_does_not_require_vllm() -> None:
     blocker = """
 import importlib.abc

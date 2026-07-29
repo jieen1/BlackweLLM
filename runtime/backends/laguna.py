@@ -165,13 +165,6 @@ class LagunaBackend:
         self._laguna_router_library = None
         self._laguna_router_arena = None
 
-        # Apply A2 patches before loading
-        from runtime.nvfp4_custom_gemm import patch_nvfp4_custom_gemm
-        from runtime.nvfp4_cutlass_direct_patch import patch_nvfp4_prefer_cutlass_direct
-
-        patch_nvfp4_prefer_cutlass_direct()
-        patch_nvfp4_custom_gemm()
-
         # The self-built model has no vLLM global-config reader.  Establish
         # the one-rank torch process group, then construct it directly.
         init_method = get_distributed_init_method("127.0.0.1", get_open_port())
@@ -185,9 +178,6 @@ class LagunaBackend:
         self.model = load_laguna_model(vllm_config)
         # Set IR op priority (fused RMSNorm C++ kernels) — normally done by worker init
         vllm_config.kernel_config.ir_op_priority.set_default()
-
-        # Replace vLLM RMSNorm with our Triton fused kernel (zero vLLM dep)
-        self._patch_rmsnorm_triton()
 
         # Patch MoE layers with the sparkinfer kernel (自研 kernel 集成,
         # zero vLLM dependency for the expert compute itself)
@@ -1645,37 +1635,6 @@ class LagunaBackend:
                 f"(got {id(actual):#x}, expected {id(expected):#x}). "
                 f"Rebind leak on exception path?"
             )
-
-    def _patch_rmsnorm_triton(self):
-        """Replace vLLM RMSNorm with Triton fused kernel (zero vLLM dependency).
-
-        vLLM 0.26.0 CustomOp binds _forward_method at __init__ time via
-        dispatch_forward(). Patching the class method alone has no effect on
-        already-constructed instances. We must also rebind each instance's
-        _forward_method after the class-level patch.
-        """
-        from vllm.model_executor.layers.layernorm import RMSNorm
-
-        from runtime.kernels.fused_rms_norm import fused_add_rms_norm, rms_norm
-
-        def _triton_forward(self_norm, x, residual=None):
-            if residual is None:
-                return rms_norm(x, self_norm.weight.data, self_norm.variance_epsilon)
-            out, new_res = fused_add_rms_norm(
-                x, residual, self_norm.weight.data, self_norm.variance_epsilon
-            )
-            return out, new_res
-
-        RMSNorm.forward_cuda = _triton_forward
-
-        # Re-dispatch all existing RMSNorm instances (vLLM 0.26.0 binds
-        # _forward_method at construction; class patch alone is insufficient)
-        patched = 0
-        for module in self.model.modules():
-            if isinstance(module, RMSNorm):
-                module._forward_method = _triton_forward.__get__(module, RMSNorm)
-                patched += 1
-        logger.info("Laguna: RMSNorm patched with Triton fused kernel (%d instances)", patched)
 
     def reset_slot(self, slot: int) -> None:
         self.slot_kv_len[slot] = 0

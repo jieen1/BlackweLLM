@@ -36,7 +36,6 @@ _APPROVED_DIRECT_IMPORT_FILES = {
     # target, it exists so Laguna's ledger entries above don't have to
     # carry qwen36's dependency weight.
     "runtime/compat_vllm_qwen36.py",
-    "runtime/backends/laguna.py",
     # runtime/backends/laguna_dflash_cudagraph.py removed 2026-07-28
     # (任务#41, vLLM removal plan 阶段8): its only vLLM/FlashInfer import
     # was inside DFlashVerifyCudaGraph, a FlashInfer-based main-model
