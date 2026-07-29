@@ -33,14 +33,9 @@ if TYPE_CHECKING:
     import torch
 
 __all__ = [
-    "FLA_CHUNK_SIZE",
     "EngineArgs",
-    "GDNAttentionMetadata",  # re-exported from vLLM (isinstance-sensitive)
-    "SM120GQAMetadata",  # re-exported from vLLM (isinstance-sensitive)
     "VllmConfig",
-    "AttentionBackendEnum",
     "bind_kv_cache",
-    "compute_causal_conv1d_metadata",
     "get_distributed_init_method",
     "get_gemma_rms_norm",
     "get_model",
@@ -48,10 +43,7 @@ __all__ = [
     "get_vllm_ir",
     "init_worker_distributed_environment",
     "load_eagle_model",
-    "prepare_chunk_indices",
-    "prepare_chunk_offsets",
     "set_current_vllm_config",
-    "register_backend",
     "set_forward_context",
     "get_flashinfer_metadata_builder",
     "get_common_attn_metadata_cls",
@@ -67,28 +59,22 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
-# Re-exported: SM120GQAMetadata (thin — vLLM dataclass, isinstance-sensitive)
-#
-# Cannot self-write: vLLM's SM120GQAImpl.forward() does isinstance() checks
-# against this class. Self-writing breaks the check. Will be replaced when
-# we own the model graph (V2/E1).
+# GDNAttentionMetadata/SM120GQAMetadata/AttentionBackendEnum/register_backend/
+# FLA chunk helpers/compute_causal_conv1d_metadata moved to
+# runtime/compat_vllm_qwen36.py (任务#42) -- every real consumer
+# (runtime/metadata_builders.py, runtime/cuda_graphs.py,
+# runtime/direct_model_runner.py) is exclusively the qwen36 tenant, never
+# Laguna (grep-verified: zero references anywhere in laguna*.py/
+# runtime/model/*.py/runtime/kernels/*.py). Having them as unconditional
+# module-level imports HERE meant Laguna's own, legitimate
+# ``from runtime.compat_vllm import (...)`` transitively required
+# vllm.v1.attention.backends.gdn_attn/sm120_gqa/registry and the
+# third-party fla package to be importable too, purely because this file
+# is shared between both tenants -- not because Laguna's code needs any
+# of them. See compat_vllm_qwen36.py's module docstring for the full
+# writeup (found via a coordinator cross-check, not this project's own
+# earlier audits).
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Re-exported: GDNAttentionMetadata (thin — vLLM dataclass, isinstance-sensitive)
-#
-# Cannot self-write: vLLM's qwen_gdn_attention_core does isinstance() checks.
-# Will be replaced when we own the model graph (V2/E1).
-# ---------------------------------------------------------------------------
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata  # noqa: E402
-from vllm.v1.attention.backends.sm120_gqa import SM120GQAMetadata  # noqa: E402
-
-# ---------------------------------------------------------------------------
-# Self-written: constants (thin)
-# ---------------------------------------------------------------------------
-
-FLA_CHUNK_SIZE: int = 64
-
 
 # ---------------------------------------------------------------------------
 # Self-written: network utilities (thin)
@@ -110,42 +96,37 @@ def get_distributed_init_method(ip: str, port: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Self-written: compute_causal_conv1d_metadata (B7-V1 薄依赖自写)
+# Re-exported: medium/thick dependencies (vLLM public API). 任务#46
+# removed Laguna's OWN QSR_LAGUNA_MODEL_LOADER=vllm/QSR_DFLASH_MODEL_
+# LOADER=vllm escape hatches (runtime/backends/laguna.py/laguna_dflash.py
+# no longer call get_model()/init_worker_distributed_environment/
+# load_dflash_model() at all), so these symbols now exist here purely
+# for: (1) the separate qwen3.6/DirectModelRunner tenant (runtime/
+# direct_model_runner.py, out of scope for this whole effort, 阶段0),
+# which unconditionally constructs a real vLLM model graph via
+# get_model() and genuinely needs all of config plumbing/distributed
+# init/forward-context state the same way Laguna's escape hatch used to;
+# (2) EngineArgs specifically, which dozens of benchmarks/*.py diagnostic
+# scripts construct directly for one-off real-vLLM comparisons/repros,
+# independent of either tenant's production loader. See
+# runtime/compat_vllm_qwen36.py for the qwen36-exclusive re-exports this
+# file used to also carry (split out 任务#42a).
 #
-# 原 vLLM 实现纯计算（numpy + torch），已自写替代（见文件末尾）。
-# 2026-07-22 实测验证 bit-exact。
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Re-exported: medium/thick dependencies (vLLM public API)
-#
-# These are imported at module level so that ``direct_model_runner.py``
-# can do ``from runtime.compat_vllm import X`` at its own module level.
-# All vLLM imports in the production path are consolidated here — this
-# is the B7-V1 "single point" contract.
+# ForwardContext/CUDAGraphMode/vllm.forward_context specifically: dropped
+# 任务#42(b), then RESTORED 任务#45 after a real GPU run of Laguna's
+# escape hatch (before its 任务#46 removal) crashed: ``AssertionError:
+# Forward context is not set`` inside vLLM's OWN ``vllm/model_executor/
+# layers/fused_moe/runner/moe_runner.py``, which calls
+# ``get_forward_context()`` internally -- confirmed direct_model_runner.py
+# (still in production use) hits the exact same real-vLLM-FusedMoE
+# dependency via set_forward_context(), so this stays regardless of
+# Laguna's own escape hatch being gone.
 # ---------------------------------------------------------------------------
 import vllm.forward_context as _vllm_fc  # noqa: E402
-
-# ---------------------------------------------------------------------------
-# Re-exported: FLA chunk index helpers (vLLM internal, kernel-coupled)
-# ---------------------------------------------------------------------------
-# B7-V1: FLA 切上游 — 从 vLLM 内嵌 FLA 切到 flash-linear-attention 上游包
-# 2026-07-22 实测验证：上游 FLA 0.5.2 的 prepare_chunk_indices/offsets
-# 与 vLLM 内嵌版本 bit-exact 一致（batch 1/2/4 × seq 128/1024/4096 × chunk 64/128）
-from fla.ops.utils.index import (  # noqa: E402
-    prepare_chunk_indices,
-    prepare_chunk_offsets,
-)
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config  # noqa: E402
 from vllm.engine.arg_utils import EngineArgs  # noqa: E402
 from vllm.forward_context import ForwardContext  # noqa: E402
 from vllm.model_executor.model_loader import get_model  # noqa: E402
-from vllm.v1.attention.backends.registry import (  # noqa: E402
-    AttentionBackendEnum,  # noqa: E402
-    register_backend,  # noqa: E402
-)
-
-# B7-V1: compute_causal_conv1d_metadata 已自写（见文件末尾）
 from vllm.v1.worker.gpu_worker import (  # noqa: E402
     init_worker_distributed_environment,  # noqa: E402
 )
@@ -242,7 +223,12 @@ def bind_kv_cache(
 #
 # 原 vLLM 实现: vllm/forward_context.py:260
 # 简化版：跳过 DP/batch-tracking/cudagraph/platform 逻辑（单 GPU 无需）。
-# 仍需 ForwardContext dataclass（model layers 通过 get_forward_context() 读取）。
+# 仍需 ForwardContext dataclass 并写入 vllm.forward_context._forward_
+# context -- 任务#42(b)一度移除过这段状态写入(理由:this runtime自己的
+# 代码从不调用get_forward_context()),任务#45一次真实的escape hatch GPU
+# 跑通测试(QSR_LAGUNA_MODEL_LOADER=vllm)当场crash在vLLM自己
+# FusedMoE runner的get_forward_context()调用上,已恢复且不再重试这个
+# 移除方向 -- 完整依据见上面的模块级注释。
 # ---------------------------------------------------------------------------
 
 from contextlib import contextmanager  # noqa: E402
@@ -263,8 +249,12 @@ def set_forward_context(
     Skips DP coordination, batch-size tracking, cudagraph mode dispatch,
     and platform hooks — none apply to our single-GPU, non-MoE setup.
 
-    Still sets ``vllm.forward_context._forward_context`` because model
-    layers (loaded via vLLM's ``get_model()``) call ``get_forward_context()``.
+    Still sets ``vllm.forward_context._forward_context`` because vLLM's
+    OWN model/layer code (used unconditionally by both the escape hatch,
+    which constructs a real vLLM model graph, and the self-built default
+    path's own real ``Attention``/``FusedMoE`` construction side effects)
+    calls ``get_forward_context()`` -- see the module comment above for
+    the specific real crash this restores a fix for.
     """
     forward_context = ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
@@ -288,83 +278,13 @@ def set_forward_context(
 
 
 # ---------------------------------------------------------------------------
-# Self-written: compute_causal_conv1d_metadata (B7-V1 薄依赖自写)
-#
-# 原 vLLM 实现: vllm/v1/attention/backends/utils.py:836
-# 纯计算：numpy + torch tensor ops，零 vLLM 依赖。
-# 2026-07-22 实测验证 bit-exact（见下方切换注释）。
+# compute_causal_conv1d_metadata moved to runtime/compat_vllm_qwen36.py
+# (任务#42) -- causal_conv1d is a GDN/Mamba-kernel concern, its only real
+# caller is runtime/metadata_builders.py (qwen36-exclusive, see that
+# module's docstring). Already zero-vLLM-dependency (pure numpy/torch),
+# so moving it doesn't change any vLLM-importability story -- purely
+# keeping qwen36-only functionality out of Laguna's compat layer.
 # ---------------------------------------------------------------------------
-
-_PAD_SLOT_ID = -1
-
-
-def _is_pin_memory_available() -> bool:
-    import torch
-
-    return torch.cuda.is_available() and hasattr(torch.Tensor, "pin_memory")
-
-
-def _np_to_pinned_tensor(array) -> torch.Tensor:
-    import torch
-
-    t = torch.from_numpy(array)
-    return t.pin_memory() if _is_pin_memory_available() else t
-
-
-def compute_causal_conv1d_metadata(
-    query_start_loc_p_cpu: torch.Tensor, *, device: torch.device
-) -> tuple:
-    """Compute chunk metadata for causal_conv1d kernel.
-
-    Self-written replacement for vLLM's
-    ``vllm.v1.attention.backends.utils.compute_causal_conv1d_metadata``.
-    Pure computation: numpy + torch tensor ops, zero vLLM dependency.
-    """
-    import numpy as np
-    import torch
-
-    assert query_start_loc_p_cpu.device.type == "cpu"
-    seqlens = query_start_loc_p_cpu.diff()
-    nums_dict: dict[int, dict] = {}
-    batch_ptr = None
-    token_chunk_offset_ptr = None
-    pin_memory = _is_pin_memory_available()
-
-    for BLOCK_M in [8]:
-        nums = -(-seqlens // BLOCK_M)
-        nums_dict[BLOCK_M] = {}
-        nums_dict[BLOCK_M]["nums"] = nums
-        nums_dict[BLOCK_M]["tot"] = nums.sum().item()
-        mlist = _np_to_pinned_tensor(np.repeat(np.arange(len(nums)), nums.numpy()))
-        nums_dict[BLOCK_M]["mlist"] = mlist
-        mlist_len = len(mlist)
-        nums_dict[BLOCK_M]["mlist_len"] = mlist_len
-        MAX_NUM_PROGRAMS = max(1024, mlist_len) * 2
-        offsetlist = []
-        for idx, num in enumerate(nums):
-            offsetlist.extend(range(num.item()))
-        offsetlist = torch.tensor(offsetlist, dtype=torch.int32, pin_memory=pin_memory)
-        nums_dict[BLOCK_M]["offsetlist"] = offsetlist
-
-        if batch_ptr is None:
-            batch_ptr = torch.full(
-                (MAX_NUM_PROGRAMS,), _PAD_SLOT_ID, dtype=torch.int32, device=device
-            )
-            token_chunk_offset_ptr = torch.full(
-                (MAX_NUM_PROGRAMS,), _PAD_SLOT_ID, dtype=torch.int32, device=device
-            )
-        else:
-            if batch_ptr.nelement() < MAX_NUM_PROGRAMS:
-                batch_ptr.resize_(MAX_NUM_PROGRAMS).fill_(_PAD_SLOT_ID)
-                token_chunk_offset_ptr.resize_(MAX_NUM_PROGRAMS).fill_(_PAD_SLOT_ID)
-
-        batch_ptr[0:mlist_len].copy_(mlist, non_blocking=True)
-        token_chunk_offset_ptr[0:mlist_len].copy_(offsetlist, non_blocking=True)
-        nums_dict[BLOCK_M]["batch_ptr"] = batch_ptr
-        nums_dict[BLOCK_M]["token_chunk_offset_ptr"] = token_chunk_offset_ptr
-
-    return nums_dict, batch_ptr, token_chunk_offset_ptr
-
 
 # ---------------------------------------------------------------------------
 # Re-exported: FlashInfer attention metadata (Laguna backend)

@@ -20,19 +20,21 @@ from __future__ import annotations
 import torch
 
 from runtime.compat_vllm import (
-    AttentionBackendEnum,
     EngineArgs,
-    GDNAttentionMetadata,
-    SM120GQAMetadata,
     VllmConfig,
     bind_kv_cache,
     get_distributed_init_method,
     get_model,
     get_open_port,
     init_worker_distributed_environment,
-    register_backend,
     set_current_vllm_config,
     set_forward_context,
+)
+from runtime.compat_vllm_qwen36 import (
+    AttentionBackendEnum,
+    GDNAttentionMetadata,
+    SM120GQAMetadata,
+    register_backend,
 )
 from runtime.sampling import SamplingParams, make_generator, sample_from_logits
 

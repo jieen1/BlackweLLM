@@ -14,11 +14,8 @@ if TYPE_CHECKING:
     from runtime.direct_model_runner import DirectModelRunner
 
 from runtime.block_pool import RESERVED_PHYSICAL_SLOTS, _physical_slot, _ssm_spec_row
-from runtime.compat_vllm import (
-    GDNAttentionMetadata,
-    SM120GQAMetadata,
-    set_forward_context,
-)
+from runtime.compat_vllm import set_forward_context
+from runtime.compat_vllm_qwen36 import GDNAttentionMetadata, SM120GQAMetadata
 
 
 class CapturedBatchDecodeGraph:

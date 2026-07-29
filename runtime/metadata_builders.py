@@ -9,7 +9,7 @@ from __future__ import annotations
 import torch
 
 from runtime.block_pool import _physical_slot, _ssm_spec_row
-from runtime.compat_vllm import (
+from runtime.compat_vllm_qwen36 import (
     FLA_CHUNK_SIZE,
     GDNAttentionMetadata,
     SM120GQAMetadata,
