@@ -944,12 +944,10 @@ class DFlashEngine:
         context_positions = torch.arange(
             position_offset, position_offset + num_positions, dtype=torch.long, device=self.device
         )
-        slot_mappings = torch.zeros(num_positions, dtype=torch.long, device=self.device)
-        for i in range(num_positions):
-            pos = position_offset + i
-            ring_block = (pos % ring_slots) // bs
-            ring_off = pos % bs
-            slot_mappings[i] = (draft_base + ring_block) * bs + ring_off
+        # Vectorized ring-buffer slot mapping (was Python for-loop, O(N) interpreter overhead)
+        ring_block = (context_positions % ring_slots) // bs
+        ring_off = context_positions % bs
+        slot_mappings = (draft_base + ring_block) * bs + ring_off
 
         if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
             n_unique = torch.unique(slot_mappings).numel()

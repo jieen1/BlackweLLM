@@ -25,12 +25,16 @@ SO = Path(_REPO) / "runtime/kernels/nvfp4_gemm_sm120.so"
 WARMUP, ITERS = 30, 200
 
 SHAPES = [
-    (34816, 5120, 56, "gate_up_proj"),
-    (5120, 17408, 56, "down_proj"),
-    (17408, 17408, 8, "down_proj_attn"),
-    (6144, 6144, 64, "out_proj"),
-    (5120, 5120, 72, "in_proj_qkvz"),
-    (96, 5120, 48, "in_proj_ba"),
+    # Laguna-S-2.1 shapes (N, K, num_heads_or_experts, label)
+    (11264, 3072, 72, "laguna_qkv_swa"),      # 47 MoE layers
+    (3072, 9216, 72, "laguna_o_proj_swa"),      # 47 MoE layers
+    (8192, 3072, 48, "laguna_qkv_full"),        # 12 full-attn layers
+    (3072, 6144, 48, "laguna_o_proj_full"),     # 12 full-attn layers
+    (12288, 3072, 1, "laguna_dense_gate_up"),   # layer 0 dense MLP
+    (3072, 12288, 1, "laguna_dense_down"),      # layer 0 dense MLP
+    (1024, 3072, 1, "laguna_shared_gate_up"),   # shared expert
+    (3072, 1024, 1, "laguna_shared_down"),      # shared expert
+    (100352, 3072, 1, "laguna_lm_head"),        # lm_head
 ]
 M_VALUES = [1, 4, 16]
 CONFIGS = {0: "128x128", 1: "128x128p", 2: "256x128p", 3: "128x256p"}

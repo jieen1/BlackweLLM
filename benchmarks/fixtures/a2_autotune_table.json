@@ -1,489 +1,732 @@
 {
-  "date": "2026-07-23T07:47:30",
+  "date": "2026-07-29T11:22:00",
   "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
   "table": {
-    "M1_gate_up_proj": {
+    "M1_laguna_qkv_swa": {
       "M": 1,
-      "N": 34816,
-      "K": 5120,
-      "count": 56,
-      "best_config": "128x256p",
-      "best_p50_ms": 0.5154,
-      "all_exact": true,
-      "configs": {
-        "128x128": {
-          "p50_ms": 0.5504,
-          "exact": true
-        },
-        "128x128p": {
-          "p50_ms": 0.5549,
-          "exact": true
-        },
-        "256x128p": {
-          "p50_ms": 0.6309,
-          "exact": true
-        },
-        "128x256p": {
-          "p50_ms": 0.5154,
-          "exact": true
-        }
-      }
-    },
-    "M4_gate_up_proj": {
-      "M": 4,
-      "N": 34816,
-      "K": 5120,
-      "count": 56,
-      "best_config": "128x256p",
-      "best_p50_ms": 0.4881,
-      "all_exact": true,
-      "configs": {
-        "128x128": {
-          "p50_ms": 0.5227,
-          "exact": true
-        },
-        "128x128p": {
-          "p50_ms": 0.5889,
-          "exact": true
-        },
-        "256x128p": {
-          "p50_ms": 0.6549,
-          "exact": true
-        },
-        "128x256p": {
-          "p50_ms": 0.4881,
-          "exact": true
-        }
-      }
-    },
-    "M16_gate_up_proj": {
-      "M": 16,
-      "N": 34816,
-      "K": 5120,
-      "count": 56,
-      "best_config": "128x256p",
-      "best_p50_ms": 0.4106,
-      "all_exact": true,
-      "configs": {
-        "128x128": {
-          "p50_ms": 0.5553,
-          "exact": true
-        },
-        "128x128p": {
-          "p50_ms": 0.5103,
-          "exact": true
-        },
-        "256x128p": {
-          "p50_ms": 0.6175,
-          "exact": true
-        },
-        "128x256p": {
-          "p50_ms": 0.4106,
-          "exact": true
-        }
-      }
-    },
-    "M1_down_proj": {
-      "M": 1,
-      "N": 5120,
-      "K": 17408,
-      "count": 56,
-      "best_config": "128x128",
-      "best_p50_ms": 0.3596,
-      "all_exact": true,
-      "configs": {
-        "128x128": {
-          "p50_ms": 0.3596,
-          "exact": true
-        },
-        "128x128p": {
-          "p50_ms": 0.3608,
-          "exact": true
-        },
-        "256x128p": {
-          "p50_ms": 0.5315,
-          "exact": true
-        },
-        "128x256p": {
-          "p50_ms": 0.5644,
-          "exact": true
-        }
-      }
-    },
-    "M4_down_proj": {
-      "M": 4,
-      "N": 5120,
-      "K": 17408,
-      "count": 56,
-      "best_config": "128x128",
-      "best_p50_ms": 0.4014,
-      "all_exact": true,
-      "configs": {
-        "128x128": {
-          "p50_ms": 0.4014,
-          "exact": true
-        },
-        "128x128p": {
-          "p50_ms": 0.4221,
-          "exact": true
-        },
-        "256x128p": {
-          "p50_ms": 0.4875,
-          "exact": true
-        },
-        "128x256p": {
-          "p50_ms": 0.4887,
-          "exact": true
-        }
-      }
-    },
-    "M16_down_proj": {
-      "M": 16,
-      "N": 5120,
-      "K": 17408,
-      "count": 56,
-      "best_config": "128x128p",
-      "best_p50_ms": 0.4056,
-      "all_exact": true,
-      "configs": {
-        "128x128": {
-          "p50_ms": 0.4437,
-          "exact": true
-        },
-        "128x128p": {
-          "p50_ms": 0.4056,
-          "exact": true
-        },
-        "256x128p": {
-          "p50_ms": 0.5623,
-          "exact": true
-        },
-        "128x256p": {
-          "p50_ms": 0.5795,
-          "exact": true
-        }
-      }
-    },
-    "M1_down_proj_attn": {
-      "M": 1,
-      "N": 17408,
-      "K": 17408,
-      "count": 8,
-      "best_config": "128x256p",
-      "best_p50_ms": 0.6313,
-      "all_exact": true,
-      "configs": {
-        "128x128": {
-          "p50_ms": 0.6791,
-          "exact": true
-        },
-        "128x128p": {
-          "p50_ms": 0.6498,
-          "exact": true
-        },
-        "256x128p": {
-          "p50_ms": 0.8093,
-          "exact": true
-        },
-        "128x256p": {
-          "p50_ms": 0.6313,
-          "exact": true
-        }
-      }
-    },
-    "M4_down_proj_attn": {
-      "M": 4,
-      "N": 17408,
-      "K": 17408,
-      "count": 8,
-      "best_config": "128x256p",
-      "best_p50_ms": 0.5502,
-      "all_exact": true,
-      "configs": {
-        "128x128": {
-          "p50_ms": 0.659,
-          "exact": true
-        },
-        "128x128p": {
-          "p50_ms": 0.6559,
-          "exact": true
-        },
-        "256x128p": {
-          "p50_ms": 0.8237,
-          "exact": true
-        },
-        "128x256p": {
-          "p50_ms": 0.5502,
-          "exact": true
-        }
-      }
-    },
-    "M16_down_proj_attn": {
-      "M": 16,
-      "N": 17408,
-      "K": 17408,
-      "count": 8,
-      "best_config": "128x128",
-      "best_p50_ms": 0.5401,
-      "all_exact": true,
-      "configs": {
-        "128x128": {
-          "p50_ms": 0.5401,
-          "exact": true
-        },
-        "128x128p": {
-          "p50_ms": 0.6266,
-          "exact": true
-        },
-        "256x128p": {
-          "p50_ms": 0.7858,
-          "exact": true
-        },
-        "128x256p": {
-          "p50_ms": 0.5993,
-          "exact": true
-        }
-      }
-    },
-    "M1_out_proj": {
-      "M": 1,
-      "N": 6144,
-      "K": 6144,
-      "count": 64,
-      "best_config": "128x128",
-      "best_p50_ms": 0.4179,
-      "all_exact": true,
-      "configs": {
-        "128x128": {
-          "p50_ms": 0.4179,
-          "exact": true
-        },
-        "128x128p": {
-          "p50_ms": 0.458,
-          "exact": true
-        },
-        "256x128p": {
-          "p50_ms": 0.4372,
-          "exact": true
-        },
-        "128x256p": {
-          "p50_ms": 0.4535,
-          "exact": true
-        }
-      }
-    },
-    "M4_out_proj": {
-      "M": 4,
-      "N": 6144,
-      "K": 6144,
-      "count": 64,
-      "best_config": "128x128p",
-      "best_p50_ms": 0.3714,
-      "all_exact": true,
-      "configs": {
-        "128x128": {
-          "p50_ms": 0.3965,
-          "exact": true
-        },
-        "128x128p": {
-          "p50_ms": 0.3714,
-          "exact": true
-        },
-        "256x128p": {
-          "p50_ms": 0.4836,
-          "exact": true
-        },
-        "128x256p": {
-          "p50_ms": 0.3999,
-          "exact": true
-        }
-      }
-    },
-    "M16_out_proj": {
-      "M": 16,
-      "N": 6144,
-      "K": 6144,
-      "count": 64,
-      "best_config": "128x128p",
-      "best_p50_ms": 0.3915,
-      "all_exact": true,
-      "configs": {
-        "128x128": {
-          "p50_ms": 0.4617,
-          "exact": true
-        },
-        "128x128p": {
-          "p50_ms": 0.3915,
-          "exact": true
-        },
-        "256x128p": {
-          "p50_ms": 0.459,
-          "exact": true
-        },
-        "128x256p": {
-          "p50_ms": 0.4146,
-          "exact": true
-        }
-      }
-    },
-    "M1_in_proj_qkvz": {
-      "M": 1,
-      "N": 5120,
-      "K": 5120,
+      "N": 11264,
+      "K": 3072,
       "count": 72,
-      "best_config": "128x256p",
-      "best_p50_ms": 0.2653,
+      "best_config": "128x128",
+      "best_p50_ms": 0.2223,
       "all_exact": true,
       "configs": {
         "128x128": {
-          "p50_ms": 0.409,
+          "p50_ms": 0.2223,
           "exact": true
         },
         "128x128p": {
-          "p50_ms": 0.3789,
+          "p50_ms": 0.2289,
           "exact": true
         },
         "256x128p": {
-          "p50_ms": 0.3694,
+          "p50_ms": 0.244,
           "exact": true
         },
         "128x256p": {
-          "p50_ms": 0.2653,
+          "p50_ms": 0.2248,
           "exact": true
         }
       }
     },
-    "M4_in_proj_qkvz": {
+    "M4_laguna_qkv_swa": {
       "M": 4,
-      "N": 5120,
-      "K": 5120,
+      "N": 11264,
+      "K": 3072,
       "count": 72,
       "best_config": "128x128p",
-      "best_p50_ms": 0.1949,
+      "best_p50_ms": 0.2145,
       "all_exact": true,
       "configs": {
         "128x128": {
-          "p50_ms": 0.2303,
+          "p50_ms": 0.2368,
           "exact": true
         },
         "128x128p": {
-          "p50_ms": 0.1949,
+          "p50_ms": 0.2145,
           "exact": true
         },
         "256x128p": {
-          "p50_ms": 0.2183,
+          "p50_ms": 0.2349,
           "exact": true
         },
         "128x256p": {
-          "p50_ms": 0.3558,
+          "p50_ms": 0.2245,
           "exact": true
         }
       }
     },
-    "M16_in_proj_qkvz": {
+    "M16_laguna_qkv_swa": {
       "M": 16,
-      "N": 5120,
-      "K": 5120,
+      "N": 11264,
+      "K": 3072,
       "count": 72,
-      "best_config": "256x128p",
-      "best_p50_ms": 0.236,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.2277,
       "all_exact": true,
       "configs": {
         "128x128": {
-          "p50_ms": 0.2371,
+          "p50_ms": 0.2394,
           "exact": true
         },
         "128x128p": {
-          "p50_ms": 0.2669,
+          "p50_ms": 0.2277,
           "exact": true
         },
         "256x128p": {
-          "p50_ms": 0.236,
+          "p50_ms": 0.2375,
           "exact": true
         },
         "128x256p": {
-          "p50_ms": 0.2423,
+          "p50_ms": 0.2397,
           "exact": true
         }
       }
     },
-    "M1_in_proj_ba": {
+    "M1_laguna_o_proj_swa": {
       "M": 1,
-      "N": 96,
-      "K": 5120,
+      "N": 3072,
+      "K": 9216,
+      "count": 72,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.2277,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.2369,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.2277,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.2646,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2618,
+          "exact": true
+        }
+      }
+    },
+    "M4_laguna_o_proj_swa": {
+      "M": 4,
+      "N": 3072,
+      "K": 9216,
+      "count": 72,
+      "best_config": "128x128",
+      "best_p50_ms": 0.2275,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.2275,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.2357,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.2596,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2545,
+          "exact": true
+        }
+      }
+    },
+    "M16_laguna_o_proj_swa": {
+      "M": 16,
+      "N": 3072,
+      "K": 9216,
+      "count": 72,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.2284,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.243,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.2284,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.261,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2719,
+          "exact": true
+        }
+      }
+    },
+    "M1_laguna_qkv_full": {
+      "M": 1,
+      "N": 8192,
+      "K": 3072,
       "count": 48,
       "best_config": "128x128",
-      "best_p50_ms": 0.1936,
+      "best_p50_ms": 0.215,
       "all_exact": true,
       "configs": {
         "128x128": {
-          "p50_ms": 0.1936,
+          "p50_ms": 0.215,
           "exact": true
         },
         "128x128p": {
-          "p50_ms": 0.4266,
+          "p50_ms": 0.2241,
           "exact": true
         },
         "256x128p": {
-          "p50_ms": 0.4454,
+          "p50_ms": 0.2379,
           "exact": true
         },
         "128x256p": {
-          "p50_ms": 0.4131,
+          "p50_ms": 0.2247,
           "exact": true
         }
       }
     },
-    "M4_in_proj_ba": {
+    "M4_laguna_qkv_full": {
       "M": 4,
-      "N": 96,
-      "K": 5120,
+      "N": 8192,
+      "K": 3072,
       "count": 48,
       "best_config": "128x128p",
-      "best_p50_ms": 0.3224,
+      "best_p50_ms": 0.2085,
       "all_exact": true,
       "configs": {
         "128x128": {
-          "p50_ms": 0.3359,
+          "p50_ms": 0.2133,
           "exact": true
         },
         "128x128p": {
-          "p50_ms": 0.3224,
+          "p50_ms": 0.2085,
           "exact": true
         },
         "256x128p": {
-          "p50_ms": 0.3761,
+          "p50_ms": 0.2343,
           "exact": true
         },
         "128x256p": {
-          "p50_ms": 0.3711,
+          "p50_ms": 0.2315,
           "exact": true
         }
       }
     },
-    "M16_in_proj_ba": {
+    "M16_laguna_qkv_full": {
       "M": 16,
-      "N": 96,
-      "K": 5120,
+      "N": 8192,
+      "K": 3072,
       "count": 48,
-      "best_config": "128x128p",
-      "best_p50_ms": 0.3598,
+      "best_config": "128x256p",
+      "best_p50_ms": 0.1778,
       "all_exact": true,
       "configs": {
         "128x128": {
-          "p50_ms": 0.3706,
+          "p50_ms": 0.2066,
           "exact": true
         },
         "128x128p": {
-          "p50_ms": 0.3598,
+          "p50_ms": 0.2051,
           "exact": true
         },
         "256x128p": {
-          "p50_ms": 0.3825,
+          "p50_ms": 0.2202,
           "exact": true
         },
         "128x256p": {
-          "p50_ms": 0.4183,
+          "p50_ms": 0.1778,
+          "exact": true
+        }
+      }
+    },
+    "M1_laguna_o_proj_full": {
+      "M": 1,
+      "N": 3072,
+      "K": 6144,
+      "count": 48,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.1641,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.1685,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.1641,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.2095,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2155,
+          "exact": true
+        }
+      }
+    },
+    "M4_laguna_o_proj_full": {
+      "M": 4,
+      "N": 3072,
+      "K": 6144,
+      "count": 48,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.179,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.1814,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.179,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.2133,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2016,
+          "exact": true
+        }
+      }
+    },
+    "M16_laguna_o_proj_full": {
+      "M": 16,
+      "N": 3072,
+      "K": 6144,
+      "count": 48,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.1797,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.1804,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.1797,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.2085,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2088,
+          "exact": true
+        }
+      }
+    },
+    "M1_laguna_dense_gate_up": {
+      "M": 1,
+      "N": 12288,
+      "K": 3072,
+      "count": 1,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.1911,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.1973,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.1911,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.2508,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2414,
+          "exact": true
+        }
+      }
+    },
+    "M4_laguna_dense_gate_up": {
+      "M": 4,
+      "N": 12288,
+      "K": 3072,
+      "count": 1,
+      "best_config": "128x256p",
+      "best_p50_ms": 0.2301,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.238,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.2302,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.2578,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2301,
+          "exact": true
+        }
+      }
+    },
+    "M16_laguna_dense_gate_up": {
+      "M": 16,
+      "N": 12288,
+      "K": 3072,
+      "count": 1,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.2149,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.2176,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.2149,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.247,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2373,
+          "exact": true
+        }
+      }
+    },
+    "M1_laguna_dense_down": {
+      "M": 1,
+      "N": 3072,
+      "K": 12288,
+      "count": 1,
+      "best_config": "128x128",
+      "best_p50_ms": 0.2471,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.2471,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.2548,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.3013,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2925,
+          "exact": true
+        }
+      }
+    },
+    "M4_laguna_dense_down": {
+      "M": 4,
+      "N": 3072,
+      "K": 12288,
+      "count": 1,
+      "best_config": "128x128",
+      "best_p50_ms": 0.2463,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.2463,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.2596,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.2893,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2769,
+          "exact": true
+        }
+      }
+    },
+    "M16_laguna_dense_down": {
+      "M": 16,
+      "N": 3072,
+      "K": 12288,
+      "count": 1,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.2475,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.2555,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.2475,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.2926,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.3157,
+          "exact": true
+        }
+      }
+    },
+    "M1_laguna_shared_gate_up": {
+      "M": 1,
+      "N": 1024,
+      "K": 3072,
+      "count": 1,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.1928,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.1994,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.1928,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.2208,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2405,
+          "exact": true
+        }
+      }
+    },
+    "M4_laguna_shared_gate_up": {
+      "M": 4,
+      "N": 1024,
+      "K": 3072,
+      "count": 1,
+      "best_config": "128x128",
+      "best_p50_ms": 0.2053,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.2053,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.2091,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.2165,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2295,
+          "exact": true
+        }
+      }
+    },
+    "M16_laguna_shared_gate_up": {
+      "M": 16,
+      "N": 1024,
+      "K": 3072,
+      "count": 1,
+      "best_config": "128x128",
+      "best_p50_ms": 0.2047,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.2047,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.2124,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.2226,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2442,
+          "exact": true
+        }
+      }
+    },
+    "M1_laguna_shared_down": {
+      "M": 1,
+      "N": 3072,
+      "K": 1024,
+      "count": 1,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.1922,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.1999,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.1922,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.1981,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2,
+          "exact": true
+        }
+      }
+    },
+    "M4_laguna_shared_down": {
+      "M": 4,
+      "N": 3072,
+      "K": 1024,
+      "count": 1,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.1865,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.1884,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.1865,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.1986,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2146,
+          "exact": true
+        }
+      }
+    },
+    "M16_laguna_shared_down": {
+      "M": 16,
+      "N": 3072,
+      "K": 1024,
+      "count": 1,
+      "best_config": "128x128p",
+      "best_p50_ms": 0.1841,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.2029,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.1841,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.2109,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.2029,
+          "exact": true
+        }
+      }
+    },
+    "M1_laguna_lm_head": {
+      "M": 1,
+      "N": 100352,
+      "K": 3072,
+      "count": 1,
+      "best_config": "128x256p",
+      "best_p50_ms": 0.3557,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.4143,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.4086,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.5973,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.3557,
+          "exact": true
+        }
+      }
+    },
+    "M4_laguna_lm_head": {
+      "M": 4,
+      "N": 100352,
+      "K": 3072,
+      "count": 1,
+      "best_config": "128x256p",
+      "best_p50_ms": 0.3583,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.4088,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.4021,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.5858,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.3583,
+          "exact": true
+        }
+      }
+    },
+    "M16_laguna_lm_head": {
+      "M": 16,
+      "N": 100352,
+      "K": 3072,
+      "count": 1,
+      "best_config": "128x256p",
+      "best_p50_ms": 0.3448,
+      "all_exact": true,
+      "configs": {
+        "128x128": {
+          "p50_ms": 0.3902,
+          "exact": true
+        },
+        "128x128p": {
+          "p50_ms": 0.4174,
+          "exact": true
+        },
+        "256x128p": {
+          "p50_ms": 0.5748,
+          "exact": true
+        },
+        "128x256p": {
+          "p50_ms": 0.3448,
           "exact": true
         }
       }
