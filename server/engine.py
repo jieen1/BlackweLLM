@@ -166,7 +166,7 @@ class StreamChannel:
 
 
 class ServerEngine:
-    """Owns the one ``DirectModelRunner`` instance, plus the admission and
+    """Owns the one ``LagunaBackend`` instance, plus the admission and
     speculative verify/commit bookkeeping for a live, continuously-batched
     service.
 
