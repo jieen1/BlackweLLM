@@ -90,14 +90,6 @@ from runtime.model._prefix import maybe_prefix
 from runtime.model.plain_attention import SelfBuiltAttentionPlaceholder
 from runtime.model.plain_linear import PlainLinear
 
-if typing.TYPE_CHECKING:
-    # Type-annotation only -- see runtime/model_loading.py's TYPE_CHECKING
-    # import for the same reasoning. VllmConfig itself was imported here
-    # but never actually used anywhere in this file at all -- dropped.
-    from vllm.config import CacheConfig
-    from vllm.model_executor.layers.quantization import QuantizationConfig
-
-
 def _extract_layer_index(layer_name: str) -> int:
     """Narrowed port of vLLM's ``extract_layer_index`` (vllm/model_
     executor/models/utils.py) -- only the ``num_attn_module=1`` (default)
@@ -162,7 +154,7 @@ class LagunaMoESelfBuilt(nn.Module):
     def __init__(
         self,
         config,
-        quant_config: QuantizationConfig | None = None,
+        quant_config: typing.Any = None,
         prefix: str = "",
         enable_eplb: bool = False,
     ):
@@ -214,8 +206,8 @@ class LagunaAttentionSelfBuilt(nn.Module):
         max_position_embeddings: int = 131072,
         max_model_len: int | None = None,
         head_dim: int | None = None,
-        cache_config: CacheConfig | None = None,
-        quant_config: QuantizationConfig | None = None,
+        cache_config: typing.Any = None,
+        quant_config: typing.Any = None,
         prefix: str = "",
         attention_sink: bool = False,
         layer_idx: int | None = None,
@@ -415,8 +407,8 @@ class LagunaDecoderLayerSelfBuilt(nn.Module):
     def __init__(
         self,
         config,
-        cache_config: CacheConfig | None = None,
-        quant_config: QuantizationConfig | None = None,
+        cache_config: typing.Any = None,
+        quant_config: typing.Any = None,
         prefix: str = "",
         enable_eplb: bool = False,
         layer_idx: int | None = None,

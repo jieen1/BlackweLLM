@@ -95,17 +95,13 @@ from runtime.model._weight_loading import default_weight_loader
 from runtime.model.laguna_decoder import LagunaDecoderLayerSelfBuilt
 from runtime.model.plain_embedding import PlainEmbedding, PlainLMHead, PlainLogitsProcessor
 
-if typing.TYPE_CHECKING:
-    # Type-annotation only -- see runtime/model_loading.py's TYPE_CHECKING
-    # import for the same reasoning.
-    from vllm.config import VllmConfig
 from runtime.model.plain_linear import PlainLinear
 
 
 class LagunaDraftModelSelfBuilt(nn.Module):
     """Self-built equivalent of vLLM's ``DFlashLagunaModel``."""
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__()
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
         config = self.config
@@ -387,7 +383,7 @@ class LagunaDraftModelSelfBuilt(nn.Module):
 class LagunaDraftForCausalLMSelfBuilt(nn.Module):
     """Self-built equivalent of vLLM's ``DFlashLagunaForCausalLM``."""
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__()
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
         config = self.config

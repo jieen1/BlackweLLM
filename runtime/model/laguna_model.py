@@ -70,10 +70,6 @@ from runtime.kernels.fused_rms_norm import TritonRMSNorm
 from runtime.model._prefix import maybe_prefix as _maybe_prefix
 from runtime.model._weight_loading import default_weight_loader, remap_kv_scale_name
 
-if typing.TYPE_CHECKING:
-    # Type-annotation only -- see runtime/model_loading.py's TYPE_CHECKING
-    # import for the same reasoning (no runtime isinstance/construction use).
-    from vllm.config import VllmConfig
 from runtime.model.laguna_decoder import LagunaDecoderLayerSelfBuilt
 from runtime.model.plain_embedding import PlainEmbedding, PlainLMHead, PlainLogitsProcessor
 
@@ -87,7 +83,7 @@ class LagunaModelSelfBuilt(nn.Module):
     still borrowed from vLLM.
     """
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__()
 
         config = vllm_config.model_config.hf_config
@@ -302,7 +298,7 @@ class LagunaForCausalLMSelfBuilt(nn.Module):
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     }
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+    def __init__(self, *, vllm_config: Any, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config

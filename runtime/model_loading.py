@@ -58,17 +58,6 @@ from runtime.model.laguna_dflash_model import LagunaDraftForCausalLMSelfBuilt
 from runtime.model.laguna_model import LagunaForCausalLMSelfBuilt
 from runtime.model.plain_attention import SelfBuiltAttentionPlaceholder
 
-if TYPE_CHECKING:
-    # Type-annotation only -- never instantiated/isinstance-checked here,
-    # so this import doesn't need to happen at runtime (verified: no
-    # runtime use of the name below beyond parameter/return annotations,
-    # and `from __future__ import annotations` above makes annotations
-    # lazy strings anyway). Real vllm.config dependency stays only where
-    # a VllmConfig instance actually gets constructed (runtime/compat_vllm.py
-    # / runtime/backends/laguna.py), not here.
-    from vllm.config import VllmConfig
-
-
 @contextlib.contextmanager
 def _default_torch_dtype(dtype: torch.dtype) -> Generator[None, None, None]:
     """Verbatim port of vLLM's ``set_default_torch_dtype`` (vllm/utils/
@@ -169,7 +158,7 @@ def _apply_kv_cache_scale_post_load(model: torch.nn.Module) -> None:
             module._v_scale.copy_(module.v_scale.detach().to(torch.float32))
 
 
-def load_laguna_model(vllm_config: VllmConfig) -> LagunaForCausalLMSelfBuilt:
+def load_laguna_model(vllm_config: Any) -> LagunaForCausalLMSelfBuilt:
     """Construct + load a Laguna model instance without vLLM's ``get_model()``.
 
     Caller is responsible for the ``set_current_vllm_config(vllm_config)``
@@ -199,7 +188,7 @@ def load_laguna_model(vllm_config: VllmConfig) -> LagunaForCausalLMSelfBuilt:
 
 def load_laguna_dflash_draft_model(
     target_model: LagunaForCausalLMSelfBuilt,
-    draft_vllm_config: VllmConfig,
+    draft_vllm_config: Any,
 ) -> LagunaDraftForCausalLMSelfBuilt:
     """Construct + load the DFlash draft model without vLLM's ``get_model()``
     / ``load_dflash_model()``. See runtime/model/laguna_dflash_model.py's

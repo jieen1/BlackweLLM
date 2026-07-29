@@ -117,11 +117,6 @@ import typing
 import torch
 from torch import nn
 
-if typing.TYPE_CHECKING:
-    from vllm.config import CacheConfig
-    from vllm.model_executor.layers.quantization import QuantizationConfig
-
-
 class SelfBuiltAttentionPlaceholder(nn.Module):
     """TP=1 replacement for constructing a real ``vllm.model_executor.
     layers.attention.Attention`` instance. See module docstring for the
@@ -135,7 +130,7 @@ class SelfBuiltAttentionPlaceholder(nn.Module):
         scale: float,
         num_kv_heads: int,
         cache_config: CacheConfig,
-        quant_config: QuantizationConfig | None,
+        quant_config: typing.Any,
         per_layer_sliding_window: int | None = None,
         prefix: str = "",
         sinks: torch.Tensor | None = None,
