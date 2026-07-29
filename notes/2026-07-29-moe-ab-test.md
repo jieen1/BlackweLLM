@@ -31,3 +31,18 @@
 - [x] SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT=0 → 更慢，不开
 - [x] SPARKINFER_DYNAMIC_WORK_SOURCE=ready_queue → 崩溃，不可用
 - [x] _physical_slot bug lead → RESERVED_PHYSICAL_SLOTS=0，两边一致，不是 bug
+
+## MoE Tile/Cluster Tuning (2026-07-29, 补充)
+
+| Config | tok/s | vs baseline |
+|--------|-------|-------------|
+| default (auto) | 368.9 | -- |
+| tile=16x128 | 351.9 | -4.6% |
+| tile=32x128 | 340.0 | -7.8% |
+| tile=16x256 | ERROR | unsupported |
+| tile=32x256 | ERROR | unsupported |
+| tile=64x128 | CRASH | CUDA illegal memory access |
+
+**结论: sparkinfer 自动调优已是最优，不要手动设置 tile。**
+
+MaxActiveClusters 和 down_scale 测试因 tile=64x128 导致的 CUDA 崩溃而无法完成。
