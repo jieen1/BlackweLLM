@@ -23,9 +23,10 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
+if TYPE_CHECKING:
+    import torch
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,8 @@ def _unpack_bitmask_to_mask(bitmask_row: torch.Tensor, vocab_size: int) -> torch
 
     Vectorized: uses bitwise ops on the full int32 tensor, no Python loops.
     """
+    import torch
+
     # bitmask_row: [ceil(vocab/32)] int32
     # Expand each int32 into 32 bits using bitwise AND with powers of 2
     # Create bit position tensor [32]
