@@ -1,6 +1,7 @@
 """E3: Laguna-S-2.1 Backend — direct model.forward() without vLLM's LLM engine.
 
-Loads the model via runtime.model_loading.load_laguna_model() (zero vLLM get_model() dependency), allocates KV caches, builds
+Loads the model via runtime.model_loading.load_laguna_model() (self-built,
+zero vLLM get_model() dependency since 任务#46), allocates KV caches, builds
 SparkInfer paged attention for prefill and decode.
 drives prefill/decode forward passes directly.
 
@@ -30,11 +31,6 @@ from runtime.compat_vllm import (
     set_current_vllm_config,
     set_forward_context,
 )
-
-# isort: split
-# bf_attention is the first import here that pulls in vLLM, and compat_vllm
-# sets VLLM_USE_AOT_COMPILE=0 at import time — that has to land before vLLM
-# is imported, so this group must stay below the one above.
 from runtime.backends.bf_attention import bf_attn_context
 from runtime.logprobs import compute_logprobs
 from runtime.model_spec import ModelSpec
@@ -174,9 +170,39 @@ class LagunaBackend:
         # Load model
         with set_current_vllm_config(vllm_config):
             init_method = get_distributed_init_method("127.0.0.1", get_open_port())
+            # Minimal, nano-vllm-style torch.distributed.init_process_
+            # group() only -- verified (阶段8/任务#44) that nothing in
+            # this runtime's own code reads vLLM's GroupCoordinator/
+            # get_tp_group()/get_pp_group() state. 任务#46 removed the
+            # QSR_LAGUNA_MODEL_LOADER=vllm escape hatch (real
+            # init_worker_distributed_environment() + get_model()) that
+            # used to sit alongside this -- see notes doc 任务#46 for
+            # what it cost to keep working (a TP/PP GroupCoordinator gap
+            # in the mixed-loader case, plus a deeper lm_head/quant_
+            # method tying incompatibility) versus what it was actually
+            # for (a safety net during 任务#45's own validation, no
+            # longer needed once both paths were bit-exact confirmed).
             from runtime.laguna_config import init_laguna_distributed_environment
-            init_laguna_distributed_environment(vllm_config, init_method)
+
+            init_laguna_distributed_environment(
+                rank=0, distributed_init_method=init_method, local_rank=0
+            )
+            # runtime.model_loading.load_laguna_model() (see notes/2026-07-27
+            # -vllm-complete-removal-implementation-plan.md 阶段1) replaces
+            # get_model()'s registry lookup + weight loading orchestration.
+            # Still reuses vLLM's Linear/Embedding/Attention/FusedMoE classes
+            # (阶段2 scope). Default since 2026-07-28 after two bit-exact
+            # passes against the old get_model() path:
+            #   - benchmarks/_phase1_bitexact_validate.py: 167-token real
+            #     English prompt, single-chunk prefill, 32-round greedy
+            #     decode -- exact match.
+            #   - benchmarks/_phase1_bitexact_validate_long.py: 10240-token
+            #     real multi-paragraph text, multi-chunk prefill (crosses
+            #     the 8192-token QSR_PREFILL_CHUNK threshold), 128-round
+            #     greedy decode (forces multiple SWA ring wrap-arounds) --
+            #     exact match, zero mismatches across all 128 tokens.
             from runtime.model_loading import load_laguna_model
+
             self.model = load_laguna_model(vllm_config)
         # Set IR op priority (fused RMSNorm C++ kernels) — normally done by worker init
         vllm_config.kernel_config.ir_op_priority.set_default()
@@ -194,8 +220,20 @@ class LagunaBackend:
         self._moe_sparkinfer_layers: list = []
         self._patch_moe_sparkinfer()
 
-        # Discover attention layers from static_forward_context
+        # Discover attention layers from static_forward_context. Real vLLM
+        # Attention.__init__ self-registers into this dict as a side
+        # effect of construction; SelfBuiltAttentionPlaceholder (阶段7
+        # item 2, replacing Attention construction in laguna_decoder.py)
+        # does not, so this loop populates it externally instead -- the
+        # rest of this method (and bf_attention.py/laguna_cuda_graph.py)
+        # keeps reading from ``sfc``/``self.static_forward_context``
+        # completely unchanged.
+        from runtime.model.plain_attention import SelfBuiltAttentionPlaceholder
+
         sfc = vllm_config.compilation_config.static_forward_context
+        for name, module in self.model.named_modules():
+            if isinstance(module, SelfBuiltAttentionPlaceholder):
+                sfc[name] = module
         self.static_forward_context = sfc
         self.attn_layer_names: list[str] = []
         for name, layer in sfc.items():
@@ -268,13 +306,22 @@ class LagunaBackend:
         self._full_layer_names: list[str] = []
         self._swa_layer_names: list[str] = []
         self._swa_window: int = 0
+        # Reads SelfBuiltAttentionPlaceholder's own is_swa/sliding_window
+        # attributes directly -- that's genuinely all this loop ever
+        # needed off the old vLLM get_kv_cache_spec()-derived spec object
+        # (阶段7 item 2; spec.block_size was never consumed -- verified by
+        # grep, see runtime/model/plain_attention.py's module docstring).
+        # Every layer here is a SelfBuiltAttentionPlaceholder unconditionally
+        # since 任务#46 removed the QSR_LAGUNA_MODEL_LOADER=vllm escape
+        # hatch (real vLLM Attention has no is_swa attribute, which is why
+        # this used to need a hasattr() fallback -- no longer reachable).
         for name in self.attn_layer_names:
             layer = sfc[name]
-            spec = layer.get_kv_cache_spec(vllm_config)
-            spec_cls = type(spec).__name__
-            if spec_cls == "SlidingWindowSpec":
+            is_swa = layer.is_swa
+            sliding_window = layer.sliding_window
+            if is_swa:
                 self._swa_layer_names.append(name)
-                self._swa_window = spec.sliding_window
+                self._swa_window = sliding_window
             else:
                 self._full_layer_names.append(name)
 
@@ -422,28 +469,28 @@ class LagunaBackend:
         )
 
     def _patch_moe_sparkinfer(self) -> None:
-        """Replace vLLM FusedMoE expert kernel with sparkinfer (the default MoE path).
+        """Replace MoE compute with sparkinfer for every LagunaMoESelfBuilt layer.
 
-        Loads weights directly from checkpoint (bypasses vLLM scale reformat),
-        uses runtime-alpha path (Phase 1 validated: cos=0.964 vs bf16 truth).
-        Patches each MoE layer's forward to: router → sparkinfer → shared.
-
-        After preparing sparkinfer weights for a layer, frees vLLM's copy of
-        that layer's expert weights to avoid double memory usage.
+        Loads all NVFP4 expert weights AND the two activation global scales
+        AND e_score_correction_bias directly from checkpoint (阶段6, vLLM
+        removal plan: LagunaMoESelfBuilt no longer constructs vLLM's
+        FusedMoE at all -- see runtime/model/laguna_decoder.py's module
+        docstring for what was actually consumed from it before this
+        change, and runtime/backends/laguna_sparkinfer_moe.py's
+        load_moe_layer_activation_gscales for the verified-against-a-live-
+        run formula this replaces). Patches each MoE layer's forward to:
+        router → sparkinfer → shared.
         """
-        # laguna_sparkinfer_moe must be imported before anything reaches into
-        # sparkinfer directly: it sets the SPARKINFER_* env vars sparkinfer
-        # reads at import time and installs the BF_SPARKINFER_PATH sys.path
-        # fallback that makes `import sparkinfer` resolve at all.
         from runtime.backends.laguna_sparkinfer_moe import (
             SparkinferMoELayer,
             _find_checkpoint,
+            load_moe_layer_activation_gscales,
+            load_moe_layer_e_score_correction_bias,
             load_moe_layer_weights,
             prepare_sparkinfer_layer,
             sparkinfer_version,
         )
-
-        # isort: split
+        from runtime.model.laguna_decoder import LagunaMoESelfBuilt
         from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
         from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
             fused_topk_bias,
@@ -465,13 +512,7 @@ class LagunaBackend:
 
         patched = 0
         for name, module in model.named_modules():
-            if not hasattr(module, "gate") or not hasattr(module, "experts"):
-                continue
-            experts_obj = module.experts
-            if not hasattr(experts_obj, "routed_experts"):
-                continue
-            routed = experts_obj.routed_experts
-            if not hasattr(routed, "w13_weight"):
+            if not isinstance(module, LagunaMoESelfBuilt):
                 continue
 
             parts = name.split(".")
@@ -482,50 +523,21 @@ class LagunaBackend:
                         layer_idx = int(parts[i + 1])
                     except ValueError:
                         pass
-            if layer_idx is None or layer_idx == 0:
+            if layer_idx is None:
                 continue
 
             moe_module = module
             shared_expert = getattr(moe_module, "shared_expert", None)
             routed_scaling = getattr(moe_module, "routed_scaling_factor", 1.0)
-            e_bias = getattr(experts_obj, "e_score_correction_bias", None)
+            e_bias = load_moe_layer_e_score_correction_bias(ckpt, layer_idx, self.device)
 
-            # Load weights directly from checkpoint (alpha path)
+            # Load weights + activation global scales directly from checkpoint
             raw = load_moe_layer_weights(ckpt, layer_idx, self.device)
-            # a1_gscale = 1/input_scale (sparkinfer convention: reciprocal)
-            inp13 = getattr(routed, "w13_input_scale", None)
-            inp2 = getattr(routed, "w2_input_scale", None)
-            a1g = (
-                (1.0 / inp13.float().max()).item()
-                if inp13 is not None and inp13.numel() > 0
-                else None
-            )
-            a2g = (
-                (1.0 / inp2.float().max()).item() if inp2 is not None and inp2.numel() > 0 else None
-            )
+            a1g, a2g = load_moe_layer_activation_gscales(ckpt, layer_idx)
             si_experts = prepare_sparkinfer_layer(raw, self.device, a1_gscale=a1g, a2_gscale=a2g)
             del raw
             si_layer = SparkinferMoELayer(si_experts, workspace, self.device)
             self._moe_sparkinfer_layers.append(si_layer)
-
-            # Free vLLM's expert weights to reclaim memory
-            for attr in (
-                "w13_weight",
-                "w13_weight_scale",
-                "w13_weight_scale_2",
-                "w2_weight",
-                "w2_weight_scale",
-                "w2_weight_scale_2",
-                "w13_input_scale",
-                "w2_input_scale",
-            ):
-                if hasattr(routed, attr):
-                    t = getattr(routed, attr)
-                    if isinstance(t, torch.nn.Parameter):
-                        t.data = torch.empty(0, device=t.device)
-                    elif isinstance(t, torch.Tensor):
-                        setattr(routed, attr, torch.empty(0, device=t.device))
-            torch.cuda.empty_cache()
 
             def _make_patched_forward(
                 moe_mod,
@@ -541,7 +553,10 @@ class LagunaBackend:
                 def _patched_forward(hidden_states: torch.Tensor) -> torch.Tensor:
                     orig_shape = hidden_states.shape
                     hs = hidden_states.view(-1, hidden_states.shape[-1])
-                    router_logits, _ = moe_mod.gate(hs)
+                    # moe_mod.gate is PlainLinear (runtime/model/plain_linear.py),
+                    # returns a plain tensor -- not vLLM's ReplicatedLinear
+                    # (output, bias) tuple convention this line used to match.
+                    router_logits = moe_mod.gate(hs)
                     router_logits = router_logits.float()
                     if _softcap > 0:
                         router_logits = torch.tanh(router_logits / _softcap) * _softcap
@@ -709,9 +724,7 @@ class LagunaBackend:
             causal=True,
         )
 
-    def _build_sparkinfer_metadata(
-        self, common_meta, window_left: int = -1, mode: str | None = None
-    ):
+    def _build_sparkinfer_metadata(self, common_meta, window_left: int = -1, mode: str | None = None):
         """Convert CommonAttentionMetadata to SparkinferAttnMetadata."""
         from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
 
@@ -883,6 +896,7 @@ class LagunaBackend:
         common_meta = self._build_common_attn_metadata(slot_ids, kv_lengths, qo_lens, is_decode)
 
         # Build sparkinfer attention metadata per group
+        from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
 
         attn_metadata_dict: dict[str, Any] = {}
         slot_mapping_dict: dict[str, torch.Tensor] = {}
@@ -998,15 +1012,8 @@ class LagunaBackend:
             logger.warning(
                 "CHUNK_CHECK chunk=%d bs=%d ring[%d:%d)->scratch[0:%d) status=%s "
                 "max_abs_diff=%.6g n_mismatch=%d/%d",
-                chunk_idx,
-                bs,
-                abs_start,
-                abs_start + count,
-                count,
-                status,
-                max_abs_diff,
-                n_mismatch,
-                len(sample_positions),
+                chunk_idx, bs, abs_start, abs_start + count, count, status,
+                max_abs_diff, n_mismatch, len(sample_positions),
             )
 
     def _debug_check_scratch_to_ring_copy(
@@ -1050,15 +1057,8 @@ class LagunaBackend:
             logger.warning(
                 "CHUNK_CHECK chunk=%d bs=%d scratch[%d:%d)->ring[%d:%d) status=%s "
                 "max_abs_diff=%.6g n_mismatch=%d/%d",
-                chunk_idx,
-                bs,
-                scratch_start,
-                scratch_start + count,
-                abs_start,
-                abs_start + count,
-                status,
-                max_abs_diff,
-                n_mismatch,
+                chunk_idx, bs, scratch_start, scratch_start + count,
+                abs_start, abs_start + count, status, max_abs_diff, n_mismatch,
                 len(sample_positions),
             )
 
@@ -1192,6 +1192,7 @@ class LagunaBackend:
         absolute kv_length; SWA layers use relative positions in scratch.
         """
         sfc = self.static_forward_context
+        bs = self.block_size
         chunk_tokens = self._prefill_chunk_tokens
         prompt_len = len(prompt_ids)
         window = self._swa_window
@@ -1366,11 +1367,7 @@ class LagunaBackend:
                 if debug_chunk_check:
                     logger.warning(
                         "CHUNK_CHECK chunk=%d bs=%d chunk_start=%d chunk_end=%d overlap=%d",
-                        _chunk_idx,
-                        self.block_size,
-                        chunk_start,
-                        chunk_end,
-                        overlap,
+                        _chunk_idx, self.block_size, chunk_start, chunk_end, overlap,
                     )
 
                 # Rebind SWA to scratch for this chunk
@@ -1443,6 +1440,8 @@ class LagunaBackend:
             self._fill_decode_buffers(slot_ids, token_ids, kv_lengths)
 
         common_meta = self._build_common_attn_metadata(slot_ids, kv_lengths, qo_lens, is_decode)
+
+        from runtime.backends.laguna_sparkinfer_attn import SparkinferAttnMetadata
 
         attn_metadata_dict: dict[str, Any] = {}
         slot_mapping_dict: dict[str, torch.Tensor] = {}
@@ -1639,9 +1638,8 @@ class LagunaBackend:
         already-constructed instances. We must also rebind each instance's
         _forward_method after the class-level patch.
         """
-        from vllm.model_executor.layers.layernorm import RMSNorm
-
         from runtime.kernels.fused_rms_norm import fused_add_rms_norm, rms_norm
+        from vllm.model_executor.layers.layernorm import RMSNorm
 
         def _triton_forward(self_norm, x, residual=None):
             if residual is None:
@@ -1879,6 +1877,7 @@ class LagunaBackend:
             # Short suffix: single chunk with scratch
             sfc = self.static_forward_context
             window = self._swa_window
+            bs = self.block_size
 
             # Copy overlap from ring to scratch
             overlap = min(window, start_pos)
