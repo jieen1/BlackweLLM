@@ -15,6 +15,7 @@ from bfdiag.shapes.moe import (
     sparkinfer_w13_shapes,
     stacked_expert_shapes,
 )
+from tests.laguna_fixtures import TARGET_CONFIG
 
 
 def test_expert_projection_shapes_match_real_checkpoint():
@@ -22,7 +23,7 @@ def test_expert_projection_shapes_match_real_checkpoint():
     gate_proj/up_proj: weight_packed=[1024,1536] weight_scale=[1024,192]
     down_proj:         weight_packed=[3072, 512] weight_scale=[3072, 64]
     """
-    config = load_laguna_config()
+    config = load_laguna_config(path_override=TARGET_CONFIG)
     projs = expert_projection_shapes(config)
 
     assert projs["gate_proj"].weight_packed_shape == (1024, 1536)
@@ -34,7 +35,7 @@ def test_expert_projection_shapes_match_real_checkpoint():
 
 
 def test_packing_halves_in_features_and_scale_divides_by_group_size():
-    config = load_laguna_config()
+    config = load_laguna_config(path_override=TARGET_CONFIG)
     projs = expert_projection_shapes(config)
     for proj in projs.values():
         assert proj.weight_packed_shape[1] == proj.in_features // 2
@@ -43,7 +44,7 @@ def test_packing_halves_in_features_and_scale_divides_by_group_size():
 
 
 def test_stacked_expert_shapes_prepend_num_experts():
-    config = load_laguna_config()
+    config = load_laguna_config(path_override=TARGET_CONFIG)
     stacked = stacked_expert_shapes(config)
     assert stacked["gate_proj.weight_packed"] == (256, 1024, 1536)
     assert stacked["gate_proj.weight_scale"] == (256, 1024, 192)
@@ -54,14 +55,14 @@ def test_stacked_expert_shapes_prepend_num_experts():
 def test_sparkinfer_w13_fuses_gate_and_up():
     """prepare_sparkinfer_layer concatenates [up_w, gate_w] along dim=1 --
     the fused w13 out-dim doubles moe_intermediate_size."""
-    config = load_laguna_config()
+    config = load_laguna_config(path_override=TARGET_CONFIG)
     w = sparkinfer_w13_shapes(config)
     assert w["w13_fp4"] == (256, 2 * 1024, 1536)
     assert w["w2_fp4"] == (256, 3072, 512)
 
 
 def test_router_shapes():
-    config = load_laguna_config()
+    config = load_laguna_config(path_override=TARGET_CONFIG)
     r = router_shapes(config, num_tokens=5)
     assert r["router_logits"] == (5, 256)
     assert r["topk_ids"] == (5, 10)
@@ -69,7 +70,7 @@ def test_router_shapes():
 
 
 def test_expert_projection_shapes_requires_group_size(monkeypatch):
-    config = load_laguna_config()
+    config = load_laguna_config(path_override=TARGET_CONFIG)
     broken = config.__class__(
         **{**config.__dict__, "nvfp4_group_size": None},
     )
@@ -80,7 +81,7 @@ def test_expert_projection_shapes_requires_group_size(monkeypatch):
 def test_expert_projection_shapes_requires_experts():
     """The DFlash draft model has num_experts=0 -- moe.py should refuse to
     derive expert shapes for it rather than silently returning something."""
-    config = load_laguna_config()
+    config = load_laguna_config(path_override=TARGET_CONFIG)
     dense_only = config.__class__(**{**config.__dict__, "num_experts": 0})
     with pytest.raises(ValueError, match="num_experts=0"):
         expert_projection_shapes(dense_only)

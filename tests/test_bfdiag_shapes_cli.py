@@ -11,6 +11,7 @@ import argparse
 import json
 
 from bfdiag.shapes.cli import diff_flat, register
+from tests.laguna_fixtures import DRAFT_CONFIG, TARGET_CONFIG
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -22,7 +23,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _run(argv: list[str]) -> tuple[int, argparse.Namespace]:
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    command, command_args = argv[0], argv[1:]
+    args = parser.parse_args(
+        [
+            command,
+            "--model-path",
+            str(TARGET_CONFIG),
+            "--draft-model-path",
+            str(DRAFT_CONFIG),
+            *command_args,
+        ]
+    )
     rc = args.func(args)
     return rc, args
 

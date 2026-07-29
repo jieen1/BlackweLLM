@@ -15,6 +15,7 @@ from bfdiag.shapes.gemm import (
     target_dense_gemms,
 )
 from bfdiag.shapes.model import load_draft_config, load_laguna_config
+from tests.laguna_fixtures import DRAFT_CONFIG, TARGET_CONFIG
 
 
 def test_target_attention_proj_gemms_match_real_weight_shapes():
@@ -22,7 +23,7 @@ def test_target_attention_proj_gemms_match_real_weight_shapes():
     layer 0 (full):    q_proj=[6144,3072] k/v_proj=[1024,3072] o_proj=[3072,6144] g_proj=[48,3072]
     layer 1 (sliding):  q_proj=[9216,3072] k/v_proj=[1024,3072] o_proj=[3072,9216] g_proj=[72,3072]
     """
-    config = load_laguna_config()
+    config = load_laguna_config(path_override=TARGET_CONFIG)
     gemms = {g.name: g for g in target_dense_gemms(config, num_tokens=7)}
 
     assert gemms["full.q_proj"].weight_shape == (6144, 3072)
@@ -45,7 +46,7 @@ def test_target_dense_mlp_and_moe_gemms_match_real_weight_shapes():
     """layer 0 dense mlp: gate/up=[12288,3072] down=[3072,12288]
     router gate: [256,3072]; shared_expert: gate/up=[1024,3072] down=[3072,1024]
     lm_head: [100352,3072]"""
-    config = load_laguna_config()
+    config = load_laguna_config(path_override=TARGET_CONFIG)
     gemms = {g.name: g for g in target_dense_gemms(config, num_tokens=1)}
 
     assert gemms["layer0.dense_mlp.gate_proj"].weight_shape == (12288, 3072)
@@ -65,7 +66,7 @@ def test_draft_qkv_proj_is_fused_and_matches_real_weight_shape():
     """Real draft checkpoint: self_attn.qkv_proj.weight = [11264, 3072]
     (72*128 q + 8*128 k + 8*128 v = 9216 + 1024 + 1024), a real architecture
     difference from the target model's separate q/k/v_proj."""
-    draft = load_draft_config()
+    draft = load_draft_config(path_override=DRAFT_CONFIG)
     gemm = draft_qkv_proj_gemm(draft, num_tokens=3)
     assert gemm.weight_shape == (11264, 3072)
     assert gemm.n == 9216 + 1024 + 1024
@@ -73,7 +74,7 @@ def test_draft_qkv_proj_is_fused_and_matches_real_weight_shape():
 
 
 def test_draft_attention_gemms_match_real_weight_shapes():
-    draft = load_draft_config()
+    draft = load_draft_config(path_override=DRAFT_CONFIG)
     gemms = {g.name: g for g in draft_attention_gemms(draft, num_tokens=1)}
     assert gemms["draft.qkv_proj"].weight_shape == (11264, 3072)
     assert gemms["draft.o_proj"].weight_shape == (3072, 9216)
@@ -83,7 +84,7 @@ def test_draft_attention_gemms_match_real_weight_shapes():
 def test_draft_fc_gemm_matches_real_weight_shape():
     """Real draft checkpoint: fc.weight = [3072, 18432] = [hidden, 6*hidden]
     (EAGLE-style fusion of the 6 aux hidden states)."""
-    draft = load_draft_config()
+    draft = load_draft_config(path_override=DRAFT_CONFIG)
     gemm = draft_fc_gemm(draft, num_tokens=1)
     assert gemm.weight_shape == (3072, 18432)
     assert gemm.k == 6 * 3072
@@ -92,7 +93,7 @@ def test_draft_fc_gemm_matches_real_weight_shape():
 def test_draft_dense_gemms_has_no_lm_head():
     """The draft checkpoint has no lm_head/embed_tokens tensor -- it reuses
     the target model's tied lm_head. draft_dense_gemms must not invent one."""
-    draft = load_draft_config()
+    draft = load_draft_config(path_override=DRAFT_CONFIG)
     gemms = {g.name for g in draft_dense_gemms(draft, num_tokens=1)}
     assert not any("lm_head" in name for name in gemms)
     assert "draft.mlp.gate_proj" in gemms

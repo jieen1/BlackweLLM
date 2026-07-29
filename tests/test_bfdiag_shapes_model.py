@@ -22,6 +22,7 @@ from bfdiag.shapes.model import (
     load_draft_config,
     load_laguna_config,
 )
+from tests.laguna_fixtures import DRAFT_CONFIG, TARGET_CONFIG
 
 # ---------------------------------------------------------------------------
 # Real checkpoint (must be present on this machine per the task brief)
@@ -31,7 +32,7 @@ from bfdiag.shapes.model import (
 def test_real_config_layer_grouping():
     """Acceptance criterion #2: 12 full_attention + 36 sliding_attention,
     full layer positions exactly 0,4,8,...,44."""
-    config = load_laguna_config()
+    config = load_laguna_config(path_override=TARGET_CONFIG)
     assert len(config.full_layer_indices) == 12
     assert len(config.sliding_layer_indices) == 36
     assert config.full_layer_indices == tuple(range(0, 48, 4))
@@ -42,7 +43,7 @@ def test_real_config_per_layer_heads():
     """Real per-layer head counts (safetensors-verified, see
     notes/2026-07-27-laguna-real-shapes-correction-and-page-size-migration-plan.md):
     full_attention=48 Q heads, sliding_attention=72 Q heads, both 8 KV heads."""
-    config = load_laguna_config()
+    config = load_laguna_config(path_override=TARGET_CONFIG)
     assert config.heads_per_layer_source == "config_per_layer"
     full = config.groups["full"]
     sliding = config.groups["sliding"]
@@ -59,7 +60,7 @@ def test_real_config_per_layer_heads():
 
 
 def test_real_config_moe_and_dense_layers():
-    config = load_laguna_config()
+    config = load_laguna_config(path_override=TARGET_CONFIG)
     assert config.dense_mlp_layer_indices == (0,)
     assert 0 not in config.moe_layer_indices
     assert len(config.moe_layer_indices) == 47
@@ -71,12 +72,12 @@ def test_real_config_moe_and_dense_layers():
 
 
 def test_real_config_kv_cache_dtype_is_fp8():
-    config = load_laguna_config()
+    config = load_laguna_config(path_override=TARGET_CONFIG)
     assert config.kv_cache_dtype == "fp8_e4m3"
 
 
 def test_real_draft_config():
-    draft = load_draft_config()
+    draft = load_draft_config(path_override=DRAFT_CONFIG)
     assert draft.num_hidden_layers == 6
     assert draft.num_attention_heads == 72
     assert draft.num_key_value_heads == 8
@@ -97,7 +98,7 @@ def test_dflash_constants_agree_with_draft_config():
         DRAFT_WINDOW,
     )
 
-    draft = load_draft_config()
+    draft = load_draft_config(path_override=DRAFT_CONFIG)
     assert DRAFT_NUM_LAYERS == draft.num_hidden_layers
     assert DRAFT_WINDOW == draft.sliding_window
     assert DRAFT_NUM_QO_HEADS == draft.num_attention_heads
