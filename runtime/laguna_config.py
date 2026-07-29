@@ -53,7 +53,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-
 from transformers import AutoConfig
 
 # ---------------------------------------------------------------------------
@@ -238,6 +237,39 @@ class SelfBuiltModelConfig:
 
 
 @dataclasses.dataclass
+class LagunaDraftModelConfig:
+    """Configuration surface consumed by the self-built DFlash model.
+
+    This deliberately models only the draft checkpoint fields the local
+    loader reads.  It is not a replacement for vLLM's general ModelConfig.
+    """
+
+    model: str
+    hf_config: object
+    tokenizer: str
+    tokenizer_mode: str
+    trust_remote_code: bool
+    dtype: torch.dtype
+    seed: int
+    max_model_len: int
+    spec_target_max_model_len: int
+    enforce_eager: bool = True
+    runner: str = "draft"
+
+
+@dataclasses.dataclass
+class LagunaDFlashConfig:
+    """Owned DFlash settings required by ``LagunaDraftForCausalLMSelfBuilt``."""
+
+    model: str
+    method: str
+    num_speculative_tokens: int
+    target_model_config: SelfBuiltModelConfig
+    target_parallel_config: SelfBuiltParallelConfig
+    draft_model_config: LagunaDraftModelConfig
+
+
+@dataclasses.dataclass
 class SelfBuiltVllmConfig:
     """Duck-typed stand-in for ``vllm.config.VllmConfig``, used only for
     the ``selfbuilt`` (default) loader path -- see module docstring.
@@ -252,7 +284,8 @@ class SelfBuiltVllmConfig:
     device_config: SelfBuiltDeviceConfig
     kernel_config: SelfBuiltKernelConfig
     speculative_config: Any = None
-    ec_transfer_config: Any = None  # real vLLM's ensure_ec_transfer_initialized just needs this to exist and be None
+    # Required by the former worker-initialization contract; always unused.
+    ec_transfer_config: Any = None
 
 
 def build_laguna_config(
@@ -304,6 +337,71 @@ def build_laguna_config(
         device_config=SelfBuiltDeviceConfig(),
         kernel_config=SelfBuiltKernelConfig(),
     )
+
+
+def build_laguna_dflash_config(
+    runtime_config: SelfBuiltVllmConfig,
+    *,
+    model: str,
+    hf_config: object,
+    num_speculative_tokens: int,
+    max_model_len: int,
+) -> SelfBuiltVllmConfig:
+    """Return a DFlash-specific copy of a Laguna runtime configuration.
+
+    The draft loader only consumes its checkpoint identity/configuration and
+    the target model's fixed single-GPU geometry.  Keeping this narrow avoids
+    importing vLLM's broad speculative configuration machinery at startup.
+    """
+    target = runtime_config.model_config
+    draft_model_config = LagunaDraftModelConfig(
+        model=model,
+        hf_config=hf_config,
+        tokenizer=target.tokenizer,
+        tokenizer_mode=target.tokenizer_mode,
+        trust_remote_code=target.trust_remote_code,
+        dtype=target.dtype,
+        seed=target.seed,
+        max_model_len=max_model_len,
+        spec_target_max_model_len=target.max_model_len,
+    )
+    speculative_config = LagunaDFlashConfig(
+        model=model,
+        method="dflash",
+        num_speculative_tokens=num_speculative_tokens,
+        target_model_config=target,
+        target_parallel_config=runtime_config.parallel_config,
+        draft_model_config=draft_model_config,
+    )
+    return dataclasses.replace(runtime_config, speculative_config=speculative_config)
+
+
+def load_laguna_draft_hf_config(model: str) -> object:
+    """Load and normalize the DFlash checkpoint configuration locally.
+
+    The draft checkpoint deliberately has no ``auto_map`` entry.  Its
+    generic Transformers config preserves the draft's sliding-attention RoPE
+    settings, while vLLM historically supplied a few absent Laguna defaults.
+    Keep that exact split: replacing the config class with the target's
+    custom class changes the draft RoPE default and breaks acceptance.
+    """
+    config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+    defaults = {
+        "qkv_bias": False,
+        "decoder_sparse_step": 1,
+        "mlp_only_layers": [0],
+        "norm_topk_prob": True,
+        "partial_rotary_factor": 1.0,
+        "swa_attention_sink_enabled": False,
+        "swa_rope_parameters": None,
+    }
+    for name, value in defaults.items():
+        if not hasattr(config, name):
+            setattr(config, name, value)
+    # The generic config materializes a uniform list; the legacy DFlash
+    # config intentionally normalized that representation to ``None``.
+    config.num_attention_heads_per_layer = None
+    return config
 
 
 def init_laguna_distributed_environment(

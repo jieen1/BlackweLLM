@@ -18,23 +18,6 @@ _ROOT = Path(__file__).resolve().parents[1]
 # are moved behind runtime.compat_vllm.py or replaced by self-owned code.
 _APPROVED_DIRECT_IMPORT_FILES = {
     "runtime/compat_vllm.py",
-    # Added 2026-07-28 (任务#45): runtime/laguna_config.py's ONLY vLLM
-    # import is `vllm.transformers_utils.configs.laguna.LagunaConfig` --
-    # a tiny (~120-line), fully standalone `transformers.PretrainedConfig`
-    # subclass with zero further vLLM coupling, kept verbatim (not
-    # re-derived via transformers.AutoConfig.from_pretrained()) to
-    # guarantee byte-identical field defaults to every prior GPU
-    # bit-exact validation, rather than risk silent default-value drift
-    # from re-implementing the same class from scratch. This module
-    # replaces vllm.config/vllm.engine.arg_utils/vllm.model_executor.
-    # model_loader (VllmConfig/EngineArgs/get_model's config-construction
-    # role) for Laguna's production config construction -- 任务#46
-    # removed the QSR_LAGUNA_MODEL_LOADER=vllm escape hatch that used to
-    # construct a real VllmConfig as an alternative; EngineArgs/get_model
-    # etc. remain real vLLM imports inside runtime/compat_vllm.py, but
-    # only for the separate qwen3.6/DirectModelRunner tenant (out of
-    # scope, 阶段0) and one-off benchmark/diagnostic scripts now.
-    "runtime/laguna_config.py",
     # Added 2026-07-28 (任务#42): the qwen36/DirectModelRunner-exclusive
     # counterpart to compat_vllm.py -- GDNAttentionMetadata/
     # SM120GQAMetadata/AttentionBackendEnum/register_backend/FLA chunk
@@ -54,7 +37,6 @@ _APPROVED_DIRECT_IMPORT_FILES = {
     # carry qwen36's dependency weight.
     "runtime/compat_vllm_qwen36.py",
     "runtime/backends/laguna.py",
-    "runtime/backends/laguna_dflash.py",
     # runtime/backends/laguna_dflash_cudagraph.py removed 2026-07-28
     # (任务#41, vLLM removal plan 阶段8): its only vLLM/FlashInfer import
     # was inside DFlashVerifyCudaGraph, a FlashInfer-based main-model

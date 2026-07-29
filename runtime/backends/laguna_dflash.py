@@ -182,63 +182,27 @@ class DFlashEngine:
     def _load_draft_model(self, model_path: str | None) -> Any:
         """Load the DFlash draft model.
 
-        SpeculativeConfig/ModelConfig construction still goes through
-        vLLM's real dataclasses (config plumbing, not model code -- same
-        tier as VllmConfig/ModelConfig already accepted everywhere else in
-        this runtime, see notes/2026-07-27-vllm-complete-removal-
-        implementation-plan.md 阶段3). The draft model class itself is
-        always built + loaded by runtime.model_loading.
-        load_laguna_dflash_draft_model (self-built DFlashLagunaModel/
-        DFlashLagunaForCausalLM equivalent, see runtime/model/
-        laguna_dflash_model.py) -- 阶段3 replaced vLLM's load_dflash_model
-        (get_model() -> full registry lookup + AutoWeightsLoader) with
-        this after two bit-exact passes (benchmarks/
-        _phase3_dflash_bitexact_validate*.py). 任务#46 removed the
-        QSR_DFLASH_MODEL_LOADER=vllm escape hatch entirely (see notes doc
-        任务#46): it had accumulated real, never-fully-fixed regressions
-        (a TP/PP GroupCoordinator gap, and a deeper lm_head/quant_method
-        tying incompatibility between vLLM's load_dflash_model() and our
-        self-built PlainLMHead -- both found via 任务#45's GPU validation,
-        neither worth fixing in code about to be deleted).
+        Both the DFlash model graph and its configuration are owned by this
+        runtime.  Only the narrow fields consumed by the local loader are
+        constructed; vLLM's general speculative-config resolution is not.
         """
-        from vllm.config import ModelConfig, SpeculativeConfig
-        from vllm.config import replace as vllm_replace
+        from runtime.laguna_config import (
+            build_laguna_dflash_config,
+            load_laguna_draft_hf_config,
+        )
 
         if model_path is None:
             model_path = os.path.expanduser(DFLASH_MODEL_PATH)
 
-        # Build SpeculativeConfig for the draft model
-        target_model_config = self.vllm_config.model_config
-        spec_config = SpeculativeConfig(
-            model=model_path,
-            method="dflash",
-            num_speculative_tokens=NUM_SPECULATIVE_TOKENS,
-            target_model_config=target_model_config,
-            target_parallel_config=self.vllm_config.parallel_config,
+        draft_hf_config = load_laguna_draft_hf_config(
+            model_path,
         )
-        # Set draft_model_config directly (skip full post-init resolution)
-        spec_config.draft_model_config = ModelConfig(
-            model=model_path,
-            runner="draft",
-            tokenizer=target_model_config.tokenizer,
-            tokenizer_mode=target_model_config.tokenizer_mode,
-            trust_remote_code=target_model_config.trust_remote_code,
-            dtype=target_model_config.dtype,
-            seed=target_model_config.seed,
-            max_model_len=DRAFT_WINDOW + NUM_QUERY_PER_REQ + 128,
-            spec_target_max_model_len=target_model_config.max_model_len,
-            enforce_eager=True,
-        )
-
-        # vllm_replace(dataclass_instance, **kwargs) reconstructs
-        # type(dataclass_instance)(**merged_fields) -- verified directly
-        # against vllm.config.replace's real source, not assumed -- so it
-        # transparently produces ANOTHER SelfBuiltVllmConfig here, which
-        # load_laguna_dflash_draft_model (self-built, duck-typed) is fine
-        # with.
-        draft_vllm_config = vllm_replace(
+        draft_vllm_config = build_laguna_dflash_config(
             self.vllm_config,
-            speculative_config=spec_config,
+            model=model_path,
+            hf_config=draft_hf_config,
+            num_speculative_tokens=NUM_SPECULATIVE_TOKENS,
+            max_model_len=DRAFT_WINDOW + NUM_QUERY_PER_REQ + 128,
         )
 
         with set_current_vllm_config(draft_vllm_config):
