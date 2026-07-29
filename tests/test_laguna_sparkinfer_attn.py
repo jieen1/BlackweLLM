@@ -12,6 +12,14 @@ from runtime.backends.laguna_cuda_graph import _SparkinferCGExtendImpl  # noqa: 
 from runtime.backends.laguna_sparkinfer_attn import _paged_descale  # noqa: E402
 
 
+def _sparkinfer_forward_importable() -> bool:
+    try:
+        import sparkinfer.attention.paged._forward  # noqa: F401
+        return True
+    except (ImportError, ModuleNotFoundError):
+        return False
+
+
 def test_paged_descale_normalizes_rank_zero_dflash_default_scale():
     descale = _paged_descale(torch.tensor(0.5), batch_size=1, num_kv_heads=8)
 
@@ -33,6 +41,10 @@ def test_paged_descale_rejects_ambiguous_scale_shape():
         _paged_descale(torch.ones(3), batch_size=2, num_kv_heads=8)
 
 
+@pytest.mark.skipif(
+    not _sparkinfer_forward_importable(),
+    reason="sparkinfer.attention.paged._forward requires cutlass",
+)
 def test_cuda_graph_attention_rebinds_when_model_buffers_move(monkeypatch):
     bindings = []
 

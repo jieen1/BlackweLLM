@@ -1,0 +1,36 @@
+{
+  "date": "2026-07-29T14:20:10.094621",
+  "config": "4x128K gpu_mem=0.80",
+  "results": [
+    {
+      "slot": 0,
+      "ctx_k": 4,
+      "tok_s": 321.7,
+      "ttft_ms": 906.0,
+      "pf_tok_s": 4521.0,
+      "itl_ms": 3.11,
+      "accept": 0.9852,
+      "wall_s": 1.3
+    },
+    {
+      "slot": 0,
+      "ctx_k": 64,
+      "tok_s": 249.4,
+      "ttft_ms": 15750.0,
+      "pf_tok_s": 4161.0,
+      "itl_ms": 4.01,
+      "accept": 0.84,
+      "wall_s": 16.3
+    },
+    {
+      "slot": 0,
+      "ctx_k": 128,
+      "tok_s": 280.4,
+      "ttft_ms": 37742.0,
+      "pf_tok_s": 3473.0,
+      "itl_ms": 3.57,
+      "accept": 0.9407,
+      "wall_s": 38.2
+    }
+  ]
+}

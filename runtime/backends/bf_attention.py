@@ -158,16 +158,27 @@ class BFAttention(nn.Module):
                 f"BFAttention context is missing metadata or slot mapping for {self.layer_name!r}."
             )
 
-        # KV cache write via self-developed fused Triton kernel (replaces
-        # vLLM's compiled C++ reshape_and_cache_flash). Single kernel per
-        # layer instead of 6 Python ops (288→48 kernels/step).
+        # KV cache write. For fp8/uint8 cache, use the fused Triton kernel
+        # (single kernel per layer instead of 6 Python ops). For bf16 cache,
+        # use a simple index_copy scatter.
         if sm is not None and k is not None and v is not None and self.kv_cache is not None:
             k_cache = self.kv_cache[0]
             v_cache = self.kv_cache[1]
-            if k_cache.dtype == torch.uint8:
-                k_cache = k_cache.view(torch.float8_e4m3fn)
-                v_cache = v_cache.view(torch.float8_e4m3fn)
-            fused_kv_scatter(k, v, k_cache, v_cache, sm, self._k_scale, self._v_scale)
+            if k_cache.dtype in (torch.uint8, torch.float8_e4m3fn):
+                if k_cache.dtype == torch.uint8:
+                    k_cache = k_cache.view(torch.float8_e4m3fn)
+                    v_cache = v_cache.view(torch.float8_e4m3fn)
+                fused_kv_scatter(k, v, k_cache, v_cache, sm, self._k_scale, self._v_scale)
+            else:
+                # bf16/fp16 cache: simple scatter (no quantization)
+                valid = sm >= 0
+                if valid.any():
+                    block_size = k_cache.shape[1]
+                    valid_sm = sm[valid]
+                    block_idx = valid_sm // block_size
+                    block_off = valid_sm % block_size
+                    k_cache[block_idx, block_off] = k[valid]
+                    v_cache[block_idx, block_off] = v[valid]
 
         # Sparkinfer attention forward
         self.impl.forward(self, q, k, v, self.kv_cache, meta, out)

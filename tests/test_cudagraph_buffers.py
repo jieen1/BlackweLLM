@@ -16,8 +16,11 @@ page_table/cache_seqlens 由 _fill_buffers() 直接以 GPU tensor 写入更新�
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 
 import pytest
+
+_ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestReplayContract:
@@ -136,3 +139,35 @@ class TestIndependentWorkspace:
             "_init_workspaces 必须为每个 group 创建独立的 SparkinferDecodeWorkspace 实例，"
             "不能跨 group 共享"
         )
+
+
+class TestDependencySurfaces:
+    """Freeze the graph modules' runtime-dependency boundaries."""
+
+    def test_graph_modules_do_not_import_runtime_compat_vllm(self):
+        for relpath in (
+            "runtime/backends/laguna_cuda_graph.py",
+            "runtime/backends/laguna_dflash_cudagraph.py",
+        ):
+            src = (_ROOT / relpath).read_text(encoding="utf-8")
+            assert "runtime.compat_vllm" not in src, (
+                f"{relpath} 应直接使用 owned runtime context，而不是 compat_vllm"
+            )
+
+    def test_dflash_graph_module_has_no_flashinfer_dependency(self):
+        src = (_ROOT / "runtime/backends/laguna_dflash_cudagraph.py").read_text(
+            encoding="utf-8"
+        )
+        assert "flashinfer" not in src.lower(), (
+            "DFlash CUDA Graph 应只保留 Sparkinfer 路径，不应残留 FlashInfer 依赖"
+        )
+
+    def test_graph_modules_use_owned_runtime_context(self):
+        for relpath in (
+            "runtime/backends/laguna_cuda_graph.py",
+            "runtime/backends/laguna_dflash_cudagraph.py",
+        ):
+            src = (_ROOT / relpath).read_text(encoding="utf-8")
+            assert "laguna_forward_context" in src, (
+                f"{relpath} 应通过 runtime.laguna_runtime 提供 forward context"
+            )
