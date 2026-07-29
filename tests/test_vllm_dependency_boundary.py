@@ -21,6 +21,13 @@ _APPROVED_DIRECT_IMPORT_FILES = {
     "runtime/backends/laguna.py",
     "runtime/backends/laguna_dflash.py",
     "runtime/backends/laguna_dflash_cudagraph.py",
+    # Added by the vLLM 0.26.0 adaptation (4e99b7c), which moved the KV cache
+    # write from manual Python indexing to vLLM's compiled C++
+    # reshape_and_cache_flash. These three import that one symbol only, and
+    # are the sites to revisit once a self-owned KV scatter kernel replaces it.
+    "runtime/backends/bf_attention.py",
+    "runtime/backends/laguna_cuda_graph.py",
+    "runtime/backends/laguna_sparkinfer_attn.py",
 }
 
 _APPROVED_DIRECT_FLASHINFER_IMPORT_FILES = {

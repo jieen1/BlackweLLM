@@ -1,5 +1,5 @@
 """M=1 decode CG benchmark at 64K — replicating commit 66d5913 methodology."""
-import gc, json, os, sys, time
+import json, os, sys, time
 os.environ["USE_LIBUV"] = "0"
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
@@ -65,7 +65,7 @@ kv = backend.slot_kv_len[0]
 tok_id = first
 for _ in range(20):
     r = cg.replay([0], [tok_id], [kv]); tok_id = r[0]; kv += 1
-print(f"CG captured and warmed up", file=sys.stderr)
+print("CG captured and warmed up", file=sys.stderr)
 
 # Test rounds
 N_ROUNDS = 3

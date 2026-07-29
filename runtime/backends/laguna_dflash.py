@@ -937,8 +937,11 @@ class DFlashEngine:
             logger.warning(
                 "CHUNK_CHECK combined_stats bs=%d shape=%s mean=%.6g std=%.6g "
                 "first_row_mean=%.6g last_row_mean=%.6g",
-                bs, tuple(combined.shape), combined.float().mean().item(),
-                combined.float().std().item(), combined[0].float().mean().item(),
+                bs,
+                tuple(combined.shape),
+                combined.float().mean().item(),
+                combined.float().std().item(),
+                combined[0].float().mean().item(),
                 combined[-1].float().mean().item(),
             )
 
@@ -955,7 +958,11 @@ class DFlashEngine:
             logger.warning(
                 "CHUNK_CHECK draft_kv_precompute bs=%d num_positions=%d ring_slots=%d "
                 "position_offset=%d n_unique_slot_mappings=%d (dup=%d)",
-                bs, num_positions, ring_slots, position_offset, n_unique,
+                bs,
+                num_positions,
+                ring_slots,
+                position_offset,
+                n_unique,
                 num_positions - n_unique,
             )
 
@@ -977,8 +984,14 @@ class DFlashEngine:
                 logger.warning(
                     "CHUNK_CHECK draft_kv_readback bs=%d i=%d pos=%d slot_mapping=%d "
                     "block=%d off=%d k_abs_sum=%.6g v_abs_sum=%.6g k_nonzero=%s",
-                    bs, i, position_offset + i, sm, blk, off,
-                    k_val.abs().sum().item(), v_val.abs().sum().item(),
+                    bs,
+                    i,
+                    position_offset + i,
+                    sm,
+                    blk,
+                    off,
+                    k_val.abs().sum().item(),
+                    v_val.abs().sum().item(),
                     bool((k_val != 0).any().item()),
                 )
 
@@ -1188,7 +1201,11 @@ class DFlashEngine:
                 logger.warning(
                     "CHUNK_CHECK generate_verify_only prompt_len=%d prefix_len=%d "
                     "aux_len=%d aux_offset=%d n_aux_tensors=%d",
-                    prompt_len, prefix_len, aux_len, aux_offset, len(aux_hidden_states),
+                    prompt_len,
+                    prefix_len,
+                    aux_len,
+                    aux_offset,
+                    len(aux_hidden_states),
                 )
             self._bulk_precompute_context_kv(slot, aux_hidden_states, aux_len, aux_offset)
 
@@ -1211,7 +1228,10 @@ class DFlashEngine:
         if _debug_chunk in ("1", "2"):
             logger.warning(
                 "CHUNK_CHECK initial_draft bs=%d bonus_token=%d kv_len=%d draft_tokens=%s",
-                self.block_size, bonus_token, kv_len, draft_tokens,
+                self.block_size,
+                bonus_token,
+                kv_len,
+                draft_tokens,
             )
 
         tokens = [first_token]
@@ -1256,19 +1276,29 @@ class DFlashEngine:
                 vtop2 = vl.topk(2, dim=-1)
                 vpositions = []
                 for j in range(vl.shape[0]):
-                    vpositions.append({
-                        "top1_tok": int(vtop2.indices[j, 0]),
-                        "top1_val": round(float(vtop2.values[j, 0]), 6),
-                        "top2_tok": int(vtop2.indices[j, 1]),
-                        "top2_val": round(float(vtop2.values[j, 1]), 6),
-                    })
+                    vpositions.append(
+                        {
+                            "top1_tok": int(vtop2.indices[j, 0]),
+                            "top1_val": round(float(vtop2.values[j, 0]), 6),
+                            "top2_tok": int(vtop2.indices[j, 1]),
+                            "top2_val": round(float(vtop2.values[j, 1]), 6),
+                        }
+                    )
                 import json as _json
+
                 with open(verify_dump_path, "a") as _f:
-                    _f.write(_json.dumps({
-                        "bs": self.block_size, "kv_len": kv_len,
-                        "bonus_token": bonus_token, "draft_tokens": draft_tokens,
-                        "positions": vpositions,
-                    }) + "\n")
+                    _f.write(
+                        _json.dumps(
+                            {
+                                "bs": self.block_size,
+                                "kv_len": kv_len,
+                                "bonus_token": bonus_token,
+                                "draft_tokens": draft_tokens,
+                                "positions": vpositions,
+                            }
+                        )
+                        + "\n"
+                    )
 
             decision = _verify_only_accept_reject(all_argmax, draft_tokens, bonus_token)
             num_accepted = decision["num_accepted"]
@@ -1287,8 +1317,14 @@ class DFlashEngine:
                 logger.warning(
                     "CHUNK_CHECK round bs=%d num_steps=%d kv_len=%d bonus_token=%d "
                     "draft_tokens=%s num_accepted=%d new_tokens=%s new_bonus=%d",
-                    self.block_size, num_steps, kv_len, bonus_token, draft_tokens,
-                    num_accepted, new_tokens, new_bonus,
+                    self.block_size,
+                    num_steps,
+                    kv_len,
+                    bonus_token,
+                    draft_tokens,
+                    num_accepted,
+                    new_tokens,
+                    new_bonus,
                 )
 
             # Step 4: Precompute draft context KV from committed verifier inputs.

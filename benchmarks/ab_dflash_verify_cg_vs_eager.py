@@ -1,5 +1,5 @@
 """A/B: DFlash verify CG vs eager at 64K, matching cac38ab methodology."""
-import gc, json, os, sys, time
+import json, os, sys, time
 os.environ["USE_LIBUV"] = "0"
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"

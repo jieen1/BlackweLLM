@@ -1,5 +1,5 @@
 """Correctness A/B: decode_batch_sampled eager vs CG-routed path, plus edge cases."""
-import os, sys, time, json
+import os, sys, json
 os.environ["USE_LIBUV"] = "0"
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"

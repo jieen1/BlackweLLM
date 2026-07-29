@@ -12,9 +12,17 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
-from bfprobe.baseline import absmax_ratio_bound, record_baseline
-from bfprobe.reduce import Signature
-from bfprobe.scan import (
+import pytest
+
+# Synthetic data only -- no GPU is touched here -- but bfprobe.scan reaches
+# Signature through bfprobe.reduce, the module that holds the Triton
+# signature kernel, so the import chain needs torch + triton installed.
+pytest.importorskip("torch")
+pytest.importorskip("triton")
+
+from bfprobe.baseline import absmax_ratio_bound, record_baseline  # noqa: E402
+from bfprobe.reduce import Signature  # noqa: E402
+from bfprobe.scan import (  # noqa: E402
     SITE_ATTN_OUT,
     SITE_INPUT_LAYERNORM,
     SITE_MOE_OUT,
@@ -24,7 +32,7 @@ from bfprobe.scan import (
     site_name,
     to_json_dict,
 )
-from bfprobe.signature import SignatureRecord
+from bfprobe.signature import SignatureRecord  # noqa: E402
 
 NUM_LAYERS = 48
 ALL_SITES = (SITE_INPUT_LAYERNORM, SITE_ATTN_OUT, SITE_POST_ATTENTION_LAYERNORM, SITE_MOE_OUT)
@@ -33,9 +41,7 @@ _GOOD = Signature(absmax=1.0, l2=10.0, mean=0.1, nan_count=0, inf_count=0, numel
 
 
 def _make_baseline():
-    signatures = [
-        (site_id, layer, _GOOD) for layer in range(NUM_LAYERS) for site_id in ALL_SITES
-    ]
+    signatures = [(site_id, layer, _GOOD) for layer in range(NUM_LAYERS) for site_id in ALL_SITES]
     return record_baseline(signatures, model_revision="qwen3.6-demo", git_sha="deadbeef")
 
 
@@ -70,9 +76,7 @@ class TestFirstOutOfBandLocatesInjectedLayer:
         records = _clean_round(round_idx=0)
         # Inject an unmistakable absmax spike at layer 31, one tap only.
         spike_idx = next(
-            i
-            for i, r in enumerate(records)
-            if r.layer == 31 and r.site_id == SITE_MOE_OUT
+            i for i, r in enumerate(records) if r.layer == 31 and r.site_id == SITE_MOE_OUT
         )
         records[spike_idx] = replace(records[spike_idx], absmax=500.0)
 
@@ -115,9 +119,7 @@ class TestNaturalDeepLayerDriftDoesNotFalsePositive:
         records = _clean_round(round_idx=0)
         bound = absmax_ratio_bound(47)
         drifted_absmax = _GOOD.absmax * (bound - 0.01)
-        idx = next(
-            i for i, r in enumerate(records) if r.layer == 47 and r.site_id == SITE_MOE_OUT
-        )
+        idx = next(i for i, r in enumerate(records) if r.layer == 47 and r.site_id == SITE_MOE_OUT)
         records[idx] = replace(records[idx], absmax=drifted_absmax)
 
         report = scan(records, baseline)
@@ -132,9 +134,7 @@ class TestNaturalDeepLayerDriftDoesNotFalsePositive:
         bound = absmax_ratio_bound(47)
         drifted_absmax = _GOOD.absmax * (bound - 0.01)
         records = _clean_round(round_idx=0)
-        idx = next(
-            i for i, r in enumerate(records) if r.layer == 0 and r.site_id == SITE_MOE_OUT
-        )
+        idx = next(i for i, r in enumerate(records) if r.layer == 0 and r.site_id == SITE_MOE_OUT)
         records[idx] = replace(records[idx], absmax=drifted_absmax)
         report = scan(records, baseline)
         assert report.has_out_of_band
@@ -156,9 +156,7 @@ class TestNanAlwaysCaughtRegardlessOfDepth:
     def test_nan_at_deepest_layer(self):
         baseline = _make_baseline()
         records = _clean_round(round_idx=0)
-        idx = next(
-            i for i, r in enumerate(records) if r.layer == 47 and r.site_id == SITE_MOE_OUT
-        )
+        idx = next(i for i, r in enumerate(records) if r.layer == 47 and r.site_id == SITE_MOE_OUT)
         records[idx] = replace(records[idx], nan_count=1)
         report = scan(records, baseline)
         assert report.has_out_of_band
@@ -222,9 +220,7 @@ class TestReportRendering:
     def test_json_report_shape_when_out_of_band(self):
         baseline = _make_baseline()
         records = _clean_round(0)
-        idx = next(
-            i for i, r in enumerate(records) if r.layer == 31 and r.site_id == SITE_MOE_OUT
-        )
+        idx = next(i for i, r in enumerate(records) if r.layer == 31 and r.site_id == SITE_MOE_OUT)
         records[idx] = replace(records[idx], absmax=500.0)
         report = scan(records, baseline)
         payload = to_json_dict(report)
@@ -236,9 +232,7 @@ class TestReportRendering:
     def test_text_report_mentions_layer_and_reason_when_out_of_band(self):
         baseline = _make_baseline()
         records = _clean_round(0)
-        idx = next(
-            i for i, r in enumerate(records) if r.layer == 31 and r.site_id == SITE_MOE_OUT
-        )
+        idx = next(i for i, r in enumerate(records) if r.layer == 31 and r.site_id == SITE_MOE_OUT)
         records[idx] = replace(records[idx], absmax=500.0)
         report = scan(records, baseline)
         text = format_text_report(report)

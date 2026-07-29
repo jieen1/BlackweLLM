@@ -9,9 +9,12 @@ to CPU, which would hide the mistake instead of surfacing it).
 from __future__ import annotations
 
 import pytest
-import torch
 
-from bfdiag.shapes.harness import (
+# The whole module exercises real torch tensor construction, and
+# bfdiag.shapes.harness imports torch at module scope.
+torch = pytest.importorskip("torch")
+
+from bfdiag.shapes.harness import (  # noqa: E402
     empty_from_shapes,
     make_empty,
     make_randn,

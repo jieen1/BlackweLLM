@@ -1,5 +1,5 @@
 """Kernel-level torch.profiler breakdown of the M=16 verify CG replay."""
-import os, sys, time, json
+import os, sys
 os.environ["USE_LIBUV"] = "0"
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
@@ -34,7 +34,7 @@ def make_ids(n):
 from runtime.compat_vllm import EngineArgs
 from runtime.backends.laguna import LagunaBackend
 from runtime.backends.laguna_dflash import DFlashEngine
-from runtime.backends.dflash_constants import NUM_SPECULATIVE_TOKENS, NUM_QUERY_PER_REQ
+from runtime.backends.dflash_constants import NUM_QUERY_PER_REQ
 from runtime.backends.laguna_dflash import _verify_only_accept_reject, _physical_slot
 
 prompt = make_ids(CTX)
@@ -103,7 +103,7 @@ with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_sh
         verify_logits, verify_aux = engine._verify_cg.replay_with_aux(slot, verify_tokens, kv_len)
         torch.cuda.synchronize()
 
-print("\n===== TOP 40 CUDA KERNELS BY TOTAL TIME (over %d replays) =====" % N_PROF)
+print(f"\n===== TOP 40 CUDA KERNELS BY TOTAL TIME (over {N_PROF} replays) =====")
 print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=40))
 
 # Bucket by name heuristics for a category rollup.

@@ -9,7 +9,7 @@ order, see notes/2026-07-27-verify-cg-mode-fix-and-block-size-eval.md for
 precedent) between the two block sizes; a large divergence in accepted
 tokens would indicate a real bug, not just FP noise.
 """
-import gc, json, os, sys, time
+import json, os, sys, time
 os.environ["USE_LIBUV"] = "0"
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
