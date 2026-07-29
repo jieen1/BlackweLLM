@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from typing import Any
 
 import numpy as np
@@ -43,6 +45,22 @@ RESERVED_PHYSICAL_SLOTS = 0
 # Formula: cdiv(window - 1 + qo_max, block_size) + 1
 # qo_max=1 → 33, qo_max=16 → 34 (审查阻断①)
 SWA_QO_MAX = 16
+
+
+@dataclass(frozen=True)
+class LagunaSlotState:
+    """Read-only server view of one Laguna slot.
+
+    Server scheduling needs occupancy and the committed prefix for session
+    retention, but must not mutate Laguna's cache bookkeeping directly.
+    """
+
+    kv_len: int
+    committed_tokens: tuple[int, ...]
+
+    @property
+    def is_fresh(self) -> bool:
+        return self.kv_len == 0
 
 
 def _ring_blocks_for_window(window: int, block_size: int, qo_max: int = SWA_QO_MAX) -> int:
@@ -359,14 +377,6 @@ class LagunaBackend:
         # Per-slot state
         self.slot_kv_len: list[int] = [0] * num_slots
         self.slot_committed_tokens: list[list[int]] = [[] for _ in range(num_slots)]
-        # E1: mirrors DirectModelRunner.block_table's role as a per-slot
-        # "has this slot ever been touched" dirty flag for admission. Laguna
-        # has no block-table indirection (physical slot is a direct
-        # arithmetic mapping, see _physical_slot) -- this list is never
-        # populated, only kept empty/falsy so ServerEngine's shared admission
-        # check (`slot_kv_len[slot] != 0 or block_table[slot]`) works
-        # unmodified against either backend.
-        self.block_table: list[list[int]] = [[] for _ in range(num_slots)]
 
         # M=1 decode CUDA Graph (lazily captured on first generate call)
         self._decode_cg = None
@@ -1748,6 +1758,44 @@ class LagunaBackend:
         except Exception as e:
             logger.warning("Laguna: decode CG capture failed (falling back to eager): %s", e)
             self._decode_cg_enabled = False
+
+    def capture_decode_cuda_graph(self) -> int | None:
+        """Capture the server decode graph and return its fixed batch size.
+
+        The graph object and its patching lifecycle stay backend-private;
+        callers only need to know whether capture succeeded.
+        """
+        self._ensure_decode_cg()
+        return None if self._decode_cg is None else self._decode_cg.batch_size
+
+    @property
+    def has_speculative_decode(self) -> bool:
+        """Whether greedy server rounds should use DFlash verification."""
+        return self._dflash is not None
+
+    def enable_dflash(self, *, num_speculative_tokens: int) -> bool:
+        """Attach the owned DFlash engine before any production slot is used."""
+        if self._dflash is not None:
+            return self._dflash._use_cuda_graph
+
+        from runtime.backends.laguna_dflash import DFlashEngine
+
+        dflash = DFlashEngine(self)
+        self._dflash = dflash
+        self.spec = dataclass_replace(
+            self.spec,
+            mtp_model_id=dflash.draft_model.__class__.__name__,
+            num_speculative_tokens=num_speculative_tokens,
+        )
+        self.num_speculative_tokens = num_speculative_tokens
+        return dflash._use_cuda_graph
+
+    def slot_state(self, slot: int) -> LagunaSlotState:
+        """Return a snapshot for scheduler decisions and session retention."""
+        return LagunaSlotState(
+            kv_len=self.slot_kv_len[slot],
+            committed_tokens=tuple(self.slot_committed_tokens[slot]),
+        )
 
     def _unpatch_impls_for_prefill(self) -> None:
         """Restore original attention impls so prefill works after CG capture."""

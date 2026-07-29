@@ -27,7 +27,6 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from dataclasses import replace as dataclass_replace
 from typing import Any
 
 from runtime.sampling import SamplingParams
@@ -391,11 +390,11 @@ class ServerEngine:
             blocks_per_slot=self.blocks_per_slot,
         )
         if self._enable_cudagraph:
-            self.runner._ensure_decode_cg()
-            if self.runner._decode_cg is not None:
+            graph_batch_size = self.runner.capture_decode_cuda_graph()
+            if graph_batch_size is not None:
                 logger.info(
                     "Laguna decode CUDA Graph captured at load (batch_size=%d)",
-                    self.runner._decode_cg.batch_size,
+                    graph_batch_size,
                 )
             else:
                 logger.warning(
@@ -404,7 +403,7 @@ class ServerEngine:
                 )
         if self.enable_dflash:
             # Wire DFlash speculative decoding into the shared MTP-shaped
-            # decode path: self.runner.spec.has_mtp flips True so
+            # decode path: runner.has_speculative_decode flips True so
             # classify_decode_slots (server/engine.py) routes greedy
             # requests to mtp_verify_and_commit_batch, which
             # LagunaBackend now implements by delegating to
@@ -415,19 +414,13 @@ class ServerEngine:
             # _ensure_decode_cg above): DFlashEngine.__init__ captures its
             # own draft/verify CUDA Graphs, which scribble dummy warmup data
             # into physical slots.
-            from runtime.backends.laguna_dflash import DFlashEngine
-
-            dflash = DFlashEngine(self.runner)
-            self.runner._dflash = dflash
-            self.runner.spec = dataclass_replace(
-                self.runner.spec,
-                mtp_model_id=dflash.draft_model.__class__.__name__,
-                num_speculative_tokens=self.K,
+            dflash_cuda_graph = self.runner.enable_dflash(
+                num_speculative_tokens=self.K
             )
             logger.info(
                 "DFlash speculative decoding wired: K=%d, cuda_graph=%s",
                 self.K,
-                dflash._use_cuda_graph,
+                dflash_cuda_graph,
             )
         logger.info(
             "Laguna model loaded on engine thread: num_slots=%d blocks_per_slot=%d "
@@ -570,14 +563,14 @@ class ServerEngine:
     # -- admission-time correctness check (engine thread) --------------------
     def _admission_bootstrap_check(self, slot: int, req: GenerationRequest, anchor: int) -> None:
         ref_slot = self.ref_slot_for[slot]
-        if self.runner.slot_kv_len[ref_slot] != 0:
+        if not self.runner.slot_state(ref_slot).is_fresh:
             self.runner.reset_slot(ref_slot)
         ref_first = self.runner.prefill(ref_slot, req.prompt_ids)
         if ref_first == anchor:
             self.stats["bootstrap_checks_ok"] += 1
             return
         diag_slot = self.diag_slot_for[slot]
-        if self.runner.slot_kv_len[diag_slot] != 0:
+        if not self.runner.slot_state(diag_slot).is_fresh:
             self.runner.reset_slot(diag_slot)
         diag = self._near_tie_margin_diag(self.runner, diag_slot, req.prompt_ids, anchor)
         if diag["within_tolerance"]:
@@ -730,8 +723,9 @@ class ServerEngine:
             if old is not None and old["slot"] != slot:
                 self.runner.reset_slot(old["slot"])
                 self.free_slots.append(old["slot"])
-            prior_len = self.runner.slot_kv_len[slot]
-            committed_full = list(self.runner.slot_committed_tokens[slot])
+            slot_state = self.runner.slot_state(slot)
+            prior_len = slot_state.kv_len
+            committed_full = list(slot_state.committed_tokens)
             self.retained[req.session_id] = {
                 "slot": slot,
                 "expire_t": time.perf_counter() + self.session_ttl_s,
@@ -914,7 +908,7 @@ class ServerEngine:
             new_prompts = [r.prompt_ids for _, r in admit_now]
             try:
                 for slot, _ in admit_now:
-                    if self.runner.slot_kv_len[slot] != 0 or self.runner.block_table[slot]:
+                    if not self.runner.slot_state(slot).is_fresh:
                         self.runner.reset_slot(slot)
                 hit_depths = [self.runner.reconcile_prefix_hit(p) for p in new_prompts]
                 prefill_state = self.runner.prefill_chunked_begin(
@@ -979,7 +973,7 @@ class ServerEngine:
         # E1: a backend with no MTP (e.g. Laguna) routes every slot through
         # the sampled path regardless of is_greedy -- see classify_decode_slots.
         greedy_slots, sampled_slots = classify_decode_slots(
-            active_slots, self.active, grammar_slots, self.runner.spec.has_mtp
+            active_slots, self.active, grammar_slots, self.runner.has_speculative_decode
         )
 
         self.stats["rounds"] += 1
@@ -992,7 +986,7 @@ class ServerEngine:
             self.stats["sampled_decode_rounds"] += 1
             slot_ids = sampled_slots
             token_ids = [self.active[s]["last_token"] for s in slot_ids]
-            kv_lengths = [self.runner.slot_kv_len[s] for s in slot_ids]
+            kv_lengths = [self.runner.slot_state(s).kv_len for s in slot_ids]
             params_list = [self.active[s]["req"].sampling_params for s in slot_ids]
             any_lp = any(self.active[s]["req"].logprobs for s in slot_ids)
             top_lp = (
@@ -1175,7 +1169,7 @@ class ServerEngine:
             for s in stale_slots:
                 st = self.active.pop(s)
                 req = st["req"]
-                kv_len = self.runner.slot_kv_len[s] if self.runner else -1
+                kv_len = self.runner.slot_state(s).kv_len if self.runner else -1
                 committed = len(st["committed_tokens"])
                 event = {
                     "slot": s,

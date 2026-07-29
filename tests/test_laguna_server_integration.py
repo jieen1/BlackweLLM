@@ -111,6 +111,32 @@ class TestLagunaBackendE1Surface:
         assert backend.reconcile_prefix_hit([1, 2, 3]) == 0
         assert backend.reconcile_prefix_hit([]) == 0
 
+    def test_slot_state_is_immutable_scheduler_snapshot(self):
+        backend = self._bare_backend()
+        backend.slot_kv_len = [3]
+        backend.slot_committed_tokens = [[11, 12, 13, 14]]
+
+        state = backend.slot_state(0)
+
+        assert state.kv_len == 3
+        assert state.committed_tokens == (11, 12, 13, 14)
+        assert state.is_fresh is False
+        backend.slot_committed_tokens[0].append(15)
+        assert state.committed_tokens == (11, 12, 13, 14)
+
+
+def test_server_engine_uses_laguna_owned_runtime_surface():
+    """Keep Qwen compatibility fields out of the Laguna server path."""
+    source = inspect.getsource(ServerEngine)
+    for private_member in (
+        "_decode_cg",
+        "_dflash",
+        "block_table",
+        "slot_kv_len",
+        "slot_committed_tokens",
+    ):
+        assert f"runner.{private_member}" not in source
+
     def test_prefill_chunked_begin_rejects_mismatched_lengths(self):
         backend = self._bare_backend()
         with pytest.raises(ValueError, match="equal length"):
