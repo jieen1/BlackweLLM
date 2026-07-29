@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from huggingface_hub import snapshot_download
 from transformers import AutoConfig
 
 # ---------------------------------------------------------------------------
@@ -288,6 +289,14 @@ class SelfBuiltVllmConfig:
     ec_transfer_config: Any = None
 
 
+def _resolve_laguna_model_dir(model: str) -> Path:
+    """Return a local checkpoint directory without allowing a network fetch."""
+    model_dir = Path(model)
+    if (model_dir / "config.json").is_file():
+        return model_dir
+    return Path(snapshot_download(repo_id=model, local_files_only=True))
+
+
 def build_laguna_config(
     model: str,
     *,
@@ -304,8 +313,8 @@ def build_laguna_config(
     every real ``EngineArgs(...)`` call site in the production/
     validation paths, not vLLM's full CLI surface).
     """
-    model_dir = Path(model)
-    hf_config = AutoConfig.from_pretrained(model, trust_remote_code=True)
+    model_dir = _resolve_laguna_model_dir(model)
+    hf_config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True)
 
     checkpoint_config = json.loads((model_dir / "config.json").read_text())
     quantization_config = checkpoint_config.get("quantization_config")
@@ -319,12 +328,12 @@ def build_laguna_config(
     model_config = SelfBuiltModelConfig(
         hf_config=hf_config,
         dtype=torch_dtype,
-        model=model,
+        model=str(model_dir),
         max_model_len=max_model_len,
         gpu_memory_utilization=gpu_memory_utilization,
         trust_remote_code=trust_remote_code,
         quantization=quantization,
-        tokenizer=model,
+        tokenizer=str(model_dir),
         enforce_eager=enforce_eager,
     )
     return SelfBuiltVllmConfig(

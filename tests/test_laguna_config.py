@@ -18,6 +18,7 @@ from runtime.laguna_config import (
     SelfBuiltParallelConfig,
     SelfBuiltQuantConfig,
     SelfBuiltVllmConfig,
+    build_laguna_config,
     build_laguna_dflash_config,
     load_laguna_draft_hf_config,
 )
@@ -106,3 +107,22 @@ def test_draft_config_preserves_draft_rope_and_adds_legacy_defaults(monkeypatch)
     assert draft_config.partial_rotary_factor == 1.0
     assert draft_config.swa_attention_sink_enabled is False
     assert draft_config.swa_rope_parameters is None
+
+
+def test_build_config_resolves_cached_repo_id_to_local_snapshot(monkeypatch, tmp_path) -> None:
+    from runtime import laguna_config
+
+    (tmp_path / "config.json").write_text('{"quantization_config": {"quant_method": "nvfp4"}}')
+    loaded: dict[str, object] = {}
+
+    monkeypatch.setattr(laguna_config, "snapshot_download", lambda **_: str(tmp_path))
+    def load(model, **_):
+        loaded["model"] = model
+        return SimpleNamespace()
+
+    monkeypatch.setattr(laguna_config.AutoConfig, "from_pretrained", load)
+
+    config = build_laguna_config("poolside/Laguna-S-2.1-NVFP4", max_model_len=64)
+
+    assert loaded["model"] == str(tmp_path)
+    assert config.model_config.model == str(tmp_path)
