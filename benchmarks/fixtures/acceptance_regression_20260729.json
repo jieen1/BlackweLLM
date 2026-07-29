@@ -1,0 +1,380 @@
+{
+  "date": "2026-07-29T10:06:59",
+  "suite_version": "1.0",
+  "rounds": 2,
+  "summary": {
+    "all": {
+      "n": 13,
+      "mean": 0.7711,
+      "p50": 0.9778,
+      "min": 0.1215,
+      "max": 1.0
+    },
+    "real_workload": {
+      "n": 11,
+      "mean": 0.8448,
+      "p50": 0.9852,
+      "min": 0.313,
+      "max": 1.0
+    },
+    "by_category": {
+      "chinese": {
+        "n": 2,
+        "mean": 0.3148,
+        "p50": 0.3148
+      },
+      "code": {
+        "n": 1,
+        "mean": 0.9778,
+        "p50": 0.9778
+      },
+      "long": {
+        "n": 1,
+        "mean": 0.8815,
+        "p50": 0.8815
+      },
+      "qa": {
+        "n": 4,
+        "mean": 0.9963,
+        "p50": 1.0
+      },
+      "repeat": {
+        "n": 3,
+        "mean": 0.9395,
+        "p50": 0.9852
+      },
+      "synthetic": {
+        "n": 2,
+        "mean": 0.3655,
+        "p50": 0.3655
+      }
+    }
+  },
+  "results": [
+    {
+      "label": "fox-4K",
+      "category": "repeat",
+      "prompt_len": 4096,
+      "accept": 0.9852,
+      "accept_avg": 0.9852,
+      "tps": 14.11,
+      "tok_s": 314.6,
+      "rounds": [
+        {
+          "accept": 0.9851851851851852,
+          "tps": 14.11111111111111,
+          "tok_s": 314.5961119353154,
+          "wall_s": 1.525,
+          "steps": 9
+        },
+        {
+          "accept": 0.9851851851851852,
+          "tps": 14.11111111111111,
+          "tok_s": 289.3753038591689,
+          "wall_s": 1.514,
+          "steps": 9
+        }
+      ]
+    },
+    {
+      "label": "galaxy-4K",
+      "category": "repeat",
+      "prompt_len": 4096,
+      "accept": 1.0,
+      "accept_avg": 1.0,
+      "tps": 15.88,
+      "tok_s": 375.8,
+      "rounds": [
+        {
+          "accept": 1.0,
+          "tps": 15.875,
+          "tok_s": 375.84084957228333,
+          "wall_s": 1.395,
+          "steps": 8
+        },
+        {
+          "accept": 1.0,
+          "tps": 15.875,
+          "tok_s": 356.5933584106754,
+          "wall_s": 1.407,
+          "steps": 8
+        }
+      ]
+    },
+    {
+      "label": "ml-4K",
+      "category": "repeat",
+      "prompt_len": 4096,
+      "accept": 0.8333,
+      "accept_avg": 0.8333,
+      "tps": 12.7,
+      "tok_s": 280.2,
+      "rounds": [
+        {
+          "accept": 0.8333333333333334,
+          "tps": 12.7,
+          "tok_s": 280.2052704370982,
+          "wall_s": 1.505,
+          "steps": 10
+        },
+        {
+          "accept": 0.8333333333333334,
+          "tps": 12.7,
+          "tok_s": 273.6925560048909,
+          "wall_s": 1.534,
+          "steps": 10
+        }
+      ]
+    },
+    {
+      "label": "code-4K",
+      "category": "code",
+      "prompt_len": 4096,
+      "accept": 0.9778,
+      "accept_avg": 0.9778,
+      "tps": 14.11,
+      "tok_s": 297.1,
+      "rounds": [
+        {
+          "accept": 0.9777777777777777,
+          "tps": 14.11111111111111,
+          "tok_s": 297.0914492129362,
+          "wall_s": 1.585,
+          "steps": 9
+        },
+        {
+          "accept": 0.9777777777777777,
+          "tps": 14.11111111111111,
+          "tok_s": 285.8960950456348,
+          "wall_s": 1.581,
+          "steps": 9
+        }
+      ]
+    },
+    {
+      "label": "qa-relativity",
+      "category": "qa",
+      "prompt_len": 2048,
+      "accept": 1.0,
+      "accept_avg": 1.0,
+      "tps": 15.88,
+      "tok_s": 312.5,
+      "rounds": [
+        {
+          "accept": 1.0,
+          "tps": 15.875,
+          "tok_s": 312.52444903637456,
+          "wall_s": 1.276,
+          "steps": 8
+        },
+        {
+          "accept": 1.0,
+          "tps": 15.875,
+          "tok_s": 298.0971823116324,
+          "wall_s": 1.231,
+          "steps": 8
+        }
+      ]
+    },
+    {
+      "label": "qa-quicksort",
+      "category": "qa",
+      "prompt_len": 2048,
+      "accept": 0.9852,
+      "accept_avg": 0.9852,
+      "tps": 14.11,
+      "tok_s": 277.6,
+      "rounds": [
+        {
+          "accept": 0.9851851851851852,
+          "tps": 14.11111111111111,
+          "tok_s": 277.5948238431435,
+          "wall_s": 1.307,
+          "steps": 9
+        },
+        {
+          "accept": 0.9851851851851852,
+          "tps": 14.11111111111111,
+          "tok_s": 290.7181360804775,
+          "wall_s": 1.256,
+          "steps": 9
+        }
+      ]
+    },
+    {
+      "label": "qa-tcp-udp",
+      "category": "qa",
+      "prompt_len": 2048,
+      "accept": 1.0,
+      "accept_avg": 1.0,
+      "tps": 15.88,
+      "tok_s": 301.1,
+      "rounds": [
+        {
+          "accept": 1.0,
+          "tps": 15.875,
+          "tok_s": 301.1259554762728,
+          "wall_s": 1.246,
+          "steps": 8
+        },
+        {
+          "accept": 1.0,
+          "tps": 15.875,
+          "tok_s": 360.2972279646665,
+          "wall_s": 1.138,
+          "steps": 8
+        }
+      ]
+    },
+    {
+      "label": "qa-photosynthesis",
+      "category": "qa",
+      "prompt_len": 2048,
+      "accept": 1.0,
+      "accept_avg": 1.0,
+      "tps": 15.88,
+      "tok_s": 357.7,
+      "rounds": [
+        {
+          "accept": 1.0,
+          "tps": 15.875,
+          "tok_s": 357.734396517116,
+          "wall_s": 1.071,
+          "steps": 8
+        },
+        {
+          "accept": 1.0,
+          "tps": 15.875,
+          "tok_s": 339.50551327020503,
+          "wall_s": 1.141,
+          "steps": 8
+        }
+      ]
+    },
+    {
+      "label": "cn-repeat-4K",
+      "category": "chinese",
+      "prompt_len": 4096,
+      "accept": 0.3167,
+      "accept_avg": 0.3167,
+      "tps": 5.29,
+      "tok_s": 116.6,
+      "rounds": [
+        {
+          "accept": 0.31666666666666665,
+          "tps": 5.291666666666667,
+          "tok_s": 116.5555043783715,
+          "wall_s": 2.149,
+          "steps": 24
+        },
+        {
+          "accept": 0.31666666666666665,
+          "tps": 5.291666666666667,
+          "tok_s": 118.0152980385363,
+          "wall_s": 2.112,
+          "steps": 24
+        }
+      ]
+    },
+    {
+      "label": "cn-qa",
+      "category": "chinese",
+      "prompt_len": 2048,
+      "accept": 0.313,
+      "accept_avg": 0.313,
+      "tps": 5.52,
+      "tok_s": 112.1,
+      "rounds": [
+        {
+          "accept": 0.3130434782608696,
+          "tps": 5.521739130434782,
+          "tok_s": 112.0650142970519,
+          "wall_s": 1.935,
+          "steps": 23
+        },
+        {
+          "accept": 0.3130434782608696,
+          "tps": 5.521739130434782,
+          "tok_s": 113.29490611045344,
+          "wall_s": 2.005,
+          "steps": 23
+        }
+      ]
+    },
+    {
+      "label": "ids-cycle-4K",
+      "category": "synthetic",
+      "prompt_len": 4096,
+      "accept": 0.1215,
+      "accept_avg": 0.1215,
+      "tps": 2.82,
+      "tok_s": 60.2,
+      "rounds": [
+        {
+          "accept": 0.12148148148148148,
+          "tps": 2.8222222222222224,
+          "tok_s": 60.21507954001444,
+          "wall_s": 3.206,
+          "steps": 45
+        },
+        {
+          "accept": 0.12148148148148148,
+          "tps": 2.8222222222222224,
+          "tok_s": 61.1874591417317,
+          "wall_s": 3.219,
+          "steps": 45
+        }
+      ]
+    },
+    {
+      "label": "ids-cycle-512",
+      "category": "synthetic",
+      "prompt_len": 512,
+      "accept": 0.6095,
+      "accept_avg": 0.6095,
+      "tps": 9.07,
+      "tok_s": 210.2,
+      "rounds": [
+        {
+          "accept": 0.6095238095238096,
+          "tps": 9.071428571428571,
+          "tok_s": 210.1957900982725,
+          "wall_s": 1.062,
+          "steps": 14
+        },
+        {
+          "accept": 0.6095238095238096,
+          "tps": 9.071428571428571,
+          "tok_s": 203.9378402529628,
+          "wall_s": 1.079,
+          "steps": 14
+        }
+      ]
+    },
+    {
+      "label": "fox-64K",
+      "category": "long",
+      "prompt_len": 65536,
+      "accept": 0.8815,
+      "accept_avg": 0.8815,
+      "tps": 14.17,
+      "tok_s": 299.6,
+      "rounds": [
+        {
+          "accept": 0.8814814814814815,
+          "tps": 14.166666666666666,
+          "tok_s": 299.6407508323096,
+          "wall_s": 15.648,
+          "steps": 18
+        },
+        {
+          "accept": 0.8814814814814815,
+          "tps": 14.166666666666666,
+          "tok_s": 289.99689355425056,
+          "wall_s": 16.348,
+          "steps": 18
+        }
+      ]
+    }
+  ]
+}

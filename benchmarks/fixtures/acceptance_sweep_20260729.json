@@ -1,0 +1,36 @@
+{
+  "date": "2026-07-29T09:50:00",
+  "test": "acceptance_sweep",
+  "daemon_config": {"block_size": 64, "max_model_len": 131072, "gpu_mem_util": 0.90, "num_slots": 1},
+  "git_head": "1cab5f9",
+  "note": "Comprehensive acceptance sweep. Same daemon, same params, all prompts tested in one session.",
+  "results": [
+    {"label": "repeat: fox",              "prompt_len": 4096,  "accept": 0.985, "tps": 14.11, "tok_s": 331.7},
+    {"label": "repeat: galaxy",           "prompt_len": 4096,  "accept": 1.000, "tps": 15.88, "tok_s": 361.3},
+    {"label": "repeat: ML",               "prompt_len": 4096,  "accept": 0.833, "tps": 12.70, "tok_s": 293.0},
+    {"label": "qa: relativity",           "prompt_len": 2048,  "accept": 0.662, "tps": 9.77,  "tok_s": 228.4},
+    {"label": "qa: quicksort",            "prompt_len": 2048,  "accept": 0.393, "tps": 6.68,  "tok_s": 153.3},
+    {"label": "qa: tcp-udp",              "prompt_len": 2048,  "accept": 0.641, "tps": 9.77,  "tok_s": 167.6},
+    {"label": "qa: photosynthesis",       "prompt_len": 2048,  "accept": 0.661, "tps": 10.58, "tok_s": 184.2},
+    {"label": "code: transformer",        "prompt_len": 4096,  "accept": 1.000, "tps": 15.88, "tok_s": 260.8},
+    {"label": "chinese repeat",           "prompt_len": 4096,  "accept": 0.317, "tps": 5.29,  "tok_s": 88.4},
+    {"label": "chinese qa",               "prompt_len": 2048,  "accept": 0.313, "tps": 5.52,  "tok_s": 109.1},
+    {"label": "ids-1000-1100 @512",       "prompt_len": 512,   "accept": 0.610, "tps": 9.07,  "tok_s": 181.6},
+    {"label": "ids-1000-1100 @4096",      "prompt_len": 4096,  "accept": 0.121, "tps": 2.82,  "tok_s": 54.1},
+    {"label": "ids-5000-5100 @4K",        "prompt_len": 4096,  "accept": 0.538, "tps": 9.07,  "tok_s": 180.9},
+    {"label": "ids-sequential @4K",       "prompt_len": 4096,  "accept": 0.407, "tps": 6.35,  "tok_s": 105.6},
+    {"label": "fox-64K",                  "prompt_len": 65536, "accept": 0.881, "tps": 14.17, "tok_s": 221.7}
+  ],
+  "summary": {
+    "overall_avg": 0.624,
+    "natural_avg": 0.699,
+    "synthetic_avg": 0.419,
+    "min": {"label": "ids-1000-1100 @4096", "accept": 0.121},
+    "max": {"label": "repeat: galaxy / code", "accept": 1.0}
+  },
+  "baselines": {
+    "c22699c_eager_64K": 0.87,
+    "vllm_native_fox_64K": 0.9922,
+    "vllm_matched_text_64K": 1.0
+  }
+}

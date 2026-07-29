@@ -1,0 +1,123 @@
+{
+  "date": "2026-07-29T10:15:00",
+  "test": "verify_kernel_profile",
+  "context": "DFlash verify M=16 @ kv_len=65536, SWA=512, 5 rounds averaged",
+  "daemon_config": {
+    "block_size": 64,
+    "max_model_len": 131072,
+    "gpu_mem_util": 0.9
+  },
+  "git_head": "1cab5f9",
+  "env": {
+    "SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT": "1",
+    "SPARKINFER_ENABLE_DYNAMIC_DOWN_SCALE": "1",
+    "QSR_DFLASH_CUDA_GRAPH": "1",
+    "QSR_VERIFY_CUDA_GRAPH": "1"
+  },
+  "round_breakdown": {
+    "verify_m16_ms": 38.5,
+    "verify_pct": 87,
+    "draft_cg_ms": 3.6,
+    "draft_pct": 8,
+    "context_kv_ms": 1.4,
+    "context_kv_pct": 3,
+    "accept_reject_ms": 0.8,
+    "accept_reject_pct": 2,
+    "round_total_ms": 44.2,
+    "effective_tok_s": 361.8,
+    "accepted": "15/15"
+  },
+  "verify_cg_vs_eager": {
+    "cg_median_ms": 56.1,
+    "cg_min_ms": 51.4,
+    "cg_max_ms": 73.0,
+    "eager_median_ms": 352.5,
+    "eager_min_ms": 336.5,
+    "eager_max_ms": 374.2,
+    "cg_speedup": 6.28,
+    "note": "tight-loop measurement includes sync overhead; actual round verify is ~38.5ms"
+  },
+  "kernel_breakdown_per_round": {
+    "sparkinfer_moe_shared_ms": 23.4,
+    "sparkinfer_moe_shared_pct": 59.2,
+    "sparkinfer_moe_calls": 47,
+    "sparkinfer_attn_paged_ms": 6.5,
+    "sparkinfer_attn_paged_pct": 16.4,
+    "sparkinfer_attn_calls": 48,
+    "cutlass_bf16_gemm_ms": 2.3,
+    "cutlass_bf16_gemm_pct": 5.9,
+    "cutlass_s1616_gemm_ms": 1.9,
+    "cutlass_s1616_gemm_pct": 4.9,
+    "cutlass_bf16_small_ms": 0.9,
+    "cutlass_s1616_small_ms": 0.6,
+    "sparkinfer_attn_merge_ms": 0.2,
+    "topk_gating_ms": 0.25,
+    "fused_add_rms_norm_ms": 0.24,
+    "rope_ms": 0.19,
+    "rms_norm_ms": 0.18,
+    "kv_scatter_ms": 0.07,
+    "total_cuda_ms": 39.6
+  },
+  "backend_config": {
+    "swa_window": 512,
+    "ring_slots_per_slot": 640,
+    "block_size": 64,
+    "blocks_per_slot": 2048,
+    "model_layers": 48,
+    "verify_cg_type": "LagunaCudaGraphVerify",
+    "draft_cg_type": "DFlashDraftCudaGraph"
+  },
+  "optimization_targets": [
+    {
+      "name": "sparkinfer MoE",
+      "pct": 59.2,
+      "action": "check deterministic overhead, sparkinfer version"
+    },
+    {
+      "name": "sparkinfer attention",
+      "pct": 16.4,
+      "action": "already SWA-optimized, check split-K config"
+    },
+    {
+      "name": "dense GEMM (cutlass)",
+      "pct": 15.0,
+      "action": "autotune missing shapes N=9216,1024,48"
+    },
+    {
+      "name": "norms/rope/misc",
+      "pct": 9.4,
+      "action": "already fused, minimal headroom"
+    }
+  ],
+  "model_architecture": {
+    "total_layers": 48,
+    "dense_layers": 1,
+    "moe_layers": 47,
+    "layer_0_dense": {
+      "qkv": [
+        8192,
+        3072
+      ],
+      "o_proj": [
+        3072,
+        6144
+      ],
+      "gate": [
+        12288,
+        3072
+      ]
+    },
+    "layers_1_47_moe": {
+      "qkv": [
+        11264,
+        3072
+      ],
+      "o_proj": [
+        3072,
+        9216
+      ]
+    },
+    "custom_gemm_patched": true,
+    "linear_forward": "ColumnParallelLinear.forward (vLLM standard)"
+  }
+}
