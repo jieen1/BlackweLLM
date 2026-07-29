@@ -902,6 +902,7 @@ class DFlashEngine:
             num_positions: number of positions to precompute
             position_offset: absolute position offset (for chunked prefill)
         """
+        _debug_chunk = os.environ.get("QSR_DEBUG_CHUNK_CHECK")
         # Combine hidden states: [N, 18432] → [N, 3072]
         combined_input = torch.cat(aux_hidden_states, dim=-1)
         combined = self.draft_model.combine_hidden_states(combined_input)
@@ -1118,6 +1119,7 @@ class DFlashEngine:
 
         Returns (tokens, stats).
         """
+        _debug_chunk = os.environ.get("QSR_DEBUG_CHUNK_CHECK")
         backend = self.backend
         prompt_len = len(prompt_ids)
         cached_kv_len = backend.slot_kv_len[slot]
@@ -1218,7 +1220,6 @@ class DFlashEngine:
         num_steps = 0
 
         # ── Cache loop-invariant values (avoid per-iteration lookups) ──
-        _debug_chunk = os.environ.get("QSR_DEBUG_CHUNK_CHECK")
         _debug_logits_file = os.environ.get("QSR_DEBUG_VERIFY_LOGITS_FILE")
         _phys = _physical_slot(slot)
         _draft_base = _phys * self._draft_blocks_per_slot

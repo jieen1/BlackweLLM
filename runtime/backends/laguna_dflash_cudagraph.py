@@ -13,6 +13,7 @@ Per speculative step:
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import torch
@@ -92,6 +93,14 @@ class DFlashVerifyCudaGraph:
                 self.num_tokens, dtype=torch.long, device=self.device
             )
 
+        # Pre-allocated offset buffers for _fill_buffers (avoid torch.arange allocs)
+        self._pos_offset = torch.arange(self.num_tokens, dtype=torch.long, device=self.device)
+        self._full_idx_offset = torch.arange(max_full_pages, dtype=torch.int32, device=self.device)
+        if self._ring_blocks_per_slot > 0:
+            self._swa_block_offset = torch.arange(
+                self._ring_blocks_per_slot, dtype=torch.long, device=self.device
+            )
+
         # FlashInfer prefill wrappers (one per layer group)
         self._prefill_wrappers: dict[tuple, Any] = {}
         self._workspaces: list[torch.Tensor] = []
@@ -144,17 +153,13 @@ class DFlashVerifyCudaGraph:
         phys = _physical_slot(slot)
         new_kv_len = kv_len + self.num_tokens
 
-        # Positions
-        self._positions[: self.num_tokens] = torch.arange(
-            kv_len, kv_len + self.num_tokens, dtype=torch.long, device=self.device
-        )
+        # Positions (use pre-allocated offset buffer + scalar add)
+        torch.add(self._pos_offset, kv_len, out=self._positions[: self.num_tokens])
 
-        # Full-attention buffers
+        # Full-attention buffers (use pre-allocated offset buffer + scalar add)
         full_base = phys * self.blocks_per_slot
         n_full_blocks = (new_kv_len + bs - 1) // bs
-        self._full_kv_indices[:n_full_blocks] = torch.arange(
-            full_base, full_base + n_full_blocks, dtype=torch.int32, device=self.device
-        )
+        torch.add(self._full_idx_offset[:n_full_blocks], full_base, out=self._full_kv_indices[:n_full_blocks])
         self._full_kv_indptr_cpu[0] = 0
         self._full_kv_indptr_cpu[1] = n_full_blocks
         lpl = new_kv_len % bs
@@ -178,14 +183,8 @@ class DFlashVerifyCudaGraph:
             aligned_len = new_kv_len - aligned_start
             n_ring = min((aligned_len + bs - 1) // bs, self._ring_blocks_per_slot)
 
-            # Vectorized ring block indices
-            _ap = torch.arange(
-                aligned_start,
-                aligned_start + n_ring * bs,
-                bs,
-                device=self.device,
-                dtype=torch.long,
-            )
+            # Vectorized ring block indices (use pre-allocated offset buffer)
+            _ap = self._swa_block_offset[:n_ring] * bs + aligned_start
             self._swa_kv_indices[:n_ring] = ring_base + (_ap % ring_slots) // bs
 
             self._swa_kv_indptr_cpu[0] = 0
@@ -341,7 +340,8 @@ class DFlashVerifyCudaGraph:
             return None
 
         num_tokens = len(tokens)
-        self._input_ids[:num_tokens] = torch.tensor(tokens, dtype=torch.long, device=self.device)
+        # In-place fill avoids torch.tensor() allocation from Python list
+        self._input_ids[:num_tokens] = torch.as_tensor(tokens, dtype=torch.long, device=self.device)
         self._fill_buffers(slot, kv_len)
         self._run_plan()
         self._graph.replay()
@@ -391,6 +391,12 @@ class DFlashDraftCudaGraph:
             [0, self.num_tokens], dtype=torch.int32, device=self.device
         )
         self._slot_mapping = torch.zeros(self.num_tokens, dtype=torch.long, device=self.device)
+
+        # Pre-allocated offset buffers (avoid torch.arange allocs per replay)
+        self._pos_offset = torch.arange(self.num_tokens, dtype=torch.long, device=self.device)
+        self._ring_block_offset = torch.arange(
+            self._draft_blocks_per_slot, dtype=torch.long, device=self.device
+        )
 
         self._workspace = None
         self._metadata = None
@@ -471,9 +477,8 @@ class DFlashDraftCudaGraph:
         ring_slots = self._ring_slots
         new_kv_len = kv_len + self.num_tokens
 
-        self._positions[: self.num_tokens] = torch.arange(
-            kv_len, kv_len + self.num_tokens, dtype=torch.long, device=self.device
-        )
+        # Positions (pre-allocated offset + scalar add)
+        torch.add(self._pos_offset, kv_len, out=self._positions[: self.num_tokens])
 
         window_start = max(0, kv_len - DRAFT_WINDOW + 1)
         align_gran = _debug_swa_align_gran() or bs
@@ -481,24 +486,14 @@ class DFlashDraftCudaGraph:
         aligned_len = new_kv_len - aligned_start
         n_ring = min((aligned_len + bs - 1) // bs, self._draft_blocks_per_slot)
 
-        # Vectorized ring page table. The physical indices address the shared
-        # draft KV tensor directly; the Sparkinfer plan remains fixed.
-        _ap = torch.arange(
-            aligned_start,
-            aligned_start + n_ring * bs,
-            bs,
-            device=self.device,
-            dtype=torch.long,
-        )
+        # Vectorized ring page table (pre-allocated offset buffer)
+        _ap = self._ring_block_offset[:n_ring] * bs + aligned_start
         self._page_table[0, :n_ring] = draft_base + (_ap % ring_slots) // bs
         self._cache_seqlens[0] = aligned_len
 
-        import os as _os
-        if _os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
-            import logging as _logging
-            _logger = _logging.getLogger("qwen_sm120_runtime.laguna_dflash_cudagraph")
+        if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
             pt = self._page_table[0, :n_ring].tolist()
-            _logger.warning(
+            logger.warning(
                 "CHUNK_CHECK draft_fill_buffers bs=%d kv_len=%d window_start=%d "
                 "aligned_start=%d aligned_len=%d n_ring=%d page_table=%s",
                 bs, kv_len, window_start, aligned_start, aligned_len, n_ring, pt,
