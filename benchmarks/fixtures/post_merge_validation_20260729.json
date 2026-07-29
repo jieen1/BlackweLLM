@@ -1,0 +1,28 @@
+{
+  "results": {
+    "4K": {
+      "tok_s": 358.2,
+      "itl_ms": 2.79,
+      "accept": 0.9608,
+      "ttft_ms": 777.0,
+      "baseline_tps": 347.95,
+      "delta_pct": 2.9
+    },
+    "64K": {
+      "tok_s": 273.2,
+      "itl_ms": 3.76,
+      "accept": 0.9608,
+      "ttft_ms": 14150.0,
+      "baseline_tps": 278.82,
+      "delta_pct": -2.0
+    },
+    "128K": {
+      "tok_s": 265.6,
+      "itl_ms": 3.77,
+      "accept": 0.9529,
+      "ttft_ms": 36015.0,
+      "baseline_tps": 269.16,
+      "delta_pct": -1.3
+    }
+  }
+}
