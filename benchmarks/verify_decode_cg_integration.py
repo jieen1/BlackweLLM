@@ -13,7 +13,7 @@ MODEL = os.path.expanduser(
     "snapshots/07614121b31898586430f189d27a25a0be310843/"
 )
 
-from runtime.compat_vllm import EngineArgs
+from runtime.legacy_qwen36_vllm import EngineArgs
 from runtime.backends.laguna import LagunaBackend
 from runtime.sampling import SamplingParams
 

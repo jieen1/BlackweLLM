@@ -54,7 +54,7 @@ def run_one(backend_name: str, batches: list[int], steps: int, warmup: int) -> d
     """Load model with given moe_backend, profile decode for each batch."""
     import torch
     from torch.profiler import profile, ProfilerActivity
-    from runtime.compat_vllm import EngineArgs
+    from runtime.legacy_qwen36_vllm import EngineArgs
     from runtime.backends.laguna import LagunaBackend
     from transformers import AutoTokenizer
 

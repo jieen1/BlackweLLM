@@ -28,10 +28,10 @@ def patch_gemma_rms_norm() -> None:
         return
     _patched = True
 
-    from runtime.compat_vllm import get_vllm_ir
+    from runtime.legacy_qwen36_vllm import get_vllm_ir
 
     ir = get_vllm_ir()
-    from runtime.compat_vllm import get_gemma_rms_norm
+    from runtime.legacy_qwen36_vllm import get_gemma_rms_norm
 
     GemmaRMSNorm = get_gemma_rms_norm()
 

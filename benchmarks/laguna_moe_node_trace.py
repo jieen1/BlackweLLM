@@ -67,7 +67,7 @@ def gemm_family(name: str) -> str:
 
 
 def build_config(mode: str, max_model_len: int):
-    from runtime.compat_vllm import EngineArgs
+    from runtime.legacy_qwen36_vllm import EngineArgs
 
     if mode == "eager":
         args = EngineArgs(
@@ -76,7 +76,7 @@ def build_config(mode: str, max_model_len: int):
             async_scheduling=False,
         )
         return args.create_engine_config()
-    from runtime.compat_vllm import CUDAGraphMode
+    from runtime.legacy_qwen36_vllm import CUDAGraphMode
     args = EngineArgs(
         model=MODEL, max_model_len=max_model_len, gpu_memory_utilization=0.85,
         dtype="bfloat16", disable_log_stats=True, async_scheduling=False,

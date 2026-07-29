@@ -31,7 +31,7 @@ def make_ids(n):
     return ids[:n]
 
 
-from runtime.compat_vllm import EngineArgs
+from runtime.legacy_qwen36_vllm import EngineArgs
 from runtime.backends.laguna import LagunaBackend
 from runtime.backends.laguna_dflash import DFlashEngine
 from runtime.backends.dflash_constants import NUM_QUERY_PER_REQ

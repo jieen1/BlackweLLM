@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from runtime.laguna_runtime import LagunaAttentionMetadata, bind_laguna_kv_cache
 
 
@@ -48,7 +50,7 @@ def test_owned_kv_binding_sorts_layers_and_updates_placeholders() -> None:
     assert layers["model.layers.10.attn"].kv_cache == "cache-10"
 
 
-def test_laguna_runtime_modules_do_not_import_compat_vllm() -> None:
+def test_laguna_runtime_modules_do_not_import_qwen_legacy_vllm() -> None:
     root = Path(__file__).resolve().parents[1]
     for relative_path in (
         "runtime/backends/laguna.py",
@@ -56,13 +58,27 @@ def test_laguna_runtime_modules_do_not_import_compat_vllm() -> None:
     ):
         tree = ast.parse((root / relative_path).read_text(encoding="utf-8"), filename=relative_path)
         assert not any(
-            (isinstance(node, ast.ImportFrom) and node.module == "runtime.compat_vllm")
+            (isinstance(node, ast.ImportFrom) and node.module in {
+                "runtime.compat_vllm",
+                "runtime.compat_vllm_qwen36",
+                "runtime.legacy_qwen36_vllm",
+                "runtime.legacy_qwen36_attention",
+            })
             or (
                 isinstance(node, ast.Import)
-                and any(alias.name == "runtime.compat_vllm" for alias in node.names)
+                and any(
+                    alias.name
+                    in {
+                        "runtime.compat_vllm",
+                        "runtime.compat_vllm_qwen36",
+                        "runtime.legacy_qwen36_vllm",
+                        "runtime.legacy_qwen36_attention",
+                    }
+                    for alias in node.names
+                )
             )
             for node in ast.walk(tree)
-        ), f"{relative_path} must use runtime.laguna_runtime, not compat_vllm"
+        ), f"{relative_path} must not depend on the Qwen vLLM legacy tenant"
 
 
 def test_laguna_backend_has_no_dead_vllm_patch_hooks() -> None:
@@ -75,6 +91,7 @@ def test_laguna_backend_has_no_dead_vllm_patch_hooks() -> None:
 
 
 def test_laguna_backend_import_does_not_require_vllm() -> None:
+    pytest.importorskip("numpy")
     blocker = """
 import importlib.abc
 import sys
@@ -86,6 +103,8 @@ class BlockVllm(importlib.abc.MetaPathFinder):
         return None
 
 sys.meta_path.insert(0, BlockVllm())
+import server.app
+import server.engine
 import runtime.backends.laguna
 import runtime.backends.laguna_dflash
 """

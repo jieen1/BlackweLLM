@@ -205,14 +205,26 @@ class TestDependencySurfaces:
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
                     imports_compat = any(
-                        alias.name == "runtime.compat_vllm" for alias in node.names
+                        alias.name
+                        in {
+                            "runtime.compat_vllm",
+                            "runtime.compat_vllm_qwen36",
+                            "runtime.legacy_qwen36_vllm",
+                            "runtime.legacy_qwen36_attention",
+                        }
+                        for alias in node.names
                     )
                 elif isinstance(node, ast.ImportFrom):
-                    imports_compat = node.module == "runtime.compat_vllm"
+                    imports_compat = node.module in {
+                        "runtime.compat_vllm",
+                        "runtime.compat_vllm_qwen36",
+                        "runtime.legacy_qwen36_vllm",
+                        "runtime.legacy_qwen36_attention",
+                    }
                 if imports_compat:
                     break
             assert not imports_compat, (
-                f"{relpath} 应直接使用 runtime.laguna_runtime，而不是 compat_vllm"
+                f"{relpath} 应直接使用 owned Laguna runtime，而不是 Qwen legacy vLLM"
             )
 
     def test_dflash_graph_module_has_no_flashinfer_dependency(self):

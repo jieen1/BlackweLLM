@@ -4,9 +4,6 @@ Tests the speculative decode accept/reject logic, buffer management,
 and configuration constants without requiring GPU or model weights.
 """
 
-import sys
-import types
-
 import pytest
 
 from runtime.backends.dflash_constants import (
@@ -20,42 +17,6 @@ from runtime.backends.dflash_constants import (
     NUM_QUERY_PER_REQ,
     NUM_SPECULATIVE_TOKENS,
 )
-
-# runtime.backends.laguna_dflash imports runtime.backends.laguna, which
-# imports runtime.compat_vllm at module level -- the sole module in that
-# chain that actually needs real vllm. Stub just that one (see
-# test_swa_ring_kv.py for the same pattern/rationale), bracketed to this
-# file's own test window so it doesn't leak into other test files sharing
-# this pytest process.
-_MODULES_BEFORE: frozenset[str] = frozenset()
-
-
-def setup_module() -> None:
-    global _MODULES_BEFORE
-    _MODULES_BEFORE = frozenset(sys.modules)
-    if "runtime.compat_vllm" not in sys.modules:
-        stub = types.ModuleType("runtime.compat_vllm")
-        for attr in [
-            "VllmConfig",
-            "bind_kv_cache",
-            "get_distributed_init_method",
-            "get_model",
-            "get_open_port",
-            "init_worker_distributed_environment",
-            "set_current_vllm_config",
-            "set_forward_context",
-            "get_flashinfer_metadata_builder",
-            "get_common_attn_metadata_cls",
-            "init_flashinfer_workspace",
-        ]:
-            setattr(stub, attr, None)
-        sys.modules["runtime.compat_vllm"] = stub
-
-
-def teardown_module() -> None:
-    for mod_name in list(sys.modules):
-        if mod_name not in _MODULES_BEFORE and mod_name.startswith("runtime."):
-            sys.modules.pop(mod_name, None)
 
 
 class TestDFlashConstants:

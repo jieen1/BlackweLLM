@@ -19,7 +19,7 @@ import torch
 if TYPE_CHECKING:
     from runtime.direct_model_runner import DirectModelRunner
 
-from runtime.compat_vllm import set_forward_context
+from runtime.legacy_qwen36_vllm import set_forward_context
 from runtime.logprobs import compute_logprobs
 from runtime.metadata_builders import (
     _MAX_DECODE_QO_LEN,

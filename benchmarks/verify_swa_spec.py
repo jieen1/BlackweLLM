@@ -4,7 +4,7 @@ os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("QSR_A2_CUSTOM_GEMM", "0")
 sys.path.insert(0, "/home/bot/project/qwen-sm120-runtime")
-from runtime.compat_vllm import EngineArgs
+from runtime.legacy_qwen36_vllm import EngineArgs
 from runtime.backends.laguna import LagunaBackend
 MODEL = "poolside/Laguna-S-2.1-NVFP4"
 config = EngineArgs(model=MODEL, max_model_len=8192, gpu_memory_utilization=0.85,

@@ -188,7 +188,7 @@ def install_triton_norm_ops() -> None:
         return
     _installed = True
 
-    from runtime.compat_vllm import get_vllm_ir
+    from runtime.legacy_qwen36_vllm import get_vllm_ir
 
     ir = get_vllm_ir()
 

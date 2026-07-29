@@ -13,7 +13,7 @@ import torch
 MODEL = "poolside/Laguna-S-2.1-NVFP4"
 
 def main():
-    from runtime.compat_vllm import EngineArgs, CUDAGraphMode
+    from runtime.legacy_qwen36_vllm import EngineArgs, CUDAGraphMode
     args = EngineArgs(
         model=MODEL, max_model_len=4096, gpu_memory_utilization=0.85,
         dtype="bfloat16", disable_log_stats=True, async_scheduling=False,

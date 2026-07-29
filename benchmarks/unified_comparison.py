@@ -68,7 +68,7 @@ def make_prompt(tok, n):
 def bench_ours(base_len, suffix_len, base_ids, suffix_ids, tok):
     import torch; torch.set_grad_enabled(False)
     os.environ["QSR_DFLASH_CUDA_GRAPH"] = "1"
-    from runtime.compat_vllm import EngineArgs
+    from runtime.legacy_qwen36_vllm import EngineArgs
     total_len = base_len + suffix_len
     max_len = max(total_len + 1024, 262144)
     bps = (total_len + 15) // 16 + 512

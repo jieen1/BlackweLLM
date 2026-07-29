@@ -1,4 +1,4 @@
-"""vLLM re-exports needed ONLY by the qwen36/DirectModelRunner tenant.
+"""vLLM attention re-exports needed ONLY by the qwen36/DirectModelRunner tenant.
 
 任务#42 (vLLM removal plan): split out of ``runtime/compat_vllm.py``.
 Found by a coordinator cross-check, not by this project's own earlier

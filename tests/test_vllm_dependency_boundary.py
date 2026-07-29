@@ -15,11 +15,12 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parents[1]
 
 # Each entry is an existing migration site.  Remove entries as their callers
-# are moved behind runtime.compat_vllm.py or replaced by self-owned code.
+# are moved behind the explicitly isolated Qwen legacy modules or replaced by
+# self-owned code.
 _APPROVED_DIRECT_IMPORT_FILES = {
-    "runtime/compat_vllm.py",
+    "runtime/legacy_qwen36_vllm.py",
     # Added 2026-07-28 (任务#42): the qwen36/DirectModelRunner-exclusive
-    # counterpart to compat_vllm.py -- GDNAttentionMetadata/
+    # counterpart to legacy_qwen36_vllm.py -- GDNAttentionMetadata/
     # SM120GQAMetadata/AttentionBackendEnum/register_backend/FLA chunk
     # helpers/compute_causal_conv1d_metadata, split out of compat_vllm.py
     # because their only real consumers (runtime/metadata_builders.py,
@@ -35,7 +36,7 @@ _APPROVED_DIRECT_IMPORT_FILES = {
     # 本次不动") -- this file is intentionally NOT part of that removal
     # target, it exists so Laguna's ledger entries above don't have to
     # carry qwen36's dependency weight.
-    "runtime/compat_vllm_qwen36.py",
+    "runtime/legacy_qwen36_attention.py",
     # runtime/backends/laguna_dflash_cudagraph.py removed 2026-07-28
     # (任务#41, vLLM removal plan 阶段8): its only vLLM/FlashInfer import
     # was inside DFlashVerifyCudaGraph, a FlashInfer-based main-model

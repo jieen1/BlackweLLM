@@ -16,7 +16,7 @@ def dequant_cpu(w,sf,gs):
 
 print("Loading model...")
 t0=time.time()
-from runtime.compat_vllm import (EngineArgs, set_current_vllm_config, get_model,
+from runtime.legacy_qwen36_vllm import (EngineArgs, set_current_vllm_config, get_model,
     get_distributed_init_method, get_open_port, init_worker_distributed_environment,
     init_flashinfer_workspace, set_forward_context)
 from runtime.nvfp4_cutlass_direct_patch import patch_nvfp4_prefer_cutlass_direct

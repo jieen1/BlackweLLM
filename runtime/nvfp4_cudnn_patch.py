@@ -42,7 +42,7 @@ def patch_nvfp4_to_cudnn() -> bool:
         return False
 
     try:
-        from runtime.compat_vllm import get_nvfp4_cudnn_components
+        from runtime.legacy_qwen36_vllm import get_nvfp4_cudnn_components
 
         flashinfer_scaled_fp4_mm, has_flashinfer = get_nvfp4_cudnn_components()
 
@@ -54,7 +54,7 @@ def patch_nvfp4_to_cudnn() -> bool:
         return False
 
     try:
-        from runtime.compat_vllm import (
+        from runtime.legacy_qwen36_vllm import (
             get_nvfp4_cudnn_apply_dependencies,
             get_nvfp4_flashinfer_module,
         )

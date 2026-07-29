@@ -16,8 +16,6 @@ Covers:
 from __future__ import annotations
 
 import inspect
-import sys
-import types
 
 import pytest
 
@@ -92,43 +90,9 @@ class TestLagunaBackendE1Surface:
     __init__; every method under test either never touches `self` at all, or
     returns before reaching any GPU-backed attribute.
 
-    runtime.backends.laguna imports runtime.compat_vllm at module level,
-    which needs real vllm -- not installed in the CPU-only test venv. Since
-    __new__ skips __init__, none of these methods actually need a working
-    compat_vllm (its names are only used inside __init__/other GPU-backed
-    methods), so a stub with the needed names bound to None is enough to let
-    the import succeed. Installed/removed per-class (not module top level)
-    so it doesn't leak into other test files sharing this pytest process.
+    Laguna imports are vLLM-free, so these tests intentionally import the
+    real backend rather than masking its import closure with a test stub.
     """
-
-    _MODULES_BEFORE: frozenset = frozenset()
-
-    @classmethod
-    def setup_class(cls) -> None:
-        cls._MODULES_BEFORE = frozenset(sys.modules)
-        if "runtime.compat_vllm" not in sys.modules:
-            stub = types.ModuleType("runtime.compat_vllm")
-            for attr in [
-                "VllmConfig",
-                "bind_kv_cache",
-                "get_distributed_init_method",
-                "get_model",
-                "get_open_port",
-                "init_worker_distributed_environment",
-                "set_current_vllm_config",
-                "set_forward_context",
-                "get_flashinfer_metadata_builder",
-                "get_common_attn_metadata_cls",
-                "init_flashinfer_workspace",
-            ]:
-                setattr(stub, attr, None)
-            sys.modules["runtime.compat_vllm"] = stub
-
-    @classmethod
-    def teardown_class(cls) -> None:
-        for mod_name in list(sys.modules):
-            if mod_name not in cls._MODULES_BEFORE and mod_name.startswith("runtime."):
-                sys.modules.pop(mod_name, None)
 
     def _bare_backend(self):
         from runtime.backends.laguna import LagunaBackend
@@ -168,18 +132,6 @@ class TestLagunaBackendE1Surface:
         """E1: both backends must accept the exact same positional/keyword
         shape so ServerEngine's call site works unmodified against either."""
         pytest.importorskip("vllm")
-        # Unlike the __new__-bypass tests above, this one needs the REAL
-        # runtime.compat_vllm (DirectModelRunner's import chain needs names
-        # -- AttentionBackendEnum et al. -- the class-level stub in
-        # setup_class() doesn't provide, since those tests never construct
-        # a real instance). Evict the stub (and anything cached against it)
-        # so this import resolves against genuine vllm, now confirmed
-        # available by the importorskip above.
-        for mod_name in list(sys.modules):
-            if mod_name == "runtime.compat_vllm" or mod_name.startswith("runtime.backends."):
-                if getattr(sys.modules[mod_name], "__file__", None) is None:
-                    sys.modules.pop(mod_name, None)
-
         from runtime.backends.laguna import LagunaBackend
         from runtime.direct_model_runner import DirectModelRunner
 

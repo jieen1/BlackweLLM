@@ -1,7 +1,7 @@
 """CPU-only regression tests for NVFP4 patch policy adapters.
 
 The patch modules must remain importable without vLLM.  They obtain upstream
-symbols only through ``runtime.compat_vllm`` when a patch is actually enabled.
+symbols only through ``runtime.legacy_qwen36_vllm`` when a patch is actually enabled.
 """
 
 from __future__ import annotations
@@ -13,10 +13,10 @@ import pytest
 
 
 def _install_compat_stub(monkeypatch, **symbols: object) -> None:
-    compat = types.ModuleType("runtime.compat_vllm")
+    compat = types.ModuleType("runtime.legacy_qwen36_vllm")
     for name, value in symbols.items():
         setattr(compat, name, value)
-    monkeypatch.setitem(sys.modules, "runtime.compat_vllm", compat)
+    monkeypatch.setitem(sys.modules, "runtime.legacy_qwen36_vllm", compat)
 
 
 def test_b12x_patch_uses_compat_registry(monkeypatch) -> None:

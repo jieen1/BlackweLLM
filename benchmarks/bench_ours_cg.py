@@ -33,7 +33,7 @@ suffix_ids = [(t+50000)%100352 for t in chunk*(suffix_len//len(chunk)+1)]
 suffix_ids = suffix_ids[:suffix_len]
 full_ids = base_ids + suffix_ids
 
-from runtime.compat_vllm import EngineArgs
+from runtime.legacy_qwen36_vllm import EngineArgs
 total_len = len(full_ids)
 max_len = max(total_len + 1024, 262144)
 bps = (total_len + 15) // 16 + 512

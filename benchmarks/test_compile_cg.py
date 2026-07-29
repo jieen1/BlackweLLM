@@ -11,7 +11,7 @@ sys.path.insert(0, '/home/bot/project/qwen-sm120-runtime')
 import torch
 torch.set_grad_enabled(False)
 
-from runtime.compat_vllm import EngineArgs
+from runtime.legacy_qwen36_vllm import EngineArgs
 
 MODEL = os.path.expanduser(
     '~/.cache/huggingface/hub/models--poolside--Laguna-S-2.1-NVFP4/'

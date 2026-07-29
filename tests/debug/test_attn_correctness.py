@@ -15,7 +15,7 @@ MODEL = os.path.expanduser(
 
 
 def build_vllm_config():
-    from runtime.compat_vllm import EngineArgs
+    from runtime.legacy_qwen36_vllm import EngineArgs
 
     engine_args = EngineArgs(
         model=MODEL,

@@ -19,7 +19,13 @@ from __future__ import annotations
 
 import torch
 
-from runtime.compat_vllm import (
+from runtime.legacy_qwen36_attention import (
+    AttentionBackendEnum,
+    GDNAttentionMetadata,
+    SM120GQAMetadata,
+    register_backend,
+)
+from runtime.legacy_qwen36_vllm import (
     EngineArgs,
     VllmConfig,
     bind_kv_cache,
@@ -29,12 +35,6 @@ from runtime.compat_vllm import (
     init_worker_distributed_environment,
     set_current_vllm_config,
     set_forward_context,
-)
-from runtime.compat_vllm_qwen36 import (
-    AttentionBackendEnum,
-    GDNAttentionMetadata,
-    SM120GQAMetadata,
-    register_backend,
 )
 from runtime.sampling import SamplingParams, make_generator, sample_from_logits
 
@@ -543,7 +543,7 @@ class DirectModelRunner:
         self.mtp_attn_layer_names: list[str] = []
         self.num_speculative_tokens: int | None = None
         if vllm_config.speculative_config is not None:
-            from runtime.compat_vllm import load_eagle_model
+            from runtime.legacy_qwen36_vllm import load_eagle_model
 
             names_before = set(sfc.keys())
             with set_current_vllm_config(vllm_config):

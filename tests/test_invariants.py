@@ -260,7 +260,7 @@ class TestRealCodeRegression:
         at module level; reproduced here so this test exercises the REAL
         formula without needing the full runtime import chain (this repo's
         own convention for CPU-only tests, see ``tests/test_dflash_engine.py``
-        stubbing ``runtime.compat_vllm`` for the same reason)."""
+        importing the owned Laguna runtime directly for the same reason)."""
         return -(-(window - 1 + qo_max) // block_size) + 1
 
     @pytest.mark.parametrize("assert_level", [1], indirect=True)

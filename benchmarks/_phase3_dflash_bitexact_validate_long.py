@@ -95,7 +95,7 @@ while len(prompt_ids) < TARGET_CTX:
 prompt_ids = prompt_ids[:TARGET_CTX]
 print(f"prompt tokens: {len(prompt_ids)} (target {TARGET_CTX})", file=sys.stderr)
 
-from runtime.compat_vllm import EngineArgs
+from runtime.legacy_qwen36_vllm import EngineArgs
 from runtime.backends.laguna import LagunaBackend
 from runtime.backends.laguna_dflash import DFlashEngine
 

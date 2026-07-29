@@ -24,7 +24,7 @@ def gpu_mem_mb():
     return torch.cuda.memory_allocated() / 1024**2
 
 def main():
-    from runtime.compat_vllm import EngineArgs
+    from runtime.legacy_qwen36_vllm import EngineArgs
     model_path = os.path.expanduser(
         "~/.cache/huggingface/hub/models--poolside--Laguna-S-2.1-NVFP4/"
         "snapshots/07614121b31898586430f189d27a25a0be310843/"

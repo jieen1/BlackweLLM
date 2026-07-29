@@ -1,7 +1,7 @@
-"""B7-V1: Single-point consolidation for ALL vLLM dependencies.
+"""Qwen3.6 legacy tenant's single-point consolidation for vLLM dependencies.
 
-Every ``from vllm.*`` import in the production path goes through this
-module.  Dependencies are classified into three tiers:
+Every remaining ``from vllm.*`` import belongs to the separately retained
+Qwen3.6/``DirectModelRunner`` tenant and goes through this module.
 
 **Self-written (thin)** — pure dataclasses / constants / trivial utilities
 re-implemented here with zero vLLM import.  These survive even if vLLM

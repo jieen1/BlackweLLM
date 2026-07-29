@@ -15,7 +15,7 @@ import torch
 MODEL = "poolside/Laguna-S-2.1-NVFP4"
 
 def main():
-    from runtime.compat_vllm import EngineArgs
+    from runtime.legacy_qwen36_vllm import EngineArgs
     args = EngineArgs(
         model=MODEL, max_model_len=4096, gpu_memory_utilization=0.80,
         enforce_eager=True,  # NO compile, save RAM

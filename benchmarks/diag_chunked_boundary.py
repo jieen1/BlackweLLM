@@ -22,7 +22,7 @@ def test_acceptance(engine, backend, tokenizer, ctx_len, num_steps=20):
     return stats['acceptance_rate'], stats['tokens_per_step'], stats['tok_per_s']
 
 def main():
-    from runtime.compat_vllm import EngineArgs
+    from runtime.legacy_qwen36_vllm import EngineArgs
     model_path = os.path.expanduser(
         "~/.cache/huggingface/hub/models--poolside--Laguna-S-2.1-NVFP4/"
         "snapshots/07614121b31898586430f189d27a25a0be310843/"

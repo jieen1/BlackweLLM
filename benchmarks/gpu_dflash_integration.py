@@ -24,7 +24,7 @@ sys.path.insert(0, "/home/bot/project/qwen-sm120-runtime")
 
 def build_vllm_config():
     """Build VllmConfig for Laguna-S-2.1-NVFP4."""
-    from runtime.compat_vllm import EngineArgs
+    from runtime.legacy_qwen36_vllm import EngineArgs
 
     model_path = os.path.expanduser(
         "~/.cache/huggingface/hub/models--poolside--Laguna-S-2.1-NVFP4/"

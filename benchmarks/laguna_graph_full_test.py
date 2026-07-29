@@ -25,7 +25,7 @@ os.environ.setdefault("QSR_A2_CUSTOM_GEMM", "0")
 MODEL = "poolside/Laguna-S-2.1-NVFP4"
 
 def main():
-    from runtime.compat_vllm import EngineArgs
+    from runtime.legacy_qwen36_vllm import EngineArgs
     config = EngineArgs(model=MODEL, max_model_len=4096, gpu_memory_utilization=0.80,
         enforce_eager=True, dtype="bfloat16", disable_log_stats=True, async_scheduling=False
     ).create_engine_config()

@@ -4,72 +4,8 @@ No GPU or model weights required.
 """
 
 import math
-import sys
-import types
 
 import pytest
-
-# Stub out runtime.compat_vllm to avoid vllm import, and import the pure
-# functions this file needs -- done in setup_module()/teardown_module(),
-# NOT at module top level. pytest COLLECTS (imports) every test file before
-# RUNNING any of them, so top-level stubbing code would install these stubs
-# during collection, long before this file's own teardown gets a chance to
-# run -- any other test file whose tests happen to EXECUTE first (e.g.
-# alphabetically-earlier file names) would see the leaked, deliberately-
-# incomplete stub instead of the real runtime.compat_vllm. setup_module()/
-# teardown_module() instead bracket the stub's lifetime tightly around just
-# this file's own test execution window.
-_MODULES_BEFORE: frozenset[str] = frozenset()
-
-
-def _install_stub(mod_name, module):
-    if mod_name not in sys.modules:
-        sys.modules[mod_name] = module
-
-
-def setup_module() -> None:
-    """Only runtime.compat_vllm itself needs a stub -- it's the sole module
-    in laguna.py's import chain that actually touches vllm at module level.
-    runtime.block_pool/logprobs/model_spec/sampling/nvfp4_* are all
-    self-written and vllm-free; importing them for real (rather than faking
-    them with e.g. an argument-less placeholder class for ChunkedPrefillState)
-    is both simpler and avoids tests silently exercising a fake that doesn't
-    match the real class's construction contract.
-
-    Each test below does its own `from runtime.backends.laguna import ...`
-    (rather than this function injecting names into module globals) so
-    ruff's static F821 check can see where every name comes from."""
-    global _MODULES_BEFORE
-    _MODULES_BEFORE = frozenset(sys.modules)
-
-    _compat = types.ModuleType("runtime.compat_vllm")
-    for attr in [
-        "VllmConfig",
-        "bind_kv_cache",
-        "get_distributed_init_method",
-        "get_model",
-        "get_open_port",
-        "init_worker_distributed_environment",
-        "set_current_vllm_config",
-        "set_forward_context",
-        "get_flashinfer_metadata_builder",
-        "get_common_attn_metadata_cls",
-        "init_flashinfer_workspace",
-    ]:
-        setattr(_compat, attr, None)
-    _install_stub("runtime.compat_vllm", _compat)
-
-
-def teardown_module() -> None:
-    """Undo everything installed/imported in setup_module() (stubs AND
-    anything that transitively imported against them, e.g.
-    runtime.backends.laguna) so later test files (in the same pytest
-    process) see the real runtime.compat_vllm etc. instead of this file's
-    deliberately-incomplete stand-ins, or a laguna.py module object built
-    from them."""
-    for mod_name in list(sys.modules):
-        if mod_name not in _MODULES_BEFORE and mod_name.startswith("runtime."):
-            sys.modules.pop(mod_name, None)
 
 
 class TestRingBlocksFormula:

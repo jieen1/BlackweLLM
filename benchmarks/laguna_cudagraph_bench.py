@@ -36,7 +36,7 @@ BENCH_REPS = 5
 
 def build_laguna_config_compile(max_model_len: int = 4096):
     """Build config with torch.compile enabled but vLLM cudagraph disabled."""
-    from runtime.compat_vllm import EngineArgs, CUDAGraphMode
+    from runtime.legacy_qwen36_vllm import EngineArgs, CUDAGraphMode
 
     args = EngineArgs(
         model=MODEL,
@@ -53,7 +53,7 @@ def build_laguna_config_compile(max_model_len: int = 4096):
 
 def build_laguna_config_eager(max_model_len: int = 4096):
     """Build config with enforce_eager (no compile, no graph)."""
-    from runtime.compat_vllm import EngineArgs
+    from runtime.legacy_qwen36_vllm import EngineArgs
 
     args = EngineArgs(
         model=MODEL,

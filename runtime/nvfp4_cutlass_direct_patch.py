@@ -32,7 +32,7 @@ def patch_nvfp4_prefer_cutlass_direct() -> bool:
         return False
 
     try:
-        from runtime.compat_vllm import get_nvfp4_cutlass_kernel_components
+        from runtime.legacy_qwen36_vllm import get_nvfp4_cutlass_kernel_components
 
         (
             _POSSIBLE_NVFP4_KERNELS,

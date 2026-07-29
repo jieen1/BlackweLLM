@@ -80,7 +80,7 @@ def run_one(perturbation: str, shape: LoadShape, model: str = DEFAULT_MODEL) -> 
     from bfdiag.sensitivity.perturbations import build
     from runtime.backends.laguna import LagunaBackend
     from runtime.backends.laguna_dflash import DFlashEngine
-    from runtime.compat_vllm import EngineArgs
+    from runtime.legacy_qwen36_vllm import EngineArgs
 
     torch.set_grad_enabled(False)
     model_path = os.path.expanduser(model)
