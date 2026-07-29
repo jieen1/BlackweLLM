@@ -73,20 +73,10 @@ DEFAULT_MAX_TOKENS = 16384
 # directly) since uvicorn's import-string app-loading convention
 # (``uvicorn.run("server.app:app", ...)``) needs ``app`` importable with
 # no constructor arguments.
-# E1: which model backend to serve. "qwen36" (default) is the original,
-# unmodified production path. "laguna" drives the new LagunaBackend second
-# tenant (roadmap Track E / L2) -- it has no CUDA Graph integration yet
-# (Lane 2 GPU work lives in runtime/backends/laguna_cuda_graph.py, not
-# wired into the engine), no persistent prefix cache, and no session
-# affinity, so those three default OFF for it below unless the operator
-# explicitly opts back in via the same env vars. It also has no SWA
-# ring-buffer KV yet (roadmap L2 TODO) -- every discovered attention layer,
-# including the 36 sliding-window ones, currently gets a KV cache sized for
-# the FULL context ceiling, so per-token memory cost is ~4x the roadmap L0
-# budget note's estimate (which assumed that optimization already existed).
-# SERVER_BLOCKS_PER_SLOT's Laguna default is sized conservatively for this
-# reality, not for the eventual ring-buffer-optimized budget.
-SERVER_MODEL_BACKEND = os.environ.get("QSR_SERVER_MODEL_BACKEND", "qwen36")
+# The production server is Laguna-only. ServerEngine rejects other values;
+# keeping a Qwen default here made ``python -m server.app`` fail before it
+# could load the model and falsely advertised a legacy tenant as supported.
+SERVER_MODEL_BACKEND = os.environ.get("QSR_SERVER_MODEL_BACKEND", "laguna")
 _IS_LAGUNA = SERVER_MODEL_BACKEND == "laguna"
 
 SERVER_CAPACITY = int(os.environ.get("QSR_SERVER_CAPACITY", "1" if _IS_LAGUNA else "4"))

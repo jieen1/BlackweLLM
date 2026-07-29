@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -116,3 +117,16 @@ import runtime.backends.laguna_dflash
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_server_app_defaults_to_the_only_supported_backend() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-c", "import server.app; print(server.app.SERVER_MODEL_BACKEND)"],
+        check=False,
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        env={key: value for key, value in os.environ.items() if key != "QSR_SERVER_MODEL_BACKEND"},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "laguna"
