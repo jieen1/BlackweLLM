@@ -106,3 +106,12 @@ def test_flashinfer_direct_imports_are_an_explicit_migration_ledger() -> None:
 
 def test_production_code_does_not_import_archived_qwen_oracle() -> None:
     assert not _direct_import_files("oracle.qwen36_vllm")
+
+
+def test_distribution_metadata_does_not_offer_vllm() -> None:
+    """The production wheel must not advertise vLLM as an installable extra."""
+    pyproject = (_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    extras = pyproject.split("[project.optional-dependencies]", maxsplit=1)[1]
+    extras = extras.split("\n[", maxsplit=1)[0]
+
+    assert "vllm" not in extras.lower()
