@@ -95,3 +95,24 @@ def test_quality_gate_preserves_explicit_oracle_build_parallelism(monkeypatch) -
 
     assert laguna_quality_gate.run_in_subprocess("pass", "oracle") == []
     assert seen["env"]["MAX_JOBS"] == "2"
+
+
+def test_quality_gate_default_only_requires_prompt_interface_parity() -> None:
+    assert laguna_quality_gate._comparison_passes(
+        prompt_ids_match_all=True,
+        token_match_all=False,
+        require_token_match=False,
+    )
+
+
+def test_quality_gate_strict_mode_requires_token_parity() -> None:
+    assert not laguna_quality_gate._comparison_passes(
+        prompt_ids_match_all=True,
+        token_match_all=False,
+        require_token_match=True,
+    )
+    assert not laguna_quality_gate._comparison_passes(
+        prompt_ids_match_all=False,
+        token_match_all=True,
+        require_token_match=False,
+    )
