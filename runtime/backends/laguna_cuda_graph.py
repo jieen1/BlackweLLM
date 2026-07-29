@@ -366,7 +366,7 @@ class LagunaCudaGraphDecode:
 
     def _build_metadata_and_forward(self) -> torch.Tensor:
         """Build sparkinfer CG metadata and run forward."""
-        from runtime.compat_vllm import set_current_vllm_config, set_forward_context
+        from runtime.laguna_runtime import laguna_forward_context
 
         backend = self.backend
         bs = self.batch_size
@@ -383,15 +383,12 @@ class LagunaCudaGraphDecode:
                 attn_metadata_dict[name] = meta
                 slot_mapping_dict[name] = sm
 
-        with set_current_vllm_config(backend.vllm_config):
-            with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
-                with set_forward_context(
-                    attn_metadata_dict, backend.vllm_config,
-                    slot_mapping=slot_mapping_dict, skip_compiled=True,
-                ):
-                    result = backend.model.forward(
-                        self._input_ids[:bs], self._positions[:bs]
-                    )
+        with bf_attn_context(attn_metadata_dict, slot_mapping_dict):
+            with laguna_forward_context(
+                attn_metadata_dict, backend.vllm_config,
+                slot_mapping=slot_mapping_dict, skip_compiled=True,
+            ):
+                result = backend.model.forward(self._input_ids[:bs], self._positions[:bs])
 
         if isinstance(result, tuple):
             hidden_states, self._aux_hidden_states = result
@@ -838,7 +835,7 @@ class LagunaCudaGraphVerify:
             for name in layer_names:
                 attn_meta[name] = meta
 
-        from runtime.compat_vllm import set_forward_context
+        from runtime.laguna_runtime import laguna_forward_context
 
         # Warmup (3x)
         side_stream = torch.cuda.Stream()
@@ -846,7 +843,7 @@ class LagunaCudaGraphVerify:
             for _ in range(3):
                 self._fill_buffers(0, dummy_tokens, warmup_kv)
                 with bf_attn_context(attn_meta, slot_mapping_dict):
-                    with set_forward_context(
+                    with laguna_forward_context(
                         attn_meta, backend.vllm_config,
                         slot_mapping=slot_mapping_dict, skip_compiled=True,
                     ):
@@ -864,7 +861,7 @@ class LagunaCudaGraphVerify:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             with bf_attn_context(attn_meta, slot_mapping_dict):
-                with set_forward_context(
+                with laguna_forward_context(
                     attn_meta, backend.vllm_config,
                     slot_mapping=slot_mapping_dict, skip_compiled=True,
                 ):

@@ -224,7 +224,7 @@ class DFlashDraftCudaGraph:
 
     def _build_metadata_and_forward(self) -> torch.Tensor:
         from runtime.backends.bf_attention import bf_attn_context
-        from runtime.compat_vllm import set_current_vllm_config, set_forward_context
+        from runtime.laguna_runtime import laguna_forward_context
 
         engine = self.engine
         # bf_attn_context added 阶段7-补充: draft attention layers are now
@@ -233,19 +233,18 @@ class DFlashDraftCudaGraph:
         # get_forward_context() -- same fix as _draft_forward's, needed
         # here too since this is a separate forward call site (CUDA graph
         # capture/replay, not the eager path).
-        with set_current_vllm_config(engine.vllm_config):
-            with bf_attn_context(self._attn_metadata_dict, self._slot_mapping_dict):
-                with set_forward_context(
-                    self._attn_metadata_dict,
-                    engine.vllm_config,
-                    slot_mapping=self._slot_mapping_dict,
-                    skip_compiled=True,
-                ):
-                    draft_hidden = engine.draft_model(
-                        input_ids=self._input_ids[: self.num_tokens],
-                        positions=self._positions[: self.num_tokens],
-                        inputs_embeds=None,
-                    )
+        with bf_attn_context(self._attn_metadata_dict, self._slot_mapping_dict):
+            with laguna_forward_context(
+                self._attn_metadata_dict,
+                engine.vllm_config,
+                slot_mapping=self._slot_mapping_dict,
+                skip_compiled=True,
+            ):
+                draft_hidden = engine.draft_model(
+                    input_ids=self._input_ids[: self.num_tokens],
+                    positions=self._positions[: self.num_tokens],
+                    inputs_embeds=None,
+                )
 
         # Position 0's logits are never read (replay() only uses positions
         # 1..num_tokens-1 -- the 15 draft-token predictions; position 0's
