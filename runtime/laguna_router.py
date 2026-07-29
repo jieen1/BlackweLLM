@@ -20,7 +20,6 @@ ABI_VERSION = 1
 EXPERTS = 256
 TOP_K = 10
 TARGET_SM = "sm_120a"
-ROUTER_MODES = frozenset(("vllm", "native"))
 
 _KERNEL_DIR = Path(__file__).with_name("kernels")
 _GENERATED_DIR = _KERNEL_DIR / "_generated"
@@ -30,15 +29,6 @@ _MANIFEST_PATH = _GENERATED_DIR / "laguna_router_sm120.manifest.json"
 
 class LagunaRouterError(RuntimeError):
     """The fixed native router cannot satisfy its production contract."""
-
-
-def resolve_router_mode(value: str | None) -> str:
-    """Return the explicit temporary A/B router mode or reject typos early."""
-    mode = value or "vllm"
-    if mode not in ROUTER_MODES:
-        choices = ", ".join(sorted(ROUTER_MODES))
-        raise LagunaRouterError(f"invalid QSR_LAGUNA_ROUTER={mode!r}; expected one of: {choices}")
-    return mode
 
 
 def router_max_rows(prefill_chunk_tokens: int, num_slots: int, *, swa_qo_max: int) -> int:

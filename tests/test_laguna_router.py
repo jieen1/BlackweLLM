@@ -13,7 +13,6 @@ from runtime.laguna_router import (
     LagunaRouterLibrary,
     _require_sm120_cuda,
     artifact_paths,
-    resolve_router_mode,
     router_max_rows,
 )
 
@@ -70,16 +69,6 @@ def test_loader_rejects_library_hash_mismatch_before_loading_library(tmp_path) -
 
     with pytest.raises(LagunaRouterError, match="SHA256"):
         LagunaRouterLibrary.load(library_path=library, manifest_path=manifest)
-
-
-def test_router_mode_defaults_to_vllm_and_accepts_native_for_ab_validation() -> None:
-    assert resolve_router_mode(None) == "vllm"
-    assert resolve_router_mode("native") == "native"
-
-
-def test_router_mode_rejects_an_unrecognized_ab_value() -> None:
-    with pytest.raises(LagunaRouterError, match="QSR_LAGUNA_ROUTER"):
-        resolve_router_mode("torch")
 
 
 def test_router_arena_capacity_is_fixed_from_prefill_verify_and_slots() -> None:

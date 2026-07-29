@@ -163,7 +163,6 @@ class LagunaBackend:
         # native A/B path uses this fixed prefill bound to allocate a
         # grow-never output arena during construction.
         self._prefill_chunk_tokens = int(os.environ.get("QSR_PREFILL_CHUNK", "8192"))
-        self._laguna_router_mode = "vllm"
         self._laguna_router_library = None
         self._laguna_router_arena = None
 
@@ -476,18 +475,12 @@ class LagunaBackend:
         )
 
     def _initialize_laguna_router(self) -> None:
-        """Prepare the temporary native A/B router before any graph capture."""
+        """Prepare the native router before any CUDA Graph capture."""
         from runtime.laguna_router import (
             LagunaRouterArena,
             LagunaRouterLibrary,
-            resolve_router_mode,
             router_max_rows,
         )
-
-        mode = resolve_router_mode(os.environ.get("QSR_LAGUNA_ROUTER"))
-        self._laguna_router_mode = mode
-        if mode == "vllm":
-            return
 
         max_rows = router_max_rows(
             self._prefill_chunk_tokens,
@@ -500,8 +493,6 @@ class LagunaBackend:
 
     def _warmup_laguna_router(self, correction_bias: torch.Tensor) -> None:
         """Resolve the native module before CUDA Graph capture, never in forward."""
-        if self._laguna_router_mode != "native":
-            return
         assert self._laguna_router_library is not None
         assert self._laguna_router_arena is not None
         logits = torch.zeros((1, 256), dtype=torch.float32, device=self.device)
@@ -529,12 +520,6 @@ class LagunaBackend:
         """
         from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
 
-        fused_topk_bias = None
-        if self._laguna_router_mode == "vllm":
-            from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
-                fused_topk_bias,
-            )
-
         from runtime.backends.laguna_sparkinfer_moe import (
             SparkinferMoELayer,
             SparkinferMoEOutputArena,
@@ -553,7 +538,7 @@ class LagunaBackend:
         renormalize = getattr(hf_config, "norm_topk_prob", True)
         softcap = getattr(hf_config, "moe_router_logit_softcapping", 0.0) or 0.0
         apply_on_input = getattr(hf_config, "moe_apply_router_weight_on_input", False)
-        if self._laguna_router_mode == "native" and (top_k != 10 or not renormalize):
+        if top_k != 10 or not renormalize:
             raise RuntimeError(
                 "native Laguna router requires num_experts_per_tok=10 and norm_topk_prob=True"
             )
@@ -568,6 +553,8 @@ class LagunaBackend:
         self._moe_sparkinfer_output_arena = output_arena
         native_router = self._laguna_router_library
         native_router_arena = self._laguna_router_arena
+        assert native_router is not None
+        assert native_router_arena is not None
         ckpt = _find_checkpoint()
         logger.info(
             "sparkinfer MoE patch (checkpoint-direct, alpha path): sparkinfer@%s",
@@ -633,25 +620,12 @@ class LagunaBackend:
                     router_logits = router_logits.float()
                     if _softcap > 0:
                         router_logits = torch.tanh(router_logits / _softcap) * _softcap
-                    if _native_router is None:
-                        assert fused_topk_bias is not None
-                        topk_weights, topk_ids = fused_topk_bias(
-                            hs,
-                            router_logits,
-                            "sigmoid",
-                            _e_bias,
-                            _top_k,
-                            _renorm,
-                            routed_scaling_factor=1.0,
-                        )
-                    else:
-                        assert _native_router_arena is not None
-                        topk_weights, topk_ids = _native_router.launch(
-                            router_logits,
-                            _e_bias,
-                            _native_router_arena.weights,
-                            _native_router_arena.ids,
-                        )
+                    topk_weights, topk_ids = _native_router.launch(
+                        router_logits,
+                        _e_bias,
+                        _native_router_arena.weights,
+                        _native_router_arena.ids,
+                    )
                     capture_routing(router_logits, topk_ids, topk_weights)  # bfprobe P-TOPK
                     routed_out = _si_layer.forward(hs, topk_ids, topk_weights)
                     if _shared is not None:
@@ -682,10 +656,9 @@ class LagunaBackend:
             if patched % 10 == 0:
                 logger.info("sparkinfer MoE: patched %d layers...", patched)
 
-        if native_router is not None:
-            if patched == 0:
-                raise RuntimeError("native Laguna router found no MoE layers to patch")
-            self._warmup_laguna_router(e_bias)
+        if patched == 0:
+            raise RuntimeError("native Laguna router found no MoE layers to patch")
+        self._warmup_laguna_router(e_bias)
         logger.info("Laguna: patched %d MoE layers with sparkinfer kernel", patched)
 
     def _fill_decode_buffers(
