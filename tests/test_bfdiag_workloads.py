@@ -10,8 +10,8 @@ from bfdiag.workloads import (
     HISTORICAL_M1_CONTEXT_TOKENS,
     HISTORICAL_M1_SUFFIX_TOKENS,
     capture_dynamic_route_tile_trace,
-    capture_laguna_m16_logits_oracle,
     capture_laguna_route_histograms,
+    capture_laguna_target_logits_oracle,
     check_b1_metadata_fastpath_parity,
     check_dflash_server_step_parity,
     check_dflash_verify_cg_parity,
@@ -262,9 +262,11 @@ def test_route_histogram_rejects_non_dynamic_shapes():
         capture_laguna_route_histograms(object(), object(), shapes=(6,))
 
 
-def test_m16_logits_oracle_requires_a_variant():
+def test_target_logits_oracle_requires_a_valid_contract():
     with pytest.raises(ValueError, match="variant"):
-        capture_laguna_m16_logits_oracle(object(), object(), variant="")
+        capture_laguna_target_logits_oracle(object(), object(), variant="", token_count=1)
+    with pytest.raises(ValueError, match="token_count"):
+        capture_laguna_target_logits_oracle(object(), object(), variant="m1", token_count=0)
 def test_dflash_profiler_reports_the_quick_prompt_contract_for_bad_geometry():
     class Backend:
         block_size = 1

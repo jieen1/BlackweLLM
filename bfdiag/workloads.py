@@ -1229,15 +1229,18 @@ def capture_laguna_route_histograms(
     return {"run_id": run_id, "shapes": shapes, "reports": reports}
 
 
-def capture_laguna_m16_logits_oracle(
+def capture_laguna_target_logits_oracle(
     engine: Any,
     tokenizer: Any,
     *,
     variant: str,
+    token_count: int,
 ) -> dict[str, Any]:
-    """Record the complete eager target logits for one named M=16 variant."""
+    """Record complete eager target logits for one named serving shape."""
     if not variant:
         raise ValueError("variant must be non-empty")
+    if token_count <= 0 or token_count > 16:
+        raise ValueError("token_count must be in [1, 16]")
     import torch
 
     backend = engine.backend
@@ -1245,12 +1248,12 @@ def capture_laguna_m16_logits_oracle(
     try:
         reset_dflash_workload_state(engine)
         state = engine.dflash_prefill_bootstrap(0, prompt_ids)
-        verify_tokens = [state["anchor"], *state["draft_tokens"]]
-        if len(verify_tokens) != 16:
-            raise RuntimeError(f"M=16 oracle received M={len(verify_tokens)}")
+        verify_tokens = [state["anchor"], *state["draft_tokens"]][:token_count]
+        if len(verify_tokens) != token_count:
+            raise RuntimeError(f"target oracle received M={len(verify_tokens)}")
         kv_len = backend.slot_kv_len[0]
         logits = backend._forward(
-            [0], verify_tokens, [kv_len], qo_len=16, is_decode=False, skip_logits=False
+            [0], verify_tokens, [kv_len], qo_len=token_count, is_decode=False, skip_logits=False
         )
         if logits is None:
             raise RuntimeError("target forward unexpectedly omitted logits")
@@ -1271,11 +1274,11 @@ def capture_laguna_m16_logits_oracle(
     with run_record(
         script=__file__,
         workload={
-            "contract": "laguna-m16-eager-logits-oracle-64k",
+            "contract": "laguna-target-eager-logits-oracle-64k",
             "variant": variant,
             "prompt_hash": _token_ids_hash(prompt_ids),
             "prompt_len": len(prompt_ids),
-            "verify_tokens": 16,
+            "target_tokens": token_count,
             "block_size": backend.block_size,
             "blocks_per_slot": backend.blocks_per_slot,
             "max_model_len": backend.runtime_config.model_config.max_model_len,
@@ -1285,9 +1288,9 @@ def capture_laguna_m16_logits_oracle(
     ) as rec:
         artifacts = default_store().artifacts_dir(rec.run_id)
         artifacts.mkdir(parents=True, exist_ok=True)
-        path = artifacts / "m16_logits_oracle.json"
+        path = artifacts / f"m{token_count}_logits_oracle.json"
         path.write_text(json.dumps(report, indent=2, sort_keys=True))
-        rec.artifact("m16_logits_oracle", path)
+        rec.artifact("target_logits_oracle", path)
         run_id = rec.run_id
     return {"run_id": run_id, **report}
 
