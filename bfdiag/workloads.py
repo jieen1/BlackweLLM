@@ -1131,6 +1131,98 @@ def profile_laguna_target_shape_matrix(
     return {"run_id": run_id, "shapes": shapes, "replays_per_shape": replays_per_shape}
 
 
+def summarize_moe_route_ids(route_ids: list[list[list[int]]]) -> dict[str, Any]:
+    """Return per-layer expert-count evidence from one target forward."""
+    layers: list[dict[str, Any]] = []
+    for layer_index, layer_ids in enumerate(route_ids, start=1):
+        counts = [0] * 256
+        for token_ids in layer_ids:
+            for expert_id in token_ids:
+                if not 0 <= expert_id < len(counts):
+                    raise ValueError(f"layer {layer_index} has invalid expert id {expert_id}")
+                counts[expert_id] += 1
+        routed_pairs = sum(counts)
+        layers.append(
+            {
+                "moe_layer": layer_index,
+                "routed_pairs": routed_pairs,
+                "unique_experts": sum(count > 0 for count in counts),
+                "max_pairs_per_expert": max(counts, default=0),
+                "expert_pair_counts": counts,
+            }
+        )
+    return {
+        "moe_layer_count": len(layers),
+        "layers": layers,
+        "mean_unique_experts": sum(layer["unique_experts"] for layer in layers)
+        / max(len(layers), 1),
+    }
+
+
+def capture_laguna_route_histograms(
+    engine: Any,
+    tokenizer: Any,
+    *,
+    shapes: tuple[int, ...] = (7, 8, 16),
+) -> dict[str, Any]:
+    """Capture all 47 router outputs for dynamic-serving shapes only."""
+    if not shapes or any(shape < 7 or shape > 16 for shape in shapes):
+        raise ValueError("shapes must be dynamic serving token counts in [7, 16]")
+    if tuple(sorted(set(shapes))) != shapes:
+        raise ValueError("shapes must be unique and sorted")
+
+    backend = engine.backend
+    prompt_ids = historical_dflash_m16_prompt_ids(tokenizer)
+    prompt_hash = _token_ids_hash(prompt_ids)
+    import runtime.backends.laguna as laguna_backend_module
+
+    original_capture = laguna_backend_module.capture_routing
+    captures: list[list[list[int]]] = []
+
+    def capture(_logits: Any, topk_ids: Any, _weights: Any) -> None:
+        captures.append(topk_ids.detach().cpu().tolist())
+
+    reset_dflash_workload_state(engine)
+    try:
+        engine.dflash_prefill_bootstrap(0, prompt_ids)
+        kv_len = backend.slot_kv_len[0]
+        reports: dict[str, Any] = {}
+        laguna_backend_module.capture_routing = capture
+        for shape in shapes:
+            captures.clear()
+            backend._forward(
+                [0], list(range(1000, 1000 + shape)), [kv_len],
+                qo_len=shape, is_decode=False, skip_logits=True,
+            )
+            if len(captures) != 47:
+                raise RuntimeError(f"M={shape} captured {len(captures)} MoE layers, expected 47")
+            reports[f"m{shape}"] = summarize_moe_route_ids(captures)
+        with run_record(
+            script=__file__,
+            workload={
+                "contract": "laguna-route-histogram-64k",
+                "prompt_hash": prompt_hash,
+                "prompt_len": len(prompt_ids),
+                "shapes": list(shapes),
+                "block_size": backend.block_size,
+                "blocks_per_slot": backend.blocks_per_slot,
+                "max_model_len": backend.runtime_config.model_config.max_model_len,
+            },
+        ) as rec:
+            artifacts = default_store().artifacts_dir(rec.run_id)
+            artifacts.mkdir(parents=True, exist_ok=True)
+            path = artifacts / "moe_route_histograms.json"
+            path.write_text(json.dumps(reports, indent=2), encoding="utf-8")
+            rec.artifact("moe_route_histograms", path)
+            for name, report in reports.items():
+                rec.metric(f"{name}_mean_unique_experts", report["mean_unique_experts"])
+            run_id = rec.run_id
+    finally:
+        laguna_backend_module.capture_routing = original_capture
+        reset_dflash_workload_state(engine)
+    return {"run_id": run_id, "shapes": shapes, "reports": reports}
+
+
 def profile_rms_norm_m16(
     *,
     iterations: int = 400,

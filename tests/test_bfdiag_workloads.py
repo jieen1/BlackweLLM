@@ -10,6 +10,7 @@ from bfdiag.workloads import (
     HISTORICAL_M1_CONTEXT_TOKENS,
     HISTORICAL_M1_SUFFIX_TOKENS,
     capture_dynamic_route_tile_trace,
+    capture_laguna_route_histograms,
     check_b1_metadata_fastpath_parity,
     check_dflash_server_step_parity,
     check_dflash_verify_cg_parity,
@@ -23,6 +24,7 @@ from bfdiag.workloads import (
     profile_rms_norm_m16,
     reset_dflash_workload_state,
     summarize_dynamic_route_tile_trace,
+    summarize_moe_route_ids,
     summarize_sparkinfer_workspace_pools,
 )
 
@@ -214,6 +216,27 @@ def test_target_shape_matrix_rejects_invalid_shape_contract():
         profile_laguna_target_shape_matrix(object(), object(), shapes=(2, 1))
     with pytest.raises(ValueError, match="replays_per_shape"):
         profile_laguna_target_shape_matrix(object(), object(), replays_per_shape=0)
+
+
+def test_moe_route_summary_counts_every_topk_pair() -> None:
+    report = summarize_moe_route_ids([[[1, 2], [2, 2]]])
+
+    assert report["moe_layer_count"] == 1
+    assert report["mean_unique_experts"] == 2
+    assert report["layers"] == [
+        {
+            "moe_layer": 1,
+            "routed_pairs": 4,
+            "unique_experts": 2,
+            "max_pairs_per_expert": 3,
+            "expert_pair_counts": [0, 1, 3] + [0] * 253,
+        }
+    ]
+
+
+def test_route_histogram_rejects_non_dynamic_shapes():
+    with pytest.raises(ValueError, match="dynamic serving"):
+        capture_laguna_route_histograms(object(), object(), shapes=(6,))
 
 
 def test_dflash_profiler_reports_the_quick_prompt_contract_for_bad_geometry():
