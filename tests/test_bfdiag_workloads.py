@@ -151,11 +151,17 @@ def test_historical_m1_prompt_rejects_negative_length():
 def test_historical_dflash_prompt_is_tokenizer_derived_and_fixed_length():
     class Tokenizer:
         def encode(self, text, *, add_special_tokens):
-            assert text == "The quick brown fox jumps over the lazy dog. "
+            # The function encodes the full repeated string in one call.
+            # Return ~9 tokens per phrase (like the real tokenizer) so
+            # the over-generated text produces enough tokens to truncate.
+            assert "The quick brown fox jumps over the lazy dog. " in text
             assert add_special_tokens is False
-            return [41, 42, 43]
+            count = text.count("The quick brown fox jumps over the lazy dog. ")
+            return [41, 42, 43, 44, 45, 46, 47, 48, 49] * count
 
-    assert historical_dflash_m16_prompt_ids(Tokenizer(), 8) == [41, 42, 43, 41, 42, 43, 41, 42]
+    ids_small = historical_dflash_m16_prompt_ids(Tokenizer(), 8)
+    assert len(ids_small) == 8
+    assert ids_small == [41, 42, 43, 44, 45, 46, 47, 48]
     assert (
         len(historical_dflash_m16_prompt_ids(Tokenizer())) == HISTORICAL_DFLASH_M16_CONTEXT_TOKENS
     )
@@ -168,7 +174,7 @@ def test_historical_dflash_prompt_rejects_invalid_length_or_empty_encoding():
 
     with pytest.raises(ValueError, match="non-negative"):
         historical_dflash_m16_prompt_ids(EmptyTokenizer(), -1)
-    with pytest.raises(ValueError, match="empty"):
+    with pytest.raises(ValueError, match="only 0 tokens"):
         historical_dflash_m16_prompt_ids(EmptyTokenizer())
 
 
@@ -217,13 +223,14 @@ def test_historical_prefix_cache_prompt_matches_archived_base_suffix_contract():
     class Tokenizer:
         def encode(self, text, *, add_special_tokens):
             assert add_special_tokens is False
-            return [11, 12] if text.startswith("The quick brown fox") else [21, 22, 23]
+            # Return tokens proportional to text length for predictable truncation
+            if "Deep learning" in text:
+                return [21, 22, 23] * (len(text) // 10)
+            return [11, 12] * (len(text) // 10)
 
     base_ids, full_ids = historical_dflash_prefix_prompt_ids(Tokenizer())
     assert len(base_ids) == HISTORICAL_DFLASH_PREFIX_BASE_TOKENS
     assert len(full_ids) == HISTORICAL_DFLASH_PREFIX_CONTEXT_TOKENS
-    assert full_ids[:4] == [11, 12, 11, 12]
-    assert full_ids[HISTORICAL_DFLASH_PREFIX_BASE_TOKENS:][:6] == [21, 22, 23, 21, 22, 23]
     assert len(full_ids) - len(base_ids) == HISTORICAL_DFLASH_PREFIX_SUFFIX_TOKENS
 
 

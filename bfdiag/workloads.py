@@ -242,13 +242,25 @@ def historical_m1_prompt_ids(length: int) -> list[int]:
 def historical_dflash_m16_prompt_ids(
     tokenizer: Any, length: int = HISTORICAL_DFLASH_M16_CONTEXT_TOKENS
 ) -> list[int]:
-    """Build the frozen tokenizer-derived DFlash prompt at an exact length."""
+    """Build the frozen tokenizer-derived DFlash prompt at an exact length.
+
+    Encode the full repeated string in ONE call, then truncate.  Do NOT
+    repeat a tokenized chunk -- tokenizer boundary merging makes
+    N * len(encode(phrase)) != len(encode(phrase * N)), producing
+    different boundary tokens and drastically different acceptance rates
+    (0.69 vs 0.96 at 64K).  Matches acceptance_regression.py _repeat_text.
+    """
     if length < 0:
         raise ValueError("length must be non-negative")
-    chunk = tokenizer.encode(HISTORICAL_DFLASH_M16_TEXT, add_special_tokens=False)
-    if not chunk:
-        raise ValueError("tokenizer produced an empty DFlash benchmark chunk")
-    return (chunk * ((length + len(chunk) - 1) // len(chunk)))[:length]
+    chars_needed = length * 8
+    text = HISTORICAL_DFLASH_M16_TEXT
+    big = text * max(chars_needed // max(len(text), 1) + 1, 10)
+    ids = tokenizer.encode(big, add_special_tokens=False)
+    if len(ids) < length:
+        raise ValueError(
+            f"tokenizer produced only {len(ids)} tokens, need {length}"
+        )
+    return ids[:length]
 
 
 def capture_gpu_telemetry() -> dict[str, float | int | None]:
@@ -401,10 +413,19 @@ def run_historical_dflash_m16_e2e(
 
 
 def _repeat_tokenized_text(tokenizer: Any, text: str, length: int) -> list[int]:
-    chunk = tokenizer.encode(text, add_special_tokens=False)
-    if not chunk:
-        raise ValueError("tokenizer produced an empty historical benchmark chunk")
-    return (chunk * ((length + len(chunk) - 1) // len(chunk)))[:length]
+    """Encode repeated text to exactly length tokens.
+
+    Encode the full repeated string in ONE call, then truncate.
+    Tokenizer boundary merging makes chunk-repeat != whole-encode.
+    """
+    chars_needed = length * 8
+    big = text * max(chars_needed // max(len(text), 1) + 1, 10)
+    ids = tokenizer.encode(big, add_special_tokens=False)
+    if len(ids) < length:
+        raise ValueError(
+            f"tokenizer produced only {len(ids)} tokens, need {length}"
+        )
+    return ids[:length]
 
 
 def historical_dflash_prefix_prompt_ids(tokenizer: Any) -> tuple[list[int], list[int]]:
