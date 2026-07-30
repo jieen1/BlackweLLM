@@ -54,8 +54,19 @@ class TestRingPrefixReuse:
 
         return _ring_prefix_reuse_is_safe(cached_kv_len, prefix_len, ring_specs)
 
+    def _partial_is_exact(self, prefix_len, prompt_len):
+        pytest.importorskip("numpy")
+        pytest.importorskip("torch")
+        from runtime.backends.laguna_dflash import _partial_prefix_reuse_is_exact
+
+        return _partial_prefix_reuse_is_exact(prefix_len, prompt_len)
+
     def test_exact_boundary_is_safe(self):
         assert self._is_safe(4096, 4096, ((640, 512), (640, 512)))
+
+    def test_partial_reuse_requires_unimplemented_chunk_provenance(self):
+        assert not self._partial_is_exact(55488, 65536)
+        assert self._partial_is_exact(65536, 65536)
 
     def test_rewind_within_spare_capacity_is_safe(self):
         assert self._is_safe(4224, 4096, ((640, 512), (640, 512)))

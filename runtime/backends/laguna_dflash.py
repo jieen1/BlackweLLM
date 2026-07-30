@@ -73,6 +73,18 @@ def _ring_prefix_reuse_is_safe(
     return all(rewind <= max(0, capacity - window) for capacity, window in ring_specs)
 
 
+def _partial_prefix_reuse_is_exact(prefix_len: int, prompt_len: int) -> bool:
+    """Whether the current cache carries enough provenance for an exact continuation.
+
+    Ring retention only proves that the required KV rows remain addressable.
+    It does not preserve the original prefill chunk boundaries, whose attention
+    reduction geometry can change BF16/FP8 results.  The current cache records
+    no chunk-boundary snapshot, so only a full prompt hit can be reused without
+    re-executing a numerically different prefill.
+    """
+    return prefix_len >= prompt_len
+
+
 def _greedy_accept_reject(
     verify_argmax: list[int],
     draft_tokens: list[int],
@@ -1180,6 +1192,13 @@ class DFlashEngine:
                 logger.info(
                     "Prefix cache MISS: rewinding %d KV positions exceeds ring history",
                     cached_kv_len - prefix_len,
+                )
+                prefix_len = 0
+            elif prefix_len > 0 and not _partial_prefix_reuse_is_exact(
+                prefix_len, prompt_len
+            ):
+                logger.info(
+                    "Prefix cache MISS: partial reuse lacks exact prefill chunk provenance"
                 )
                 prefix_len = 0
 
