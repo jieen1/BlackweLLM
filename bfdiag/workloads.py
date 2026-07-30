@@ -1229,6 +1229,69 @@ def capture_laguna_route_histograms(
     return {"run_id": run_id, "shapes": shapes, "reports": reports}
 
 
+def capture_laguna_m16_logits_oracle(
+    engine: Any,
+    tokenizer: Any,
+    *,
+    variant: str,
+) -> dict[str, Any]:
+    """Record the complete eager target logits for one named M=16 variant."""
+    if not variant:
+        raise ValueError("variant must be non-empty")
+    import torch
+
+    backend = engine.backend
+    prompt_ids = historical_dflash_m16_prompt_ids(tokenizer)
+    try:
+        reset_dflash_workload_state(engine)
+        state = engine.dflash_prefill_bootstrap(0, prompt_ids)
+        verify_tokens = [state["anchor"], *state["draft_tokens"]]
+        if len(verify_tokens) != 16:
+            raise RuntimeError(f"M=16 oracle received M={len(verify_tokens)}")
+        kv_len = backend.slot_kv_len[0]
+        logits = backend._forward(
+            [0], verify_tokens, [kv_len], qo_len=16, is_decode=False, skip_logits=False
+        )
+        if logits is None:
+            raise RuntimeError("target forward unexpectedly omitted logits")
+        torch.cuda.synchronize()
+        cpu_logits = logits.detach().cpu().clone()
+    finally:
+        restore_dflash_daemon_state(engine)
+    report = {
+        "variant": variant,
+        "verify_tokens": verify_tokens,
+        "kv_len": kv_len,
+        "logits_shape": list(cpu_logits.shape),
+        "logits_sha256": hashlib.sha256(
+            cpu_logits.contiguous().view(torch.uint8).numpy().tobytes()
+        ).hexdigest(),
+        "top1": cpu_logits.argmax(dim=-1).tolist(),
+    }
+    with run_record(
+        script=__file__,
+        workload={
+            "contract": "laguna-m16-eager-logits-oracle-64k",
+            "variant": variant,
+            "prompt_hash": _token_ids_hash(prompt_ids),
+            "prompt_len": len(prompt_ids),
+            "verify_tokens": 16,
+            "block_size": backend.block_size,
+            "blocks_per_slot": backend.blocks_per_slot,
+            "max_model_len": backend.runtime_config.model_config.max_model_len,
+            "capacity": backend.num_slots,
+            "cuda_graph": False,
+        },
+    ) as rec:
+        artifacts = default_store().artifacts_dir(rec.run_id)
+        artifacts.mkdir(parents=True, exist_ok=True)
+        path = artifacts / "m16_logits_oracle.json"
+        path.write_text(json.dumps(report, indent=2, sort_keys=True))
+        rec.artifact("m16_logits_oracle", path)
+        run_id = rec.run_id
+    return {"run_id": run_id, **report}
+
+
 def profile_rms_norm_m16(
     *,
     iterations: int = 400,
