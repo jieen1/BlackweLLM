@@ -15,6 +15,7 @@ from bfdiag.workloads import (
     capture_dynamic_route_tile_trace,
     capture_laguna_route_histograms,
     capture_laguna_target_logits_oracle,
+    capture_laguna_target_prefill_state,
     check_b1_metadata_fastpath_parity,
     check_dflash_server_step_parity,
     check_dflash_verify_cg_parity,
@@ -264,6 +265,29 @@ def test_compare_target_prefill_states_reports_first_changed_layer_and_aux():
         "candidate": "changed",
     }
     assert result["aux_difference_count"] == 1
+
+
+def test_target_prefill_state_uses_laguna_cache_slot_zero() -> None:
+    torch = pytest.importorskip("torch")
+
+    class Backend:
+        block_size = 4
+        blocks_per_slot = 2
+        _ring_blocks_per_slot = 1
+        slot_kv_len = [5]
+        _full_layer_names = ["full"]
+        kv_caches = {
+            "full": torch.zeros(2, 2, 4, 1, 1, dtype=torch.uint8),
+            "swa": torch.zeros(2, 1, 4, 1, 1, dtype=torch.uint8),
+        }
+
+    state = capture_laguna_target_prefill_state(Backend(), 0, 5, 7, None)
+
+    assert state["physical_slot"] == 0
+    assert [item["shape"] for item in state["layer_hashes"]] == [
+        [2, 2, 4, 1, 1],
+        [2, 1, 4, 1, 1],
+    ]
 
 
 def test_partial_prefix_diagnostic_rejects_invalid_token_budgets():

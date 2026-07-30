@@ -306,7 +306,11 @@ def capture_laguna_target_prefill_state(
     generation never calls this helper, so its hashes cannot perturb target or
     draft execution order.
     """
-    from runtime.block_pool import _physical_slot
+    # Laguna allocates its own attention caches and deliberately uses a
+    # different physical-slot convention from BlockPool.  Hash against the
+    # allocator that owns these tensors; BlockPool reserves slot zero, while
+    # Laguna's self-allocated cache starts logical slot zero at block zero.
+    from runtime.backends.laguna import _physical_slot
 
     physical_slot = _physical_slot(slot)
     block_size = backend.block_size
