@@ -21,6 +21,11 @@ def _resolve(store: RunStore, ref: str) -> RunRecord:
     return store.load(run_id)
 
 
+def _display_status(record: RunRecord) -> str:
+    """Make an unfinalized record visibly non-comparable in ``bf ls``."""
+    return "running" if record.finished_at is None else record.status
+
+
 def _cmd_ls(args: argparse.Namespace) -> int:
     store = default_store()
     runs = store.list_runs(limit=args.n)
@@ -33,7 +38,7 @@ def _cmd_ls(args: argparse.Namespace) -> int:
     for r in runs:
         acceptance = r.metrics.get("acceptance_rate")
         suffix = f"  acceptance_rate={acceptance}" if acceptance is not None else ""
-        print(f"{r.run_id}  {r.started_at}  {r.status:6s}  {r.script}{suffix}")
+        print(f"{r.run_id}  {r.started_at}  {_display_status(r):7s}  {r.script}{suffix}")
     return 0
 
 

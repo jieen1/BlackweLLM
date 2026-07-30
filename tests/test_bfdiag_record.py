@@ -321,6 +321,18 @@ def test_cli_ls_show_diff_end_to_end(monkeypatch, tmp_path: Path, capsys) -> Non
     assert exit_code in (0, 2)
 
 
+def test_cli_ls_labels_an_unfinished_record_running(monkeypatch, tmp_path: Path, capsys) -> None:
+    monkeypatch.setenv("QSR_BFDIAG_DIR", str(tmp_path / ".bfdiag"))
+    cli_store = RunStore(tmp_path / ".bfdiag")
+    record = _make_record(run_id="unfinished", finished_at=None)
+    cli_store.save(record)
+
+    assert bfdiag_cli.main(["ls"]) == 0
+    output = capsys.readouterr().out
+    assert "unfinished" in output
+    assert "running" in output
+
+
 def test_cli_no_subcommand_prints_help_and_returns_nonzero(
     monkeypatch, tmp_path: Path, capsys
 ) -> None:
