@@ -1297,12 +1297,25 @@ class DFlashEngine:
         total_accepted = 0
         num_steps = 0
 
+        # Cache loop-invariant values outside the hot decode loop
+        _trace_enabled = bfdiag_trace.TRACE_ENABLED
+        _chunk_check = os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2")
+        _verify_dump_path = os.environ.get("QSR_DEBUG_VERIFY_LOGITS_FILE")
+        _bs = self.block_size
+        _phys = _physical_slot(slot)
+        _draft_base = _phys * self._draft_blocks_per_slot
+        _ring_slots = self._draft_blocks_per_slot * _bs
+        # Pre-allocate context position buffer (max M=16 tokens per round)
+        _ctx_pos_buf = torch.arange(
+            NUM_QUERY_PER_REQ, dtype=torch.long, device=self.device
+        )
+
         while len(tokens) < max_tokens:
             num_steps += 1
             total_draft += NUM_SPECULATIVE_TOKENS
             kv_len = backend.slot_kv_len[slot]
             _bf_row = (
-                bfdiag_trace.begin_round(slot, kv_len) if bfdiag_trace.TRACE_ENABLED else -1
+                bfdiag_trace.begin_round(slot, kv_len) if _trace_enabled else -1
             )
 
             # Step 1: Verify (M=16 full model forward) — replaces decode+verify
@@ -1325,8 +1338,7 @@ class DFlashEngine:
             if _force_sync:
                 torch.cuda.synchronize()
 
-            verify_dump_path = os.environ.get("QSR_DEBUG_VERIFY_LOGITS_FILE")
-            if verify_dump_path:
+            if _verify_dump_path:
                 vl = verify_logits[:NUM_QUERY_PER_REQ].float()
                 vtop2 = vl.topk(2, dim=-1)
                 vpositions = []
@@ -1341,7 +1353,7 @@ class DFlashEngine:
                     )
                 import json as _json
 
-                with open(verify_dump_path, "a") as _f:
+                with open(_verify_dump_path, "a") as _f:
                     _f.write(
                         _json.dumps(
                             {
@@ -1368,7 +1380,7 @@ class DFlashEngine:
             # The recovery/bonus token remains pending and is not in KV yet.
             context_count = decision["context_count"]
 
-            if os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2"):
+            if _chunk_check:
                 logger.warning(
                     "CHUNK_CHECK round bs=%d num_steps=%d kv_len=%d bonus_token=%d "
                     "draft_tokens=%s num_accepted=%d new_tokens=%s new_bonus=%d",
@@ -1387,16 +1399,10 @@ class DFlashEngine:
                 aux_slice = [a[:context_count] for a in verify_aux]
                 combined_input = torch.cat(aux_slice, dim=-1)
                 combined = self.draft_model.combine_hidden_states(combined_input)
-                bs = self.block_size
-                phys = _physical_slot(slot)
-                draft_base = phys * self._draft_blocks_per_slot
-                ring_slots = self._draft_blocks_per_slot * bs
-                context_positions = torch.arange(
-                    kv_len, kv_len + context_count, dtype=torch.long, device=self.device
-                )
-                ring_blocks = (context_positions % ring_slots) // bs
-                ring_offs = context_positions % bs
-                slot_mappings = (draft_base + ring_blocks) * bs + ring_offs
+                context_positions = _ctx_pos_buf[:context_count] + kv_len
+                ring_blocks = (context_positions % _ring_slots) // _bs
+                ring_offs = context_positions % _bs
+                slot_mappings = (_draft_base + ring_blocks) * _bs + ring_offs
                 self.draft_model.precompute_and_store_context_kv(
                     combined, context_positions, slot_mappings
                 )
@@ -1407,7 +1413,7 @@ class DFlashEngine:
             backend.slot_kv_len[slot] += context_count
             backend.slot_committed_tokens[slot].extend(new_tokens)
             tokens.extend(new_tokens)
-            if bfdiag_trace.TRACE_ENABLED:
+            if _trace_enabled:
                 bfdiag_trace.mark(_bf_row, bfdiag_events.PHASE_COMMIT)
 
             # Check EOS
