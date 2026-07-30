@@ -270,6 +270,7 @@ class Daemon:
 
         self._state = "STARTING"
         self._provider_lock = threading.Lock()
+        self._provider_unloaded = False
         self._jobs: queue.Queue[_Job | None] = queue.Queue()
         self._shutdown_event = threading.Event()
         self._worker_thread: threading.Thread | None = None
@@ -356,6 +357,13 @@ class Daemon:
         self._jobs.put(None)
         if self._worker_thread is not None:
             self._worker_thread.join(timeout=5.0)
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            logger.warning(
+                "bfdiag daemon: worker did not stop within 5s; skipping provider unload to avoid "
+                "racing a live engine call"
+            )
+        else:
+            self._unload_provider_once()
         if self._idle_watchdog_thread is not None:
             self._idle_watchdog_thread.join(timeout=5.0)
         if self._listen_sock is not None:
@@ -411,10 +419,20 @@ class Daemon:
                 break
 
     def _auto_shutdown_for_idle(self) -> None:
-        with contextlib.suppress(Exception):
-            self._provider.unload()
+        self._unload_provider_once()
         self._shutdown_event.set()
         self._jobs.put(None)
+
+    def _unload_provider_once(self) -> None:
+        """Release the provider exactly once after its worker is quiescent."""
+        with self._provider_lock:
+            if self._provider_unloaded:
+                return
+            self._provider_unloaded = True
+        try:
+            self._provider.unload()
+        except Exception:
+            logger.exception("bfdiag daemon: provider unload failed during shutdown")
 
     def _read_last_activity(self) -> float:
         with self._provider_lock:

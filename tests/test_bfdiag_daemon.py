@@ -199,6 +199,18 @@ class TestLifecycle:
             time.sleep(0.05)
         assert not socket_path.exists()
 
+    def test_manual_shutdown_unloads_provider_once(self, daemon_factory):
+        daemon, client = daemon_factory()
+        provider = daemon._provider
+
+        assert client.shutdown().ok is True
+        deadline = time.monotonic() + 2.0
+        while daemon._read_state() != "STOPPED" and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        assert daemon._read_state() == "STOPPED"
+        assert provider._unload_count == 1
+
     def test_client_raises_when_no_daemon_running(self, tmp_path: Path):
         client = Client(socket_path=tmp_path / "nonexistent.sock")
         with pytest.raises(DaemonNotRunning):
