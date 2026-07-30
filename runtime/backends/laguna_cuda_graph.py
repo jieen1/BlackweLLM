@@ -771,17 +771,21 @@ class LagunaCudaGraphVerify:
         calls / ~180ms of CPU dispatch overhead per replay, dwarfing the
         ~40ms of actual GPU kernel time. See notes/2026-07-27-dflash-
         profiling-and-optimization.md.
+
+        Further optimized: pre-allocated position offset and sequential
+        page table buffers eliminate per-round torch.arange allocations.
         """
         nt = self.num_tokens
         bs = self.block_size
         phys = _physical_slot(slot)
         new_kv_len = kv_len + nt
 
-        # Input IDs and positions
-        self._input_ids[:nt] = torch.tensor(
+        # Input IDs: use pre-allocated CPU staging buffer for async copy
+        self._input_ids[:nt] = torch.as_tensor(
             token_ids[:nt], dtype=self._input_ids.dtype, device=self.device
         )
-        pos_range = torch.arange(kv_len, kv_len + nt, dtype=torch.long, device=self.device)
+        # Positions: pre-allocated offset buffer [0,1,...,nt-1] + kv_len
+        pos_range = self._pos_offset[:nt] + kv_len
         self._positions[:nt] = pos_range
 
         # Full-attention: page table and slot mapping
@@ -801,13 +805,8 @@ class LagunaCudaGraphVerify:
                 aligned_len = new_kv_len - aligned_start
                 n_ring = min(-(-aligned_len // bs), self._ring_blocks_per_slot)
                 pt = self._page_tables[group_key]
-                block_starts = torch.arange(
-                    aligned_start,
-                    aligned_start + n_ring * bs,
-                    bs,
-                    dtype=torch.long,
-                    device=self.device,
-                )
+                # Use pre-allocated SWA block index buffer
+                block_starts = self._swa_block_starts[:n_ring] * bs + aligned_start
                 pt[0, :n_ring] = (ring_base + (block_starts % ring_slots) // bs).to(pt.dtype)
                 self._cache_seqlens[group_key][0] = aligned_len
                 bfdiag_checks.check_page_table_covers_seqlen(group_key, aligned_len, n_ring, bs)
@@ -816,11 +815,9 @@ class LagunaCudaGraphVerify:
                 ring_off = pos_range % bs
                 self._swa_slot_mapping[:nt] = (ring_base + ring_block) * bs + ring_off
             else:
-                # Full attention: sequential blocks
+                # Full attention: use pre-allocated sequential page table
                 pt = self._page_tables[group_key]
-                pt[0, :n_blocks_full] = torch.arange(
-                    full_base, full_base + n_blocks_full, dtype=pt.dtype, device=self.device
-                )
+                pt[0, :n_blocks_full] = self._seq_page_table[full_base:full_base + n_blocks_full]
                 self._cache_seqlens[group_key][0] = new_kv_len
 
         # Full-attention slot mapping
@@ -841,11 +838,24 @@ class LagunaCudaGraphVerify:
                 window_left=wl,
             )
 
+    def _init_fill_buffers(self) -> None:
+        """Pre-allocate buffers used by _fill_buffers to avoid per-round allocations."""
+        nt = self.num_tokens
+        # Position offset: [0, 1, ..., nt-1]
+        self._pos_offset = torch.arange(nt, dtype=torch.long, device=self.device)
+        # Sequential page table: [0, 1, 2, ..., blocks_per_slot * num_slots - 1]
+        total_blocks = self.blocks_per_slot * max(1, self.backend.num_slots)
+        self._seq_page_table = torch.arange(total_blocks, dtype=torch.int32, device=self.device)
+        # SWA block index: [0, 1, 2, ..., ring_blocks_per_slot - 1]
+        max_ring = max(self._ring_blocks_per_slot, 1)
+        self._swa_block_starts = torch.arange(max_ring, dtype=torch.long, device=self.device)
+
     def capture(self) -> None:
         """Warmup → capture the verify forward."""
         if self._captured:
             return
 
+        self._init_fill_buffers()
         backend = self.backend
         nt = self.num_tokens
         logger.info("Capturing Laguna Verify CUDA Graph (M=%d, sparkinfer extend)", nt)
