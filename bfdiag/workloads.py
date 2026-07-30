@@ -1071,6 +1071,7 @@ def profile_laguna_target_shape_matrix(
     *,
     shapes: tuple[int, ...] = (1, 2, 4, 6, 7, 8, 16),
     replays_per_shape: int = 4,
+    nvfp4_split_decode: bool | None = None,
 ) -> dict[str, Any]:
     """Profile eager target forwards across the serving MoE shape regimes.
 
@@ -1086,6 +1087,8 @@ def profile_laguna_target_shape_matrix(
         raise ValueError("shapes must be unique and sorted")
     if replays_per_shape <= 0:
         raise ValueError("replays_per_shape must be positive")
+    if nvfp4_split_decode is not None and not isinstance(nvfp4_split_decode, bool):
+        raise TypeError("nvfp4_split_decode must be bool or None")
 
     backend = engine.backend
     required_tokens = HISTORICAL_DFLASH_M16_CONTEXT_TOKENS + max(shapes)
@@ -1109,12 +1112,17 @@ def profile_laguna_target_shape_matrix(
             f"{required_tokens}, got {backend.runtime_config.model_config.max_model_len}"
         )
 
+    import os
+
     import torch
 
     prompt_ids = historical_dflash_m16_prompt_ids(tokenizer)
     prompt_hash = _token_ids_hash(prompt_ids)
-    reset_dflash_workload_state(engine)
+    previous_split_decode = os.environ.get("SPARKINFER_NVFP4_SPLIT_DECODE")
+    if nvfp4_split_decode is not None:
+        os.environ["SPARKINFER_NVFP4_SPLIT_DECODE"] = "1" if nvfp4_split_decode else "0"
     try:
+        reset_dflash_workload_state(engine)
         engine.dflash_prefill_bootstrap(0, prompt_ids)
         kv_len = backend.slot_kv_len[0]
         torch.cuda.synchronize()
@@ -1132,6 +1140,7 @@ def profile_laguna_target_shape_matrix(
                 "max_model_len": backend.runtime_config.model_config.max_model_len,
                 "capacity": backend.num_slots,
                 "cuda_graph": False,
+                "nvfp4_split_decode": nvfp4_split_decode,
             },
         ) as rec:
             activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
@@ -1156,7 +1165,17 @@ def profile_laguna_target_shape_matrix(
             run_id = rec.run_id
     finally:
         reset_dflash_workload_state(engine)
-    return {"run_id": run_id, "shapes": shapes, "replays_per_shape": replays_per_shape}
+        if nvfp4_split_decode is not None:
+            if previous_split_decode is None:
+                os.environ.pop("SPARKINFER_NVFP4_SPLIT_DECODE", None)
+            else:
+                os.environ["SPARKINFER_NVFP4_SPLIT_DECODE"] = previous_split_decode
+    return {
+        "run_id": run_id,
+        "shapes": shapes,
+        "replays_per_shape": replays_per_shape,
+        "nvfp4_split_decode": nvfp4_split_decode,
+    }
 
 
 def summarize_moe_route_ids(route_ids: list[list[list[int]]]) -> dict[str, Any]:

@@ -249,6 +249,8 @@ def test_target_shape_matrix_rejects_invalid_shape_contract():
         profile_laguna_target_shape_matrix(object(), object(), shapes=(2, 1))
     with pytest.raises(ValueError, match="replays_per_shape"):
         profile_laguna_target_shape_matrix(object(), object(), replays_per_shape=0)
+    with pytest.raises(TypeError, match="bool or None"):
+        profile_laguna_target_shape_matrix(object(), object(), nvfp4_split_decode=1)
 
 
 def test_target_shape_matrix_rejects_insufficient_live_capacity():
