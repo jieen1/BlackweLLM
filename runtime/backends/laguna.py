@@ -171,6 +171,36 @@ def _prefill_chunk_ranges(
     return ranges
 
 
+def _exact_prefix_replay_boundary(
+    *,
+    prefix_len: int,
+    prompt_len: int,
+    chunk_tokens: int,
+    min_final_tokens: int,
+    snapshot_boundary: int | None,
+) -> int | None:
+    """Return a cached chunk boundary from which cold-equivalent replay can start.
+
+    A retained prefix alone is insufficient: its last partial chunk may have
+    used a different query shape than the new prompt's cold prefill.  A ring
+    snapshot made at a prior fixed chunk boundary permits replay from that
+    boundary only when it is also a start boundary in the new cold schedule.
+    """
+    if snapshot_boundary is None or snapshot_boundary <= 0:
+        return None
+    if snapshot_boundary > prefix_len:
+        return None
+    target_ranges = _prefill_chunk_ranges(
+        0,
+        prompt_len,
+        chunk_tokens,
+        min_final_tokens=min_final_tokens,
+    )
+    if any(start == snapshot_boundary for start, _ in target_ranges):
+        return snapshot_boundary
+    return None
+
+
 class LagunaBackend:
     """Direct model runner for Laguna-S-2.1-NVFP4.
 

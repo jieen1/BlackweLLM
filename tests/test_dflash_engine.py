@@ -251,6 +251,19 @@ class TestPrefillChunkRanges:
             min_final_tokens=window,
         )
 
+    def _replay_boundary(self, *, prefix_len, prompt_len, snapshot_boundary):
+        pytest.importorskip("numpy")
+        pytest.importorskip("torch")
+        from runtime.backends.laguna import _exact_prefix_replay_boundary
+
+        return _exact_prefix_replay_boundary(
+            prefix_len=prefix_len,
+            prompt_len=prompt_len,
+            chunk_tokens=8192,
+            min_final_tokens=DRAFT_WINDOW,
+            snapshot_boundary=snapshot_boundary,
+        )
+
     def test_aligned_prompt_keeps_full_final_chunk(self):
         ranges = self._ranges(65536)
         assert ranges[-1] == (57344, 65536)
@@ -271,3 +284,24 @@ class TestPrefillChunkRanges:
         assert ranges[-1][1] == 65537
         assert all(left[1] == right[0] for left, right in zip(ranges, ranges[1:]))
         assert all(0 < end - start <= 8192 for start, end in ranges)
+
+    def test_prefix_replay_uses_last_shared_cold_chunk_boundary(self):
+        assert self._replay_boundary(
+            prefix_len=55488,
+            prompt_len=65536,
+            snapshot_boundary=49152,
+        ) == 49152
+
+    def test_prefix_replay_rejects_a_boundary_inside_new_cold_chunk(self):
+        assert self._replay_boundary(
+            prefix_len=55488,
+            prompt_len=65536,
+            snapshot_boundary=55488,
+        ) is None
+
+    def test_prefix_replay_rejects_snapshot_beyond_textual_match(self):
+        assert self._replay_boundary(
+            prefix_len=55488,
+            prompt_len=65536,
+            snapshot_boundary=57344,
+        ) is None
