@@ -133,6 +133,29 @@ def artifact_provenance(record) -> dict:
     }
 
 
+def save_fixture(rec, summary: dict, results: list[dict], *, output_path: Path | None = None) -> Path:
+    """Persist the complete run payload and attach it to its bfdiag record."""
+    fixture = {
+        "date": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "suite_version": SUITE_VERSION,
+        "warmup_rounds": WARMUP_ROUNDS,
+        "measure_rounds": MEASURE_ROUNDS,
+        "provenance": artifact_provenance(rec.record),
+        "summary": summary,
+        "results": results,
+    }
+    out = output_path or Path(
+        os.environ.get(
+            "QSR_ACCEPTANCE_REGRESSION_OUT",
+            _REPO / "benchmarks" / "fixtures" / f"acceptance_regression_{time.strftime('%Y%m%d')}.json",
+        )
+    )
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(fixture, indent=2, ensure_ascii=False))
+    rec.artifact("acceptance_fixture", out)
+    return out
+
+
 def run_suite(backend, engine, tokenizer, warmup_rounds=WARMUP_ROUNDS,
               measure_rounds=MEASURE_ROUNDS):
     import torch
@@ -276,6 +299,7 @@ def main():
             rec.metric(f"tok_s_{result['label']}", result["tok_s"])
         rec.metric("accept_all_mean", summary["all"]["mean"])
         rec.metric("accept_real_mean", summary["real_workload"]["mean"])
+        out = save_fixture(rec, summary, results)
 
     print(f"\n{'='*80}")
     print("SUMMARY")
@@ -287,22 +311,6 @@ def main():
     for cat, s in summary["by_category"].items():
         print(f"    {cat:13s}  n={s['n']:2d}  mean={s['mean']*100:5.1f}%  P50={s['p50']*100:5.1f}%")
 
-    # Save fixture
-    fixture = {
-        "date": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "suite_version": SUITE_VERSION,
-        "warmup_rounds": WARMUP_ROUNDS,
-        "measure_rounds": MEASURE_ROUNDS,
-        "provenance": artifact_provenance(rec.record),
-        "summary": summary,
-        "results": results,
-    }
-    out = Path(os.environ.get(
-        "QSR_ACCEPTANCE_REGRESSION_OUT",
-        _REPO / "benchmarks" / "fixtures" / f"acceptance_regression_{time.strftime('%Y%m%d')}.json",
-    ))
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(fixture, indent=2, ensure_ascii=False))
     print(f"\nSaved: {out}")
 
 if __name__ == "__main__":
