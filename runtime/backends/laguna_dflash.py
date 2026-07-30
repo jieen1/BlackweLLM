@@ -1190,11 +1190,26 @@ class DFlashEngine:
                     prefix_len,
                     ring_specs,
                 ):
-                    logger.info(
-                        "Prefix cache MISS: rewinding %d KV positions exceeds ring history",
-                        cached_kv_len - prefix_len,
+                    prefix_len = backend.prepare_exact_prefix_replay(
+                        slot, prompt_ids, prompt_len
                     )
-                    prefix_len = 0
+                    exact_cold_replay = prefix_len is not None
+                    if exact_cold_replay:
+                        logger.info(
+                            "Prefix cache REPLAY: full hit rewinds %d positions from "
+                            "cold boundary %d",
+                            cached_kv_len - prompt_len,
+                            prefix_len,
+                        )
+                    else:
+                        logger.info(
+                            "Prefix cache MISS: rewinding %d KV positions exceeds ring history",
+                            cached_kv_len - prompt_len,
+                        )
+                        logger.info(
+                            "Prefix cache MISS: expired full hit lacks cold-boundary SWA provenance"
+                        )
+                        prefix_len = 0
 
         if prefix_len > 0 and prefix_len < prompt_len:
             # Partial match: continue from cached prefix
