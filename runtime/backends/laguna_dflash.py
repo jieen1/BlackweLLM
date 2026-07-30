@@ -130,6 +130,8 @@ class DFlashEngine:
         self,
         backend: LagunaBackend,
         dflash_model_path: str | None = None,
+        *,
+        defer_cuda_graph_capture: bool = False,
     ) -> None:
         self.backend = backend
         self.device = backend.device
@@ -166,7 +168,8 @@ class DFlashEngine:
         self._draft_cg = None
         self._cg_captured = False
         self._use_cuda_graph = os.environ.get("QSR_DFLASH_CUDA_GRAPH", "1") != "0"
-        if self._use_cuda_graph:
+        self._cuda_graph_capture_deferred = bool(defer_cuda_graph_capture)
+        if self._use_cuda_graph and not self._cuda_graph_capture_deferred:
             self._init_cuda_graph()
 
         logger.info(
@@ -175,6 +178,17 @@ class DFlashEngine:
             DRAFT_NUM_LAYERS,
             self._use_cuda_graph,
         )
+
+    def capture_cuda_graphs(self) -> None:
+        """Capture deferred DFlash graphs after the eager engine is fully built.
+
+        Normal production construction captures immediately. Diagnostics may
+        defer only this stage to attribute its persistent CUDA allocations;
+        the captured graph ABI and runtime behavior remain unchanged.
+        """
+        if self._use_cuda_graph and not self._cg_captured:
+            self._init_cuda_graph()
+        self._cuda_graph_capture_deferred = False
 
     def _load_draft_model(self, model_path: str | None) -> Any:
         """Load the DFlash draft model.

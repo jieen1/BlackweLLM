@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import importlib
 import time
+from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
 _DEFAULT_LAGUNA_MODEL_PATH = (
@@ -178,7 +179,7 @@ class EngineProvider(Protocol):
     contend for the same GPU and cannot reclaim the first CUDA context.
     """
 
-    def load(self) -> None:
+    def load(self, *, on_stage: Callable[[str], None] | None = None) -> None:
         """One-time expensive setup. Must be safe to call exactly once per
         process; the daemon never calls it twice on the same instance."""
         ...
@@ -390,7 +391,7 @@ class LagunaEngineProvider:
         self._engine: Any = None
         self._tokenizer: Any = None
 
-    def load(self) -> None:
+    def load(self, *, on_stage: Callable[[str], None] | None = None) -> None:
         """Load the Laguna backend + DFlash engine (weights, draft model,
         CUDA Graph capture, autotune) and leave both in a pristine state.
 
@@ -419,8 +420,20 @@ class LagunaEngineProvider:
             blocks_per_slot=self._blocks_per_slot,
             block_size=self._block_size,
         )
-        self._engine = DFlashEngine(self._backend, dflash_model_path=self._dflash_model_path)
+        if on_stage is not None:
+            on_stage("after_target_backend")
+        self._engine = DFlashEngine(
+            self._backend,
+            dflash_model_path=self._dflash_model_path,
+            defer_cuda_graph_capture=on_stage is not None,
+        )
+        if on_stage is not None:
+            on_stage("after_dflash_eager")
+            self._engine.capture_cuda_graphs()
+            on_stage("after_dflash_cuda_graphs")
         self._tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        if on_stage is not None:
+            on_stage("after_tokenizer")
         # CUDA Graph capture inside DFlashEngine.__init__ warms up using
         # dummy tokens written DIRECTLY into real logical slot 0 (every CG
         # class) and the tail num_slots-batch_size..num_slots logical slots
@@ -429,6 +442,8 @@ class LagunaEngineProvider:
         # pristine by construction; reset() as the last step here is what
         # makes it so.
         self.reset()
+        if on_stage is not None:
+            on_stage("after_reset")
 
     def reset(self) -> None:
         if self._engine is None:
