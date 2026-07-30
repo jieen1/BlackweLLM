@@ -11,7 +11,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import time
+from collections.abc import Callable
 from typing import Any
 
 from bfdiag.record import run_record
@@ -247,6 +249,155 @@ def historical_dflash_m16_prompt_ids(
     if not chunk:
         raise ValueError("tokenizer produced an empty DFlash benchmark chunk")
     return (chunk * ((length + len(chunk) - 1) // len(chunk)))[:length]
+
+
+def capture_gpu_telemetry() -> dict[str, float | int | None]:
+    """Snapshot runtime GPU conditions outside a completed timed sample."""
+    fields = "temperature.gpu,power.draw,clocks.sm,memory.used"
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=5,
+        )
+        values = [item.strip() for item in result.stdout.splitlines()[0].split(",")]
+        if result.returncode or len(values) != 4:
+            raise ValueError("unexpected nvidia-smi output")
+        return {
+            "temperature_c": int(values[0]),
+            "power_w": float(values[1]),
+            "sm_clock_mhz": int(values[2]),
+            "driver_used_mib": int(values[3]),
+        }
+    except (IndexError, OSError, subprocess.TimeoutExpired, ValueError):
+        return {
+            "temperature_c": None,
+            "power_w": None,
+            "sm_clock_mhz": None,
+            "driver_used_mib": None,
+        }
+
+
+def _run_dflash_e2e_sample(
+    backend: Any,
+    engine: Any,
+    prompt_ids: list[int],
+    *,
+    max_tokens: int,
+    synchronize: Callable[[], None],
+    telemetry: Callable[[], dict[str, float | int | None]] = capture_gpu_telemetry,
+) -> dict[str, Any]:
+    """Run the whole-generation production path once from an empty slot."""
+    backend.reset_slot(0)
+    synchronize()
+    start = time.perf_counter()
+    tokens, stats = engine.generate_verify_only(
+        prompt_ids=prompt_ids,
+        max_tokens=max_tokens,
+        enable_prefix_cache=False,
+        slot=0,
+    )
+    synchronize()
+    return {
+        "tok_s": float(stats["tok_per_s"]),
+        "acceptance_rate": float(stats["acceptance_rate"]),
+        "tokens_per_step": float(stats["tokens_per_step"]),
+        "steps": int(stats["num_steps"]),
+        "wall_s": time.perf_counter() - start,
+        "output_hash": _token_ids_hash(tokens),
+        "telemetry": telemetry(),
+    }
+
+
+def run_historical_dflash_m16_e2e(
+    engine: Any,
+    tokenizer: Any,
+    *,
+    warmup_rounds: int = 1,
+    measure_rounds: int = 6,
+    max_tokens: int = HISTORICAL_DFLASH_M16_NEW_TOKENS,
+) -> dict[str, Any]:
+    """Replay the dedicated historical fox-64K whole-generation contract."""
+    if warmup_rounds < 0 or measure_rounds <= 0:
+        raise ValueError("warmup_rounds must be non-negative and measure_rounds positive")
+
+    import torch
+
+    backend = engine.backend
+    prompt_ids = historical_dflash_m16_prompt_ids(tokenizer)
+    if backend.block_size != HISTORICAL_M1_BLOCK_SIZE:
+        raise ValueError(
+            f"{HISTORICAL_DFLASH_M16_CONTRACT} requires block_size="
+            f"{HISTORICAL_M1_BLOCK_SIZE}, got {backend.block_size}"
+        )
+    workload = {
+        "contract": HISTORICAL_DFLASH_M16_CONTRACT,
+        "prompt_hash": _token_ids_hash(prompt_ids),
+        "prompt_len": len(prompt_ids),
+        "max_tokens": max_tokens,
+        "k": 15,
+        "greedy": True,
+        "block_size": backend.block_size,
+        "blocks_per_slot": backend.blocks_per_slot,
+        "max_model_len": backend.runtime_config.model_config.max_model_len,
+        "capacity": backend.num_slots,
+        "dflash": True,
+        "prefix_cache": False,
+        "whole_generation": True,
+    }
+    with run_record(
+        script=__file__,
+        workload=workload,
+        extra={
+            "workload_extra": {
+                "kind": "laguna-dflash-fox-64k-dedicated",
+                "warmup_rounds": warmup_rounds,
+                "measure_rounds": measure_rounds,
+                "discard_first": warmup_rounds > 0,
+            }
+        },
+    ) as rec:
+        warmup = [
+            _run_dflash_e2e_sample(
+                backend,
+                engine,
+                prompt_ids,
+                max_tokens=max_tokens,
+                synchronize=torch.cuda.synchronize,
+            )
+            for _ in range(warmup_rounds)
+        ]
+        rounds = [
+            _run_dflash_e2e_sample(
+                backend,
+                engine,
+                prompt_ids,
+                max_tokens=max_tokens,
+                synchronize=torch.cuda.synchronize,
+            )
+            for _ in range(measure_rounds)
+        ]
+        for index, row in enumerate(rounds):
+            rec.metric(f"sample_{index}_tok_s", row["tok_s"])
+            rec.metric(f"sample_{index}_acceptance", row["acceptance_rate"])
+            rec.metric(f"sample_{index}_tps", row["tokens_per_step"])
+        median_tok_s = sorted(row["tok_s"] for row in rounds)[len(rounds) // 2]
+        rec.metric("stable_median_tok_s", median_tok_s)
+        rec.metric("stable_mean_tok_s", sum(row["tok_s"] for row in rounds) / len(rounds))
+        rec.metric(
+            "stable_mean_acceptance",
+            sum(row["acceptance_rate"] for row in rounds) / len(rounds),
+        )
+        artifact = {"warmup": warmup, "rounds": rounds}
+        artifacts = default_store().artifacts_dir(rec.run_id)
+        artifacts.mkdir(parents=True, exist_ok=True)
+        artifact_path = artifacts / "historical_dflash_m16_e2e.json"
+        artifact_path.write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+        rec.artifact("historical_dflash_m16_e2e", artifact_path)
+        run_id = rec.run_id
+    return {"run_id": run_id, "warmup": warmup, "rounds": rounds}
 
 
 def _repeat_tokenized_text(tokenizer: Any, text: str, length: int) -> list[int]:

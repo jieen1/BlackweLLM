@@ -11,6 +11,7 @@ from bfdiag.workloads import (
     HISTORICAL_M1_SUFFIX_TOKENS,
     _first_token_divergence,
     _first_verify_round_divergence,
+    _run_dflash_e2e_sample,
     _tensor_content_hash,
     capture_dynamic_route_tile_trace,
     capture_laguna_route_histograms,
@@ -169,6 +170,47 @@ def test_historical_dflash_prompt_rejects_invalid_length_or_empty_encoding():
         historical_dflash_m16_prompt_ids(EmptyTokenizer(), -1)
     with pytest.raises(ValueError, match="empty"):
         historical_dflash_m16_prompt_ids(EmptyTokenizer())
+
+
+def test_dflash_e2e_sample_resets_slot_and_records_whole_generation_output():
+    class Backend:
+        def __init__(self):
+            self.resets = []
+
+        def reset_slot(self, slot):
+            self.resets.append(slot)
+
+    class Engine:
+        def generate_verify_only(self, **kwargs):
+            assert kwargs == {
+                "prompt_ids": [1, 2, 3],
+                "max_tokens": 4,
+                "enable_prefix_cache": False,
+                "slot": 0,
+            }
+            return [7, 8, 9, 10], {
+                "tok_per_s": 300.0,
+                "acceptance_rate": 0.96,
+                "tokens_per_step": 15.0,
+                "num_steps": 3,
+            }
+
+    syncs = []
+    row = _run_dflash_e2e_sample(
+        Backend(),
+        Engine(),
+        [1, 2, 3],
+        max_tokens=4,
+        synchronize=lambda: syncs.append(True),
+        telemetry=lambda: {"temperature_c": None},
+    )
+
+    assert row["tok_s"] == 300.0
+    assert row["acceptance_rate"] == 0.96
+    assert row["tokens_per_step"] == 15.0
+    assert row["steps"] == 3
+    assert row["output_hash"]
+    assert len(syncs) == 2
 
 
 def test_historical_prefix_cache_prompt_matches_archived_base_suffix_contract():
