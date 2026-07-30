@@ -107,6 +107,32 @@ MAX_TOKENS_LONG = 256
 WARMUP_ROUNDS = 1
 MEASURE_ROUNDS = 3
 
+
+def artifact_provenance(record) -> dict:
+    """Return the paired-source identity for a saved acceptance fixture.
+
+    The numeric fixture is convenient for review, while bfdiag owns the full
+    workload and environment fingerprint.  Keeping the run ID and both source
+    identities here prevents a copied fixture from being compared across
+    unrelated runtime/SparkInfer revisions.
+    """
+    git = record.fingerprint.git
+
+    def repo(name: str) -> dict[str, object]:
+        info = git.get(name)
+        return {
+            "sha": info.sha if info else None,
+            "branch": info.branch if info else None,
+            "dirty": info.dirty if info else None,
+        }
+
+    return {
+        "bfdiag_run_id": record.run_id,
+        "runtime": repo("qwen-sm120-runtime"),
+        "sparkinfer": repo("sparkinfer"),
+    }
+
+
 def run_suite(backend, engine, tokenizer, warmup_rounds=WARMUP_ROUNDS,
               measure_rounds=MEASURE_ROUNDS):
     import torch
@@ -267,6 +293,7 @@ def main():
         "suite_version": SUITE_VERSION,
         "warmup_rounds": WARMUP_ROUNDS,
         "measure_rounds": MEASURE_ROUNDS,
+        "provenance": artifact_provenance(rec.record),
         "summary": summary,
         "results": results,
     }
