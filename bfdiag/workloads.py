@@ -284,7 +284,12 @@ def _tensor_content_hash(tensor: Any) -> str:
     content hash gives graph candidates a compact, exact comparison target
     without writing multi-megabyte tensor dumps for every probe.
     """
-    contiguous = tensor.detach().contiguous().cpu()
+    contiguous = tensor.detach().contiguous()
+    if str(contiguous.dtype) == "torch.bfloat16":
+        import torch
+
+        contiguous = contiguous.view(torch.uint8)
+    contiguous = contiguous.cpu()
     return hashlib.sha256(contiguous.numpy().tobytes()).hexdigest()
 
 

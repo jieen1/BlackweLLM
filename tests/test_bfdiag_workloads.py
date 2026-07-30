@@ -45,6 +45,13 @@ def test_tensor_content_hash_is_value_and_layout_stable():
     assert _tensor_content_hash(non_contiguous) != _tensor_content_hash(contiguous)
 
 
+def test_tensor_content_hash_supports_bfloat16_storage():
+    torch = pytest.importorskip("torch")
+    tensor = torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
+
+    assert _tensor_content_hash(tensor) == _tensor_content_hash(tensor.clone())
+
+
 def test_historical_m1_prompt_is_fixed_and_repeating():
     prompt = historical_m1_prompt_ids(205)
     assert prompt[:4] == [1000, 1001, 1002, 1003]
