@@ -194,25 +194,25 @@ def test_first_token_divergence_reports_value_length_and_exact_cases():
     }
 
 
-def test_first_verify_round_divergence_prioritizes_proposal_before_top1():
+def test_first_verify_round_divergence_ignores_uncommitted_tail_differences():
     identical = {
         "kv_len": 10,
         "bonus_token": 7,
         "draft_tokens": [8, 9],
-        "positions": [{"top1_tok": 8}, {"top1_tok": 9}],
+        "positions": [{"top1_tok": 8}, {"top1_tok": 9}, {"top1_tok": 10}],
     }
-    proposal_changed = {**identical, "draft_tokens": [8, 11]}
+    tail_changed_after_rejection = {
+        **identical,
+        "positions": [{"top1_tok": 7}, {"top1_tok": 12}],
+    }
     target_changed = {
         **identical,
-        "positions": [{"top1_tok": 8}, {"top1_tok": 12}],
+        "positions": [{"top1_tok": 8}, {"top1_tok": 12}, {"top1_tok": 13}],
     }
 
-    assert _first_verify_round_divergence([identical], [proposal_changed]) == {
-        "round": 0,
-        "kind": "draft_tokens",
-        "reference": [8, 9],
-        "candidate": [8, 11],
-    }
+    assert _first_verify_round_divergence(
+        [tail_changed_after_rejection], [tail_changed_after_rejection]
+    ) == {"round": None, "kind": None}
     assert _first_verify_round_divergence([identical], [target_changed]) == {
         "round": 0,
         "kind": "verifier_top1",

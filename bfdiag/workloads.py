@@ -1499,9 +1499,9 @@ def _first_token_divergence(reference: list[int], candidate: list[int]) -> dict[
 def _first_verify_round_divergence(
     reference: list[dict[str, Any]], candidate: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """Return the first proposal or verifier-top1 difference between two runs."""
+    """Return the first decision-relevant proposal or verifier-top1 difference."""
     for index, (expected, actual) in enumerate(zip(reference, candidate)):
-        for field in ("kv_len", "bonus_token", "draft_tokens"):
+        for field in ("kv_len", "bonus_token"):
             if expected[field] != actual[field]:
                 return {
                     "round": index,
@@ -1509,18 +1509,46 @@ def _first_verify_round_divergence(
                     "reference": expected[field],
                     "candidate": actual[field],
                 }
-        expected_top1 = [position["top1_tok"] for position in expected["positions"]]
-        actual_top1 = [position["top1_tok"] for position in actual["positions"]]
-        if expected_top1 != actual_top1:
+        expected_committed, _ = _verify_committed_tokens(expected)
+        actual_committed, _ = _verify_committed_tokens(actual)
+        if expected_committed != actual_committed:
             first_position = next(
-                i for i, pair in enumerate(zip(expected_top1, actual_top1)) if pair[0] != pair[1]
+                (
+                    i
+                    for i, pair in enumerate(zip(expected_committed, actual_committed))
+                    if pair[0] != pair[1]
+                ),
+                min(len(expected_committed), len(actual_committed)),
             )
+            if len(expected_committed) != len(actual_committed) and first_position == min(
+                len(expected_committed), len(actual_committed)
+            ):
+                return {
+                    "round": index,
+                    "kind": "committed_length",
+                    "reference": expected_committed,
+                    "candidate": actual_committed,
+                }
+            prefix_drafts_match = (
+                expected["draft_tokens"][:first_position]
+                == actual["draft_tokens"][:first_position]
+            )
+            expected_top1 = expected["positions"][first_position]["top1_tok"]
+            actual_top1 = actual["positions"][first_position]["top1_tok"]
+            if prefix_drafts_match and expected_top1 != actual_top1:
+                return {
+                    "round": index,
+                    "kind": "verifier_top1",
+                    "position": first_position,
+                    "reference": expected_top1,
+                    "candidate": actual_top1,
+                }
             return {
                 "round": index,
-                "kind": "verifier_top1",
+                "kind": "draft_tokens",
                 "position": first_position,
-                "reference": expected_top1[first_position],
-                "candidate": actual_top1[first_position],
+                "reference": expected_committed[first_position],
+                "candidate": actual_committed[first_position],
             }
     if len(reference) != len(candidate):
         return {
@@ -1530,6 +1558,16 @@ def _first_verify_round_divergence(
             "candidate": len(candidate),
         }
     return {"round": None, "kind": None}
+
+
+def _verify_committed_tokens(round_dump: dict[str, Any]) -> tuple[list[int], int]:
+    """Reconstruct the output tokens that one verify-only round can commit."""
+    draft_tokens = round_dump["draft_tokens"]
+    top1 = [position["top1_tok"] for position in round_dump["positions"]]
+    for index, draft_token in enumerate(draft_tokens):
+        if top1[index] != draft_token:
+            return draft_tokens[:index] + [top1[index]], index
+    return draft_tokens + [top1[len(draft_tokens)]], len(draft_tokens)
 
 
 def diagnose_historical_dflash_partial_prefix_reuse(
