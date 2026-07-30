@@ -10,7 +10,6 @@ from bfdiag.workloads import (
     HISTORICAL_M1_CONTEXT_TOKENS,
     HISTORICAL_M1_SUFFIX_TOKENS,
     capture_dynamic_route_tile_trace,
-    capture_laguna_deterministic_pair_direct_m16_logits,
     capture_laguna_route_histograms,
     check_b1_metadata_fastpath_parity,
     check_dflash_server_step_parity,
@@ -260,12 +259,6 @@ def test_moe_route_summary_counts_every_topk_pair() -> None:
 def test_route_histogram_rejects_non_dynamic_shapes():
     with pytest.raises(ValueError, match="dynamic serving"):
         capture_laguna_route_histograms(object(), object(), shapes=(6,))
-
-
-def test_pair_direct_oracle_capture_is_available():
-    assert callable(capture_laguna_deterministic_pair_direct_m16_logits)
-
-
 def test_dflash_profiler_reports_the_quick_prompt_contract_for_bad_geometry():
     class Backend:
         block_size = 1
