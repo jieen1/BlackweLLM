@@ -1268,6 +1268,9 @@ class DFlashEngine:
             num_steps += 1
             total_draft += NUM_SPECULATIVE_TOKENS
             kv_len = backend.slot_kv_len[slot]
+            _bf_row = (
+                bfdiag_trace.begin_round(slot, kv_len) if bfdiag_trace.TRACE_ENABLED else -1
+            )
 
             # Step 1: Verify (M=16 full model forward) — replaces decode+verify
             verify_tokens = [bonus_token] + draft_tokens
@@ -1279,6 +1282,8 @@ class DFlashEngine:
                 verify_logits, verify_aux = self._forward_verify_with_aux(
                     slot, verify_tokens, kv_len, len(verify_tokens)
                 )
+            if bfdiag_trace.TRACE_ENABLED:
+                bfdiag_trace.mark(_bf_row, bfdiag_events.PHASE_VERIFY)
             if _force_sync:
                 torch.cuda.synchronize()
 
@@ -1369,6 +1374,8 @@ class DFlashEngine:
             backend.slot_kv_len[slot] += context_count
             backend.slot_committed_tokens[slot].extend(new_tokens)
             tokens.extend(new_tokens)
+            if bfdiag_trace.TRACE_ENABLED:
+                bfdiag_trace.mark(_bf_row, bfdiag_events.PHASE_COMMIT)
 
             # Check EOS
             found_eos = False
@@ -1379,6 +1386,15 @@ class DFlashEngine:
                     found_eos = True
                     break
             if found_eos:
+                if bfdiag_trace.TRACE_ENABLED:
+                    bfdiag_trace.finish_dflash_round(
+                        _bf_row,
+                        self._verify_cg is not None,
+                        self._use_cuda_graph,
+                        len(draft_tokens),
+                        decision,
+                        new_bonus,
+                    )
                 break
 
             # Step 6: Draft next 15 tokens
@@ -1390,6 +1406,15 @@ class DFlashEngine:
                 draft_tokens = self._draft_forward(slot, bonus_token, new_kv_len)
             if _force_sync:
                 torch.cuda.synchronize()
+            if bfdiag_trace.TRACE_ENABLED:
+                bfdiag_trace.finish_dflash_round(
+                    _bf_row,
+                    self._verify_cg is not None,
+                    self._use_cuda_graph,
+                    len(draft_tokens),
+                    decision,
+                    new_bonus,
+                )
 
         t_total = time.perf_counter()
         # Prefix cache: preserve slot KV for next turn

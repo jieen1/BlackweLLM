@@ -213,3 +213,58 @@ class TestDisabledPathOverhead:
         assert per_call_ns < 100.0, (
             f"disabled-path overhead {per_call_ns:.1f}ns/round exceeds the 100ns budget"
         )
+
+
+class TestVerifyOnlyTrace:
+    def test_generate_verify_only_emits_one_round_when_trace_enabled(self, monkeypatch):
+        """The historical E2E path must not silently bypass the flight recorder."""
+        import torch
+
+        from runtime.backends.laguna_dflash import DFlashEngine
+
+        class _Backend:
+            def __init__(self):
+                self.slot_kv_len = [0]
+                self.slot_committed_tokens = [[]]
+
+            def find_prefix_match(self, slot, prompt_ids):
+                return 0
+
+            def reset_slot(self, slot):
+                self.slot_kv_len[slot] = 0
+                self.slot_committed_tokens[slot] = []
+
+            def prefill_with_aux(self, slot, prompt_ids):
+                self.slot_kv_len[slot] = len(prompt_ids)
+                self.slot_committed_tokens[slot] = list(prompt_ids)
+                return 9, None
+
+        backend = _Backend()
+        engine = object.__new__(DFlashEngine)
+        engine.backend = backend
+        engine._draft_kv_caches = {}
+        engine._draft_cg = None
+        engine._verify_cg = None
+        engine._use_cuda_graph = False
+        engine._cg_captured = True
+        engine._draft_forward = lambda slot, anchor, kv_len: [10] * 15
+        logits = torch.full((16, 32), -1.0)
+        logits[:, 10] = 1.0
+        engine._forward_verify_with_aux = lambda *args: (logits, None)
+
+        from bfdiag.trace import ring as bfdiag_trace
+
+        monkeypatch.setattr(bfdiag_trace, "TRACE_ENABLED", True)
+        bfdiag_trace.reset(use_cuda=False)
+        tokens, stats = engine.generate_verify_only(
+            [1, 2, 3], max_tokens=2, enable_prefix_cache=False
+        )
+
+        events = bfdiag_trace.get_ring().snapshot()
+        assert tokens == [9, 10]
+        assert stats["num_steps"] == 1
+        assert len(events) == 1
+        assert events[0].kv_len_before == 3
+        assert events[0].draft_tokens_n == 15
+        assert events[0].accepted_n == 15
+        assert events[0].path == "eager"
