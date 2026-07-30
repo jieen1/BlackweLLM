@@ -9,6 +9,7 @@ from bfdiag.workloads import (
     HISTORICAL_DFLASH_PREFIX_SUFFIX_TOKENS,
     HISTORICAL_M1_CONTEXT_TOKENS,
     HISTORICAL_M1_SUFFIX_TOKENS,
+    _first_token_divergence,
     _tensor_content_hash,
     capture_dynamic_route_tile_trace,
     capture_laguna_route_histograms,
@@ -17,6 +18,7 @@ from bfdiag.workloads import (
     check_dflash_server_step_parity,
     check_dflash_verify_cg_parity,
     diagnose_dflash_verify_cg_divergence,
+    diagnose_historical_dflash_partial_prefix_reuse,
     historical_dflash_m16_prompt_ids,
     historical_dflash_prefix_prompt_ids,
     historical_m1_prompt_ids,
@@ -171,6 +173,33 @@ def test_historical_prefix_cache_prompt_matches_archived_base_suffix_contract():
     assert full_ids[:4] == [11, 12, 11, 12]
     assert full_ids[HISTORICAL_DFLASH_PREFIX_BASE_TOKENS:][:6] == [21, 22, 23, 21, 22, 23]
     assert len(full_ids) - len(base_ids) == HISTORICAL_DFLASH_PREFIX_SUFFIX_TOKENS
+
+
+def test_first_token_divergence_reports_value_length_and_exact_cases():
+    assert _first_token_divergence([1, 2, 3], [1, 9, 3]) == {
+        "index": 1,
+        "reference_token": 2,
+        "candidate_token": 9,
+    }
+    assert _first_token_divergence([1, 2], [1]) == {
+        "index": 1,
+        "reference_token": 2,
+        "candidate_token": None,
+    }
+    assert _first_token_divergence([1, 2], [1, 2]) == {
+        "index": None,
+        "reference_token": None,
+        "candidate_token": None,
+    }
+
+
+def test_partial_prefix_diagnostic_rejects_invalid_token_budgets():
+    with pytest.raises(ValueError, match="max_tokens"):
+        diagnose_historical_dflash_partial_prefix_reuse(object(), object(), max_tokens=1)
+    with pytest.raises(ValueError, match="base_generation_tokens"):
+        diagnose_historical_dflash_partial_prefix_reuse(
+            object(), object(), base_generation_tokens=1
+        )
 
 
 def test_dflash_workload_reset_undoes_m1_patch_before_clearing_kv(monkeypatch):

@@ -1476,6 +1476,188 @@ def profile_rms_norm_m16(
     return {"run_id": run_id, "results": results}
 
 
+def _first_token_divergence(reference: list[int], candidate: list[int]) -> dict[str, int | None]:
+    """Return the first exact token difference, including a length-only one."""
+    for index, (expected, actual) in enumerate(zip(reference, candidate)):
+        if expected != actual:
+            return {
+                "index": index,
+                "reference_token": expected,
+                "candidate_token": actual,
+            }
+    if len(reference) != len(candidate):
+        index = min(len(reference), len(candidate))
+        return {
+            "index": index,
+            "reference_token": reference[index] if index < len(reference) else None,
+            "candidate_token": candidate[index] if index < len(candidate) else None,
+        }
+    return {"index": None, "reference_token": None, "candidate_token": None}
+
+
+def diagnose_historical_dflash_partial_prefix_reuse(
+    engine: Any,
+    tokenizer: Any,
+    *,
+    max_tokens: int = HISTORICAL_DFLASH_PREFIX_MAX_TOKENS,
+    base_generation_tokens: int = 5,
+) -> dict[str, Any]:
+    """Compare cold DFlash output with the canonical partial-prefix state path.
+
+    The historical 64K workload first generates from the 55,536-token base,
+    then submits the base plus a 10,000-token suffix.  This diagnostic runs
+    that exact transition next to a reset cold prefill and writes both token
+    streams, state geometry, and trace-round boundaries into a bfdiag record.
+    It deliberately reports divergence instead of raising: a failed oracle is
+    useful evidence and must leave a complete record for ``bf trace show``.
+    """
+    if max_tokens < 2:
+        raise ValueError("max_tokens must be at least two")
+    if base_generation_tokens < 2:
+        raise ValueError("base_generation_tokens must be at least two")
+
+    backend = engine.backend
+    expected = {
+        "block_size": HISTORICAL_DFLASH_PREFIX_BLOCK_SIZE,
+        "blocks_per_slot": HISTORICAL_DFLASH_PREFIX_BLOCKS_PER_SLOT,
+        "max_model_len": HISTORICAL_DFLASH_PREFIX_MAX_MODEL_LEN,
+    }
+    actual = {
+        "block_size": backend.block_size,
+        "blocks_per_slot": backend.blocks_per_slot,
+        "max_model_len": backend.runtime_config.model_config.max_model_len,
+    }
+    for name, value in expected.items():
+        if actual[name] != value:
+            raise ValueError(
+                f"{HISTORICAL_DFLASH_PREFIX_CONTRACT} partial-prefix diagnostic requires "
+                f"{name}={value}, got {actual[name]}"
+            )
+
+    from runtime.backends.dflash_constants import DRAFT_WINDOW
+    from runtime.backends.laguna_dflash import _ring_prefix_reuse_is_safe
+
+    base_ids, full_ids = historical_dflash_prefix_prompt_ids(tokenizer)
+    prompt_hash = _token_ids_hash(full_ids)
+    base_hash = _token_ids_hash(base_ids)
+    try:
+        with run_record(
+            script=__file__,
+            workload={
+                "contract": HISTORICAL_DFLASH_PREFIX_CONTRACT,
+                "prompt_hash": prompt_hash,
+                "base_prompt_hash": base_hash,
+                "prompt_len": len(full_ids),
+                "base_len": len(base_ids),
+                "suffix_len": HISTORICAL_DFLASH_PREFIX_SUFFIX_TOKENS,
+                "max_tokens": max_tokens,
+                "base_generation_tokens": base_generation_tokens,
+                "k": 15,
+                "greedy": True,
+                "block_size": backend.block_size,
+                "blocks_per_slot": backend.blocks_per_slot,
+                "max_model_len": backend.runtime_config.model_config.max_model_len,
+                "capacity": backend.num_slots,
+                "dflash": True,
+                "cuda_graph": True,
+                "prefix_cache": True,
+                "partial_prefix_oracle": True,
+            },
+        ) as rec:
+            reset_dflash_workload_state(engine)
+            cold_tokens, cold_stats = engine.generate_verify_only(
+                full_ids,
+                max_tokens=max_tokens,
+                temperature=0.0,
+                slot=0,
+                enable_prefix_cache=False,
+            )
+
+            reset_dflash_workload_state(engine)
+            base_tokens, base_stats = engine.generate_verify_only(
+                base_ids,
+                max_tokens=base_generation_tokens,
+                temperature=0.0,
+                slot=0,
+                enable_prefix_cache=False,
+            )
+            cached_kv_len = backend.slot_kv_len[0]
+            prefix_len = backend.find_prefix_match(0, full_ids)
+            rewind_tokens = cached_kv_len - prefix_len
+            ring_specs = (
+                (backend._ring_slots_per_slot, backend._swa_window),
+                (engine._draft_blocks_per_slot * engine.block_size, DRAFT_WINDOW),
+            )
+            reuse_is_safe = _ring_prefix_reuse_is_safe(cached_kv_len, prefix_len, ring_specs)
+            if prefix_len <= 0 or prefix_len >= len(full_ids) or not reuse_is_safe:
+                raise AssertionError(
+                    "canonical partial-prefix setup did not retain a safe partial match: "
+                    f"prefix_len={prefix_len}, cached_kv_len={cached_kv_len}, "
+                    f"reuse_is_safe={reuse_is_safe}"
+                )
+            partial_tokens, partial_stats = engine.generate_verify_only(
+                full_ids,
+                max_tokens=max_tokens,
+                temperature=0.0,
+                slot=0,
+                enable_prefix_cache=True,
+            )
+
+            divergence = _first_token_divergence(cold_tokens, partial_tokens)
+            report = {
+                "contract": HISTORICAL_DFLASH_PREFIX_CONTRACT,
+                "cold": {"tokens": cold_tokens, "stats": cold_stats},
+                "base_seed": {"tokens": base_tokens, "stats": base_stats},
+                "partial_reuse": {"tokens": partial_tokens, "stats": partial_stats},
+                "prefix": {
+                    "cached_kv_len": cached_kv_len,
+                    "prefix_len": prefix_len,
+                    "rewind_tokens": rewind_tokens,
+                    "ring_specs": [list(spec) for spec in ring_specs],
+                    "reuse_is_safe": reuse_is_safe,
+                },
+                "divergence": divergence,
+                "parity": divergence["index"] is None,
+                # ``generate_verify_only`` emits one trace row per DFlash round.
+                "trace_round_ranges": {
+                    "cold": [0, int(cold_stats["num_steps"]) - 1],
+                    "base_seed": [
+                        int(cold_stats["num_steps"]),
+                        int(cold_stats["num_steps"] + base_stats["num_steps"]) - 1,
+                    ],
+                    "partial_reuse": [
+                        int(cold_stats["num_steps"] + base_stats["num_steps"]),
+                        int(
+                            cold_stats["num_steps"]
+                            + base_stats["num_steps"]
+                            + partial_stats["num_steps"]
+                        )
+                        - 1,
+                    ],
+                },
+            }
+            artifacts = default_store().artifacts_dir(rec.run_id)
+            artifacts.mkdir(parents=True, exist_ok=True)
+            report_path = artifacts / "partial_prefix_reuse_oracle.json"
+            report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+            rec.artifact("partial_prefix_reuse_oracle", report_path)
+            rec.metric("partial_prefix_len", prefix_len)
+            rec.metric("partial_rewind_tokens", rewind_tokens)
+            rec.metric("partial_reuse_safe", float(reuse_is_safe))
+            rec.metric("partial_parity", float(report["parity"]))
+            rec.metric(
+                "first_token_divergence",
+                float(divergence["index"] if divergence["index"] is not None else -1),
+            )
+            rec.metric("cold_acceptance_rate", cold_stats["acceptance_rate"])
+            rec.metric("partial_acceptance_rate", partial_stats["acceptance_rate"])
+            run_id = rec.run_id
+    finally:
+        reset_dflash_workload_state(engine)
+
+    return {"run_id": run_id, **report}
+
+
 def run_historical_dflash_prefix_cache_m16(
     engine: Any,
     tokenizer: Any,
