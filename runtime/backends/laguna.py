@@ -549,6 +549,7 @@ class LagunaBackend:
         """
         from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
 
+        from runtime.backends.laguna_moe_overlap import active_moe_shared_overlap
         from runtime.backends.laguna_sparkinfer_moe import (
             SparkinferMoELayer,
             SparkinferMoEOutputArena,
@@ -567,6 +568,8 @@ class LagunaBackend:
         renormalize = getattr(hf_config, "norm_topk_prob", True)
         softcap = getattr(hf_config, "moe_router_logit_softcapping", 0.0) or 0.0
         apply_on_input = getattr(hf_config, "moe_apply_router_weight_on_input", False)
+        overlap_layer_text = os.environ.get("QSR_MOE_SHARED_OVERLAP_V2_LAYER")
+        overlap_layer = int(overlap_layer_text) if overlap_layer_text else None
         if top_k != 10 or not renormalize:
             raise RuntimeError(
                 "native Laguna router requires num_experts_per_tok=10 and norm_topk_prob=True"
@@ -638,6 +641,7 @@ class LagunaBackend:
                 _apply_on_input,
                 _native_router,
                 _native_router_arena,
+                _layer_idx,
             ):
                 def _patched_forward(hidden_states: torch.Tensor) -> torch.Tensor:
                     orig_shape = hidden_states.shape
@@ -685,17 +689,32 @@ class LagunaBackend:
                     else:
                         routed_out = _si_layer.forward(hs, topk_ids, topk_weights)
                     if _shared is not None:
+                        overlap = active_moe_shared_overlap()
+                        if overlap_layer is not None and _layer_idx != overlap_layer:
+                            overlap = None
                         if _PROFILE_MOE_PHASES:
                             with torch.profiler.record_function("laguna::moe_shared"):
-                                shared_out = _shared(hs)
+                                shared_out = (
+                                    overlap.launch(_shared, hs)
+                                    if overlap is not None
+                                    else _shared(hs)
+                                )
                         else:
-                            shared_out = _shared(hs)
+                            shared_out = (
+                                overlap.launch(_shared, hs)
+                                if overlap is not None
+                                else _shared(hs)
+                            )
                         if _PROFILE_MOE_PHASES:
                             with torch.profiler.record_function("laguna::moe_finalize"):
+                                if overlap is not None:
+                                    overlap.join(hs.device)
                                 if _scaling != 1.0:
                                     routed_out = routed_out * _scaling
                                 routed_out = routed_out + shared_out
                         else:
+                            if overlap is not None:
+                                overlap.join(hs.device)
                             if _scaling != 1.0:
                                 routed_out = routed_out * _scaling
                             routed_out = routed_out + shared_out
@@ -717,6 +736,7 @@ class LagunaBackend:
                 apply_on_input,
                 native_router,
                 native_router_arena,
+                layer_idx,
             )
             patched += 1
             if patched % 10 == 0:

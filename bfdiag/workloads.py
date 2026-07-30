@@ -276,6 +276,17 @@ def _token_ids_hash(token_ids: list[int]) -> str:
     return hashlib.sha256(b"".join(token.to_bytes(4, "little") for token in token_ids)).hexdigest()
 
 
+def _tensor_content_hash(tensor: Any) -> str:
+    """Hash a CPU materialization without weakening a numeric diagnostic.
+
+    Divergence reports already materialize logits and aux tensors on CPU.  A
+    content hash gives graph candidates a compact, exact comparison target
+    without writing multi-megabyte tensor dumps for every probe.
+    """
+    contiguous = tensor.detach().contiguous().cpu()
+    return hashlib.sha256(contiguous.numpy().tobytes()).hexdigest()
+
+
 def reset_dflash_workload_state(engine: Any) -> None:
     """Reset target/draft KV and undo any preceding M=1 graph patch."""
     from bfdiag.daemon.session import reset_laguna_engine
@@ -553,6 +564,12 @@ def diagnose_dflash_verify_cg_divergence(
         "eager_top1": eager_top1.tolist(),
         "logits_max_abs": float(logits_delta.abs().max()),
         "logits_rmse": float(logits_delta.square().mean().sqrt()),
+        "captured_logits_hash": _tensor_content_hash(captured["logits"]),
+        "eager_logits_hash": _tensor_content_hash(eager["logits"]),
+        "captured_aux_hashes": [
+            _tensor_content_hash(item) for item in captured["aux"] or []
+        ],
+        "eager_aux_hashes": [_tensor_content_hash(item) for item in eager["aux"] or []],
         "aux": aux_report,
     }
     with run_record(

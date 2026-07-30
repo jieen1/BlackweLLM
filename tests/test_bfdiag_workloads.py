@@ -9,6 +9,7 @@ from bfdiag.workloads import (
     HISTORICAL_DFLASH_PREFIX_SUFFIX_TOKENS,
     HISTORICAL_M1_CONTEXT_TOKENS,
     HISTORICAL_M1_SUFFIX_TOKENS,
+    _tensor_content_hash,
     capture_dynamic_route_tile_trace,
     capture_laguna_route_histograms,
     capture_laguna_target_logits_oracle,
@@ -29,6 +30,15 @@ from bfdiag.workloads import (
     summarize_moe_route_ids,
     summarize_sparkinfer_workspace_pools,
 )
+
+
+def test_tensor_content_hash_is_value_and_layout_stable():
+    torch = pytest.importorskip("torch")
+    contiguous = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    non_contiguous = contiguous.t()
+
+    assert _tensor_content_hash(contiguous) == _tensor_content_hash(contiguous.clone())
+    assert _tensor_content_hash(non_contiguous) != _tensor_content_hash(contiguous)
 
 
 def test_historical_m1_prompt_is_fixed_and_repeating():
