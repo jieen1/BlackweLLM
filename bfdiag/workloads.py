@@ -1223,6 +1223,108 @@ def capture_laguna_route_histograms(
     return {"run_id": run_id, "shapes": shapes, "reports": reports}
 
 
+def check_laguna_deterministic_pair_direct_m16_exact(
+    engine: Any,
+    tokenizer: Any,
+) -> dict[str, Any]:
+    """Compare the experimental pair-direct M=16 path against its oracle.
+
+    Both passes start from an identical 64K DFlash bootstrap and run the real
+    next verify-token shape eagerly.  CUDA Graph capture is intentionally out
+    of scope here: this is the kernel-level numerical gate that must pass
+    before graph capture or end-to-end performance is considered.
+    """
+    import os
+
+    import torch
+
+    selector = "SPARKINFER_DYNAMIC_DETERMINISTIC_PAIR_DIRECT"
+    original_selector = os.environ.get(selector)
+    backend = engine.backend
+    prompt_ids = historical_dflash_m16_prompt_ids(tokenizer)
+    prompt_hash = _token_ids_hash(prompt_ids)
+
+    def target_logits(*, pair_direct: bool) -> tuple[Any, list[int], int]:
+        reset_dflash_workload_state(engine)
+        os.environ.pop(selector, None)
+        state = engine.dflash_prefill_bootstrap(0, prompt_ids)
+        verify_tokens = [state["anchor"], *state["draft_tokens"]]
+        if len(verify_tokens) != 16:
+            raise RuntimeError(
+                "pair-direct oracle requires DFlash's captured M=16 verify shape, "
+                f"got M={len(verify_tokens)}"
+            )
+        if pair_direct:
+            os.environ[selector] = "1"
+        logits = backend._forward(
+            [0],
+            verify_tokens,
+            [backend.slot_kv_len[0]],
+            qo_len=len(verify_tokens),
+            is_decode=False,
+            skip_logits=False,
+        )
+        if logits is None:
+            raise RuntimeError("target forward unexpectedly omitted logits")
+        torch.cuda.synchronize()
+        return logits.detach().cpu().clone(), verify_tokens, backend.slot_kv_len[0]
+
+    try:
+        reference, reference_tokens, reference_kv_len = target_logits(pair_direct=False)
+        candidate, candidate_tokens, candidate_kv_len = target_logits(pair_direct=True)
+    finally:
+        if original_selector is None:
+            os.environ.pop(selector, None)
+        else:
+            os.environ[selector] = original_selector
+        reset_dflash_workload_state(engine)
+
+    if reference_tokens != candidate_tokens or reference_kv_len != candidate_kv_len:
+        raise AssertionError("pair-direct passes did not reach the same target state")
+    delta = (reference.float() - candidate.float()).abs()
+    exact = bool(torch.equal(reference, candidate))
+    top1_mismatch_count = int((reference.argmax(dim=-1) != candidate.argmax(dim=-1)).sum().item())
+    report = {
+        "exact": exact,
+        "verify_tokens": reference_tokens,
+        "kv_len": reference_kv_len,
+        "logits_shape": list(reference.shape),
+        "reference_sha256": hashlib.sha256(
+            reference.contiguous().view(torch.uint8).numpy().tobytes()
+        ).hexdigest(),
+        "candidate_sha256": hashlib.sha256(
+            candidate.contiguous().view(torch.uint8).numpy().tobytes()
+        ).hexdigest(),
+        "max_abs": float(delta.max()) if delta.numel() else 0.0,
+        "top1_mismatch_count": top1_mismatch_count,
+    }
+    with run_record(
+        script=__file__,
+        workload={
+            "contract": "laguna-deterministic-pair-direct-m16-exact-64k",
+            "prompt_hash": prompt_hash,
+            "prompt_len": len(prompt_ids),
+            "verify_tokens": 16,
+            "block_size": backend.block_size,
+            "blocks_per_slot": backend.blocks_per_slot,
+            "max_model_len": backend.runtime_config.model_config.max_model_len,
+            "capacity": backend.num_slots,
+            "cuda_graph": False,
+            "pair_direct": True,
+        },
+    ) as rec:
+        artifacts = default_store().artifacts_dir(rec.run_id)
+        artifacts.mkdir(parents=True, exist_ok=True)
+        report_path = artifacts / "pair_direct_m16_exact.json"
+        report_path.write_text(json.dumps(report, indent=2, sort_keys=True))
+        rec.artifact("pair_direct_m16_exact", report_path)
+        rec.metric("exact", exact)
+        rec.metric("max_abs", report["max_abs"])
+        rec.metric("top1_mismatch_count", top1_mismatch_count)
+        run_id = rec.run_id
+    return {"run_id": run_id, **report}
+
+
 def profile_rms_norm_m16(
     *,
     iterations: int = 400,
