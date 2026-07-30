@@ -1042,6 +1042,95 @@ def profile_historical_dflash_m16(
     }
 
 
+def profile_laguna_target_shape_matrix(
+    engine: Any,
+    tokenizer: Any,
+    *,
+    shapes: tuple[int, ...] = (1, 2, 4, 6, 7, 8, 16),
+    replays_per_shape: int = 4,
+) -> dict[str, Any]:
+    """Profile eager target forwards across the serving MoE shape regimes.
+
+    This records the component-level target cost after one fixed 64K DFlash
+    bootstrap. It deliberately does not report throughput: M=16 production
+    verify runs in its captured graph and M<=6 decode has its own graph path.
+    The matrix instead prevents a kernel candidate from being justified by a
+    cost model sampled at the wrong MoE implementation boundary.
+    """
+    if not shapes or any(shape <= 0 for shape in shapes):
+        raise ValueError("shapes must contain positive token counts")
+    if tuple(sorted(set(shapes))) != shapes:
+        raise ValueError("shapes must be unique and sorted")
+    if replays_per_shape <= 0:
+        raise ValueError("replays_per_shape must be positive")
+
+    backend = engine.backend
+    expected = {
+        "block_size": HISTORICAL_DFLASH_PREFIX_BLOCK_SIZE,
+        "blocks_per_slot": HISTORICAL_DFLASH_PREFIX_BLOCKS_PER_SLOT,
+        "max_model_len": HISTORICAL_DFLASH_PREFIX_MAX_MODEL_LEN,
+    }
+    actual = {
+        "block_size": backend.block_size,
+        "blocks_per_slot": backend.blocks_per_slot,
+        "max_model_len": backend.runtime_config.model_config.max_model_len,
+    }
+    for name, value in expected.items():
+        if actual[name] != value:
+            raise ValueError(
+                f"target shape profiler requires {name}={value}, got {actual[name]}"
+            )
+
+    import torch
+
+    prompt_ids = historical_dflash_m16_prompt_ids(tokenizer)
+    prompt_hash = _token_ids_hash(prompt_ids)
+    reset_dflash_workload_state(engine)
+    try:
+        engine.dflash_prefill_bootstrap(0, prompt_ids)
+        kv_len = backend.slot_kv_len[0]
+        torch.cuda.synchronize()
+        with run_record(
+            script=__file__,
+            workload={
+                "contract": "laguna-target-shape-matrix-64k",
+                "profile_only": True,
+                "prompt_hash": prompt_hash,
+                "prompt_len": len(prompt_ids),
+                "shapes": list(shapes),
+                "replays_per_shape": replays_per_shape,
+                "block_size": backend.block_size,
+                "blocks_per_slot": backend.blocks_per_slot,
+                "max_model_len": backend.runtime_config.model_config.max_model_len,
+                "capacity": backend.num_slots,
+                "cuda_graph": False,
+            },
+        ) as rec:
+            activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+            artifacts = default_store().artifacts_dir(rec.run_id)
+            artifacts.mkdir(parents=True, exist_ok=True)
+            for shape in shapes:
+                tokens = list(range(1000, 1000 + shape))
+                with torch.profiler.profile(activities=activities) as profiler:
+                    for _ in range(replays_per_shape):
+                        backend._forward(
+                            [0], tokens, [kv_len], qo_len=shape, is_decode=False, skip_logits=True
+                        )
+                torch.cuda.synchronize()
+                table_path = artifacts / f"cuda_profile_m{shape}.txt"
+                table_path.write_text(
+                    profiler.key_averages().table(
+                        sort_by="self_cuda_time_total", row_limit=120
+                    )
+                )
+                rec.artifact(f"cuda_profile_m{shape}", table_path)
+                rec.metric(f"m{shape}_replays", replays_per_shape)
+            run_id = rec.run_id
+    finally:
+        reset_dflash_workload_state(engine)
+    return {"run_id": run_id, "shapes": shapes, "replays_per_shape": replays_per_shape}
+
+
 def profile_rms_norm_m16(
     *,
     iterations: int = 400,

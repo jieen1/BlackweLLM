@@ -19,6 +19,7 @@ from bfdiag.workloads import (
     historical_m1_prompt_ids,
     profile_historical_dflash_m16,
     profile_historical_m1_decode_cg,
+    profile_laguna_target_shape_matrix,
     profile_rms_norm_m16,
     reset_dflash_workload_state,
     summarize_dynamic_route_tile_trace,
@@ -204,6 +205,15 @@ def test_dflash_profiler_rejects_invalid_round_count():
         profile_historical_dflash_m16(object(), object(), profile_rounds=0)
     with pytest.raises(ValueError, match="non-negative"):
         profile_historical_dflash_m16(object(), object(), warmup_rounds=-1)
+
+
+def test_target_shape_matrix_rejects_invalid_shape_contract():
+    with pytest.raises(ValueError, match="positive token"):
+        profile_laguna_target_shape_matrix(object(), object(), shapes=(0,))
+    with pytest.raises(ValueError, match="unique and sorted"):
+        profile_laguna_target_shape_matrix(object(), object(), shapes=(2, 1))
+    with pytest.raises(ValueError, match="replays_per_shape"):
+        profile_laguna_target_shape_matrix(object(), object(), replays_per_shape=0)
 
 
 def test_dflash_profiler_reports_the_quick_prompt_contract_for_bad_geometry():
