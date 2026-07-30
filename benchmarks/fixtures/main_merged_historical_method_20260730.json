@@ -1,0 +1,119 @@
+{
+  "timestamp": "2026-07-30T23:57:11+0800",
+  "method": "acceptance_regression.py SUITE + generate_verify_only (exact historical)",
+  "code_state": "main merged (all 66 commits)",
+  "report": {
+    "fox-4K": {
+      "warmup": {
+        "sample": 0,
+        "tok_s": 357.2603059709751,
+        "acceptance_rate": 0.9703703703703703,
+        "tokens_per_step": 14.11111111111111,
+        "num_steps": 9
+      },
+      "stable": [
+        {
+          "sample": 1,
+          "tok_s": 361.05669856800324,
+          "acceptance_rate": 0.9703703703703703,
+          "tokens_per_step": 14.11111111111111,
+          "num_steps": 9
+        },
+        {
+          "sample": 2,
+          "tok_s": 362.16116945698286,
+          "acceptance_rate": 0.9703703703703703,
+          "tokens_per_step": 14.11111111111111,
+          "num_steps": 9
+        },
+        {
+          "sample": 3,
+          "tok_s": 359.55951366611424,
+          "acceptance_rate": 0.9703703703703703,
+          "tokens_per_step": 14.11111111111111,
+          "num_steps": 9
+        },
+        {
+          "sample": 4,
+          "tok_s": 359.47679257657836,
+          "acceptance_rate": 0.9703703703703703,
+          "tokens_per_step": 14.11111111111111,
+          "num_steps": 9
+        },
+        {
+          "sample": 5,
+          "tok_s": 355.2462169533572,
+          "acceptance_rate": 0.9703703703703703,
+          "tokens_per_step": 14.11111111111111,
+          "num_steps": 9
+        },
+        {
+          "sample": 6,
+          "tok_s": 357.3267548234313,
+          "acceptance_rate": 0.9703703703703703,
+          "tokens_per_step": 14.11111111111111,
+          "num_steps": 9
+        }
+      ],
+      "median_tok_s": 359.5181531213463,
+      "mean_tok_s": 359.13785767407785,
+      "median_accept": 0.9703703703703703
+    },
+    "fox-64K": {
+      "warmup": {
+        "sample": 0,
+        "tok_s": 304.04306741623884,
+        "acceptance_rate": 0.9607843137254902,
+        "tokens_per_step": 15.0,
+        "num_steps": 17
+      },
+      "stable": [
+        {
+          "sample": 1,
+          "tok_s": 311.6801837205159,
+          "acceptance_rate": 0.9607843137254902,
+          "tokens_per_step": 15.0,
+          "num_steps": 17
+        },
+        {
+          "sample": 2,
+          "tok_s": 308.03432559200525,
+          "acceptance_rate": 0.9607843137254902,
+          "tokens_per_step": 15.0,
+          "num_steps": 17
+        },
+        {
+          "sample": 3,
+          "tok_s": 310.3821719099557,
+          "acceptance_rate": 0.9607843137254902,
+          "tokens_per_step": 15.0,
+          "num_steps": 17
+        },
+        {
+          "sample": 4,
+          "tok_s": 312.7974297303819,
+          "acceptance_rate": 0.9607843137254902,
+          "tokens_per_step": 15.0,
+          "num_steps": 17
+        },
+        {
+          "sample": 5,
+          "tok_s": 309.2542710653776,
+          "acceptance_rate": 0.9607843137254902,
+          "tokens_per_step": 15.0,
+          "num_steps": 17
+        },
+        {
+          "sample": 6,
+          "tok_s": 309.0426591001221,
+          "acceptance_rate": 0.9607843137254902,
+          "tokens_per_step": 15.0,
+          "num_steps": 17
+        }
+      ],
+      "median_tok_s": 309.8182214876666,
+      "mean_tok_s": 310.1985068530597,
+      "median_accept": 0.9607843137254902
+    }
+  }
+}

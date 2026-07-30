@@ -1,0 +1,198 @@
+{
+  "timestamp": "2026-07-30T23:27:04.808794",
+  "source_pair": {
+    "runtime": "2ce5c34",
+    "sparkinfer": "a2a8214"
+  },
+  "venv": "~/.venvs/vllm (torch 2.13.0a0+gitcf30153)",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q",
+  "config": {
+    "blocks_per_slot": 4096,
+    "block_size": 64,
+    "max_model_len": 131072,
+    "gpu_mem_util": 0.88,
+    "num_slots": 1
+  },
+  "results_4k": {
+    "label": "fox-4K",
+    "prompt_len": 4096,
+    "rounds": [
+      {
+        "round": 1,
+        "tok_s": 379.15,
+        "accept": 0.960784,
+        "decode_s": 0.6726,
+        "prefill_s": 0.711,
+        "avg_step_ms": 39.558,
+        "steps": 17
+      },
+      {
+        "round": 2,
+        "tok_s": 384.06,
+        "accept": 0.960784,
+        "decode_s": 0.664,
+        "prefill_s": 0.698,
+        "avg_step_ms": 39.052,
+        "steps": 17
+      },
+      {
+        "round": 3,
+        "tok_s": 383.3,
+        "accept": 0.960784,
+        "decode_s": 0.6653,
+        "prefill_s": 0.682,
+        "avg_step_ms": 39.13,
+        "steps": 17
+      },
+      {
+        "round": 4,
+        "tok_s": 378.78,
+        "accept": 0.960784,
+        "decode_s": 0.6732,
+        "prefill_s": 0.717,
+        "avg_step_ms": 39.596,
+        "steps": 17
+      },
+      {
+        "round": 5,
+        "tok_s": 376.01,
+        "accept": 0.960784,
+        "decode_s": 0.6782,
+        "prefill_s": 0.722,
+        "avg_step_ms": 39.889,
+        "steps": 17
+      },
+      {
+        "round": 6,
+        "tok_s": 386.18,
+        "accept": 0.960784,
+        "decode_s": 0.6603,
+        "prefill_s": 0.71,
+        "avg_step_ms": 38.839,
+        "steps": 17
+      },
+      {
+        "round": 7,
+        "tok_s": 381.48,
+        "accept": 0.960784,
+        "decode_s": 0.6685,
+        "prefill_s": 0.713,
+        "avg_step_ms": 39.317,
+        "steps": 17
+      },
+      {
+        "round": 8,
+        "tok_s": 378.22,
+        "accept": 0.960784,
+        "decode_s": 0.6742,
+        "prefill_s": 0.732,
+        "avg_step_ms": 39.655,
+        "steps": 17
+      }
+    ],
+    "all_tok_s": [
+      379.15,
+      384.06,
+      383.3,
+      378.78,
+      376.01,
+      386.18,
+      381.48,
+      378.22
+    ],
+    "median_tok_s": 381.48,
+    "warm_median_tok_s": 381.48,
+    "accept": 0.960784
+  },
+  "results_64k": {
+    "label": "fox-64K",
+    "prompt_len": 65536,
+    "rounds": [
+      {
+        "round": 1,
+        "tok_s": 306.63,
+        "accept": 0.960784,
+        "decode_s": 0.8316,
+        "prefill_s": 12.135,
+        "avg_step_ms": 48.915,
+        "steps": 17
+      },
+      {
+        "round": 2,
+        "tok_s": 305.68,
+        "accept": 0.960784,
+        "decode_s": 0.8342,
+        "prefill_s": 12.165,
+        "avg_step_ms": 49.067,
+        "steps": 17
+      },
+      {
+        "round": 3,
+        "tok_s": 307.33,
+        "accept": 0.960784,
+        "decode_s": 0.8297,
+        "prefill_s": 12.182,
+        "avg_step_ms": 48.803,
+        "steps": 17
+      },
+      {
+        "round": 4,
+        "tok_s": 308.97,
+        "accept": 0.960784,
+        "decode_s": 0.8253,
+        "prefill_s": 12.167,
+        "avg_step_ms": 48.545,
+        "steps": 17
+      },
+      {
+        "round": 5,
+        "tok_s": 306.49,
+        "accept": 0.960784,
+        "decode_s": 0.832,
+        "prefill_s": 12.193,
+        "avg_step_ms": 48.938,
+        "steps": 17
+      },
+      {
+        "round": 6,
+        "tok_s": 311.29,
+        "accept": 0.960784,
+        "decode_s": 0.8192,
+        "prefill_s": 12.235,
+        "avg_step_ms": 48.183,
+        "steps": 17
+      },
+      {
+        "round": 7,
+        "tok_s": 309.35,
+        "accept": 0.960784,
+        "decode_s": 0.8243,
+        "prefill_s": 12.254,
+        "avg_step_ms": 48.485,
+        "steps": 17
+      },
+      {
+        "round": 8,
+        "tok_s": 308.42,
+        "accept": 0.960784,
+        "decode_s": 0.8268,
+        "prefill_s": 12.248,
+        "avg_step_ms": 48.631,
+        "steps": 17
+      }
+    ],
+    "all_tok_s": [
+      306.63,
+      305.68,
+      307.33,
+      308.97,
+      306.49,
+      311.29,
+      309.35,
+      308.42
+    ],
+    "median_tok_s": 308.42,
+    "warm_median_tok_s": 308.42,
+    "accept": 0.960784
+  }
+}
