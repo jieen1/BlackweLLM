@@ -52,11 +52,6 @@ SWA_QO_MAX = 16
 _PROFILE_MOE_PHASES = os.environ.get("QSR_PROFILE_MOE_PHASES") == "1"
 
 
-def _bf16_router_enabled() -> bool:
-    """Return the cold-start gate for the exact BF16 router ABI experiment."""
-    return os.environ.get("QSR_LAGUNA_ROUTER_BF16") == "1"
-
-
 class _LayerForwardHooks:
     """Temporarily run named callbacks around selected decoder layers.
 
@@ -587,7 +582,6 @@ class LagunaBackend:
         self._moe_sparkinfer_output_arena = output_arena
         native_router = self._laguna_router_library
         native_router_arena = self._laguna_router_arena
-        use_bf16_router = _bf16_router_enabled()
         assert native_router is not None
         assert native_router_arena is not None
         ckpt = _find_checkpoint()
@@ -644,7 +638,6 @@ class LagunaBackend:
                 _apply_on_input,
                 _native_router,
                 _native_router_arena,
-                _use_bf16_router,
             ):
                 def _patched_forward(hidden_states: torch.Tensor) -> torch.Tensor:
                     orig_shape = hidden_states.shape
@@ -659,8 +652,6 @@ class LagunaBackend:
                                 router_logits = (
                                     torch.tanh(router_logits.float() / _softcap) * _softcap
                                 )
-                            elif not _use_bf16_router:
-                                router_logits = router_logits.float()
                             topk_weights, topk_ids = _native_router.launch(
                                 router_logits,
                                 _e_bias,
@@ -671,8 +662,6 @@ class LagunaBackend:
                         router_logits = moe_mod.gate(hs)
                         if _softcap > 0:
                             router_logits = torch.tanh(router_logits.float() / _softcap) * _softcap
-                        elif not _use_bf16_router:
-                            router_logits = router_logits.float()
                         topk_weights, topk_ids = _native_router.launch(
                             router_logits,
                             _e_bias,
@@ -728,7 +717,6 @@ class LagunaBackend:
                 apply_on_input,
                 native_router,
                 native_router_arena,
-                use_bf16_router,
             )
             patched += 1
             if patched % 10 == 0:

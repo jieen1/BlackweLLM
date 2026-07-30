@@ -5,7 +5,6 @@ import json
 
 import pytest
 
-from runtime.backends.laguna import _bf16_router_enabled
 from runtime.laguna_router import (
     ABI_VERSION,
     TARGET_SM,
@@ -121,11 +120,3 @@ def test_sm120_guard_rejects_cpu_only_torch(monkeypatch) -> None:
     monkeypatch.setitem(__import__("sys").modules, "torch", FakeTorch())
     with pytest.raises(LagunaRouterError, match="available SM120"):
         _require_sm120_cuda()
-
-
-def test_bf16_router_gate_is_opt_in(monkeypatch) -> None:
-    monkeypatch.delenv("QSR_LAGUNA_ROUTER_BF16", raising=False)
-    assert _bf16_router_enabled() is False
-
-    monkeypatch.setenv("QSR_LAGUNA_ROUTER_BF16", "1")
-    assert _bf16_router_enabled() is True
