@@ -251,6 +251,25 @@ def test_target_shape_matrix_rejects_invalid_shape_contract():
         profile_laguna_target_shape_matrix(object(), object(), replays_per_shape=0)
 
 
+def test_target_shape_matrix_rejects_insufficient_live_capacity():
+    class ModelConfig:
+        max_model_len = HISTORICAL_DFLASH_M16_CONTEXT_TOKENS + 16
+
+    class RuntimeConfig:
+        model_config = ModelConfig()
+
+    class Backend:
+        block_size = 64
+        blocks_per_slot = 1_024
+        runtime_config = RuntimeConfig()
+
+    class Engine:
+        backend = Backend()
+
+    with pytest.raises(ValueError, match="at least 1025 blocks_per_slot"):
+        profile_laguna_target_shape_matrix(Engine(), object(), shapes=(16,))
+
+
 def test_moe_route_summary_counts_every_topk_pair() -> None:
     report = summarize_moe_route_ids([[[1, 2], [2, 2]]])
 

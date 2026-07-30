@@ -1088,21 +1088,26 @@ def profile_laguna_target_shape_matrix(
         raise ValueError("replays_per_shape must be positive")
 
     backend = engine.backend
-    expected = {
-        "block_size": HISTORICAL_DFLASH_PREFIX_BLOCK_SIZE,
-        "blocks_per_slot": HISTORICAL_DFLASH_PREFIX_BLOCKS_PER_SLOT,
-        "max_model_len": HISTORICAL_DFLASH_PREFIX_MAX_MODEL_LEN,
-    }
-    actual = {
-        "block_size": backend.block_size,
-        "blocks_per_slot": backend.blocks_per_slot,
-        "max_model_len": backend.runtime_config.model_config.max_model_len,
-    }
-    for name, value in expected.items():
-        if actual[name] != value:
-            raise ValueError(
-                f"target shape profiler requires {name}={value}, got {actual[name]}"
-            )
+    required_tokens = HISTORICAL_DFLASH_M16_CONTEXT_TOKENS + max(shapes)
+    required_blocks = (
+        required_tokens + backend.block_size - 1
+    ) // backend.block_size
+    if backend.block_size != HISTORICAL_DFLASH_PREFIX_BLOCK_SIZE:
+        raise ValueError(
+            "target shape profiler requires "
+            f"block_size={HISTORICAL_DFLASH_PREFIX_BLOCK_SIZE}, got {backend.block_size}"
+        )
+    if backend.blocks_per_slot < required_blocks:
+        raise ValueError(
+            "target shape profiler requires at least "
+            f"{required_blocks} blocks_per_slot for {required_tokens} tokens, "
+            f"got {backend.blocks_per_slot}"
+        )
+    if backend.runtime_config.model_config.max_model_len < required_tokens:
+        raise ValueError(
+            "target shape profiler requires max_model_len at least "
+            f"{required_tokens}, got {backend.runtime_config.model_config.max_model_len}"
+        )
 
     import torch
 
