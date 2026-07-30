@@ -287,6 +287,12 @@ def reset_dflash_workload_state(engine: Any) -> None:
     reset_laguna_engine(engine)
 
 
+def restore_dflash_daemon_state(engine: Any) -> None:
+    """Restore clean KV state and the normal decode-CUDA-graph bindings."""
+    reset_dflash_workload_state(engine)
+    engine.backend._repatch_impls_for_cg()
+
+
 def check_dflash_server_step_parity(
     engine: Any,
     tokenizer: Any,
@@ -1277,7 +1283,7 @@ def capture_laguna_deterministic_pair_direct_m16_logits(
             os.environ.pop(selector, None)
         else:
             os.environ[selector] = original_selector
-        reset_dflash_workload_state(engine)
+        restore_dflash_daemon_state(engine)
 
     report = {
         "pair_direct": pair_direct,

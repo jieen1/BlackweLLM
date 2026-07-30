@@ -24,6 +24,7 @@ from bfdiag.workloads import (
     profile_laguna_target_shape_matrix,
     profile_rms_norm_m16,
     reset_dflash_workload_state,
+    restore_dflash_daemon_state,
     summarize_dynamic_route_tile_trace,
     summarize_moe_route_ids,
     summarize_sparkinfer_workspace_pools,
@@ -178,6 +179,27 @@ def test_dflash_workload_reset_undoes_m1_patch_before_clearing_kv(monkeypatch):
     )
     reset_dflash_workload_state(Engine())
     assert calls == ["unpatch", "reset_kv"]
+
+
+def test_dflash_daemon_restore_repatches_after_reset(monkeypatch):
+    calls = []
+
+    class Backend:
+        def _unpatch_impls_for_prefill(self):
+            calls.append("unpatch")
+
+        def _repatch_impls_for_cg(self):
+            calls.append("repatch")
+
+    class Engine:
+        backend = Backend()
+
+    monkeypatch.setattr(
+        "bfdiag.daemon.session.reset_laguna_engine",
+        lambda engine: calls.append("reset_kv"),
+    )
+    restore_dflash_daemon_state(Engine())
+    assert calls == ["unpatch", "reset_kv", "repatch"]
 
 
 def test_dflash_server_step_parity_rejects_a_single_token_budget():
