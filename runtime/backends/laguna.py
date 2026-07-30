@@ -685,6 +685,11 @@ class LagunaBackend:
                         capture_routing(
                             router_logits.float(), topk_ids, topk_weights
                         )  # bfprobe P-TOPK
+                    else:
+                        # Keep the disabled probe's one-condition no-op and
+                        # dynamic diagnostic monkey-patches without allocating
+                        # a production FP32 routing tensor.
+                        capture_routing(router_logits, topk_ids, topk_weights)  # bfprobe P-TOPK
                     if _PROFILE_MOE_PHASES:
                         with torch.profiler.record_function("laguna::moe_routed"):
                             routed_out = _si_layer.forward(hs, topk_ids, topk_weights)
