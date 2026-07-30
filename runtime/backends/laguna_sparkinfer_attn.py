@@ -25,7 +25,10 @@ import os
 # already FP8; this avoids dequantizing to BF16 before the QK/PV matmuls,
 # halving memory traffic for KV reads.  Measured +6.2% at 64K context
 # (310 → 330 tok/s) with acceptance rate improving from 0.96 to 1.0.
-os.environ.setdefault("SPARKINFER_TURBO_ATTN", "1")
+# SPARKINFER_TURBO_ATTN: Native FP8 attention MMA. +6% at 64K but
+# causes acceptance regression on code/qa workloads (code-4K: 0.978→0.586).
+# Opt-in only: set SPARKINFER_TURBO_ATTN=1 for fox-64K-dominated workloads.
+os.environ.setdefault("SPARKINFER_TURBO_ATTN", "0")
 
 import logging
 import sys
