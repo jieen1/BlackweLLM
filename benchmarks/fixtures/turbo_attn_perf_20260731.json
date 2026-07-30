@@ -1,0 +1,23 @@
+{
+  "timestamp": "2026-07-31T01:00:00+0800",
+  "config": "SPARKINFER_TURBO_ATTN=1 (native FP8 attention MMA)",
+  "baseline_comparison": {
+    "64k_baseline_tok_s": 310.19,
+    "64k_turbo_tok_s": 329.53,
+    "64k_improvement": "+6.2%",
+    "4k_baseline_tok_s": 360.70,
+    "4k_turbo_tok_s": 350.38,
+    "4k_change": "-2.9%",
+    "64k_baseline_accept": 0.960784,
+    "64k_turbo_accept": 1.000000,
+    "4k_baseline_accept": 0.970370,
+    "4k_turbo_accept": 0.962963
+  },
+  "fox_64k_10rounds": {
+    "median_tok_s": 329.53,
+    "all_tok_s": [330.5, 331.0, 321.5, 328.4, 324.9, 330.4, 323.9, 330.7, 328.5, 329.5],
+    "accept": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  },
+  "gpu_memory_mib": 85855,
+  "notes": "FP8 MMA avoids dequantizing KV cache to BF16 before QK/PV matmuls. 64K acceptance improves from 0.96 to 1.0. 4K acceptance slightly decreases (0.970→0.963)."
+}
