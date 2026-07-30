@@ -16,6 +16,64 @@ from typing import Any
 from bfdiag.record import run_record
 from bfdiag.record.store import default_store
 
+
+def summarize_sparkinfer_workspace_pools(
+    pools: list[Any],
+    *,
+    view_mapper: Any,
+) -> dict[str, Any]:
+    """Make a JSON-safe, view-level report for shared SparkInfer core arenas."""
+    unique_pools = {id(pool): pool for pool in pools}
+    arenas: list[dict[str, Any]] = []
+    for pool in unique_pools.values():
+        for key, arena in pool.core_arenas.items():
+            plan = arena.plan
+            views = [dict(view) for view in view_mapper(plan)]
+            arena_nbytes = int(
+                arena.shared_arena.numel() * arena.shared_arena.element_size()
+            )
+            arenas.append(
+                {
+                    "workspace_key": repr(key),
+                    "arena_nbytes": arena_nbytes,
+                    "implementation": plan.implementation,
+                    "deterministic_output": bool(plan.deterministic_output),
+                    "routed_rows": int(plan.routed_rows),
+                    "num_topk": int(plan.num_topk),
+                    "views": views,
+                }
+            )
+    return {"pool_count": len(unique_pools), "core_arenas": arenas}
+
+
+def audit_sparkinfer_workspace(backend: Any) -> dict[str, Any]:
+    """Persist the live SparkInfer core-arena view map for one warm backend."""
+    from sparkinfer.moe.fused_moe._impl import _core_workspace_view_map
+
+    layers = getattr(backend, "_moe_sparkinfer_layers", ())
+    if not layers:
+        raise RuntimeError("Laguna backend has no patched SparkInfer MoE layers")
+    report = summarize_sparkinfer_workspace_pools(
+        [layer.workspace for layer in layers], view_mapper=_core_workspace_view_map
+    )
+    with run_record(
+        script=__file__,
+        workload={"kind": "sparkinfer-workspace-audit"},
+        extra={"workload_extra": {"deterministic_moe": True}},
+    ) as rec:
+        artifacts = default_store().artifacts_dir(rec.run_id)
+        artifacts.mkdir(parents=True, exist_ok=True)
+        path = artifacts / "workspace_views.json"
+        path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        rec.artifact("workspace_views", path)
+        rec.metric("workspace_pool_count", report["pool_count"])
+        rec.metric("core_arena_count", len(report["core_arenas"]))
+        rec.metric(
+            "core_arena_bytes", sum(arena["arena_nbytes"] for arena in report["core_arenas"])
+        )
+        run_id = rec.run_id
+    return {"run_id": run_id, **report}
+
 HISTORICAL_M1_CONTEXT_TOKENS = 65_536
 HISTORICAL_M1_SUFFIX_TOKENS = 10_240
 HISTORICAL_M1_NEW_TOKENS = 128

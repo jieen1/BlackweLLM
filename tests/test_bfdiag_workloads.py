@@ -20,6 +20,7 @@ from bfdiag.workloads import (
     profile_historical_m1_decode_cg,
     profile_rms_norm_m16,
     reset_dflash_workload_state,
+    summarize_sparkinfer_workspace_pools,
 )
 
 
@@ -30,6 +31,57 @@ def test_historical_m1_prompt_is_fixed_and_repeating():
     assert (
         len(historical_m1_prompt_ids(HISTORICAL_M1_CONTEXT_TOKENS)) == HISTORICAL_M1_CONTEXT_TOKENS
     )
+
+
+def test_workspace_audit_attributes_a_shared_arena_by_view() -> None:
+    class Tensor:
+        def numel(self):
+            return 100
+
+        def element_size(self):
+            return 2
+
+    class Plan:
+        implementation = "dynamic"
+        deterministic_output = True
+        routed_rows = 20
+        num_topk = 10
+
+    class Arena:
+        plan = Plan()
+        shared_arena = Tensor()
+
+    class Pool:
+        core_arenas = {"key": Arena()}
+
+    report = summarize_sparkinfer_workspace_pools(
+        [Pool(), Pool()],
+        view_mapper=lambda _plan: ({"name": "route_output", "nbytes": 120},),
+    )
+
+    assert report == {
+        "pool_count": 2,
+        "core_arenas": [
+            {
+                "workspace_key": "'key'",
+                "arena_nbytes": 200,
+                "implementation": "dynamic",
+                "deterministic_output": True,
+                "routed_rows": 20,
+                "num_topk": 10,
+                "views": [{"name": "route_output", "nbytes": 120}],
+            },
+            {
+                "workspace_key": "'key'",
+                "arena_nbytes": 200,
+                "implementation": "dynamic",
+                "deterministic_output": True,
+                "routed_rows": 20,
+                "num_topk": 10,
+                "views": [{"name": "route_output", "nbytes": 120}],
+            },
+        ],
+    }
     assert len(historical_m1_prompt_ids(HISTORICAL_M1_SUFFIX_TOKENS)) == HISTORICAL_M1_SUFFIX_TOKENS
 
 
