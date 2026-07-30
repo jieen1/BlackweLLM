@@ -256,8 +256,12 @@ class TestVerifyOnlyTrace:
 
         monkeypatch.setattr(bfdiag_trace, "TRACE_ENABLED", True)
         bfdiag_trace.reset(use_cuda=False)
+        observed_prefill = []
         tokens, stats = engine.generate_verify_only(
-            [1, 2, 3], max_tokens=2, enable_prefix_cache=False
+            [1, 2, 3],
+            max_tokens=2,
+            enable_prefix_cache=False,
+            prefill_observer=lambda *args: observed_prefill.append(args),
         )
 
         events = bfdiag_trace.get_ring().snapshot()
@@ -268,3 +272,4 @@ class TestVerifyOnlyTrace:
         assert events[0].draft_tokens_n == 15
         assert events[0].accepted_n == 15
         assert events[0].path == "eager"
+        assert observed_prefill == [(0, 0, 9, None)]

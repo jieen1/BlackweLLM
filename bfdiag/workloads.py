@@ -288,6 +288,104 @@ def _tensor_content_hash(tensor: Any) -> str:
     return hashlib.sha256(contiguous.numpy().tobytes()).hexdigest()
 
 
+def capture_laguna_target_prefill_state(
+    backend: Any,
+    slot: int,
+    prefix_len: int,
+    first_token: int,
+    aux_hidden_states: list[Any] | None,
+) -> dict[str, Any]:
+    """Exact, opt-in host hashes of one target slot immediately after prefill.
+
+    The caller owns the diagnostic-only synchronization/copies.  Production
+    generation never calls this helper, so its hashes cannot perturb target or
+    draft execution order.
+    """
+    from runtime.block_pool import _physical_slot
+
+    physical_slot = _physical_slot(slot)
+    block_size = backend.block_size
+    kv_len = int(backend.slot_kv_len[slot])
+    full_blocks = (kv_len + block_size - 1) // block_size
+    full_start = physical_slot * backend.blocks_per_slot
+    ring_start = physical_slot * backend._ring_blocks_per_slot
+    full_names = set(backend._full_layer_names)
+    layer_hashes = []
+    for name in backend.kv_caches:
+        cache = backend.kv_caches[name]
+        if name in full_names:
+            view = cache[:, full_start : full_start + full_blocks]
+            kind = "full"
+        else:
+            view = cache[:, ring_start : ring_start + backend._ring_blocks_per_slot]
+            kind = "swa"
+        layer_hashes.append(
+            {
+                "name": name,
+                "kind": kind,
+                "shape": list(view.shape),
+                "sha256": _tensor_content_hash(view),
+            }
+        )
+    aux = []
+    for index, tensor in enumerate(aux_hidden_states or []):
+        aux.append(
+            {
+                "index": index,
+                "shape": list(tensor.shape),
+                "sha256": _tensor_content_hash(tensor),
+            }
+        )
+    return {
+        "slot": slot,
+        "physical_slot": physical_slot,
+        "kv_len": kv_len,
+        "prefix_len": prefix_len,
+        "first_token": first_token,
+        "layer_hashes": layer_hashes,
+        "aux_hashes": aux,
+    }
+
+
+def compare_laguna_target_prefill_states(
+    reference: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, Any]:
+    """Summarize exact target-state differences from two captured prefill boundaries."""
+    scalar_fields = ("kv_len", "first_token")
+    scalar_differences = {
+        name: {"reference": reference[name], "candidate": candidate[name]}
+        for name in scalar_fields
+        if reference[name] != candidate[name]
+    }
+    layer_differences = [
+        {
+            "name": expected["name"],
+            "kind": expected["kind"],
+            "reference": expected["sha256"],
+            "candidate": actual["sha256"],
+        }
+        for expected, actual in zip(reference["layer_hashes"], candidate["layer_hashes"])
+        if expected != actual
+    ]
+    aux_differences = [
+        {
+            "index": expected["index"],
+            "reference": expected["sha256"],
+            "candidate": actual["sha256"],
+        }
+        for expected, actual in zip(reference["aux_hashes"], candidate["aux_hashes"])
+        if expected != actual
+    ]
+    return {
+        "scalar_differences": scalar_differences,
+        "layer_difference_count": len(layer_differences),
+        "first_layer_difference": layer_differences[0] if layer_differences else None,
+        "aux_difference_count": len(aux_differences),
+        "first_aux_difference": aux_differences[0] if aux_differences else None,
+        "exact": not scalar_differences and not layer_differences and not aux_differences,
+    }
+
+
 def reset_dflash_workload_state(engine: Any) -> None:
     """Reset target/draft KV and undo any preceding M=1 graph patch."""
     from bfdiag.daemon.session import reset_laguna_engine
@@ -1577,6 +1675,7 @@ def diagnose_historical_dflash_partial_prefix_reuse(
     max_tokens: int = HISTORICAL_DFLASH_PREFIX_MAX_TOKENS,
     base_generation_tokens: int = 5,
     capture_verify_top2: bool = False,
+    capture_target_prefill_state: bool = False,
 ) -> dict[str, Any]:
     """Compare cold DFlash output with the canonical partial-prefix state path.
 
@@ -1587,6 +1686,8 @@ def diagnose_historical_dflash_partial_prefix_reuse(
     ``capture_verify_top2`` additionally records the existing diagnostic
     verifier dump, separating a changed draft proposal from a changed target
     top-1 without altering the normal performance workload.
+    ``capture_target_prefill_state`` hashes target KV and aux state just after
+    prefill and before DFlash bootstrap; it is diagnostic-only host I/O.
     It deliberately reports divergence instead of raising: a failed oracle is
     useful evidence and must leave a complete record for ``bf trace show``.
     """
@@ -1642,6 +1743,7 @@ def diagnose_historical_dflash_partial_prefix_reuse(
                 "prefix_cache": True,
                 "partial_prefix_oracle": True,
                 "capture_verify_top2": capture_verify_top2,
+                "capture_target_prefill_state": capture_target_prefill_state,
             },
         ) as rec:
             artifacts = default_store().artifacts_dir(rec.run_id)
@@ -1654,6 +1756,25 @@ def diagnose_historical_dflash_partial_prefix_reuse(
                 )
             if capture_verify_top2:
                 os.environ["QSR_DEBUG_VERIFY_LOGITS_FILE"] = str(verify_dump_path)
+            prefill_states: dict[str, dict[str, Any]] = {}
+
+            def observe_prefill(label: str):
+                def observer(
+                    observed_slot: int,
+                    observed_prefix_len: int,
+                    observed_first_token: int,
+                    observed_aux: list[Any] | None,
+                ) -> None:
+                    prefill_states[label] = capture_laguna_target_prefill_state(
+                        backend,
+                        observed_slot,
+                        observed_prefix_len,
+                        observed_first_token,
+                        observed_aux,
+                    )
+
+                return observer
+
             try:
                 reset_dflash_workload_state(engine)
                 cold_tokens, cold_stats = engine.generate_verify_only(
@@ -1662,6 +1783,9 @@ def diagnose_historical_dflash_partial_prefix_reuse(
                     temperature=0.0,
                     slot=0,
                     enable_prefix_cache=False,
+                    prefill_observer=(
+                        observe_prefill("cold") if capture_target_prefill_state else None
+                    ),
                 )
 
                 reset_dflash_workload_state(engine)
@@ -1692,6 +1816,9 @@ def diagnose_historical_dflash_partial_prefix_reuse(
                     temperature=0.0,
                     slot=0,
                     enable_prefix_cache=True,
+                    prefill_observer=(
+                        observe_prefill("partial_reuse") if capture_target_prefill_state else None
+                    ),
                 )
             finally:
                 if capture_verify_top2:
@@ -1718,6 +1845,15 @@ def diagnose_historical_dflash_partial_prefix_reuse(
                     verify_rounds[:cold_count],
                     verify_rounds[cold_count + base_count :],
                 )
+            target_prefill_comparison = None
+            if capture_target_prefill_state:
+                if set(prefill_states) != {"cold", "partial_reuse"}:
+                    raise AssertionError(
+                        f"missing target prefill captures: {sorted(prefill_states)}"
+                    )
+                target_prefill_comparison = compare_laguna_target_prefill_states(
+                    prefill_states["cold"], prefill_states["partial_reuse"]
+                )
             report = {
                 "contract": HISTORICAL_DFLASH_PREFIX_CONTRACT,
                 "cold": {"tokens": cold_tokens, "stats": cold_stats},
@@ -1732,6 +1868,7 @@ def diagnose_historical_dflash_partial_prefix_reuse(
                 },
                 "divergence": divergence,
                 "verify_round_divergence": verify_divergence,
+                "target_prefill_comparison": target_prefill_comparison,
                 "parity": divergence["index"] is None,
                 # ``generate_verify_only`` emits one trace row per DFlash round.
                 "trace_round_ranges": {
@@ -1756,6 +1893,12 @@ def diagnose_historical_dflash_partial_prefix_reuse(
             rec.artifact("partial_prefix_reuse_oracle", report_path)
             if capture_verify_top2:
                 rec.artifact("partial_prefix_verify_top2", verify_dump_path)
+            if capture_target_prefill_state:
+                target_state_path = artifacts / "partial_prefix_target_prefill_state.json"
+                target_state_path.write_text(
+                    json.dumps(prefill_states, indent=2, sort_keys=True) + "\n"
+                )
+                rec.artifact("partial_prefix_target_prefill_state", target_state_path)
             rec.metric("partial_prefix_len", prefix_len)
             rec.metric("partial_rewind_tokens", rewind_tokens)
             rec.metric("partial_reuse_safe", float(reuse_is_safe))

@@ -18,6 +18,7 @@ from bfdiag.workloads import (
     check_b1_metadata_fastpath_parity,
     check_dflash_server_step_parity,
     check_dflash_verify_cg_parity,
+    compare_laguna_target_prefill_states,
     diagnose_dflash_verify_cg_divergence,
     diagnose_historical_dflash_partial_prefix_reuse,
     historical_dflash_m16_prompt_ids,
@@ -224,6 +225,38 @@ def test_first_verify_round_divergence_ignores_uncommitted_tail_differences():
         "round": None,
         "kind": None,
     }
+
+
+def test_compare_target_prefill_states_reports_first_changed_layer_and_aux():
+    cold = {
+        "kv_len": 8,
+        "first_token": 9,
+        "layer_hashes": [
+            {"name": "layers.0", "kind": "full", "shape": [2], "sha256": "a"},
+            {"name": "layers.1", "kind": "swa", "shape": [2], "sha256": "b"},
+        ],
+        "aux_hashes": [{"index": 0, "shape": [1], "sha256": "c"}],
+    }
+    partial = {
+        **cold,
+        "layer_hashes": [
+            cold["layer_hashes"][0],
+            {"name": "layers.1", "kind": "swa", "shape": [2], "sha256": "changed"},
+        ],
+        "aux_hashes": [{"index": 0, "shape": [1], "sha256": "changed-aux"}],
+    }
+
+    result = compare_laguna_target_prefill_states(cold, partial)
+
+    assert result["exact"] is False
+    assert result["layer_difference_count"] == 1
+    assert result["first_layer_difference"] == {
+        "name": "layers.1",
+        "kind": "swa",
+        "reference": "b",
+        "candidate": "changed",
+    }
+    assert result["aux_difference_count"] == 1
 
 
 def test_partial_prefix_diagnostic_rejects_invalid_token_budgets():

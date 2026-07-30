@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -1145,6 +1146,7 @@ class DFlashEngine:
         eos_tokens: tuple[int, ...] = (2, 24),
         slot: int = 0,
         enable_prefix_cache: bool = True,
+        prefill_observer: Callable[[int, int, int, list[torch.Tensor] | None], None] | None = None,
     ) -> tuple[list[int], dict[str, float]]:
         """Generate using verify-only speculative decoding (no redundant decode).
 
@@ -1214,6 +1216,9 @@ class DFlashEngine:
         else:
             # Full prefill
             first_token, aux_hidden_states = backend.prefill_with_aux(slot, prompt_ids)
+
+        if prefill_observer is not None:
+            prefill_observer(slot, prefix_len, first_token, aux_hidden_states)
 
         # Bulk precompute draft context KV from prefill aux
         if aux_hidden_states is not None:
