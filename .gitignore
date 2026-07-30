@@ -70,3 +70,6 @@ benchmarks/fixtures/vllm_profile/
 
 # bfdiag run-record store (local, reproducible from re-running scripts)
 .bfdiag/
+
+# Date-stamped acceptance snapshots point to the authoritative bfdiag record.
+benchmarks/fixtures/acceptance_regression_*.json
