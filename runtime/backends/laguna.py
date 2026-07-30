@@ -48,6 +48,7 @@ RESERVED_PHYSICAL_SLOTS = 0
 # Formula: cdiv(window - 1 + qo_max, block_size) + 1
 # qo_max=1 → 33, qo_max=16 → 34 (审查阻断①)
 SWA_QO_MAX = 16
+_PROFILE_MOE_PHASES = os.environ.get("QSR_PROFILE_MOE_PHASES") == "1"
 
 
 class _LayerForwardHooks:
@@ -643,23 +644,48 @@ class LagunaBackend:
                     # moe_mod.gate is PlainLinear (runtime/model/plain_linear.py),
                     # returns a plain tensor -- not vLLM's ReplicatedLinear
                     # (output, bias) tuple convention this line used to match.
-                    router_logits = moe_mod.gate(hs)
-                    router_logits = router_logits.float()
-                    if _softcap > 0:
-                        router_logits = torch.tanh(router_logits / _softcap) * _softcap
-                    topk_weights, topk_ids = _native_router.launch(
-                        router_logits,
-                        _e_bias,
-                        _native_router_arena.weights,
-                        _native_router_arena.ids,
-                    )
+                    if _PROFILE_MOE_PHASES:
+                        with torch.profiler.record_function("laguna::moe_router"):
+                            router_logits = moe_mod.gate(hs)
+                            router_logits = router_logits.float()
+                            if _softcap > 0:
+                                router_logits = torch.tanh(router_logits / _softcap) * _softcap
+                            topk_weights, topk_ids = _native_router.launch(
+                                router_logits,
+                                _e_bias,
+                                _native_router_arena.weights,
+                                _native_router_arena.ids,
+                            )
+                    else:
+                        router_logits = moe_mod.gate(hs)
+                        router_logits = router_logits.float()
+                        if _softcap > 0:
+                            router_logits = torch.tanh(router_logits / _softcap) * _softcap
+                        topk_weights, topk_ids = _native_router.launch(
+                            router_logits,
+                            _e_bias,
+                            _native_router_arena.weights,
+                            _native_router_arena.ids,
+                        )
                     capture_routing(router_logits, topk_ids, topk_weights)  # bfprobe P-TOPK
-                    routed_out = _si_layer.forward(hs, topk_ids, topk_weights)
+                    if _PROFILE_MOE_PHASES:
+                        with torch.profiler.record_function("laguna::moe_routed"):
+                            routed_out = _si_layer.forward(hs, topk_ids, topk_weights)
+                    else:
+                        routed_out = _si_layer.forward(hs, topk_ids, topk_weights)
                     if _shared is not None:
-                        shared_out = _shared(hs)
-                        if _scaling != 1.0:
-                            routed_out = routed_out * _scaling
-                        routed_out = routed_out + shared_out
+                        if _PROFILE_MOE_PHASES:
+                            with torch.profiler.record_function("laguna::moe_shared"):
+                                shared_out = _shared(hs)
+                            with torch.profiler.record_function("laguna::moe_finalize"):
+                                if _scaling != 1.0:
+                                    routed_out = routed_out * _scaling
+                                routed_out = routed_out + shared_out
+                        else:
+                            shared_out = _shared(hs)
+                            if _scaling != 1.0:
+                                routed_out = routed_out * _scaling
+                            routed_out = routed_out + shared_out
                     elif _scaling != 1.0:
                         routed_out = routed_out * _scaling
                     return routed_out.view(orig_shape)
