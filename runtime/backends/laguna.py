@@ -49,6 +49,30 @@ RESERVED_PHYSICAL_SLOTS = 0
 # qo_max=1 → 33, qo_max=16 → 34 (审查阻断①)
 SWA_QO_MAX = 16
 _PROFILE_MOE_PHASES = os.environ.get("QSR_PROFILE_MOE_PHASES") == "1"
+_MOE_SHARED_OVERLAP = os.environ.get("QSR_MOE_SHARED_OVERLAP") == "1"
+
+
+class _MoESharedOverlap:
+    """Launch one layer's independent shared expert beside routed MoE work."""
+
+    def __init__(self, device: torch.device) -> None:
+        self._stream = torch.cuda.Stream(device=device)
+        self._input_ready = torch.cuda.Event(enable_timing=False)
+        self._shared_ready = torch.cuda.Event(enable_timing=False)
+
+    def launch(
+        self, shared_expert: Callable[[torch.Tensor], torch.Tensor], hidden: torch.Tensor
+    ) -> torch.Tensor:
+        producer = torch.cuda.current_stream(hidden.device)
+        self._input_ready.record(producer)
+        self._stream.wait_event(self._input_ready)
+        with torch.cuda.stream(self._stream):
+            output = shared_expert(hidden)
+            self._shared_ready.record(self._stream)
+        return output
+
+    def wait(self, device: torch.device) -> None:
+        torch.cuda.current_stream(device).wait_event(self._shared_ready)
 
 
 class _LayerForwardHooks:
@@ -579,6 +603,7 @@ class LagunaBackend:
         # share output storage implicitly.
         output_arena = SparkinferMoEOutputArena()
         self._moe_sparkinfer_output_arena = output_arena
+        shared_overlap = _MoESharedOverlap(self.device) if _MOE_SHARED_OVERLAP else None
         native_router = self._laguna_router_library
         native_router_arena = self._laguna_router_arena
         assert native_router is not None
@@ -637,10 +662,16 @@ class LagunaBackend:
                 _apply_on_input,
                 _native_router,
                 _native_router_arena,
+                _shared_overlap,
             ):
                 def _patched_forward(hidden_states: torch.Tensor) -> torch.Tensor:
                     orig_shape = hidden_states.shape
                     hs = hidden_states.view(-1, hidden_states.shape[-1])
+                    shared_out = (
+                        _shared_overlap.launch(_shared, hs)
+                        if _shared is not None and _shared_overlap is not None
+                        else None
+                    )
                     # moe_mod.gate is PlainLinear (runtime/model/plain_linear.py),
                     # returns a plain tensor -- not vLLM's ReplicatedLinear
                     # (output, bias) tuple convention this line used to match.
@@ -674,15 +705,19 @@ class LagunaBackend:
                     else:
                         routed_out = _si_layer.forward(hs, topk_ids, topk_weights)
                     if _shared is not None:
-                        if _PROFILE_MOE_PHASES:
+                        if shared_out is not None:
+                            _shared_overlap.wait(hs.device)
+                        elif _PROFILE_MOE_PHASES:
                             with torch.profiler.record_function("laguna::moe_shared"):
                                 shared_out = _shared(hs)
+                        else:
+                            shared_out = _shared(hs)
+                        if _PROFILE_MOE_PHASES:
                             with torch.profiler.record_function("laguna::moe_finalize"):
                                 if _scaling != 1.0:
                                     routed_out = routed_out * _scaling
                                 routed_out = routed_out + shared_out
                         else:
-                            shared_out = _shared(hs)
                             if _scaling != 1.0:
                                 routed_out = routed_out * _scaling
                             routed_out = routed_out + shared_out
@@ -704,6 +739,7 @@ class LagunaBackend:
                 apply_on_input,
                 native_router,
                 native_router_arena,
+                shared_overlap,
             )
             patched += 1
             if patched % 10 == 0:
