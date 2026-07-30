@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import os
-from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -22,10 +21,6 @@ if TYPE_CHECKING:
     from runtime.backends.laguna import LagunaBackend
 
 from runtime.backends.bf_attention import bf_attn_context
-from runtime.backends.laguna_moe_overlap import (
-    MoESharedOverlapSession,
-    moe_shared_overlap_session,
-)
 
 logger = logging.getLogger("qwen_sm120_runtime.laguna_cuda_graph")
 
@@ -634,12 +629,6 @@ class LagunaCudaGraphVerify:
         self._captured = False
         self._logits: torch.Tensor | None = None
         self._aux_hidden_states: list[torch.Tensor] | None = None
-        # V2 is intentionally scoped to one verify graph instance.  The
-        # patched MoE forwards discover it only while warmup/capture installs
-        # this context, keeping eager and decode free of stream state.
-        self._moe_shared_overlap: MoESharedOverlapSession | None = None
-        if os.environ.get("QSR_MOE_SHARED_OVERLAP_V2") == "1":
-            self._moe_shared_overlap = MoESharedOverlapSession(self.device)
 
         # Pre-allocated input buffers (fixed address for CG)
         self._input_ids = torch.zeros(num_tokens, dtype=torch.long, device=self.device)
@@ -892,36 +881,6 @@ class LagunaCudaGraphVerify:
         with torch.cuda.stream(side_stream):
             for _ in range(3):
                 self._fill_buffers(0, dummy_tokens, warmup_kv)
-                with (
-                    moe_shared_overlap_session(self._moe_shared_overlap)
-                    if self._moe_shared_overlap
-                    else nullcontext()
-                ):
-                    with bf_attn_context(attn_meta, slot_mapping_dict):
-                        with laguna_forward_context(
-                            attn_meta,
-                            backend.runtime_config,
-                            slot_mapping=slot_mapping_dict,
-                            skip_compiled=True,
-                        ):
-                            result = backend.model.forward(self._input_ids, self._positions)
-                    if isinstance(result, tuple):
-                        hidden_states, _aux = result
-                    else:
-                        hidden_states, _aux = result, None
-                    backend.model.compute_logits(hidden_states)
-        side_stream.synchronize()
-
-        # Final fill before capture
-        self._fill_buffers(0, dummy_tokens, warmup_kv)
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            with (
-                moe_shared_overlap_session(self._moe_shared_overlap)
-                if self._moe_shared_overlap
-                else nullcontext()
-            ):
                 with bf_attn_context(attn_meta, slot_mapping_dict):
                     with laguna_forward_context(
                         attn_meta,
@@ -931,10 +890,30 @@ class LagunaCudaGraphVerify:
                     ):
                         result = backend.model.forward(self._input_ids, self._positions)
                 if isinstance(result, tuple):
-                    hidden_states, self._aux_hidden_states = result
+                    hidden_states, _aux = result
                 else:
-                    hidden_states, self._aux_hidden_states = result, None
-                self._logits = backend.model.compute_logits(hidden_states)
+                    hidden_states, _aux = result, None
+                backend.model.compute_logits(hidden_states)
+        side_stream.synchronize()
+
+        # Final fill before capture
+        self._fill_buffers(0, dummy_tokens, warmup_kv)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            with bf_attn_context(attn_meta, slot_mapping_dict):
+                with laguna_forward_context(
+                    attn_meta,
+                    backend.runtime_config,
+                    slot_mapping=slot_mapping_dict,
+                    skip_compiled=True,
+                ):
+                    result = backend.model.forward(self._input_ids, self._positions)
+            if isinstance(result, tuple):
+                hidden_states, self._aux_hidden_states = result
+            else:
+                hidden_states, self._aux_hidden_states = result, None
+            self._logits = backend.model.compute_logits(hidden_states)
 
         self._graph = graph
         self._captured = True
