@@ -92,8 +92,9 @@ class LagunaRouterLibrary:
 
     def __init__(self, library: ctypes.CDLL) -> None:
         self._library = library
-        self._launch = library.qsr_laguna_router_f32
-        self._launch.argtypes = [
+        self._launch_f32 = library.qsr_laguna_router_f32
+        self._launch_bf16 = library.qsr_laguna_router_bf16
+        arguments = [
             ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_void_p,
@@ -101,7 +102,9 @@ class LagunaRouterLibrary:
             ctypes.c_int32,
             ctypes.c_void_p,
         ]
-        self._launch.restype = ctypes.c_int
+        for launch in (self._launch_f32, self._launch_bf16):
+            launch.argtypes = arguments
+            launch.restype = ctypes.c_int
 
     @classmethod
     def load(
@@ -155,7 +158,8 @@ class LagunaRouterLibrary:
         if rows == 0:
             return topk_weights[:0], topk_ids[:0]
         stream = torch.cuda.current_stream(logits.device).cuda_stream
-        status = self._launch(
+        launch = self._launch_bf16 if logits.dtype == torch.bfloat16 else self._launch_f32
+        status = launch(
             ctypes.c_void_p(logits.data_ptr()),
             ctypes.c_void_p(correction_bias.data_ptr()),
             ctypes.c_void_p(topk_weights.data_ptr()),
@@ -192,8 +196,10 @@ def _validate_tensors(
     tensors = (logits, correction_bias, topk_weights, topk_ids)
     if any(not tensor.is_cuda for tensor in tensors):
         raise LagunaRouterError("Laguna router requires CUDA tensors")
-    if logits.dtype != torch_module.float32 or correction_bias.dtype != torch_module.float32:
-        raise LagunaRouterError("Laguna router requires FP32 logits and correction bias")
+    if logits.dtype not in (torch_module.float32, torch_module.bfloat16):
+        raise LagunaRouterError("Laguna router requires BF16 or FP32 logits")
+    if correction_bias.dtype != torch_module.float32:
+        raise LagunaRouterError("Laguna router requires FP32 correction bias")
     if topk_weights.dtype != torch_module.float32 or topk_ids.dtype != torch_module.int32:
         raise LagunaRouterError("Laguna router requires FP32 weights and int32 ids")
     if logits.ndim != 2 or logits.shape[1] != EXPERTS:

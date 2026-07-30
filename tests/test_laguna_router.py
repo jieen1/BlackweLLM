@@ -12,6 +12,7 @@ from runtime.laguna_router import (
     LagunaRouterError,
     LagunaRouterLibrary,
     _require_sm120_cuda,
+    _validate_tensors,
     artifact_paths,
     router_max_rows,
 )
@@ -79,6 +80,32 @@ def test_router_arena_capacity_is_fixed_from_prefill_verify_and_slots() -> None:
 def test_router_arena_constructor_rejects_nonpositive_capacity_without_cuda() -> None:
     with pytest.raises(LagunaRouterError, match="max rows"):
         LagunaRouterArena(0, "cuda")
+
+
+def test_tensor_validation_accepts_bf16_logits_without_changing_output_contract() -> None:
+    class FakeTorch:
+        float32 = object()
+        bfloat16 = object()
+        int32 = object()
+
+    class FakeTensor:
+        def __init__(self, dtype, shape) -> None:
+            self.dtype = dtype
+            self.shape = shape
+            self.ndim = len(shape)
+            self.is_cuda = True
+            self.device = "cuda:0"
+
+        def is_contiguous(self) -> bool:
+            return True
+
+    torch = FakeTorch()
+    logits = FakeTensor(torch.bfloat16, (4, 256))
+    bias = FakeTensor(torch.float32, (256,))
+    weights = FakeTensor(torch.float32, (8, 10))
+    ids = FakeTensor(torch.int32, (8, 10))
+
+    assert _validate_tensors(logits, bias, weights, ids, torch_module=torch) == 4
 
 
 def test_sm120_guard_rejects_cpu_only_torch(monkeypatch) -> None:

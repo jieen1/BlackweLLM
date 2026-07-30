@@ -307,7 +307,7 @@ def capture_live(args: argparse.Namespace) -> Path:
 
 
 def verify(args: argparse.Namespace) -> dict[str, int]:
-    """Compare the native C ABI with a frozen vLLM artifact exactly."""
+    """Compare native routing with the frozen oracle or BF16 ABI baseline."""
     import torch
 
     from runtime.laguna_router import LagunaRouterLibrary
@@ -327,10 +327,19 @@ def verify(args: argparse.Namespace) -> dict[str, int]:
         weights = torch.empty((logits.shape[0], TOP_K), dtype=torch.float32, device="cuda")
         ids = torch.empty((logits.shape[0], TOP_K), dtype=torch.int32, device="cuda")
         bias = payload["biases"][bias_name].to(device="cuda", dtype=torch.float32)
-        got_weights, got_ids = router.launch(logits, bias, weights, ids)
+        if args.bf16_input:
+            bf16_logits = logits.to(dtype=torch.bfloat16)
+            baseline_weights = torch.empty_like(weights)
+            baseline_ids = torch.empty_like(ids)
+            expected_weights, expected_ids = router.launch(
+                bf16_logits.float(), bias, baseline_weights, baseline_ids
+            )
+            got_weights, got_ids = router.launch(bf16_logits, bias, weights, ids)
+        else:
+            got_weights, got_ids = router.launch(logits, bias, weights, ids)
         torch.cuda.synchronize()
-        expected_weights = reference["weights"]
-        expected_ids = reference["ids"]
+        expected_weights = expected_weights.cpu() if args.bf16_input else reference["weights"]
+        expected_ids = expected_ids.cpu() if args.bf16_input else reference["ids"]
         if not torch.equal(got_ids.cpu(), expected_ids):
             raise AssertionError(f"router ids differ for {reference_name}")
         if not torch.equal(got_weights.cpu(), expected_weights):
@@ -341,7 +350,12 @@ def verify(args: argparse.Namespace) -> dict[str, int]:
         if not bool(torch.isfinite(got_weights).all()):
             raise AssertionError(f"router produced non-finite weights for {reference_name}")
         checked += 1
-    return {"cases": checked, "rows": len(payload["inputs"]), "biases": len(payload["biases"])}
+    return {
+        "cases": checked,
+        "input_dtype": "bf16" if args.bf16_input else "fp32",
+        "rows": len(payload["inputs"]),
+        "biases": len(payload["biases"]),
+    }
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -362,6 +376,11 @@ def _parser() -> argparse.ArgumentParser:
         "verify", help="verify native router against frozen output"
     )
     verify_parser.add_argument("artifact", type=Path)
+    verify_parser.add_argument(
+        "--bf16-input",
+        action="store_true",
+        help="compare the BF16 ABI to the FP32 ABI on the same BF16-rounded logits",
+    )
     return parser
 
 

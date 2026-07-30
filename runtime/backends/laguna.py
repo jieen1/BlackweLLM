@@ -26,6 +26,7 @@ import torch
 from torch import nn
 
 from bfdiag.trace import ring as bfdiag_trace
+from bfprobe.routing import PROBE_ENABLED as ROUTING_PROBE_ENABLED
 from bfprobe.routing import capture_routing
 from runtime.backends.bf_attention import bf_attn_context
 from runtime.block_pool import ChunkedPrefillState
@@ -647,9 +648,10 @@ class LagunaBackend:
                     if _PROFILE_MOE_PHASES:
                         with torch.profiler.record_function("laguna::moe_router"):
                             router_logits = moe_mod.gate(hs)
-                            router_logits = router_logits.float()
                             if _softcap > 0:
-                                router_logits = torch.tanh(router_logits / _softcap) * _softcap
+                                router_logits = (
+                                    torch.tanh(router_logits.float() / _softcap) * _softcap
+                                )
                             topk_weights, topk_ids = _native_router.launch(
                                 router_logits,
                                 _e_bias,
@@ -658,16 +660,20 @@ class LagunaBackend:
                             )
                     else:
                         router_logits = moe_mod.gate(hs)
-                        router_logits = router_logits.float()
                         if _softcap > 0:
-                            router_logits = torch.tanh(router_logits / _softcap) * _softcap
+                            router_logits = torch.tanh(router_logits.float() / _softcap) * _softcap
                         topk_weights, topk_ids = _native_router.launch(
                             router_logits,
                             _e_bias,
                             _native_router_arena.weights,
                             _native_router_arena.ids,
                         )
-                    capture_routing(router_logits, topk_ids, topk_weights)  # bfprobe P-TOPK
+                    if ROUTING_PROBE_ENABLED:
+                        # The probe contract is post-softcap FP32 logits.  The
+                        # production router otherwise reads BF16 directly.
+                        capture_routing(
+                            router_logits.float(), topk_ids, topk_weights
+                        )  # bfprobe P-TOPK
                     if _PROFILE_MOE_PHASES:
                         with torch.profiler.record_function("laguna::moe_routed"):
                             routed_out = _si_layer.forward(hs, topk_ids, topk_weights)
@@ -1284,8 +1290,8 @@ class LagunaBackend:
         debug_enabled = (
             debug_chunk_index is not None
             and os.environ.get("QSR_DEBUG_CHUNK_CHECK") in (
-            "1",
-            "2",
+                "1",
+                "2",
             )
         )
         debug_name = self._swa_layer_names[0]

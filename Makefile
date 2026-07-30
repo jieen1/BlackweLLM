@@ -55,13 +55,13 @@ build-laguna-router: ## Build the fixed-contract SM120 Laguna router artifact
 	@set -eu; tmp_library="$(ROUTER_LIBRARY).tmp"; \
 	$(NVCC) $(ROUTER_FLAGS) $(ROUTER_SOURCE) -o "$$tmp_library"; \
 	mv "$$tmp_library" "$(ROUTER_LIBRARY)"
-	@$(PYTHON) -c 'import hashlib,json,subprocess,sys; from pathlib import Path; library=Path(sys.argv[1]); manifest=Path(sys.argv[2]); source=Path(sys.argv[3]); flags=sys.argv[4]; payload={"abi_version":1,"target_sm":"sm_120a","nvcc":subprocess.check_output([sys.argv[5],"--version"],text=True).strip(),"ptxas":subprocess.check_output(["ptxas","--version"],text=True).strip(),"compile_flags":flags,"source_sha256":hashlib.sha256(source.read_bytes()).hexdigest(),"runtime_git_sha":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"library_sha256":hashlib.sha256(library.read_bytes()).hexdigest(),"provenance":{"license":"Apache-2.0","upstream":"vLLM csrc/libtorch_stable/moe/topk_softmax_kernels.cu","specialization":"256-expert FP32 sigmoid top-k router"}}; temporary=manifest.with_suffix(".tmp"); temporary.write_text(json.dumps(payload,indent=2,sort_keys=True)+"\n"); temporary.replace(manifest)' "$(ROUTER_LIBRARY)" "$(ROUTER_MANIFEST)" "$(ROUTER_SOURCE)" "$(ROUTER_FLAGS)" "$(NVCC)"
+	@$(PYTHON) -c 'import hashlib,json,subprocess,sys; from pathlib import Path; library=Path(sys.argv[1]); manifest=Path(sys.argv[2]); source=Path(sys.argv[3]); flags=sys.argv[4]; payload={"abi_version":1,"target_sm":"sm_120a","nvcc":subprocess.check_output([sys.argv[5],"--version"],text=True).strip(),"ptxas":subprocess.check_output(["ptxas","--version"],text=True).strip(),"compile_flags":flags,"source_sha256":hashlib.sha256(source.read_bytes()).hexdigest(),"runtime_git_sha":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"library_sha256":hashlib.sha256(library.read_bytes()).hexdigest(),"provenance":{"license":"Apache-2.0","upstream":"vLLM csrc/libtorch_stable/moe/topk_softmax_kernels.cu","specialization":"256-expert BF16/FP32 sigmoid top-k router"}}; temporary=manifest.with_suffix(".tmp"); temporary.write_text(json.dumps(payload,indent=2,sort_keys=True)+"\n"); temporary.replace(manifest)' "$(ROUTER_LIBRARY)" "$(ROUTER_MANIFEST)" "$(ROUTER_SOURCE)" "$(ROUTER_FLAGS)" "$(NVCC)"
 	@$(MAKE) verify-laguna-router
 
 verify-laguna-router: ## Verify the generated router ABI and dynamic dependencies
 	@test -f $(ROUTER_LIBRARY)
 	@test -f $(ROUTER_MANIFEST)
-	@nm -D --defined-only $(ROUTER_LIBRARY) | awk '{print $$3}' | grep -Ex 'qsr_laguna_router_(abi_version|f32)' | wc -l | grep -qx 2
+	@nm -D --defined-only $(ROUTER_LIBRARY) | awk '{print $$3}' | grep -Ex 'qsr_laguna_router_(abi_version|bf16|f32)' | wc -l | grep -qx 3
 	@! readelf -d $(ROUTER_LIBRARY) | grep -Ei 'libtorch|vllm'
 	@! ldd $(ROUTER_LIBRARY) | grep -Ei 'libtorch|vllm'
 

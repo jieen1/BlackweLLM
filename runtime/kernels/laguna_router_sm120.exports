@@ -1,6 +1,7 @@
 {
   global:
     qsr_laguna_router_abi_version;
+    qsr_laguna_router_bf16;
     qsr_laguna_router_f32;
   local:
     *;

@@ -8,6 +8,7 @@ from tools.laguna_router_oracle import (
     DEFAULT_FAMILIES,
     DEFAULT_ROWS,
     _load_live_logits,
+    _parser,
     parse_families,
     parse_rows,
 )
@@ -39,6 +40,12 @@ def test_parse_families_accepts_a_subset() -> None:
 def test_parse_families_rejects_invalid_names(value: str) -> None:
     with pytest.raises(argparse.ArgumentTypeError):
         parse_families(value)
+
+
+def test_verify_parser_exposes_the_bf16_abi_equivalence_mode() -> None:
+    args = _parser().parse_args(["verify", "router-oracle", "--bf16-input"])
+
+    assert args.bf16_input is True
 
 
 def test_load_live_logits_accepts_the_production_gate_tensor_contract(tmp_path) -> None:
