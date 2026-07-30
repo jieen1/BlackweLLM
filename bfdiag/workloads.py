@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from typing import Any
 
@@ -1495,12 +1496,49 @@ def _first_token_divergence(reference: list[int], candidate: list[int]) -> dict[
     return {"index": None, "reference_token": None, "candidate_token": None}
 
 
+def _first_verify_round_divergence(
+    reference: list[dict[str, Any]], candidate: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Return the first proposal or verifier-top1 difference between two runs."""
+    for index, (expected, actual) in enumerate(zip(reference, candidate)):
+        for field in ("kv_len", "bonus_token", "draft_tokens"):
+            if expected[field] != actual[field]:
+                return {
+                    "round": index,
+                    "kind": field,
+                    "reference": expected[field],
+                    "candidate": actual[field],
+                }
+        expected_top1 = [position["top1_tok"] for position in expected["positions"]]
+        actual_top1 = [position["top1_tok"] for position in actual["positions"]]
+        if expected_top1 != actual_top1:
+            first_position = next(
+                i for i, pair in enumerate(zip(expected_top1, actual_top1)) if pair[0] != pair[1]
+            )
+            return {
+                "round": index,
+                "kind": "verifier_top1",
+                "position": first_position,
+                "reference": expected_top1[first_position],
+                "candidate": actual_top1[first_position],
+            }
+    if len(reference) != len(candidate):
+        return {
+            "round": min(len(reference), len(candidate)),
+            "kind": "round_count",
+            "reference": len(reference),
+            "candidate": len(candidate),
+        }
+    return {"round": None, "kind": None}
+
+
 def diagnose_historical_dflash_partial_prefix_reuse(
     engine: Any,
     tokenizer: Any,
     *,
     max_tokens: int = HISTORICAL_DFLASH_PREFIX_MAX_TOKENS,
     base_generation_tokens: int = 5,
+    capture_verify_top2: bool = False,
 ) -> dict[str, Any]:
     """Compare cold DFlash output with the canonical partial-prefix state path.
 
@@ -1508,6 +1546,9 @@ def diagnose_historical_dflash_partial_prefix_reuse(
     then submits the base plus a 10,000-token suffix.  This diagnostic runs
     that exact transition next to a reset cold prefill and writes both token
     streams, state geometry, and trace-round boundaries into a bfdiag record.
+    ``capture_verify_top2`` additionally records the existing diagnostic
+    verifier dump, separating a changed draft proposal from a changed target
+    top-1 without altering the normal performance workload.
     It deliberately reports divergence instead of raising: a failed oracle is
     useful evidence and must leave a complete record for ``bf trace show``.
     """
@@ -1562,48 +1603,83 @@ def diagnose_historical_dflash_partial_prefix_reuse(
                 "cuda_graph": True,
                 "prefix_cache": True,
                 "partial_prefix_oracle": True,
+                "capture_verify_top2": capture_verify_top2,
             },
         ) as rec:
-            reset_dflash_workload_state(engine)
-            cold_tokens, cold_stats = engine.generate_verify_only(
-                full_ids,
-                max_tokens=max_tokens,
-                temperature=0.0,
-                slot=0,
-                enable_prefix_cache=False,
-            )
-
-            reset_dflash_workload_state(engine)
-            base_tokens, base_stats = engine.generate_verify_only(
-                base_ids,
-                max_tokens=base_generation_tokens,
-                temperature=0.0,
-                slot=0,
-                enable_prefix_cache=False,
-            )
-            cached_kv_len = backend.slot_kv_len[0]
-            prefix_len = backend.find_prefix_match(0, full_ids)
-            rewind_tokens = cached_kv_len - prefix_len
-            ring_specs = (
-                (backend._ring_slots_per_slot, backend._swa_window),
-                (engine._draft_blocks_per_slot * engine.block_size, DRAFT_WINDOW),
-            )
-            reuse_is_safe = _ring_prefix_reuse_is_safe(cached_kv_len, prefix_len, ring_specs)
-            if prefix_len <= 0 or prefix_len >= len(full_ids) or not reuse_is_safe:
-                raise AssertionError(
-                    "canonical partial-prefix setup did not retain a safe partial match: "
-                    f"prefix_len={prefix_len}, cached_kv_len={cached_kv_len}, "
-                    f"reuse_is_safe={reuse_is_safe}"
+            artifacts = default_store().artifacts_dir(rec.run_id)
+            artifacts.mkdir(parents=True, exist_ok=True)
+            verify_dump_path = artifacts / "partial_prefix_verify_top2.jsonl"
+            prior_verify_dump = os.environ.get("QSR_DEBUG_VERIFY_LOGITS_FILE")
+            if capture_verify_top2 and prior_verify_dump is not None:
+                raise RuntimeError(
+                    "capture_verify_top2 requires QSR_DEBUG_VERIFY_LOGITS_FILE to be unset"
                 )
-            partial_tokens, partial_stats = engine.generate_verify_only(
-                full_ids,
-                max_tokens=max_tokens,
-                temperature=0.0,
-                slot=0,
-                enable_prefix_cache=True,
-            )
+            if capture_verify_top2:
+                os.environ["QSR_DEBUG_VERIFY_LOGITS_FILE"] = str(verify_dump_path)
+            try:
+                reset_dflash_workload_state(engine)
+                cold_tokens, cold_stats = engine.generate_verify_only(
+                    full_ids,
+                    max_tokens=max_tokens,
+                    temperature=0.0,
+                    slot=0,
+                    enable_prefix_cache=False,
+                )
+
+                reset_dflash_workload_state(engine)
+                base_tokens, base_stats = engine.generate_verify_only(
+                    base_ids,
+                    max_tokens=base_generation_tokens,
+                    temperature=0.0,
+                    slot=0,
+                    enable_prefix_cache=False,
+                )
+                cached_kv_len = backend.slot_kv_len[0]
+                prefix_len = backend.find_prefix_match(0, full_ids)
+                rewind_tokens = cached_kv_len - prefix_len
+                ring_specs = (
+                    (backend._ring_slots_per_slot, backend._swa_window),
+                    (engine._draft_blocks_per_slot * engine.block_size, DRAFT_WINDOW),
+                )
+                reuse_is_safe = _ring_prefix_reuse_is_safe(cached_kv_len, prefix_len, ring_specs)
+                if prefix_len <= 0 or prefix_len >= len(full_ids) or not reuse_is_safe:
+                    raise AssertionError(
+                        "canonical partial-prefix setup did not retain a safe partial match: "
+                        f"prefix_len={prefix_len}, cached_kv_len={cached_kv_len}, "
+                        f"reuse_is_safe={reuse_is_safe}"
+                    )
+                partial_tokens, partial_stats = engine.generate_verify_only(
+                    full_ids,
+                    max_tokens=max_tokens,
+                    temperature=0.0,
+                    slot=0,
+                    enable_prefix_cache=True,
+                )
+            finally:
+                if capture_verify_top2:
+                    os.environ.pop("QSR_DEBUG_VERIFY_LOGITS_FILE", None)
 
             divergence = _first_token_divergence(cold_tokens, partial_tokens)
+            verify_divergence = None
+            if capture_verify_top2:
+                verify_rounds = [
+                    json.loads(line)
+                    for line in verify_dump_path.read_text().splitlines()
+                    if line.strip()
+                ]
+                cold_count = int(cold_stats["num_steps"])
+                base_count = int(base_stats["num_steps"])
+                partial_count = int(partial_stats["num_steps"])
+                if len(verify_rounds) != cold_count + base_count + partial_count:
+                    raise AssertionError(
+                        "verify dump round count disagrees with generation stats: "
+                        f"dump={len(verify_rounds)}, cold={cold_count}, base={base_count}, "
+                        f"partial={partial_count}"
+                    )
+                verify_divergence = _first_verify_round_divergence(
+                    verify_rounds[:cold_count],
+                    verify_rounds[cold_count + base_count :],
+                )
             report = {
                 "contract": HISTORICAL_DFLASH_PREFIX_CONTRACT,
                 "cold": {"tokens": cold_tokens, "stats": cold_stats},
@@ -1617,6 +1693,7 @@ def diagnose_historical_dflash_partial_prefix_reuse(
                     "reuse_is_safe": reuse_is_safe,
                 },
                 "divergence": divergence,
+                "verify_round_divergence": verify_divergence,
                 "parity": divergence["index"] is None,
                 # ``generate_verify_only`` emits one trace row per DFlash round.
                 "trace_round_ranges": {
@@ -1636,11 +1713,11 @@ def diagnose_historical_dflash_partial_prefix_reuse(
                     ],
                 },
             }
-            artifacts = default_store().artifacts_dir(rec.run_id)
-            artifacts.mkdir(parents=True, exist_ok=True)
             report_path = artifacts / "partial_prefix_reuse_oracle.json"
             report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
             rec.artifact("partial_prefix_reuse_oracle", report_path)
+            if capture_verify_top2:
+                rec.artifact("partial_prefix_verify_top2", verify_dump_path)
             rec.metric("partial_prefix_len", prefix_len)
             rec.metric("partial_rewind_tokens", rewind_tokens)
             rec.metric("partial_reuse_safe", float(reuse_is_safe))

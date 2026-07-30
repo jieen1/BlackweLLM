@@ -10,6 +10,7 @@ from bfdiag.workloads import (
     HISTORICAL_M1_CONTEXT_TOKENS,
     HISTORICAL_M1_SUFFIX_TOKENS,
     _first_token_divergence,
+    _first_verify_round_divergence,
     _tensor_content_hash,
     capture_dynamic_route_tile_trace,
     capture_laguna_route_histograms,
@@ -190,6 +191,38 @@ def test_first_token_divergence_reports_value_length_and_exact_cases():
         "index": None,
         "reference_token": None,
         "candidate_token": None,
+    }
+
+
+def test_first_verify_round_divergence_prioritizes_proposal_before_top1():
+    identical = {
+        "kv_len": 10,
+        "bonus_token": 7,
+        "draft_tokens": [8, 9],
+        "positions": [{"top1_tok": 8}, {"top1_tok": 9}],
+    }
+    proposal_changed = {**identical, "draft_tokens": [8, 11]}
+    target_changed = {
+        **identical,
+        "positions": [{"top1_tok": 8}, {"top1_tok": 12}],
+    }
+
+    assert _first_verify_round_divergence([identical], [proposal_changed]) == {
+        "round": 0,
+        "kind": "draft_tokens",
+        "reference": [8, 9],
+        "candidate": [8, 11],
+    }
+    assert _first_verify_round_divergence([identical], [target_changed]) == {
+        "round": 0,
+        "kind": "verifier_top1",
+        "position": 1,
+        "reference": 9,
+        "candidate": 12,
+    }
+    assert _first_verify_round_divergence([identical], [identical]) == {
+        "round": None,
+        "kind": None,
     }
 
 
