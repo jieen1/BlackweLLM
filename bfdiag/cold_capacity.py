@@ -210,44 +210,15 @@ def _route_tile_trace_from_host(
     num_topk: int,
 ) -> dict[str, int]:
     """Decode the existing dynamic workspace into exact-order tile evidence."""
-    if physical_tiles_capacity <= 0 or num_topk <= 0:
-        raise ValueError("physical_tiles_capacity and num_topk must be positive")
-    if len(expert_tile_base) != len(expert_row_counts) + 1:
-        raise ValueError("expert tile bases do not match expert row counts")
-    if len(token_map) % physical_tiles_capacity:
-        raise ValueError("token_map length is not divisible by physical tile capacity")
+    from bfdiag.workloads import summarize_dynamic_route_tile_trace
 
-    from sparkinfer.moe.fused_moe._impl import _deterministic_route_tile_dependencies
-
-    tile_m = len(token_map) // physical_tiles_capacity
-    active_tiles = expert_tile_base[-1]
-    if active_tiles < 0 or active_tiles > physical_tiles_capacity:
-        raise ValueError("active physical tile count is outside workspace capacity")
-    physical_to_pair = [-1] * (active_tiles * tile_m)
-    for expert_index, rows in enumerate(expert_row_counts):
-        tile_span = expert_tile_base[expert_index + 1] - expert_tile_base[expert_index]
-        if rows < 0 or rows > tile_span * tile_m:
-            raise ValueError(f"expert {expert_index} has invalid routed row count")
-        start = expert_tile_base[expert_index] * tile_m
-        physical_to_pair[start : start + rows] = token_map[start : start + rows]
-    routed_rows = sum(expert_row_counts)
-    if routed_rows % num_topk:
-        raise ValueError("routed rows are not divisible by num_topk")
-    dependencies = _deterministic_route_tile_dependencies(
-        physical_to_pair=physical_to_pair,
-        num_tokens=routed_rows // num_topk,
+    return summarize_dynamic_route_tile_trace(
+        token_map=token_map,
+        expert_row_counts=expert_row_counts,
+        expert_tile_base=expert_tile_base,
+        physical_tiles_capacity=physical_tiles_capacity,
         num_topk=num_topk,
-        tile_m=tile_m,
     )
-    return {
-        "routed_rows": routed_rows,
-        "tile_m": tile_m,
-        "active_tiles": dependencies.active_tiles,
-        "dependency_edges": dependencies.dependency_edges,
-        "cyclic_components": dependencies.cyclic_components,
-        "largest_cyclic_component_tiles": dependencies.largest_cyclic_component_tiles,
-        "largest_cyclic_component_route_rows": dependencies.largest_cyclic_component_route_rows,
-    }
 
 
 def _capture_route_tile_trace(backend: Any) -> dict[str, int]:

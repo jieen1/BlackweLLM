@@ -46,16 +46,118 @@ def summarize_sparkinfer_workspace_pools(
     return {"pool_count": len(unique_pools), "core_arenas": arenas}
 
 
+def summarize_dynamic_route_tile_trace(
+    *,
+    token_map: list[int],
+    expert_row_counts: list[int],
+    expert_tile_base: list[int],
+    physical_tiles_capacity: int,
+    num_topk: int,
+) -> dict[str, int]:
+    """Decode actual dynamic route placement into exact-order tile evidence.
+
+    The trace is descriptive, not a proposed launch order. Dependency cycles
+    identify when a simple tile-reordered streaming reduction cannot preserve
+    the existing fixed top-k accumulation order.
+    """
+    if physical_tiles_capacity <= 0 or num_topk <= 0:
+        raise ValueError("physical_tiles_capacity and num_topk must be positive")
+    if len(expert_tile_base) != len(expert_row_counts) + 1:
+        raise ValueError("expert tile bases do not match expert row counts")
+    if len(token_map) % physical_tiles_capacity:
+        raise ValueError("token_map length is not divisible by physical tile capacity")
+
+    from sparkinfer.moe.fused_moe._impl import _deterministic_route_tile_dependencies
+
+    tile_m = len(token_map) // physical_tiles_capacity
+    active_tiles = expert_tile_base[-1]
+    if active_tiles < 0 or active_tiles > physical_tiles_capacity:
+        raise ValueError("active physical tile count is outside workspace capacity")
+    physical_to_pair = [-1] * (active_tiles * tile_m)
+    for expert_index, rows in enumerate(expert_row_counts):
+        tile_span = expert_tile_base[expert_index + 1] - expert_tile_base[expert_index]
+        if rows < 0 or rows > tile_span * tile_m:
+            raise ValueError(f"expert {expert_index} has invalid routed row count")
+        start = expert_tile_base[expert_index] * tile_m
+        physical_to_pair[start : start + rows] = token_map[start : start + rows]
+    routed_rows = sum(expert_row_counts)
+    if routed_rows % num_topk:
+        raise ValueError("routed rows are not divisible by num_topk")
+    dependencies = _deterministic_route_tile_dependencies(
+        physical_to_pair=physical_to_pair,
+        num_tokens=routed_rows // num_topk,
+        num_topk=num_topk,
+        tile_m=tile_m,
+    )
+    return {
+        "routed_rows": routed_rows,
+        "tile_m": tile_m,
+        "active_tiles": dependencies.active_tiles,
+        "dependency_edges": dependencies.dependency_edges,
+        "cyclic_components": dependencies.cyclic_components,
+        "largest_cyclic_component_tiles": dependencies.largest_cyclic_component_tiles,
+        "largest_cyclic_component_route_rows": dependencies.largest_cyclic_component_route_rows,
+    }
+
+
+def capture_dynamic_route_tile_trace(backend: Any) -> dict[str, int]:
+    """Copy the current dynamic workspace's small routing metadata to host."""
+    layers = getattr(backend, "_moe_sparkinfer_layers", ())
+    if not layers:
+        raise RuntimeError("Laguna backend exposes no SparkInfer MoE layers")
+    pool = layers[0].workspace
+    candidates = [
+        workspace
+        for workspace in getattr(pool, "workspaces", {}).values()
+        if all(
+            hasattr(workspace, name)
+            for name in (
+                "token_map",
+                "row_counts",
+                "expert_tile_base",
+                "physical_tiles_capacity",
+                "num_topk",
+            )
+        )
+    ]
+    if not candidates:
+        raise RuntimeError("no dynamic SparkInfer workspace was materialized")
+    snapshots = [
+        (sum(workspace.row_counts.cpu().tolist()), workspace)
+        for workspace in candidates
+    ]
+    routed_rows, workspace = max(snapshots, key=lambda item: item[0])
+    if routed_rows <= 0:
+        capacities = [int(workspace.routed_rows_capacity) for workspace in candidates]
+        raise RuntimeError(f"no dynamic workspace has routed rows; capacities={capacities}")
+    return summarize_dynamic_route_tile_trace(
+        token_map=workspace.token_map.cpu().tolist(),
+        expert_row_counts=workspace.row_counts.cpu().tolist(),
+        expert_tile_base=workspace.expert_tile_base.cpu().tolist(),
+        physical_tiles_capacity=int(workspace.physical_tiles_capacity),
+        num_topk=int(workspace.num_topk),
+    )
+
+
 def audit_sparkinfer_workspace(backend: Any) -> dict[str, Any]:
     """Persist the live SparkInfer core-arena view map for one warm backend."""
-    from sparkinfer.moe.fused_moe._impl import _core_workspace_view_map
+    from sparkinfer.moe.fused_moe._impl import (
+        _core_workspace_view_map,
+        _dynamic_core_workspace_liveness_map,
+    )
 
     layers = getattr(backend, "_moe_sparkinfer_layers", ())
     if not layers:
         raise RuntimeError("Laguna backend has no patched SparkInfer MoE layers")
     report = summarize_sparkinfer_workspace_pools(
-        [layer.workspace for layer in layers], view_mapper=_core_workspace_view_map
+        [layer.workspace for layer in layers],
+        view_mapper=lambda plan: (
+            _dynamic_core_workspace_liveness_map(plan)
+            if plan.implementation == "dynamic"
+            else _core_workspace_view_map(plan)
+        ),
     )
+    report["route_tile_trace"] = capture_dynamic_route_tile_trace(backend)
     with run_record(
         script=__file__,
         workload={"kind": "sparkinfer-workspace-audit"},
@@ -71,6 +173,8 @@ def audit_sparkinfer_workspace(backend: Any) -> dict[str, Any]:
         rec.metric(
             "core_arena_bytes", sum(arena["arena_nbytes"] for arena in report["core_arenas"])
         )
+        for name, value in report["route_tile_trace"].items():
+            rec.metric(f"route_tile_{name}", value)
         run_id = rec.run_id
     return {"run_id": run_id, **report}
 

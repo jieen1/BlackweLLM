@@ -9,6 +9,7 @@ from bfdiag.workloads import (
     HISTORICAL_DFLASH_PREFIX_SUFFIX_TOKENS,
     HISTORICAL_M1_CONTEXT_TOKENS,
     HISTORICAL_M1_SUFFIX_TOKENS,
+    capture_dynamic_route_tile_trace,
     check_b1_metadata_fastpath_parity,
     check_dflash_server_step_parity,
     check_dflash_verify_cg_parity,
@@ -20,6 +21,7 @@ from bfdiag.workloads import (
     profile_historical_m1_decode_cg,
     profile_rms_norm_m16,
     reset_dflash_workload_state,
+    summarize_dynamic_route_tile_trace,
     summarize_sparkinfer_workspace_pools,
 )
 
@@ -83,6 +85,34 @@ def test_workspace_audit_attributes_a_shared_arena_by_view() -> None:
         ],
     }
     assert len(historical_m1_prompt_ids(HISTORICAL_M1_SUFFIX_TOKENS)) == HISTORICAL_M1_SUFFIX_TOKENS
+
+
+def test_dynamic_route_tile_trace_reports_exact_order_dependency_cycles() -> None:
+    trace = summarize_dynamic_route_tile_trace(
+        token_map=[0, 3, 2, 1],
+        expert_row_counts=[2, 2],
+        expert_tile_base=[0, 1, 2],
+        physical_tiles_capacity=2,
+        num_topk=2,
+    )
+
+    assert trace == {
+        "routed_rows": 4,
+        "tile_m": 2,
+        "active_tiles": 2,
+        "dependency_edges": 2,
+        "cyclic_components": 1,
+        "largest_cyclic_component_tiles": 2,
+        "largest_cyclic_component_route_rows": 4,
+    }
+
+
+def test_capture_dynamic_route_tile_trace_requires_a_live_backend() -> None:
+    class EmptyBackend:
+        _moe_sparkinfer_layers = ()
+
+    with pytest.raises(RuntimeError, match="no SparkInfer MoE layers"):
+        capture_dynamic_route_tile_trace(EmptyBackend())
 
 
 def test_historical_m1_prompt_rejects_negative_length():
