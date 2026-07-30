@@ -112,6 +112,14 @@ class LagunaSlotState:
         return self.kv_len == 0
 
 
+@dataclass
+class _PrefixChunkSnapshot:
+    """SWA ring state at one cold-prefill chunk boundary for a slot."""
+
+    boundary: int
+    swa_kv: dict[str, torch.Tensor]
+
+
 def _ring_blocks_for_window(window: int, block_size: int, qo_max: int = SWA_QO_MAX) -> int:
     return -(-(window - 1 + qo_max) // block_size) + 1  # cdiv + 1
 
@@ -468,6 +476,7 @@ class LagunaBackend:
         # Per-slot state
         self.slot_kv_len: list[int] = [0] * num_slots
         self.slot_committed_tokens: list[list[int]] = [[] for _ in range(num_slots)]
+        self._prefix_chunk_snapshots: list[_PrefixChunkSnapshot | None] = [None] * num_slots
 
         # M=1 decode CUDA Graph (lazily captured on first generate call)
         self._decode_cg = None
@@ -1467,6 +1476,7 @@ class LagunaBackend:
             raise RuntimeError(f"slot {slot} is not fresh (kv_len={self.slot_kv_len[slot]})")
         prompt_len = len(prompt_ids)
         PREFILL_CHUNK = self._prefill_chunk_tokens
+        self._prefix_chunk_snapshots[slot] = None
 
         if prompt_len <= PREFILL_CHUNK and self._swa_scratch is not None:
             # Short prompt: use scratch path (single forward)
@@ -1500,6 +1510,7 @@ class LagunaBackend:
                 PREFILL_CHUNK,
                 min_final_tokens=window,
             )
+            snapshot_boundary = self._prefix_snapshot_boundary(chunk_ranges, prompt_len)
             debug_chunk_check = os.environ.get("QSR_DEBUG_CHUNK_CHECK") in ("1", "2")
             for _chunk_idx, (chunk_start, chunk_end) in enumerate(chunk_ranges):
                 chunk = prompt_ids[chunk_start:chunk_end]
@@ -1552,6 +1563,8 @@ class LagunaBackend:
                             swa_kv_lengths=swa_kv,
                             skip_logits=True,
                         )
+                if chunk_end == snapshot_boundary:
+                    self._capture_prefix_chunk_snapshot(slot, chunk_end)
 
         first_token = int(logits[-1].argmax(dim=-1).item())
         self.slot_kv_len[slot] = prompt_len
@@ -1760,6 +1773,7 @@ class LagunaBackend:
     def reset_slot(self, slot: int) -> None:
         self.slot_kv_len[slot] = 0
         self.slot_committed_tokens[slot] = []
+        self._prefix_chunk_snapshots[slot] = None
         phys = _physical_slot(slot)
         # Full-attention layers: clear blocks_per_slot blocks.
         # The block axis is dim 1 -- kv_cache is
@@ -1984,8 +1998,67 @@ class LagunaBackend:
         # Never exceed the cached KV length
         return min(aligned, self.slot_kv_len[slot])
 
+    def _prefix_snapshot_boundary(
+        self, chunk_ranges: list[tuple[int, int]], prompt_len: int
+    ) -> int | None:
+        """Return the last regular cold-prefill boundary before ``prompt_len``."""
+        candidates = [
+            end
+            for _start, end in chunk_ranges
+            if end < prompt_len and end % self._prefill_chunk_tokens == 0
+        ]
+        return candidates[-1] if candidates else None
+
+    def _capture_prefix_chunk_snapshot(self, slot: int, boundary: int) -> None:
+        """Persist the SWA ring immediately after a reusable cold boundary."""
+        if boundary <= 0 or boundary % self._prefill_chunk_tokens:
+            raise ValueError(f"prefix snapshot boundary must be chunk-aligned, got {boundary}")
+        phys = _physical_slot(slot)
+        ring_start = phys * self._ring_blocks_per_slot
+        ring_end = ring_start + self._ring_blocks_per_slot
+        self._prefix_chunk_snapshots[slot] = _PrefixChunkSnapshot(
+            boundary=boundary,
+            swa_kv={
+                name: self.kv_caches[name][:, ring_start:ring_end].clone()
+                for name in self._swa_layer_names
+            },
+        )
+
+    def prepare_exact_prefix_replay(
+        self, slot: int, prompt_ids: list[int], matched_prefix_len: int
+    ) -> int | None:
+        """Restore a cold-equivalent target state and return its replay start.
+
+        Full-attention KV before the chosen boundary remains resident in the
+        slot.  The SWA ring does not, so it is restored from the snapshot that
+        was made at that boundary before any later prefill or decode wrote it.
+        """
+        snapshot = self._prefix_chunk_snapshots[slot]
+        boundary = _exact_prefix_replay_boundary(
+            prefix_len=matched_prefix_len,
+            prompt_len=len(prompt_ids),
+            chunk_tokens=self._prefill_chunk_tokens,
+            min_final_tokens=self._swa_window,
+            snapshot_boundary=None if snapshot is None else snapshot.boundary,
+        )
+        if boundary is None or snapshot is None:
+            return None
+        phys = _physical_slot(slot)
+        ring_start = phys * self._ring_blocks_per_slot
+        ring_end = ring_start + self._ring_blocks_per_slot
+        for name, cached_ring in snapshot.swa_kv.items():
+            self.kv_caches[name][:, ring_start:ring_end].copy_(cached_ring)
+        self.slot_kv_len[slot] = boundary
+        self.slot_committed_tokens[slot] = list(prompt_ids[:boundary])
+        return boundary
+
     def continue_prefill_with_aux(
-        self, slot: int, prompt_ids: list[int], start_pos: int
+        self,
+        slot: int,
+        prompt_ids: list[int],
+        start_pos: int,
+        *,
+        exact_cold_replay: bool = False,
     ) -> tuple[int, list[torch.Tensor] | None]:
         """Continue prefill from start_pos, reusing cached KV for [0, start_pos).
 
@@ -2046,11 +2119,37 @@ class LagunaBackend:
             aux = None
             logits = None
 
-            chunk_ranges = _prefill_chunk_ranges(
-                start_pos,
+            if exact_cold_replay:
+                full_ranges = _prefill_chunk_ranges(
+                    0,
+                    prompt_len,
+                    PREFILL_CHUNK,
+                    min_final_tokens=window,
+                )
+                chunk_ranges = [
+                    (chunk_start, chunk_end)
+                    for chunk_start, chunk_end in full_ranges
+                    if chunk_start >= start_pos
+                ]
+                if not chunk_ranges or chunk_ranges[0][0] != start_pos:
+                    raise ValueError(
+                        f"exact prefix replay start {start_pos} is not a cold chunk boundary"
+                    )
+            else:
+                chunk_ranges = _prefill_chunk_ranges(
+                    start_pos,
+                    prompt_len,
+                    PREFILL_CHUNK,
+                    min_final_tokens=window,
+                )
+            snapshot_boundary = self._prefix_snapshot_boundary(
+                _prefill_chunk_ranges(
+                    0,
+                    prompt_len,
+                    PREFILL_CHUNK,
+                    min_final_tokens=window,
+                ),
                 prompt_len,
-                PREFILL_CHUNK,
-                min_final_tokens=window,
             )
             for chunk_start, chunk_end in chunk_ranges:
                 chunk = prompt_ids[chunk_start:chunk_end]
@@ -2090,6 +2189,8 @@ class LagunaBackend:
                             swa_kv_lengths=swa_kv,
                             skip_logits=True,
                         )
+                if chunk_end == snapshot_boundary:
+                    self._capture_prefix_chunk_snapshot(slot, chunk_end)
         first_token = int(logits[-1].argmax(dim=-1).item())
         self.slot_kv_len[slot] = prompt_len
         self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]

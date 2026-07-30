@@ -273,3 +273,49 @@ class TestVerifyOnlyTrace:
         assert events[0].accepted_n == 15
         assert events[0].path == "eager"
         assert observed_prefill == [(0, 0, 9, None)]
+
+    def test_generate_verify_only_replays_from_prepared_cold_boundary(self, monkeypatch):
+        """A partial text match must use the backend's restored cold boundary."""
+        import torch
+
+        from runtime.backends.laguna_dflash import DFlashEngine
+
+        class _Backend:
+            def __init__(self):
+                self.slot_kv_len = [12]
+                self.slot_committed_tokens = [[1] * 12]
+                self.continue_args = None
+
+            def find_prefix_match(self, slot, prompt_ids):
+                return 8
+
+            def prepare_exact_prefix_replay(self, slot, prompt_ids, matched_prefix_len):
+                assert matched_prefix_len == 8
+                self.slot_kv_len[slot] = 4
+                return 4
+
+            def continue_prefill_with_aux(self, slot, prompt_ids, start_pos, *, exact_cold_replay):
+                self.continue_args = (slot, prompt_ids, start_pos, exact_cold_replay)
+                self.slot_kv_len[slot] = len(prompt_ids)
+                return 9, None
+
+        backend = _Backend()
+        engine = object.__new__(DFlashEngine)
+        engine.backend = backend
+        engine._draft_kv_caches = {}
+        engine._draft_cg = None
+        engine._verify_cg = None
+        engine._use_cuda_graph = False
+        engine._cg_captured = True
+        engine._draft_forward = lambda slot, anchor, kv_len: [10] * 15
+        logits = torch.full((16, 32), -1.0)
+        logits[:, 10] = 1.0
+        engine._forward_verify_with_aux = lambda *args: (logits, None)
+
+        from bfdiag.trace import ring as bfdiag_trace
+
+        monkeypatch.setattr(bfdiag_trace, "TRACE_ENABLED", False)
+        tokens, _stats = engine.generate_verify_only([1] * 12, max_tokens=2)
+
+        assert tokens == [9, 10]
+        assert backend.continue_args == (0, [1] * 12, 4, True)

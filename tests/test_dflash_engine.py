@@ -54,19 +54,8 @@ class TestRingPrefixReuse:
 
         return _ring_prefix_reuse_is_safe(cached_kv_len, prefix_len, ring_specs)
 
-    def _partial_is_exact(self, prefix_len, prompt_len):
-        pytest.importorskip("numpy")
-        pytest.importorskip("torch")
-        from runtime.backends.laguna_dflash import _partial_prefix_reuse_is_exact
-
-        return _partial_prefix_reuse_is_exact(prefix_len, prompt_len)
-
     def test_exact_boundary_is_safe(self):
         assert self._is_safe(4096, 4096, ((640, 512), (640, 512)))
-
-    def test_partial_reuse_requires_unimplemented_chunk_provenance(self):
-        assert not self._partial_is_exact(55488, 65536)
-        assert self._partial_is_exact(65536, 65536)
 
     def test_rewind_within_spare_capacity_is_safe(self):
         assert self._is_safe(4224, 4096, ((640, 512), (640, 512)))
@@ -305,3 +294,52 @@ class TestPrefillChunkRanges:
             prompt_len=65536,
             snapshot_boundary=57344,
         ) is None
+
+
+class TestPrefixChunkSnapshot:
+    def test_snapshot_restores_swa_ring_at_shared_cold_boundary(self):
+        torch = pytest.importorskip("torch")
+        from runtime.backends.laguna import LagunaBackend
+
+        class Backend:
+            _prefill_chunk_tokens = 8
+            _swa_window = 4
+            _ring_blocks_per_slot = 2
+            _swa_layer_names = ["swa"]
+            slot_kv_len = [12]
+            slot_committed_tokens = [[1] * 12]
+            _prefix_chunk_snapshots = [None]
+            kv_caches = {
+                "swa": torch.arange(16, dtype=torch.uint8).reshape(2, 2, 4, 1, 1)
+            }
+
+        backend = Backend()
+        LagunaBackend._capture_prefix_chunk_snapshot(backend, 0, 8)
+        expected = backend.kv_caches["swa"].clone()
+        backend.kv_caches["swa"].zero_()
+
+        start = LagunaBackend.prepare_exact_prefix_replay(backend, 0, [2] * 16, 12)
+
+        assert start == 8
+        assert backend.slot_kv_len == [8]
+        assert backend.slot_committed_tokens == [[2] * 8]
+        assert torch.equal(backend.kv_caches["swa"], expected)
+
+    def test_snapshot_does_not_restore_when_no_shared_boundary_exists(self):
+        torch = pytest.importorskip("torch")
+        from runtime.backends.laguna import LagunaBackend
+
+        class Backend:
+            _prefill_chunk_tokens = 8
+            _swa_window = 4
+            _ring_blocks_per_slot = 1
+            _swa_layer_names = ["swa"]
+            slot_kv_len = [12]
+            slot_committed_tokens = [[1] * 12]
+            _prefix_chunk_snapshots = [None]
+            kv_caches = {"swa": torch.ones(2, 1, 4, 1, 1, dtype=torch.uint8)}
+
+        backend = Backend()
+        LagunaBackend._capture_prefix_chunk_snapshot(backend, 0, 8)
+
+        assert LagunaBackend.prepare_exact_prefix_replay(backend, 0, [2] * 16, 7) is None

@@ -73,18 +73,6 @@ def _ring_prefix_reuse_is_safe(
     return all(rewind <= max(0, capacity - window) for capacity, window in ring_specs)
 
 
-def _partial_prefix_reuse_is_exact(prefix_len: int, prompt_len: int) -> bool:
-    """Whether the current cache carries enough provenance for an exact continuation.
-
-    Ring retention only proves that the required KV rows remain addressable.
-    It does not preserve the original prefill chunk boundaries, whose attention
-    reduction geometry can change BF16/FP8 results.  The current cache records
-    no chunk-boundary snapshot, so only a full prompt hit can be reused without
-    re-executing a numerically different prefill.
-    """
-    return prefix_len >= prompt_len
-
-
 def _greedy_accept_reject(
     verify_argmax: list[int],
     draft_tokens: list[int],
@@ -1178,29 +1166,35 @@ class DFlashEngine:
 
         # Prefix cache: find matching prefix in cached KV
         prefix_len = 0
+        exact_cold_replay = False
         if enable_prefix_cache:
             prefix_len = backend.find_prefix_match(slot, prompt_ids)
-            ring_specs = (
-                (backend._ring_slots_per_slot, backend._swa_window),
-                (self._draft_blocks_per_slot * self.block_size, DRAFT_WINDOW),
-            )
-            if prefix_len > 0 and not _ring_prefix_reuse_is_safe(
-                cached_kv_len,
-                prefix_len,
-                ring_specs,
-            ):
-                logger.info(
-                    "Prefix cache MISS: rewinding %d KV positions exceeds ring history",
-                    cached_kv_len - prefix_len,
+            if 0 < prefix_len < prompt_len:
+                matched_prefix_len = prefix_len
+                prefix_len = backend.prepare_exact_prefix_replay(
+                    slot, prompt_ids, matched_prefix_len
                 )
-                prefix_len = 0
-            elif prefix_len > 0 and not _partial_prefix_reuse_is_exact(
-                prefix_len, prompt_len
-            ):
-                logger.info(
-                    "Prefix cache MISS: partial reuse lacks exact prefill chunk provenance"
+                exact_cold_replay = prefix_len is not None
+                if prefix_len is None:
+                    logger.info(
+                        "Prefix cache MISS: partial reuse lacks cold-boundary SWA provenance"
+                    )
+                    prefix_len = 0
+            elif prefix_len >= prompt_len:
+                ring_specs = (
+                    (backend._ring_slots_per_slot, backend._swa_window),
+                    (self._draft_blocks_per_slot * self.block_size, DRAFT_WINDOW),
                 )
-                prefix_len = 0
+                if not _ring_prefix_reuse_is_safe(
+                    cached_kv_len,
+                    prefix_len,
+                    ring_specs,
+                ):
+                    logger.info(
+                        "Prefix cache MISS: rewinding %d KV positions exceeds ring history",
+                        cached_kv_len - prefix_len,
+                    )
+                    prefix_len = 0
 
         if prefix_len > 0 and prefix_len < prompt_len:
             # Partial match: continue from cached prefix
@@ -1230,7 +1224,7 @@ class DFlashEngine:
         if prefix_len > 0:
             # Continue from cached prefix
             first_token, aux_hidden_states = backend.continue_prefill_with_aux(
-                slot, prompt_ids, prefix_len
+                slot, prompt_ids, prefix_len, exact_cold_replay=exact_cold_replay
             )
         else:
             # Full prefill
