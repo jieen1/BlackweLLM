@@ -32,7 +32,7 @@ import os
 # Fix path: per-head K/V descale (kernel supports 2D [batch,heads]
 # descale at forward_paged.py:5429, needs runtime wiring) + per-row
 # Q scale before e4m3 conversion (forward_paged.py mxfp8 helpers).
-os.environ.setdefault("SPARKINFER_TURBO_ATTN", "1")
+os.environ.setdefault("SPARKINFER_TURBO_ATTN", "0")
 
 import logging
 import sys
