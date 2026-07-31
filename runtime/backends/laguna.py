@@ -1436,9 +1436,10 @@ class LagunaBackend:
         return all_logits
 
     def _copy_warm_kv(self, target_slot: int, warm_slot: int, num_tokens: int) -> None:
-        """Copy KV cache data from warm_slot to target_slot for num_tokens."""
+        """Copy KV cache data from warm_slot to target_slot for num_tokens.
+        Zeroes out stale data beyond num_tokens in the last partial block."""
         if target_slot == warm_slot:
-            return  # Same slot, data already in place
+            return
         num_blocks = (num_tokens + self.block_size - 1) // self.block_size
         t_phys = _physical_slot(target_slot)
         w_phys = _physical_slot(warm_slot)
@@ -1448,6 +1449,16 @@ class LagunaBackend:
             self.kv_caches[name][:, t_start:t_start + num_blocks].copy_(
                 self.kv_caches[name][:, w_start:w_start + num_blocks]
             )
+        # Zero out stale tokens in the partial last block
+        remainder = num_tokens % self.block_size
+        if remainder > 0 and num_blocks > 0:
+            last_block = t_start + num_blocks - 1
+            for name in self._full_layer_names:
+                self.kv_caches[name][:, last_block, remainder:].zero_()
+        # Zero ALL blocks beyond the prefix (stale from previous use)
+        if num_blocks < self.blocks_per_slot:
+            for name in self._full_layer_names:
+                self.kv_caches[name][:, t_start + num_blocks:t_start + self.blocks_per_slot].zero_()
         # SWA ring: copy ring blocks if applicable
         if self._ring_blocks_per_slot > 0:
             t_ring = t_phys * self._ring_blocks_per_slot
