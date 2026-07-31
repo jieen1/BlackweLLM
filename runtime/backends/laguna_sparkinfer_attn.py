@@ -25,10 +25,14 @@ import os
 # already FP8; this avoids dequantizing to BF16 before the QK/PV matmuls,
 # halving memory traffic for KV reads.  Measured +6.2% at 64K context
 # (310 → 330 tok/s) with acceptance rate improving from 0.96 to 1.0.
-# SPARKINFER_TURBO_ATTN: Native FP8 attention MMA. +6% at 64K but
-# causes acceptance regression on code/qa workloads (code-4K: 0.978→0.586).
-# Opt-in only: set SPARKINFER_TURBO_ATTN=1 for fox-64K-dominated workloads.
-os.environ.setdefault("SPARKINFER_TURBO_ATTN", "0")
+# SPARKINFER_TURBO_ATTN: Native FP8 attention MMA.  Enabled by default.
+# +6.2% at 64K (310→330 tok/s), acceptance 0.96→1.0 on fox-64K.
+# Known limitation: code-4K acceptance regression (0.978→0.586) due to
+# per-tensor FP8 QK scale precision loss at short range.
+# Fix path: per-head K/V descale (kernel supports 2D [batch,heads]
+# descale at forward_paged.py:5429, needs runtime wiring) + per-row
+# Q scale before e4m3 conversion (forward_paged.py mxfp8 helpers).
+os.environ.setdefault("SPARKINFER_TURBO_ATTN", "1")
 
 import logging
 import sys
