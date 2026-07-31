@@ -105,10 +105,28 @@ class TestLagunaBackendE1Surface:
         with pytest.raises(ValueError, match=r"block_size in \(64, 128\)"):
             LagunaBackend(None, block_size=16)
 
-    def test_reconcile_prefix_hit_is_permanent_miss(self):
+    def test_reconcile_prefix_hit_cold_miss(self):
+        """No warm cache → always returns 0 (cold miss)."""
         backend = self._bare_backend()
+        backend._prefix_cache_tokens = [None, None]
+        backend._prefix_cache_kv_len = [0, 0]
+        backend._pending_prefix_hits = {}
+        backend.block_size = 64
         assert backend.reconcile_prefix_hit([1, 2, 3]) == 0
         assert backend.reconcile_prefix_hit([]) == 0
+
+    def test_reconcile_prefix_hit_warm_match(self):
+        """Warm cache with matching prefix → returns block-aligned hit depth."""
+        backend = self._bare_backend()
+        backend._prefix_cache_tokens = [[10, 20, 30, 40, 50] * 20, None]  # 100 tokens
+        backend._prefix_cache_kv_len = [100, 0]
+        backend._pending_prefix_hits = {}
+        backend.block_size = 64
+        # Prompt shares first 100 tokens → hit = 64 (block-aligned)
+        prompt = [10, 20, 30, 40, 50] * 20 + [99, 98, 97]
+        hit = backend.reconcile_prefix_hit(prompt)
+        assert hit == 64  # block-aligned down from 100
+        assert backend._pending_prefix_hits.get(0) == 64
 
     def test_slot_state_is_immutable_scheduler_snapshot(self):
         backend = self._bare_backend()

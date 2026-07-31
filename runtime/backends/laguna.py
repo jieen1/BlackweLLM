@@ -476,9 +476,10 @@ class LagunaBackend:
         # Per-slot state
         self.slot_kv_len: list[int] = [0] * num_slots
         self.slot_committed_tokens: list[list[int]] = [[] for _ in range(num_slots)]
-        # Prefix cache: list of (token_ids, slot, kv_len) for warm (reset but not zeroed) slots
-        self._warm_prefixes: list[tuple[list[int], int, int]] = []
-        self._pending_prefix_hit: tuple[int, int] | None = None
+        # Prefix cache: per-slot warm KV metadata (tokens preserved, KV not zeroed)
+        self._prefix_cache_tokens: list[list[int] | None] = [None] * num_slots
+        self._prefix_cache_kv_len: list[int] = [0] * num_slots
+        self._pending_prefix_hits: dict[int, int] = {}  # slot -> hit_depth
         self._prefix_chunk_snapshots: list[_PrefixChunkSnapshot | None] = [None] * num_slots
 
         # M=1 decode CUDA Graph (lazily captured on first generate call)
@@ -1469,37 +1470,23 @@ class LagunaBackend:
                 )
 
     def prefill(self, slot: int, prompt_ids: list[int]) -> int:
-        """Prefill prompt and return the greedy first token.
-        Supports prefix cache hit: if reconcile_prefix_hit found a match,
-        copies warm KV data and only prefills the suffix."""
-        prefix_hit = 0
-        print(f'[PREFIX_CACHE] prefill slot={slot} pending={self._pending_prefix_hit}', flush=True)
-        if self._pending_prefix_hit is not None:
-            warm_idx, hit_len = self._pending_prefix_hit
-            self._pending_prefix_hit = None
-            if warm_idx < len(self._warm_prefixes):
-                _, warm_slot, warm_kv_len = self._warm_prefixes[warm_idx]
-                if hit_len <= warm_kv_len and hit_len <= len(prompt_ids):
-                    # Copy warm KV data to target slot
-                    self._copy_warm_kv(slot, warm_slot, hit_len)
-                    self.slot_kv_len[slot] = hit_len
-                    self.slot_committed_tokens[slot] = list(prompt_ids[:hit_len])
-                    prefix_hit = hit_len
-                    print(f'[PREFIX_CACHE] HIT! slot={slot} warm_slot={warm_slot} hit={hit_len} suffix={len(prompt_ids)-hit_len}', flush=True)
-                    # Remove used warm entry
-                    self._warm_prefixes.pop(warm_idx)
-        kv_offset = self.slot_kv_len[slot]  # 0 for fresh, >0 for prefix hit
-        if kv_offset == 0 and self._swa_scratch is not None:
+        """Prefill prompt and return the greedy first token (cold path).
+
+        For prefix-cache-aware prefill, use ``prefill_with_aux`` with
+        ``prefix_hit > 0`` instead. This method always does a full cold
+        prefill from position 0.
+        """
+        if self._swa_scratch is not None:
             prompt_len = len(prompt_ids)
             if prompt_len <= self._prefill_chunk_tokens:
                 logits = self._prefill_with_swa_scratch(slot, prompt_ids)
             else:
                 logits = self._prefill_with_swa_chunked(slot, prompt_ids)
         else:
-            logits = self._forward([slot], prompt_ids, [kv_offset], qo_len=len(prompt_ids), is_decode=False)
+            logits = self._forward([slot], prompt_ids, [0], qo_len=len(prompt_ids), is_decode=False)
         first_token = int(logits[-1].argmax(dim=-1).item())
-        self.slot_kv_len[slot] = kv_offset + len(prompt_ids)
-        self.slot_committed_tokens[slot] = self.slot_committed_tokens[slot] + list(prompt_ids) + [first_token]
+        self.slot_kv_len[slot] = len(prompt_ids)
+        self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
         return first_token
 
     def prefill_sampled(self, slot: int, prompt_ids: list[int], params: SamplingParams) -> int:
@@ -1517,20 +1504,34 @@ class LagunaBackend:
         return first_token
 
     def prefill_with_aux(
-        self, slot: int, prompt_ids: list[int]
+        self, slot: int, prompt_ids: list[int], *, prefix_hit: int = 0,
     ) -> tuple[int, list[torch.Tensor] | None]:
         """Prefill prompt and return (first_token, aux_hidden_states).
 
-        Processes the prompt in chunks of PREFILL_CHUNK_SIZE tokens to
+        When ``prefix_hit > 0``, the slot's full-attention KV cache already
+        holds correct data for positions [0, prefix_hit) from a previous
+        request (same-slot reuse, causal determinism). Only the suffix
+        ``prompt_ids[prefix_hit:]`` is processed through the model.
+
+        SWA ring rebuild: the ring buffer is per-request state and may be
+        stale after a prefix hit. We rebuild it by re-processing the last
+        ``window`` tokens of the prefix (cheap: full-attention KV overwrites
+        are identity operations; SWA scratch→ring copy restores the ring).
+        This matches SGLang's ``swa_reprefill_tail_tokens`` invariant (I7).
+
+        Processes long suffixes in chunks of PREFILL_CHUNK_SIZE tokens to
         reduce peak GPU memory. Only returns aux hidden states from the
         last chunk (sufficient for DFlash's initial context precompute).
         """
-        kv_offset = self.slot_kv_len[slot]  # 0 for fresh, >0 for prefix hit
         prompt_len = len(prompt_ids)
         PREFILL_CHUNK = self._prefill_chunk_tokens
         self._prefix_chunk_snapshots[slot] = None
 
-        if prompt_len <= PREFILL_CHUNK and self._swa_scratch is not None and kv_offset == 0:
+        if prefix_hit > 0:
+            return self._prefill_with_prefix_hit(slot, prompt_ids, prefix_hit)
+
+        # --- Cold path (no prefix hit) ---
+        if prompt_len <= PREFILL_CHUNK and self._swa_scratch is not None:
             # Short prompt: use scratch path (single forward)
             copy_count = min(self._swa_window, prompt_len)
             with self._swa_scratch_context(
@@ -1546,9 +1547,9 @@ class LagunaBackend:
                 )
 
         elif prompt_len <= PREFILL_CHUNK:
-            # Short prompt or suffix-only prefill with prefix hit
+            # Short prompt, no SWA scratch
             logits, aux = self._forward_with_aux(
-                [slot], prompt_ids, [kv_offset], qo_len=prompt_len, is_decode=False
+                [slot], prompt_ids, [0], qo_len=prompt_len, is_decode=False
             )
 
         else:
@@ -1617,6 +1618,125 @@ class LagunaBackend:
                         )
                 if chunk_end == snapshot_boundary:
                     self._capture_prefix_chunk_snapshot(slot, chunk_end)
+
+        first_token = int(logits[-1].argmax(dim=-1).item())
+        self.slot_kv_len[slot] = prompt_len
+        self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
+        return first_token, aux
+
+    def _prefill_with_prefix_hit(
+        self, slot: int, prompt_ids: list[int], prefix_hit: int,
+    ) -> tuple[int, list[torch.Tensor] | None]:
+        """Prefix-cache-aware prefill: skip [0, prefix_hit), process suffix.
+
+        Full-attention KV at [0, prefix_hit) is preserved and correct
+        (same-slot reuse, causal determinism). SWA ring is rebuilt by
+        re-processing the trailing ``window`` tokens of the prefix.
+        """
+        prompt_len = len(prompt_ids)
+        suffix = prompt_ids[prefix_hit:]
+        suffix_len = len(suffix)
+        window = self._swa_window
+        has_swa = self._swa_scratch is not None and self._ring_blocks_per_slot > 0
+        PREFILL_CHUNK = self._prefill_chunk_tokens
+
+        # Step 1: Zero SWA ring (stale from previous request's decode phase)
+        if has_swa:
+            phys = _physical_slot(slot)
+            ring_start = phys * self._ring_blocks_per_slot
+            ring_end = ring_start + self._ring_blocks_per_slot
+            for name in self._swa_layer_names:
+                self.kv_caches[name][:, ring_start:ring_end].zero_()
+
+        # Step 2: Rebuild SWA ring by re-processing last `window` prefix tokens.
+        # Full-attention KV overwrite is identity (same tokens → same KV).
+        # SWA scratch→ring copy writes correct ring data at correct positions.
+        if has_swa and prefix_hit > 0:
+            rebuild_len = min(window, prefix_hit)
+            rebuild_start = prefix_hit - rebuild_len
+            rebuild_tokens = prompt_ids[rebuild_start:prefix_hit]
+            copy_count = min(window, rebuild_len)
+            with self._swa_scratch_context(
+                slot=slot,
+                overlap_abs_start=0,
+                overlap_count=0,
+                scratch_copy_start=rebuild_len - copy_count,
+                ring_copy_abs_start=prefix_hit - copy_count,
+                copy_count=copy_count,
+            ):
+                self._forward(
+                    [slot],
+                    rebuild_tokens,
+                    [rebuild_start],
+                    qo_len=rebuild_len,
+                    is_decode=False,
+                    swa_kv_lengths=[0],
+                    skip_logits=True,
+                )
+
+        # Step 3: Process suffix with correct kv_offset and SWA overlap.
+        # Set kv_len to prefix_hit so _forward computes correct positions
+        # and attention metadata (full-attn reads preserved KV [0, prefix_hit)).
+        self.slot_kv_len[slot] = prefix_hit
+
+        if suffix_len <= PREFILL_CHUNK:
+            # Short suffix: single forward with SWA scratch context
+            overlap = min(window, prefix_hit) if has_swa else 0
+            total_in_scratch = overlap + suffix_len
+            copy_count = min(window, total_in_scratch) if has_swa else 0
+            copy_scratch_start = total_in_scratch - copy_count
+            copy_abs_start = prefix_hit + suffix_len - copy_count
+            with self._swa_scratch_context(
+                slot=slot,
+                overlap_abs_start=prefix_hit - overlap,
+                overlap_count=overlap,
+                scratch_copy_start=copy_scratch_start,
+                ring_copy_abs_start=copy_abs_start,
+                copy_count=copy_count,
+            ):
+                swa_kv = [overlap] if has_swa else None
+                logits, aux = self._forward_with_aux(
+                    [slot], suffix, [prefix_hit], qo_len=suffix_len,
+                    is_decode=False, swa_kv_lengths=swa_kv,
+                )
+        else:
+            # Long suffix: chunked prefill with overlap from ring
+            aux = None
+            chunk_ranges = _prefill_chunk_ranges(
+                0, suffix_len, PREFILL_CHUNK, min_final_tokens=window,
+            )
+            for _chunk_idx, (chunk_start, chunk_end) in enumerate(chunk_ranges):
+                chunk = suffix[chunk_start:chunk_end]
+                chunk_len = len(chunk)
+                is_last = chunk_end == suffix_len
+                # Overlap includes prefix context for the first chunk
+                abs_start = prefix_hit + chunk_start
+                overlap = min(window, abs_start) if has_swa else 0
+                total_in_scratch = overlap + chunk_len
+                copy_count = min(window, total_in_scratch) if has_swa else 0
+                copy_scratch_start = total_in_scratch - copy_count
+                copy_abs_start = abs_start + chunk_len - copy_count
+                with self._swa_scratch_context(
+                    slot=slot,
+                    overlap_abs_start=abs_start - overlap,
+                    overlap_count=overlap,
+                    scratch_copy_start=copy_scratch_start,
+                    ring_copy_abs_start=copy_abs_start,
+                    copy_count=copy_count,
+                ):
+                    swa_kv = [overlap] if has_swa else None
+                    if is_last:
+                        logits, aux = self._forward_with_aux(
+                            [slot], chunk, [abs_start],
+                            qo_len=chunk_len, is_decode=False,
+                            swa_kv_lengths=swa_kv,
+                        )
+                    else:
+                        self._forward(
+                            [slot], chunk, [abs_start],
+                            qo_len=chunk_len, is_decode=False,
+                            swa_kv_lengths=swa_kv, skip_logits=True,
+                        )
 
         first_token = int(logits[-1].argmax(dim=-1).item())
         self.slot_kv_len[slot] = prompt_len
@@ -1823,50 +1943,65 @@ class LagunaBackend:
             )
 
     def reset_slot(self, slot: int) -> None:
-        # Save token history to warm prefix cache BEFORE resetting metadata.
-        # KV cache data is NOT zeroed -- kept warm for prefix reuse.
-        old_tokens = self.slot_committed_tokens[slot]
-        old_kv_len = self.slot_kv_len[slot]
-        print(f'[PREFIX_CACHE] reset_slot({slot}): kv_len={old_kv_len} tokens={len(old_tokens)} warm={len(self._warm_prefixes)}', flush=True)
-        if old_tokens and old_kv_len > 0:
-            # Keep at most 8 warm prefixes (LRU: drop oldest)
-            self._warm_prefixes = [
-                (t, s, l) for t, s, l in self._warm_prefixes if s != slot
-            ]
-            self._warm_prefixes.append((list(old_tokens), slot, old_kv_len))
-            if len(self._warm_prefixes) > 8:
-                self._warm_prefixes.pop(0)
+        """Release slot for reuse. Preserves KV data for prefix cache.
+
+        KV cache tensors are NOT zeroed — the same slot's physical KV memory
+        is reused in-place when a future request matches this slot's token
+        prefix (content-addressed, same-slot reuse; no cross-slot copies).
+        Token history is saved so ``reconcile_prefix_hit`` can match.
+        """
+        # Save token history for prefix matching before clearing metadata
+        if self.slot_committed_tokens[slot] and self.slot_kv_len[slot] > 0:
+            self._prefix_cache_tokens[slot] = list(self.slot_committed_tokens[slot])
+            self._prefix_cache_kv_len[slot] = self.slot_kv_len[slot]
+        else:
+            self._prefix_cache_tokens[slot] = None
+            self._prefix_cache_kv_len[slot] = 0
         self.slot_kv_len[slot] = 0
         self.slot_committed_tokens[slot] = []
         self._prefix_chunk_snapshots[slot] = None
 
     def reconcile_prefix_hit(self, token_ids: list[int]) -> int:
-        """Content-aware prefix cache: find the longest warm prefix match
-        across all recently-reset slots. Returns hit depth in tokens
-        (block-aligned). The engine uses this to skip prefilling the
-        cached prefix."""
-        print(f'[PREFIX_CACHE] reconcile: warm={len(self._warm_prefixes)} prompt_len={len(token_ids)}', flush=True)
-        if not self._warm_prefixes or not token_ids:
+        """Content-aware prefix match against warm KV in available slots.
+
+        Finds the longest token-prefix match between ``token_ids`` and any
+        slot's saved token history. Returns block-aligned hit depth (tokens).
+        The result is stored per-slot in ``_pending_prefix_hits`` for
+        ``prefill_chunked_begin`` to consume.
+
+        Correctness: same-slot reuse guarantees the full-attention KV at
+        positions [0, hit) is identical (causal determinism — same model,
+        same tokens, same positions). SWA ring is rebuilt during prefill.
+        """
+        if not token_ids:
             return 0
         prompt_len = len(token_ids)
         best_hit = 0
-        best_warm_idx = -1
-        for wi, (cached_tokens, warm_slot, warm_kv_len) in enumerate(self._warm_prefixes):
-            # Compare prompt prefix with cached tokens
+        best_slot = -1
+        for s in range(len(self._prefix_cache_tokens)):
+            cached = self._prefix_cache_tokens[s]
+            if cached is None:
+                continue
+            cached_kv_len = self._prefix_cache_kv_len[s]
+            if cached_kv_len <= 0:
+                continue
+            # Token-level prefix comparison
             match_len = 0
-            for a, b in zip(token_ids, cached_tokens):
-                if a != b:
+            limit = min(prompt_len, len(cached), cached_kv_len)
+            for i in range(limit):
+                if token_ids[i] != cached[i]:
                     break
                 match_len += 1
-            # Token-level prefix match (KV cache is per-token, no block alignment needed)
-            if match_len > best_hit and match_len <= warm_kv_len:
-                best_hit = match_len
-                best_warm_idx = wi
-        print(f'[PREFIX_CACHE] result: best_hit={best_hit} warm_idx={best_warm_idx}', flush=True)
-        if best_hit > 0 and best_warm_idx >= 0:
-            self._pending_prefix_hit = (best_warm_idx, best_hit)
-        else:
-            self._pending_prefix_hit = None
+            # Block-align down (full-attention KV is block-addressed)
+            aligned = (match_len // self.block_size) * self.block_size
+            # Must leave at least 1 token to prefill (need logits for anchor)
+            if aligned >= prompt_len:
+                aligned = ((prompt_len - 1) // self.block_size) * self.block_size
+            if aligned > best_hit:
+                best_hit = aligned
+                best_slot = s
+        if best_hit > 0 and best_slot >= 0:
+            self._pending_prefix_hits[best_slot] = best_hit
         return best_hit
 
     def prefill_chunked_begin(
@@ -1875,48 +2010,47 @@ class LagunaBackend:
         prompts_per_slot: list[list[int]],
         chunk_size: int = 512,
     ) -> ChunkedPrefillState:
-        """Prefill with prefix cache: skip cached prefix, prefill only suffix."""
+        """Prefill with prefix cache: skip cached prefix, prefill only suffix.
+
+        Prefix cache uses same-slot KV reuse: the slot's full-attention KV
+        is preserved from the previous request and reused in-place when the
+        new prompt shares a token prefix. No cross-slot KV copies.
+        """
         if len(slots) != len(prompts_per_slot):
             raise ValueError("slots and prompts_per_slot must have equal length")
         if not slots:
             return ChunkedPrefillState(done=True, result={})
         result: dict[int, dict] = {}
         for slot, prompt in zip(slots, prompts_per_slot):
-            prefix_hit = 0
-            if self._pending_prefix_hit is not None:
-                warm_idx, hit_len = self._pending_prefix_hit
-                self._pending_prefix_hit = None
-                if warm_idx < len(self._warm_prefixes):
-                    _, warm_slot, warm_kv_len = self._warm_prefixes[warm_idx]
-                    if hit_len <= warm_kv_len and hit_len <= len(prompt):
-                        self._copy_warm_kv(slot, warm_slot, hit_len)
-                        self.slot_kv_len[slot] = hit_len
-                        self.slot_committed_tokens[slot] = list(prompt[:hit_len])
-                        prefix_hit = hit_len
-                        self._warm_prefixes.pop(warm_idx)
-                        print(f'[PREFIX_CACHE] HIT slot={slot} warm={warm_slot} hit={hit_len} suffix={len(prompt)-hit_len}', flush=True)
+            # Check for prefix hit on THIS slot (same-slot reuse)
+            prefix_hit = self._pending_prefix_hits.pop(slot, 0)
+            # Validate: hit must not exceed prompt length and must leave
+            # at least 1 token to prefill (need logits for anchor token)
+            if prefix_hit >= len(prompt):
+                prefix_hit = ((len(prompt) - 1) // self.block_size) * self.block_size
             if prefix_hit > 0:
-                # KV data is warm from _copy_warm_kv. Set kv_len to prefix_hit
-                # so prefill_with_aux starts from the correct offset.
-                # Only pass suffix tokens to avoid re-processing the prefix.
-                self.slot_kv_len[slot] = prefix_hit
-                self.slot_committed_tokens[slot] = list(prompt[:prefix_hit])
-                suffix = prompt[prefix_hit:]
+                logger.info(
+                    "[PREFIX_CACHE] HIT slot=%d hit=%d suffix=%d (%.1f%% cached)",
+                    slot, prefix_hit, len(prompt) - prefix_hit,
+                    100.0 * prefix_hit / len(prompt),
+                )
                 if self._dflash is not None:
-                    result[slot] = self._dflash.dflash_prefill_bootstrap(slot, suffix)
-                    # Fix kv_len: dflash only knows about suffix, add prefix_hit
-                    self.slot_kv_len[slot] += prefix_hit
+                    result[slot] = self._dflash.dflash_prefill_bootstrap(
+                        slot, prompt, prefix_hit=prefix_hit,
+                    )
                 else:
-                    first_token = self.prefill(slot, suffix)
+                    first_token, _ = self.prefill_with_aux(
+                        slot, prompt, prefix_hit=prefix_hit,
+                    )
                     result[slot] = {"anchor": first_token, "draft_tokens": []}
-                # Fix committed_tokens to include full prompt
-                self.slot_committed_tokens[slot] = list(prompt) + self.slot_committed_tokens[slot][prefix_hit:]
             else:
                 if self._dflash is not None:
                     result[slot] = self._dflash.dflash_prefill_bootstrap(slot, prompt)
                 else:
-                    first_token = self.prefill(slot, prompt)
+                    first_token, _ = self.prefill_with_aux(slot, prompt)
                     result[slot] = {"anchor": first_token, "draft_tokens": []}
+        # Clear any stale pending hits for slots not in this batch
+        self._pending_prefix_hits.clear()
         return ChunkedPrefillState(done=True, result=result)
 
     def prefill_chunked_step(self, state: ChunkedPrefillState) -> bool:

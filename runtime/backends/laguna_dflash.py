@@ -1474,21 +1474,25 @@ class DFlashEngine:
         }
         return tokens, stats
 
-    def dflash_prefill_bootstrap(self, slot: int, prompt_ids: list[int]) -> dict:
-        """E1: DFlash-aware prefill for ServerEngine's admission path.
+    def dflash_prefill_bootstrap(
+        self, slot: int, prompt_ids: list[int], *, prefix_hit: int = 0,
+    ) -> dict:
+        """DFlash-aware prefill for ServerEngine's admission path.
 
-        Mirrors ``generate_verify_only``'s prefill + initial-draft bootstrap
-        (no prefix-cache reuse -- matches ``LagunaBackend.prefill_chunked_begin``'s
-        existing simplicity; Laguna prefix caching is a separate, unbuilt
-        roadmap item per ``reconcile_prefix_hit``). Returns the same
-        ``{"anchor": int, "draft_tokens": list[int]}`` shape
-        ``prefill_chunked_begin`` already returns for the non-DFlash path, so
-        callers don't need to special-case it.
+        When ``prefix_hit > 0``, the main model's full-attention KV is
+        preserved (same-slot reuse) and only the suffix is prefilled via
+        ``prefill_with_aux(prefix_hit=...)``. The draft model's context KV
+        for the prefix portion may be stale (ring buffer overwritten by the
+        previous request's decode); initial draft quality degrades gracefully
+        but correctness is maintained by the verify step. The decode loop
+        gradually rebuilds draft context KV from verify aux_hidden_states.
+
+        Returns ``{"anchor": int, "draft_tokens": list[int]}``.
         """
         backend = self.backend
-        prompt_len = len(prompt_ids)
-        kv_before = backend.slot_kv_len[slot]  # prefix hit offset (0 for cold)
-        first_token, aux_hidden_states = backend.prefill_with_aux(slot, prompt_ids)
+        first_token, aux_hidden_states = backend.prefill_with_aux(
+            slot, prompt_ids, prefix_hit=prefix_hit,
+        )
 
         if aux_hidden_states is not None:
             aux_len = aux_hidden_states[0].shape[0]
