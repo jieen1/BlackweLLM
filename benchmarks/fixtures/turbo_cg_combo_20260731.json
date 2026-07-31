@@ -1,0 +1,28 @@
+{
+  "date": "2026-07-31T12:20:00",
+  "config": {
+    "SPARKINFER_TURBO_ATTN": "1",
+    "QSR_VERIFY_CG_MAX_PAGES": "1040",
+    "blocks_per_slot": 4096,
+    "block_size": 64,
+    "gpu_memory_utilization": 0.88,
+    "max_model_len": 131072
+  },
+  "results": {
+    "fox-64K": {
+      "rounds": [377.5, 379.9, 383.2],
+      "avg_tok_s": 380.2,
+      "acceptance_rate": 0.9958
+    },
+    "code-4K": {
+      "tok_s": 220.7,
+      "acceptance_rate": 0.5857
+    }
+  },
+  "baseline_comparison": {
+    "fox-64K_baseline_tok_s": 312,
+    "fox-64K_baseline_accept": 0.9608,
+    "improvement_pct": 21.8,
+    "accept_delta": 0.035
+  }
+}
