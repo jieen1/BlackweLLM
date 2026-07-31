@@ -1,7 +1,7 @@
 {
   "_comment": "BlackForge speed baseline — frozen 2026-07-22 after full re-verification. Run benchmarks/baseline_compare.py after changes to detect regression.",
   "date": "2026-07-22",
-  "gpu": "RTX PRO 6000 Blackwell (SM120, CC 12.0, 96 GB, 132 SMs)",
+  "gpu": "RTX PRO 6000 Blackwell (SM120, CC 12.0, 96 GB, 188 SMs)",
   "model": "unsloth/Qwen3.6-27B-NVFP4",
   "runtime_config": {
     "mtp_k": 3,

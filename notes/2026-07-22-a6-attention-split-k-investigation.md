@@ -38,7 +38,7 @@ A1a profiling 显示 128K 下 attention 占 28.2%（decode 15.8% + prefill 11.2%
 
 ## 分析
 
-1. **64K 是最优点**：split=2048 给出 32 splits（132 SMs 的 24%），比 split=4096 的 16 splits（12%）更好地利用 SM 并行度
+1. **64K 是最优点**：split=2048 给出 32 splits（188 SMs 的 24%），比 split=4096 的 16 splits（12%）更好地利用 SM 并行度
 2. **128K 已饱和**：32+ splits 已足够，更多 splits 增加 reduction 开销
 3. **短上下文（≤32K）延迟受限**：0.32-0.35ms 几乎不随 context 变化，说明 kernel launch + reduction 是瓶颈
 4. **带宽利用率**：峰值 ~1068 GB/s（64K, split=2048），约为理论峰值 1.8 TB/s 的 59%

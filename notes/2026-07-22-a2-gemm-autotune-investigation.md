@@ -4,7 +4,7 @@
 
 ## 测试条件
 
-- GPU: RTX PRO 6000 Blackwell (SM120, 96 GB, 132 SMs)
+- GPU: RTX PRO 6000 Blackwell (SM120, 96 GB, 188 SMs)
 - 模型: unsloth/Qwen3.6-27B-NVFP4
 - Decode: M=4 (c=1, K=3 MTP verify), eager mode
 - 基准: CUTLASS sm120 NVFP4 GEMM (vLLM 0.25.1.dev0 内置)
@@ -63,7 +63,7 @@
 ## 裁决
 
 1. **gate_up_proj（46% GEMM 占比）已达 98.7% 峰值带宽——无优化空间。**
-2. **down_proj 有 20% 空间**（SM 利用率低：N=5120 仅产生 40 个 128×128 tile，132 SM 中 92 个空闲），但需要修改 CUTLASS tile 配置（128×64×128），需重建 vLLM C 扩展。
+2. **down_proj 有 20% 空间**（SM 利用率低：N=5120 仅产生 40 个 128×128 tile，188 SM 中 92 个空闲），但需要修改 CUTLASS tile 配置（128×64×128），需重建 vLLM C 扩展。
 3. **小 shape（out_proj, in_proj）CUTLASS NVFP4 比 bf16 更慢**——128×128 tile 对 M=4, N≤6144 严重浪费。但这些 shape 的绝对时间很小（合计 ~5 ms/round），且它们走的是 FP8 GEMM 路径而非 NVFP4。
 4. **A2 autotune 的实际杠杆远小于路线图预期**（路线图基于"GEMM 占 71%"推断，但未考虑 CUTLASS 已接近带宽极限）。
 5. **建议：A2 降级为"down_proj tile 优化"单项**（预期 ~1 ms/round = 3.7% e2e），不再作为"贯穿全月主线"。主线应转向 B7-V1（去 vLLM 化）和 L0（Laguna 冒烟），这些是架构层面的真正杠杆。
