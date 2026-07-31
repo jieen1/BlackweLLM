@@ -1,0 +1,41 @@
+{
+  "date": "2026-07-31T12:30:00",
+  "config": {
+    "SPARKINFER_TURBO_ATTN": "1",
+    "QSR_VERIFY_CG_MAX_PAGES": "1040",
+    "gpu": "RTX PRO 6000 Blackwell (SM120, CC 12.0, 96 GB, 188 SMs)"
+  },
+  "kernel_profile_64K_8steps": {
+    "total_cuda_s": 11.937,
+    "breakdown": {
+      "MoE_kernel": {"pct": 43.7, "time_s": 5.219, "calls": 752, "avg_ms": 6.94},
+      "Attention_paged_fwd": {"pct": 33.1, "time_s": 3.945, "calls": 384, "avg_ms": 10.27},
+      "Dense_GEMM_cutlass80": {"pct": 12.9, "time_s": 1.541, "calls": 794, "avg_ms": 1.94},
+      "RMS_norm": {"pct": 2.1, "time_s": 0.250},
+      "Dense_GEMM_2": {"pct": 2.1, "time_s": 0.247},
+      "MoE_w4a8": {"pct": 1.1, "time_s": 0.129},
+      "Other": {"pct": 5.0}
+    }
+  },
+  "acceptance_suite": {
+    "fox-64K": {"tok_s": 370.8, "accept": 0.996},
+    "fox-4K": {"tok_s": 346.6, "accept": 0.963},
+    "galaxy-4K": {"tok_s": 340.0, "accept": 0.978},
+    "ml-4K": {"tok_s": 350.3, "accept": 0.963},
+    "code-4K": {"tok_s": 228.5, "accept": 0.586},
+    "qa-relativity": {"tok_s": 360.4, "accept": 0.978},
+    "qa-quicksort": {"tok_s": 323.5, "accept": 0.853},
+    "qa-tcp-udp": {"tok_s": 360.0, "accept": 0.881},
+    "qa-photosynthesis": {"tok_s": 361.8, "accept": 0.911},
+    "cn-repeat-4K": {"tok_s": 57.4, "accept": 0.086},
+    "cn-qa": {"tok_s": 211.9, "accept": 0.567},
+    "ids-cycle-4K": {"tok_s": 135.2, "accept": 0.352},
+    "ids-cycle-512": {"tok_s": 181.0, "accept": 0.404}
+  },
+  "baseline_comparison": {
+    "fox-64K": {"baseline_tok_s": 306, "baseline_accept": 0.961, "delta_pct": 21.2},
+    "fox-4K": {"baseline_tok_s": 347, "baseline_accept": 0.970, "delta_pct": -0.1},
+    "code-4K": {"baseline_accept": 0.978, "note": "TURBO FP8 short-context regression"}
+  },
+  "gpu_memory_gb": {"allocated": 76.2, "reserved": 79.8}
+}
