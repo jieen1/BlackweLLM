@@ -705,6 +705,7 @@ class LagunaCudaGraphVerify:
             page_table = torch.arange(max_pages, dtype=torch.int32, device=self.device).unsqueeze(0)
             cache_seqlens = torch.tensor([max_kv], dtype=torch.int32, device=self.device)
 
+            _ctas_per_sm = int(os.environ.get("QSR_VERIFY_CG_CTAS_PER_SM", "0")) or None
             plan = create_paged_plan(
                 q,
                 k_cache,
@@ -715,6 +716,7 @@ class LagunaCudaGraphVerify:
                 mode="verify",
                 enable_cuda_graph=True,
                 window_left=wl,
+                graph_ctas_per_sm=_ctas_per_sm,
             )
             ws._ensure_capacity(plan)
             ws._copy_runtime_metadata(page_table, cache_seqlens, self._cu_seqlens_q)
