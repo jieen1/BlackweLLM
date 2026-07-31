@@ -156,7 +156,18 @@ class LagunaCudaGraphDecode:
             if is_swa:
                 max_pages = self._ring_blocks_per_slot
             else:
-                max_pages = self.blocks_per_slot + 16  # margin for generated tokens
+                # CG capture capacity for full attention layers.
+                # Default: capture at blocks_per_slot+16 (full capacity).
+                # Override with QSR_VERIFY_CG_MAX_PAGES to capture at a
+                # representative context (e.g. 1040 for 64K) — shorter
+                # capture → smaller chunks → more useful CTAs at that
+                # context length.  Contexts longer than capture capacity
+                # still work (fewer useful chunks, graceful degradation).
+                _cg_cap = int(os.environ.get("QSR_VERIFY_CG_MAX_PAGES", "0"))
+                if _cg_cap > 0:
+                    max_pages = _cg_cap
+                else:
+                    max_pages = self.blocks_per_slot + 16
 
             ws = SparkinferDecodeWorkspace(
                 num_q_heads=nqh,
@@ -664,7 +675,8 @@ class LagunaCudaGraphVerify:
                 max_pages = self._ring_blocks_per_slot
             else:
                 max_pages = self.blocks_per_slot + 16  # margin for generated tokens
-
+                _cg_cap = int(os.environ.get("QSR_VERIFY_CG_MAX_PAGES", "0"))
+                max_pages = _cg_cap if _cg_cap > 0 else self.blocks_per_slot + 16
             # Keep only shape-only K/V planning views until real cache
             # storage is bound before capture.
             ws = PagedAttentionWorkspace.for_contract(
