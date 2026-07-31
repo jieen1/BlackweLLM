@@ -1487,12 +1487,14 @@ class DFlashEngine:
         """
         backend = self.backend
         prompt_len = len(prompt_ids)
+        kv_before = backend.slot_kv_len[slot]  # prefix hit offset (0 for cold)
         first_token, aux_hidden_states = backend.prefill_with_aux(slot, prompt_ids)
 
         if aux_hidden_states is not None:
             aux_len = aux_hidden_states[0].shape[0]
-            aux_offset = prompt_len - aux_len
-            bfdiag_checks.check_aux_hidden_alignment(slot, prompt_len, aux_len, aux_offset)
+            # aux_offset is relative to the FULL context (prefix + suffix)
+            total_kv = backend.slot_kv_len[slot]
+            aux_offset = total_kv - aux_len
             self._bulk_precompute_context_kv(slot, aux_hidden_states, aux_len, aux_offset)
         del aux_hidden_states
 

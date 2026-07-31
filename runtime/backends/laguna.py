@@ -1893,6 +1893,8 @@ class LagunaBackend:
                 suffix = prompt[prefix_hit:]
                 if self._dflash is not None:
                     result[slot] = self._dflash.dflash_prefill_bootstrap(slot, suffix)
+                    # Fix kv_len: dflash only knows about suffix, add prefix_hit
+                    self.slot_kv_len[slot] += prefix_hit
                 else:
                     first_token = self.prefill(slot, suffix)
                     result[slot] = {"anchor": first_token, "draft_tokens": []}
