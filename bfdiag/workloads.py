@@ -1050,6 +1050,219 @@ def diagnose_dflash_verify_split_kv_chunking(
     return {"run_id": run_id, **report}
 
 
+def diagnose_dflash_verify_dense_oracle(
+    engine: Any,
+    *,
+    kv_lens: tuple[int, ...] = (64, 400, 500),
+) -> dict[str, Any]:
+    """Three-way compare CG-verify / eager-verify / a dense causal attention
+    oracle at the same real ``kv_len``, to settle which (if either) matches
+    ground truth.
+
+    ``diagnose_dflash_verify_split_kv_chunking`` established a structural
+    fact: CG and eager compute genuinely different split-KV chunk counts
+    for the same real ``kv_len`` (CG collapses to 1 chunk almost always;
+    eager splits into 4-16 chunks once ``kv_len`` >= ~400). That does not
+    say which chunk count -- if either -- is *correct*. This function
+    answers that by adding a third, independent measurement: a
+    from-scratch dense causal attention (``bfdiag.dense_attention_oracle.
+    DenseCausalOracleImpl``) that never calls sparkinfer's
+    ``create_paged_plan``/``paged_attention_forward`` at all, so it cannot
+    share a bug with either split-KV path.
+
+    Method, mirroring the prior note's already-validated "sequential with
+    full reset in between" protocol (the note's double-slot-isolation test
+    confirmed this gives the same numbers as fully independent slots, so
+    reusing it here is not re-opening a settled methodology question):
+    for each ``kv_len``, three independent fresh prefills of slot 0 (reset
+    -> ``prefill_with_aux`` -> the same fixed verify window), one per
+    variant (cg / eager / oracle). Greedy, deterministic model -> the three
+    prefills produce identical KV state and an identical first ("bonus")
+    token, asserted below before trusting any logits comparison.
+
+    GQA head-mapping calibration: sparkinfer's actual query-head-to-kv-head
+    convention lives in compiled CuTe device code, not visible from Python,
+    so ``DenseCausalOracleImpl`` cannot simply assume one. This function
+    calibrates it empirically at kv_len=64 -- the one point the prior note
+    already proved CG and eager agree on bit-exactly -- by running the
+    oracle with both ``"interleaved"`` (HF/vLLM ``repeat_kv`` convention)
+    and ``"blocked"`` mappings and keeping whichever one agrees with the
+    CG/eager consensus at that point (reported under ``"calibration"`` in
+    the returned report, so the choice is visible, not asserted). Every
+    other ``kv_len`` in ``kv_lens`` is then scored only against the
+    calibrated mapping.
+
+    Judgement to apply to the ``rows`` this returns:
+      - CG close to oracle, eager far -> eager is the wrong one (fix
+        direction 1 in the note: make eager collapse to one chunk too --
+        and go find out *why* sparkinfer's multi-chunk merge is wrong).
+      - eager close to oracle, CG far -> CG is wrong, and CG is what
+        production actually serves today -- treat as urgent, do not
+        silently proceed to a fix.
+      - both far from oracle -> the bug is not (only) in chunk count;
+        report as-is, do not force a conclusion.
+      - all three agree at 0.999991+ cosine (the historical "correct
+        kernel variant" bar recorded in
+        notes/2026-07-27-bfdiag-oracle-divergence.md) but argmax still
+        flips -> that is a near-tied-logit argmax flip, not the same
+        severity class as a real >>noise-level logit gap; say so
+        explicitly rather than let it read as confirming a bug.
+    """
+    import torch
+
+    from bfdiag.dense_attention_oracle import DenseCausalOracleImpl
+    from oracle.comparator import compare_values
+    from runtime.backends.dflash_constants import NUM_QUERY_PER_REQ
+
+    backend = engine.backend
+    captured_verify = engine._verify_cg
+    if captured_verify is None:
+        raise RuntimeError("DFlash verify CUDA Graph must be captured")
+
+    full_groups = [key for key in backend._layer_groups if key[0] == -1]
+    if not full_groups:
+        raise RuntimeError(
+            "diagnose_dflash_verify_dense_oracle requires a full-attention "
+            "(window_left=-1) layer group -- none found on this backend"
+        )
+    full_key = full_groups[0]
+    full_layer_names = backend._layer_groups[full_key]
+    _window_left, num_q_heads, num_kv_heads = full_key
+    head_dim = 128
+    scale = head_dim**-0.5
+
+    sfc = backend.static_forward_context
+    original_impls = {name: sfc[name].impl for name in full_layer_names}
+
+    def run_variant(*, kv_len: int, use_cg: bool, gqa_head_mapping: str | None) -> dict[str, Any]:
+        prompt_ids = historical_m1_prompt_ids(kv_len)
+        reset_dflash_workload_state(engine)
+        first_token, _aux = backend.prefill_with_aux(0, prompt_ids)
+        verify_tokens = [first_token] + [11] * (NUM_QUERY_PER_REQ - 1)
+        patched = gqa_head_mapping is not None
+        try:
+            if patched:
+                for name in full_layer_names:
+                    sfc[name].impl = DenseCausalOracleImpl(
+                        num_heads=num_q_heads,
+                        head_size=head_dim,
+                        scale=scale,
+                        num_kv_heads=num_kv_heads,
+                        gqa_head_mapping=gqa_head_mapping,
+                    )
+            if use_cg:
+                logits, _aux2 = engine._verify_cg.replay_with_aux(0, verify_tokens, kv_len)
+            else:
+                logits, _aux2 = engine._forward_verify_with_aux(
+                    0, verify_tokens, kv_len, len(verify_tokens)
+                )
+            torch.cuda.synchronize()
+        finally:
+            if patched:
+                for name in full_layer_names:
+                    sfc[name].impl = original_impls[name]
+        return {
+            "first_token": first_token,
+            "verify_tokens": list(verify_tokens),
+            "logits": logits.detach().float().cpu(),
+        }
+
+    def vs_reference(
+        reference: torch.Tensor, candidate: torch.Tensor, label: str
+    ) -> dict[str, Any]:
+        cmp = compare_values(reference.reshape(-1), candidate.reshape(-1), top_k=10)
+        argmax_ref = reference.argmax(dim=-1)
+        argmax_cand = candidate.argmax(dim=-1)
+        mismatch_positions = (argmax_ref != argmax_cand).nonzero().flatten().tolist()
+        return {
+            "label": label,
+            "cosine": cmp.cosine_similarity,
+            "max_abs_error": cmp.max_abs_error,
+            "mean_abs_error": cmp.mean_abs_error,
+            "top10_agreement": cmp.top_k_agreement,
+            "argmax_mismatch_positions": mismatch_positions,
+        }
+
+    try:
+        # -- Calibration at kv_len=64 (the prior note's proven bit-exact point) --
+        calib_cg = run_variant(kv_len=64, use_cg=True, gqa_head_mapping=None)
+        calib_eager = run_variant(kv_len=64, use_cg=False, gqa_head_mapping=None)
+        if calib_cg["verify_tokens"] != calib_eager["verify_tokens"]:
+            raise AssertionError("calibration: cg/eager prefill state diverged before kv_len=64")
+        calib_interleaved = run_variant(kv_len=64, use_cg=False, gqa_head_mapping="interleaved")
+        calib_blocked = run_variant(kv_len=64, use_cg=False, gqa_head_mapping="blocked")
+        calib_scores = {
+            "interleaved": compare_values(
+                calib_cg["logits"].reshape(-1), calib_interleaved["logits"].reshape(-1)
+            ).cosine_similarity,
+            "blocked": compare_values(
+                calib_cg["logits"].reshape(-1), calib_blocked["logits"].reshape(-1)
+            ).cosine_similarity,
+        }
+        gqa_head_mapping = max(calib_scores, key=calib_scores.__getitem__)
+        calibration = {
+            "kv_len": 64,
+            "cg_vs_eager_cosine": compare_values(
+                calib_cg["logits"].reshape(-1), calib_eager["logits"].reshape(-1)
+            ).cosine_similarity,
+            "oracle_interleaved_vs_cg_cosine": calib_scores["interleaved"],
+            "oracle_blocked_vs_cg_cosine": calib_scores["blocked"],
+            "chosen_gqa_head_mapping": gqa_head_mapping,
+        }
+
+        rows = []
+        for kv_len in kv_lens:
+            cg = run_variant(kv_len=kv_len, use_cg=True, gqa_head_mapping=None)
+            eager = run_variant(kv_len=kv_len, use_cg=False, gqa_head_mapping=None)
+            oracle = run_variant(kv_len=kv_len, use_cg=False, gqa_head_mapping=gqa_head_mapping)
+            if not (cg["verify_tokens"] == eager["verify_tokens"] == oracle["verify_tokens"]):
+                raise AssertionError(
+                    f"kv_len={kv_len}: cg/eager/oracle prefill state diverged before "
+                    "the comparison even started -- not a verify-path bug, a test-harness one"
+                )
+            rows.append(
+                {
+                    "kv_len": kv_len,
+                    "first_token": cg["first_token"],
+                    "cg_vs_oracle": vs_reference(oracle["logits"], cg["logits"], "cg"),
+                    "eager_vs_oracle": vs_reference(oracle["logits"], eager["logits"], "eager"),
+                    "cg_vs_eager": vs_reference(eager["logits"], cg["logits"], "cg_vs_eager"),
+                }
+            )
+    finally:
+        for name in full_layer_names:
+            sfc[name].impl = original_impls[name]
+        reset_dflash_workload_state(engine)
+
+    report = {
+        "window_left": _window_left,
+        "num_q_heads": num_q_heads,
+        "num_kv_heads": num_kv_heads,
+        "calibration": calibration,
+        "rows": rows,
+    }
+    with run_record(
+        script=__file__,
+        workload={
+            "contract": "dflash_verify_dense_oracle",
+            "kv_lens": list(kv_lens),
+            "gqa_head_mapping": gqa_head_mapping,
+        },
+    ) as rec:
+        artifacts = default_store().artifacts_dir(rec.run_id)
+        artifacts.mkdir(parents=True, exist_ok=True)
+        report_path = artifacts / "verify_dense_oracle.json"
+        report_path.write_text(json.dumps(report, indent=2, sort_keys=True))
+        rec.artifact("verify_dense_oracle", report_path)
+        rec.metric("calibration_cg_vs_eager_cosine", calibration["cg_vs_eager_cosine"])
+        for row in rows:
+            kv = row["kv_len"]
+            rec.metric(f"kv{kv}_cg_vs_oracle_cosine", row["cg_vs_oracle"]["cosine"])
+            rec.metric(f"kv{kv}_eager_vs_oracle_cosine", row["eager_vs_oracle"]["cosine"])
+        run_id = rec.run_id
+    return {"run_id": run_id, **report}
+
+
 def run_historical_m1_decode_cg(
     backend: Any,
     *,
