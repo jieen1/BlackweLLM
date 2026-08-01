@@ -1179,6 +1179,25 @@ async def list_models():
     }
 
 
+def _slot_kv_len(runner, slot: int) -> int:
+    """Read one slot's KV length from a runner, tolerating either shape.
+
+    LagunaBackend stores this as a list indexed by slot. Reading it as a
+    mapping is what broke /metrics under load (see the call site). Kept
+    permissive so a differently-shaped backend cannot turn an observability
+    endpoint into a 500 -- metrics must never be the thing that fails.
+    """
+    kv = getattr(runner, "slot_kv_len", None)
+    if kv is None:
+        return 0
+    try:
+        if isinstance(kv, dict):
+            return int(kv.get(slot, 0))
+        return int(kv[slot])
+    except (IndexError, KeyError, TypeError, ValueError):
+        return 0
+
+
 @app.get("/metrics")
 async def metrics_endpoint():
     """Prometheus-compatible metrics in the BlackweLLM namespace."""
@@ -1188,9 +1207,15 @@ async def metrics_endpoint():
     # not a dynamic BlockPool. Compute KV usage from active slot count.
     total_blocks = engine.num_slots * engine.blocks_per_slot
     active_slots = len(engine.active)
+    # LagunaBackend.slot_kv_len is a list indexed by slot, not a mapping. This
+    # read used `.get(s, 0)` and so raised AttributeError -- but only while
+    # `engine.active` was non-empty, which made /metrics return 500 exactly
+    # when the server was busy and 200 whenever it was idle. Observed live
+    # 2026-08-01 during a 68 s request; every idle scrape either side of it
+    # succeeded, which is what kept it hidden.
     used_blocks = (
         sum(
-            (runner.slot_kv_len.get(s, 0) + engine.block_size - 1) // engine.block_size
+            (_slot_kv_len(runner, s) + engine.block_size - 1) // engine.block_size
             for s in engine.active
         )
         if hasattr(runner, "slot_kv_len")

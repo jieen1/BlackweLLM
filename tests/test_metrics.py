@@ -1,5 +1,7 @@
 """D2: tests for server/metrics.py — Prometheus-style metrics."""
 
+import pytest
+
 import server.metrics as M
 
 
@@ -172,3 +174,45 @@ class TestD2Metrics:
         output = M.render_d2_metrics()
         assert "blackwellm:prefix_cache_hits_total 0" in output
         assert "blackwellm:prefix_cache_misses_total 0" in output
+
+
+class TestMetricsUnderLoad:
+    """/metrics must not 500 while the server is busy.
+
+    `LagunaBackend.slot_kv_len` is a list indexed by slot; the endpoint read
+    it as a mapping. The expression only evaluates for slots in
+    `engine.active`, so an idle server scraped fine and a busy one returned
+    500 -- observed live 2026-08-01 during a 68 s request, with successful
+    scrapes either side of it hiding the failure.
+    """
+
+    def test_slot_kv_len_reads_a_list_backend(self):
+        pytest.importorskip("fastapi")
+        from server.app import _slot_kv_len
+
+        class _ListRunner:
+            slot_kv_len = [0, 4096, 0]
+
+        assert _slot_kv_len(_ListRunner(), 1) == 4096
+
+    def test_slot_kv_len_tolerates_a_mapping_backend(self):
+        pytest.importorskip("fastapi")
+        from server.app import _slot_kv_len
+
+        class _DictRunner:
+            slot_kv_len = {1: 4096}
+
+        assert _slot_kv_len(_DictRunner(), 1) == 4096
+
+    def test_slot_kv_len_never_raises_for_an_unknown_slot(self):
+        pytest.importorskip("fastapi")
+        from server.app import _slot_kv_len
+
+        class _ListRunner:
+            slot_kv_len = [0]
+
+        class _NoAttr:
+            pass
+
+        assert _slot_kv_len(_ListRunner(), 99) == 0
+        assert _slot_kv_len(_NoAttr(), 0) == 0
