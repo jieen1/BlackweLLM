@@ -30,7 +30,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from runtime.sampling import SamplingParams
-from runtime.structured_output import GrammarState, ResponseFormat
 from server.tracing import tracer
 
 os.environ.setdefault("USE_LIBUV", "0")
@@ -120,7 +119,6 @@ class GenerationRequest:
     session_id: str | None = None
     stream_channel: StreamChannel | None = None
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
-    response_format: dict | None = None
     logprobs: bool = False
     top_logprobs: int = 0
 
@@ -463,7 +461,6 @@ class ServerEngine:
         max_tokens: int,
         session_id: str | None = None,
         sampling_params: SamplingParams | None = None,
-        response_format: dict | None = None,
         logprobs: bool = False,
         top_logprobs: int = 0,
     ) -> dict:
@@ -477,7 +474,6 @@ class ServerEngine:
             future=fut,
             session_id=session_id,
             sampling_params=sampling_params or SamplingParams(),
-            response_format=response_format,
             logprobs=logprobs,
             top_logprobs=top_logprobs,
         )
@@ -495,7 +491,6 @@ class ServerEngine:
         session_id: str | None = None,
         sampling_params: SamplingParams | None = None,
         cancel_ref: list | None = None,
-        response_format: dict | None = None,
         logprobs: bool = False,
         top_logprobs: int = 0,
     ):
@@ -516,7 +511,6 @@ class ServerEngine:
             session_id=session_id,
             stream_channel=channel,
             sampling_params=sampling_params or SamplingParams(),
-            response_format=response_format,
             logprobs=logprobs,
             top_logprobs=top_logprobs,
         )
@@ -687,12 +681,6 @@ class ServerEngine:
             "start_time": time.perf_counter(),
         }
         tracer.request_admitted(req.request_id, slot, len(req.prompt_ids))
-        # C3: initialize grammar state for structured output
-        fmt = ResponseFormat.from_api(req.response_format)
-        if fmt.is_constrained:
-            self.active[slot]["grammar"] = GrammarState(fmt, self.tok)
-        else:
-            self.active[slot]["grammar"] = None
 
     def _finish_request(
         self,
@@ -981,12 +969,17 @@ class ServerEngine:
 
         # -- decode round (hot path, zero wait) --
         active_slots = list(self.active.keys())
-        # C3: structured output requests use sampled path with grammar masking
-        grammar_slots = [s for s in active_slots if self.active[s].get("grammar") is not None]
+        # N1: structured output (json_object/json_schema) is rejected at
+        # the API layer (server/app.py::_reject_unsupported_response_format)
+        # rather than routed here -- see docs/api-layer-design.md §7.1 for
+        # why grammar-masking has no reachable hook in this decode loop.
+        # grammar_slots stays permanently empty; classify_decode_slots keeps
+        # the parameter (still covered by tests/test_laguna_server_integration.py)
+        # for the day a real implementation lands.
         # E1: a backend with no MTP (e.g. Laguna) routes every slot through
         # the sampled path regardless of is_greedy -- see classify_decode_slots.
         greedy_slots, sampled_slots = classify_decode_slots(
-            active_slots, self.active, grammar_slots, self.runner.has_speculative_decode
+            active_slots, self.active, [], self.runner.has_speculative_decode
         )
 
         self.stats["rounds"] += 1
@@ -1051,10 +1044,6 @@ class ServerEngine:
                 st["last_progress_round"] = self.stats["rounds"]
                 if lp_batch is not None and st["req"].logprobs:
                     st.setdefault("logprobs_acc", []).append(lp_batch[i])
-                # C3: advance grammar state
-                grammar = st.get("grammar")
-                if grammar is not None:
-                    grammar.accept(tok)
                 if req.stream_channel is not None:
                     self._stream_put(req.stream_channel, [tok])
                 if len(st["committed_tokens"]) >= req.max_tokens:
@@ -1120,11 +1109,6 @@ class ServerEngine:
                 if finish_reason is None:
                     st["anchor"] = decision["next_anchor"]
                     st["drafts"] = decision["next_draft_tokens"]
-                    # C3: advance grammar state for committed tokens
-                    grammar = st.get("grammar")
-                    if grammar is not None:
-                        for _t in kept:
-                            grammar.accept(_t)
                     tracer.decode_round(req.request_id, self.stats["rounds"], len(kept), _round_ms)
                     continue
 

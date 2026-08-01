@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from runtime.sampling import SamplingParams
+from runtime.structured_output import ResponseFormat
 from server import metrics
 from server.engine import ServerEngine
 from server.formats import anthropic as anthropic_format
@@ -487,6 +488,41 @@ def _validate_and_resolve_max_tokens(max_tokens: int | None) -> int:
     return resolved
 
 
+def _reject_unsupported_response_format(response_format: dict | None) -> None:
+    """N1: structured output (``json_object`` / ``json_schema``) has no
+    working enforcement path in this runtime -- see
+    docs/api-layer-design.md §7.1. The only reachable masking hook
+    (``runtime/sampling.py::sample_from_logits``) is never reached by:
+
+    - the prefill anchor token (the FIRST token of every request is a raw
+      unconstrained argmax inside ``runtime/backends/laguna.py``'s
+      ``prefill_chunked_begin``/``_forward``, with no ``SamplingParams``
+      involved at all);
+    - the CUDA-Graph decode replay path (greedy argmax is baked into the
+      captured graph itself);
+    - the plain eager ``if params.is_greedy: argmax(...)`` shortcut in
+      ``decode_batch_sampled`` (bypasses ``sample_from_logits`` entirely).
+
+    Since this runtime's default temperature is 0.0 (greedy) when a client
+    doesn't set one explicitly, EVERY one of those unreachable paths is
+    exactly the path a typical "give me guaranteed JSON" request (no
+    explicit temperature) takes, for every token including the first.
+    Wiring only the narrow reachable slice (temperature > 0, decode tokens
+    2+) would silently leave the common/default case completely
+    unconstrained while looking wired-in -- the same silent-failure shape
+    this check exists to eliminate, just relocated. Reject loudly instead.
+    """
+    fmt = ResponseFormat.from_api(response_format)
+    if fmt.is_constrained:
+        raise _invalid_request(
+            f"response_format type={fmt.type!r} is not supported: this runtime "
+            "does not enforce structured output (JSON mode / json_schema) during "
+            "generation -- passing it would silently return unconstrained plain "
+            "text, not a JSON guarantee. Omit response_format and validate/parse "
+            "JSON on the client side instead."
+        )
+
+
 def _validate_capacity(prompt_ids: list[int], max_tokens: int) -> None:
     # metrics.record_error is NOT called here: _http_exception_handler
     # records it once, uniformly, for every raised HTTPException -- an
@@ -606,6 +642,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         seed=req.seed,
         n=req.n,
     )
+    _reject_unsupported_response_format(req.response_format)
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
     t0 = time.perf_counter()
 
@@ -660,7 +697,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 session_id=req.session_id,
                 sampling_params=sampling_params,
                 cancel_ref=_cancel_ref,
-                response_format=req.response_format,
                 logprobs=bool(req.logprobs),
                 top_logprobs=req.top_logprobs or 0,
             ):
@@ -842,6 +878,7 @@ async def completions(req: CompletionRequest, request: Request):
         seed=req.seed,
         n=req.n,
     )
+    _reject_unsupported_response_format(req.response_format)
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
     t0 = time.perf_counter()
     prompt_ids = await _tokenize_encode(engine, req.prompt)
