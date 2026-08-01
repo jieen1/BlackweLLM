@@ -612,6 +612,46 @@ class LagunaBackend:
         torch.cuda.synchronize(self.device)
         del logits
 
+    def declare_verify_capacity(self, max_query_len: int) -> None:
+        """Let a mode="verify" caller (DFlash's eager verify fallback, via
+        DFlashEngine.__init__) use this backend's shared per-layer-group
+        SparkinferPrefillWorkspace instances without under-provisioning
+        their capacity.
+
+        ``LagunaBackend`` itself has no concept of DFlash or verify traffic
+        -- it is constructed before ``DFlashEngine`` exists and never calls
+        ``mode="verify"`` on its own. This method exists purely so the
+        caller who DOES know the real bound (DFlash's fixed
+        ``NUM_QUERY_PER_REQ`` verify window) can declare it onto the
+        already-built workspaces, the same way ``_prefill_capacity_by_
+        window_left`` declares extend/decode's bound at construction time.
+        See ``SparkinferPrefillWorkspace.declare_verify_capacity`` (laguna_
+        sparkinfer_attn.py) and notes/2026-08-01-c1-c2-gpu-investigation.md
+        for why an undeclared capacity is a loud ``RuntimeError`` on the
+        first real verify call, not a silent guess.
+
+        Idempotent and safe to call multiple times (e.g. once per DFlash
+        engine, or defensively before every generation) -- capacity only
+        ever grows (``SparkinferPrefillWorkspace.declare_verify_capacity``
+        takes the max), never shrinks.
+        """
+        seen_ids: set[int] = set()
+        declared = 0
+        for layer_names in self._layer_groups.values():
+            impl = self.static_forward_context[layer_names[0]].impl
+            ws = getattr(impl, "_prefill_ws", None)
+            if ws is None or id(ws) in seen_ids:
+                continue
+            seen_ids.add(id(ws))
+            ws.declare_verify_capacity(max_query_len)
+            declared += 1
+        logger.info(
+            "Laguna: declared verify capacity (max_query_len=%d) on %d "
+            "shared prefill workspace group(s)",
+            max_query_len,
+            declared,
+        )
+
     def warmup_paged_attention_shapes(self, *, slot: int = 0) -> None:
         """Proactively compile each layer group's paged-attention JIT kernel.
 

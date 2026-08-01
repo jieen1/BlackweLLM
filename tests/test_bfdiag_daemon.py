@@ -796,11 +796,18 @@ class TestHotColdBoundary:
         # Documents the exact, code-verified list (see provider.py's
         # comment citing runtime/backends/laguna*.py line numbers) --
         # changing this set should be a deliberate, reviewed edit.
+        #
+        # QSR_DFLASH_REQUIRE_CG / QSR_DFLASH_DEBUG_FORCE_CG_FAIL added
+        # alongside the C-1 capacity fix (see
+        # notes/2026-08-01-c1-c2-gpu-investigation.md): both are read once
+        # into DFlashEngine.__init__ (_require_cg / _debug_force_cg_fail).
         assert LOAD_TIME_ENV_VARS == {
             "QSR_PREFILL_CHUNK",
             "QSR_DECODE_CUDA_GRAPH",
             "QSR_DFLASH_CUDA_GRAPH",
             "QSR_VERIFY_CUDA_GRAPH",
+            "QSR_DFLASH_REQUIRE_CG",
+            "QSR_DFLASH_DEBUG_FORCE_CG_FAIL",
         }
 
     def test_fake_provider_describe_exposes_load_config(self):

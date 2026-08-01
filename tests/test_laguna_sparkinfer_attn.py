@@ -248,3 +248,223 @@ def test_prefill_workspace_never_rebuilds_across_varying_real_shapes(monkeypatch
         "new real shape -- this reintroduces the per-shape JIT recompile bug "
         "(see notes/2026-08-01-prefill-shape-buckets-root-cause.md)"
     )
+
+
+def test_prefill_workspace_verify_mode_without_declared_capacity_raises_loud_error():
+    """Regression test for the C-1 capacity bug (notes/2026-08-01-c1-c2-gpu-
+    investigation.md): before the fix, mode="verify" silently reused the
+    extend-shaped eager_extend_work_items_capacity() estimate, which
+    under-provisions verify's real work-item need and only surfaced as
+    sparkinfer's own opaque `ValueError: fixed-capacity paged workspace
+    exceeded` deep inside _ensure_capacity -- confirmed on real GPU via a
+    direct call to DFlashEngine._forward_verify_with_aux (run record
+    940b708aa0f8). After the fix, calling mode="verify" before
+    declare_verify_capacity() raises a clear, actionable RuntimeError from
+    this class itself, without ever reaching sparkinfer.
+    """
+    pytest.importorskip("sparkinfer")
+
+    workspace = SparkinferPrefillWorkspace(
+        torch.device("cpu"), max_total_q=8192, max_page_table_width=4096
+    )
+    q = torch.empty(16, 48, 128)
+    cache = torch.empty(4096, 64, 8, 128)
+    output = torch.empty_like(q)
+
+    with pytest.raises(RuntimeError, match="declare_verify_capacity"):
+        workspace.forward(
+            q=q,
+            k_cache=cache,
+            v_cache=cache,
+            output=output,
+            page_table=torch.empty(1, 32, dtype=torch.int32),
+            cache_seqlens=torch.empty(1, dtype=torch.int32),
+            cu_seqlens_q=torch.empty(2, dtype=torch.int32),
+            mode="verify",
+            window_left=-1,
+            plan_cache_key=object(),
+        )
+
+
+def test_declare_verify_capacity_rejects_degenerate_query_len():
+    workspace = SparkinferPrefillWorkspace(
+        torch.device("cpu"), max_total_q=8192, max_page_table_width=4096
+    )
+    with pytest.raises(ValueError, match="max_query_len"):
+        workspace.declare_verify_capacity(1)
+    with pytest.raises(ValueError, match="max_query_len"):
+        workspace.declare_verify_capacity(0)
+
+
+def test_declare_verify_capacity_is_monotonic():
+    workspace = SparkinferPrefillWorkspace(
+        torch.device("cpu"), max_total_q=8192, max_page_table_width=4096
+    )
+    workspace.declare_verify_capacity(16)
+    workspace.declare_verify_capacity(8)  # must not shrink an already-declared bound
+    assert workspace._max_verify_query_len == 16
+
+    workspace2 = SparkinferPrefillWorkspace(
+        torch.device("cpu"), max_total_q=8192, max_page_table_width=4096
+    )
+    workspace2.declare_verify_capacity(8)
+    workspace2.declare_verify_capacity(16)
+    assert workspace2._max_verify_query_len == 16
+
+
+def test_prefill_workspace_verify_mode_uses_verify_capacity_planner(monkeypatch):
+    """Once capacity is declared, mode="verify" must ask sparkinfer's own
+    verify-graph capacity planner (plan_verify_graph_capacity) for
+    max_work_items/max_partial_rows -- never the extend-shaped
+    eager_extend_work_items_capacity heuristic that under-provisioned it.
+    """
+    pytest.importorskip("sparkinfer")
+    calls: list[str] = []
+
+    class FakeWorkspace:
+        @staticmethod
+        def eager_extend_work_items_capacity(**kwargs):
+            calls.append("eager_extend_work_items_capacity")
+            return 1  # would be silently wrong for verify if ever reached
+
+        @classmethod
+        def for_fixed_capacity(cls, **kwargs):
+            calls.append("workspace")
+            assert kwargs["max_work_items"] == 4321
+            assert kwargs["max_partial_rows"] == 99
+            return cls()
+
+        def _ensure_capacity(self, plan):
+            pass
+
+        def _copy_runtime_metadata(self, *args):
+            pass
+
+        def _copy_plan_metadata(self, plan):
+            pass
+
+    def fake_plan_verify_graph_capacity(**kwargs):
+        calls.append("plan_verify_graph_capacity")
+        assert kwargs["query_len"] == 16
+        assert kwargs["batch"] == 1
+        assert kwargs["window_left"] == -1
+        return SimpleNamespace(max_work_items=4321, max_partial_rows=99)
+
+    monkeypatch.setattr(
+        "sparkinfer.attention.paged.workspace.PagedAttentionWorkspace",
+        FakeWorkspace,
+    )
+    monkeypatch.setattr(
+        "sparkinfer.attention.paged.planner.plan_verify_graph_capacity",
+        fake_plan_verify_graph_capacity,
+    )
+    monkeypatch.setattr(
+        "sparkinfer.attention.paged.planner.create_paged_plan",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.attention.paged._scratch.build_paged_attention_binding",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.attention.paged._forward.paged_attention_forward",
+        lambda *, binding: None,
+    )
+
+    workspace = SparkinferPrefillWorkspace(
+        torch.device("cpu"), max_total_q=8192, max_page_table_width=4096
+    )
+    workspace.declare_verify_capacity(16)
+
+    q = torch.empty(16, 48, 128)
+    cache = torch.empty(4096, 64, 8, 128)
+    output = torch.empty_like(q)
+    workspace.forward(
+        q=q,
+        k_cache=cache,
+        v_cache=cache,
+        output=output,
+        page_table=torch.empty(1, 32, dtype=torch.int32),
+        cache_seqlens=torch.empty(1, dtype=torch.int32),
+        cu_seqlens_q=torch.empty(2, dtype=torch.int32),
+        mode="verify",
+        window_left=-1,
+        plan_cache_key=object(),
+    )
+
+    assert calls.count("plan_verify_graph_capacity") == 1
+    assert calls.count("eager_extend_work_items_capacity") == 0, (
+        "mode='verify' must not size its fixed capacity via the extend-shaped "
+        "estimator -- that is exactly the C-1 under-provisioning bug"
+    )
+    assert calls.count("workspace") == 1
+
+
+def test_prefill_workspace_extend_mode_still_uses_eager_extend_heuristic(monkeypatch):
+    """Non-regression check: extend/decode must keep using
+    eager_extend_work_items_capacity (unchanged from before the C-1 fix) --
+    only verify's capacity source changed.
+    """
+    pytest.importorskip("sparkinfer")
+    calls: list[str] = []
+
+    class FakeWorkspace:
+        @staticmethod
+        def eager_extend_work_items_capacity(**kwargs):
+            calls.append("eager_extend_work_items_capacity")
+            return 42
+
+        @classmethod
+        def for_fixed_capacity(cls, **kwargs):
+            calls.append("workspace")
+            assert kwargs["max_work_items"] == 42
+            assert kwargs["max_partial_rows"] == 0
+            return cls()
+
+        def _ensure_capacity(self, plan):
+            pass
+
+        def _copy_runtime_metadata(self, *args):
+            pass
+
+        def _copy_plan_metadata(self, plan):
+            pass
+
+    monkeypatch.setattr(
+        "sparkinfer.attention.paged.workspace.PagedAttentionWorkspace",
+        FakeWorkspace,
+    )
+    monkeypatch.setattr(
+        "sparkinfer.attention.paged.planner.create_paged_plan",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.attention.paged._scratch.build_paged_attention_binding",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.attention.paged._forward.paged_attention_forward",
+        lambda *, binding: None,
+    )
+
+    workspace = SparkinferPrefillWorkspace(
+        torch.device("cpu"), max_total_q=8192, max_page_table_width=4096
+    )
+    q = torch.empty(512, 48, 128)
+    cache = torch.empty(4096, 64, 8, 128)
+    output = torch.empty_like(q)
+    workspace.forward(
+        q=q,
+        k_cache=cache,
+        v_cache=cache,
+        output=output,
+        page_table=torch.empty(1, 32, dtype=torch.int32),
+        cache_seqlens=torch.empty(1, dtype=torch.int32),
+        cu_seqlens_q=torch.empty(2, dtype=torch.int32),
+        mode="extend",
+        window_left=-1,
+        plan_cache_key=object(),
+    )
+
+    assert calls.count("eager_extend_work_items_capacity") == 1
+    assert calls.count("workspace") == 1
