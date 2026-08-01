@@ -171,8 +171,22 @@ def build_response(
     input_tokens: int,
     output_tokens: int,
     cache_read_input_tokens: int = 0,
+    reasoning_content: str | None = None,
 ) -> dict:
-    """Build a non-streaming Anthropic Messages API response."""
+    """Build a non-streaming Anthropic Messages API response.
+
+    ``text`` must already have any reasoning span removed (e.g. via
+    ``StreamProcessor.content_text()``) -- this function only extracts
+    tool calls out of it. ``reasoning_content`` (when the server is
+    running with ``QSR_REASONING_MODE=expose``, the default) is surfaced
+    as a top-level ``reasoning_content`` field, NOT as a spec ``thinking``
+    content block: we cannot produce the cryptographic signature real
+    Anthropic thinking blocks carry, and shipping one anyway is what broke
+    Claude Desktop before (commit f13fd4a; "Directive: Do NOT re-add
+    thinking block emission without a valid signature source"). An
+    additive top-level field is ignored by permissive clients instead of
+    being validated as a member of the ``content`` block type union.
+    """
     visible_text, tool_calls = parse_tool_calls(text)
     stop_reason = "end_turn" if finish_reason == "stop" else "max_tokens"
 
@@ -185,7 +199,7 @@ def build_response(
     if not content_blocks:
         content_blocks.append({"type": "text", "text": ""})
 
-    return {
+    resp: dict[str, Any] = {
         "id": f"msg_{uuid.uuid4().hex[:24]}",
         "type": "message",
         "role": "assistant",
@@ -200,6 +214,9 @@ def build_response(
             "cache_read_input_tokens": cache_read_input_tokens,
         },
     }
+    if reasoning_content:
+        resp["reasoning_content"] = reasoning_content
+    return resp
 
 
 def build_sse_events(

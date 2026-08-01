@@ -61,8 +61,17 @@ def build_response(
     completion_tokens: int,
     committed_token_ids: list[int] | None = None,
     prompt_token_ids: list[int] | None = None,
+    reasoning_content: str | None = None,
 ) -> dict:
-    """Build a non-streaming OpenAI chat completion response."""
+    """Build a non-streaming OpenAI chat completion response.
+
+    ``text`` must already have any reasoning span removed (e.g. via
+    ``StreamProcessor.content_text()``) -- this function only extracts
+    tool calls out of it. ``reasoning_content`` (when the server is
+    running with ``QSR_REASONING_MODE=expose``, the default) is surfaced
+    as ``message.reasoning_content``, mirroring vLLM's ``--reasoning-parser``
+    convention -- never mixed into ``content``.
+    """
     visible_text, tool_calls = parse_tool_calls(text)
 
     message: dict[str, Any] = {"role": "assistant"}
@@ -73,6 +82,8 @@ def build_response(
     else:
         message["content"] = visible_text
     message["refusal"] = None
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
 
     resp: dict[str, Any] = {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",

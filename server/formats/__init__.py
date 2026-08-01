@@ -4,7 +4,11 @@ This package handles ALL input/output format conversion between external
 API formats (OpenAI, Anthropic) and the internal engine representation.
 
 Sub-modules:
-- thinking: strip thinking/reasoning blocks from model output
+- thinking: reasoning-span detection (find_reasoning_span) + <usage>
+  artifact stripping; strip_thinking() is the text-only QSR_REASONING_MODE
+  =strip helper
+- stream: StreamProcessor -- the stateful reasoning/content/tool-call state
+  machine both the streaming and non-streaming response paths reuse
 - content: parse flexible content fields (string | array of blocks)
 - tools: parse tool calls from model XML output, format for each API
 - openai: OpenAI Chat Completions request/response formatting
