@@ -8,7 +8,7 @@
 > - **M3（2026-Q4）弹性与平台化**：动态 KV 分配 · 模型抽象层 · Qwen3 系列接入 · Laguna L2 Backend 接入（过质量链）· 去 vLLM 化 V2 按证据推进
 > - **M4（2027-H1）新模型与扩展**：Laguna L3 性能专项（DFlash 投机 · MoE dispatch · NVFP4 autotune 扩展）· sm120-runtime-core 收敛 + 零依赖门禁（V3）· 自动回退
 >
-> 编制于 2026-07-22；同日修订：并入 HY3 调研现状 + 新增 B7「去 vLLM 化」主线（分步混合 + 证据拉动替换）；三修：第二租户目标模型改为 Laguna-S-2.1-NVFP4；四修（07-23）：新增 Track F 开源发布主线——**全开源决策 + BlackForge 命名统一**（已于 2026-07-25 进一步更名为 **BlackweLLM**，见第 9 节 F1）；五修（07-25）：Laguna sparkinfer 自研 kernel 冲刺复盘——MoE/attention 两大 kernel 均已脱离通用实现，但 server 生产集成（L2）与 vLLM 对比方法论明显落后于 kernel 进度，详见执行看板与第 8 节 E3。配套架构文档见 [architecture.md](architecture.md)。
+> 编制于 2026-07-22；同日修订：并入 HY3 调研现状 + 新增 B7「去 vLLM 化」主线（分步混合 + 证据拉动替换）；三修：第二租户目标模型改为 Laguna-S-2.1-NVFP4；四修（07-23）：新增 Track F 开源发布主线——**全开源决策 + BlackForge 命名统一**（已于 2026-07-25 进一步更名为 **BlackweLLM**，见第 9 节 F1）；五修（07-25）：Laguna sparkinfer 自研 kernel 冲刺复盘——MoE/attention 两大 kernel 均已脱离通用实现，但 server 生产集成（L2）与 vLLM 对比方法论明显落后于 kernel 进度，详见执行看板与第 8 节 E3。配套架构文档见 [architecture.md](2026-07-30-architecture-two-tenant.md)。
 
 ## 目录
 
@@ -159,7 +159,7 @@ flowchart LR
 1. **独立建仓门禁（V1 末）**——干净 venv 中以 **pinned 官方 vLLM（v0.25.x）** 为可选依赖完成可复现安装与启动，依赖面收口到 `compat_vllm.py` 单点；
 2. **零依赖门禁（V3，方向而非截止日）**——厚依赖**按证据逐个退出**：性能证据拉动（profiling 占比 + SM120/模型专用化空间，如 A1a→GDN、A2→NVFP4 GEMM，与 decode attention 自研同一路径）或平台证据拉动（E1 抽象层需要自有模型图、core 抽取），每项替换单独过 golden fixtures parity 与各自收益门禁；**vLLM 中已足够好又不挡路的部分可无限期停留在界面之后**。这正是 OpRegistry「逐个替换」哲学从 kernel 层到整个依赖面的推广。
 
-**终态收敛蓝图**见 [architecture.md 第 3 节「终态架构：完全剥离 vLLM 之后」](architecture.md#3-终态架构完全剥离-vllm-之后)：终态分层图、逐项替换映射表（每个 vLLM 触点 → 终态组件 → 拉动信号）、ForwardContext 显式状态流、权重加载流水线与迁移不变量——每一次 V2 替换都必须落在该蓝图的某个格子里。
+**终态收敛蓝图**见 [architecture.md 第 3 节「终态架构：完全剥离 vLLM 之后」](2026-07-30-architecture-two-tenant.md#3-终态架构完全剥离-vllm-之后)：终态分层图、逐项替换映射表（每个 vLLM 触点 → 终态组件 → 拉动信号）、ForwardContext 显式状态流、权重加载流水线与迁移不变量——每一次 V2 替换都必须落在该蓝图的某个格子里。
 
 依赖分级（不做「重写一个 vLLM」）：
 
@@ -249,7 +249,7 @@ B7 与 **B5（runner 模块化）、E1（模型抽象层）、A2（NVFP4 GEMM）
 
 | 阶段 | 内容 | 门禁（合入/晋级标准） | 里程碑 |
 |---|---|---|---|
-| **L0** 本地调研合同 | ✅ **已关（2026-07-22）**：[notes/2026-07-22-laguna-l0-memory-budget.md](../notes/2026-07-22-laguna-l0-memory-budget.md)——权重实测 66.96 GiB（14 分片齐）、12 全局层 + 36 滑窗层实证、KV 增长 24 KiB/token；**07-23 复验发现**首版 `LagunaBackend` 未实现环形 KV（48 层一律按满上下文分页，96 KiB/token，账本失真 4×），**07-24 已补上 SWA 环形 KV**（`laguna.py` 的 `_ring_blocks_per_slot`/`_ring_slots_per_slot`），账本恢复有效 | 账本 ✅；冒烟通过或明确版本要求后 L0 关账 | ✅ 已关 |
+| **L0** 本地调研合同 | ✅ **已关（2026-07-22）**：[notes/2026-07-22-laguna-l0-memory-budget.md](../../notes/2026-07-22-laguna-l0-memory-budget.md)——权重实测 66.96 GiB（14 分片齐）、12 全局层 + 36 滑窗层实证、KV 增长 24 KiB/token；**07-23 复验发现**首版 `LagunaBackend` 未实现环形 KV（48 层一律按满上下文分页，96 KiB/token，账本失真 4×），**07-24 已补上 SWA 环形 KV**（`laguna.py` 的 `_ring_blocks_per_slot`/`_ring_slots_per_slot`），账本恢复有效 | 账本 ✅；冒烟通过或明确版本要求后 L0 关账 | ✅ 已关 |
 | **L1** pinned-vLLM 冒烟租户 | ✅ **已关（2026-07-22/23）**：`get_model` 加载 Laguna + eager 正确性 4/4（`laguna_l1_correctness.json`/`laguna_quality_gate.json`），MARLIN/CUTLASS 基线吞吐入库 | 固定 prompt 集与 oracle 一致；基线数字可复现 | ✅ 已关 |
 | **L2** LagunaBackend 接入 | 🟡 **半开**：E1 抽象层已落地（`ModelSpec`/`Qwen36Backend`/`LagunaBackend`），`server/engine.py` 已有 `backend="qwen36"｜"laguna"` 分派 + 双协议接线（Lane 1，2026-07-23，CPU-only，12/12 结构测试 + 全仓库回归绿），poolside_v1 工具调用/思考解析已按 chat_template 适配。**但**：`_load_laguna_model` 至今**从未跑过真实 GPU 请求**；`enable_cudagraph=0`、`moe_backend="marlin"` 硬编码在 server 路径里，07-24/25 的 sparkinfer/CUDA Graph/DFlash 成果（Lane 2）尚未合并进来；质量链（oracle 逐层 → A/B → SWE-bench 对标）未跑 | 新增模型不改 runner 核心；Qwen 路径 bit 级不变；质量链全绿；**新增：一次真实 GPU 端到端冒烟** | M3（L，**当前最高优先级缺口**） |
 | **L3** 性能专项 | 🟡 **kernel 级证据已出，组合证据未出**：sparkinfer MoE 替换 MARLIN/CUTLASS（CUDA Graph 下 4.8× vs CUTLASS eager，B12x 因 SM121 MMA guard 确认死路已删除）；sparkinfer paged attention 替换 FlashInfer（4K 微跑赢 vLLM 70.5，64K 仍落后 0.95×）；block_size 16→64、split-KV、decode CG batch=1 路径落地。DFlash（K=15）已集成但**仍用 FlashInfer attention**（未随主路径切 sparkinfer），128K+ 场景 acceptance 与 prefill 分块对齐仍有已知问题（`swa_fix_benchmark_20260725.json` known_issues）；expert offload 未触发（L0 账本仍判定不需要） | 每项按既有收益门禁结算（A2 端到端 ≥1% / kernel 项 profiling 准入）；投机按 accepted tok/s 净收益；**新增：DFlash K=15 全开、128K/200K 真实工作负载下与 vLLM 的可比对标**（现有对比要么未开 DFlash，要么 vLLM 进程 crash，见执行看板） | M4（L） |

@@ -7,7 +7,7 @@
 >
 > 本文档编制于 2026-07-22，基于 README、《项目实施规划》、notes/ 设计文档及对 `server/`、`runtime/` 源码的逐文件调研。性能与质量数据均可由 `benchmarks/` 内脚本复现。文档同时描述**现状架构**（第 2 节）与**完全剥离 vLLM 后的终态架构**（第 3 节）——后者是路线图 B7 主线所有替换工作的收敛方向。
 >
-> **2026-07-25 修订**：`runtime/backends/` 已成为真实的第二租户目录——`Qwen36Backend`（E1 Phase 2 抽取）与 `LagunaBackend`（poolside Laguna-S-2.1，自研 sparkinfer MoE + attention kernel）并存，`server/engine.py` 已能按 `backend=` 分派。第 2 节按现状更新；差距与待办见 [roadmap.md 执行看板](roadmap.md#0-执行看板先做什么2026-07-22-复盘)。
+> **2026-07-25 修订**：`runtime/backends/` 已成为真实的第二租户目录——`Qwen36Backend`（E1 Phase 2 抽取）与 `LagunaBackend`（poolside Laguna-S-2.1，自研 sparkinfer MoE + attention kernel）并存，`server/engine.py` 已能按 `backend=` 分派。第 2 节按现状更新；差距与待办见 [roadmap.md 执行看板](2026-07-26-roadmap-vllm-removal.md#0-执行看板先做什么2026-07-22-复盘)。
 
 ## 目录
 
@@ -488,4 +488,4 @@ STEM 强、人文偏弱是模型本身画像（同权重 stock vLLM 得分相同
 
 ### 13.3 路线图
 
-后续规划（性能深挖、去 vLLM 化 B7 主线、架构弹性化、兼容层补全、观测性加固、多模型支持）详见 [roadmap.md](roadmap.md)。其中第 3 节的终态架构即 B7 的收敛蓝图：V1 阶段完成全部「薄依赖」替换与依赖收口，V2 按证据拉动逐个落地 3.2 节映射表中的厚组件，V3 关闭零依赖门禁。
+后续规划（性能深挖、去 vLLM 化 B7 主线、架构弹性化、兼容层补全、观测性加固、多模型支持）详见 [roadmap.md](2026-07-26-roadmap-vllm-removal.md)。其中第 3 节的终态架构即 B7 的收敛蓝图：V1 阶段完成全部「薄依赖」替换与依赖收口，V2 按证据拉动逐个落地 3.2 节映射表中的厚组件，V3 关闭零依赖门禁。
