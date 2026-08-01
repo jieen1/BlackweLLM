@@ -14,11 +14,13 @@ exclusive) and parses accordingly. This module parses that text into
 structured tool-call objects and formats them for each API style
 (OpenAI / Anthropic).
 
-Streaming incremental deltas (``server/formats/stream.py``'s
-``drain_tool_deltas``) are NOT covered by this -- they only recognize
-Qwen's ``<function=`` shape mid-generation. A Laguna tool call still
-resolves correctly in the final response (``StreamProcessor.finalize()``
-calls ``parse_tool_calls``), it just won't stream incrementally yet.
+``parse_qwen_params``/``parse_poolside_args`` (the per-shape arg-block
+parsers) are also used directly by ``server/formats/stream.py``'s
+``drain_tool_deltas`` for streaming responses, so a tool call's arguments
+are parsed identically whether the request was streamed or not, and the
+streamed ``function.arguments`` delta is always valid JSON (never the raw
+``<parameter=>``/``<arg_key>`` XML -- see ``drain_tool_deltas`` for why that
+distinction matters).
 """
 
 from __future__ import annotations
@@ -79,6 +81,29 @@ def _parse_value(raw: str) -> Any:
             return raw
 
 
+def parse_qwen_params(params_block: str) -> dict:
+    """Parse a Qwen ``<parameter=K>V</parameter>...`` block into an args dict.
+
+    Shared by the final-text parser below and the streaming incremental
+    parser (``server/formats/stream.py``) so the two never disagree on how
+    a given fragment decodes.
+    """
+    return {
+        m.group(1).strip(): _parse_value(m.group(2).strip())
+        for m in _QWEN_PARAM_RE.finditer(params_block)
+    }
+
+
+def parse_poolside_args(args_block: str) -> dict:
+    """Parse a Poolside ``<arg_key>K</arg_key><arg_value>V</arg_value>...``
+    block into an args dict. Shared with the streaming parser -- see
+    ``parse_qwen_params``."""
+    return {
+        m.group(1).strip(): _parse_value(m.group(2).strip())
+        for m in _POOLSIDE_ARG_RE.finditer(args_block)
+    }
+
+
 def _parse_tool_call_block(block: str) -> dict | None:
     """Parse one ``<tool_call>...</tool_call>`` block's interior.
 
@@ -88,11 +113,7 @@ def _parse_tool_call_block(block: str) -> dict | None:
     func_match = _QWEN_FUNCTION_RE.search(block)
     if func_match:
         name = func_match.group(1).strip()
-        params_block = func_match.group(2)
-        arguments = {
-            m.group(1).strip(): _parse_value(m.group(2).strip())
-            for m in _QWEN_PARAM_RE.finditer(params_block)
-        }
+        arguments = parse_qwen_params(func_match.group(2))
         return {"name": name, "arguments": arguments}
 
     # Poolside shape: bare NAME, optionally followed by <arg_key>/<arg_value>
@@ -103,10 +124,7 @@ def _parse_tool_call_block(block: str) -> dict | None:
     if not _IDENTIFIER_RE.match(name):
         return None
     args_block = block[first_arg_idx:] if first_arg_idx >= 0 else ""
-    arguments = {
-        m.group(1).strip(): _parse_value(m.group(2).strip())
-        for m in _POOLSIDE_ARG_RE.finditer(args_block)
-    }
+    arguments = parse_poolside_args(args_block)
     return {"name": name, "arguments": arguments}
 
 

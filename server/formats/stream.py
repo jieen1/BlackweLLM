@@ -19,8 +19,15 @@ For API compatibility:
 
 from __future__ import annotations
 
+import json
+
 from server.formats.thinking import strip_thinking
-from server.formats.tools import find_tool_call_start, parse_tool_calls
+from server.formats.tools import (
+    find_tool_call_start,
+    parse_poolside_args,
+    parse_qwen_params,
+    parse_tool_calls,
+)
 
 _THINK_OPEN = chr(60) + "think" + chr(62)
 _THINK_CLOSE = chr(60) + "/think" + chr(62)
@@ -195,10 +202,25 @@ class StreamProcessor:
 
         Returns a list of delta events:
           - {"type": "name", "index": i, "name": "func_name", "id": "call_xxx"}
-          - {"type": "arguments_delta", "index": i, "delta": "...partial json..."}
+          - {"type": "arguments_delta", "index": i, "delta": "...json..."}
 
-        Enables streaming tool_call arguments as they are generated,
-        rather than freezing until the complete tool call is parsed.
+        The ``name`` event streams as soon as the function name is known.
+        ``arguments_delta`` is emitted exactly once per tool call, once its
+        block fully closes (``</function>`` / ``</tool_call>``) -- NOT
+        incrementally character-by-character. The model's on-the-wire shape
+        (Qwen's ``<parameter=K>V</parameter>``, Poolside's
+        ``<arg_key>K</arg_key><arg_value>V</arg_value>``) is XML-ish, not
+        JSON; streaming raw slices of it as "arguments_delta" (the previous
+        implementation) handed clients a concatenated string like
+        ``<arg_key>path</arg_key><arg_value>.</arg_value>`` where the
+        OpenAI/Anthropic wire formats require a JSON object string --
+        every OpenAI-compatible client fails to json-decode that. Emitting
+        the fully-parsed, ``json.dumps``-encoded arguments as a single delta
+        once the block is known-complete is what OpenAI's own "arguments
+        arrive as one or more chunks that concatenate to valid JSON"
+        contract requires; one whole-JSON chunk trivially satisfies it (and
+        remains valid even for a client that parses eagerly on every chunk,
+        unlike a genuinely-partial JSON prefix would).
 
         Recognizes both interior shapes (see server/formats/tools.py):
         Qwen's ``<function=NAME>...</function>`` and Laguna's poolside_v1
@@ -222,8 +244,8 @@ class StreamProcessor:
 
         if not hasattr(self, "_tool_names_emitted"):
             self._tool_names_emitted = set()
-        if not hasattr(self, "_tool_args_emitted_len"):
-            self._tool_args_emitted_len = {}
+        if not hasattr(self, "_tool_args_emitted"):
+            self._tool_args_emitted = set()
 
         search_start = 0
         tc_idx = 0
@@ -277,15 +299,16 @@ class StreamProcessor:
                     }
                 )
 
-            prev_len = self._tool_args_emitted_len.get(tc_idx, 0)
-            if len(args_so_far) > prev_len:
-                delta_text = args_so_far[prev_len:]
-                self._tool_args_emitted_len[tc_idx] = len(args_so_far)
+            if block_end >= 0 and tc_idx not in self._tool_args_emitted:
+                self._tool_args_emitted.add(tc_idx)
+                arguments = (
+                    parse_qwen_params(args_so_far) if is_qwen else parse_poolside_args(args_so_far)
+                )
                 deltas.append(
                     {
                         "type": "arguments_delta",
                         "index": tc_idx,
-                        "delta": delta_text,
+                        "delta": json.dumps(arguments, ensure_ascii=False),
                     }
                 )
 

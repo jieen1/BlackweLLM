@@ -301,26 +301,46 @@ class TestStreamToolDeltas:
         assert name_deltas[0]["name"] == "get_weather"
         assert name_deltas[0]["index"] == 0
 
-    def test_arguments_delta_incremental(self):
+    def test_arguments_delta_withheld_until_block_closes(self):
+        """No arguments_delta while </parameter></function> hasn't arrived
+        yet -- streaming a partial XML-ish fragment isn't valid JSON, so
+        there is nothing safe to emit until the whole block is parseable."""
         proc = StreamProcessor(_FakeTok())
         close_think = chr(60) + "/think" + chr(62)
         tc_open = chr(60) + "tool_call" + chr(62)
         func_open = chr(60) + "function=fn" + chr(62)
         param_open = chr(60) + "parameter=x" + chr(62)
-        # First chunk: name + partial args
-        proc.add_tokens(_ids("t" + close_think + tc_open + func_open + param_open + "12"))
+        proc.add_tokens(_ids("t" + close_think + tc_open + func_open + param_open + "1234"))
         proc.drain_content()
-        deltas1 = proc.drain_tool_deltas()
-        arg_deltas1 = [d for d in deltas1 if d["type"] == "arguments_delta"]
-        assert len(arg_deltas1) >= 1
-        # Second chunk: more args
-        proc.add_tokens(_ids("34"))
-        deltas2 = proc.drain_tool_deltas()
-        arg_deltas2 = [d for d in deltas2 if d["type"] == "arguments_delta"]
-        assert len(arg_deltas2) >= 1
-        # The second delta should only contain the new text
-        assert "34" in arg_deltas2[0]["delta"]
-        assert "12" not in arg_deltas2[0]["delta"]
+        deltas = proc.drain_tool_deltas()
+        assert [d for d in deltas if d["type"] == "arguments_delta"] == []
+
+    def test_arguments_delta_emitted_once_as_valid_json_on_close(self):
+        """Regression test: arguments_delta must be a JSON string, not the
+        raw <parameter=...> XML fragment (that XML, handed verbatim to an
+        OpenAI-compatible client as `function.arguments`, fails to
+        json-decode -- exactly the reported bug)."""
+        proc = StreamProcessor(_FakeTok())
+        close_think = chr(60) + "/think" + chr(62)
+        tc_open = chr(60) + "tool_call" + chr(62)
+        func_open = chr(60) + "function=fn" + chr(62)
+        param_open = chr(60) + "parameter=x" + chr(62)
+        param_close = chr(60) + "/parameter" + chr(62)
+        func_close = chr(60) + "/function" + chr(62)
+        proc.add_tokens(
+            _ids("t" + close_think + tc_open + func_open + param_open + "1234" + param_close)
+        )
+        proc.drain_content()
+        deltas = proc.drain_tool_deltas()  # "name" fires here; args must not
+        assert [d for d in deltas if d["type"] == "arguments_delta"] == []
+        proc.add_tokens(_ids(func_close))
+        deltas = proc.drain_tool_deltas()
+        arg_deltas = [d for d in deltas if d["type"] == "arguments_delta"]
+        assert len(arg_deltas) == 1
+        assert json.loads(arg_deltas[0]["delta"]) == {"x": 1234}
+        # Emitted exactly once -- a later drain for the same call is a no-op.
+        proc.add_tokens(_ids(""))
+        assert proc.drain_tool_deltas() == []
 
     def test_finalize_after_tool_deltas(self):
         proc = StreamProcessor(_FakeTok())
@@ -400,7 +420,9 @@ class TestStreamToolDeltasPoolside:
         assert len(name_deltas) == 1
         assert name_deltas[0]["name"] == "get_weather"
 
-    def test_arguments_delta_incremental(self):
+    def test_arguments_delta_withheld_until_block_closes(self):
+        """No arguments_delta while </tool_call> hasn't arrived yet --
+        streaming the raw <arg_key>/<arg_value> fragment isn't valid JSON."""
         proc = StreamProcessor(_FakeTok())
         close_think = chr(60) + "/think" + chr(62)
         tc_open = chr(60) + "tool_call" + chr(62)
@@ -417,19 +439,54 @@ class TestStreamToolDeltasPoolside:
                 + "x"
                 + arg_key_close
                 + arg_value_open
-                + "12"
+                + "1234"
             )
         )
         proc.drain_content()
-        deltas1 = proc.drain_tool_deltas()
-        arg_deltas1 = [d for d in deltas1 if d["type"] == "arguments_delta"]
-        assert len(arg_deltas1) >= 1
-        proc.add_tokens(_ids("34"))
-        deltas2 = proc.drain_tool_deltas()
-        arg_deltas2 = [d for d in deltas2 if d["type"] == "arguments_delta"]
-        assert len(arg_deltas2) >= 1
-        assert "34" in arg_deltas2[0]["delta"]
-        assert "12" not in arg_deltas2[0]["delta"]
+        deltas = proc.drain_tool_deltas()
+        assert [d for d in deltas if d["type"] == "arguments_delta"] == []
+
+    def test_arguments_delta_emitted_once_as_valid_json_on_close(self):
+        """Regression test for the reported bug: an OpenAI-compatible client
+        (Go's encoding/json, per the exact error text 'invalid character
+        <lt> looking for beginning of value') tried to json-decode
+        `function.arguments` and got the raw
+        `<arg_key>path</arg_key><arg_value>.</arg_value>` XML instead of
+        JSON. arguments_delta must carry valid, parseable JSON."""
+        proc = StreamProcessor(_FakeTok())
+        close_think = chr(60) + "/think" + chr(62)
+        tc_open = chr(60) + "tool_call" + chr(62)
+        tc_close = chr(60) + "/tool_call" + chr(62)
+        arg_key_open = chr(60) + "arg_key" + chr(62)
+        arg_key_close = chr(60) + "/arg_key" + chr(62)
+        arg_value_open = chr(60) + "arg_value" + chr(62)
+        arg_value_close = chr(60) + "/arg_value" + chr(62)
+        proc.add_tokens(
+            _ids(
+                "t"
+                + close_think
+                + tc_open
+                + "ls"
+                + arg_key_open
+                + "path"
+                + arg_key_close
+                + arg_value_open
+                + "."
+                + arg_value_close
+            )
+        )
+        proc.drain_content()
+        deltas = proc.drain_tool_deltas()  # "name" fires here; args must not
+        assert [d for d in deltas if d["type"] == "arguments_delta"] == []
+        proc.add_tokens(_ids(tc_close))
+        deltas = proc.drain_tool_deltas()
+        arg_deltas = [d for d in deltas if d["type"] == "arguments_delta"]
+        assert len(arg_deltas) == 1
+        assert "<arg_key>" not in arg_deltas[0]["delta"]
+        assert json.loads(arg_deltas[0]["delta"]) == {"path": "."}
+        # Emitted exactly once -- a later drain for the same call is a no-op.
+        proc.add_tokens(_ids(""))
+        assert proc.drain_tool_deltas() == []
 
     def test_finalize_after_tool_deltas(self):
         proc = StreamProcessor(_FakeTok())
@@ -475,3 +532,27 @@ class TestStreamToolDeltasPoolside:
         names = [d for d in deltas if d["type"] == "name"]
         assert [n["name"] for n in names] == ["foo", "bar"]
         assert [n["index"] for n in names] == [0, 1]
+
+    def test_multi_arg_call_and_second_call_both_get_valid_json(self):
+        """Multi-key-value regression: every key in a multi-arg call, and
+        every call in a multi-call round, must independently concatenate to
+        valid JSON -- not just the single-arg case above."""
+        proc = StreamProcessor(_FakeTok())
+        close_think = chr(60) + "/think" + chr(62)
+        tc_open = chr(60) + "tool_call" + chr(62)
+        tc_close = chr(60) + "/tool_call" + chr(62)
+        ako, akc = chr(60) + "arg_key" + chr(62), chr(60) + "/arg_key" + chr(62)
+        avo, avc = chr(60) + "arg_value" + chr(62), chr(60) + "/arg_value" + chr(62)
+
+        def pair(k, v):
+            return ako + k + akc + avo + v + avc
+
+        call1 = tc_open + "search" + pair("query", "python") + pair("limit", "10") + tc_close
+        call2 = tc_open + "get_time" + tc_close
+        proc.add_tokens(_ids("think" + close_think + call1 + call2))
+        proc.drain_content()
+        deltas = proc.drain_tool_deltas()
+        arg_deltas = {d["index"]: d["delta"] for d in deltas if d["type"] == "arguments_delta"}
+        assert set(arg_deltas) == {0, 1}
+        assert json.loads(arg_deltas[0]) == {"query": "python", "limit": 10}
+        assert json.loads(arg_deltas[1]) == {}
