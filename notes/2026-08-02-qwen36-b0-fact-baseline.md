@@ -28,6 +28,21 @@
 > 3. B0-7：GDN 递归状态是**每槽固定 ~72–150 MiB**（取决于状态 dtype，[待验证]，
 >    见下文），与上下文长度无关；权重只有 **18.8 GiB**（纯文本，不含 vision/MTP）
 >    ——比 Laguna 的 67 GiB 权重小得多，96GB 卡上的可行域比 Laguna 宽松很多。
+>
+> **2026-08-02 第二轮追加（同日，协调者跟进三个待拍板问题）**——见 §6/§7/§8：
+> 4. sparkinfer 的 `moe._shared.kernels.w4a16` **已经原生支持 modelopt NVFP4
+>    weight-only 语义**（`prepare_w4a16_modelopt_nvfp4_weights`，明确是为
+>    "GLM 服务需要 A4 prefill + A16 decode 共享同一份权重"这个真实场景写的），
+>    且底层 kernel 对 `num_experts=1` **没有任何下限限制**——不需要新功能，
+>    通过公开的 `moe.fused_moe(quant_mode="w4a16")` API 配退化单专家路由即可，
+>    **[待验证 GPU]** 未实跑。
+> 5. GDN 递归状态 dtype：**原结论（BF16 持久化）成立，但原来的证据链是错的**
+>    ——本机装的是真的 `fla`，实际走的是 FLA 真 kernel（内部用 FP32 计算），
+>    不是我 8-2 第一轮读到的 torch 兜底函数；FP32 结果被 HF 通用 `Cache` 类
+>    按 `conv_states` 先落的 dtype（BF16）**逐步降精度存回**——净效果是"单步
+>    FP32 计算、跨步 BF16 落盘"，不是简单的"全程 BF16"或"全程 FP32"。
+> 6. FP8 KV scale 缺失怎么办：vLLM/SGLang 都是**默认 1.0 + 告警**，vLLM 官方
+>    还在弃用运行时校准选项，明确说"以后就是有则读、没有就 1.0"。
 
 ---
 
@@ -450,7 +465,7 @@ Laguna 那侧，只做量级对比）——Qwen3.6-27B 参数量本身更小，�
 
 | KV dtype | 每 token 每槽 | 256K（262144 token） | 128K | 64K |
 |---|---:|---:|---:|---:|
-| FP8（1 byte，**scale 来源见 §1.3 待验证**） | 32 KiB | 8.0 GiB/槽 | 4.0 GiB/槽 | 2.0 GiB/槽 |
+| FP8（1 byte，**scale 来源见 §1.3；上游框架怎么办见 §8**） | 32 KiB | 8.0 GiB/槽 | 4.0 GiB/槽 | 2.0 GiB/槽 |
 | BF16（2 byte） | 64 KiB | 16.0 GiB/槽 | 8.0 GiB/槽 | 4.0 GiB/槽 |
 
 （这些是精确算术，不是估算：`262144×32768/1024^3 = 8.0` 恰好整除，
@@ -481,8 +496,9 @@ if self.num_v_heads // self.num_k_heads > 1:
 （`conv_dim = key_dim×2 + value_dim = 128×16×2 + 128×48 = 4096+6144=10240`，
 与实测的 `conv1d.weight` shape `(10240,1,4)` 完全对应）。
 
-**状态 dtype 是本节唯一的 [待验证] 项**：`config.json` 声明
-`mamba_ssm_dtype: "float32"`，但穷举 `transformers/models/qwen3_5/
+**状态 dtype——2026-08-02 第二轮已核实，结论修正见 §7，这里保留第一轮原文
+以留痕（第一轮读的是错误的代码分支，但巧合地得出了正确的落盘 dtype 结论）**：
+`config.json` 声明 `mamba_ssm_dtype: "float32"`，但穷举 `transformers/models/qwen3_5/
 modeling_qwen3_5.py` 全文 grep `mamba_ssm_dtype`/`ssm_dtype`**零命中**——
 这个字段在当前装的 `transformers==5.8.0` 参考实现里**未被读取**。真正决定
 存储 dtype 的是 `transformers/cache_utils.py:773,777,784`：
@@ -495,14 +511,17 @@ self.recurrent_states = torch.zeros_like(recurrent_states, dtype=self.dtype, ...
 
 `conv_states`/`recurrent_states` 的 dtype 由**调用方**（`mixed_qkv`/
 `in_proj_a`/`in_proj_b` 的输出，即模型的 bf16 计算 dtype）决定——也就是说
-**HF 参考实现的持久化状态实际是 BF16，`mamba_ssm_dtype: float32` 这个
-config 字段目前看起来是摆设**（未在本笔记范围内实跑代码验证这个结论，
-只是静态读码，标 **[待验证，建议后续用一次 CPU-only 的 dummy forward
-实测确认]**）。生产实现（vLLM 的 Mamba2Cache、FLA 的 kernel）历史上惯例是
-用 fp32 累积递归状态以保数值稳定性，这条"该用 fp32 还是 bf16"的选择会
-直接影响 B1"与 HF 参考逐 token 对齐"这条门禁该对齐到哪个精度基准，
-不是纯粹的性能选择——**这是留给 B1 实现者的一个决定点，本笔记只把两边的
-证据摆出来，不代为拍板**。
+**HF 参考实现的持久化状态实际是 BF16**。**[第一轮的推理有缺口，第二轮已补——
+见 §7]**：第一轮以为这是因为 delta-rule 本身用了 bf16 计算的 torch 兜底函数；
+实际上本机 `fla` 包真的能 import，参考实现走的是 FLA 的真 kernel，**FLA 的
+kernel 内部用 FP32 计算 recurrent state**，是 HF 通用 `Cache` 类在写回持久化
+buffer 时按 `conv_states` 先落的 dtype（BF16）把这个 FP32 结果**降精度存回**——
+净效果同样是"落盘 BF16"，但机制是"单步 FP32 计算 + 跨步 BF16 舍入"，不是
+"全程 BF16 计算"。这条区别对 B1 想做逐 token bit-exact 对齐是实质性的，见 §7。
+生产实现（vLLM 的 Mamba2Cache、FLA 的 kernel 本身）历史上惯例用 fp32 累积
+递归状态以保数值稳定性，这条"该用 fp32 还是 bf16"的选择直接影响 B1"与 HF
+参考逐 token 对齐"这条门禁该对齐到哪个精度基准，不是纯粹的性能选择——
+**这是留给 B1 实现者的一个决定点，本笔记只把两边的证据摆出来，不代为拍板**。
 
 单槽总大小（48 层合计，两种 dtype 假设）：
 
@@ -564,22 +583,378 @@ c 槽总占用 = c × 单槽总占用
 
 ---
 
-## 4. 给 `docs/qwen36-rebuild-spec.md` 的具体更正（已同步过去，见该文件 diff）
+## 4. （2026-08-02 第二轮）sparkinfer 能不能吃 Qwen3.6 稠密 MLP 的 W4A16 语义
+
+**问题**：Qwen3.6 稠密 MLP/`lm_head` 是 modelopt NVFP4 **weight-only**（§1.2，
+激活留在 bf16，不量化到 FP4）。协调者判定 `sparkinfer.gemm.blockscaled.mm`
+是对称 block-scaled GEMM（两个操作数都要 scale），吃不了这个语义，但指出
+`sparkinfer/moe/_shared/kernels/w4a16/` 底下有 W4A16 实现（README 第 43 行：
+"BF16 activations, inline FP4 weight dequant — no activation-scale math"），
+可能被封装在 MoE 的 API 形状下。四个具体问题，逐一查（零 GPU，只读
+`/home/bot/project/sparkinfer`，只读，未改动任何文件）。
+
+### 4.0 先把 `sparkinfer/gemm/` 下所有 op 过一遍（协调者问题 4，优先做）
+
+逐个读 `sparkinfer/gemm/*/api.py` 的模块 docstring 与依赖，9 个子模块：
+
+| op | 底层原语 | 操作数 dtype 组合 | 能否给我们用 |
+|---|---|---|---|
+| `gemm.blockscaled` | `sparkinfer._lib.dense_gemm.dense_gemm` | `lhs`/`rhs` 都是 `(value, scale)` 二元组（签名 `lhs: Tuple[Tensor,Tensor], rhs: Tuple[Tensor,Tensor]`，`dense_gemm.py:6660-6668`）——**结构上强制两边都要 scale** | 不能，协调者判断已核实为真 |
+| `gemm._bmm` | `_shared.mxfp8_bmm`，硬编码单一特化 | `a_dtype='bfloat16', b_dtype='float8_e4m3fn', sf_dtype='float8_e8m0fnu'`（`api.py:14-19`） | 不能——8-bit 权重不是 4-bit，且仍要 `sf_dtype`（B 侧有 scale） |
+| `gemm.bf16_gemv` | 自成一体的小 N GEMV kernel | 纯 bf16×bf16，零量化；只服务 `N<=1024且K>=1024` 的窄投影（`api.py:21-23`，专为 GDN 的 `in_proj_ba` 这类窄层设计） | 不能——我们的 MLP 是 `N=17408`（gate/up）宽投影，且是权重量化不是纯 bf16 |
+| `gemm.block_fp8_linear` | `_shared.block_fp8`（`dense_gemm`/`dense_gemm_fused_quant_a` + `quantize_block_fp8_linear_input_mxfp8`） | 权重 128×128 block-FP8，**激活也动态量化到 MXFP8**（`quantize_input` 是导出符号，见 `block_fp8_linear/api.py`） | 不能——8-bit 不是 4-bit，且激活仍被量化，不是 weight-only |
+| `gemm.mxfp8_linear` | `_kernel.py`，同样基于 `dense_gemm` + `quantize_block_fp8_linear_input_mxfp8` | 权重 MXFP8，激活同样动态量化到 MXFP8（`_kernel.py:1-18` import 链） | 不能，同上 |
+| `gemm.tensor_fp8_linear` | `_kernel.py`，基于 `dense_gemm` | 权重 per-tensor E4M3 + 静态 `scale_mma`/`output_scale`（`TensorFP8LinearWeight`），激活走同一 `dense_gemm` 路径（同样需要 A 侧 scale） | 不能——8-bit，且是对称量化 |
+| `gemm.mla_query_projection` | `_shared.mxfp8_bmm` + 自建 `_bf16` 分支 | 权重可以是纯 BF16 **或** MXFP8；但 `q_nope [H,M,192]`/`q_pe [M,H,64]`/`out [M,H,576]` 是 **DeepSeek MLA 专用的硬编码维度**（`api.py:20-27`） | 不能——维度锁死在 MLA 的 192/64/576，不是通用 dense GEMM，且即便有 BF16 权重分支也是 8-bit 量化家族，不是 NVFP4 |
+| `gemm.wo_projection` | `_shared.wo_mxfp8`（同样基于 `dense_gemm`） | MXFP8 权重+激活，"grouped WO-projection...用于 MLA attention"（README） | 不能——MLA 专用（协调者猜的候选，已排除），且仍是 8-bit 对称量化 |
+| `gemm.trellis_linear` | **直接 import `moe._shared.kernels.w4a16.kernel.run_trellis256_dense`** | BF16/FP16 激活 × **EXL3 trellis 编码**权重（`suh`/`svh` Hadamard 旋转 + `mcg`/`mul1` 编码本，`trellis_linear/api.py:1-40`），3/4/5/6-bit，**不是 NVFP4 block-scale** | 语义最接近（bf16 激活、低比特权重、无激活 scale 数学）但**数值格式不对**——EXL3 trellis 码本+Hadamard 旋转，与 modelopt 的"NVFP4 block(16)+全局 scale"完全不同的编码，不能直接复用，要把 checkpoint 重新量化成 EXL3 才能用，代价太大、也偏离"官方 checkpoint 原样加载"的既定路线 |
+
+**结论**：9 个 `gemm.*` op 里，除 `trellis_linear`（数值格式不对）外，其余全部
+基于同一个对称 `dense_gemm` 原语，**结构性地要求两个操作数都带 scale**——
+协调者的判断完全正确，**`sparkinfer/gemm/` 下没有第三条路**（问题 4 的答案：
+过了一遍，没有漏掉的候选；`wo_projection`/`mla_query_projection` 都不是，
+原因不是"形状不对"这么简单，是"专用于 MLA 的维度硬编码 + 仍是 8-bit 对称量化"
+两条都不满足）。真正的候选只能是协调者已经指对的 `moe/_shared/kernels/w4a16/`。
+
+### 4.1 `moe/_shared/kernels/w4a16/` 是不是 shape-generic（问题 1）
+
+**分层看，答案是"底层 kernel 通用，唯一现成的高层 dense 入口不通用"**：
+
+- **底层 kernel 发起类 `_compile_w4a16_gemm_launch`（`kernel.py:680` 起的类，
+  编译/启动这个 CuTe DSL persistent-grid GEMM 的核心）是真正的 shape/layout
+  通用件**：`num_experts`/`top_k` 只是普通 `int` 参数，唯一的下限检查是
+  `"num_experts must be positive"`（`kernel.py:9378`），**没有任何 "E>=2"
+  或"必须走 MoE 路由"的限制**。`weight_layout` 独立于 MoE 路由概念，是
+  一个纯粹的权重编码格式选择，合法值至少有 `"packed"`（sparkinfer 原生/
+  compressed-tensors 风格）、`"modelopt"`（modelopt 原生格式，`kernel.py:711,
+  4618,9842` 三处独立校验分支）、`"trellis3_t256"`（EXL3）、`"nf3_2p1"`。
+  `dense_route_fast_path: bool` 是**通用**验证的字段（`kernel.py:852-863`）：
+  ```python
+  self.dense_route_fast_path = bool(dense_route_fast_path)
+  if self.dense_route_fast_path and (
+      self.direct_topk_routes or self.single_token_route_fast_path
+      or self.num_experts != 1 or self.top_k != 1 or self.mul_topk_weights
+  ):
+      raise ValueError("dense_route_fast_path requires E=1, top_k=1, ...")
+  ```
+  这条校验**不检查 `weight_layout`**——`dense_route_fast_path=True` 与
+  `weight_layout="modelopt"` 组合在校验层面是合法的，没有代码路径会拒绝它。
+- **权重准备函数用统一的 `[num_experts, out, in]` 张量约定，`num_experts=1`
+  是这个约定里的合法值，不是特例**：`prepare.py:608` `num_experts =
+  int(weight.shape[0])`——直接读 shape[0]，没有下限检查；`prepare.py:2057-2059`
+  甚至对 trellis dense 路径显式要求 `trellis.shape[0] == 1`（"trellis3_t256
+  dense payload requires E=1"）——**E=1 是这个代码库里被断言、被使用的正常
+  形状，不是要绕过的边界情况**。
+- **`prepare_w4a16_modelopt_nvfp4_weights`（`prepare.py:987-1020`）已经原生
+  支持我们要的确切语义**：docstring 直接写"Prepare ModelOpt NVFP4 tensors
+  into the W4A16 packed runtime layout. The per-block scales are the normal
+  NVFP4 K/16 scale grid"——group_size=16、block scale、全局 scale，与 Qwen3.6
+  MLP 的 `weight`/`weight_scale`/`weight_scale_2`（B0-2，§1.2）逐字段对应。
+  姐妹函数 `prepare_w4a16_modelopt_native_weights`（`prepare.py:1023-1046`）
+  的 docstring 更进一步：**"This is the memory-safe path for GLM serving
+  that needs A4 prefill and A16 decode in the same process"**——这是
+  sparkinfer 团队**已经为一个真实生产模型（GLM 系列）的 weight-only NVFP4
+  场景写过这条路径**，不是理论上"应该能行"，是有真实动机、被验证过的代码。
+- **但唯一现成的"dense（非 MoE 路由）"高层入口 `run_trellis256_dense`
+  （`kernel.py:9669`）是硬编码给 EXL3 trellis 格式的**——它的实现
+  `_run_trellis256_dense_current_device`（`kernel.py:9500-9666`）内部确实
+  调用 `_compile_w4a16_gemm_launch(..., num_experts=1, top_k=1,
+  dense_route_fast_path=True, weight_layout="trellis3_t256", ...)`，**这正是
+  协调者设想的那个退化配置的真实、已经在跑的代码**——但函数体里夹杂了 EXL3
+  专属的 Hadamard 输入/输出旋转（`hadamard_128(x_f16, rotated_f16,
+  prepared_dense.suh, ...)`），这是 EXL3 格式本身需要的步骤，NVFP4 不需要
+  （NVFP4 没有旋转，直接 block-scale 反量化），所以这个具体函数不能直接换
+  `weight_layout` 复用——**限制在这一个 Python 包装函数里，不在底层 kernel**。
+
+**结论（问题 1）**：不是"绑死 MoE 语义"，是"底层通用，唯一现成的高层 dense
+包装函数选错了权重格式（写死 trellis，不是限制）"。
+
+### 4.2 能不能用 `num_experts=1` 退化配置当稠密 GEMM 用（问题 2）
+
+**能，而且不需要碰 sparkinfer 一行代码，走公开 API 就够**——4.1 节已确认
+`num_experts=1` 在整个 `w4a16` 子树里是合法、被使用的形状，且
+`sparkinfer.moe.fused_moe` 公开 API 本身就有 `quant_mode="w4a16"`
+（`moe/fused_moe/_impl.py:937,1222,1298,1452` 等处 `_normalize_quant_mode`/
+`caps.quant_mode == "w4a16"` 分支）：
+
+```python
+# 推断出的调用形状（未跑，[待验证 GPU]）——不是新写 sparkinfer 代码，
+# 是用它公开 API 的正常参数
+from sparkinfer.moe import fused_moe
+
+wplan = fused_moe.plan_weights(
+    quant_modes="w4a16", source_format="modelopt_nvfp4", ...,
+)
+experts = fused_moe.prepare_weights(plan=wplan, ...)   # num_experts=1 的权重
+plan = fused_moe.plan(fused_moe.Caps(
+    max_tokens=..., num_topk=1, quant_mode="w4a16", weight_plan=wplan, ...,
+))
+# topk_ids: 全 0（只有一个"专家"）；topk_weights: 全 1.0（float32）
+binding = fused_moe.bind(plan, a=x, experts=experts,
+                         topk_weights=torch.ones(m, 1),
+                         topk_ids=torch.zeros(m, 1, dtype=torch.int32), ...)
+out = fused_moe.run(binding=binding)
+```
+
+`TPMoEScratchCaps.__post_init__`（`_impl.py:760-762`）把 `num_topk` 的下限
+钳到 `max(int(self.num_topk), 1)`——`num_topk=1` 是**下限**，不是要绕过的
+特例。全仓库 grep 找 `num_experts` 相关的最小值断言，唯一命中是
+`"num_experts must be positive"`（`kernel.py:9378`）和两处 `ep_moe`（专家并行）
+模块的 `"global_num_experts must be positive"`——**没有任何地方写
+`num_experts >= 2`**。
+
+**这条路径走的是 sparkinfer 公开、文档化的 `moe.fused_moe` API，用真实存在
+的 `quant_mode="w4a16"`，不是绕过公开接口去调用下划线开头的私有函数**——
+比协调者问题 2 里设想的"退化配置 hack"更干净：不需要碰任何私有 API，
+就是把 `num_experts` 这个参数设成 1，`topk`/路由张量设成"全部路由到 0 号
+专家、权重恒 1"这个平凡情况。**唯一的代价**：会走通用 MoE 路由/permutation
+的记账路径（`route_pack.py` 构造 `packed_route_indices`/`block_expert_ids` 等），
+不会命中 `dense_route_fast_path` 那条零开销捷径（那条捷径目前只接在
+`run_trellis256_dense` 这一个函数上，见 4.1）——**功能上应该完全正确，
+性能上有一点可避免的路由开销，但排除这点开销不是 B1（正确性优先）阶段
+需要解决的问题**。
+
+**[待验证 GPU，本轮未跑一行 CUDA 代码，纯读码判断]**：上面的调用形状是
+从 API 签名与内部校验推断出的，不是复制自任何现成的调用样例（未在
+sparkinfer 仓库里找到 `num_experts=1` 的 fused_moe 单测或 benchmark 作为
+现成参照）——**第一次真跑很可能要调几个参数名/张量 dtype 细节，但不应该
+撞到"这个 API 根本不支持 E=1"这类结构性障碍**，4.1/4.2 的证据链已经排除了
+这种可能性。
+
+### 4.3 需不需要给 SparkInfer 团队提需求（问题 3）
+
+**不需要阻塞性的需求**——4.1/4.2 已经证明现有公开 API 覆盖我们的确切数值
+语义（modelopt NVFP4 weight-only、group_size=16），不需要 SparkInfer team
+写任何新代码。
+
+**可以提一条非阻塞、低优先级的性能优化建议**（供协调者决定是否要提，
+本笔记不代为拍板要不要真的提这个 issue，只把材料准备好）：
+
+> **给 SparkInfer 团队的材料（如果决定要提）**：
+> `moe._shared.kernels.w4a16` 已经有一个真正零开销的 dense 单专家路径
+> （`_compile_w4a16_gemm_launch(num_experts=1, top_k=1,
+> dense_route_fast_path=True, ...)`），目前只通过 `gemm.trellis_linear`
+> 暴露给 EXL3 trellis 权重格式（`run_trellis256_dense`）。我们的用例
+> （Qwen3.6-27B 稠密 MLP，`hidden=5120`、`intermediate=17408`，modelopt
+> NVFP4 weight-only、`group_size=16`、`F8_E4M3` block scale + `F32` 全局
+> scale，bf16 激活，**无激活侧 scale 数学**）与 `run_trellis256_dense`
+> 的语义几乎一致，只是权重编码换成 `weight_layout="modelopt"` 且不需要
+> EXL3 的 Hadamard 输入/输出旋转步骤。建议：提供一个
+> `run_modelopt_w4a16_dense`（或类似命名）作为 `gemm.*` 下的新 op，直接调用
+> 已经存在的 `dense_route_fast_path` 机制配 `weight_layout="modelopt"`，
+> 跳过通过 `moe.fused_moe` 走完整 MoE 路由/permutation 记账的可避免开销。
+> **这是性能优化，不是功能缺口**——目前通过公开的 `moe.fused_moe(quant_mode=
+> "w4a16", num_experts=1)` 已经可以正确跑通（[待验证 GPU]），只是多付一点
+> 路由开销。
+
+---
+
+## 5. （2026-08-02 第二轮）GDN 递归状态 dtype：修正证据链，结论不变但更精确
+
+**协调者要求复核**："transformers 实际存 BF16"这条结论是否在**纯文本推理
+路径**上成立，不是某个我们不走的分支——查完发现：**结论（落盘 BF16）成立，
+但第一轮（§3.3）的证据链找错了函数**，机制比第一轮描述的更细。
+
+### 5.1 第一轮的缺口：本机装的是真的 `fla`，不会走 torch 兜底函数
+
+`Qwen3_5GatedDeltaNet.__init__`（`modeling_qwen3_5.py:409-410`）：
+
+```python
+self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
+self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
+```
+
+`chunk_gated_delta_rule`/`fused_recurrent_gated_delta_rule` 是从真实的
+`fla` 包 import 的（`modeling_qwen3_5.py:60-61`：`from fla.ops.gated_delta_rule
+import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule`）。本机
+`fla` 包在 `/home/bot/project/flash-linear-attention`，`~/.venvs/vllm` 里
+可以真实 import 成功（B0 第一轮已确认，本轮复核：`~/.venvs/vllm/bin/python
+-c "import fla.ops.gated_delta_rule as g; print(g.chunk_gated_delta_rule,
+g.fused_recurrent_gated_delta_rule)"` 两个都不是 `None`）——所以上面两行
+`or` 的**左边**为真，`self.chunk_gated_delta_rule`/`self.recurrent_gated_
+delta_rule` 绑定的是**真实 FLA kernel**，不是第一轮读的 `torch_chunk_
+gated_delta_rule`/`torch_recurrent_gated_delta_rule` 那两个纯 PyTorch
+兜底函数（那两个函数只在 `causal_conv1d_fn`/`causal_conv1d_update` 缺失时
+才被用到，且缺失的只是 conv1d 那一步，跟 gated-delta-rule 本身的函数选择
+是独立的两个 `or` 判断）。**这是第一轮的错误**——引用了正确的落盘结论，
+但证据取自不会被执行的分支。
+
+### 5.2 真实 FLA kernel 的 recurrent state 是 FP32，不是 BF16
+
+`flash-linear-attention/fla/ops/gated_delta_rule/fused_recurrent.py:209-212`
+（decode 单步路径）：
+
+```python
+if state_v_first:
+    final_state = q.new_empty(N, HV, V, K, dtype=torch.float32)
+else:
+    final_state = q.new_empty(N, HV, K, V, dtype=torch.float32)
+```
+
+`flash-linear-attention/fla/ops/common/chunk_delta_h.py:637,640`
+（chunk/prefill 路径）：
+
+```python
+final_state = k.new_zeros(N, HV, V, K, dtype=torch.float32) if output_final_state else None
+final_state = k.new_zeros(N, HV, K, V, dtype=torch.float32) if output_final_state else None
+```
+
+**两条路径（decode 的 `fused_recurrent_gated_delta_rule` 与 prefill 的
+`chunk_gated_delta_rule`）都无条件把 `final_state` 分配成 `torch.float32`，
+与 q/k/v 的输入 dtype（bf16）无关。** 这与第一轮读到的 torch 兜底函数
+（`dtype=value.dtype`，即 bf16）刚好相反。
+
+### 5.3 但落盘时被 HF 通用 `Cache` 类降精度round-trip回 BF16——净结论不变
+
+`transformers/cache_utils.py:772-784`（`LinearAttentionLayer.
+lazy_initialization`，与第一轮引用的行号一致）：
+
+```python
+if conv_states is not None:
+    self.dtype, self.device = conv_states.dtype, conv_states.device   # 先落 conv 的 dtype
+    ...
+if recurrent_states is not None:
+    self.recurrent_states = torch.zeros_like(recurrent_states, dtype=self.dtype, ...)  # 用 self.dtype，不是 recurrent_states.dtype！
+```
+
+**关键**：`recurrent_states` 分支用的是 `dtype=self.dtype`，不是
+`dtype=recurrent_states.dtype`！`self.dtype` 在**同一次 forward 调用内**
+已经被 `conv_states` 分支提前锁定成 BF16（因为 `Qwen3_5GatedDeltaNet.forward`
+里 conv1d 的更新总是发生在 delta-rule 之前，`cache_params.update_conv_state`
+/`causal_conv1d_update` 先于 `cache_params.update_recurrent_state`，见
+`modeling_qwen3_5.py:455-473` vs `:534-535`）。所以：
+
+1. FLA 真 kernel 算出 `last_recurrent_state`（FP32）。
+2. `cache_params.update_recurrent_state(last_recurrent_state, ...)` 调用
+   `update_recurrent_state`（`cache_utils.py:823-834`）。
+3. 若是第一次调用（prefill），`lazy_initialization` 用**已经被 conv 锁定的
+   `self.dtype`=BF16**分配 `self.recurrent_states` 缓冲区，然后
+   `self.recurrent_states.copy_(recurrent_states)`——**FP32 值被隐式转换
+   降精度存进 BF16 buffer**。
+4. 下一步 decode 时，从这个 BF16 buffer 读出的 `initial_state` 传回 FLA
+   kernel，FLA kernel 内部再次以 FP32 精度计算这一步更新，产出新的 FP32
+   `final_state`，再被同一个 BF16 buffer 的 `.copy_()` 降精度存回。
+
+**净效果：每一步的数值计算发生在 FP32，但跨步骤"携带"的状态在 BF16 精度
+上取整**——不是"全程 BF16 计算"（第一轮的表述过粗），也不是"全程 FP32
+持久化"（如果真要对齐这个参考实现的字面行为）。**这条机制对 B1 的
+"逐 token bit-exact 对齐" 门禁是实质性的**：如果我们自己的实现选择"全程
+FP32 状态、从不降精度"，长上下文/多步之后会因为缺失这个逐步舍入而与参考
+实现产生可测的漂移——**要跟这份参考"位对齐"，必须复刻"FP32 计算、BF16
+存储之间的舍入"这个具体动作，不能只是"选一个精度、从头到尾都用它"**。
+这是本轮新增、比第一轮更具体的技术要求，留给 B1 实现者。
+
+### 5.4 结论修正（覆盖 §3.3 的原表述，容量数字不变）
+
+- `mamba_ssm_dtype: "float32"` 这个 config 字段——**依然是摆设**，不是因为
+  delta-rule 计算不用 fp32（它确实用 fp32），而是因为**跨步持久化**这个层面
+  被 HF 通用 Cache 类的降精度规则覆盖了，config 字段本身在这条链路上从未
+  被读取（第一轮的这条子结论未变）。
+- 单槽容量数字**不变**：落盘确实是 BF16，3.3 节"~74.8 MiB/槽"那一行仍是
+  匹配当前参考实现实际行为的数字，"~149.6 MiB/槽"那一行对应的是"如果
+  跨步也存 FP32"的假设场景（生产实现可能会选，只是不match这份参考实现的
+  字面行为）——3.3 节两行数字本身都不需要改，改的是"为什么落盘是 BF16"
+  这条因果链，以及新增了"FP32 计算+BF16 舍入"这条 B1 精度对齐的具体要求。
+- **[仍是 [待验证]]**：本节全部是静态读码（HF `transformers` 源码 +
+  真实 `flash-linear-attention` 源码），未跑一次 GPU forward 验证实际张量
+  dtype。建议 B1 起步时用一次 CPU-only 或单 GPU 的 dummy forward，
+  在 `cache_params.layers[i].recurrent_states.dtype` 上直接断言一次，
+  把"读码推断"升级成"实测确认"。
+
+---
+
+## 6. （2026-08-02 第二轮）FP8 KV 声明但无 scale 张量时，vLLM/SGLang 怎么办
+
+**查法**：本机 vLLM 源码在 `/home/bot/vllm`（`import vllm` 直接命中），
+SGLang 源码在 `/home/bot/project/sglang`。零 GPU，只读源码。
+
+### 6.1 vLLM：默认 1.0 + 告警，且正在把"运行时校准"这条路废弃
+
+`vllm/model_executor/layers/quantization/kv_cache.py`
+（`BaseKVCacheMethod.process_weights_after_loading`，21-197 行）：
+
+- `create_weights` 把 `k_scale`/`v_scale`（以及 `q_scale`/`prob_scale`）
+  初始化成 **`-1.0`**（"无效哨兵值"，`kv_cache.py:65-69`）。checkpoint 里若有
+  真实值，权重加载时会覆盖这个哨兵。
+- `process_weights_after_loading`（:100-152）三分支：
+  1. `k_scale>0 and v_scale>0`——checkpoint 提供了真实值，直接用。
+  2. **`k_scale<0 and v_scale<0`（两个都还是哨兵，即"checkpoint 没提供"）
+     ——`k_scale = v_scale = 1.0`**（:111-115，**这正是 Qwen3.6-27B-NVFP4
+     这份 checkpoint 会落进的分支**：声明 `kv_cache_quant_algo=FP8`，但
+     零 `k_scale`/`v_scale` 张量，见 B0 第一轮 §1.3）。
+  3. 只有一个标量 `kv_scale`（老格式）——复制成 k/v 各一份。
+  - 分支 2 触发时还会打一条运行时告警（:147-152）：*"Using KV cache
+    scaling factor 1.0 for fp8_e4m3. If this is unintended, verify that
+    k/v_scale scaling factors are properly set in the checkpoint."*
+- **`--calculate-kv-scales`**（`CacheConfig.calculate_kv_scales`，
+  `vllm/config/cache.py:111`）是运行时动态校准 k/v scale 的旧机制
+  （首次 forward 时用真实 Q/K/V 的 amax 算一个 scale，`attention.py:
+  690-706` 的 `maybe_calc_kv_scales`/`calc_kv_scales`）。**但这条路径正在
+  被弃用**——`vllm/config/cache.py:261-272` 的字段校验器在这个 flag 为
+  True 时打出明确的弃用告警：*"The `--calculate-kv-scales` option is
+  deprecated and will be removed in v0.19. The scales will be loaded from
+  the model checkpoint if available, otherwise they default to 1.0."*
+  ——**这句话就是 vLLM 项目对"declared FP8 KV 但没 scale 张量"这个问题
+  官方、当前、明确的处理方针**：有就读，没有就 1.0，不再费力自动校准。
+
+### 6.2 SGLang：与 vLLM 逐字节相同的策略（文件头注明是从 vLLM 搬的）
+
+`sglang/python/sglang/srt/layers/quantization/kv_cache.py` 文件头
+（第 2-3 行）：
+
+```python
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/kv_cache.py
+```
+
+逻辑逐行对应：`k_scale`/`v_scale` 初始化成 `torch.tensor(-1.0, ...)`
+（:39-44），`process_weights_after_loading` 同样三分支
+（`k_scale<0 and v_scale<0` → **`k_scale=v_scale=1.0`**，:59-63）。**这不是
+两个框架独立收敛到同一答案——是 SGLang 直接照抄 vLLM 的实现**，所以只算
+一条证据链，不是两条独立确认，但仍说明这是当前主流推理框架实际在跑、
+没有人在用更复杂方案的成熟做法，不是权宜之计。
+
+### 6.3 结论：建议采纳"默认 1.0 + 告警"，不建议自己搭校准流水线
+
+vLLM 自己都在把运行时校准废弃掉，没有理由我们反而去新建一套。**建议**（
+不代为最终拍板，见 spec §7 的待拍板条目）：Qwen3.6 的 FP8 KV 如果最终启用，
+`k_scale`/`v_scale` 默认 `1.0`，日志打一条与 vLLM 同款的告警提示"若非预期
+请检查 checkpoint"。**唯一需要盯的风险**：`1.0` 是否对 Qwen3.6 的真实 K/V
+数值范围合适（RMSNorm 后的量级），如果逐 token 对齐/质量评测掉点明显，
+再考虑要不要自己跑一次校准——**但不要在验证到"1.0 不够"之前就先去写校准
+代码，遵守"先证据、后工程"的仓库纪律**。
+
+---
+
+## 7. 给 `docs/qwen36-rebuild-spec.md` 的具体更正（已同步过去，见该文件 diff）
+
+**第一轮（B0-2/6/7）**：
 
 1. §1.9"格式警告"："本轮未定位到 modelopt 参考实现，不猜字段名"这句已过时，
    替换为指向本笔记 §1 的具体命名表。
 2. §3.4"加载器 adapter"：补充真实字段名与"按量化算法分三支"的结论（本笔记 §1.6）。
 3. §4"已确认的事实"："modelopt NVFP4 + fp8 KV" 改成准确描述（混合精度 +
    KV scale 缺失，本笔记 §1.1/§1.3）。
-4. §6 待验证清单：勾掉 B0-2/B0-6/B0-7 对应条目，新增：
-   - KV cache scale 缺失的处理方式（§1.3）
-   - GDN 状态 dtype：fp32 声明 vs bf16 实测代码路径（§3.3）
-   - modelopt `input_scale` 在 W4A16 组的语义（§1.2）
-   - `q_proj` 2× 宽度融合 gate 的加载器/模型图含义（§1.7）
+4. §6 待验证清单：勾掉 B0-2/B0-6/B0-7 对应条目，新增 KV cache scale 缺失、
+   GDN 状态 dtype、modelopt `input_scale` 语义、`q_proj` 2× 宽度四项。
+
+**第二轮（本轮，协调者跟进）**：
+
+5. §3.4/§5.2"NVFP4 GEMM 到底选自研 `.cu` 还是 sparkinfer"：**候选集进一步
+   收窄，不再是"两个 FP4×FP4 kernel 选一个"或"混合精度 kernel 待找"**——
+   `sparkinfer.moe.fused_moe(quant_mode="w4a16", source_format=
+   "modelopt_nvfp4")` 配 `num_experts=1` 已经是现成、公开、覆盖我们确切数值
+   语义的路径（本笔记 §4），**[待验证 GPU]** 但不再是"完全没有候选"的状态。
+6. §6/§7 待验证/待拍板清单：GDN 状态 dtype 从"两个候选，不知道哪个对"收窄为
+   "落盘 BF16 已确认（机制是 FP32 计算+BF16 舍入，不是简单的 bf16 全程），
+   B1 若要 bit-exact 需要复刻这个舍入动作"（本笔记 §5）。
+7. §7 待拍板"FP8 KV 的 scale 从哪来"：新增 vLLM/SGLang 的现成答案（默认
+   1.0+告警，本笔记 §6）作为参考先例，不改变"这条仍待 C-2 结果后再最终拍板"
+   的状态，但把"要不要自己搭校准流水线"这个子问题基本排除（先用 1.0）。
 
 ---
 
-## 5. 复现清单（给下一个查这个 checkpoint 的人）
+## 8. 复现清单（给下一个查这个 checkpoint 的人）
 
 - 所有命令见各节代码块，均只读 `config.json`/`hf_quant_config.json`/
   `model.safetensors.index.json`/safetensors JSON header，无需 GPU，
@@ -593,3 +968,23 @@ c 槽总占用 = c × 单槽总占用
   如果重写了 mrope 实现，需要重新核对 §2 的行号引用（虽然"纯文本三维
   position_ids 恒等"这个数学事实大概率不会变，除非官方主动加了"即使
   纯文本也走不同 position_ids"的新行为）。
+- **第二轮追加的源码位置**（均只读，未改动任何文件）：
+  - sparkinfer：`/home/bot/project/sparkinfer`（按任务约定只读，不 import
+    进生产代码）——关键文件 `sparkinfer/gemm/*/api.py`（9 个 op 的入口）、
+    `sparkinfer/_lib/dense_gemm.py:6660`（对称 `dense_gemm` 原语签名）、
+    `sparkinfer/moe/_shared/kernels/w4a16/kernel.py`（11430 行，
+    `_compile_w4a16_gemm_launch` 类在 :680、`run_trellis256_dense` 在
+    :9669、`run_w4a16_moe` 在 :9740）、`.../w4a16/prepare.py`（2271 行，
+    `prepare_w4a16_modelopt_nvfp4_weights` 在 :987）、
+    `sparkinfer/moe/fused_moe/_impl.py`（`TPMoEScratchCaps` 在 :741）。
+  - `flash-linear-attention`（`fla`）真实源码：`/home/bot/project/
+    flash-linear-attention`（`~/.venvs/vllm` 里可 `import fla`，指向这份
+    源码，不是 pip 装的隔离副本）——`fla/ops/gated_delta_rule/
+    fused_recurrent.py:209-212`、`fla/ops/common/chunk_delta_h.py:637,640`。
+  - vLLM：`/home/bot/vllm`（`~/.venvs/vllm` 里 `import vllm` 命中这份源码；
+    与本仓库"不依赖 vLLM"的方向无关，纯粹当参考实现读，不 import 进本仓库
+    任何生产代码）——`vllm/model_executor/layers/quantization/kv_cache.py`
+    全文件、`vllm/config/cache.py:261-272`、`vllm/model_executor/layers/
+    attention/attention.py:690-706`。
+  - SGLang：`/home/bot/project/sglang`——`python/sglang/srt/layers/
+    quantization/kv_cache.py` 全文件。

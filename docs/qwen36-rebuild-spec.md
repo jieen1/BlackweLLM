@@ -460,22 +460,30 @@ modelopt quant、MTP 层数）、`runtime/model_registry.py`（151 行，已注�
   FP4"的假设上。实测 `quantization_config.config_groups` 里 MLP/lm_head 那组的
   `input_activations` 是 `None`，`quantized_layers` 标的算法名是
   `"W4A16_NVFP4"`——**weight 4-bit、activation 16-bit，激活不量化到 FP4**。
-  如果这条实测语义就是运行时行为（**[待验证]**：`.input_scale` 张量在这组里
-  确实存在但语义未定，不排除某些推理栈仍会用它做某种激活侧处理），那么 MLP/
-  lm_head 需要的是**权重侧反量化到 bf16 再做标准 GEMM，或一个 bf16-激活×NVFP4-
-  权重的混合精度 GEMM kernel**，根本不需要
-  `sparkinfer.quantization.nvfp4`（bf16→packed-FP4 激活量化器）这一步——
-  这与"整条 GEMM 路径里最具体的单个空白"的原判定方向相反，需要在选 GEMM kernel
-  前先确认 `sparkinfer.gemm.blockscaled.mm` 是否支持/要求纯 FP4×FP4 输入
-  （若只支持 FP4×FP4，混合精度这条路就走不通，要么退化成"反量化+bf16 GEMM"，
-  要么找别的 kernel）。**只有 self_attn/GDN 的 FP8 投影层（W8A8，权重+激活都量化）
-  才是真的需要激活侧动态量化的路径**，且是 FP8 不是 FP4，量化目标 dtype 也不同。
-- **GEMM 本身**：上一条意味着这里原来假设的"NVFP4×NVFP4 blockscaled GEMM
-  A/B（自研 `.cu` vs sparkinfer）"这个问题范围需要收窄或改变——如果 MLP 真是
-  weight-only，要 A/B 的可能是"权重侧反量化+bf16 GEMM" vs "混合精度 GEMM
-  kernel"，不一定是原来设想的两个 FP4×FP4 kernel 之间的选择。`sparkinfer.gemm.
-  blockscaled.mm` 支持哪些输入精度组合需要直接读源码确认，本轮未做（GPU 无关但
-  超出 B0-2 的字面范围），标 **[待验证]**，见第 7 节。
+  **只有 self_attn/GDN 的 FP8 投影层（W8A8，权重+激活都量化）才是真的需要
+  激活侧动态量化的路径**，且是 FP8 不是 FP4，量化目标 dtype 也不同。
+- **GEMM 本身（2026-08-02 第二轮已确认，不再是空白）**：`sparkinfer.gemm.
+  blockscaled.mm` 确认吃不了这个语义——其底层 `sparkinfer._lib.dense_gemm.
+  dense_gemm` 的签名是 `lhs/rhs: Tuple[Tensor, Tensor]`（值+scale 二元组），
+  结构性地要求两个操作数都带 scale，逐个读完 `sparkinfer/gemm/` 下全部 9 个
+  op（`_bmm`/`bf16_gemv`/`block_fp8_linear`/`blockscaled`/
+  `mla_query_projection`/`mxfp8_linear`/`tensor_fp8_linear`/`trellis_linear`/
+  `wo_projection`）确认没有第十条路：除 `trellis_linear`（EXL3 trellis 编码，
+  数值格式不对，不是 NVFP4 block-scale）外全部基于同一个对称 `dense_gemm`。
+  **但 `sparkinfer/moe/_shared/kernels/w4a16/` 这个 MoE 子树已经原生支持我们
+  要的语义**：`prepare_w4a16_modelopt_nvfp4_weights`（`prepare.py:987`）
+  docstring 直接写"NVFP4 K/16 scale grid"，姐妹函数 `prepare_w4a16_modelopt_
+  native_weights` 的 docstring 更进一步写明是"GLM serving 需要 A4 prefill +
+  A16 decode 共享同一份权重"这个真实场景的实现，且底层 `_compile_w4a16_
+  gemm_launch`（`kernel.py:680`）对 `num_experts` 只有"必须为正"的下限
+  （`kernel.py:9378`），没有任何 E≥2 的限制，`weight_layout="modelopt"` 是
+  独立于 MoE 路由的合法值。**结论：走公开的 `moe.fused_moe(quant_mode=
+  "w4a16", source_format="modelopt_nvfp4")` 配 `num_experts=1`/单专家退化
+  路由即可，不需要新 SparkInfer 功能，不需要复活自研 `.cu`**——原来"自研 vs
+  sparkinfer 二选一 GPU A/B"这个问题被替换成"验证公开 API 在 E=1 下能不能
+  跑通、跑多快"，**[待验证 GPU，本轮只读代码，未跑一行 CUDA]**。完整证据链、
+  9 个 op 的逐一排除表、调用形状推断见
+  [`../notes/2026-08-02-qwen36-b0-fact-baseline.md`](../notes/2026-08-02-qwen36-b0-fact-baseline.md) §4。
 - **333 个 vision 张量过滤（2026-08-02 已确认前缀）**：D6 已拍板用官方
   `nvidia/Qwen3.6-27B-NVFP4`，实测 333 个张量精确复现，前缀统一为
   **`model.visual.`**（不是笼统的 `vision.*`——穷举确认没有其它带"vision"字样
@@ -585,27 +593,31 @@ B2 期间顺手做的小事。
 
 ### 5.2 其余风险（按判断的确定性排序，非难度）
 
-- **NVFP4 GEMM 到底选自研 `.cu` 还是 sparkinfer——2026-08-02 更新：问题本身的
-  前提被 B0-2 部分证伪**。原判定假设 MLP 是像 Laguna MoE 专家那样的 W4A4
-  （激活也量化到 FP4），需要"权重 GEMM kernel A/B"；实测 `nvidia/
-  Qwen3.6-27B-NVFP4` 的 MLP/`lm_head` 是 **W4A16（weight-only）**，激活不量化到
-  FP4（见 §3.4、B0 笔记 §1.1/§1.6）。这意味着要 A/B 的可能不是"两个 FP4×FP4
-  kernel 选一个"，而是"要不要用 FP4×FP4 kernel（如果 sparkinfer 的
-  `blockscaled.mm` 只接受这种输入，那就要先把权重反量化到 bf16 再退化成标准
-  GEMM，等于放弃这条 kernel 的低比特收益）vs 找/写一个真正的混合精度
-  (bf16 激活 × NVFP4 权重) GEMM kernel"。**这是一个新的、比原判定更具体的
-  待拍板点**，见第 7 节；GPU A/B 本身仍然需要，但 A/B 的候选集变了。
+- **NVFP4 GEMM 到底选自研 `.cu` 还是 sparkinfer——2026-08-02 第二轮已解出候选，
+  不再是开放问题**。`sparkinfer.moe.fused_moe(quant_mode="w4a16",
+  source_format="modelopt_nvfp4")` 配 `num_experts=1` 单专家退化路由，公开
+  API、已确认覆盖我们的确切数值语义（见 §3.4、B0 笔记 §4）。**仍然
+  [待验证 GPU]**（本轮只读代码，未跑一行 CUDA），但风险性质从"候选集不明"
+  降到"验证一条已知候选能不能跑通/多快"，且已经确认不需要复活自研 `.cu`
+  也不需要 SparkInfer team 新写代码。
 - **`RESERVED_PHYSICAL_SLOTS=1` 是否还需要**——1.4 节已指出这可能是纯 vLLM 调度器
   伪影，Laguna 用 0 也能跑，但"新实现要不要保留 1"需要在自建栈上实证检查，不能
   两头都假设。
 - **`_MAX_DECODE_QO_LEN=16` 等常量绑定旧 kernel 的测试范围**——换新 GEMM/attention
   kernel 后这类边界常量需要逐个重新核实，不能整包沿用。
-- **GDN 递归状态的存储 dtype（fp32 声明 vs bf16 实测代码路径）未定**——
-  `config.json` 声明 `mamba_ssm_dtype: "float32"`，但 `transformers==5.8.0` 的
-  参考实现实测走的是 bf16（跟随激活 dtype，见 B0 笔记 §3.3）。这条从"未知"变成
-  "两个具体候选，需要人/后续实现选一个"，选择直接影响单槽显存（~75 MiB vs
-  ~150 MiB，量级上不影响第 7 节的可行域结论，但影响 B1 的"逐 token 对齐"该对齐
-  到哪个精度基准。
+- **GDN 递归状态的存储 dtype——2026-08-02 第二轮已确认落盘 BF16，但机制比原来
+  描述的更精确，不是简单"哪个候选对"的问题**：本机真装了可 import 的 `fla`，
+  参考实现实际走的是 FLA 真 kernel（`fla/ops/gated_delta_rule/
+  fused_recurrent.py:209-212`、`fla/ops/common/chunk_delta_h.py:637,640`
+  确认其内部把 `final_state` 硬编码分配成 `torch.float32`），不是 B0 第一轮
+  误读的 torch 兜底函数；但 HF 通用 `Cache` 类落盘时用同一 forward 调用里
+  `conv_states` 先锁定的 BF16 把这个 FP32 结果降精度存回（`transformers/
+  cache_utils.py:772-784`，`dtype=self.dtype` 不是 `dtype=recurrent_states.
+  dtype`）。净效果：**"单步 FP32 计算、跨步 BF16 舍入"**，不是"全程 BF16"
+  也不是"全程 FP32"——B1 若要对这份参考实现 bit-exact，需要复刻这个具体的
+  舍入动作，不能只是"选 bf16 或 fp32 其中一个，从头到尾都用它"。单槽显存
+  数字不变（~75 MiB，因为落盘确实是 BF16），变的是"为什么"与"精确到什么
+  程度才算对齐"。完整证据链见 B0 笔记 §5。
 - **modelopt 张量命名/scale 语义——2026-08-02 B0-2 已确认，不再是未知**，见 §1.9/
   §3.4 与 B0 笔记；**KV cache scale 缺失**是本轮唯一没有闭环的子项（见 §4/§7）。
 - **chunked prefill 跨步交织（Phase B）连 oracle 自己都没做完**——B1/B2 阶段可以
@@ -629,26 +641,37 @@ B2 期间顺手做的小事。
   实测**，运行时开销（~3 GiB 假设）与 KV/状态实际分配器行为仍需要 B0-3/B2 补测，
   这条不算完全闭环，只是从"完全未知"变成"有公式和量级，缺一个实测系数"。
 
-**本轮闭环过程中新发现、原清单没有的条目**：
+**2026-08-02 第二轮已核实闭环的条目**（读码确认，仍缺 GPU 实测，证据见 B0 笔记 §4/§5/§6）：
 
-- [ ] **KV cache scale 缺失的处理方式**——checkpoint 声明 `kv_cache_quant_algo:
-  "FP8"` 但零 `k_scale`/`v_scale` 张量（B0-2，§1.3/§4）。B3 如果真的走 FP8 KV
-  （C-2 结论），需要决定 scale 从哪来：固定 1.0？自己校准？还是这条本身就是
-  "不该用 FP8 KV"的证据之一，需要与 C-2 的本机实测结果一起权衡。
-- [ ] **GDN 递归状态的存储 dtype**：`mamba_ssm_dtype: "float32"` 声明 vs
-  `transformers==5.8.0` 参考实现实测走 bf16（B0-7，§3.3）——影响 B1"逐 token
-  对齐"该对齐到哪个精度基准，以及单槽显存 ~75 MiB vs ~150 MiB。
+- [x] **`sparkinfer.gemm.blockscaled.mm` 是否支持纯 FP4×FP4 之外的输入**——
+  **确认不支持**（底层 `dense_gemm` 结构性要求两个操作数都带 scale），但
+  **`sparkinfer/moe/_shared/kernels/w4a16` 原生支持 modelopt NVFP4 weight-only
+  语义**，逐个排查完 `sparkinfer/gemm/` 全部 9 个 op 后确认没有第十条路。原来
+  "自研 `.cu` vs sparkinfer 二选一 A/B"这个问题被替换成"验证 `moe.fused_moe
+  (quant_mode="w4a16")` 配 `num_experts=1` 能不能跑通/多快"，**[待验证 GPU]**。
+- [x] **GDN 递归状态的存储 dtype**——**落盘确认 BF16**，但机制是"单步 FP32
+  计算（真实 FLA kernel 内部硬编码 fp32）+ 跨步 BF16 舍入（HF 通用 `Cache`
+  类按 conv_states 先锁定的 dtype 存回）"，不是简单的"全程 bf16"或"全程
+  fp32"。`mamba_ssm_dtype: "float32"` 这个 config 字段仍确认未被这条链路
+  读取。B1 若要 bit-exact 对齐需要复刻这个具体的舍入动作。**[仍是读码结论，
+  未跑一次 dummy forward 实测确认]**。
+- [x] **FP8 KV scale 缺失时上游框架怎么办**——**vLLM/SGLang 都是默认
+  `k_scale=v_scale=1.0`+运行时告警**，vLLM 正在弃用运行时校准选项
+  （`--calculate-kv-scales`，v0.19 移除），官方声明口径是"有则读、没有就
+  1.0"。这条不代表我们的 KV dtype 最终决定（仍待 C-2），但排除了"要不要自己
+  搭一套校准流水线"的额外未知数——先用 1.0，除非质量评测证明不够。
+
+**仍未闭环的条目**：
+
 - [ ] **modelopt `input_scale` 在 W4A16（weight-only）组的实际语义**——张量
   存在但 `config_groups` 声明 `input_activations: None`（B0-2，§1.2）；不确定
   推理时是否真的被消费，还是纯校准期遗留。
-- [ ] **`sparkinfer.gemm.blockscaled.mm` 是否支持/要求纯 FP4×FP4 输入**——如果
-  只支持这种输入组合，Qwen3.6 MLP 的 W4A16（weight-only）语义就没有直接对应的
-  sparkinfer kernel，需要另找混合精度 GEMM 或退化成"反量化+bf16 GEMM"（§3.4/
-  §5.2 已更新，原来的"自研 `.cu` vs sparkinfer 二选一 A/B"这个问题的候选集变了）。
-- [ ] sparkinfer `blockscaled.mm`（或混合精度 GEMM 候选）在 Qwen3.6 真实稠密
-  shape（34816/17408/6144/5120/96）上的 A/B（3.4 节，1.8 节，候选集见上一条）
+- [ ] `sparkinfer.moe.fused_moe(quant_mode="w4a16")` 配 `num_experts=1` 在
+  Qwen3.6 真实稠密 shape（`hidden=5120`/`intermediate=17408`）上的实测跑通
+  与吞吐（3.4 节，B0 笔记 §4.2，候选集已确定，只差实跑）
 - [ ] FLA `gated_delta_rule`（chunk / fused_recurrent 两条路径）在 SM120 上的正确性
-  与速度实测——本轮只确认了本地可 `import`，未做任何 GPU 执行
+  与速度实测——本轮只确认了本地可 `import`、以及参考实现真的会走这两个真 kernel
+  （不是 torch 兜底，见 B0 笔记 §5.1），未做任何 GPU 执行
 - [ ] GDN 递归状态更新在自建 CUDA graph 骨架上是否 capture-safe（3.5 节，第 6.1 节
   第一难点的具体验证动作）
 - [ ] `RESERVED_PHYSICAL_SLOTS=1` 在自建栈上是否仍必要（5.2 节）
@@ -662,20 +685,25 @@ B2 期间顺手做的小事。
 - **`oracle/qwen36_vllm/` 的处置时机**——`roadmap.md` §7 D5 已列出三个选项
   （保留只读参考 / B 完成后删除 / 现在就删）。本文档大量引用了它的具体行号，
   **建议在 Track B3 验收通过前保持 (a) 不变**，否则本文档的可核查性会打折。
-- **（新增，2026-08-02）FP8 KV 的 scale 从哪来**——B0-2 实测官方 checkpoint
-  声明 `kv_cache_quant_algo: FP8` 但不带任何 `k_scale`/`v_scale` 张量（§1.3/§4）。
-  C-2 已经倾向 FP8 KV（另一 agent 的结论，本文档不预判），但"scale 用固定 1.0
-  还是自己校准"这条子决定没有人拍过——建议：若 C-2 最终判定用 FP8 KV，先用
-  固定 1.0（对齐 self_attn/GDN 投影层的静态量化惯例）跑 B1 正确性门禁，若逐 token
-  对齐失败再考虑自己校准，不要一开始就假设需要一套校准流水线。
-- **（新增，2026-08-02）Qwen3.6 稠密 MLP 的 GEMM 路线**——B0-2 证伪了"MLP 也是
-  W4A4"的假设，实测是 W4A16（weight-only，§3.4/§5.2）。这直接决定原来"自研
-  `.cu` vs sparkinfer 两个 FP4×FP4 kernel 选一个"这条 GPU A/B 该测什么：如果
-  `sparkinfer.gemm.blockscaled.mm` 只吃 FP4×FP4 输入，选它就等于要么牺牲
-  weight-only 的收益（反量化到 bf16）要么想办法伪造一个激活侧 FP4 量化步骤
-  （即使 checkpoint 本身不要求）；需要先读一遍 sparkinfer 该函数的输入契约再
-  决定 A/B 候选集，这条本文档不代为拍板，因为需要读 sparkinfer 源码（不需要
-  GPU，但超出本轮 B0-2/6/7 的字面范围，留给紧邻的下一步）。
+- **（2026-08-02 第二轮，已有明确建议但仍需人确认）FP8 KV 的 scale 从哪来**——
+  B0-2 实测官方 checkpoint 声明 `kv_cache_quant_algo: FP8` 但不带任何
+  `k_scale`/`v_scale` 张量（§1.3/§4）。**vLLM/SGLang 的现成答案是默认 1.0+
+  告警**（B0 笔记 §6），vLLM 自己正在把运行时校准这条路废弃。C-2 仍在判断
+  要不要用 FP8 KV（另一 agent 的结论，本文档不预判），但"scale 从哪来"这个
+  子问题已经有主流框架的现成先例可循——**建议**：若 C-2 最终判定用 FP8 KV，
+  直接采用 vLLM/SGLang 同款策略（固定 1.0 + 告警），不要在验证到"1.0 不够"
+  之前先去搭一套校准流水线。人需要拍板的只是"要不要采纳这个建议"，不是
+  "从哪找答案"。
+- **（2026-08-02 第二轮已解决，不再需要拍板）Qwen3.6 稠密 MLP 的 GEMM
+  路线**——B0-2 证伪了"MLP 也是 W4A4"的假设，实测是 W4A16（weight-only，
+  §3.4/§5.2）。第二轮读完 `sparkinfer/gemm/` 全部 9 个 op 与
+  `sparkinfer/moe/_shared/kernels/w4a16/` 源码后确认：公开的
+  `moe.fused_moe(quant_mode="w4a16", source_format="modelopt_nvfp4")` 配
+  `num_experts=1` 单专家退化路由已经原生覆盖这个语义，不需要新 SparkInfer
+  功能，不需要复活自研 `.cu`，不需要在"反量化+bf16"与"混合精度 kernel"之间
+  选择——**这条不再是待拍板事项，只剩"实测跑通/测吞吐"这个纯执行动作**
+  （见 §6 待验证清单），完整证据链见
+  [`../notes/2026-08-02-qwen36-b0-fact-baseline.md`](../notes/2026-08-02-qwen36-b0-fact-baseline.md) §4。
 - **B0-2（modelopt 张量命名确认，已完成，见 §1）与 B0-4（GDN 方案三选一：FLA/移植/自研）的排期
   顺序**——本文档判定 GDN kernel 本身不是性能瓶颈（2.6 节），建议 B0-4 直接选①
   FLA 拿正确性，把"要不要自研③"推迟到 B3 profiling 之后再看，这条 roadmap 已经
