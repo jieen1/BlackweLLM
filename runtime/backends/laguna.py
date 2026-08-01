@@ -1949,14 +1949,17 @@ class LagunaBackend:
         is reused in-place when a future request matches this slot's token
         prefix (content-addressed, same-slot reuse; no cross-slot copies).
         Token history is saved so ``reconcile_prefix_hit`` can match.
+
+        Important: if the slot is already fresh (kv_len==0, no committed
+        tokens), we do NOT overwrite the saved prefix cache — the previous
+        reset already saved it. This prevents the double-reset pattern
+        (finish → reset saves cache; admission → reset would clear it).
         """
-        # Save token history for prefix matching before clearing metadata
+        # Only save token history if this slot actually ran a request
         if self.slot_committed_tokens[slot] and self.slot_kv_len[slot] > 0:
             self._prefix_cache_tokens[slot] = list(self.slot_committed_tokens[slot])
             self._prefix_cache_kv_len[slot] = self.slot_kv_len[slot]
-        else:
-            self._prefix_cache_tokens[slot] = None
-            self._prefix_cache_kv_len[slot] = 0
+        # If slot is already fresh (double-reset), preserve existing cache
         self.slot_kv_len[slot] = 0
         self.slot_committed_tokens[slot] = []
         self._prefix_chunk_snapshots[slot] = None
