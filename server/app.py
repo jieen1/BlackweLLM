@@ -892,6 +892,56 @@ async def completions(req: CompletionRequest, request: Request):
     }
 
 
+def _run_startup_preflight() -> None:
+    """Validate the environment before any weights are loaded, and abort on a
+    fatal mismatch (roadmap T0-3 / D3).
+
+    ``runtime.preflight`` deliberately never prints or exits -- it returns a
+    structured report and leaves presentation and policy to its caller. This
+    is that caller: it renders one line per check, blocks on fatal failures,
+    and lets warnings through with their remediation text.
+
+    The checkpoint checks want a local directory, but ``ServerEngine.MODEL``
+    is a HuggingFace repo id. ``_resolve_laguna_model_dir`` is the resolver
+    the loader itself uses (offline-only, no network fetch); importing the
+    private name is deliberate -- duplicating two lines of resolution logic
+    here would be free to drift away from what actually gets loaded.
+    """
+    import sys
+
+    from runtime.laguna_config import _resolve_laguna_model_dir
+    from runtime.preflight import run_preflight
+
+    try:
+        checkpoint_dir = _resolve_laguna_model_dir(ServerEngine.MODEL)
+    except Exception as exc:  # noqa: BLE001 - any resolution failure is fatal here
+        print(
+            f"preflight: cannot resolve a local checkpoint for {ServerEngine.MODEL!r}: {exc}\n"
+            f"           Download it first, or point QSR_SERVED_MODEL_NAME at a local path.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
+
+    report = run_preflight(checkpoint_dir)
+    for check in report.checks:
+        mark = "ok  " if check.passed else ("FAIL" if check.severity == "fatal" else "warn")
+        print(f"preflight [{mark}] {check.name}: {check.actual}", file=sys.stderr)
+    for check in report.warnings:
+        if check.remediation:
+            print(f"preflight        -> {check.remediation}", file=sys.stderr)
+    if report.ok:
+        return
+    print("preflight: refusing to start.", file=sys.stderr)
+    for check in report.fatal_failures:
+        print(
+            f"  {check.name}: expected {check.expected}, got {check.actual}",
+            file=sys.stderr,
+        )
+        if check.remediation:
+            print(f"    -> {check.remediation}", file=sys.stderr)
+    raise SystemExit(1)
+
+
 def main() -> None:
     import argparse
 
@@ -904,6 +954,15 @@ def main() -> None:
     parser.add_argument("--num-slots", type=int, default=SERVER_NUM_SLOTS)
     parser.add_argument("--blocks-per-slot", type=int, default=SERVER_BLOCKS_PER_SLOT)
     parser.add_argument("--no-cudagraph", action="store_true")
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help=(
+            "Skip the startup environment checks (GPU architecture, CUDA, torch, "
+            "SparkInfer, checkpoint). Escape hatch for deliberately unusual setups; "
+            "a fatal check normally means the server would fail later and less clearly."
+        ),
+    )
     parser.add_argument(
         "--no-prefix-cache",
         action="store_true",
@@ -953,6 +1012,11 @@ def main() -> None:
     os.environ["QSR_SERVER_SESSION_TTL_S"] = str(args.session_ttl_s)
     if args.dflash:
         os.environ["QSR_SERVER_ENABLE_DFLASH"] = "1"
+
+    # Runs before uvicorn imports the app module, so the model is not loaded
+    # yet -- a fatal environment mismatch costs seconds, not a failed load.
+    if not args.skip_preflight:
+        _run_startup_preflight()
 
     uvicorn.run("server.app:app", host=args.host, port=args.port, log_level="info")
 
