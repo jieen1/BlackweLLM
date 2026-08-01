@@ -147,9 +147,11 @@ cmd_start() {
     ln -sf "$log_file" "$LOG_DIR/current.log"
     echo "started pid=$pid, log: $log_file"
 
-    echo "waiting for startup (model load + KV cache alloc can take a while)..."
+    echo "waiting for startup (model load + KV cache alloc + paged-attention JIT"
+    echo "warmup can take a few extra minutes on a clean ~/.cache/sparkinfer,"
+    echo "well under 3min once that on-disk compile cache is warm)..."
     local miss_count=0
-    for _ in $(seq 1 180); do
+    for _ in $(seq 1 480); do
         if curl -s -m 3 "http://localhost:$PORT/v1/models" >/dev/null 2>&1; then
             echo "server is UP on $HOST:$PORT"
             local relay_pids

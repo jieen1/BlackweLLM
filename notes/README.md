@@ -1,6 +1,6 @@
 # notes/ 索引
 
-> 编制日期：2026-08-01 · 共 119 篇（`git ls-files notes | wc -l`）
+> 编制日期：2026-08-01 · 共 120 篇（`git ls-files notes | wc -l`）
 
 `notes/` 是**调查记录与证据档案**，不是文档。它的价值在于：当一个结论被
 质疑时，能翻出当初的实测数据、复现命令和被排除的假设。
@@ -52,6 +52,7 @@
 | `2026-07-29-cg-slot-doubling-fix.md` | CUDA Graph 槽位重复分配 |
 | `2026-07-24-moe-b12x-cudagraph-incompat-fix.md` | MoE kernel 与 CUDA Graph 不兼容 |
 | `2026-08-01-bfdiag-assertion-audit.md` | **bfdiag 断言可信度审计(Track C0)**——`reset_slot` 隔离保证失效(checkpoint/restore + daemon reset 两处都依赖已经不成立的"reset_slot 会清零 KV");两份手册误称 `reconcile_prefix_hit` 是 stub(实为生产代码);已删除的 `bug_found_not_fixed` 条目;`bfdiag/` 其余模块的真假断言普查 |
+| `2026-08-01-prefill-shape-buckets-root-cause.md` | **prefill 每轮 30+ 秒卡顿**——真正的编译缓存键轴是 sparkinfer `page_table` 宽度（`kv_len+qo_len` 的函数），不是最初怀疑的 `q.shape[0]`（源码 + 本机实测编译缓存直接证伪）；修复是让 `SparkinferPrefillWorkspace` 按 `(mode, window_left)` 建固定容量 workspace，不是按形状重建 |
 
 ## 3. SM120 kernel 研究 🟢
 

@@ -381,11 +381,20 @@ class DFlashEngine:
         def _resolve_parent(layer_name: str) -> tuple[Any, str]:
             return parents_by_name[layer_name], "attn"
 
+        # Draft attention only ever runs at a fixed qo_len=NUM_QUERY_PER_REQ
+        # (16: 1 bonus + 15 mask, see _draft_forward) -- unlike the main
+        # model's prefill, its shape never varies. This capacity is
+        # generous headroom, not a bucket ladder; see SparkinferPrefillWorkspace's
+        # docstring in laguna_sparkinfer_attn.py for why a fixed capacity
+        # (not an exact-shape rebuild) is still required here too.
         replace_laguna_attention(
             self.draft_model,
             self._draft_attn_layers,
             self._draft_kv_caches,
             resolve_parent=_resolve_parent,
+            prefill_capacity_by_window_left={
+                DRAFT_WINDOW - 1: (NUM_QUERY_PER_REQ, self._draft_blocks_per_slot),
+            },
         )
         logger.info(
             "DFlash: draft attention patched with sparkinfer (%d layers)",

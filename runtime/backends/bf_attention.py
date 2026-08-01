@@ -200,6 +200,8 @@ def replace_laguna_attention(
     sfc: dict[str, Any],
     kv_caches: dict[str, torch.Tensor],
     resolve_parent: Any = None,
+    *,
+    prefill_capacity_by_window_left: dict[int, tuple[int, int]],
 ) -> int:
     """Replace Laguna attention placeholders in ``model`` with BFAttention.
 
@@ -221,6 +223,16 @@ def replace_laguna_attention(
     fail. Default (``None``) preserves the exact original behavior for
     the main model, where layer_name IS the real path.
 
+    ``prefill_capacity_by_window_left`` maps each layer group's
+    ``window_left`` to the ``(max_total_q, max_page_table_width)``
+    capacity its shared ``SparkinferPrefillWorkspace`` should be built at
+    (see that class's docstring for why this must be a fixed capacity, not
+    a per-call exact shape). Required, not defaulted: the caller (Laguna's
+    own layer-group discovery) is the only place that knows the real bound
+    on ``kv_len + qo_len`` for each group, and a wrong bound fails loudly
+    (``PagedAttentionWorkspace._ensure_capacity`` raises) rather than
+    silently reintroducing per-shape recompiles.
+
     Returns number of layers replaced.
     """
     from runtime.backends.laguna_sparkinfer_attn import SparkinferPrefillWorkspace
@@ -241,7 +253,12 @@ def replace_laguna_attention(
         workspace_key = (window_left, num_heads, num_kv_heads, head_size)
         prefill_workspace = prefill_workspaces.get(workspace_key)
         if prefill_workspace is None:
-            prefill_workspace = SparkinferPrefillWorkspace(torch.device("cuda"))
+            max_total_q, max_page_table_width = prefill_capacity_by_window_left[window_left]
+            prefill_workspace = SparkinferPrefillWorkspace(
+                torch.device("cuda"),
+                max_total_q=max_total_q,
+                max_page_table_width=max_page_table_width,
+            )
             prefill_workspaces[workspace_key] = prefill_workspace
 
         # Create BFAttention replacement

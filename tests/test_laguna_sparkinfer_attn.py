@@ -96,8 +96,12 @@ def test_prefill_workspace_reuses_plan_only_within_one_metadata_object(monkeypat
     calls: list[str] = []
 
     class FakeWorkspace:
+        @staticmethod
+        def eager_extend_work_items_capacity(**kwargs):
+            return 1
+
         @classmethod
-        def for_tensors(cls, **kwargs):
+        def for_fixed_capacity(cls, **kwargs):
             calls.append("workspace")
             return cls()
 
@@ -127,7 +131,9 @@ def test_prefill_workspace_reuses_plan_only_within_one_metadata_object(monkeypat
         lambda *, binding: calls.append("forward"),
     )
 
-    workspace = SparkinferPrefillWorkspace(torch.device("cpu"))
+    workspace = SparkinferPrefillWorkspace(
+        torch.device("cpu"), max_total_q=8192, max_page_table_width=64
+    )
     q = torch.empty(2, 1, 4)
     cache = torch.empty(3, 2, 1, 4)
     output = torch.empty_like(q)
@@ -154,3 +160,91 @@ def test_prefill_workspace_reuses_plan_only_within_one_metadata_object(monkeypat
     assert calls.count("runtime") == 2
     assert calls.count("plan_metadata") == 2
     assert calls.count("forward") == 3
+
+
+def test_prefill_workspace_never_rebuilds_across_varying_real_shapes(monkeypatch):
+    """Regression test for the prefill-shape-buckets bug.
+
+    Root cause: sparkinfer's paged_attention_forward JIT-compiles its CuTe
+    launch keyed on (among other things) page_table's literal width, which
+    is a function of kv_len+qo_len. The old SparkinferPrefillWorkspace
+    rebuilt a PagedAttentionWorkspace via for_tensors() -- sized to the
+    exact literal q/page_table shape -- every time that shape changed, so
+    every previously-unseen (kv_len, qo_len) paid sparkinfer's ~30s CuTe
+    recompile. Real multi-turn traffic almost never repeats a shape.
+
+    Before the fix (SparkinferPrefillWorkspace._key() included q.shape and
+    the workspace was built via for_tensors()), this test fails: it counts
+    a fresh "workspace" build for every distinct (qo_len, page_table_width)
+    pair below. After the fix (fixed-capacity workspace, built once per
+    (mode, window_left)), it must build exactly once no matter how many
+    distinct real shapes are seen.
+    """
+    pytest.importorskip("sparkinfer")
+    calls: list[str] = []
+
+    class FakeWorkspace:
+        @staticmethod
+        def eager_extend_work_items_capacity(**kwargs):
+            return 1
+
+        @classmethod
+        def for_fixed_capacity(cls, **kwargs):
+            calls.append("workspace")
+            return cls()
+
+        def _ensure_capacity(self, plan):
+            pass
+
+        def _copy_runtime_metadata(self, *args):
+            pass
+
+        def _copy_plan_metadata(self, plan):
+            pass
+
+    monkeypatch.setattr(
+        "sparkinfer.attention.paged.workspace.PagedAttentionWorkspace",
+        FakeWorkspace,
+    )
+    monkeypatch.setattr(
+        "sparkinfer.attention.paged.planner.create_paged_plan",
+        lambda *args, **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.attention.paged._scratch.build_paged_attention_binding",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(
+        "sparkinfer.attention.paged._forward.paged_attention_forward",
+        lambda *, binding: None,
+    )
+
+    workspace = SparkinferPrefillWorkspace(
+        torch.device("cpu"), max_total_q=8192, max_page_table_width=1088
+    )
+    cache = torch.empty(3, 64, 8, 128)
+
+    # Distinct real (qo_len, kv_len) pairs -- mirrors a growing multi-turn
+    # conversation, where neither the query length nor the accumulated KV
+    # length ever repeats.
+    for qo_len, kv_len in [(37, 0), (512, 0), (2151, 0), (2839, 4096), (91, 8192)]:
+        new_kv_len = kv_len + qo_len
+        max_blocks = (new_kv_len + 63) // 64
+        q = torch.empty(qo_len, 48, 128)
+        output = torch.empty_like(q)
+        workspace.forward(
+            q=q,
+            k_cache=cache,
+            v_cache=cache,
+            output=output,
+            page_table=torch.empty(1, max_blocks, dtype=torch.int32),
+            cache_seqlens=torch.empty(1, dtype=torch.int32),
+            cu_seqlens_q=torch.empty(2, dtype=torch.int32),
+            plan_cache_key=object(),
+        )
+
+    assert calls.count("workspace") == 1, (
+        "SparkinferPrefillWorkspace rebuilt its PagedAttentionWorkspace for a "
+        "new real shape -- this reintroduces the per-shape JIT recompile bug "
+        "(see notes/2026-08-01-prefill-shape-buckets-root-cause.md)"
+    )

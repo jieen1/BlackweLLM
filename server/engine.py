@@ -399,6 +399,14 @@ class ServerEngine:
             block_size=self.block_size,
             blocks_per_slot=self.blocks_per_slot,
         )
+        if os.environ.get("QSR_SERVER_WARMUP_PAGED_ATTENTION", "1") != "0":
+            # Before any slot can be claimed by a real request (same "every
+            # slot is still definitionally empty" window the CUDA Graph/
+            # DFlash captures below rely on): pay the paged-attention JIT's
+            # per-block-table-width compile cost up front instead of on
+            # whichever real request happens to hit each width first. See
+            # LagunaBackend.warmup_paged_attention_shapes's docstring.
+            self.runner.warmup_paged_attention_shapes()
         if self._enable_cudagraph:
             graph_batch_size = self.runner.capture_decode_cuda_graph()
             if graph_batch_size is not None:
@@ -446,8 +454,19 @@ class ServerEngine:
             target=self._engine_thread_main, daemon=True, name="blackwellm-engine"
         )
         self._engine_thread.start()
-        if not self._ready_event.wait(timeout=600):
-            raise RuntimeError("Engine thread failed to initialize model within 600s")
+        # 2400s (40min), not 600s: on a clean ~/.cache/sparkinfer, model
+        # load (~2.5min) plus LagunaBackend.warmup_paged_attention_shapes
+        # (one CuTe compile per attention layer group -- full-attention
+        # plus each distinct SWA window, commonly tens of seconds apiece)
+        # adds a few extra minutes at most. Generous headroom here in case
+        # a given machine/toolchain compiles slower than observed. Only the
+        # *first* boot on a given machine pays this -- every later restart
+        # replays the on-disk compile cache in well under a second total.
+        startup_timeout_s = int(os.environ.get("QSR_SERVER_STARTUP_TIMEOUT_S", "2400"))
+        if not self._ready_event.wait(timeout=startup_timeout_s):
+            raise RuntimeError(
+                f"Engine thread failed to initialize model within {startup_timeout_s}s"
+            )
         if self._load_error is not None:
             raise RuntimeError("Engine thread failed during model loading") from self._load_error
 

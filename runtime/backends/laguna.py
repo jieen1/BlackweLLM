@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -407,6 +408,20 @@ class LagunaBackend:
             self._ring_blocks_per_slot,
         )
 
+        # SWA prefill scratch capacity (blocks), hoisted ahead of its own
+        # tensor allocation below: replace_laguna_attention() needs this
+        # bound *before* it runs, to size each SWA layer group's shared
+        # SparkinferPrefillWorkspace at a fixed capacity (see that class's
+        # docstring in laguna_sparkinfer_attn.py). Pure arithmetic on
+        # values already set above; no side effects moved.
+        _scratch_tokens = (
+            self._swa_window if self._swa_window > 0 else 0
+        ) + self._prefill_chunk_tokens
+        self._swa_scratch_blocks = min(
+            blocks_per_slot,
+            -(-_scratch_tokens // block_size),  # cdiv
+        )
+
         # ── Allocate KV caches: per-group ──
         num_phys = num_slots + RESERVED_PHYSICAL_SLOTS
         full_num_blocks = num_phys * blocks_per_slot
@@ -429,25 +444,39 @@ class LagunaBackend:
         # Replace vLLM Attention modules with self-developed BFAttention
         from runtime.backends.bf_attention import replace_laguna_attention
 
-        replace_laguna_attention(self.model, sfc, self.kv_caches)
+        # Fixed capacity per layer group's shared SparkinferPrefillWorkspace
+        # (see that class's docstring): max_total_q bounds any single
+        # extend/verify call's real query-token count, max_page_table_width
+        # bounds ceil((kv_len + qo_len) / block_size) for that group. Full
+        # attention reads the whole per-slot KV range; SWA prefill only ever
+        # reads/writes the scratch arena sized just above. Every real call
+        # already respects these bounds by construction (_prefill_chunk_
+        # tokens caps qo_len per chunk; the scratch/slot allocation sizes
+        # cap the corresponding KV reach) -- PagedAttentionWorkspace raises
+        # loudly instead of silently recompiling if that ever stops holding.
+        self._prefill_capacity_by_window_left: dict[int, tuple[int, int]] = {
+            -1: (self._prefill_chunk_tokens, blocks_per_slot),
+        }
+        if self._swa_layer_names:
+            self._prefill_capacity_by_window_left[self._swa_window - 1] = (
+                self._prefill_chunk_tokens,
+                self._swa_scratch_blocks,
+            )
+        replace_laguna_attention(
+            self.model,
+            sfc,
+            self.kv_caches,
+            prefill_capacity_by_window_left=self._prefill_capacity_by_window_left,
+        )
 
         # ── Persistent prefill scratch for SWA layers ──
         # A decoder layer's SWA KV is copied to its ring immediately after
         # that layer completes, so one arena can be safely reused by all 36
         # SWA layers. It is not zeroed: the per-layer overlap copy and causal
         # mask guarantee no read-before-write within the active window.
+        # Capacity (self._swa_scratch_blocks) is computed above, ahead of
+        # replace_laguna_attention(), which also needs it.
         self._swa_scratch: torch.Tensor | None = None
-        # SWA scratch: sized for overlap (window) + one prefill chunk.
-        # Chunked prefill copies the last `window` tokens from ring into
-        # scratch before each chunk, then processes chunk_tokens new tokens.
-        # Total scratch capacity = window + chunk_tokens.
-        _scratch_tokens = (
-            self._swa_window if self._swa_window > 0 else 0
-        ) + self._prefill_chunk_tokens
-        self._swa_scratch_blocks = min(
-            blocks_per_slot,
-            -(-_scratch_tokens // block_size),  # cdiv
-        )
         self._swa_decoder_layers: dict[str, nn.Module] = {}
         if self._swa_layer_names:
             scratch_specs: set[tuple[tuple[int, ...], torch.dtype]] = set()
@@ -576,6 +605,113 @@ class LagunaBackend:
         )
         torch.cuda.synchronize(self.device)
         del logits
+
+    def warmup_paged_attention_shapes(self, *, slot: int = 0) -> None:
+        """Proactively compile each layer group's paged-attention JIT kernel.
+
+        ``SparkinferPrefillWorkspace`` (laguna_sparkinfer_attn.py) builds
+        ONE fixed-capacity workspace per ``(mode, window_left)`` layer
+        group the first time that group runs, paying sparkinfer's one-time
+        CuTe compile (commonly tens of seconds); every later call against
+        it -- at any real ``qo_len``/``kv_len`` within the capacity this
+        backend declared via ``self._prefill_capacity_by_window_left`` --
+        reuses it for free, with no further compiles. Compiles are cached
+        to ``~/.cache/sparkinfer`` across process restarts too.
+
+        Called once at server startup, before any request is admitted
+        (see ``ServerEngine._load_laguna_model``), so that small, fixed
+        number of compiles (one per layer group -- full-attention plus
+        one per distinct SWA window -- times 2, see below) is paid for up
+        front with progress logged, instead of landing inside whichever
+        real request happens to touch each group first.
+
+        Two dummy forward passes, each exercising every layer group at
+        once (a single model forward dispatches to every attention layer
+        regardless of prompt length):
+        - A multi-token prompt hits ``mode="extend"`` (ordinary prefill).
+        - A single-token prompt hits ``mode="decode"``:
+          ``_build_sparkinfer_metadata`` picks "decode" whenever
+          ``num_actual_tokens == num_reqs`` (== 1), even for this
+          ``is_decode=False`` prefill call. ``mode`` is part of
+          ``SparkinferPrefillWorkspace._key()``, so this is a genuinely
+          separate compile from the multi-token case above -- rare in real
+          traffic (a literal one-token prompt) but still reachable through
+          this same workspace, not the M=1 decode CUDA Graph (which
+          requires an already-committed anchor token).
+
+        Uses ``slot`` purely as throwaway scratch: this calls ``_forward``
+        directly, bypassing every ``prefill_*``/``decode`` bookkeeping path,
+        so ``self.slot_kv_len``/``slot_committed_tokens``/prefix-cache state
+        for it are untouched -- the slot is exactly as fresh afterward as
+        before, safe to hand to the first real request.
+
+        Not called from ``__init__`` -- callers that only need a fast
+        smoke-test backend (benchmarks, unit tests) should not pay for it.
+        """
+        t_start = time.perf_counter()
+        has_swa = bool(self._swa_layer_names) and self._ring_blocks_per_slot > 0
+        groups = sorted(getattr(self, "_prefill_capacity_by_window_left", {}))
+        # warning, not info: this codebase's loggers have no basicConfig
+        # attached anywhere, so the effective level is the root logger's
+        # default (WARNING) -- an info-level "warmup starting" banner would
+        # be silently dropped. SparkinferPrefillWorkspace's own compile-
+        # timing diagnostic (below) already established warning as the
+        # right level for "should be visible on a default-configured
+        # server" startup progress; match it here for the same reason.
+        logger.warning(
+            "Laguna: warming up paged-attention JIT for %d layer group(s) "
+            "(window_left=%s), extend and decode contracts each. First "
+            "boot after a clean ~/.cache/sparkinfer pays sparkinfer's "
+            "one-time CuTe compile per (group, contract) (commonly tens of "
+            "seconds each); later restarts replay the on-disk compile "
+            "cache in well under a second total.",
+            len(groups),
+            groups,
+        )
+
+        # dummy_qo=1 deliberately hits mode="decode" (see docstring);
+        # dummy_qo=8 (>1) hits mode="extend".
+        for dummy_qo in (8, 1):
+            dummy_tokens = [0] * dummy_qo
+            t0 = time.perf_counter()
+            try:
+                with self._swa_scratch_context(
+                    slot=slot,
+                    overlap_abs_start=0,
+                    overlap_count=0,
+                    scratch_copy_start=0,
+                    ring_copy_abs_start=0,
+                    copy_count=0,
+                ):
+                    self._forward(
+                        [slot],
+                        dummy_tokens,
+                        [0],
+                        qo_len=dummy_qo,
+                        is_decode=False,
+                        swa_kv_lengths=[0] if has_swa else None,
+                        skip_logits=True,
+                    )
+                torch.cuda.synchronize(self.device)
+            except Exception:  # noqa: BLE001 - warmup must never block startup
+                logger.warning(
+                    "Laguna: paged-attention warmup failed for qo_len=%d "
+                    "(non-fatal -- these groups will compile lazily on the "
+                    "first real request instead)",
+                    dummy_qo,
+                    exc_info=True,
+                )
+            logger.warning(
+                "Laguna: warmup pass qo_len=%d done in %.1fs",
+                dummy_qo,
+                time.perf_counter() - t0,
+            )
+
+        logger.warning(
+            "Laguna: paged-attention JIT warmup complete in %.1fs (%d layer group(s))",
+            time.perf_counter() - t_start,
+            len(groups),
+        )
 
     def _patch_moe_sparkinfer(self) -> None:
         """Replace MoE compute with sparkinfer for every LagunaMoESelfBuilt layer.

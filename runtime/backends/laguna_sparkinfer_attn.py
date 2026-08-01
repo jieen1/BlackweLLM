@@ -35,6 +35,7 @@ import os
 os.environ.setdefault("SPARKINFER_TURBO_ATTN", "0")
 
 import logging
+import time
 from typing import Any
 
 import torch
@@ -43,6 +44,13 @@ from runtime.backends._sparkinfer_import import ensure_sparkinfer_path
 from runtime.kernels.fused_kv_scatter import fused_kv_scatter
 
 logger = logging.getLogger("qwen_sm120_runtime.sparkinfer_attn")
+
+# Threshold separating "genuine cold CuTe compile just happened" from "hit
+# sparkinfer's on-disk compile cache" in the SparkinferPrefillWorkspace
+# first-call diagnostic below. Compiles measured ~30s; disk-cache hits
+# measured single-digit milliseconds -- there is no realistic middle ground,
+# so this default has wide margin either way.
+_ATTN_COMPILE_WARN_S = float(os.environ.get("QSR_ATTN_COMPILE_WARN_S", "5.0"))
 
 # Route through the single controlled resolver (see
 # runtime/backends/_sparkinfer_import.py) instead of inserting BF_SPARKINFER_PATH
@@ -116,21 +124,54 @@ class SparkinferAttnMetadata:
 
 
 class SparkinferPrefillWorkspace:
-    """Manages sparkinfer extend-mode workspaces for prefill (eager, no CG).
+    """Manages sparkinfer extend/verify-mode workspaces for prefill (eager, no CG).
 
     One instance can be shared by all layers in an attention group. The
     immutable planner metadata is identical for those layers within one model
     forward, so it is prepared once and reused by the remaining layers. A
     different metadata object always rebuilds the plan and uploads its runtime
     metadata; this cache never crosses requests.
+
+    Root cause this class exists to avoid (see
+    notes/2026-08-01-prefill-shape-buckets-root-cause.md): sparkinfer's
+    ``paged_attention_forward`` JIT-compiles its CuTe launch wrapper keyed on
+    a snapshot of several tensors' shapes (``forward_cache_key`` in
+    sparkinfer's ``attention/paged/_forward.py``). ``q``'s own token
+    dimension is already masked dynamic there, but ``page_table``'s block-
+    table width is not -- it is a literal function of ``kv_len + qo_len``.
+    Building a *fresh* ``PagedAttentionWorkspace`` (via ``for_tensors``) for
+    every distinct request shape, as this class used to do, means every
+    previously-unseen ``(kv_len, qo_len)`` combination pays a ~30s CuTe
+    recompile -- and real multi-turn traffic almost never repeats a shape,
+    so every turn pays it. Building ONE persistent workspace at a fixed
+    capacity via ``PagedAttentionWorkspace.for_fixed_capacity`` instead means
+    ``page_table`` (and every other capacity-bound buffer) keeps the SAME
+    object and the SAME shape across calls; only its *contents* change per
+    call. That makes the compile cache key stable, so the compile happens
+    once per (mode, window_left) and every request within the declared
+    capacity reuses it -- confirmed empirically: identical trailing calls
+    against a fixed-capacity workspace measure ~4ms regardless of how much
+    the real ``qo_len``/``kv_len`` differs from the previous call, vs ~32s
+    for the very first call against any new workspace.
     """
 
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, *, max_total_q: int, max_page_table_width: int):
         self.device = device
         self._descale = torch.ones(1, dtype=torch.float32, device=device)
         self._workspace: Any | None = None
         self._workspace_key: tuple[Any, ...] | None = None
         self._prepared_metadata: object | None = None
+        # Capacity for the persistent PagedAttentionWorkspace this instance
+        # builds lazily (see forward()). Sized by the caller (LagunaBackend)
+        # to bound every real qo_len / (kv_len+qo_len) this group can see, so
+        # _ensure_capacity() below never needs to grow (and raises loudly --
+        # rather than silently recompiling -- if the caller under-sized it).
+        self._max_total_q = max_total_q
+        self._max_page_table_width = max_page_table_width
+        # One request per extend/verify call everywhere in this runtime
+        # (prefill is always single-slot; DFlash verify is always
+        # single-slot -- see laguna.py and laguna_dflash.py call sites).
+        self._max_batch = 1
 
     @staticmethod
     def _key(
@@ -143,19 +184,25 @@ class SparkinferPrefillWorkspace:
     ) -> tuple[Any, ...]:
         """Return the static contract which permits workspace reuse.
 
-        Runtime metadata is deliberately excluded: it is guarded by object
-        identity in ``_prepared_metadata`` and must be copied for every new
-        model forward.
+        Deliberately excludes ``q.shape[0]`` (total query tokens) and
+        ``k_cache.shape[0]``/``v_cache.shape[0]`` (page/block count): those
+        are exactly the per-call-varying dimensions the fixed-capacity
+        workspace built in ``forward()`` is designed to absorb without a
+        rebuild. Runtime metadata (the actual per-call values) is guarded
+        separately by object identity in ``_prepared_metadata``.
         """
         return (
             mode,
             q.device,
             q.dtype,
-            tuple(q.shape),
+            int(q.shape[1]),
+            int(q.shape[2]),
             k_cache.dtype,
-            tuple(k_cache.shape),
+            int(k_cache.shape[1]),
+            int(k_cache.shape[2]),
+            int(k_cache.shape[3]),
             v_cache.dtype,
-            tuple(v_cache.shape),
+            int(v_cache.shape[3]),
             int(window_left),
         )
 
@@ -192,12 +239,48 @@ class SparkinferPrefillWorkspace:
             v_cache=v_cache,
             window_left=window_left,
         )
-        if self._workspace_key != workspace_key:
-            self._workspace = PagedAttentionWorkspace.for_tensors(
+        is_new_workspace = self._workspace_key != workspace_key
+        if is_new_workspace:
+            num_q_heads = int(q.shape[1])
+            num_kv_heads = int(k_cache.shape[2])
+            max_work_items = PagedAttentionWorkspace.eager_extend_work_items_capacity(
+                max_total_q=self._max_total_q,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+            )
+            logger.info(
+                "SparkinferPrefillWorkspace: new fixed-capacity contract "
+                "mode=%s window_left=%d q_heads=%d kv_heads=%d "
+                "max_total_q=%d max_page_table_width=%d -- the *next* "
+                "paged_attention_forward call below pays sparkinfer's "
+                "one-time CuTe compile for this (mode, window_left); every "
+                "later call at any shape within this capacity reuses it "
+                "(and it stays warm across process restarts via sparkinfer's "
+                "own on-disk cache). See "
+                "notes/2026-08-01-prefill-shape-buckets-root-cause.md.",
+                mode,
+                window_left,
+                num_q_heads,
+                num_kv_heads,
+                self._max_total_q,
+                self._max_page_table_width,
+            )
+            self._workspace = PagedAttentionWorkspace.for_fixed_capacity(
                 mode=mode,
-                q=q,
-                k_cache=k_cache,
-                v_cache=v_cache,
+                device=q.device,
+                dtype=q.dtype,
+                kv_dtype=k_cache.dtype,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=int(q.shape[2]),
+                head_dim_vo=int(v_cache.shape[3]),
+                page_size=int(k_cache.shape[1]),
+                max_total_q=self._max_total_q,
+                max_batch=self._max_batch,
+                max_page_table_width=self._max_page_table_width,
+                max_work_items=max_work_items,
+                max_partial_rows=0,
+                num_cache_pages=int(k_cache.shape[0]),
                 use_cuda_graph=False,
             )
             self._workspace_key = workspace_key
@@ -232,7 +315,28 @@ class SparkinferPrefillWorkspace:
             k_descale=k_descale,
             v_descale=v_descale,
         )
-        paged_attention_forward(binding=binding)
+        if is_new_workspace:
+            t0 = time.perf_counter()
+            paged_attention_forward(binding=binding)
+            if q.device.type == "cuda":
+                torch.cuda.synchronize(q.device)
+            elapsed = time.perf_counter() - t0
+            log = logger.warning if elapsed >= _ATTN_COMPILE_WARN_S else logger.info
+            log(
+                "SparkinferPrefillWorkspace: first paged_attention_forward "
+                "for mode=%s window_left=%d took %.3fs (>=%.1fs means a "
+                "genuine cold CuTe compile just happened; well under that "
+                "means sparkinfer's on-disk cache at ~/.cache/sparkinfer "
+                "already had this contract from a prior process). Every "
+                "later call against this workspace reuses it with no "
+                "further compiles, regardless of real qo_len/kv_len.",
+                mode,
+                window_left,
+                elapsed,
+                _ATTN_COMPILE_WARN_S,
+            )
+        else:
+            paged_attention_forward(binding=binding)
 
 
 class SparkinferDecodeWorkspace:
