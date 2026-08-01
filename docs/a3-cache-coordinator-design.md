@@ -1,881 +1,631 @@
-# A3 Cache Coordinator — Implementable Design
+# A3 缓存协调者：可实施设计
 
-> Status: **design only, not implemented**. Track A step 7 (`docs/implementation-plan.md`
-> §6 row 7; `docs/architecture.md` §3.5.5 row 7). Branch `work/a3-design-20260802`,
-> worktree `/home/bot/project/qsr-w-a3` — **not merged into `main`**.
+> 编制日期：2026-08-02 · 基线 commit：`d87c7ef`（`main`，Track A 第 1–5 步已完成）
+> 分支：`work/a3-design-20260802`（worktree `/home/bot/project/qsr-w-a3`）——**本文档不合并进 main**。
 >
-> Zero GPU used to produce this document. Zero production code touched: `runtime/`,
-> `server/`, `oracle/` are read-only inputs here.
-
-## 0. How to read this
-
-Every claim below is tagged as one of:
-
-- **[FACT — path:line]** — read directly from source in this repo, or from the local
-  vLLM/SGLang checkouts, this round. Where a fact corrects something an earlier document
-  claimed, the correction is called out explicitly (`docs/roadmap.md` §1.5-S4's
-  characterization of `block_pool.py`'s GDN hooks turned out to be stale — see §2.5).
-- **[JUDGMENT]** — a design recommendation. Not a fact; argued for, but a call someone
-  could reasonably make differently. §6 collects the ones big enough that they should not
-  be decided unilaterally here.
-- **[OPEN]** — genuinely unresolved, needs a GPU or a human decision this document cannot
-  supply.
-
-Primary sources consulted directly (not by re-reading `hybrid-cache-prior-art.md`'s
-transcription of them — that note's quotes were independently re-verified against the
-files below, and two corrections came out of doing so; see §3):
-
-| Source | What | Where |
-|---|---|---|
-| vLLM 0.25.1 | `v1/core/{single_type_kv_cache_manager,kv_cache_coordinator,block_pool,kv_cache_utils}.py` | `~/.venvs/vllm025/lib/python3.12/site-packages/vllm/` |
-| SGLang | `srt/mem_cache/{allocator/mamba,hi_mamba_radix_cache,base_prefix_cache,hybrid_cache/hybrid_cache_controller}.py`, `srt/managers/{schedule_batch,schedule_policy}.py` | `/home/bot/project/sglang` @ `b296e1a5035b` (2026-07-16) |
-| This repo's own retired prior art | `oracle/qwen36_vllm/{gdn_state,prefix_cache,direct_model_runner}.py`, `notes/prefix-cache-design.md`, `benchmarks/prefix_cache_eviction_check.py` | this repo, see §2.2 for why it exists and is retired |
-| This repo's live substrate | `runtime/block_pool.py`, `runtime/architecture.py`, `runtime/backends/{protocol,laguna}.py` | this repo |
-
-No newer vLLM checkout than 0.25.1 exists on this machine (confirmed by search); vLLM
-0.26.0's advertised "partial prefix-cache hit support for hybrid models" remains
-unverified here — flagged again in §3.1.
+> 范围：本文档只出设计。不改 `runtime/`、`server/`、`tests/` 的任何生产/测试代码；
+> 本文档里出现的 dataclass、方法签名、测试骨架**全部是说明性代码块**，是"这样写"的提案，
+> 不是已落地的实现。
+>
+> 记号约定：**【事实】**= 亲自读代码/读上游源码核实过的陈述，带 `file:line`；
+> **【判断】**= 设计取舍，可被推翻；**【待拍板】**= 半径大到不该由本文档单方面定案的项，
+> 集中在 §8，带选项和推荐但不代选。
 
 ---
 
-## 1. Executive summary
+## 0. 方法论：跟"转述"的区别
 
-1. **The framing in `docs/implementation-plan.md` row 7 needs two corrections before
-   anyone writes code against it** (§2.5, §3): the "S4 GDN remnants" are not remnants —
-   `docs/qwen36-rebuild-spec.md` §1.5/§1.10 already found this and my own read of
-   `runtime/block_pool.py` confirms it — and "vLLM/SGLang return `(kv_hit, state_hit)`"
-   as a pair the *scheduler* chooses between is true of **neither**: vLLM's default
-   scheduling path converges to one number before the scheduler ever sees two (§3.1),
-   and tracing SGLang's `match_prefix` to its actual truncation point shows its
-   scheduler-facing hit is collapsed to the state-constrained number too (§3.2) — the
-   second number SGLang carries answers a different question entirely. This matters
-   because it changes what "faithful to upstream precedent" means for A3's own return
-   type (§4.2): no surveyed system is precedent for branching scheduling logic on two
-   competing hit lengths, only for keeping a second, differently-purposed number around.
-2. **Laguna's production prefix cache does not use `runtime/block_pool.py` at all.**
-   `LagunaBackend.reconcile_prefix_hit` (`runtime/backends/laguna.py:2179-2220`) is a
-   same-slot linear token comparison over private per-slot arrays
-   (`_prefix_cache_tokens`/`_prefix_cache_kv_len`), not a content-hash lookup into
-   `BlockPool.hash_to_block`. `BlockPool` is exercised today only by `benchmarks/`,
-   `tests/test_block_pool.py`, and the retired `oracle/qwen36_vllm/`. This is the single
-   most important fact for the migration story in §5: "zero behavior change for Laguna"
-   is not a hard constraint A3 must engineer around, it is close to automatic, because
-   A3's new machinery and Laguna's live machinery do not currently share a call path.
-3. **This project already solved this exact problem once**, for a different tenant, at
-   GPU-validated quality, and then retired that tenant. `oracle/qwen36_vllm/gdn_state.py`
-   + `notes/prefix-cache-design.md` (INV1–INV9, R1–R10) + `benchmarks/prefix_cache_eviction_check.py`
-   is a complete, tested design for exactly "two co-indexed cache groups, reconciled,
-   evicted in lockstep, budgeted independently." A3's job is to re-derive that design
-   against the *new* `ModelBackend` protocol substrate, not invent it from scratch and not
-   revive the old code (`docs/implementation-plan.md` §10 explicitly forbids reviving
-   `oracle/qwen36_vllm/`). §4 and §7 are built on top of it, with citations.
-4. **Recommendation for the `(kv_hit, state_hit)` question (§4.2)**: expose both numbers
-   in a frozen `PrefixHit` dataclass — a diagnostic pairing loosely in the spirit of
-   SGLang keeping a second field (`mamba_branching_seqlen`) alongside its primary hit
-   result, though that field answers a different question than this design's `kv_hit`
-   does (§3.2's traced-through correction: SGLang's own scheduler-facing hit is already
-   collapsed to `state_hit`, same as everyone else's) — but have the scheduler
-   act only on `PrefixHit.effective = state_hit` (matches vLLM's converged single number
-   and our own retired `L = G ≤ A` rule). The two raw numbers exist for observability
-   (`/metrics`, bfdiag, and the A6 "prefix hit rate must not regress" gate) — no real
-   system branches *scheduling* logic on the gap between them, and this project's own
-   retired prior art already proved out why the invariant `state_hit ≤ kv_hit` makes that
-   safe.
-5. **Recommended sub-step breakdown (§7)**: 5 sub-steps inside step 7, each independently
-   gate-able, all but the last GPU-free, mirroring the phase discipline
-   `notes/prefix-cache-design.md` §5 already used once (P0–P4) and Track A's own
-   "zero-behavior-change steps before the risky one" discipline (steps 1–4 of the 8-step
-   plan).
-6. **Six decisions in §6 need a human call**, not a default from this document — most
-   consequentially (Decision 0), whether A3 should also rewire Laguna's own prefix cache
-   onto the new content-addressed allocator while the machinery is being built anyway, or
-   leave that structurally separate and out of scope for this step (recommended). Second
-   most consequential (Decision 1): whether `runtime/block_pool.py`'s dormant
-   `_on_evict_block` hook is the mechanism the coordinator uses, or whether the
-   coordinator supersedes it per the two-independent-allocators framing.
+本文档的每一条 vLLM/SGLang 引用都是本轮**重新核实**的行号（`~/.venvs/vllm025/lib/
+python3.12/site-packages/vllm/`、`/home/bot/project/sglang`），不是照抄
+`notes/2026-08-01-hybrid-cache-prior-art.md` 的转述——那份笔记质量很高，但重新核实后发现
+它有**两处需要纠正**的过度概括（§3、§4 开头），本文档在指出它们的同时保留它做对的部分。
+本仓库侧的引用全部来自本轮直接 `Read`/`grep` 的输出。
 
 ---
 
-## 2. Ground truth: what exists today
+## 1. 现状盘点（事实，非判断）
 
-### 2.1 Laguna's real prefix cache is not content-addressed
+### 1.1 Laguna 今天实际跑的前缀缓存，不是 `architecture.md` §2.4 描述的那套
 
-**[FACT]** `runtime/backends/laguna.py:2179-2220`, `reconcile_prefix_hit`:
+**【事实，且是一处需要先纠正的文档错误】** `docs/architecture.md:125` 说现状是"内容寻址：
+块级哈希 + 引用计数 + LRU 驱逐（`runtime/block_pool.py`）"。这与真实代码不符：
+
+- `grep -n "hash\|ref_cnt\|LRU\|lru" runtime/backends/laguna.py` **零匹配**。
+- `runtime/backends/laguna.py:39` 是这个文件唯一一处 `from runtime.block_pool import ...`，
+  只导入 `ChunkedPrefillState`，不导入 `BlockPool`/`Block`/`hash_block_tokens`。
+- `server/app.py:1248-1249` 自己的注释直接否认了 BlockPool 假设："LagunaBackend uses static
+  block allocation (num_slots × blocks_per_slot), not a dynamic BlockPool."
+- `docs/qwen36-rebuild-spec.md:144` 独立佐证："`LagunaBackend` 从不构造 `BlockPool`，
+  从不调用 `cache_block`/`touch`/`hash_to_block`"。
+- 真正驱动线上准入的三个方法，全部是**同槽（per-slot）token 列表线性比较**，向下取整到
+  `block_size`，没有跨槽内容寻址、没有 `ref_cnt`、没有共享 LRU 池：
+  - `reconcile_prefix_hit`（`laguna.py:2179-2220`）：遍历所有槽的 `_prefix_cache_tokens[s]`
+    （每个槽**上一次**跑完时保存的 token 历史），逐 token 比较，取最深命中槽，写入
+    `_pending_prefix_hits[best_slot]`。
+  - `find_best_slot_for_prompt`（`laguna.py:2222-2259`）：同样的比较逻辑，但只在给定的
+    `free_slots` 里找，返回 `(best_slot, hit_depth)`。
+  - `find_prefix_match`（`laguna.py:2531-2549`）：单槽版本，比较 `slot_committed_tokens[slot]`
+    （当前活跃槽的实时历史），供 DFlash 内部用（见下）。
+- 命中记录用两个并行数组：`_prefix_cache_tokens[slot]` / `_prefix_cache_kv_len[slot]`，
+  在 `reset_slot`（`laguna.py:2157-2177`）里写入，有一条防止"二次 reset 冲掉缓存"的显式判断
+  （`:2171-2174`）。
+- 调用点：`server/engine.py:1090-1106`。两处细节：
+  1. `find_best_slot_for_prompt` 返回的 `_hit` 在 `engine.py:1091` **被丢弃**，随后
+     `engine.py:1106` 对每个 prompt 再单独调一次 `reconcile_prefix_hit` 拿真正的命中深度。
+  2. `engine.py:1090` 用 `hasattr(self.runner, "find_best_slot_for_prompt")` 做能力探测，
+     这跟 `architecture.md` §3.5.3 想消灭的 `try/except AttributeError` 反模式是姊妹形态。
+     协调者落地时应顺手换成 `capabilities.prefix_cache` 查询。
+- `runtime/backends/protocol.py:192,194-198` 已把这两个方法收进协议，由 `prefix_cache`
+  能力位治理（`CAPABILITY_MEMBERS`，`:235`）。今天两者的返回类型是裸 `int` /
+  `tuple[int, int]`（slot, hit_depth）。
+- `find_prefix_match` **不在协议的 13 个成员里**，被 `runtime/backends/laguna_dflash.py:1379`
+  （DFlash 投机路径内部）和 `bfdiag/workloads.py:2362`（诊断）直接调用，绕开 `ServerEngine`。
+  `bfdiag/daemon/session.py:138,145` 明确称它"Laguna's own lightweight per-slot
+  prefix-cache reuse"——概念同属一个家族，但不受 `prefix_cache` 能力位治理，是协议之外的
+  第三个消费者，改协议形状时容易漏看，见 §7-b。
+
+### 1.2 `BlockPool` + `_on_evict_block` 钩子：孤儿基础设施，不是死代码，但也不是活代码
+
+**【事实】** `runtime/block_pool.py` 的 `BlockPool` 类（`:270` 起）——哈希索引
+（`hash_to_block`）、`ref_cnt`、intrusive LRU free queue（`FreeBlockQueue`）、
+`_on_evict_block` 钩子——**在生产路径里从未被实例化**。唯一的生产/参考构造点是
+`oracle/qwen36_vllm/direct_model_runner.py:441,895`（已退役、只读的 oracle）；其余全部在
+`tests/test_block_pool.py` 和 `benchmarks/prefix_cache_*_check.py`（单测/基准）。
+
+`_on_evict_block` 只被两处赋值：`direct_model_runner.py:590`
+（`self.block_pool._on_evict_block = self.evict_gdn_checkpoint`）和
+`benchmarks/prefix_cache_eviction_check.py:196`（基准里手动挂 stub）。
+`runtime/backends/laguna.py`、`server/engine.py` 对 `_on_evict_block` 零匹配。
+`_ssm_spec_row`/`_physical_slot`（`block_pool.py:23-79`）同理：被 `tests/test_block_pool.py`
+测试纯数学正确性，但唯二的调用方是 `oracle/qwen36_vllm/{metadata_builders,cuda_graphs,
+backends/qwen36,direct_model_runner}.py`（全部只读）。
+
+**【判断】** 这不是"S4 时代写坏的死代码"，是"提取之后失去了活调用方的正确代码"：`BlockPool`
+是 commit `8ec9cd3`（"B5 模块化 Domain 1：block_pool 提取"）从 `direct_model_runner.py`
+纯移动出来的；那个运行器（当时经 vLLM 服务 Qwen3.6）后来又整体搬进 `oracle/qwen36_vllm/`
+（`git log` 确认：commit `a9cb932`，"Isolate retired Qwen runtime from Laguna
+distribution"）。提取先发生、退役后发生，退役没有动 `block_pool.py`，因为它已经被泛化出去了
+——这正是这些钩子"还在、没用、结构完好、但比它们服务的模型更晚被写下日期"的原因。
+
+### 1.3 一处活文档间的矛盾："残迹"这个词本身可能已经过时
+
+**【事实】** `docs/roadmap.md:158`（S4 条目）、`docs/architecture.md:129-131`、以及本任务
+原话（`docs/implementation-plan.md:195`）都把 `_on_evict_block`/`evict_gdn_checkpoint`
+称为"残迹"（措辞暗示待清理）。但 `docs/qwen36-rebuild-spec.md:561-565`——编制日期
+**2026-08-02**，比 `implementation-plan.md` 的"2026-08-01 二次修订"新一天——明确写：
+"`runtime/block_pool.py` 里没有需要清理的 GDN 专属残留代码……两者都是干净、可直接复用的
+挂钩，不是'死代码待删'……它们是**休眠但设计良好的挂钩**"。`docs/README.md` 的"文档纪律"
+把三份文档全部列为"反映当前状态"的活文档——这不是转述之间打架，是仓库里两份都自称权威的
+文档互相矛盾，且更新的一份明确指出更旧的一份措辞有问题。
+
+**【判断】** 我读了 `_on_evict_block`（`block_pool.py:323-329,343-361`）、`_ssm_spec_row`
+（`:45-79`）、`_physical_slot`（`:23-24`）的实现后同意 `qwen36-rebuild-spec.md` 的结论：三者
+都是通用、正确、不含任何"专属于已废弃方案"的错误逻辑的原语。所以"清掉 S4 的 GDN 残迹"应
+拆成两件不冲突的事：**(a)** 改文档措辞（§8 决策点 1）；**(b)** 不删除、不重写这三个原语，
+留给 §7 决定何时接线。
+
+### 1.4 本仓库已有一份完整的参考实现，比 vLLM/SGLang 更贴近我们的寻址方案
+
+**【事实】** `oracle/qwen36_vllm/prefix_cache.py:131-166` 的 `reconcile_prefix_hit` 已经
+实现了 `(A, G, L=G)` 两资源协调，逐字对应我们要设计的 `(kv_hit, state_hit)`：左到右哈希
+匹配算 `A`（attention 命中）；从 `A` 向左找最深的、**哈希一致**的 GDN checkpoint 边界算
+`G`；`L = G`（恒 `<= A`）。`A>0, G=0` 视为 compute miss，不是"部分命中"
+（`prefix_cache.py:135-139` 注释原话）。
+
+`oracle/qwen36_vllm/gdn_state.py:183-226` 的 `evict_gdn_checkpoint`/
+`_evict_gdn_checkpoints_for_budget` 已经实现"独立字节预算 + LRU + 双向 lockstep"：
+
+- **正向**：`direct_model_runner.py:590` 把 `evict_gdn_checkpoint` 挂到
+  `BlockPool._on_evict_block`——KV 块被驱逐时联动丢配套 checkpoint。
+- **反向**：`gdn_state.py:205-209`——checkpoint 自己的字节预算触发驱逐时，*如果*配套 KV
+  块 `ref_cnt == 0` 就顺手丢它的 hash；*如果* `ref_cnt > 0`，**只丢 checkpoint，不动 KV
+  块**，注释原话："losing only the checkpoint, which merely turns a future would-be hit
+  into a safe compute miss (L = G <= A still holds)"。
+
+**【判断】** 这份代码不能被 import（硬约束），但可以被抄读——`qwen36-rebuild-spec.md` 自己
+也是这个用法。下面 §3、§4 的很多设计答案直接引用这份实现，而不是重新发明。
+
+### 1.5 一处此前没被任何文档描述过的已有基础设施：`ArchitectureSpec.needs_two_cache_families`
+
+**【事实，重要】** `runtime/architecture.py:56-64`（`LayerSpec`）已经有一个 `cache: str`
+字段，取值 `CACHE_PAGED_KV`/`CACHE_RECURRENT`（`:47-48`），字段文档字符串原话：
+"This is the field `SlotResourceManager` (step 7) is built around: a checkpoint mixing
+both is what makes two cache families necessary rather than hypothetical."
+（`architecture.py:59-62`）。`ArchitectureSpec`（`:96-142`）据此暴露：
 
 ```python
-def reconcile_prefix_hit(self, token_ids: list[int]) -> int:
-    ...
-    for s in range(len(self._prefix_cache_tokens)):
-        cached = self._prefix_cache_tokens[s]
-        ...
-        for i in range(limit):
-            if token_ids[i] != cached[i]:
-                break
-            match_len += 1
-        aligned = (match_len // self.block_size) * self.block_size
-        ...
+# runtime/architecture.py:126-142（已存在，原样引用）
+@property
+def paged_kv_layers(self) -> tuple[int, ...]:
+    return tuple(layer.index for layer in self.layers if layer.cache == CACHE_PAGED_KV)
+
+@property
+def recurrent_layers(self) -> tuple[int, ...]:
+    return tuple(layer.index for layer in self.layers if layer.cache == CACHE_RECURRENT)
+
+@property
+def needs_two_cache_families(self) -> bool:
+    return bool(self.paged_kv_layers) and bool(self.recurrent_layers)
 ```
 
-This walks every slot's own saved token history (`_prefix_cache_tokens[s]`,
-`_prefix_cache_kv_len[s]`, populated by `reset_slot` at `laguna.py:2157-2178`) and
-returns the longest block-aligned match — **same-slot reuse**, not cross-request
-content-addressed sharing. `find_prefix_match` (`laguna.py:2531-2548`) is the
-single-slot version of the same idea, called from `laguna_dflash.py:1379` and from
-`bfdiag/workloads.py:2362`. Neither touches `BlockPool`, `hash_to_block`, or any chained
-hash. `runtime/backends/protocol.py:192`'s contract for this member is `(self,
-token_ids: list[int]) -> int` — a single integer, matching what the implementation
-actually returns.
+**这条改变了本设计的一个关键决策**（见 §8 决策点 3）：Track A 第 3 步（A1 ModelSpec，已落地，
+`tests/test_architecture_spec.py` 覆盖）**已经**预留了"这个 checkpoint 是否需要两类缓存"
+这个布尔判定，而且它天然属于**模型架构事实**（从 `config.json` 解析而来），不是**backend
+执行层能力**（`BackendCapabilities` 描述的是"这个 backend 实现了什么"，不是"这个模型结构
+上需不需要什么"）。这意味着协调者判断"要不要实例化第二个分配器"时，理应先问
+`ArchitectureSpec.needs_two_cache_families`，而不是凭空在 `BackendCapabilities` 里新加
+一个字段——尽管两者最终数值上应该一致（§8 决策点 3 展开这个取舍）。
 
-**[FACT]** `docs/qwen36-rebuild-spec.md:144` confirms this independently: *"`LagunaBackend`
-从不构造 `BlockPool`，从不调用 `cache_block`/`touch`/`hash_to_block`"*.
+`runtime/model_registry.py:80`：`IMPLEMENTED_BACKENDS = frozenset({"laguna"})`——今天
+只有一个 backend，`needs_two_cache_families` 对 Laguna checkpoint 的解析结果为 `False`
+（单一 `CACHE_PAGED_KV` 层类型），这是 §5"零行为变更"论证的又一层证据，且是**已经跑过真实
+checkpoint 验证**的证据（`tests/test_architecture_spec.py`），不是本文档新提出的假设。
 
-Why this matters: any worry about A3 regressing Laguna's *cross-request* prefix cache
-hit rate is moot — there isn't one to regress. Laguna's only prefix-cache behavior is
-per-slot warm reuse across a slot's own successive requests, and A3 does not need to
-touch that code path to add a second resource type; it needs to not break it, and the
-two are already structurally disjoint (§5).
+### 1.6 协议现状（`runtime/backends/protocol.py`，已核实）
 
-### 2.2 `BlockPool` is real, tested, and used only by non-production code today
+**【事实】**
 
-**[FACT]** `runtime/block_pool.py` (270 lines) implements a full content-addressed,
-LRU-evicted, reference-counted block pool: chained hashing (`hash_block_tokens`,
-:96-…), `FreeBlockQueue` (intrusive O(1) deque), `BlockPool.allocate`/`free`/`touch`/
-`_evict_one` (:343-…), and a lockstep eviction hook:
+- `BackendCapabilities`（`:60-79`）：5 个冻结布尔字段；`prefix_cache` 治理
+  `reconcile_prefix_hit`/`find_best_slot_for_prompt`（`CAPABILITY_MEMBERS`，`:235`）。
+- `BackendSnapshot`/`SlotSnapshot`/`PrefixSnapshot`（`:83-126`）已落地（Track A 第 2 步，
+  commit `f24f5ad`）。
+- 协议模块自己的文档字符串（`:42-46`）写明重命名"stays available to take whenever call
+  sites next change for an unrelated reason (naturally: **step 7's A3 coordinator**,
+  or whichever step first touches these three call sites again)"——协议作者已经预见到
+  本步骤会改这两个方法的签名；改它是"顺势"，不是"破坏契约"。
+- 会红的具体测试清单（改协议形状后，不是猜的）：`tests/test_backend_protocol.py`
+  （`TestContractShape`/`TestConformanceChecker`/`TestLagunaConformance`）+
+  `tests/test_laguna_server_integration.py:143-164`
+  （`test_reconcile_prefix_hit_cold_miss`/`_warm_match`，`:150,162` 直接断言裸 `int`）。
 
-```python
-# block_pool.py:322-329
-self._on_evict_block: Callable[[int], None] | None = None
+### 1.7 两个跟本设计相关、重新核实过的数字（不沿用旧文档）
+
+**【事实】** `notes/prefix-cache-design.md`（旧文档，"Status: DESIGN, not yet built"，写于
+vLLM-based `direct_model_runner.py` 时代）用的 `block_size=16`、`chunk_size=8192` 是那个
+时代的数字。今天的真实值：`server/app.py:97` `SERVER_BLOCK_SIZE` 默认 **64**（不是 16）；
+`runtime/backends/laguna.py:276` `_prefill_chunk_tokens` 默认 **8192**（跟旧文档的数字
+一致，但是重新核实过的）。`8192/64=128` 整除，今天两个默认值之间没有对齐问题——但这条必须
+在 Track B 真正选定 GDN checkpoint 边界策略时**重新核实**，不能假设"当年算过就一直成立"
+（坑 #2，§6）。
+
+### 1.8 一处需要立刻记下来、容易被忽略的既有分歧：`RESERVED_PHYSICAL_SLOTS`
+
+**【事实，重要】**
+
+```
+runtime/block_pool.py:20:                  RESERVED_PHYSICAL_SLOTS = 1
+runtime/backends/laguna.py:53:             RESERVED_PHYSICAL_SLOTS = 0
+runtime/backends/laguna_cuda_graph.py:41:  return slot  # RESERVED_PHYSICAL_SLOTS = 0
 ```
 
-with the docstring at `block_pool.py:284-289` explaining exactly what it is for: *"a
-popped block that still carries a published hash is EVICTED first ... and, in lockstep,
-the co-keyed GDN checkpoint is dropped via the `_on_evict_block` callback the runner
-wires after construction (INV2/INV3/R5)"*. It is currently `None` in every live code
-path — **[FACT]** grep confirms the only place anything is ever assigned to
-`_on_evict_block` in this repo is `oracle/qwen36_vllm/direct_model_runner.py:590`
-(retired code).
+**同名常量，两个模块，两个不同的值。** `docs/qwen36-rebuild-spec.md:131,603,677` 已经把
+这个分歧记录在案，结论是 `=1`"**应废弃（待核实）**——花了四轮调试才坐实这是'vLLM 调度器
+从不产出物理索引 0'这一 vLLM 特定事实，不是硬件事实；Laguna 保留 0 个物理槽也能跑"。
 
-`_ssm_spec_row` (`block_pool.py:45-79`) and `_physical_slot` (`:23-24`) are the addressing
-primitives a recurrent-state allocator would need (column-0 row = ordinary state,
-columns 1..K = per-slot speculative scratch rows) — already written, already unit-tested
-today (`tests/test_block_pool.py:39-52`, CPU-only, no torch), and already used by the
-retired `oracle/qwen36_vllm/metadata_builders.py` and `cuda_graphs.py`.
-
-**Where this machinery came from**: `git log` shows `BlockPool` was extracted from a
-larger `direct_model_runner.py` in `8ec9cd3` (2026-07-22, *"B5 模块化 Domain 1: block_pool
-提取"*) into today's `runtime/block_pool.py`, while that runner (which used to serve
-Qwen3.6 via vLLM) was later moved wholesale to `oracle/qwen36_vllm/` in `a9cb932`
-(2026-07-30, *"Isolate retired Qwen runtime from Laguna distribution"*). The extraction
-happened first; the retirement happened second and did not touch `block_pool.py` because
-`block_pool.py` had already been generalized out. That is why the hooks are still there,
-unused, structurally sound, and dated after the model they were built for was retired.
-
-### 2.3 `roadmap.md` §1.5-S4's "残迹" framing is stale — corrected in `qwen36-rebuild-spec.md`, confirmed here
-
-**[FACT — correction]** `docs/roadmap.md:158` (S4 row): *"`block_pool.py` 只管 paged KV；
-GDN/SSM 递归状态的挂钩（`evict_gdn_checkpoint` 等）是 Qwen3.6 时代留下的**残迹**，当前
-Laguna 无 GDN 层，这条路径没有活代码"* — this reads as "dead code, safe to delete."
-
-**[FACT — the correction]** `docs/qwen36-rebuild-spec.md:562-567` already re-investigated
-this on 2026-08-02 and reached the opposite conclusion: *"`runtime/block_pool.py` 里没有
-需要清理的 GDN 专属残留代码 —— `_on_evict_block` 是通用回调，`_ssm_spec_row`/
-`_physical_slot` 是通用寻址原语，两者都是干净、可直接复用的挂钩，不是"死代码待删"...
-它们是**休眠但设计良好的挂钩**"*. My own read in §2.2 above agrees: there is nothing
-GDN-*specific* sitting in `block_pool.py` — `_on_evict_block` is a generic `Callable[[int],
-None]`, and its only GDN-flavored *name* (`evict_gdn_checkpoint`) lives entirely in
-retired code, referenced only in a comment as an example of what a caller might name the
-callback.
-
-**[JUDGMENT]** `docs/implementation-plan.md` row 7's instruction "清掉 S4 的 GDN 残迹"
-should be read as *"resolve the stale S4 characterization,"* not *"delete code from
-`block_pool.py."* The only concrete cleanup action this implies is: (a) fix
-`roadmap.md:158`'s S4 row text once A3 actually lands (small doc edit, not scoped to this
-design step); (b) decide explicitly whether `_on_evict_block`/`_ssm_spec_row` are the
-mechanism A3's coordinator builds on or whether the coordinator supersedes them — this is
-Decision 1 in §6, and `qwen36-rebuild-spec.md:433-436` already flags it as unresolved
-rather than prejudging it, which this document agrees with.
-
-### 2.4 The protocol today: 13 members, capability-gated, single-int prefix contracts
-
-**[FACT]** `runtime/backends/protocol.py:59-79` — `BackendCapabilities` is a frozen
-dataclass with five booleans (`speculative_decode`, `prefix_cache`, `cuda_graph`,
-`chunked_prefill`, `warm_continue`); **no field exists yet for "has a second cache
-resource type."** `runtime/backends/protocol.py:233-243` — `CAPABILITY_MEMBERS` maps
-`"prefix_cache"` to exactly `("reconcile_prefix_hit", "find_best_slot_for_prompt")`, both
-declared `-> int` / `-> tuple[int, int]` where the second element of that tuple is
-`(slot, hit_depth)` — a *slot id* paired with a hit length, not `(kv_hit, state_hit)`.
-
-**[FACT]** `runtime/architecture.py:56-64,96-142` already carries the signal A3 needs on
-the input side, landed in step 3 (2026-08-01, shadow mode): `LayerSpec.cache` is
-`CACHE_PAGED_KV` or `CACHE_RECURRENT`, and `ArchitectureSpec.needs_two_cache_families`
-is `True` exactly when a checkpoint's layers span both — with the docstring at
-`architecture.py:60-64` naming this explicitly: *"This is the field `SlotResourceManager`
-(step 7) is built around."* This is tested today against real checkpoints
-(`tests/test_architecture_spec.py:80,85,168,203`) and returns `False` for Laguna,
-`True` for Qwen3.6. **A3 can gate its entire second-allocator code path on this one
-property being true**, with zero risk to Laguna, whose spec already reports `False`.
-
-### 2.5 Two documents disagree with each other; a third resolves it
-
-To be explicit about the discrepancy this document is correcting, since the project has
-a known failure mode of documents inheriting stale numbers from each other
-(`notes/2026-08-02-laguna-docs-inherited-qwen36-numbers.md` is the most recent instance):
-
-| Document | Date | Claim | Status |
-|---|---|---|---|
-| `docs/roadmap.md` §1.5-S4 | pre-2026-08-01 | `block_pool.py` GDN hooks are dead-code remnants | **stale** |
-| `docs/qwen36-rebuild-spec.md` §1.5/§1.10 | 2026-08-02 | Same hooks are clean, reusable, dormant infrastructure | **current, confirmed independently in §2.2/§2.3 above** |
-| `notes/2026-08-01-hybrid-cache-prior-art.md` | 2026-08-01 | vLLM and SGLang both keep allocators separate; A3 should return `(kv_hit, state_hit)` | **partly stale — see §3.1/§3.2**: the "keep allocators separate" half is confirmed for both projects; the "both hand the scheduler a two-number pair to choose between" half holds for **neither** — vLLM converges to one number before scheduling, and SGLang's scheduler-facing `device_indices` is traced to the same collapsed-to-`state_hit` value (`hi_mamba_radix_cache.py:1083`); SGLang's second field (`mamba_branching_seqlen`) answers a cache-population question, not a competing hit length |
+**【判断】** 这是给 §2 INV-A3-8 的一个具体的、已经在文档里出现过的反面教材：如果协调者
+或未来的 state 分配器不假思索地沿用 `block_pool.py` 的 `=1` 约定，会在**与今天 Laguna
+实际使用的约定不一致**的情况下引入一个新常量——这正是本设计通篇强调的"不要转述别处的数字"
+原则要防的那类错误，恰好在这个仓库自己身上已经发生过一次（且已被记录、未被修正）。A3 落地
+时应该显式核实新分配器该用哪个值，不能默认抄 `block_pool.py` 的 `=1`。
 
 ---
 
-## 3. What vLLM and SGLang actually do (re-verified, not re-quoted)
+## 2. 问题 1：协调者持有哪些不变量，破坏时的可观测症状是什么
 
-### 3.1 vLLM 0.25.1 — separate managers, but the scheduler sees **one** number
+| # | 不变量 | 来源 | 破坏时的可观测症状 | 今天有没有断言 |
+|---|---|---|---|---|
+| **INV-A3-1** | 资源引用一致：任何被引用的资源不会被两个互不知情的活槽同时持有 | 对应旧 INV2/INV9 | **不是崩溃**——是某个请求的输出**因为另一个请求的写入而改变**，没有异常。只能靠信号探针测试（每槽打标记 token）或 bit-exact 回归发现——这正是"很多 token 之后才显形"的字面含义 | 否 |
+| **INV-A3-2**（核心） | `state_hit <= kv_hit` 恒成立（`L = G <= A`） | 对应旧 INV3/R5；`oracle/prefix_cache.py:131-166` 已实现 | 若违反：协调者告诉调度层可以跳过比实际拥有有效递归状态更多的 token → 续写的 suffix 从错误的 GDN 状态起步 → **贪心输出在很多 token 之后偏离预期，没有异常、没有崩溃**，只能靠 `bf diff` 在几千 token 之后发现质量/接受率回归 | 否。`bfdiag/invariants/checks.py` 今天的六个 `check_*` 函数（`check_kv_len_monotonic`/`check_no_duplicate_ids`/`check_aux_hidden_alignment`/`check_cg_replay_slot_consistency`/`check_accepted_bound`/`check_page_table_covers_seqlen`）一个都不覆盖跨资源一致性 |
+| **INV-A3-3** | 驱逐双向 lockstep，且方向不对称：KV 驱逐**必然**级联丢配套 state checkpoint；state 驱逐**只允许**在配套 KV 块 `ref_cnt==0` 时顺手清它的哈希索引，绝不允许回收活引用的 KV 内存 | 对应旧 INV3/R5；`gdn_state.py:183-209` 双向注释块 | 正向断了：未来的命中以为某段 KV 区域有有效 state，但那段内存其实已经分给了别人——同 INV-A3-2 的静默污染症状。**反向若被错误地做成对称**（state 驱逐强行回收活 KV）：活请求的 KV 被抽走，表现为崩溃（非法内存访问/形状错误）或更糟——静默错误的 attention 输出。`gdn_state.py:196` 的注释（"`L = G <= A` still holds"）正是为了防止这种对称化 |
+| **INV-A3-4** | 有存活引用（`ref_cnt>0` 或活槽占用）的资源永不被任一分配器驱逐 | 对应旧 INV9/R4 | 并发准入+驱逐压力下的崩溃（读到错误张量，use-after-free 形态）；只在负载下才能复现——这正是为什么 `notes/prefix-cache-design.md` 自己的 `admission_under_pressure` 测试（移植进 `benchmarks/prefix_cache_eviction_check.py:501` 附近）故意在其它槽活跃时强制驱逐，而不是孤立测试驱逐 |
+| **INV-A3-5** | 投机/草稿 token 永不写入任一缓存；被拒绝的草稿不能污染未来的命中 | 对应旧 INV4 | 未来某请求"命中"了一段实际从未被接受过的 token——输出在命中边界处偏离一个冷参照，偏离量正好等于被拒绝的草稿内容。只能靠"命中路径输出 vs 冷路径参照"比较发现，不是靠形状检查 |
+| **INV-A3-6** | 无递归层的 backend（今天的 Laguna）必须恒有 `state_hit == kv_hit`——没有第二资源就没有分歧的可能 | 新增，§1.5 的 `needs_two_cache_families=False` 直接对应 | 若违反：Laguna 开始跳过比过去更少的 prefill——**纯性能回归，没有正确性信号**，只能靠 A6 的吞吐/bit-exact 门禁事后发现。给每个 `needs_two_cache_families=False` 的 backend 写一条断言这个等价关系的单测，成本很低，应该先写（§7） |
+| **INV-A3-7** | CUDA Graph 重放对"哪些块/行来自命中 vs 新计算"保持无感知 | 对应旧 INV5 | 图里烤进了错误形状/过期地址；表现为非法内存访问，或更糟——重放时"看起来正确但实际错误"的输出。Laguna 的 decode 图今天不碰递归状态，这条对 Laguna 是空集；一旦 Track B 真正把递归状态行接入图重放，这是全新问题（§8 决策点 4） |
+| **INV-A3-8** | 新分配器采用的"保留物理地址"约定必须显式核实，不能默认继承 `block_pool.py` 的 `RESERVED_PHYSICAL_SLOTS=1` | 对应旧 INV7；§1.8 的具体分歧 | `block_pool.py` 保留 1 个物理槽，但 `LagunaBackend` 自己的约定是 0 个（§1.8）。这条不是"可能会破坏"的假设性风险——它**已经**是仓库里存在的一个真实分歧，`qwen36-rebuild-spec.md` 已经记录但未解决。如果协调者/新分配器盲目继承 `=1`，而实际数据用的是 `=0` 的寻址假设，后果是本项目历史上已经真实发生过一次的"物理索引 0 读写错误状态，100% 确定性错误输出"（`block_pool.py:17-19` 自己的注释） |
 
-**[FACT]** Confirmed verbatim, unchanged from the prior-art note: `MambaManager`
-(`v1/core/single_type_kv_cache_manager.py`) searches right-to-left with early stop and
-pads with null blocks (lines 1065-1085), subtracts the full speculative window before
-freeing (lines 1151-1156, the `tdoublep` comment), and reports a fake shortage
-(`num_gpu_blocks + 1`) to defer admission by one step when it cannot safely allocate
-(lines 1196-1204, guarded by a `cached_blocks_this_step` check the note did not mention).
-
-**[FACT — correction to the note's implication]** `HybridKVCacheCoordinator.
-find_longest_cache_hit` (`kv_cache_coordinator.py:630-740`) does **not** hand two numbers
-to the scheduler. It runs an iterative fixed-point: each per-type manager either accepts
-the current candidate hit length or shrinks it; any shrink triggers re-checking all
-groups; this converges because the length only ever decreases (docstring at
-`kv_cache_coordinator.py:636-641`). Full-attention blocks past the converged length are
-then truncated (lines 727-733) before the result reaches the scheduler. **A single
-number is what schedules the request.**
-
-A different method, `find_longest_cache_hit_per_group` (line 742), does return per-group
-hit lengths independently — but its only caller is `scheduler.py:697-698`, gated behind
-`self.connector is not None and self.has_mamba_layers`, i.e. **disaggregated-prefill
-(KV-connector) bookkeeping only**, where it feeds a `max()` over per-group hits into an
-external-transfer-savings estimate (`scheduler.py:715`: Mamba state transfers
-unconditionally regardless of the KV-side hit). This is very likely the seed of vLLM
-0.26.0's advertised "partial prefix-cache hit support for hybrid models" — already present
-in 0.25.1, but scoped to disaggregation, not general local scheduling. **Not independently
-verified against 0.26.0** — no newer checkout exists on this machine.
-
-**[FACT — second correction]** `block_pool.py`'s `BlockPool` is **one shared, untyped
-pool** — a single `free_block_queue`, a single `num_gpu_blocks` id space, constructed once
-and handed to every `SingleTypeKVCacheManager` subclass including `MambaManager`. Eviction
-order is one global LRU across KV and Mamba blocks alike; there is no
-resource-type-aware budget in vLLM's coordinator. This works because
-`kv_cache_utils.unify_hybrid_kv_cache_specs` pads every group's per-block byte size to a
-common `page_size_bytes`, so one integer block id validly indexes into every group's
-tensor. **The "separate per-resource eviction budget" idea belongs to SGLang, not
-vLLM** — the note's phrasing ("both upstreams... separate budgets") over-generalizes from
-SGLang to vLLM; corrected here.
-
-**Alignment**: `HybridKVCacheCoordinator.__init__` asserts `block_size %
-hash_block_size == 0` for every group (lines 552-555); there is no direct assertion
-tying Mamba's block size to full-attention's beyond that shared divisor.
-
-### 3.2 SGLang — two fields on `MatchResult`, but not two competing hit lengths
-
-**[FACT]** Re-verified directly against `/home/bot/project/sglang` (commit
-`b296e1a5035b`, 2026-07-16; no newer checkout found; `UnifiedRadixTree`/v0.5.16's
-"smarter state resets" not present in this checkout).
-
-`MambaSlotAllocator` (`srt/mem_cache/allocator/mamba.py:29-34`), verbatim: *"Unlike
-`BaseTokenToKVPoolAllocator` which is designed for per-token KV pages, Mamba slots are
-request-level (typically 1 slot per request). We keep the interface minimal and do NOT
-inherit the KV base class."* Confirmed directly, exact lines.
-
-**The two-field result** — this looked at first like the fact that resolves the vLLM/SGLang
-tension in §3.1 in SGLang's favor (two numbers, not one); tracing where each field is
-actually computed (below, and the correction later in this subsection) shows it does not —
-lives in `srt/mem_cache/base_prefix_cache.py:155-190`:
-
-```python
-class MatchResult(NamedTuple):
-    device_indices: torch.Tensor            # defines the KV hit length
-    ...
-    mamba_branching_seqlen: Optional[int]   # "the longest page-aligned position
-                                             #  that could've been cache hit if
-                                             #  there exists a mamba state"
-```
-
-`device_indices` (its length) is the KV hit; `mamba_branching_seqlen` is the state-side
-candidate boundary — **two independent fields on the same returned object**, not a
-converged single number. **[FACT, traced to the actual computation site]**
-`HiRadixCache._match_post_processor` (`hi_mamba_radix_cache.py:1016-1053`) computes it —
-and, critically, computes it from a *different, longer* candidate than the one that
-becomes `device_indices`:
-
-```python
-# hi_mamba_radix_cache.py:1040-1053
-if len(value) > best_value_len:
-    mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
-    mamba_cache_chunk_aligned_seqlen = (
-        sum(len(v) for v in value) // mamba_cache_chunk_size
-    ) * mamba_cache_chunk_size
-    mamba_branching_seqlen = (
-        mamba_cache_chunk_aligned_seqlen if mamba_cache_chunk_aligned_seqlen > 0 else None
-    )
-else:
-    mamba_branching_seqlen = None
-...
-value = value[:best_value_len]           # line 1083 — THIS becomes device_indices
-```
-
-`value` here is the *un-truncated* KV-hash walk (the `kv_hit` in this design's vocabulary);
-`best_value_len` is the deepest node that actually carries a live/backed-up Mamba
-checkpoint (the `state_hit`). So `device_indices` is deliberately truncated **to
-`state_hit`** before it ever leaves this function — SGLang's scheduler-facing KV hit is
-*already* the collapsed number, matching vLLM's and our own retired design's pattern, not
-diverging from it. `mamba_branching_seqlen` is a *third*, different quantity: the deepest
-**chunk-aligned** position within the *un-truncated* KV walk (`value`, i.e. `kv_hit`) — a
-forward-looking hint of "where would it be worth materializing a *new* Mamba checkpoint,"
-not a backward-looking hit-resolution number at all. `schedule_policy.py:140-141` copies it
-onto the request unchanged; deciding whether/how to actually use it (branch a checkpoint
-there, or not) happens downstream in Mamba-specific code. **Net correction to the framing
-above**: SGLang does not hand the scheduler two competing hit lengths to reconcile —
-it hands back one collapsed hit length (`device_indices`, already `≤ state_hit`) plus one
-unrelated cache-population hint (`mamba_branching_seqlen`). This sharpens, and slightly
-revises, the "genuinely two numbers" framing at the top of this subsection: two numbers
-reach the caller, but they answer different questions, and only one of them is a hit
-length in this design's sense.
-
-**[FACT]** Per-resource eviction budgets, confirmed directly at
-`srt/mem_cache/base_prefix_cache.py:83-98`:
-
-```python
-@dataclasses.dataclass
-class EvictParams:
-    num_tokens: int = 0
-    swa_num_tokens: int = 0
-    mamba_num: int = 0
-
-@dataclasses.dataclass
-class EvictResult:
-    num_tokens_evicted: int = 0
-    swa_num_tokens_evicted: int = 0
-    mamba_num_evicted: int = 0
-```
-
-and the hit-test that validates both resources independently, `hi_mamba_radix_cache.py:357`:
-`if last_node.evicted or (last_node.mamba_evicted and last_node.mamba_backuped):` —
-confirmed verbatim at the cited line. `mamba_evictable_size_` (separate accounting from
-the KV side) confirmed at lines 341, 540, 919, 947.
-
-**Not found in this checkout, despite looking**: an explicit "assume all draft tokens
-rejected before freeing Mamba state" rule analogous to vLLM's (grepped the mamba/hybrid
-cache files and `schedule_batch.py`/`schedule_policy.py` for `speculative`/`draft`/`EAGLE`
-near mamba-eviction code; no hit). This may live in a part of the speculative-decode
-worker this pass did not cover — **[OPEN]**, not claimed as absent, only as not found.
-
-### 3.3 Our own retired prior art — the closest analog, and it chose a third answer
-
-**[FACT]** `notes/prefix-cache-design.md` §3.4 (lines 310-340) — written for the
-vLLM-based Qwen3.6 tenant before it was retired — derives the two-group case as a
-*specialization* of vLLM's general solver, not an alternative to it:
-
-> "This is the fixed-point of vLLM's `HybridKVCacheCoordinator`... specialized to two
-> groups where the attention group is downward-closed... and the GDN group is
-> snapshot-constrained: the converged hit length is the min, block-aligned,
-> snapshot-constrained boundary. We don't need the general iterative solver — two groups
-> with `G ≤ A` gives `L = G` directly."
-
-The actual returned value from `reconcile_prefix_hit`
-(`oracle/qwen36_vllm/prefix_cache.py:131-166`) is a **single int**, `L`, computed
-internally from two intermediate quantities — `A` (left-to-right attention-hash walk,
-downward-closed, stop at first miss) and `G` (right-to-left search among the matched
-blocks for the deepest boundary with a matching GDN checkpoint) — with the invariant
-`L = G ≤ A` always holding by construction (checkpoints are only ever created at
-boundaries already inside the hashed attention prefix). This is independently confirmed
-by the eviction-direction asymmetry in `oracle/qwen36_vllm/gdn_state.py:183-209`
-(`evict_gdn_checkpoint`, full text and reasoning in §4.3 below): evicting a KV block
-always evicts its co-keyed checkpoint, but evicting a checkpoint under GDN-side memory
-pressure only clears the KV block's *hash index entry* (never its live memory) and only
-when that block is already unreferenced — so `G` can never end up greater than `A`.
-
-This means **this project has already tried the "converge to one number" approach
-once, for the same architecture, and it worked well enough to GPU-validate**
-(`benchmarks/prefix_cache_eviction_check.py`'s `chunk_boundary_partial_share` case
-exercises exactly this) — and, per §3.2's correction, this is also what every system
-surveyed here actually does at the scheduling boundary, not a choice unique to vLLM and
-our own retired code. §4.2 gives the recommendation for what (if anything) A3 should keep
-a second, unconverged number *around for*, since "hand the scheduler two competing hit
-lengths" turned out not to be a real precedent anywhere.
+**【判断】** INV-A3-2 和 INV-A3-3 是这张表里真正难查的两条，且今天完全没有自动化断言能在
+它们被破坏时报警。这直接决定了 §7 必须有一步专门把它们变成 `bfdiag/invariants/checks.py`
+里的显式 `check_*` 函数（哪怕现在 KV-only 场景永远不会触发，也要先把断言点位就位）——这是
+对 `implementation-plan.md` C8 纪律（"没红过的门禁，能不能构造一个让它红的输入"）的提前
+应用。
 
 ---
 
-## 4. Answers
+## 3. 问题 2：`(kv_hit, state_hit)` 不相等时怎么办 —— 核心难点
 
-### 4.1 Q1 — Invariants and their observable failure symptoms
+### 结论
 
-**[JUDGMENT, built on FACT]** These are adapted from `notes/prefix-cache-design.md` §4
-(INV1-INV9), which were written for a two-cache-group system and already have a working
-test methodology (`benchmarks/prefix_cache_eviction_check.py`) — not invented fresh. Names
-below are renumbered for A3 (`INV-A3-n`) since the original INV numbers were scoped to a
-retired module; the mapping to the original is given for traceability.
+**取 `state_hit`（它恒 `<= kv_hit`，即"取 min"），且必须 block-aligned。**
+`[state_hit, kv_hit)` 区间的 KV 尽管物理上还在，但当作 compute miss 处理：那段位置从未被
+"发布"（append-only + immutable-published 规则），从 `state_hit` 续写前缀是安全的，不需要
+垃圾回收或部分覆盖逻辑。
 
-| # | Invariant | Maps to | Symptom when broken |
-|---|---|---|---|
-| INV-A3-1 | A resource is never referenced by two live slots that don't agree it's shared (ref-counted correctly; no phantom double-free) | INV2, INV9 | Silent: one request's output changes because another request's write landed in "its" memory. No crash. Only visible via a signal-probe test (marker tokens per slot) or a bit-exact regression — **this is the "many tokens later" bug class the roadmap already names as the reason A3 exists** |
-| INV-A3-2 | `state_hit ≤ kv_hit` always, for every prefix, at every point in time | INV3/R5 (`L = G ≤ A`) | If violated: the coordinator tells the scheduler it can skip prefilling more tokens than it has valid *recurrent* state for → the recomputed suffix starts from wrong GDN state → silently wrong logits from that token on, no exception, no crash. Symptom is a quality/acceptance-rate regression with no stack trace, discovered (if at all) by a `bf diff` several thousand tokens later |
-| INV-A3-3 | Evicting a KV block always evicts its co-keyed recurrent-state checkpoint (forward lockstep); evicting a checkpoint under state-side budget pressure never reclaims a still-referenced (`ref_cnt>0`) KV block, only clears the hash-index entry of an already-free one (reverse lockstep, asymmetric) | INV3/R5, `gdn_state.py:183-209`'s two-direction comment | If forward lockstep breaks: a future hit thinks it has valid state for a KV region that's actually been reallocated to someone else — same silent-corruption symptom as INV-A3-2. If the reverse direction is made *symmetric* by mistake (state eviction force-evicts live KV): a live request's KV cache is yanked out from under it — this manifests as a crash (illegal memory access / wrong shape) or, worse, silently wrong attention output, and it is the difference between "safe compute-miss" and "corruption" this repo's own comment (`gdn_state.py:196`, `L = G <= A still holds`) exists to prevent |
-| INV-A3-4 | A resource actively held by any in-flight or mid-admission slot is never evicted, by either allocator | INV9/R4 | Crash (use-after-free-shaped: wrong tensor read) under concurrent admission + eviction pressure; only reproducible under load, which is exactly why `notes/prefix-cache-design.md`'s own test for this (`admission_under_pressure`, ported into `benchmarks/prefix_cache_eviction_check.py:501-575`) deliberately forces eviction while other slots stay active rather than testing eviction in isolation |
-| INV-A3-5 | Speculative/draft tokens never populate either cache (only committed positions do); a rejected draft cannot poison a future hit | INV4 | A future request "hits" a prefix that includes tokens that were never actually accepted — output diverges from a cold reference by exactly the rejected draft content, at exactly the hit boundary. Caught by comparing hit-path output to a cold-path reference for the identical prompt, never by a shape check |
-| INV-A3-6 | A backend with no recurrent layers reports `state_hit == kv_hit` unconditionally (there is no second resource to diverge from the first) | new — no analog needed under one cache family | If violated: Laguna (`needs_two_cache_families == False`) starts skipping less prefill than it used to, i.e. a pure performance regression with no correctness signature — caught by the A6 gate's throughput/bit-exact checks, but only after the fact; a dedicated unit test asserting this equivalence for every KV-only backend is cheap enough to write first (§7) |
-| INV-A3-7 | CUDA-graph replay is oblivious to which blocks/rows came from a hit vs. fresh compute | INV5 | Wrong-shaped or stale addresses baked into a captured graph; manifests as an illegal memory access or, worse, correct-looking-but-wrong output on replay. Already partially covered for Laguna's decode graph (no recurrent state touched there today); genuinely new territory once a recurrent-state row is graph-replayed (§4.3 below, Decision 4 in §6) |
-| INV-A3-8 | Reserved-address conventions (`RESERVED_PHYSICAL_SLOTS`) are consistent between whatever allocator(s) A3 wires up | INV7 | Deterministic wrong output from slot 0 onward — this exact bug already happened once in this project's history (`block_pool.py:17-19`'s own comment: *"something about index 0... makes the model read/write the wrong state"*) and is the reason the convention exists at all. **Flagged as currently inconsistent**: `block_pool.py` reserves 1 physical slot; Laguna's own local constant is `RESERVED_PHYSICAL_SLOTS=0` (`laguna.py:53`, `laguna_cuda_graph.py:41`) — i.e. Laguna does not even use `block_pool.py`'s convention today (consistent with §2.1: it doesn't use `BlockPool` at all). `qwen36-rebuild-spec.md:131` already flags this divergence as "应废弃（待核实）" rather than assuming block_pool's `=1` is required — A3 should not silently inherit `=1` for a new allocator without re-deriving whether it's still needed, since the original justification was vLLM-scheduler-specific, not hardware-specific |
+**举例：KV 命中 900，state 只命中 400 → 有效复用长度 = 400。**
 
-### 4.2 Q2 — `(kv_hit, state_hit)`: what to do when they disagree, and why
+- **不能整体退化到 0**：`[0,400)` 的 attention 命中是真实、可验证的（同一份 chained hash
+  锁定），丢弃它没有正确性收益，只有性能损失。
+- **不能用 900**：`[400,900)` 这段区间根本不存在"可以直接读、跳过 forward"的递归状态——
+  GDN 层不是分块可组合的，它是单个累积标量，只能从上一个真实 checkpoint 边界顺序重算。
+  用 900 会导致 GDN 层从位置 400 开始，拿着"400 之后没更新过"的状态去处理 500 个新 token，
+  产生错误但不崩溃的结果——正是 INV-A3-2 被破坏时的症状。
 
-**The concrete example**: KV hit is 900 tokens, state hit is 400. **[JUDGMENT]** Take
-400 — i.e. `effective = state_hit`, never `kv_hit`, and never anything computed by
-averaging or otherwise mixing the two. This is not a close call; it falls straight out of
-INV-A3-2. Serving from a state that is 500 tokens behind the KV means the recurrent
-layers' forward pass for tokens `[400, 900)` would run with the *wrong* accumulated
-gate/conv/ssm state — those layers have no positional index to "look up" 500 tokens of
-history from KV the way full attention does. The only correct move is to treat `[400,
-900)` as a compute-miss for the recurrent layers specifically. Whether the *attention*
-layers still get to reuse the KV in `[400, 900)` is a genuine design fork (does A3 support
-per-layer-family partial reuse, recomputing only the recurrent layers for that span?) —
-today's retired prior art (`prefix_cache.py:131-166`) does **not** do this; it treats
-`A > 0, G = 0`-shaped mismatches as a full compute-miss for simplicity (`prefix_cache.py:135-139`'s
-comment: *"attention cached but GDN never checkpointed... treated as a compute miss in
-v1... write-time dedup still reclaims the memory"*). **[OPEN/Decision 2 in §6]**: whether
-A3 should do better than that v1 simplification is a real scoping question, not something
-this document should decide for the same reason architecture.md deferred A1→A6 sequencing
-decisions to a human — it trades implementation complexity against a real performance
-win whose size is currently unmeasured.
+### vLLM/SGLang 实际怎么处理——本轮重新核实后的修正
 
-**How vLLM/SGLang actually handle "the two numbers disagree" (§3.1/§3.2 facts, restated
-as the answer to this question specifically)**:
+**【事实，修正 #1】** `notes/2026-08-01-hybrid-cache-prior-art.md` 的整体框架把这个问题
+描述成"两个上游都返回两个数字"。重新核实 vLLM 的**调度器实际读到的值**后，这个概括**不
+成立**：
 
-- vLLM's *default* path never lets them disagree observably: the coordinator's
-  fixed-point loop keeps shrinking the candidate until every group agrees, so by the time
-  scheduling happens there is only one number, already reconciled to the more restrictive
-  side. The two-number shape exists but is scoped to disaggregated-prefill bookkeeping,
-  not local admission.
-- **[Revised per §3.2's traced-through correction]** SGLang's scheduler-facing hit
-  (`device_indices`) is **also already collapsed to `state_hit`** by the time it leaves
-  `match_prefix` (`value[:best_value_len]`, `hi_mamba_radix_cache.py:1083`) — it does not
-  hand the scheduler a raw, uncollapsed `kv_hit` either. The second field that does ride
-  along, `mamba_branching_seqlen`, is not an alternative, larger hit length for the
-  scheduler to choose between — it answers a different question (where to materialize a
-  *future* checkpoint), computed from the pre-truncation `kv_hit` for that purpose only.
-  So all three systems agree on the scheduling-facing number; SGLang's distinctive move is
-  keeping a second, differently-purposed number around at all, not keeping two competing
-  hit lengths.
-- Our own retired code picked the same one-number shape but derived it explicitly rather
-  than letting an iterative solver find it, because two groups with a known
-  monotonicity (`G ≤ A` always) don't need the general solver.
+- `vllm/v1/core/kv_cache_coordinator.py:630`，`HybridKVCacheCoordinator.find_longest_
+  cache_hit`，返回类型 `tuple[tuple[list[KVCacheBlock], ...], int]`——**第二个元素是单个
+  int**（"The number of tokens of the longest cache hit"），由一个迭代不动点算法算出
+  （`:642-680` 起的 `while True` 循环："Each attention type either accepts the current
+  candidate length or reduces it. If any type reduces the length, restart checks over
+  all types."）。这是**调度器真正消费的值**——`kv_cache_manager.py:161`
+  （`self.block_pool = self.coordinator.block_pool`）确认所有 `SingleTypeKVCacheManager`
+  子类（包括 `MambaManager`）共享同一个 `coordinator`，这个不动点循环就是让所有组"同意"
+  一个数字的机制。
+- **确实存在**一个返回"每组各自命中长度"的方法——`find_longest_cache_hit_per_group`
+  （`kv_cache_coordinator.py:742`）——但它唯一的调用点是 `scheduler.py:697-698`，**被
+  `self.connector is not None and self.has_mamba_layers` 严格限定**
+  （`scheduler.py:690-691`），即只服务**分离式 prefill（KV-connector）的跨节点传输量估算**
+  （`scheduler.py:715`：Mamba 状态传输量不管 KV 侧命中与否都要估），不是本地调度的通用路径。
+  这大概率就是 vLLM 0.26.0 号称的"partial prefix-cache hit support for hybrid models"
+  的种子，但**本机没有 0.26.0 checkout，未能核实**这个猜测。
+- **结论**：vLLM 的通用调度路径**不是**"暴露两个数字给调度器"，是"内部收敛成一个数字
+  （已经是更保守的那一侧）"——跟我们自己退役代码的做法（`L=G<=A`，直接推导而非迭代求解，
+  因为两组场景下不需要通用不动点算法）殊途同归。
 
-**[JUDGMENT] Recommendation**: keep both raw numbers around at the *type* level (satisfies
-the literal design mandate in `implementation-plan.md` row 7 and gives `/metrics`/bfdiag/
-the A6 "prefix hit rate must not regress" gate something concrete to observe, e.g. "how
-often does `state_hit < kv_hit` fire, and by how much" — a real signal for whether GDN
-checkpoint granularity, §4.3, is coarse enough — this is this design's own diagnostic use
-for the pair, not a copy of SGLang's `mamba_branching_seqlen`, which serves a different,
-cache-population purpose this design does not need at the coordinator level), but do what
-every system actually surveyed does at the *scheduling* level (one effective number,
-`state_hit`, is what actually gates how much prefill gets skipped — not "SGLang does
-something different here," §3.2's correction). Concretely:
+- **【事实，修正 #2】** 该笔记 §5 的标题"Eviction: two budgets, two accountings"配合其
+  开篇"Both projects solved this problem in public"的整体框架，容易让人以为"两个独立预算"
+  是 vLLM 和 SGLang 的共识。重新核实后：**这是 SGLang 的设计，不是 vLLM 的**。vLLM 的
+  `BlockPool` 是**一个共享、无类型区分的池**：所有 `SingleTypeKVCacheManager`（含
+  `MambaManager`）持有同一个 `self.block_pool` 引用（`kv_cache_manager.py:161`），用的是
+  一个全局 LRU free queue、一个 `num_gpu_blocks` 地址空间，靠 `unify_hybrid_kv_cache_
+  specs`（`kv_cache_utils.py:1403`起）把每组的 `page_size_bytes` 统一到公共值，让一个整数
+  block id 能合法索引进任意组的张量。vLLM **没有**资源类型感知的独立预算。
+
+  SGLang 才是真正做了"两个数字、两个预算"的那家：`MatchResult`
+  （`/home/bot/project/sglang/python/sglang/srt/mem_cache/base_prefix_cache.py:155-190`）
+  同时携带 `device_indices`（定义 KV 命中长度）和 `mamba_branching_seqlen`（"the mamba
+  radix cache branching point, which is the longest page-aligned position that could've
+  been cache hit if there exists a mamba state"）——**两个独立字段，不是收敛后的单一值**。
+  `schedule_policy.py:140-141` 把 `mamba_branching_seqlen` 原样搬到请求对象上，"怎么用这
+  个差值"的决策被推迟到下游 Mamba 专用代码，不在匹配那一刻就解决。
+
+### 我们该怎么选
+
+**【判断】** 在**类型层面**照 SGLang 的做法——真正暴露两个数字（满足任务原话"返回
+`(kv_hit, state_hit)` 二元组"的字面要求，也给 `/metrics`/bfdiag/A6 的"前缀命中率不回归"
+门禁一个具体可观测的东西："`state_hit < kv_hit` 多久发生一次、差多少"是一个真实信号，
+能告诉 Track B GDN checkpoint 粒度是不是太粗）。在**调度层面**照 vLLM 的收敛路径和我们
+自己退役代码的做法——只有一个"有效数字"驱动"跳过多少 prefill"的决策，没有任何一个被
+核实过的系统（vLLM、SGLang、我们自己的退役代码）会在**调度逻辑**里对两个数字的差值分支
+处理，差值只用于观测，不用于分支：
 
 ```python
 @dataclass(frozen=True)
 class PrefixHit:
-    """kv_hit: longest block-aligned prefix with paged KV present and reference-able.
-    state_hit: longest block-aligned boundary at or before kv_hit with a matching
-    recurrent-state checkpoint. Invariant (INV-A3-2): 0 <= state_hit <= kv_hit always.
-    For a backend with no recurrent layers, state_hit == kv_hit unconditionally
-    (INV-A3-6)."""
+    """kv_hit: 最长的、KV 物理存在且可引用的 block-aligned 前缀长度。
+    state_hit: 不超过 kv_hit 的、有匹配递归状态 checkpoint 的最长边界。
+    不变量（INV-A3-2）：0 <= state_hit <= kv_hit 恒成立。
+    无递归层的 backend 恒有 state_hit == kv_hit（INV-A3-6）。
+    """
     kv_hit: int
     state_hit: int
 
+    def __post_init__(self) -> None:
+        if self.state_hit > self.kv_hit:
+            raise ValueError(
+                f"INV-A3-2 violated: state_hit={self.state_hit} > kv_hit={self.kv_hit}"
+            )
+
     @property
     def effective(self) -> int:
+        """调度层应该用来跳过 prefill 的长度。"""
         return self.state_hit
 ```
 
-No system surveyed here — not vLLM, not SGLang, not our own prior art — branches
-scheduling logic on the *difference* between the two numbers; they only ever use the more
-restrictive one to decide "how much can I skip." Recommending a dataclass over a bare
-`tuple[int, int]` for the same reason `BackendCapabilities` is a dataclass and not a
-string (`protocol.py:63-68`): `.kv_hit`/`.state_hit` cannot be transposed by accident the
-way `result[0]`/`result[1]` can, and the invariant lives next to the data as a docstring
-a reviewer will actually read.
+选 dataclass 而非裸 `tuple[int, int]`，理由跟 `BackendCapabilities` 选 dataclass 而非
+字符串一样（`protocol.py:63-68`）：`.kv_hit`/`.state_hit` 不会像 `result[0]`/`result[1]`
+一样被意外调换顺序，不变量能写成 reviewer 真的会读到的 docstring/`__post_init__` 断言，
+而不是散落在调用点的隐含约定。
 
-### 4.3 Q3 — Eviction budgets: who gets evicted first
+state 分配器的搜索范围本身应该受 `kv_hit` 约束（边界 `Lc <= kv_hit`），而不是"两边独立算
+完再比较"——这正是 `oracle/prefix_cache.py:157`（`for boundary_blocks in range(matched_
+blocks, 0, -1)`）已经实现的顺序：先算 `A`，再在 `[0, A]` 范围内反向找 `G`。
 
-**[FACT, from `oracle/qwen36_vllm/gdn_state.py`, re-derived for A3 rather than copied]**
-The retired implementation already answers this with an asymmetric rule, and the
-asymmetry is the load-bearing part:
+---
 
-- **KV-side pressure evicts forward**: when `BlockPool._evict_one` reclaims a still-hashed
-  attention block (`block_pool.py:343-362`), it calls `_on_evict_block`, which — in the
-  retired wiring — drops the co-keyed recurrent-state checkpoint unconditionally
-  (`gdn_state.py:183-209`, "LOCKSTEP, reverse direction" comment block, first half).
-- **State-side pressure evicts checkpoints against their own byte budget, independent of
-  KV pressure**: `_evict_gdn_checkpoints_for_budget` (`gdn_state.py:211-226`) evicts
-  LRU-oldest checkpoints purely to keep `gdn_ckpt_meta`'s total bytes under
-  `gdn_checkpoint_byte_budget` — a **separate accounting** from the KV pool's own
-  free-block count, matching SGLang's `EvictParams(num_tokens, mamba_num)` split (§3.2)
-  and *not* matching vLLM's single untyped pool (§3.1).
-- **The asymmetry that makes this safe**: when state-side pressure evicts a checkpoint, it
-  only clears the co-keyed KV block's *hash index entry* — never the block's live
-  memory — and only when that block is already `ref_cnt == 0` (`gdn_state.py:183-209`,
-  full comment: *"If the block is ref_cnt > 0 (an active slot still references it), its
-  hash stays — losing only the checkpoint, which merely turns a future would-be hit into
-  a safe compute miss (`L = G <= A` still holds)."*). State-side pressure can never evict
-  live KV memory. KV-side pressure, symmetrically, only ever evicts a checkpoint that is
-  already dead weight (its keyed block is gone).
+## 4. 问题 3：驱逐时两类资源的预算怎么分，谁先被驱逐
 
-**[JUDGMENT] Recommendation for A3**: keep this asymmetry, restated as a coordinator-level
-rule rather than a cross-allocator callback (see Decision 1, §6, for why the *mechanism*
-— callback vs. coordinator-owned — is still open even though the *rule* is not):
+### 三种已知设计，不是两种
 
-1. Each resource type gets its own budget and its own accounting — paged KV by block
-   count (as today), recurrent state by byte budget (as the retired code already did).
-   Neither allocator needs to know the other's numbers to enforce its own budget.
-2. **KV eviction never asks permission from the state allocator** — it evicts whatever its
-   own LRU says to evict, then *notifies* the coordinator, which drops the now-orphaned
-   checkpoint. This preserves KV's existing eviction order unchanged (zero behavior
-   change for Laguna, §5) and is a natural fit for `_on_evict_block`'s existing signature
-   *if* Decision 1 keeps that hook.
-3. **State eviction never reclaims live KV** — it may only demote a KV block's
-   cache-hash-index entry (turn a future hit into a future miss) when that block's
-   `ref_cnt == 0`, and it must never touch a `ref_cnt > 0` block's memory or hash. This is
-   the one rule that must be enforced regardless of which mechanism carries it, because
-   it is the rule that keeps "the state allocator ran out of budget" from ever becoming a
-   correctness incident on the KV side.
-4. Order between the two budgets, when both are under pressure simultaneously: **KV first,
-   then state** — **[FACT, independently re-verified this round]**, upgraded from the prior
-   note's unverified carry-forward. `HybridCacheController._page_transfer`
-   (`hybrid_cache/hybrid_cache_controller.py:651-666`) is explicit and structural, not just
-   an ordering convention:
+重新核实后，现在能看到的实际是**三个**先例，不是"两个上游都这样做"：
 
-   ```python
-   def _page_transfer(self, operation):
-       # KV pools first — determines actual completed page count
-       super()._page_transfer(operation)
+| 设计 | 预算 | 代表 |
+|---|---|---|
+| 单一共享池，无类型区分，全局 LRU | 无独立预算——靠统一 `page_size_bytes` 让一个 id 空间覆盖所有组 | vLLM（§3 修正 #2） |
+| 两个独立预算，双向不对称 lockstep | KV 按块数；state 按字节数；state 驱逐绝不回收活 KV | SGLang（`EvictParams(num_tokens, mamba_num)`/`EvictResult`，`base_prefix_cache.py:83-98`；hit-test `hi_mamba_radix_cache.py:357`） |
+| 两个独立预算，双向不对称 lockstep（同上一行的形状，独立实现） | 同上 | 本仓库已退役的 `oracle/gdn_state.py`（§1.4） |
 
-       # Extra pools only after KV fully completes. If KV terminated early
-       # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
-       # data misalignment.
-       kv_completed_pages = operation.completed_tokens // self.page_size
-       if operation.pool_transfers and kv_completed_pages == len(operation.hash_value):
-           ...
-   ```
+### 结论：选第二/第三种，不选 vLLM 的共享池
 
-   The extra-pool (Mamba/SWA) transfer is gated on `kv_completed_pages == len(operation.
-   hash_value)` — i.e. it does not merely go *second*, it is skipped **entirely** if KV
-   did not fully complete, specifically to avoid the two halves disagreeing about how much
-   of the prefix is actually valid (the same INV-A3-2 hazard, at the IO layer instead of
-   the eviction layer). `_resolve_pool_transfers_allocation`
-   (`hybrid_cache/hybrid_cache_controller.py:725-806`) additionally wraps extra-pool
-   allocation in an explicit `rollback_allocated()` (defined `:739`, invoked on failure at
-   `:777,802`) that frees every extra-pool allocation made so far if any one of them fails
-   — atomic all-or-nothing for the *state* side specifically, layered on top of (not
-   instead of) the KV-first ordering. Reasoning for keeping KV-first even before this
-   verification held: KV is the larger, more contended resource under this project's actual
-   capacity constraints (Track B's F2 note: KV and speculative scratch already compete for a
-   tight 96 GB budget), so it should be evicted/transferred on its own terms first; state
-   eviction is cheap relative to it and mostly a safety valve. The verified SGLang mechanism
-   gives a second, independent reason: correctness under partial failure, not just resource
-   priority.
+**【判断】** 理由：KV 的天然记账单位是"块数"（随前缀长度线性增长）；GDN state 的天然记账
+单位是"checkpoint 个数 × 固定字节数"（每个 checkpoint 大小不随前缀长度变化——
+`notes/prefix-cache-design.md:280-284` 给的具体数字"~151MB/checkpoint"是**旧硬件/旧配置
+下的数字**，Track B 落地时必须用当前 checkpoint 的真实层数/维度重算，不能直接抄）。
+vLLM 的"统一 `page_size_bytes`"技巧要求所有资源类型能被压缩进同一个字节粒度的 block——
+这对"每前缀恒定 151MB、跟长度无关"的 GDN state 来说会很不自然（把一个固定大小的东西硬套
+进"跟着前缀长度增长的块"抽象，是削足适履）。独立预算避免了这个问题，且本仓库自己已经有
+一份验证过的实现可以抄读。
 
-### 4.4 Q4 — Migration path: zero behavior change for Laguna
+### 谁先被驱逐：两条独立 LRU + 双向不对称 lockstep
 
-**[FACT, established in §2.1]** Laguna's live prefix-cache code path
-(`reconcile_prefix_hit`/`find_best_slot_for_prompt`/`find_prefix_match` in
-`laguna.py`) does not call into `BlockPool` at all today. **This is the reason zero
-behavior change is achievable by construction, not by careful engineering**: A3's new
-machinery and Laguna's existing machinery are already two different call graphs. The
-migration risk is not "will A3 change what Laguna returns" — it structurally cannot,
-unless someone chooses to rewire Laguna's own methods on top of the new coordinator, which
-is explicitly out of scope for this step (that rewiring, if ever done, is its own future
-step with its own bit-exact gate).
+不是"KV 满了先动 KV，state 满了先动 state"这种全局排序问题，是两条独立 LRU 各自跑，
+用**不对称**的双向 lockstep 保证两边不互相说谎：
 
-**The actual thing that needs proving** is narrower: *the protocol surface change itself
-must be additive*. Concretely:
+- **正向（KV 触发）**：一个 KV 块被自己的 LRU/预算驱逐 → **必然**级联丢弃同键的 state
+  checkpoint。`gdn_state.py:183-198` 已经这么写。
+- **反向（state 触发，预期**更频繁**，因为 state 预算通常远小于 KV 池）**：state
+  checkpoint 被自己的字节预算驱逐 → **不**级联丢弃 KV 块，除非该块此刻 `ref_cnt==0`。
+  `gdn_state.py:205-209` 已经这么写，注释原话："merely turns a future would-be hit into
+  a safe compute miss"。
 
-1. `BackendCapabilities` gains a new field (name TBD, e.g. `recurrent_state: bool`,
-   Decision 3 in §6) that is `False` for `LagunaBackend` — a one-line addition, covered by
-   the existing shadow-conformance test pattern (`test_backend_protocol.py:32-38` already
-   asserts an exact member count; that count goes up by one field, not one *required*
-   member, so `LagunaBackend`'s conformance is unaffected).
-2. `reconcile_prefix_hit`'s **return type changing from `int` to `PrefixHit`** is the one
-   real compatibility question, since it is a `CAPABILITY_MEMBERS["prefix_cache"]` member
-   today (`protocol.py:235`) with a concrete `-> int` signature every caller (`engine.py`,
-   `bfdiag`) currently expects. **[JUDGMENT]**: do not change this signature in place.
-   Either (a) add a new protocol member (e.g. `reconcile_prefix_hit_v2` /
-   a name-neutral rename per the naming-debt note already on file at
-   `protocol.py:29-46`) that returns `PrefixHit` and is only required when
-   `capabilities.recurrent_state` is `True`, leaving the existing `int`-returning member
-   untouched for every backend that doesn't need the second number; or (b) keep
-   `reconcile_prefix_hit -> int` as `PrefixHit.effective` and add `state_hit`/`kv_hit` as
-   a separate, optional query. Both keep Laguna's call sites bit-for-bit unchanged. Which
-   one is cleaner for `Qwen36Backend`'s eventual implementation is Decision 3 in §6 — not
-   decided here because it is exactly the kind of call `architecture.md`'s own migration
-   discipline (steps 1-4: define the shape in shadow mode, prove equivalence, *then*
-   switch) says should be proven in shadow mode against a real (if not-yet-implemented)
-   second backend's needs, not guessed at now.
-3. **INV-A3-6 as the actual proof obligation**: whatever shape is chosen, the test that
-   matters is "for every backend where `capabilities.recurrent_state` is `False` (today:
-   every shipping backend), the new code path is provably equivalent to the old one" —
-   this is a shadow-mode unit test in the same style as steps 1/3/4 of the existing 8-step
-   plan (`architecture.md:430,432,433`: define, assert equal to today's hardcoded value,
-   do not drive anything from it yet), and it is the concrete, automatable form of "zero
-   behavior change," not a promise taken on faith.
+这个不对称跟 SGLang 的双态设计（`mamba_evicted`/`mamba_backuped`，`:357`）结论一致——
+**一个节点的 KV 可以在没有 state 的情况下继续存活**，但**state 不能在没有 KV 哈希锚点的
+情况下独立存在**。方向性是设计的一部分，不是疏忽。
 
-### 4.5 Q5 — The six pitfalls, checked one at a time
+**两个预算同时告急时先动哪个**：【事实，本轮未重新核实，标注清楚】
+`notes/2026-08-01-hybrid-cache-prior-art.md` 提到 SGLang `HybridCacheController` 有
+"KV 池先、额外池后完成才做"的固定顺序，这条本轮**没有**独立重新核实（不同于上面已核实的
+`EvictParams`/`hi_mamba_radix_cache.py:357`），按笔记转述先记在这里，若要写进实现，落地前
+需重新对照 `hybrid_cache_controller.py` 源码核实。【判断】即使这条不算数，独立推荐 KV
+先（自己的 LRU 决定），state 后：KV 是更大、竞争更激烈的资源（本项目 96GB 卡上 KV 与投机
+scratch 已经在抢紧张预算，`implementation-plan.md` §7.6 F2），state checkpoint 按已知
+数量级（每个几十~百 MB）相对便宜，更适合作为"安全阀"而非"主战场"。
 
-| # | Pitfall (`hybrid-cache-prior-art.md` §6) | This design's answer | Verified this round? |
-|---|---|---|---|
-| 1 | Don't unify the allocators | Two allocators (existing `BlockPool` for paged KV; a new, not-yet-written recurrent-state allocator modeled on SGLang's `MambaSlotAllocator` shape — fixed slot per request, no paging) + a coordinator that owns cross-allocator invariants, not a merged data structure. **[FACT]** confirmed independently for both vLLM (type-dispatch via `SingleTypeKVCacheManager` subclasses) and SGLang (`MambaSlotAllocator` explicitly "do NOT inherit the KV base class") in §3.1/§3.2 this round | Yes, both projects, this round |
-| 2 | Prefix search runs in the opposite direction; block sizes must be aligned | Confirmed exactly in our own retired code (`prefix_cache.py:157-165`: right-to-left search for the deepest usable checkpoint boundary `≤ A`) as well as vLLM's `MambaManager` (§3.1, unchanged from the note). Alignment: vLLM asserts `block_size % hash_block_size == 0` per group (§3.1); our retired code sidesteps a general alignment problem by using the *same* `block_size` for both groups and deriving `G` as a multiple of it by construction. **[JUDGMENT]**: A3 should keep one shared `block_size` between paged KV and recurrent-checkpoint boundaries rather than reintroducing vLLM's general multi-block-size alignment machinery — Qwen3.6 gives no reason yet to need different granularities, and "explicit single knob" beats "general solver nobody has a second use case for" | Yes (vLLM + our own code); SGLang's alignment mechanism not separately re-checked this round |
-| 3 | Speculative decoding: subtract the full window before freeing | Confirmed in vLLM (§3.1, `tdoublep` comment, re-verified exact lines). **Not found** in SGLang's mem_cache layer this round (§3.2, explicitly reported as a negative result, not an absence claim) — may live in speculative-worker code not covered this pass. Our own retired code takes a *different*, arguably stronger approach for the *state* half specifically: rather than a budget-subtraction heuristic, `_ssm_spec_row` (`block_pool.py:45-79`) gives every speculative candidate its own dedicated, never-shared state row, so a rejected candidate's state is simply never read again — no snapshot/restore, no conservative-freeing budget needed for state at all. **[JUDGMENT]**: for A3, prefer the dedicated-row approach for recurrent state (it already exists, is unit-tested, and eliminates this whole failure class rather than bounding it) and reserve vLLM's "subtract the speculative window" rule only for whatever *block-count* accounting the KV side needs under speculative decoding — which is a Track B question, not an A3-coordinator question, since A3 itself does not do speculative decoding | Partially — vLLM yes, SGLang not found, our own code yes (different mechanism) |
-| 4 | Recurrent state can't be borrowed across requests in the same step | **[OPEN]** Confirmed in vLLM only this round (`get_num_blocks_to_allocate`'s fake-shortage return, unchanged from the note, not re-quoted here since §3.1 already re-verified the adjacent methods in the same file). Not independently re-checked in SGLang this round. This is a **scheduler-level** constraint (`ServerEngine` decides admission), not a coordinator-level one — A3 (the coordinator) should *expose* enough information (e.g. "this prefix's recurrent-state boundary requires a fresh, not-yet-taken slot") for the scheduler to enforce it, but should not itself own the admission decision. Concretely: this is a property `ServerEngine.admit_batch` (wherever it is today) would need to check, not a new method on the coordinator beyond what `PrefixHit`/allocator availability already exposes. **No code change proposed here** — flagged for whoever writes `Qwen36Backend`'s scheduling integration (Track B) to re-derive against the real scheduler, since `ServerEngine` today has no concept of this at all (confirmed: it manages exactly one resource type) | Vetted for vLLM only |
-| 5 | Answer "does the in-checkpoint MTP layer carry GDN" before scoping B3 | Out of scope for A3 itself — this is `docs/roadmap.md` B0-8, explicitly assigned to a separate parallel investigation and explicitly not to be predicted here (per this project's "别问太多次"/"不代模型" norms already in the user's own working style). Mentioned here only because if the answer is "no," the speculative/recurrent-state interaction in row 3 above simplifies further (no candidate rows ever get written by a draft step at all) | N/A — deliberately not investigated here |
-| 6 | Per-resource eviction budgets; hit test validates both independently | Answered in full in §4.3. **[FACT]** re-confirmed directly against SGLang source this round (`EvictParams`/`EvictResult`, `base_prefix_cache.py:83-98`; hit-test condition, `hi_mamba_radix_cache.py:357`) and against our own retired code (`gdn_state.py`'s asymmetric lockstep). **[FACT — correction]** vLLM does **not** do this (§3.1) — its pool is unified and untyped, so this pitfall's "both upstreams" framing in the original note is only half right; corrected here | Yes, SGLang + our own code, this round; vLLM explicitly does the opposite |
+### 谁"更值钱"因而更该被保留
 
-### 4.6 Q6 — Sub-steps inside step 7
+**【判断】** 不引入折算汇率。state checkpoint 是固定字节数、KV 块大小随 `block_size` 和
+层数变化，两者的"每字节命中收益"在不同工作负载下差异很大，任何固定汇率都会在某类负载上
+系统性偏袒另一类。独立预算 + 各自 LRU 是"不需要预判负载分布就不会错"的选择。
 
-**[JUDGMENT]**, modeled directly on two precedents already in this repo: Track A's own
-"zero-behavior-change steps before the risky one" discipline (`architecture.md:428-437`,
-steps 1-4 shadow-mode / step 5 the switch), and `notes/prefix-cache-design.md`'s own P0-P4
-phasing for the *same* underlying problem the first time it was built. Five sub-steps,
-ordered by blast radius, matching the pattern that already worked once:
+---
 
-| Sub-step | What | Behavior change | Gate | GPU |
+## 5. 问题 4：怎么做到对今天只有 KV 缓存的 Laguna 零行为变更
+
+### 为什么这次的"零行为变更"比听起来更容易做到
+
+**【事实，§1.1/1.5 的直接推论】** Laguna 的活代码路径（`reconcile_prefix_hit`/
+`find_best_slot_for_prompt`/`find_prefix_match`）**从不调用** `BlockPool`。这意味着
+A3 的新机器（协调者、可能的第二分配器）和 Laguna 的既有机器**今天就不共享调用图**——
+"零行为变更"不是"需要小心工程才能保证的约束"，接近"结构上自动成立"。而且
+`ArchitectureSpec.needs_two_cache_families`（§1.5）对 Laguna checkpoint 解析结果已经是
+`False`，并已经过真实 checkpoint 验证（`tests/test_architecture_spec.py`）——这不是本
+文档提出的新假设，是已经落地并测试过的事实。
+
+### 论证链
+
+1. 协议要改的两个方法（`reconcile_prefix_hit`/`find_best_slot_for_prompt`）在 Laguna 侧
+   的语义变化，只需要让返回值等价于 `PrefixHit(kv_hit=hit, state_hit=hit)`——数值逐字节
+   不变。
+2. 是否要**改变现有方法的返回类型**，还是**新增一个只在 `needs_two_cache_families=True`
+   时才需要的成员**，是本设计里我判断不出唯一正确答案的一个具体分叉——见 §8 决策点 2，
+   带两个选项和各自代价，不在这里代选。
+3. 协调者作为一层薄适配：对 `needs_two_cache_families=False` 的 checkpoint（今天的
+   Laguna），协调者直接转发给 backend 自己的 `reconcile_prefix_hit`，不实例化第二个
+   分配器，不触碰 `BlockPool`。真正的第二资源分配器只在 Track B 落地 GDN state 时才
+   实例化。
+
+### 具体验证门禁（形式化"零行为变更"，不是口头保证）
+
+- **贪心 bit-exact**（已有的迁移不变量 #1，`architecture.md` §3.3）。
+- 现有测试 `test_reconcile_prefix_hit_cold_miss`/`_warm_match`
+  （`tests/test_laguna_server_integration.py:143-164`）改成断言 `.effective` 值不变，
+  **加上**一条新断言 `result.state_hit == result.kv_hit`——这条本身就是"Laguna 零行为
+  变更"的形式化证明，能在 bit-exact 跑完之前先红。
+- `find_prefix_match`（DFlash 内部消费者）**不**在本次协议改动范围内，但要有一条测试
+  显式核实"没有受影响"，不能只是口头说"应该没事"（§7-b）。
+
+---
+
+## 6. 六条坑逐条对照
+
+对照 `notes/2026-08-01-hybrid-cache-prior-art.md` §6 的六条修改建议（标注哪些本轮
+独立重新核实过、哪些沿用笔记原话）：
+
+**1. 不统一分配器。**【已核实，双侧】已经是设计前提。两个独立分配器 + 协调者：KV 分配器
+= 现有 Laguna 同槽方案（是否升级到 `BlockPool` 跨槽共享是独立决策，§8 决策点 5，不属于
+本次范围）；state 分配器 = Track B 落地时新建的专用 checkpoint 池（对齐
+`oracle/gdn_state.py` 的形状，重新实现而非 import oracle）。
+
+**2. block size 对齐 + 反向搜索。**【已核实】§3 已给出"取 `state_hit`，且 state 分配器
+搜索范围受 `kv_hit` 约束"的规则。对齐今天没有现成问题（§1.7：64 与 8192 整除），但这是
+**当前默认值凑巧对齐**，不是设计上保证永远对齐——【待验证】Track B 真正选定 GDN checkpoint
+边界策略时必须重新核实这两个常数的整除关系，不能只在设计文档里 assert 一次就当永远成立。
+
+**3. 投机保守释放。**【已核实，vLLM；SGLang 本轮未找到对应机制，标为未找到而非不存在】
+vLLM 的规则（§2 INV-A3 表，`single_type_kv_cache_manager.py:1150-1153`）：释放前减去整个
+`num_speculative_tokens` 窗口。SGLang 的 `mem_cache/` 层本轮搜索
+`speculative`/`draft`/`EAGLE` 关键词未找到对应机制——**这是"没找到"，不是"确认不存在"**，
+可能在没覆盖到的投机 worker 代码里。本仓库退役代码对 state 侧给出了一个更强的替代方案：
+`_ssm_spec_row`（`block_pool.py:45-79`）给每个投机候选一条**专属、永不共享**的 state
+行，被拒绝的候选的行永不再被读——不需要保守释放预算，直接消除这一类问题。【判断】A3 对
+state 侧优先复用这个"专属行"方案（已存在、已单测），vLLM 的"减去投机窗口"规则只留给 KV
+侧的块计数场景（Track B 问题，不是 A3 协调者本身要解决的）。
+
+**4. 同轮不可跨请求借用。**【判断，结构性豁免，已核实我们自己的 restore 机制】vLLM 的
+"fake shortage，推迟一轮"是因为它的 GDN state 存在于一个共享池里。本仓库固定槽架构下，
+每个新请求拿到的是独立物理槽的独立 state buffer，不存在这种竞争。唯一可能出现"同轮多个
+请求碰同一份资源"的场景是跨槽 restore——但 `restore_gdn_state`（`gdn_state.py:213-219`，
+`torch._foreach_copy_`）做的是**拷贝**，不是指针别名，两个请求在同一轮都从同一份
+checkpoint 拷贝恢复不会冲突。这是本仓库既有设计决定带来的结构性豁免，记录"为什么不需要"
+比设计一个不需要的机制更重要。这条本身是一个**调度层**约束（谁能不能在同一轮被准入），
+不是协调者该拥有的判断——协调者只需要暴露足够信息（比如"这个前缀的 state 边界需要一个
+全新的槽"），不该自己拥有准入决策（`ServerEngine` 今天完全没有这个概念，因为它只管一类
+资源）。
+
+**5. 独立驱逐预算 + 双向 lockstep。**【已核实，SGLang 与本地代码；vLLM 明确不这样做，
+见 §4】答案见 §4。
+
+**6. MTP 是否带 GDN。**【事实，已有结论，不是本文档要回答的问题】
+`docs/qwen36-rebuild-spec.md:537-541` 的 B-6 结论："6 个本地 checkpoint 的 `mtp.*`
+张量清一色 `self_attn.*`+`mlp.*`，零 GDN"。这条**没有**消除"投机窗口的保守释放"这条难点
+（target 的 48 层 GDN 在 verify 时还是要跑、还是要回滚），但确实说明 MTP draft 本身不带
+GDN，跟 vLLM 的"current draft models don't have mamba layers"
+（`single_type_kv_cache_manager.py:1225-1226`）一致，可以直接复用 vLLM
+`reachable_block_mask` 的简化假设。
+
+---
+
+## 7. 分步实施计划
+
+| 子步 | 内容 | 行为变更 | 门禁 | GPU |
 |---|---|---|---|---|
-| 7.1 | **Type layer**: `PrefixHit`, extended `BackendCapabilities` (+1 field), protocol member(s) per Decision 3 (§6) — types and signatures only, `runtime/backends/protocol.py` stays torch-free. `INV-A3-6` unit test (every `capabilities.recurrent_state=False` backend behaves identically under the new types) | None | Existing shadow-conformance test pattern extended (`test_backend_protocol.py`-style); `ruff` + both pytest jobs | No |
-| 7.2 | **Recurrent-state allocator skeleton**: new module (not `block_pool.py` — per pitfall 1/Decision 1), fixed-slot, no paging, addressing via existing `_ssm_spec_row`/`_physical_slot`. No model wired to it yet — this is pure bookkeeping, testable the same way `_check_byte_budget`/`_check_lockstep_eviction` in `benchmarks/prefix_cache_eviction_check.py:96-317` already proved out for the retired version, minus any GPU/tensor dependency (those checks were already pure-Python; port the *pattern*, not the import from `oracle/`) | None (nothing calls it) | New unit tests, CPU-only, no torch | No |
-| 7.3 | **Coordinator**: owns INV-A3-1 through INV-A3-5 as explicit, testable rules over the two allocators from 7.1/7.2. Reconciliation (`kv_hit`/`state_hit` computation), eviction ordering (§4.3 rule 4), same-step admission signal (row 4, §4.5) exposed as a queryable fact, not enforced by the coordinator itself | None (`ArchitectureSpec.needs_two_cache_families` gates it off for every checkpoint that exists in production today) | Full invariant test suite, adapted from `notes/prefix-cache-design.md` §4/§5-P3's methodology (signal-probe, admission-under-pressure, byte-budget, lockstep-both-directions) — all CPU-only except where a real recurrent-state tensor is unavoidable | Mostly no; a small GPU-optional subset if any check needs a real tensor shape |
-| 7.4 | **Decision 1 resolution, wired**: whichever of "reuse `_on_evict_block`" vs. "coordinator supersedes it" was chosen in §6 gets implemented for real against `BlockPool`. This is the step that actually changes `runtime/block_pool.py` or actually wires a callback — everything before this point is new, additive code with nothing calling it | Only in the sense that `BlockPool._on_evict_block` goes from always-`None` to sometimes-set — still no observable effect for Laguna, since nothing constructs a coordinator for a `needs_two_cache_families=False` checkpoint | Bit-exact regression on Laguna (must be unaffected — this is the step most likely to accidentally touch a shared code path) + the full invariant suite from 7.3 run against a synthetic two-resource fixture (no real model needed yet) | Bit-exact gate needs GPU; the synthetic fixture does not |
-| 7.5 | **A6-adjacent closeout**: prefix-hit-rate metric wired into `/metrics`/bfdiag per Decision 5 (§6), documentation of the final chosen shapes back into `architecture.md` §3.2-C (replacing the "更正" note with the settled design), `roadmap.md` §1.5-S4 text corrected per §2.3 | None | Doc-link check (this document itself, see §8); C-LIVE (metrics surface changed) | Only for C-LIVE |
+| **7-a** | 类型层：`PrefixHit`、协议成员/能力位形状（按 §8 决策点 2/3 的拍板结果），`check_conformance` 更新。INV-A3-6 单测：每个 `needs_two_cache_families=False` 的 backend 在新形状下行为等价 | 无 | `tests/test_backend_protocol.py` 扩展 + `test_reconcile_prefix_hit_*` 改断言（§1.6 已列出会红的具体测试） + ruff | ❌ |
+| **7-b** | `engine.py` 调用点更新：`hasattr` 探测换成 `capabilities.prefix_cache` 查询；显式核实 `find_prefix_match`（DFlash 内部消费者）未受影响，补一条覆盖测试而不是口头保证 | 无（重构） | 影子一致性单测 + 一条新的 `find_prefix_match` 回归测试 | ❌ |
+| **7-c** | state 分配器骨架：新模块（不是 `block_pool.py`，呼应坑 #1），固定槽、不分页，寻址复用已有的 `_ssm_spec_row`/`_physical_slot`（§1.8 的 `RESERVED_PHYSICAL_SLOTS` 分歧在此显式核实，不默认继承 `=1`）。还没有模型接到它，纯记账逻辑，可用假数据测，参照 `benchmarks/prefix_cache_eviction_check.py` 的纯 Python 检查方法论（`lockstep_eviction`/`refcnt_never_evicted`/`byte_budget` 等，`:96-317`）——搬方法，不 import oracle | 无（没有调用方） | 新单测，CPU-only，无 torch | ❌ |
+| **7-d** | 协调者骨架：owns INV-A3-1~5，对 `needs_two_cache_families=False` 的 backend 纯转发（§5 第 3 点） | 无（`needs_two_cache_families` 对今天每个生产 checkpoint 都是 `False`） | 影子一致性单测（协调者转发结果与直接调用 backend 逐字节相等）+ 全套不变量单测（信号探针、压力下准入、字节预算、双向 lockstep——方法论同 7-c） | ❌ |
+| **7-e** | 不变量断言接线：把 §2 的 INV-A3-2/3/4/8 写成 `bfdiag/invariants/checks.py` 里新的 `check_*` 函数，跟着 `check_no_duplicate_ids` 的既有模式 | 无 | 单测 + 故意构造违反场景断言真的 `raise`（呼应 C8 纪律） | ❌ |
+| **7-f** | 文档措辞修正（§1.3 冲突）——待拍板是否由本任务执行，见 §8 决策点 1 | 无（纯文档） | 无 | ❌ |
+| **7-g** | 切换生效：把 7-a 到 7-e 串起来，`ServerEngine` 真正走协调者而不是直连 backend | **有** | `implementation-plan.md` 已定的四条：bit-exact + 接受率 + 前缀命中率不回归 + C-LIVE | ✅ |
+| 7-h（Track B 窗口，超出本次范围，仅标记依赖） | 第二资源真正实例化，`(kv_hit, state_hit)` 分裂逻辑落地 | 有 | Track B 自己的门禁 | ✅ |
 
-Sub-steps 7.1-7.3 have **no real consumer** until Track B exists (same argument
-`architecture.md:424-426` already made for why A3 as a whole was moved to position 7, not
-position 3) — they are pure infrastructure, buildable and fully testable today, zero GPU,
-zero risk to Laguna. 7.4 is the step that first touches shared production code
-(`block_pool.py`) and is where the bit-exact gate earns its keep. 7.5 is bookkeeping.
-
----
-
-## 5. Why this is safe for Laguna specifically (summary of §2.1/§4.4, stated as a proof)
-
-1. Laguna's `capabilities.prefix_cache` methods never call `BlockPool` (§2.1, direct
-   source read).
-2. `ArchitectureSpec.needs_two_cache_families` is `False` for Laguna today and is already
-   tested against the real checkpoint (§2.4).
-3. Every new type/allocator/coordinator method proposed in §7 is either (a) additive to
-   the protocol (new capability field, defaulted `False`; new optional member, only
-   required when the new capability is `True`) or (b) inert until something sets
-   `_on_evict_block` or constructs a coordinator for a two-family checkpoint, neither of
-   which happens for Laguna.
-4. Therefore the only sub-step with any theoretical exposure to Laguna's behavior is 7.4
-   (`_on_evict_block` goes from always-`None` to conditionally-set) — and even there,
-   exposure requires someone to construct a coordinator for a checkpoint reporting
-   `needs_two_cache_families=True`, which no checkpoint in production does.
-
-This is a stronger position than "we will test carefully and not regress" — it is "the
-new code and Laguna's live code do not share a call graph," which is why §4.4 could point
-to a specific, small, provable set of proof obligations instead of a general regression
-sweep.
+**为什么这样切**：7-a 到 7-f 全部零 GPU、全部行为不变或影子模式，可以在 GDN kernel 落地
+之前全部完成（呼应 A1/A2/A5 前 4 步的既有纪律）。只有 7-g 是真正"有行为变更"的一步，且
+此时改动面已被前面步骤压缩到最小——`implementation-plan.md` 标的"有，半径最大"这个风险
+标签，准确地说只属于 7-g，不是整个第 7 步。
 
 ---
 
-## 6. Decisions needing a human call
+## 8. 待拍板事项（不代选）
 
-**[OPEN]** — options given, no default silently assumed elsewhere in this document.
+### 决策点 1：§1.3 的文档措辞冲突怎么处理
 
-### Decision 0 — Should A3 also move Laguna onto the new content-addressed allocator?
+**背景**：`roadmap.md`/`architecture.md` 说"残迹"（暗示待清理），`qwen36-rebuild-spec.md`
+（更新一天）说"休眠但设计良好"。
+- **(a)** 保留原措辞，按字面执行——删除/重写 `_on_evict_block` 等。代价：丢弃已验证正确
+  的代码，纯为措辞一致重新发明。
+- **(b)** 改 `roadmap.md`/`architecture.md` 措辞为"休眠原语"，A3 决定何时复用。代价：
+  需要碰不属于本任务范围的活文档。
 
-The most consequential fork in this whole document, surfaced explicitly rather than left
-as a background assumption inside §4.4/§5: §2.1 established that Laguna's real prefix
-cache (same-slot linear token scan) is structurally separate from `BlockPool`'s
-content-addressed, cross-request sharing. That separation is *why* zero behavior change
-is close to automatic — but it is also a live, real limitation of what Laguna can do
-today (no cross-slot/cross-request sharing of a repeated system prompt, for instance),
-and A3 is precisely the step that builds the machinery that would fix it.
+**推荐 (b)**。理由见 §1.3。由谁改、什么时候改，留给你定。
 
-- **(a) Leave Laguna's mechanism untouched; A3 builds only the new infrastructure for a
-  second (not-yet-existing) cache resource type.** This is the assumption every other
-  section of this document is written against. Cost: a real, valuable improvement to
-  Laguna (cross-request KV sharing) sits unbuilt for another cycle, even though the
-  allocator that would provide it already exists and is already tested.
-- **(b) While A3 is being built anyway, also rewire Laguna's `reconcile_prefix_hit`/
-  `find_best_slot_for_prompt` onto `BlockPool`.** This would be a genuine behavior
-  change for Laguna (better cache hit rates, possibly different latency
-  characteristics under load) layered onto **already the highest-blast-radius step in
-  the entire 8-step plan** (`architecture.md:436`'s own characterization). It reintroduces
-  exactly the risk the plan's "zero-behavior-change steps before the risky one" ordering
-  (`architecture.md:428-437`) was built to avoid, and would need its own bit-exact-under-
-  the-new-mechanism gate distinct from A3's.
-- **[JUDGMENT] Recommendation: (a).** Bundling a real Laguna behavior change into the one
-  step this project's own risk register already flags as the largest-blast-radius item is
-  the specific failure mode Track A's whole sequencing discipline exists to prevent — "we
-  were already in there, so we also changed X" is how scope creep turns a contained step
-  into an uncontained one. If (b) is worth doing, it is worth doing as its own
-  small, independently-gated step *after* A3 lands (using exactly the "does the KV-only
-  path get slower or better" bit-exact + throughput comparison A6 already runs), not
-  folded into it. This recommendation is why §4.4/§5 write "out of scope for this step"
-  as if settled — it is this document's judgment, not yet anyone else's decision.
+### 决策点 2：`reconcile_prefix_hit` 的返回类型怎么改——原地改，还是新增一个成员
 
-### Decision 1 — Does the coordinator reuse `BlockPool._on_evict_block`, or supersede it?
+**背景**：今天 `reconcile_prefix_hit -> int` 是 `CAPABILITY_MEMBERS["prefix_cache"]`
+治理的协议成员，唯一调用方是 `engine.py:1106`。
+- **(a) 原地改**：把返回类型改成 `PrefixHit`，Laguna 的实现内部包一层
+  `PrefixHit(hit, hit)`，同一提交里更新 `engine.py` 的调用点（读 `.effective`）。
+  好处：一个方法只有一种含义，不产生"两个名字做同一件事"的长期维护面；协议文档自己
+  （`protocol.py:42-46`）已经预告"这三个调用点下一次被摸到时"适合改名/改形状，本次正是
+  那个时机。代价：这是一次真正的签名变更，理论上任何未来实现了 `prefix_cache=True` 的
+  backend 都必须跟着改。
+- **(b) 新增成员**：保留 `reconcile_prefix_hit -> int` 不动，新增一个只在
+  `needs_two_cache_families=True`（或新能力位）时才要求实现的成员（如
+  `reconcile_hybrid_hit -> PrefixHit`）。好处：今天唯一的实现者（Laguna）完全不用碰这个
+  方法，改动面最小，严格加法。代价：未来如果 `Qwen36Backend` 同时需要 `prefix_cache=True`
+  和第二资源，会同时实现两个语义相近的方法，增加一层认知负担；且"哪个是权威值"需要额外
+  文档说明。
 
-- **(a) Reuse it.** `_on_evict_block` already exists, is exactly the right shape
-  (`Callable[[int], None]`), and is exactly what the retired code used successfully. Cost:
-  it is a callback *from* the KV allocator *into* something else — which is the coupling
-  shape pitfall 1 warns against in spirit (an allocator calling out, rather than a
-  coordinator observing both). In practice the direction here is benign (KV→coordinator
-  notification, not KV→state-allocator control), but it is still the KV allocator knowing
-  a second thing exists.
-- **(b) Supersede it.** The coordinator polls or wraps both allocators' `evict`/`allocate`
-  entry points itself, and `_on_evict_block` stays `None` forever, eventually removed.
-  Cost: more new code; the existing dormant hook (already tested for the retired case)
-  goes unused, which is a small waste but not a risk.
-- **[JUDGMENT] Recommendation: (a) for the forward direction (KV pressure → drop
-  checkpoint), because that direction is a pure notification and the hook is already the
-  right shape and already load-bearing in tested retired code; but the reverse direction
-  (state pressure → touch KV hash) should be a coordinator-owned method the state
-  allocator calls, not a second symmetric callback wired the same way — the asymmetry in
-  §4.3 rule 3 is exactly the thing a shared bidirectional-callback design would be easiest
-  to accidentally make symmetric, which is the failure mode INV-A3-3 exists to name.** This
-  is a recommendation, not a decision made here, because it trades a small amount of
-  coupling against a small amount of new code and reasonable engineers could land either
-  way.
+**【判断】倾向 (a)**：协议本身已经在文档里预告了这个时机，且今天只有一个实现者、一个
+调用方，变更成本很低，不必为一个还不存在的第二 backend 的假设性需求预先加一层。但这条
+不是"半径小到我能替你定"的问题——如果 Track B 落地时发现 (a) 的迁移成本比预想的高（比如
+第二个 backend 也需要单纯的 `int` 语义作为向后兼容），(b) 随时可以退回去做，代价是 7-a
+这一步返工。**如果你倾向 (b) 以保留更大灵活性，直接告诉我，不影响后面 7-c/7-d/7-e 的
+设计**。
 
-### Decision 2 — Should A3 do better than "any state miss is a full compute-miss"?
+### 决策点 3："要不要两类缓存"这个信号该放在哪一层
 
-Per §4.2: today's (retired) design treats `A > 0, G = 0` as a full recompute, not a
-partial one. Options: **(a)** keep that simplification for A3 v1 (matches precedent,
-least new code, `write-time dedup still reclaims the memory` per the existing comment so
-it's not even wasteful, just not maximally fast); **(b)** support partial reuse (recompute
-only the recurrent layers for the mismatched span, reuse attention KV for all of it) —
-more implementation surface, unmeasured performance upside, and it is the kind of
-correctness-adjacent complexity this project's own risk register (RK1) already flags GDN
-work as prone to. **[JUDGMENT] Recommendation: (a) for A3 itself**, revisit only once
-Track B has real profiling showing how often `A > G` actually fires in practice (an
-empirical question §4.2 already noted as unmeasured) — do not build (b) speculatively.
+**背景**：§1.5 发现 `ArchitectureSpec.needs_two_cache_families` **已经存在**（Track A
+第 3 步落地，专为本步骤预留）。这跟"新增 `BackendCapabilities` 布尔字段"的直觉方案是
+两个不同层面的信号：`ArchitectureSpec` 描述**模型结构事实**（从 config.json 解析，与
+backend 实现无关）；`BackendCapabilities` 描述**backend 执行层能力**（这个类现在支不
+支持某个方法族）。
+- **(a)** 协调者只读 `ArchitectureSpec.needs_two_cache_families` 来决定要不要实例化
+  第二分配器，不在 `BackendCapabilities` 新增字段。好处：不重复一个已经存在的信号，
+  `ArchitectureSpec` 是"权威"来源（Registry 解析出来，构造 backend 之前就知道）。代价：
+  `BackendCapabilities` 的"一个 backend 的能力=一份 frozen dataclass"这个心智模型出现
+  一个例外——第二资源相关的能力不在这里查，查的人需要知道去 `ArchitectureSpec` 找。
+- **(b)** 两个都要：`ArchitectureSpec` 保留原样（权威来源），`BackendCapabilities` 也
+  加一个派生字段（构造时从 `ArchitectureSpec` 抄一份），给需要"只查 backend 能力就够"的
+  调用方（比如 `/metrics`）一个统一入口。代价：两份数据，需要保证构造时永远同步，增加
+  一个"两者不一致"的新失效模式（虽然可以用一条构造期断言消灭）。
 
-### Decision 3 — Protocol shape: new member name, or overload the existing one behind a capability check?
+**推荐 (a)**，理由：本设计通篇强调"不要发明已经存在的东西"（§1.3、§1.4、§1.5 都是这个
+主题的具体案例），`(b)` 引入的"两份数据必须同步"本身就是一个新的、不必要的不变量。但
+`/metrics` 目前怎么读能力（§1.6）如果依赖 `BackendCapabilities` 已经是既定接口约定，
+可能需要一个小的适配层——这个细节留给 7-a/7-d 落地时处理，不影响这里的架构选择。
 
-Per §4.4 point 2: add a differently-named member that returns `PrefixHit` (required only
-under `capabilities.recurrent_state`), or keep `reconcile_prefix_hit -> int` as the stable
-contract and add a second, always-optional query for the two-number breakdown. **[OPEN]**
-— this document intentionally does not pick, because whichever a real `Qwen36Backend`
-implementation finds easier to satisfy is evidence this document does not yet have (no
-`Qwen36Backend` exists — `IMPLEMENTED_BACKENDS` is `frozenset({"laguna"})` today,
-`model_registry.py:76`), and the naming-debt note already on file at `protocol.py:29-46`
-suggests this project prefers to defer renames until a real second call site forces the
-question rather than guess ahead of it.
+### 决策点 4：CUDA Graph 状态中立捕获——新问题，不能从 Laguna 借
 
-### Decision 4 — CUDA-graph state-neutral capture: new problem, not reusable from Laguna
+Track B/B2 范围，不在本次 A3 决定，列在这里只是不让它在两份文档之间失踪：
+`docs/qwen36-rebuild-spec.md:135` 已经指出 Laguna 的 decode 图从不碰递归状态，它的
+warmup 复用安全论证不能直接搬过去。退役代码的方案（永久保留 `2 × batch_size` 个 warmup
+槽，`cuda_graphs.py:87-130`）可以作为起点，但那份文档自己也说这是"全新问题，无可抄"。
 
-Flagged for completeness, not decided here (it is Track B/B2 scope, not A3 scope): per
-`docs/qwen36-rebuild-spec.md:135`, Laguna's decode graph never touches recurrent state, so
-its warmup-reuse safety argument does not transfer. The retired code's answer (permanently
-reserved `2 × batch_size` warmup slots, `cuda_graphs.py:87-130`) is available as a
-starting point but was flagged in that same document as "全新问题，无可抄" — genuinely
-needs re-deriving against whichever kernel Track B ends up using (B0-4's three options),
-not against A3's coordinator design. Listed here only so it is not lost between two
-documents that each assume the other owns it.
+### 决策点 5：A3 是否应该在本轮把 Laguna 的 KV 侧切换到 `BlockPool`（跨槽共享）
 
-### Decision 5 — What exactly does "前缀命中率不回归" (A6 gate) measure once there are two hit numbers?
+- **(a)** 不切换：A3 只处理"加第二类资源"的协调形状，KV 侧维持现状。零行为变更，风险
+  最小，符合 `implementation-plan.md` 对第 7 步的判断——"在 Track B 的递归状态到来之前
+  它没有真实消费者"。
+- **(b)** 顺手切换，一次性把两块基础设施都用上。代价：真正的行为变更（引入跨请求 KV
+  共享，今天不存在），不是 Track B/GDN 真正需要的东西，会把"爆炸半径最大的一步"的半径
+  进一步放大。
 
-Today `/metrics`/bfdiag presumably reports one hit-rate number (not verified in this
-document — out of scope for a design pass with zero GPU and no metrics code read this
-round). Once `PrefixHit` exists, does the A6 non-regression gate track `kv_hit`-based
-rate, `state_hit`(`effective`)-based rate, or both separately? **[OPEN]** — recommend
-tracking both once 7.5 lands (§4.6), specifically *because* the gap between them
-(§4.2's "how often does state_hit < kv_hit fire") is the one number this whole design
-doesn't otherwise surface anywhere, and it is the number that would tell Track B whether
-Decision 2 is worth revisiting.
+**推荐 (a)**。"切到 `BlockPool`"是一个独立的、有自己收益论证的性能特性，应该走 Track F
+或独立评估，不该被 A3 这个结构性协调任务捎带上。
 
 ---
 
-## 7. Gates for this document
+## 9. 门禁记录
 
-Per the task's instructions, this design must pass `ruff` + both pytest environments +
-the doc-link check, even though it adds no production code. No source under `runtime/`,
-`server/`, `oracle/`, `tests/`, `bfdiag/` was modified to produce it — this section
-records what was actually run, in this worktree, against this new file.
-
-Actually run, in this worktree (`work/a3-design-20260802`), against the final state of this
-file:
-
-- `ruff check .` (repo-wide) — **`All checks passed!`**, both under `~/.venvs/vllm`
-  (torch/vllm/sparkinfer present, the environment `[[test-venv-is-venvs-vllm]]` specifies
-  for this repo's real test runs) and under a freshly-built clean venv with only `.[dev]`
-  installed (simulating the CI `lint-and-test` job, which has neither torch nor vllm).
-- `ruff format --check runtime server loader model oracle tests tools` — **`191 files
-  already formatted`** (clean venv); production packages untouched by this change, as
-  expected.
-- `python -m pytest -q`, `~/.venvs/vllm` (broad-coverage environment; real torch, real
-  vllm/sparkinfer present) — **1179 passed, 3 warnings**, unchanged from the pre-existing
-  baseline measured on this same worktree before this file was added.
-- `python -m pytest -q`, clean `.[dev]`-only venv (CI `lint-and-test` job simulation, no
-  torch, no vllm) — **794 passed, 127 skipped**, unchanged from the pre-existing baseline.
-  (The CI `test-cpu-torch` job's own extra surface — `.[dev,serving,cpu-test]` + CPU-only
-  torch wheel + triton, no sparkinfer/cutlass — was not separately provisioned this round;
-  its unique exposure over the two environments actually run here is torch-dependent tests
-  that skip under `~/.venvs/vllm`'s guards for a *different* reason than under the clean
-  venv. Since this change touches zero Python files, this is not expected to matter, but is
-  recorded as a gap rather than silently assumed equivalent.)
-- Manual doc-link check: no automated doc-link checker exists in this repo today (searched
-  for `doc.link`/`doc_link`/markdown-link-walking patterns under `tools/`, `scripts/`,
-  `tests/`; none found — confirmed absent, not just unfound). This document contains no
-  `[text](path)`-style markdown links at all (`grep -n '](' ` on the file returns nothing —
-  it cites paths as backtick-quoted strings, matching `notes/prefix-cache-design.md`'s and
-  `hybrid-cache-prior-art.md`'s own convention); every backtick-quoted `docs/*.md` and
-  `notes/*.md` path referenced was checked by hand to exist in this worktree.
+- **ruff check**（`~/.venvs/vllm/bin/python -m ruff check .`）：`All checks passed!`
+- **pytest，CPU-only 环境**（全新 venv，只装 `.[dev]`，不装 torch，模拟 CI job 1）：
+  `794 passed, 127 skipped`
+- **pytest，CPU-torch 环境**（`~/.venvs/vllm`，`torch==2.13.0a0+gitcf30153`，模拟 CI
+  job 2）：`1179 passed, 3 warnings`
+- 本文档不改任何 `.py` 文件——上面两条基线在改动前后不会变化；记录它们是为了确认
+  worktree 本身处于干净可用状态。系统自带的 `/usr/bin/python3` 环境**不能**用来模拟
+  CI job 1（会假报一条 torch 相关测试失败，因为它混了 `~/.local` 下的部分包，不是干净的
+  `.[dev]` 安装——跟既有认知一致：CI 只装 dev extras，本地必须另建干净 venv 才能准确
+  模拟）。
+- **doc-link 检查**：仓库目前没有自动化的 doc-link checker（已搜索 `scripts/`、
+  `tests/`、`.github/workflows/ci.yml`，均无匹配）。手动核对本文档内的相对链接，全部
+  指向本轮已确认存在的文件：`../notes/2026-08-01-hybrid-cache-prior-art.md`、
+  `../notes/prefix-cache-design.md`、同目录下的 `architecture.md`/`roadmap.md`/
+  `implementation-plan.md`/`qwen36-rebuild-spec.md`、
+  `../docs/archive/2026-07-30-architecture-two-tenant.md`——均确认存在。
 
 ---
 
-## 8. Appendix — citation index
+## 10. 引用索引（便于复核）
 
-For quick re-verification, every file:line cited above, grouped by file:
-
-- `runtime/backends/laguna.py:2157-2178` (`reset_slot`), `:2179-2220` (`reconcile_prefix_hit`),
-  `:2222-2260` (`find_best_slot_for_prompt`), `:2531-2548` (`find_prefix_match`), `:53`
-  (`RESERVED_PHYSICAL_SLOTS=0`)
-- `runtime/backends/protocol.py:59-79` (`BackendCapabilities`), `:82-127`
-  (`SlotSnapshot`/`PrefixSnapshot`/`BackendSnapshot`), `:146-228` (`ModelBackend`),
-  `:233-252` (`CAPABILITY_MEMBERS`/`REQUIRED_MEMBERS`)
-- `runtime/block_pool.py:17-24` (`RESERVED_PHYSICAL_SLOTS`/`_physical_slot`, the index-0
-  incident comment), `:45-79` (`_ssm_spec_row`), `:270-303` (`BlockPool` class docstring),
-  `:305-338` (`__init__`, `_on_evict_block`), `:343-362` (`_evict_one`)
-- `runtime/architecture.py:42-49` (cache-kind constants), `:56-64` (`LayerSpec.cache`),
-  `:96-142` (`ArchitectureSpec`, `needs_two_cache_families`)
-- `runtime/model_registry.py:63-76` (`REGISTRY`, `IMPLEMENTED_BACKENDS`)
-- `tests/test_block_pool.py:39-52`, `tests/test_architecture_spec.py:80,85,168,203`,
-  `tests/test_backend_protocol.py:32-38`
-- `oracle/qwen36_vllm/gdn_state.py:33-92` (`_allocate_gdn_checkpoint_pool`),
-  `:106-161` (`materialize_gdn_checkpoint`), `:183-209` (`evict_gdn_checkpoint`),
-  `:211-226` (`_evict_gdn_checkpoints_for_budget`)
-- `oracle/qwen36_vllm/prefix_cache.py:112-129` (`_compute_prompt_block_hashes`),
-  `:131-166` (`reconcile_prefix_hit`, `L = G ≤ A`), `:168-224` (`restore_cached_prefix`)
-- `benchmarks/prefix_cache_eviction_check.py:1-66` (module docstring, INV/R mapping),
-  `:96-317` (pure-Python checks), `:458-782` (GPU checks)
-- `notes/prefix-cache-design.md:310-340` (§3.4 reconciliation), `:408-422` (§3.9 eviction),
-  `:426-558` (§4 INV1-INV9), `:750-797` (§8 decision forks), `:801-` (§9 appendix)
-- `docs/qwen36-rebuild-spec.md:68-90` (§1.1 `gdn_state.py` verdict), `:140-146` (§1.5
-  `prefix_cache.py` verdict), `:229-249` (§1.10 summary table), `:410-436` (§3.3, A3
-  specifically)
-- `docs/roadmap.md:158` (S4, stale), `:287` (Track A's A3 line)
-- `docs/architecture.md:253-274` (§3.2-C, the 2026-08-01 correction), `:419-441` (§3.5.5,
-  the 8-step plan)
-- `notes/2026-08-01-hybrid-cache-prior-art.md` (full file — the note this document
-  re-verifies and partially corrects)
-- vLLM 0.25.1: `v1/core/single_type_kv_cache_manager.py:1065-1085,1151-1156,1196-1204`;
-  `v1/core/kv_cache_coordinator.py:552-555,630-742`; `v1/core/kv_cache_utils.py` (~1067,
-  ~1293, page-size unification, not line-cited precisely this round)
-- SGLang `b296e1a5035b`: `srt/mem_cache/allocator/mamba.py:14-34`;
-  `srt/mem_cache/base_prefix_cache.py:83-98,155-190`;
-  `srt/mem_cache/hi_mamba_radix_cache.py:341,357,540,713,800-842,919,947,1016-1053,1083`
-  (`_match_post_processor`, the `device_indices = value[:best_value_len]` truncation);
-  `srt/mem_cache/hybrid_cache/hybrid_cache_controller.py:651-666` (`_page_transfer`,
-  KV-first + skip-on-partial-failure), `:725-806` (`_resolve_pool_transfers_allocation`,
-  `rollback_allocated` defined `:739`, invoked `:777,802`)
-- `git log`: `8ec9cd3` (2026-07-22, block_pool extraction), `a9cb932` (2026-07-30, oracle
-  isolation)
+- `runtime/backends/laguna.py:39`（唯一 block_pool import）、`:53`
+  （`RESERVED_PHYSICAL_SLOTS=0`）、`:2157-2177`（`reset_slot`）、`:2179-2220`
+  （`reconcile_prefix_hit`）、`:2222-2259`（`find_best_slot_for_prompt`）、`:2531-2549`
+  （`find_prefix_match`）
+- `runtime/backends/protocol.py:29-46`（命名债务/预告）、`:60-79`
+  （`BackendCapabilities`）、`:192,194-198,235`（`prefix_cache` 治理的成员）
+- `runtime/block_pool.py:17-24`（`RESERVED_PHYSICAL_SLOTS=1`/`_physical_slot`）、
+  `:23-79`（`_ssm_spec_row`）、`:270-361`（`BlockPool`/`_on_evict_block`/`_evict_one`）
+- `runtime/architecture.py:47-48`（cache kind 常量）、`:56-64`（`LayerSpec.cache`）、
+  `:126-142`（`paged_kv_layers`/`recurrent_layers`/`needs_two_cache_families`）
+- `runtime/model_registry.py:80`（`IMPLEMENTED_BACKENDS`）
+- `server/app.py:97`（`SERVER_BLOCK_SIZE`默认 64）、`:1248-1249`
+- `server/engine.py:1090-1106`
+- `oracle/qwen36_vllm/gdn_state.py:183-226`、`oracle/qwen36_vllm/prefix_cache.py:131-166`、
+  `oracle/qwen36_vllm/direct_model_runner.py:590`
+- `benchmarks/prefix_cache_eviction_check.py:1-66`（方法论）、`:96-317`（纯 Python 检查）
+- `tests/test_backend_protocol.py`、`tests/test_laguna_server_integration.py:143-164`、
+  `tests/test_block_pool.py`、`tests/test_architecture_spec.py`
+- `docs/roadmap.md:158`、`docs/architecture.md:125,129-131`、
+  `docs/implementation-plan.md:195`、`docs/qwen36-rebuild-spec.md:131,144,537-541,561-565,603,677`
+- `notes/prefix-cache-design.md`（§3.4、§3.9、§4）
+- vLLM `~/.venvs/vllm025/.../v1/core/single_type_kv_cache_manager.py:1026,1042,1064-1065,
+  1069-1073,1074-1079,1143,1150-1153,1186,1199-1206,1225-1226`；
+  `kv_cache_coordinator.py:161(kv_cache_manager.py),514-680,630,742`；`sched/scheduler.py:690-698,715`；
+  `kv_cache_utils.py:1403`
+- SGLang `/home/bot/project/sglang/.../srt/mem_cache/allocator/mamba.py:30-35`；
+  `base_prefix_cache.py:83-98,155-190`；`hi_mamba_radix_cache.py:357,713-742`；
+  `managers/schedule_policy.py:140-141`
