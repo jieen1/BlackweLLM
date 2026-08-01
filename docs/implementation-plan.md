@@ -6,6 +6,12 @@
 >
 > roadmap.md 仍是**目标与理由**的权威来源；本文档只回答"下一个动作是什么、谁卡着谁"。
 > 标 **[待办·开发执行]** 的条目需要 GPU / 真机 / 下载权重，编制者不代跑。
+>
+> **2026-08-01 二次修订**：基线推进到 `main @ 6acc4ba`（含 `235f51e` JIT 编译修复）。
+> 消化 [`investigation-queue.md`](investigation-queue.md) §A/§D 的调研结论；拍板 §4 的
+> C-1（GPU CI 形态）、C-2（Qwen3.6 主线 checkpoint）、§6.1 的 N8（`--session-affinity`）
+> 三项，均已解锁下游条目。新增 Track F 的 F1/F2（见 §7.6）与 Track C 的冷启动路径审计
+> （见 §7.3）。
 
 ---
 
@@ -24,7 +30,7 @@ roadmap §1.2 / §1.3 / §4 里这些条目**已经关闭**，排期时不要再
 | N4 / C0 bfdiag 隔离保证失效 | 🔴 优先 | 🟡 **主体已完成**：审计成文（341 行），逐模块判定 real / fake / honest-split，删掉伪装成回归门禁的合成张量 demo，新增真调用 `restore_checkpoint`、`reset_laguna_engine` 的测试。剩余见 C0R |
 | **Track A 设计定稿**（M1 交付物） | — | 🟢 **已完成 2026-08-01**：草案（`architecture.md` §3.1–3.4）已升级为可实施规格 **§3.5**——13 个成员的完整签名、观测层只读快照、能力查询形状、bfdiag 耦合处置、8 步迁移顺序与回滚点 |
 | **A2 工作量** | "`LagunaBackend` 有 50+ 公开方法" | 🟢 **被高估**：50 是**方法总数**（含私有），公开只有 **24 个 + 2 个 property**；而 `ServerEngine` 实际只调用其中 **13 个**。协议倒推的输入是这 13 个 |
-| **N8**（本次定稿中发现） | — | 🔴 **`--session-affinity` 100% 失效**：`engine.py:971` 调用的 `mtp_prefill_warm_continue` 只存在于 `oracle/qwen36_vllm/`，`LagunaBackend` 没有且无 `__getattr__` 转发。异常被 `try/except` 吞掉 → 永远静默回退冷 prefill，`session_warm_continuations` 恒为 0，测试零覆盖。详见 `architecture.md` §3.5.6 |
+| **N8**（本次定稿中发现） | — | 🟡 **`--session-affinity` 100% 失效，处置已拍板**：`engine.py:971` 调用的 `mtp_prefill_warm_continue` 只存在于 `oracle/qwen36_vllm/`，`LagunaBackend` 没有且无 `__getattr__` 转发。异常被 `try/except` 吞掉 → 永远静默回退冷 prefill，`session_warm_continuations` 恒为 0，测试零覆盖。详见 `architecture.md` §3.5.6。**2026-08-01 已拍板 (c)**：启动期直接拒绝该 flag，实现见 §6.1，尚待落地（零 GPU） |
 
 ### 0.1 roadmap 里没有、但必须进 P0 的一条
 
@@ -121,16 +127,32 @@ P0-C 拍板 D6 ─────────────────────�
 
 ## 4. P0-C · 两个卡住后续轨道的拍板（需要人决定）
 
-- [ ] **C-1 D3 · GPU CI 形态**（RK7）：(a) 自托管 runner / (b) 本地 pre-push 门禁 + 人工签核 / (c) 只在里程碑人工全量跑
-  → **卡 C4 位精确门禁 → 卡 A6 的"零回归"验收**。不定，Track A 就没有可执行的验收标准，A1–A5 写完也无法宣布完成
-- [ ] **C-2 D6 · Qwen3.6 主线 checkpoint** → **卡 B0 起步**
+- [x] **C-1 D3 · GPU CI 形态**（RK7）—— ✅ **2026-08-01 已拍板：(b) 本地 pre-push 门禁 + 人工签核**。
+  理由：这台机器只有一块 GPU（RK5），自托管 runner（选项 a）会和开发实时抢卡，而"一次验证以分钟计"
+  正是本项目全部效率问题的根源——引入一个还要排队等 runner 的额外瓶颈是在加剧病灶，不是治它。
+  选项 (c)（只在里程碑人工全量跑）门禁太松，位精确回归会在里程碑之间的一个月里悄悄漂移而没人发现。
+  **具体机制**（待落地，见 §7.3 Track C/C4）：一个 `make gate-local`（或 pre-push hook）跑 C-LIVE 冒烟 +
+  贪心 bit-exact 探针，touch `runtime/backends/` 或 `server/` 的分支推送前必跑；PR 模板加一条人工签核勾选项
+  （"我已在本机跑过 gate-local 并附结果"），没有勾选不合并。这解锁了 **C4 位精确门禁 → A6 验收** 的执行路径。
+- [x] **C-2 D6 · Qwen3.6 主线 checkpoint** —— ✅ **2026-08-01 已拍板：官方 `nvidia/Qwen3.6-27B-NVFP4`**
   - ⚠️ **roadmap 对这个选择的描述前提不成立**（2026-08-01 读权重索引核实）：它写的是"社区版能做投机 / 官方版需另找 MTP 层"，
     实际**两份都带 MTP**——`nvidia/Qwen3.6-27B-NVFP4` 有 15 个 `mtp.*` 张量（`mtp.fc.weight`、`mtp.layers.0.*`），
     `sakamakismile/...-Text-NVFP4-MTP` 同样 15 个。
   - 真正的取舍是：**官方 provenance + 需排除 333 个 vision 张量**（`language_model_only=False`，带 `vision_config`）
     vs **社区量化 + 天生文本版**（`language_model_only=True`，0 个 vision 张量，单文件）。
+  - **理由**：排除 333 个 vision 张量是一次性的机械过滤工作（按 tensor 名前缀跳过 `vision.*`），
+    不是架构级的工程风险；而衍生模型（微调版、下一代 Qwen）迟早都会带 vision tower，这个过滤器不管选哪份
+    checkpoint 都要写一次，官方选择不省这个工。反过来，provenance 是不可逆的：发布时"官方 NVFP4"比
+    "社区量化"站得住，而 B1 阶段一旦跑通逐 token 对齐，两份 checkpoint 换着测的成本很低。
+    **社区文本版 `sakamakismile/...-Text-NVFP4-MTP` 留作交叉验证 baseline**，不是弃用。
   - 附带事实：四个本地 Qwen3.6 变体里 **unsloth 那份是 compressed-tensors，不是 modelopt**——
     量化格式必须逐 checkpoint 读，不能按架构推断。
+  - ⚠️ **这个决定对 A1 提出一个新要求**（2026-08-01 定稿时发现，roadmap RK8 需要同步更新）：
+    `architecture.md` §3.2-A 现在的措辞是"带 vision tower 的 checkpoint 不受支持，直接拒绝"（RK8）；
+    但官方 checkpoint **恰好带 vision tower**，我们要的是"接受 checkpoint，但只加载语言模型部分、跳过
+    `vision.*` 张量"，不是整体拒绝。`validate_text_only` 的语义要从"config 里出现 `vision_config` 就报错"
+    改成"允许 `vision_config` 存在，但要求 loader 处于 `language_model_only=True` 模式并断言零 vision 张量
+    被加载"。这条留给 A1 落地时处理（不改 `architecture.md`，此处只记录设计要求），已加进 B0-1。
 - [ ] （不卡任何轨道，可延后）**D4 重命名时机**、**D5 `oracle/qwen36_vllm/` 处置**
 
 ---
@@ -179,15 +201,28 @@ P0-C 拍板 D6 ─────────────────────�
 
 **风险 RK3**：动核心执行路径，Laguna 是唯一生产模型。**顺序不能颠倒：先 P0-B 后第 5 步。**
 
-### 6.1 N8 · `--session-affinity` 静默失效（需拍板）
+### 6.1 N8 · `--session-affinity` 静默失效 —— ✅ 已拍板 (c)，待落地
 
 `engine.py:971` 调 `mtp_prefill_warm_continue`，`LagunaBackend` 没有该方法（只在 `oracle/qwen36_vllm/`），
 异常被 `try/except` 吞掉 → 每次都静默回退冷 prefill。默认关闭，但 `--session-affinity` 是文档化的 CLI 开关。
 完整证据见 [`architecture.md` §3.5.6](architecture.md)。
 
-- [ ] **N8 拍板**：(a) 为 Laguna 实现 warm-continue ／ (b) 删除该 flag 与相关调度路径 ／ (c) 启动期拒绝该 flag，把静默降级变成显式失败
-- **倾向 (c) 作为立即动作**（零 GPU、可当天落地），(a)/(b) 待 Track A 的能力查询就位后重新评估
-- [ ] 无论选哪个：补上 `warm_continue` / `session_warm` 的测试覆盖（当前**零覆盖**）
+**2026-08-01 已拍板：(c) 启动期拒绝该 flag**，把静默降级变成显式失败。理由：
+`mtp_prefill_warm_continue` 只存在于已退役的 `oracle/qwen36_vllm/`，这不是"暂时缺实现"，
+是"调用一个属于另一个已截肢子系统的方法"——`try/except` 把这个错误配置伪装成了正常运行
+（指标恒为 0、零测试覆盖，三年都不会有人发现）。真要做 warm-continue，等 Track A 的能力查询
+（§3.5.3 `BackendCapabilities.warm_continue`）落地后重新评估 (a)，那时候的实现成本和收益都更清楚；
+现在花力气实现它，地基（协议/能力查询）还没打，等 A2 落地后很可能要重写。(b)（直接删 flag）
+则会丢掉 P4b 已写好的调度逻辑，代价大于 (c)，且不排除后续真的要做 warm-continue。
+
+**落地清单**（零 GPU，可当天完成）：
+- [ ] `--session-affinity` 在启动期查 `capabilities.warm_continue`，为 `False` 时直接报错拒绝启动
+  （而不是等到运行期某次 `try/except` 才发现），错误信息指向本节
+- [ ] 删除或改写 `engine.py:971-978` 的 `try/except Exception` 兜底——它存在的唯一理由（掩盖
+  `AttributeError`）随着启动期拒绝而消失；调用点应假定 `mtp_prefill_warm_continue` 存在
+- [ ] 补上 `warm_continue` / `session_warm` 的测试覆盖（当前**零覆盖**）：至少一条测试断言
+  `--session-affinity` 在当前 `LagunaBackend` 上启动期报错，而不是运行期悄悄退化
+- [ ] (a)（为 Laguna 实现 warm-continue）留作 Track A 完成后的重新评估项，不在本次范围内
 
 ---
 
@@ -210,7 +245,14 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 `docs/archive/2026-07-30-architecture-two-tenant.md` §6.2 是可复用先验。
 
 **B0 事实基线**（M2，2 周，全部 [待办·开发执行]）
-- [ ] B0-1 变体清点选型，定主线 checkpoint（**依赖 C-2 拍板**）
+- [x] B0-1 变体清点选型，定主线 checkpoint —— ✅ **已拍板（见 §4/C-2）：官方 `nvidia/Qwen3.6-27B-NVFP4`**，
+  社区文本版 `sakamakismile/...-Text-NVFP4-MTP` 留作交叉验证。**衍生任务（未开工）**：
+  - [ ] B0-1a 写一个按 tensor 名前缀跳过 `vision.*` 的加载过滤器（333 个张量，机械工作，一次写好可复用于
+    任何带 vision tower 的衍生 Qwen3.6 checkpoint）
+  - [ ] B0-1b A1 的 `validate_text_only` 语义要跟着调整（见 §4/C-2 的附带发现）：从"config 里有
+    `vision_config` 就整体拒绝"改成"允许 `vision_config` 存在，但要求 loader 处于
+    `language_model_only=True` 并断言零 vision 张量被实际加载"——这条不改 `architecture.md`，
+    在 A1 落地时一并处理
 - [ ] B0-2 modelopt NVFP4 的 tensor 命名与 scale 语义**逐项确认，不猜**
 - [ ] B0-3 sparkinfer paged attention 在 `head_dim=256 / gqa_group=6 / page_size ∈ {64,128} / fp8 KV` 下的正确性与吞吐
 - [ ] B0-4 GDN 方案三选一：① FLA v0.5.2 `gated_delta_rule` ② 从 `oracle/qwen36_vllm/` 移植 ③ 自研。**建议先 ① 拿正确性，profiling 说话后再决定 ③**
@@ -247,11 +289,39 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 - [ ] **C1 故障面清单**：显存不足 / 槽位卡死 / 图捕获失败 / kernel JIT 失败 / 长请求超时 / 客户端断连 / tokenizer 边界 / 非法采样参数 / 并发抢占 —— 每项要有检测点、指标、日志、用户可见错误、恢复动作
 - [ ] **C2 分级降级**：CUDA Graph → eager；投机 → 非投机；前缀缓存命中 → 冷 prefill，每级出指标（**接口形状来自 P0-D 的 D-3 能力查询**）
 - [ ] **C3 看门狗覆盖**：补覆盖测试 + 故障注入
-- [ ] **C4 确定性与可复现**：补 bit-exactness 回归门禁并纳入 CI（**依赖 C-1 拍板**；是 A6 验收的实现载体）
+- [ ] **C4 确定性与可复现**：补 bit-exactness 回归门禁并纳入 CI。**C-1 已拍板**（§4，(b) 本地 pre-push
+  + 人工签核）——实现载体是 `make gate-local` + PR 签核勾选项，是 A6 验收的门禁本体
 - [ ] **C5 长稳测试**：24h soak [待办·开发执行]
 - [ ] **C6 崩溃可诊断**：进程级异常留下 bfdiag run record
+- [ ] **C7 冷启动 / 首次真实形状路径审计**（本批新增，2026-08-01）：`235f51e` 修的是"每个未见过的
+  page-table 宽度都触发 30–100s 重编译"，根因是**编译缓存键覆盖了整个模型该走的 layer-group，
+  但预热只覆盖了主模型的 extend/decode 两种 mode**。该修复自己的提交记录留了一个明确未闭合的口子
+  （见 [`../notes/2026-08-01-prefill-shape-buckets-root-cause.md`](../notes/2026-08-01-prefill-shape-buckets-root-cause.md)
+  "已知缺口"一节），这条不是我猜的，是原作者自己写的 not-tested：
+  - [ ] C7-1 DFlash 的 eager verify 回退路径（`_forward_verify_with_aux`，`mode="verify"`）**不在
+    `warmup_paged_attention_shapes()` 的覆盖范围内**——它对 `SparkinferPrefillWorkspace._key()` 是独立
+    于 extend/decode 的第三个 contract。生产配置下 `DFlashEngine.__init__` 同步捕获 verify/draft CUDA
+    Graph，理论上不该走到这条 eager 路径，但**没有直接证据证明本机 100% 命中 CG**——CG 捕获成功只打
+    `logger.info`，这个仓库默认日志配置下 info 级别被静默丢弃，只有失败才可见（`logger.warning`）。
+    验证方法见该 notes 文件"已知缺口"一节给出的具体步骤（给 `_forward_verify_with_aux`/`_draft_forward`
+    接诊断日志，故意让 verify CG 捕获失败或强制走 eager 分支，复现一次）。**如果坐实，修法与 `235f51e`
+    完全同构**：给 `enable_dflash()` 声明 `mode="verify"` 的 `prefill_capacity_by_window_left`，warmup
+    补一次 `mode="verify"` 的 dummy 调用
+  - [ ] C7-2 把 CUDA Graph 捕获**成功**的可观测性从"默认不可见"提到可查询——不是把日志级别拉到
+    warning 就完事（那只是把噪音换个位置），是把"这次运行 verify/draft CG 到底捕获成功没有"变成
+    `snapshot()`（§3.5.2）或 `/debug/stats` 里的一个字段，跟 `capabilities.cuda_graph` 一起构成
+    Track C2 分级降级判断真正需要的信号
+  - [ ] C7-3 这不只是 DFlash 一处的问题：`investigation-queue.md` C-1（flashinfer #3255）指向的是同一
+    类别——warmup/autotune 是否用**生产真实形状**而不是 autotuner 的第一个合成小形状。B0-3（sparkinfer
+    paged attention 在 `head_dim=256/gqa_group=6` 下的验证）应显式包含这条检查，不能只测正确性
+  - **为什么现在记录、但不立即安排 GPU 时间**：C7-1/C7-3 都需要真机复现，且是**假设未坐实**（`235f51e`
+    的作者本人也说"两个假设都没彻底坐实"）；C7-2（可观测性）不需要额外 GPU，可以和 P0-E 第 5 步
+    的第一次真机验证捆一起做，零增量 GPU 成本
+- **风险登记**：见 `roadmap.md` §6 RK9（本批新增，"冷启动/首次真实形状路径系统性覆盖不足"是一个模式，
+  不是一次性 bug；这条把它显式列成风险而不是留在一条已关闭 commit 的尾巴里）
 
-**插入时机**：C0R 与 C-LIVE 一起在 M1；C1/C2 随 Track A 落地；C3/C4 在 M3；C5/C6 在 M6 发布门禁前。
+**插入时机**：C0R 与 C-LIVE 一起在 M1；C1/C2 随 Track A 落地；C3/C4 在 M3；C5/C6 在 M6 发布门禁前；
+C7-2 随 P0-E 第 5 步捆绑；C7-1/C7-3 在拿到 GPU 窗口后见缝插针，不单独申请专用时段。
 
 ### 7.4 P1 · Track G · Qwen3.6-25B-A3B（M4→M5）
 
@@ -269,6 +339,10 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 - [ ] **E1-剩余**：`n>1`、usage token 统计准确性
 - [ ] **E3 客户端验证矩阵** [待办·开发执行]：openai-python / anthropic-sdk / Claude Code / Cline / Roo / OpenWebUI / LiteLLM，结果做成兼容性表
 - [ ] **E4 reasoning 正确暴露**：OpenAI `reasoning_content` 已接（`c86858a`）。**Anthropic 侧维持非标准事件，除非拿到合法签名来源**——`f13fd4a` 的生产事故明确禁止无签名重发 thinking block
+- [ ] **E5 chunked input-logprob 默认开启**（本批新增，来自 SGLang v0.5.16，`investigation-queue.md` D-8）：
+  我们已有 logprobs 路径，双协议都暴露 `top_logprobs`；长 prompt 的峰值显存是真问题（Track F 的
+  F1/F2 也在争这块显存）。**小而自足，不依赖 Track A**——建议提前到 M2 跟 F1 的窗口扫测一起做，
+  不用等 Track E 默认的 M3 窗口
 
 ### 7.6 P2 · Track F · 性能（机会主义）
 
