@@ -32,9 +32,18 @@ Three member names still carry model-specific vocabulary inherited from the
 current implementation: ``enable_dflash``, ``mtp_verify_and_commit_batch``,
 ``mtp_prefill_warm_continue``. They are declared here under today's names on
 purpose -- this module ships as a shadow contract that must hold with **zero**
-edits to call sites. The rename to neutral names (``enable_speculative_decode``,
-``verify_and_commit_batch``, ``prefill_warm_continue``) lands with step 5 of
-the migration, where call sites change anyway. See §3.5.5.
+edits to call sites.
+
+Step 5 landed (registry became the source of truth for backend selection;
+``ServerEngine.MODEL``/``BACKEND``/``SERVER_MODEL_BACKEND`` are gone) without
+taking this rename -- deliberately: renaming methods on ``LagunaBackend``
+touches GPU-executed code this migration step did not otherwise need to
+touch, widening the change under the same bit-exact gate for no benefit to
+step 5's own claim. The rename to neutral names
+(``enable_speculative_decode``, ``verify_and_commit_batch``,
+``prefill_warm_continue``) stays available to take whenever call sites next
+change for an unrelated reason (naturally: step 7's A3 coordinator, or
+whichever step first touches these three call sites again). See §3.5.5.
 """
 
 from __future__ import annotations

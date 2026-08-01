@@ -78,7 +78,15 @@ DEFAULT_MAX_TOKENS = 16384
 # The production server is Laguna-only.  The archived Qwen tenant has no
 # serving entry point, so launcher defaults state Laguna's actual geometry
 # directly instead of retaining unreachable alternate defaults.
-SERVER_MODEL_BACKEND = "laguna"
+#
+# Track A migration step 5 (docs/architecture.md §3.5.5): SERVER_MODEL_BACKEND
+# used to be hardcoded here ("laguna") and fed straight into ServerEngine.
+# It is now *resolved*, in lifespan() below, by runtime.model_registry --
+# the registry's first real production consumer (previously it had only
+# shadow-mode tests). SERVER_MODEL_PATH is the one thing that still has to be
+# stated somewhere: the registry resolves a checkpoint's config.json into a
+# backend, it does not invent which checkpoint to serve.
+SERVER_MODEL_PATH = os.environ.get("QSR_SERVER_MODEL_PATH", "poolside/Laguna-S-2.1-NVFP4")
 
 SERVER_CAPACITY = int(os.environ.get("QSR_SERVER_CAPACITY", "1"))
 # Laguna default bumped 1->2: ServerEngine requires num_slots >= capacity +
@@ -345,12 +353,26 @@ async def lifespan(app: FastAPI):
     set_active_parser(SERVER_TOOL_CALL_PARSER)
     logger.info("tool_call_parser=%s", SERVER_TOOL_CALL_PARSER)
 
+    # Track A migration step 5 (docs/architecture.md §3.5.5): the backend
+    # name used to be the hardcoded constant SERVER_MODEL_BACKEND. It is now
+    # resolved from the checkpoint's own config.json -- registry's first
+    # real production consumer, not just shadow-mode tests (see
+    # runtime/model_registry.py). Resolution reads only config.json (fast,
+    # no weights), so this still runs before the slow model load below, same
+    # as the tool_call_parser check above it.
+    from runtime.laguna_config import _resolve_laguna_model_dir
+    from runtime.model_registry import resolve_checkpoint
+
+    resolution = resolve_checkpoint(_resolve_laguna_model_dir(SERVER_MODEL_PATH))
     logger.info(
-        "loading model backend=%s (this can take a while: model load + KV cache alloc)...",
-        SERVER_MODEL_BACKEND,
+        "loading model=%s backend=%s (registry-resolved; this can take a while: "
+        "model load + KV cache alloc)...",
+        SERVER_MODEL_PATH,
+        resolution.backend,
     )
     engine = ServerEngine(
-        backend=SERVER_MODEL_BACKEND,
+        model=SERVER_MODEL_PATH,
+        backend=resolution.backend,
         capacity=SERVER_CAPACITY,
         num_slots=SERVER_NUM_SLOTS,
         block_size=SERVER_BLOCK_SIZE,
@@ -368,7 +390,7 @@ async def lifespan(app: FastAPI):
     logger.info(
         "engine ready: backend=%s model=%s capacity=%d num_slots=%d capacity_tokens_per_slot=%d "
         "cudagraph=%s prefix_cache=%s session_affinity=%s ttl=%.1fs",
-        SERVER_MODEL_BACKEND,
+        engine.backend_name,
         engine.MODEL,
         engine.capacity,
         engine.num_slots,
@@ -1004,7 +1026,7 @@ def _run_startup_preflight() -> None:
     is that caller: it renders one line per check, blocks on fatal failures,
     and lets warnings through with their remediation text.
 
-    The checkpoint checks want a local directory, but ``ServerEngine.MODEL``
+    The checkpoint checks want a local directory, but ``SERVER_MODEL_PATH``
     is a HuggingFace repo id. ``_resolve_laguna_model_dir`` is the resolver
     the loader itself uses (offline-only, no network fetch); importing the
     private name is deliberate -- duplicating two lines of resolution logic
@@ -1016,11 +1038,11 @@ def _run_startup_preflight() -> None:
     from runtime.preflight import run_preflight
 
     try:
-        checkpoint_dir = _resolve_laguna_model_dir(ServerEngine.MODEL)
+        checkpoint_dir = _resolve_laguna_model_dir(SERVER_MODEL_PATH)
     except Exception as exc:  # noqa: BLE001 - any resolution failure is fatal here
         print(
-            f"preflight: cannot resolve a local checkpoint for {ServerEngine.MODEL!r}: {exc}\n"
-            f"           Download it first, or point QSR_SERVED_MODEL_NAME at a local path.",
+            f"preflight: cannot resolve a local checkpoint for {SERVER_MODEL_PATH!r}: {exc}\n"
+            f"           Download it first, or point QSR_SERVER_MODEL_PATH at a local path.",
             file=sys.stderr,
         )
         raise SystemExit(1) from exc

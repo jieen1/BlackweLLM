@@ -178,10 +178,11 @@ P0-A 卫生（不卡任何人，可随时插）                                 
 **执行顺序按 [`architecture.md` §3.5.5](architecture.md) 定稿的 8 步**，不是 roadmap 的 A1→A6 编号顺序：
 按爆炸半径从小到大，零行为变更的步骤排在前面。**前 4 步完全不需要 GPU。**
 
-> 进度：**第 1–4 步全部完成**（`4ed5a7b`、`f24f5ad`、`a1287c5`），**全程零 GPU**。
-> torch 环境 1151 passed（起点 1100），无 torch 环境 852 passed / 93 skipped，ruff 两关全过。
-> **第 5 步（Registry 成为唯一真相源）是第一个需要真机的步骤**——它改行为，门禁是贪心 bit-exact。
-> 在拿到 GPU 之前，剩余的零 GPU 工作是 P0-B 的 C-LIVE 脚本编写（B-1/B-2/B-3）。
+> 进度：**第 1–5 步全部完成**（`4ed5a7b`、`f24f5ad`、`a1287c5`、`d9ecbd1`）。
+> 第 5 步的 GPU 验收见 [`../notes/2026-08-02-track-a-step5-gpu-verification.md`](../notes/2026-08-02-track-a-step5-gpu-verification.md)：
+> 贪心 bit-exact 用真实 revert worktree 实测确认（非推理）、接受率逐工作负载匹配基线、C-LIVE 67/67。
+> 唯一的例外是 fox-64K tok/s 低基线 ~19%——已查证据指向与第 5 步无关（daemon provider 绕过 `ServerEngine`），未根因，留作独立性能条目。
+> 下一步是第 6 步（A4 加载器 adapter）。
 
 | # | 步骤 | 行为变更 | 门禁 | GPU |
 |---|---|---|---|---|
@@ -189,7 +190,7 @@ P0-A 卫生（不卡任何人，可随时插）                                 
 | 2 | [x] **A2-观测** ✅ `f24f5ad`：`snapshot()` 落地，`/metrics` 与 `/debug/stats` 改走契约，删 `_slot_kv_len()`；补上 `/metrics` **此前完全没有的路由级测试**（冷启动 + 忙时两态） | 无（同值） | 单测 ✅ + C-LIVE metrics 两条（待 GPU） | ❌ 写 |
 | 3 | [x] **A1 ModelSpec（影子）** ✅ `a1287c5`：`runtime/architecture.py`（torch-free）解析层类型序列/FFN/RoPE/量化/MTP/**每层缓存需求**，含 RK8 的 `validate_text_only`。影子断言对真实 checkpoint 成立 | 无 | 影子一致性单测 ✅ | ❌ |
 | 4 | [x] **A5 Registry（影子）** ✅ `a1287c5`：`runtime/model_registry.py`，路径 → `(spec, backend, loader, 投机策略)`，对 Laguna 解析出 `laguna / compressed_tensors / dflash` = 今天的硬编码选择 | 无 | 影子一致性单测 ✅ | ❌ |
-| 5 | [ ] **切换** Registry 成为唯一真相源；删 `engine.py:188` `MODEL`、`:190` `BACKEND`、`app.py:81` `SERVER_MODEL_BACKEND` | **有** | 贪心 bit-exact + C-LIVE | ✅ |
+| 5 | [x] **切换** ✅ `d9ecbd1`：Registry 成为唯一真相源；删 `engine.py` `MODEL`/`BACKEND`、`app.py` `SERVER_MODEL_BACKEND`；`lifespan()` 调 `resolve_checkpoint` 决定 backend。GPU 验收见 [`../notes/2026-08-02-track-a-step5-gpu-verification.md`](../notes/2026-08-02-track-a-step5-gpu-verification.md) | **有** | 贪心 bit-exact ✅ + C-LIVE 67/67 ✅ + 接受率匹配基线 ✅（fox-64K tok/s 例外，见笔记） | ✅ |
 | 6 | [ ] **A4 加载器 adapter** 拆出 compressed-tensors；公共部分（分片流式读取、参数全覆盖断言、KV scale post-load）不变 | 有（同权重） | 逐张量校验和相等 + bit-exact | ✅ |
 | 7 | [ ] **A3 协调者**（**不是**统一分配器，2026-08-01 更正）：两个独立分配器 + 协调者持有不变量；前缀匹配返回 `(kv_hit, state_hit)`；逐资源驱逐预算与账目；清掉 S4 的 GDN 残迹。**动工前必读** [`hybrid-cache-prior-art`](../notes/2026-08-01-hybrid-cache-prior-art.md)（vLLM + SGLang 真源码先例，含 6 条会被踩中的坑） | **有，半径最大** | bit-exact + 接受率 + 前缀命中率不回归 + C-LIVE | ✅ |
 | 8 | [ ] **A6 验收**（硬门禁，**依赖 C-1 拍板**） | — | 见下 | ✅ |
@@ -210,8 +211,9 @@ P0-A 卫生（不卡任何人，可随时插）                                 
 - [ ] C-LIVE 冒烟通过；比数前先 `bf diff` 判可比性（2026-07-27 教训）
 
 **风险 RK3**：动核心执行路径，Laguna 是唯一生产模型。**顺序不能颠倒：先 P0-B 后第 5 步。**
+✅ 满足：P0-B/C-LIVE（`scripts/c_live_smoke.py`）先落地并跑通 67/67，第 5 步随后才动工。
 
-### 6.1 N8 · `--session-affinity` 静默失效 —— ✅ 已拍板 (c)，待落地
+### 6.1 N8 · `--session-affinity` 静默失效 —— ✅ 已拍板 (c)，已落地（`93f19c9`）
 
 `engine.py:971` 调 `mtp_prefill_warm_continue`，`LagunaBackend` 没有该方法（只在 `oracle/qwen36_vllm/`），
 异常被 `try/except` 吞掉 → 每次都静默回退冷 prefill。默认关闭，但 `--session-affinity` 是文档化的 CLI 开关。
@@ -225,13 +227,19 @@ P0-A 卫生（不卡任何人，可随时插）                                 
 现在花力气实现它，地基（协议/能力查询）还没打，等 A2 落地后很可能要重写。(b)（直接删 flag）
 则会丢掉 P4b 已写好的调度逻辑，代价大于 (c)，且不排除后续真的要做 warm-continue。
 
-**落地清单**（零 GPU，可当天完成）：
-- [ ] `--session-affinity` 在启动期查 `capabilities.warm_continue`，为 `False` 时直接报错拒绝启动
-  （而不是等到运行期某次 `try/except` 才发现），错误信息指向本节
-- [ ] 删除或改写 `engine.py:971-978` 的 `try/except Exception` 兜底——它存在的唯一理由（掩盖
-  `AttributeError`）随着启动期拒绝而消失；调用点应假定 `mtp_prefill_warm_continue` 存在
-- [ ] 补上 `warm_continue` / `session_warm` 的测试覆盖（当前**零覆盖**）：至少一条测试断言
-  `--session-affinity` 在当前 `LagunaBackend` 上启动期报错，而不是运行期悄悄退化
+**落地清单**（零 GPU，`93f19c9`，同天完成）：
+- [x] `--session-affinity` 在启动期查 `capabilities.warm_continue`，为 `False` 时直接报错拒绝启动——
+  两处：`server/engine.py` `ServerEngine.__init__`（任何直接构造的调用方的兜底）+
+  `server/app.py` `main()`（CLI argparse 时机，比设环境变量/起 uvicorn 都早）
+- [~] `engine.py` 的 `try/except Exception` 兜底**保留，未删除**——这是与原始清单唯一的偏差，
+  故意的：启动期拒绝已让 `enable_session_affinity=True` 且 backend 不支持 `warm_continue`
+  在生产中不可达，但 P4b 的调度逻辑（(a)/(b) 留待评估）没有理由跟着删；这段 `try/except` 现在是
+  "即使将来某处绕过启动检查，也不会让一次真实请求崩掉引擎轮"的防御层，不是掩盖 bug 的伪装。
+  下面这条新测试反而依赖它存在（验证 fallback 路径本身正确）
+- [x] 补上 `warm_continue` / `session_warm` 的测试覆盖（此前**零覆盖**）：
+  `tests/test_engine_session_affinity.py`，7 条——启动期拒绝（含"改动前红"实测）+
+  `_step_sync` 的 P4b 机制本身（session 保留、warm-continue 成功、prefix 不匹配回退、
+  异常回退——即生产中实际发生的那条路径、过期回收）
 - [ ] (a)（为 Laguna 实现 warm-continue）留作 Track A 完成后的重新评估项，不在本次范围内
 
 ---
@@ -531,9 +539,10 @@ DSpark）。**分两步，先做便宜的那步**：
 | ~~A6 零回归验收~~ | ~~**P0-C/C-1 GPU CI 拍板**~~ → C4 位精确门禁 | 🟢 **已拍板 (b)**：本地 pre-push 门禁 + 人工签核；`make gate-local` 机制待落地（§7.3/C4） |
 | ~~B0 起步~~ | ~~**P0-C/C-2 主线 checkpoint 拍板**~~ | 🟢 **已拍板**：官方 `nvidia/Qwen3.6-27B-NVFP4`；B0-1 衍生出 vision 张量过滤任务，见 §7.1 |
 | ~~A1–A6 开工~~ | ~~P0-D 设计升级到可实施~~ | 🟢 **已解锁**：规格在 `architecture.md` §3.5，第 1–4 步可立即开工且不需要 GPU |
-| P0-E 第 5–8 步 | **P0-B C-LIVE** + GPU | 🔴 C-LIVE 未开始；F1-1（窗口扫测）可蹭同一 GPU 窗口一起做 |
-| ~~N8 处置~~ | ~~拍板 (a)/(b)/(c)~~ | 🟡 **已拍板 (c)**：启动期拒绝该 flag，实现清单见 §6.1，尚未落地（零 GPU） |
-| Track B 全部 | Track A（A1–A5）完成 | 🔴 未开始 |
+| ~~P0-E 第 5 步~~ | ~~**P0-B C-LIVE** + GPU~~ | 🟢 **已解锁并完成**：C-LIVE 落地（`scripts/c_live_smoke.py`，67/67）后第 5 步随即开工并通过 GPU 验收，见 [`../notes/2026-08-02-track-a-step5-gpu-verification.md`](../notes/2026-08-02-track-a-step5-gpu-verification.md) |
+| P0-E 第 6–8 步 | 第 5 步完成 + GPU | 🟡 进行中：第 6 步（A4 加载器 adapter）是下一个 |
+| ~~N8 处置~~ | ~~拍板 (a)/(b)/(c)~~ | 🟢 **已落地 (c)**：`server/engine.py`/`server/app.py` 启动期拒绝该 flag（`93f19c9`），含 `warm_continue`/`session_warm` 测试覆盖（此前零覆盖） |
+| Track B 全部 | Track A（A1–A5）完成 | 🟡 A1–A5 完成，A6（第 8 步）待 A3/A4（第 6–7 步）先行 |
 | B0-8 GDN 是否存在于 MTP | `investigation-queue.md` B-6（另一 agent 在查） | 🟡 进行中，**不预判**；决定 B3 的两个分支（§7.1） |
 | B3 KV dtype 选型 | `investigation-queue.md` C-2（另一 agent 在查） | 🟡 进行中，**不预判**；上游数字仅供参考，不当结论用 |
 | B2 CUDA Graph | B0-5（GDN 是否 capture-safe） | 🔴 未验证 |
