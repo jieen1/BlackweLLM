@@ -211,6 +211,18 @@ P0-A 卫生（不卡任何人，可随时插）                                 
 > 这与 fox-64K 被撤下验收判据是同一个教训：**脱离生成条件的数字不是基线**。7-g 动工前必须
 > 先在**切换前的代码**上按固定负载打一份基线，并连同负载定义、轮次序列、bootstrap 探针是否
 > 计入一起发布——只发汇总数字不行。
+>
+> ✅ **基线已采集（2026-08-02，`work/prefix-baseline-20260802`，未合并 main）**：见
+> [`../notes/2026-08-02-prefix-cache-baseline.md`](../notes/2026-08-02-prefix-cache-baseline.md)，
+> 配套脚本 `benchmarks/prefix_cache_baseline.py`（`python -m
+> benchmarks.prefix_cache_baseline`，7-g 后原样重跑做 A/B）。**顺带纠正上面一句猜测**：读代码
+> 证实 admission bootstrap check 走独立的 `runner.prefill(ref_slot, ...)`，从不经过
+> `_record_prefix_cache_hits` 计数路径（`server/engine.py:626-702/1116-1133`），且默认
+> `production=1` 时 bootstrap check 根本不跑——0.0909 真正的成因是 `server_e2e_check.py`
+> 多个子测试共享同一进程级、无重置、不分工作负载的计数器，而不是 bootstrap 探针记账。基线笔记
+> 同时论证：`hit_rate` 即便正确限定到单一负载测量，仍对"浅命中"不敏感（只要 `L>0` 就算命中，
+> 不管命中深度），建议 7-g 改用逐轮 `hit_L / ideal_L`（`ideal_L` = 上一轮 `prompt_tokens` 按
+> block_size 取整）当回归信号，`hit_rate` 仅作为次要 sanity check。
 
 **A6 验收四条**（[待办·开发执行]，均需真机）：
 - [ ] 贪心输出 **bit-exact**
