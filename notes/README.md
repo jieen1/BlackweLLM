@@ -73,6 +73,8 @@ Track F（性能，机会主义）的输入。
 | `2026-07-31-session-summary.md` | **当前最佳配置与性能基线**（4K 353–401 tok/s、64K 353–368、接受率 96.3–100%） |
 | `2026-07-29-perf-optimization-results.md` / `-perf-profiling-analysis.md` | 优化结果与 profiling |
 | `2026-07-29-acceptance-regression-baseline.md` | 接受率回归基线 |
+| `2026-07-29-dflash-acceptance-incident-summary.md` | **DFlash M=16 接受率事故的停机状态记录**——2026-08-01 从 `vllm-removal-phase1` worktree 的未提交状态中抢救，此前从未被任何提交收录 |
+| `2026-07-29-dflash-m16-execution-plan.md` | 同上批抢救。含 vLLM 参考的 prompt hash、接受率 0.687、warm 吞吐三次采样——这组数字是后续所有 DFlash 对比的口径来源 |
 | `2026-07-29-gpu-memory-audit.md` | 显存审计 |
 | `2026-07-29-moe-ab-test.md` | MoE A/B |
 | `2026-07-22-quality-baseline-and-official-scores.md` | 质量基线与官方分数对标方法论 |
