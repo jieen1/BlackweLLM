@@ -70,7 +70,8 @@ laguna_cuda_graph.py, not guessed from vLLM's own internal usage:
 - ``_k_scale``/``_v_scale``: read by bf_attention.py (copied onto
   BFAttention), laguna_sparkinfer_attn.py, laguna_cuda_graph.py. These
   must hold the REAL checkpoint scale after weight loading -- see
-  ``_apply_kv_cache_scale_post_load`` in runtime/model_loading.py, the
+  ``apply_kv_cache_scale_post_load`` in runtime/loading/common.py (moved
+  there from runtime/model_loading.py at Track A step 6), the
   self-built replacement for the ONE real vLLM method that actually
   populates them for this checkpoint's quantization scheme:
   ``CompressedTensorsKVCacheMethod.process_weights_after_loading``
@@ -197,7 +198,7 @@ class SelfBuiltAttentionPlaceholder(nn.Module):
         # (see kv_cache_dtype above) but permanently uses the hardcoded
         # _k_scale/_v_scale default of 1.0 above, no checkpoint value ever
         # overrides it. Loadable Parameters created here only get read by
-        # _apply_kv_cache_scale_post_load (runtime/model_loading.py) when
+        # apply_kv_cache_scale_post_load (runtime/loading/common.py) when
         # this is True, matching this checkpoint's real "tensor" (not
         # "attn_head") KV-cache quantization strategy -- see module
         # docstring.
@@ -209,8 +210,9 @@ class SelfBuiltAttentionPlaceholder(nn.Module):
             cache_config.calculate_kv_scales = False
             # Loadable from checkpoint (model.layers.N.self_attn.{k,v}_scale,
             # remapped to model.layers.N.self_attn.attn.{k,v}_scale by
-            # vLLM's existing maybe_remap_kv_scale_name -- untouched,
-            # still in use from runtime/model/laguna_model.py).
+            # runtime.loading.compressed_tensors.remap_kv_scale_name --
+            # narrowed from vLLM's maybe_remap_kv_scale_name, called from
+            # runtime/model/laguna_model.py's load_weights).
             self.k_scale = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
             self.v_scale = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
 

@@ -12,8 +12,10 @@ once 任务#45's GPU validation confirmed this self-built path bit-exact.
 
 Remaining vLLM dependency here: ``DefaultModelLoader.get_all_weights`` and
 ``process_weights_after_loading`` are BOTH now replaced
-(``_iterate_safetensors_checkpoint``/``_apply_kv_cache_scale_post_load``
-below, 阶段7). The first attempt at the latter (calling only
+(``iterate_safetensors_checkpoint``/``apply_kv_cache_scale_post_load``,
+阶段7, moved to ``runtime/loading/common.py`` at Track A step 6 -- see
+that module's docstring for why they belong in the format-agnostic common
+layer rather than here). The first attempt at the latter (calling only
 ``Attention.process_weights_after_loading(dtype)`` per-module) produced a
 confirmed, severe regression on a real GPU e2e run (garbled text,
 degenerate repetition, wrong accept rate) versus the established
@@ -29,7 +31,7 @@ for this model -- no attention sinks), but
 compressed_tensors.py:1121-1147), which is what actually copies the
 loaded ``k_scale``/``v_scale`` checkpoint values into the ``_k_scale``/
 ``_v_scale`` buffers ``BFAttention`` reads at runtime.
-``_apply_kv_cache_scale_post_load`` below replicates exactly that (see
+``apply_kv_cache_scale_post_load`` replicates exactly that (see
 its docstring and runtime/model/plain_attention.py's module docstring
 for the full contract), and ``SelfBuiltAttentionPlaceholder``
 (runtime/model/plain_attention.py) replaces ``Attention`` construction
@@ -38,133 +40,68 @@ pure type-annotation usage in this file -- see the ``TYPE_CHECKING``
 import below.
 
 任务#41 (阶段8): ``set_default_torch_dtype`` is now self-built too
-(``_default_torch_dtype`` below) -- vLLM's real version (vllm/utils/
-torch_utils.py) is a 5-line ``@contextlib.contextmanager`` wrapping
-``torch.set_default_dtype``/restore, nothing vLLM-specific about it.
+(``runtime.loading.common.default_torch_dtype``) -- vLLM's real version
+(vllm/utils/torch_utils.py) is a 5-line ``@contextlib.contextmanager``
+wrapping ``torch.set_default_dtype``/restore, nothing vLLM-specific
+about it.
+
+Track A step 6 (``docs/architecture.md`` §3.5.5): this module used to
+define all of the above itself, plus the compressed-tensors-specific
+scale-name knowledge that actually lived one file over in
+``runtime/model/laguna_model.py``/``runtime/model/_weight_loading.py``.
+It is now the orchestrator: format-agnostic pieces come from
+``runtime.loading.common``, and it accepts a ``language_model_only``
+flag (B0-1a/B0-1b) that it threads through to
+``runtime.loading.language_model_only.filter_language_model_only``
+before any weight reaches ``model.load_weights(...)``. Both real call
+sites (``runtime/backends/laguna.py``, ``runtime/backends/laguna_dflash.py``)
+keep the default (``False``): Laguna's checkpoints have no vision tower to
+filter, so this is a real, wired parameter with no real trigger yet -- see
+the ``language_model_only`` module's docstring for what that does and does
+not prove.
 """
 
 from __future__ import annotations
 
-import contextlib
-import json
-from collections.abc import Generator
-from pathlib import Path
 from typing import Any
 
 import torch
-from safetensors import safe_open
 
+from runtime.loading.common import (
+    apply_kv_cache_scale_post_load,
+    assert_all_params_loaded,
+    default_torch_dtype,
+    iterate_safetensors_checkpoint,
+)
+from runtime.loading.language_model_only import (
+    LanguageModelOnlyStats,
+    filter_language_model_only,
+)
 from runtime.model.laguna_dflash_model import LagunaDraftForCausalLMSelfBuilt
 from runtime.model.laguna_model import LagunaForCausalLMSelfBuilt
-from runtime.model.plain_attention import SelfBuiltAttentionPlaceholder
 
 
-@contextlib.contextmanager
-def _default_torch_dtype(dtype: torch.dtype) -> Generator[None, None, None]:
-    """Verbatim port of vLLM's ``set_default_torch_dtype`` (vllm/utils/
-    torch_utils.py) -- plain ``torch.set_default_dtype`` set/restore,
-    nothing vLLM-specific about it."""
-    old_dtype = torch.get_default_dtype()
-    torch.set_default_dtype(dtype)
-    try:
-        yield
-    finally:
-        torch.set_default_dtype(old_dtype)
-
-
-def _iterate_safetensors_checkpoint(
-    model_path: str,
-) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Direct safetensors reader -- replaces vLLM's ``DefaultModelLoader.
-    get_all_weights`` (阶段7, vLLM removal plan). Same pattern already
-    proven in this codebase (``runtime/backends/laguna_sparkinfer_moe.py``'s
-    ``load_moe_layer_weights``, applied there to one MoE layer's tensors;
-    here to the whole checkpoint), not a new one.
-
-    Deliberately NOT the general vLLM loader's feature set: no HF Hub
-    download (this runtime always uses an already-cached local snapshot
-    path, confirmed by HF_HUB_OFFLINE=1 everywhere), no .bin/.pt format
-    fallback, no multi-threading, no expert-parallel weight filtering
-    (this runtime is TP=1/EP=1 always). Handles the two real checkpoint
-    layouts this runtime actually has (verified directly, not assumed):
-    the main model's 15 sharded files with a
-    ``model.safetensors.index.json``, and the DFlash draft model's single
-    unsharded ``model.safetensors`` with no index file at all.
-
-    Memory-safety note (this is the reason DefaultModelLoader's generality
-    isn't just unused complexity -- checked before writing this): the main
-    checkpoint is ~67 GiB and this host has ~19 GiB RAM (see the
-    "Checkpoint size... Available RAM..." log line vLLM's own loader
-    prints). Iterating shard files one at a time -- opening one, yielding
-    its tensors, letting it close before the next `safe_open` call -- is
-    what actually keeps peak host RAM bounded to roughly one shard's
-    worth, not the whole checkpoint; the streaming behavior is load-
-    bearing, not incidental, so it must NOT be replaced with e.g. reading
-    every shard into one dict first.
-    """
-    model_dir = Path(model_path)
-    index_path = model_dir / "model.safetensors.index.json"
-    if index_path.exists():
-        with open(index_path) as f:
-            weight_map = json.load(f)["weight_map"]
-        shard_files = sorted(set(weight_map.values()))
-    else:
-        shard_files = ["model.safetensors"]
-
-    for shard_file in shard_files:
-        with safe_open(str(model_dir / shard_file), framework="pt", device="cpu") as f:
-            for key in f.keys():
-                yield key, f.get_tensor(key)
-
-
-def _apply_kv_cache_scale_post_load(model: torch.nn.Module) -> None:
-    """Copies loaded ``k_scale``/``v_scale`` checkpoint values into the
-    ``_k_scale``/``_v_scale`` buffers ``BFAttention``/
-    ``SparkinferAttentionImpl``/``fused_kv_scatter`` actually read at
-    runtime (see runtime/model/plain_attention.py's module docstring for
-    the full read/write contract).
-
-    Self-built replacement (阶段7) for vLLM's
-    ``CompressedTensorsKVCacheMethod.process_weights_after_loading``
-    (vllm/model_executor/layers/quantization/compressed_tensors/
-    compressed_tensors.py:1121-1147) -- confirmed via real source, not
-    the more generic ``BaseKVCacheMethod.process_weights_after_loading``
-    (kv_cache.py:74), which looked plausible at first but is never
-    actually invoked for this checkpoint's quantization scheme (its
-    "positive/duplicate/no-scale" branching does not apply here). The
-    real method does a plain reference reassignment
-    (``layer._k_scale = layer.k_scale``); this does an equivalent value
-    copy instead, since ``_k_scale``/``_v_scale`` are registered buffers
-    here rather than being swapped for the loaded Parameter object
-    itself -- same end state (real checkpoint value ends up in the
-    buffer BFAttention reads), simpler to reason about than replicating
-    vLLM's specific buffer/Parameter identity dance.
-
-    Only applies to layers where ``has_checkpoint_kv_scale`` is True (the
-    main model) -- the DFlash draft model's checkpoint has no
-    quantization_config and never creates ``k_scale``/``v_scale`` at all
-    (see plain_attention.py's module docstring), so its ``_k_scale``/
-    ``_v_scale`` stay at their construction-time default of 1.0
-    permanently; there is nothing to copy for those layers, not a gap.
-    For layers where it IS True, safe to run unconditionally after
-    ``_assert_all_params_loaded`` has already passed: that assertion
-    requires ``k_scale``/``v_scale`` to have received a real checkpoint
-    tensor (no exception list carves them out), so by the time this runs
-    they are guaranteed to hold real values, not their own construction-
-    time default of 1.0.
-    """
-    for module in model.modules():
-        if isinstance(module, SelfBuiltAttentionPlaceholder) and module.has_checkpoint_kv_scale:
-            module._k_scale.copy_(module.k_scale.detach().to(torch.float32))
-            module._v_scale.copy_(module.v_scale.detach().to(torch.float32))
-
-
-def load_laguna_model(runtime_config: Any) -> LagunaForCausalLMSelfBuilt:
+def load_laguna_model(
+    runtime_config: Any,
+    *,
+    language_model_only: bool = False,
+) -> LagunaForCausalLMSelfBuilt:
     """Construct + load a Laguna model instance without vLLM's ``get_model()``.
 
     Distributed initialization is performed by ``LagunaBackend`` before this
     call. The owned model receives its configuration explicitly; it does not
     read a global vLLM context.
+
+    ``language_model_only`` (B0-1a/B0-1b, default False): when True, every
+    checkpoint tensor whose name starts with a vision-tower prefix is
+    dropped before ``model.load_weights(...)`` ever sees it -- see
+    ``runtime.loading.language_model_only`` for the exact contract and why
+    this has never been exercised against a real vision-bearing checkpoint.
+    Laguna's real checkpoint has no such tensors, so the default (False)
+    reproduces this function's pre-step-6 behavior exactly regardless of
+    which value is passed; the flag exists so the loader is *capable* of
+    the mode Track B's official Qwen3.6 checkpoint will need, not because
+    Laguna needs it today.
     """
     model_config = runtime_config.model_config
     load_config = runtime_config.load_config
@@ -173,13 +110,19 @@ def load_laguna_model(runtime_config: Any) -> LagunaForCausalLMSelfBuilt:
     load_device = device_config.device if load_config.device is None else load_config.device
     target_device = torch.device(load_device)
 
-    with _default_torch_dtype(model_config.dtype), target_device:
+    with default_torch_dtype(model_config.dtype), target_device:
         model = LagunaForCausalLMSelfBuilt(runtime_config=runtime_config)
 
-        loaded_param_names = model.load_weights(_iterate_safetensors_checkpoint(model_config.model))
-        _assert_all_params_loaded(model, loaded_param_names)
+        vision_filter_stats = LanguageModelOnlyStats()
+        weights = filter_language_model_only(
+            iterate_safetensors_checkpoint(model_config.model),
+            language_model_only=language_model_only,
+            stats=vision_filter_stats,
+        )
+        loaded_param_names = model.load_weights(weights)
+        assert_all_params_loaded(model, loaded_param_names, context="load_laguna_model")
 
-        _apply_kv_cache_scale_post_load(model)
+        apply_kv_cache_scale_post_load(model)
 
     return model.eval()
 
@@ -187,6 +130,8 @@ def load_laguna_model(runtime_config: Any) -> LagunaForCausalLMSelfBuilt:
 def load_laguna_dflash_draft_model(
     target_model: LagunaForCausalLMSelfBuilt,
     draft_runtime_config: Any,
+    *,
+    language_model_only: bool = False,
 ) -> LagunaDraftForCausalLMSelfBuilt:
     """Construct + load the DFlash draft model without vLLM's ``get_model()``
     / ``load_dflash_model()``. See runtime/model/laguna_dflash_model.py's
@@ -195,6 +140,13 @@ def load_laguna_dflash_draft_model(
 
     Distributed initialization is already complete. The draft model receives
     its configuration explicitly and does not read a global vLLM context.
+
+    ``language_model_only``: same contract as :func:`load_laguna_model`.
+    The draft model's checkpoint has no ``quantization_config`` at all
+    (see ``runtime/model/plain_attention.py``'s module docstring) and,
+    like the main model, no vision-tower tensors -- so this is here for
+    interface symmetry, with the same "never triggered by a real
+    checkpoint yet" caveat.
     """
     draft_model_config = draft_runtime_config.speculative_config.draft_model_config
     load_config = draft_runtime_config.load_config
@@ -203,15 +155,24 @@ def load_laguna_dflash_draft_model(
     load_device = device_config.device if load_config.device is None else load_config.device
     target_device = torch.device(load_device)
 
-    with _default_torch_dtype(draft_model_config.dtype), target_device:
+    with default_torch_dtype(draft_model_config.dtype), target_device:
         model = LagunaDraftForCausalLMSelfBuilt(runtime_config=draft_runtime_config)
 
-        loaded_param_names = model.load_weights(
-            _iterate_safetensors_checkpoint(draft_model_config.model)
+        vision_filter_stats = LanguageModelOnlyStats()
+        weights = filter_language_model_only(
+            iterate_safetensors_checkpoint(draft_model_config.model),
+            language_model_only=language_model_only,
+            stats=vision_filter_stats,
         )
-        _assert_draft_params_loaded(model, loaded_param_names)
+        loaded_param_names = model.load_weights(weights)
+        assert_all_params_loaded(
+            model,
+            loaded_param_names,
+            context="load_laguna_dflash_draft_model",
+            expected_unloaded=frozenset({"model.embed_tokens.weight", "lm_head.weight"}),
+        )
 
-        _apply_kv_cache_scale_post_load(model)
+        apply_kv_cache_scale_post_load(model)
 
     # embed_tokens/lm_head are shared with the target model, not loaded from
     # this checkpoint (verified: it has no such keys at all). Matches
@@ -229,56 +190,3 @@ def load_laguna_dflash_draft_model(
     model.model._build_fused_kv_buffers()
 
     return model.eval()
-
-
-def _assert_draft_params_loaded(model: torch.nn.Module, loaded: set[str]) -> None:
-    """Same rationale as _assert_all_params_loaded, minus the two params
-    that are legitimately never loaded from this checkpoint (shared with
-    the target model instead, swapped in by the caller after this returns).
-    """
-    all_param_names = {name for name, _ in model.named_parameters()}
-    expected_unloaded = {"model.embed_tokens.weight", "lm_head.weight"}
-    missing = all_param_names - loaded - expected_unloaded
-    if missing:
-        raise RuntimeError(
-            f"load_laguna_dflash_draft_model: {len(missing)} parameter(s) "
-            f"never received a checkpoint tensor, e.g. {sorted(missing)[:5]!r}."
-        )
-
-
-def _assert_all_params_loaded(model: torch.nn.Module, loaded: set[str]) -> None:
-    """Fail loudly if any parameter was never touched by load_weights.
-
-    vLLM's ``DefaultModelLoader.load_weights`` has an equivalent check
-    (``track_weights_loading``, gated behind ``enable_weights_track``,
-    default-on for non-quantized models only -- Laguna is NVFP4-quantized
-    so vLLM's own check is actually OFF for us today). We check
-    unconditionally instead: a silently-uninitialized parameter is exactly
-    the kind of bug that stays invisible until it corrupts an output many
-    tokens later (see notes/2026-07-27-block-size-128-accept-rate-root-
-    cause-CLOSED.md for what that class of bug looks like once it's
-    already propagating).
-
-    No exception list needed here (阶段7): ``SelfBuiltAttentionPlaceholder``
-    (runtime/model/plain_attention.py) only creates the two Parameters
-    this checkpoint's real, symmetric per-tensor KV-cache scheme actually
-    provides (``k_scale``/``v_scale``) -- unlike real vLLM's
-    ``CompressedTensorsKVCacheMethod.create_weights``, which also
-    unconditionally creates ``q_scale``/``k_zero_point``/``v_zero_point``/
-    ``q_zero_point`` (to support llm-compressor checkpoints that use
-    asymmetric/per-query-head schemes this one doesn't) and therefore
-    needed an exception list here for the four params no checkpoint tensor
-    would ever satisfy. Every parameter this assertion can now see is
-    expected to be genuinely loadable, so a real gap fails loud with no
-    carve-outs to accidentally widen.
-    """
-    all_param_names = {name for name, _ in model.named_parameters()}
-    missing = all_param_names - loaded
-    if missing:
-        raise RuntimeError(
-            f"load_laguna_model: {len(missing)} parameter(s) never received "
-            f"a checkpoint tensor, e.g. {sorted(missing)[:5]!r}. This means "
-            "either the checkpoint is missing a tensor the model expects, "
-            "or load_weights's name-mapping logic has a bug -- do not "
-            "silently proceed with randomly-initialized weights."
-        )

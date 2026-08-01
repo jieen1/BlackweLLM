@@ -120,7 +120,15 @@ def resolve_config(config: dict[str, Any]) -> Resolution:
     caller never has to ask whether some field was validated.
     """
     spec = parse_architecture(config)
-    validate_text_only(spec)
+    # B0-1b: this runtime's loaders always run in language_model_only mode
+    # -- there is no code path anywhere that builds a vision tower, and
+    # roadmap.md §1 commits to that being permanent, not "not implemented
+    # yet". So this is not a per-checkpoint choice to plumb through
+    # Resolution; it is a fixed fact about how every loader this registry
+    # can select actually behaves, asserted here once. See
+    # runtime.architecture.validate_text_only's docstring for what this
+    # value promises and where that promise is actually kept.
+    validate_text_only(spec, language_model_only=True)
 
     family = _family_for(spec)
     if family.backend not in IMPLEMENTED_BACKENDS:

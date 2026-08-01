@@ -70,14 +70,23 @@ class TestRefusalsHappenBeforeAnyWeightIsRead:
         with pytest.raises(UnsupportedArchitectureError, match="awq"):
             resolve_config(config)
 
-    def test_vision_tower_is_refused_by_resolution_too(self):
-        # The gate belongs in resolve(), not only in callers who remember it.
+    def test_vision_tower_no_longer_blocks_resolution_on_its_own(self):
+        # B0-1b (2026-08-02): resolve_config always validates with
+        # language_model_only=True (runtime.model_registry.resolve_config),
+        # since this runtime's loaders never build a vision tower -- so a
+        # vision_config alone must not be what blocks resolution anymore.
+        # This directly replaces the old "vision tower is refused by
+        # resolution too" claim, which is no longer the intended behavior:
+        # the official Qwen3.6 checkpoint the project committed to (D6) has
+        # exactly this shape and must resolve past this gate.
         config = minimal_config(
             architectures=["LagunaForCausalLM"],
             vision_config={"depth": 1},
+            quantization_config={"quant_method": "compressed-tensors"},
         )
-        with pytest.raises(UnsupportedArchitectureError, match="vision"):
-            resolve_config(config)
+        resolution = resolve_config(config)
+        assert resolution.spec.has_vision_tower is True
+        assert resolution.backend == "laguna"
 
     def test_missing_config_json_says_what_was_expected(self, tmp_path):
         with pytest.raises(UnsupportedArchitectureError, match="config.json"):
@@ -95,13 +104,37 @@ class TestQwen36IsRefusedHonestly:
         assert "qwen36" in message
         assert "not implemented" in message
 
-    def test_multimodal_builds_fail_the_vision_gate_first(self):
-        # Ordering is deliberate: a user pointing at the official checkpoint
-        # should be told it carries a vision tower, not that a backend is
-        # missing -- the first is actionable, the second is not.
+    def test_multimodal_builds_now_fail_on_missing_backend_not_vision(self):
+        # B0-1b flipped this: the vision gate no longer fires for these two
+        # (resolve_config validates with language_model_only=True
+        # unconditionally), so what a user pointing at either checkpoint
+        # actually hits today is qwen36 not being implemented -- the same
+        # message TestQwen36IsRefusedHonestly.
+        # test_unimplemented_backend_is_named_rather_than_pretending checks
+        # for the vision-free QWEN_TEXT_MTP checkpoint. This is the honest
+        # replacement for the old "vision gate fires first" claim, not a
+        # weakened version of it.
         for repo in (QWEN_OFFICIAL, QWEN_UNSLOTH):
-            with pytest.raises(UnsupportedArchitectureError, match="vision"):
+            with pytest.raises(UnsupportedArchitectureError) as excinfo:
                 resolve_config(load_config(repo))
+            message = str(excinfo.value)
+            assert "vision" not in message
+            assert "qwen36" in message
+            assert "not implemented" in message
+
+    def test_multimodal_builds_resolve_once_the_backend_exists(self):
+        # Positive proof of B0-1b, not just "a different error fires first":
+        # with qwen36 hypothetically implemented, both real vision-bearing
+        # checkpoints resolve successfully, and the resolution says so.
+        for repo in (QWEN_OFFICIAL, QWEN_UNSLOTH):
+            with pytest.MonkeyPatch.context() as monkeypatch:
+                monkeypatch.setattr(
+                    "runtime.model_registry.IMPLEMENTED_BACKENDS",
+                    IMPLEMENTED_BACKENDS | {"qwen36"},
+                )
+                resolution = resolve_config(load_config(repo))
+            assert resolution.backend == "qwen36"
+            assert resolution.spec.has_vision_tower is True
 
 
 class TestSpeculativeStrategyFollowsTheCheckpoint:

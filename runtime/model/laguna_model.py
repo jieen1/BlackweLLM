@@ -67,8 +67,9 @@ import torch
 from torch import nn
 
 from runtime.kernels.fused_rms_norm import TritonRMSNorm
+from runtime.loading.compressed_tensors import IGNORE_WEIGHT_SUFFIXES, remap_kv_scale_name
 from runtime.model._prefix import maybe_prefix as _maybe_prefix
-from runtime.model._weight_loading import default_weight_loader, remap_kv_scale_name
+from runtime.model._weight_loading import default_weight_loader
 from runtime.model.laguna_decoder import LagunaDecoderLayerSelfBuilt
 from runtime.model.plain_embedding import PlainEmbedding, PlainLMHead, PlainLogitsProcessor
 
@@ -205,18 +206,12 @@ class LagunaModelSelfBuilt(nn.Module):
             # NVFP4 global scales into one via .max(), losing precision.
         ]
 
-        ignore_suffixes = (
-            ".bias",
-            "_bias",
-            ".k_scale",
-            "_k_scale",
-            ".v_scale",
-            "_v_scale",
-            ".weight_scale",
-            "_weight_scale",
-            ".input_scale",
-            "_input_scale",
-        )
+        # Compressed-tensors' own scale-suffix naming knowledge (Track A
+        # step 6, docs/architecture.md §3.5.5): moved to
+        # runtime/loading/compressed_tensors.py, unchanged, so this loader
+        # adapter's naming knowledge lives with its own format instead of
+        # inline in the model graph.
+        ignore_suffixes = IGNORE_WEIGHT_SUFFIXES
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()

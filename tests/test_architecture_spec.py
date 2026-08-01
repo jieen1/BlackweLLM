@@ -122,25 +122,57 @@ class TestParserContract:
 
 
 class TestVisionTowerPolicy:
-    """RK8, at config level rather than after a surprising tensor name."""
+    """RK8, at config level rather than after a surprising tensor name.
 
-    def test_declared_text_only_is_accepted(self):
+    B0-1b (2026-08-02): the policy changed from "vision_config present ->
+    always reject" to "vision_config present -> reject unless the caller's
+    loader runs language_model_only=True". Every test below now exercises
+    both branches of the new ``language_model_only`` parameter explicitly,
+    rather than calling validate_text_only with an implicit default -- the
+    point of the parameter being required (no default) is that a caller
+    must decide, so the tests should too.
+    """
+
+    def test_declared_text_only_is_accepted_regardless_of_loader_mode(self):
+        # config.json's own 'language_model_only: true' short-circuits
+        # before the loader-mode parameter is even consulted.
         spec = parse_architecture(minimal_config(language_model_only=True))
-        validate_text_only(spec)
+        validate_text_only(spec, language_model_only=False)
+        validate_text_only(spec, language_model_only=True)
 
-    def test_vision_config_is_rejected_with_an_actionable_message(self):
+    def test_no_vision_tower_is_accepted_regardless_of_loader_mode(self):
+        # Nothing to filter, so the loader's mode cannot matter -- this is
+        # Laguna's real case (see TestLagunaShadowAgreement below).
+        spec = parse_architecture(minimal_config())
+        validate_text_only(spec, language_model_only=False)
+        validate_text_only(spec, language_model_only=True)
+
+    def test_vision_config_is_rejected_when_the_loader_would_load_it(self):
         spec = parse_architecture(minimal_config(vision_config={"depth": 1}))
         with pytest.raises(UnsupportedArchitectureError) as excinfo:
-            validate_text_only(spec)
+            validate_text_only(spec, language_model_only=False)
         message = str(excinfo.value)
         assert "vision_config" in message
         assert "language_model_only" in message
+
+    def test_vision_config_is_accepted_when_the_loader_will_filter_it(self):
+        # This is the official Qwen3.6 checkpoint's real shape: vision_config
+        # present, config.json's own language_model_only is False (verified
+        # against nvidia/Qwen3.6-27B-NVFP4), and the caller's loader mode is
+        # the only thing that lets it through. validate_text_only cannot
+        # itself verify the loader keeps that promise (torch-free, runs
+        # before any weight is read) -- see
+        # runtime.loading.language_model_only for the enforcement half.
+        spec = parse_architecture(
+            minimal_config(vision_config={"depth": 1}, language_model_only=False)
+        )
+        validate_text_only(spec, language_model_only=True)
 
     def test_an_explicit_text_only_claim_outranks_a_leftover_vision_config(self):
         spec = parse_architecture(
             minimal_config(vision_config={"depth": 1}, language_model_only=True)
         )
-        validate_text_only(spec)
+        validate_text_only(spec, language_model_only=False)
 
 
 class TestLagunaShadowAgreement:
@@ -189,7 +221,10 @@ class TestLagunaShadowAgreement:
         assert spec.rope["sliding_attention"].rope_type == "default"
 
     def test_laguna_is_accepted_as_text_only(self, spec):
-        validate_text_only(spec)
+        # Laguna has no vision tower either way, so the loader-mode
+        # parameter genuinely does not matter for it -- unlike the official
+        # Qwen3.6 checkpoint below, where it is the whole point.
+        validate_text_only(spec, language_model_only=False)
 
 
 class TestAgainstRealCheckpoints:
@@ -221,8 +256,25 @@ class TestAgainstRealCheckpoints:
         assert official.quant.method == "modelopt"
         assert unsloth.quant.method == "compressed-tensors"
 
-    def test_only_the_text_build_survives_the_vision_check(self):
-        validate_text_only(parse_architecture(load_config(QWEN_TEXT_MTP)))
+    def test_text_build_survives_the_vision_check_either_way(self):
+        # QWEN_TEXT_MTP declares language_model_only: true and has no
+        # vision_config -- the loader's own mode cannot matter for it.
+        spec = parse_architecture(load_config(QWEN_TEXT_MTP))
+        validate_text_only(spec, language_model_only=False)
+        validate_text_only(spec, language_model_only=True)
+
+    def test_vision_bearing_checkpoints_need_language_model_only_true(self):
+        # B0-1b: these three (QWEN_OFFICIAL, QWEN_UNSLOTH, QWEN_THINKINGCAP)
+        # all carry a real vision tower and all declare
+        # language_model_only: false in their own config.json (verified
+        # 2026-08-02) -- so the *loader's* mode, not the checkpoint's own
+        # claim, is what decides their fate now. This directly replaces the
+        # pre-B0-1b test that asserted these three were unconditionally
+        # refused: nvidia/Qwen3.6-27B-NVFP4 (QWEN_OFFICIAL) is the checkpoint
+        # D6 committed to, so "unconditionally refused" can no longer be the
+        # right answer for it.
         for repo in (QWEN_OFFICIAL, QWEN_UNSLOTH, QWEN_THINKINGCAP):
-            with pytest.raises(UnsupportedArchitectureError):
-                validate_text_only(parse_architecture(load_config(repo)))
+            spec = parse_architecture(load_config(repo))
+            with pytest.raises(UnsupportedArchitectureError, match="vision_config"):
+                validate_text_only(spec, language_model_only=False)
+            validate_text_only(spec, language_model_only=True)
