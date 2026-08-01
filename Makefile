@@ -11,6 +11,13 @@ PORT ?= 8000
 # Packages that hold production code (formatted + lint-strict). benchmarks/
 # is diagnostic scratch and is lint-relaxed via pyproject per-file-ignores.
 PKGS = runtime server loader model oracle tests tools
+# `make smoke` targets an already-running server started the operational way
+# (scripts/blackwellm_ctl.sh start / `make serve` with PORT=8100), which is
+# why this does NOT default to the $(PORT) above: blackwellm_ctl.sh pins
+# 8100 because 8000 on this host is already held by an unrelated service
+# (see its own comment). Override at the command line if your server is
+# somewhere else: `make smoke SMOKE_BASE_URL=http://host:port`.
+SMOKE_BASE_URL ?= http://127.0.0.1:8100
 
 .DEFAULT_GOAL := help
 
@@ -39,6 +46,9 @@ test: ## Run the CPU-only unit test suite
 
 verify-cuda: ## Smoke-test that an SM120 CUDA op executes
 	$(PYTHON) -m tools.verify_cuda
+
+smoke: ## P0-B C-LIVE: run the live-server smoke gate (server must already be running -- see scripts/blackwellm_ctl.sh smoke)
+	$(PYTHON) scripts/c_live_smoke.py --base-url $(SMOKE_BASE_URL)
 
 workloads: ## Print the frozen Phase-0 W1/W2 workload contracts
 	$(PYTHON) -m benchmarks.workloads
@@ -89,4 +99,4 @@ clean: ## Remove build and test caches
 	rm -rf .pytest_cache .ruff_cache build dist *.egg-info
 	find . -type d -name __pycache__ -not -path './.venv/*' -exec rm -rf {} + 2>/dev/null || true
 
-.PHONY: help install install-cuda lint format format-check test verify-cuda workloads build-laguna-router verify-laguna-router serve verify-sparkinfer clean
+.PHONY: help install install-cuda lint format format-check test verify-cuda smoke workloads build-laguna-router verify-laguna-router serve verify-sparkinfer clean
