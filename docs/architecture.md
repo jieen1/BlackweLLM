@@ -252,6 +252,14 @@ Track C 的"分级降级"所需要的形状。
 
 #### C. `SlotResourceManager` —— 两类缓存资源
 
+> ⚠️ **2026-08-01 更正：不要"统一"分配器。** 读了 vLLM `0.25.1` 与 SGLang 的真实实现后，
+> 两家都**刻意让两个分配器保持分离、在其上做协调**——SGLang 的 `MambaSlotAllocator`
+> 明写 "we ... do NOT inherit the KV base class"。本节下面的"统一管理"措辞是误导，
+> A3 应当是**协调者**而不是统一分配器。完整先例分析、以及另外五条会被踩中的坑
+> （前缀搜索方向相反、块大小对齐、投机窗口的保守释放、同一轮内不可跨请求借用递归状态、
+> 逐资源驱逐预算）见
+> [`../notes/2026-08-01-hybrid-cache-prior-art.md`](../notes/2026-08-01-hybrid-cache-prior-art.md)。
+
 当前 `block_pool` 只管分页 KV。目标是统一管理两类资源：
 
 | 资源 | 特征 | 生命周期 |
@@ -425,7 +433,7 @@ roadmap 只说"逐步切换而非一次性替换"，未给顺序。**定稿的�
 | 4 | **A5 Registry（影子模式）**：路径 → `(spec, backend, loader)`，断言等于今天的硬编码选择 | 无 | 影子一致性单测 | revert | ❌ |
 | 5 | **切换**：Registry 成为唯一真相源，删 `ServerEngine.MODEL` / `BACKEND` / `SERVER_MODEL_BACKEND` | **有** | **贪心 bit-exact** + C-LIVE | 回到第 4 步提交 | ✅ |
 | 6 | **A4 加载器 adapter**：拆出 compressed-tensors adapter | 有（同权重） | 权重逐张量校验和相等 + bit-exact | 回到第 5 步提交 | ✅ |
-| 7 | **A3 SlotResourceManager**：`block_pool` 升级，两类资源统一（递归状态部分随 Track B 落地） | **有，爆炸半径最大** | bit-exact + 接受率 + 前缀命中率不回归 + C-LIVE | 回到第 6 步提交 | ✅ |
+| 7 | **A3 协调者**（**不是**统一分配器 —— 见 §3.2-C 更正）：两个独立分配器 + 一个持有不变量的协调者；前缀匹配返回 `(kv_hit, state_hit)`；逐资源驱逐预算。**动工前必读** [`hybrid-cache-prior-art`](../notes/2026-08-01-hybrid-cache-prior-art.md) | **有，爆炸半径最大** | bit-exact + 接受率 + 前缀命中率不回归 + C-LIVE | 回到第 6 步提交 | ✅ |
 | 8 | **A6 验收** | — | 三条迁移不变量（§3.3）全过 | — | ✅ |
 
 **关键结论：第 1–4 步完全不需要 GPU**（协议一致性、config 解析、注册表解析都是纯 CPU）。

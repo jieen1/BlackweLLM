@@ -168,7 +168,7 @@ P0-C 拍板 D6 ─────────────────────�
 | 4 | [x] **A5 Registry（影子）** ✅ `a1287c5`：`runtime/model_registry.py`，路径 → `(spec, backend, loader, 投机策略)`，对 Laguna 解析出 `laguna / compressed_tensors / dflash` = 今天的硬编码选择 | 无 | 影子一致性单测 ✅ | ❌ |
 | 5 | [ ] **切换** Registry 成为唯一真相源；删 `engine.py:188` `MODEL`、`:190` `BACKEND`、`app.py:81` `SERVER_MODEL_BACKEND` | **有** | 贪心 bit-exact + C-LIVE | ✅ |
 | 6 | [ ] **A4 加载器 adapter** 拆出 compressed-tensors；公共部分（分片流式读取、参数全覆盖断言、KV scale post-load）不变 | 有（同权重） | 逐张量校验和相等 + bit-exact | ✅ |
-| 7 | [ ] **A3 SlotResourceManager** `block_pool` 升级为槽位资源管理器，两类资源联动驱逐；清掉 S4 的 GDN 残迹（`evict_gdn_checkpoint`）。递归状态部分随 Track B 落地 | **有，半径最大** | bit-exact + 接受率 + 前缀命中率不回归 + C-LIVE | ✅ |
+| 7 | [ ] **A3 协调者**（**不是**统一分配器，2026-08-01 更正）：两个独立分配器 + 协调者持有不变量；前缀匹配返回 `(kv_hit, state_hit)`；逐资源驱逐预算与账目；清掉 S4 的 GDN 残迹。**动工前必读** [`hybrid-cache-prior-art`](../notes/2026-08-01-hybrid-cache-prior-art.md)（vLLM + SGLang 真源码先例，含 6 条会被踩中的坑） | **有，半径最大** | bit-exact + 接受率 + 前缀命中率不回归 + C-LIVE | ✅ |
 | 8 | [ ] **A6 验收**（硬门禁，**依赖 C-1 拍板**） | — | 见下 | ✅ |
 
 **A6 验收四条**（[待办·开发执行]，均需真机）：
