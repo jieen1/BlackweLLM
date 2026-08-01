@@ -333,13 +333,26 @@ soak 回答"服务还稳吗"，两者合在一起构成北极星指标第 3 条�
   `temperature>0`-only 支持。产品语义判断，见 §2.3。
 - [ ] **usage token 缺口 2**：`<usage>` 标签剥离统一到哪种语义（流式的"冻结"还是
   非流式的"删除后继续"）。见 §2.5。
-- [ ] **[待验证]** roadmap §0 "Laguna-S-2.1 MMLU-Pro 84.5%"的引用来源——疑似误引已退役
-  Qwen3.6/vLLM 的评测结果（`notes/2026-07-22-quality-baseline-and-official-scores.md`
-  §7，84.54%）。C9-a 跑完后应该有一个真正针对 Laguna 的数字来核实或替换这条引用，
-  但替换 roadmap §0 本身不在本次改动范围内。
-- [ ] **[待验证]** `openai==2.34.0`/`anthropic==0.99.0`/`httpx==0.28.1` 具体安装在哪个
-  venv（协调者转述，未在本次任务中核实）；E3-a 落地时需要确认，并决定以什么形式声明为
-  测试期依赖（不进 `pyproject.toml` 的 `serving`/`cuda` extras）。
+- [x] ~~**[待验证]** roadmap §0 "Laguna-S-2.1 MMLU-Pro 84.5%"的引用来源~~ —— ✅ **已坐实是误引，
+  且已更正**。逐个 `json.load` 读出 `evalplus_results/` 下全部五份产物，`model` 字段**全是
+  `qwen3.6`**；仓库里不存在任何 `model` 为 Laguna 的评测产物。84.54% 属于 Qwen3.6-27B，测于
+  2026-07-22 的 vLLM 执行路径（此后已退役）。roadmap §0 / `model-support.md` / README 已于
+  `c53bd7c` 更正，证据固化在 [`../notes/2026-08-02-evaluation-artifact-provenance.md`]
+  (../notes/2026-08-02-evaluation-artifact-provenance.md)（`a3f21e1`）——因为 `evalplus_results/`
+  是 gitignore 的，一个只指向不受版本控制文件的更正和它要纠正的错误一样脆弱。
+  **Laguna 至今没有任何官方对标评测数据**，不是"数据不好找"，是从未跑过；建立它是 C9。
+- [x] ~~**[待验证]** 三个 SDK 装在哪个 venv~~ —— ✅ **已实测**（2026-08-02，
+  `importlib.metadata.version` 逐个读，非转述）：
+
+  | venv | openai | anthropic | httpx |
+  |---|---|---|---|
+  | `~/.venvs/vllm` | 2.34.0 | 0.99.0 | 0.28.1 |
+  | `/tmp/ci-sim`（CPU-only，模拟 CI job 1） | ❌ | ❌ | ❌ |
+
+  **对 E3-a 的直接约束**：三个 SDK 都不在 CPU-only 环境里，所以 SDK 一致性矩阵的测试
+  **必须 `pytest.importorskip`**，否则会打红 CI 的 torch-free job。这正是 `AGENTS.md`
+  记录的那类失败——本地全绿、CI 收集阶段就红。声明形式（测试期依赖，不进
+  `pyproject.toml` 的 `serving`/`cuda` extras）仍待 E3-a 落地时定。
 
 ---
 
