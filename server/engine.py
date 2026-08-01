@@ -485,16 +485,20 @@ class ServerEngine:
         if self.enable_dflash:
             # Wire DFlash speculative decoding into the shared MTP-shaped
             # decode path: runner.has_speculative_decode flips True so
-            # classify_decode_slots (server/engine.py) routes greedy
-            # requests to mtp_verify_and_commit_batch, which
-            # LagunaBackend now implements by delegating to
-            # DFlashEngine.dflash_round per slot. Non-greedy requests are
-            # unaffected -- classify_decode_slots still routes them through
-            # decode_batch_sampled. Must run before start()'s admission loop
-            # (same "capture before any real slot use" requirement as
-            # _ensure_decode_cg above): DFlashEngine.__init__ captures its
-            # own draft/verify CUDA Graphs, which scribble dummy warmup data
-            # into physical slots.
+            # classify_decode_slots (server/engine.py) routes requests to
+            # mtp_verify_and_commit_batch, which LagunaBackend now
+            # implements by delegating to DFlashEngine.dflash_round per
+            # slot. E2-b (docs/e2e-and-quality-plan.md S2.2) extended this
+            # to non-greedy requests too -- dflash_round resolves
+            # accept/reject via rejection sampling instead of argmax for
+            # them, so classify_decode_slots routes them here as well, not
+            # to decode_batch_sampled (only grammar-constrained requests,
+            # or every request when DFlash is disabled, still go there).
+            # Must run before start()'s admission loop (same "capture
+            # before any real slot use" requirement as _ensure_decode_cg
+            # above): DFlashEngine.__init__ captures its own draft/verify
+            # CUDA Graphs, which scribble dummy warmup data into physical
+            # slots.
             dflash_cuda_graph = self.runner.enable_dflash(num_speculative_tokens=self.K)
             logger.info(
                 "DFlash speculative decoding wired: K=%d, cuda_graph=%s",
