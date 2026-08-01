@@ -178,11 +178,17 @@ P0-A 卫生（不卡任何人，可随时插）                                 
 **执行顺序按 [`architecture.md` §3.5.5](architecture.md) 定稿的 8 步**，不是 roadmap 的 A1→A6 编号顺序：
 按爆炸半径从小到大，零行为变更的步骤排在前面。**前 4 步完全不需要 GPU。**
 
-> 进度：**第 1–5 步全部完成**（`4ed5a7b`、`f24f5ad`、`a1287c5`、`d9ecbd1`）。
+> 进度：**第 1–6 步全部完成**（`4ed5a7b`、`f24f5ad`、`a1287c5`、`d9ecbd1`、`a4959cb`）。
 > 第 5 步的 GPU 验收见 [`../notes/2026-08-02-track-a-step5-gpu-verification.md`](../notes/2026-08-02-track-a-step5-gpu-verification.md)：
 > 贪心 bit-exact 用真实 revert worktree 实测确认（非推理）、接受率逐工作负载匹配基线、C-LIVE 67/67。
 > 唯一的例外是 fox-64K tok/s 低基线 ~19%——已查证据指向与第 5 步无关（daemon provider 绕过 `ServerEngine`），未根因，留作独立性能条目。
-> 下一步是第 6 步（A4 加载器 adapter）。
+> 第 6 步（`a4959cb`）拆出 compressed-tensors 加载器 adapter（`runtime/loading/`），并把 §7.1 的
+> B0-1a（`language_model_only` 张量前缀过滤器）/B0-1b（`validate_text_only` 语义调整）合并进来，
+> 作为该抽象的第二个真实消费者落地——两条均**只做了机械落地，未被任何真实带 vision tower 的
+> checkpoint 触发过**（Laguna 无 vision tower），只用构造张量名单测验证；GPU 验收见
+> [`../notes/2026-08-02-track-a-step6-gpu-verification.md`](../notes/2026-08-02-track-a-step6-gpu-verification.md)：
+> 逐张量 SHA256 校验和 724/724 相等、贪心 bit-exact（5 条固定 prompt，含 DFlash 路径）。
+> 下一步是第 7 步（A3 协调者，爆炸半径最大）。
 
 | # | 步骤 | 行为变更 | 门禁 | GPU |
 |---|---|---|---|---|
@@ -191,7 +197,7 @@ P0-A 卫生（不卡任何人，可随时插）                                 
 | 3 | [x] **A1 ModelSpec（影子）** ✅ `a1287c5`：`runtime/architecture.py`（torch-free）解析层类型序列/FFN/RoPE/量化/MTP/**每层缓存需求**，含 RK8 的 `validate_text_only`。影子断言对真实 checkpoint 成立 | 无 | 影子一致性单测 ✅ | ❌ |
 | 4 | [x] **A5 Registry（影子）** ✅ `a1287c5`：`runtime/model_registry.py`，路径 → `(spec, backend, loader, 投机策略)`，对 Laguna 解析出 `laguna / compressed_tensors / dflash` = 今天的硬编码选择 | 无 | 影子一致性单测 ✅ | ❌ |
 | 5 | [x] **切换** ✅ `d9ecbd1`：Registry 成为唯一真相源；删 `engine.py` `MODEL`/`BACKEND`、`app.py` `SERVER_MODEL_BACKEND`；`lifespan()` 调 `resolve_checkpoint` 决定 backend。GPU 验收见 [`../notes/2026-08-02-track-a-step5-gpu-verification.md`](../notes/2026-08-02-track-a-step5-gpu-verification.md) | **有** | 贪心 bit-exact ✅ + C-LIVE 67/67 ✅ + 接受率匹配基线 ✅（fox-64K tok/s 例外，见笔记） | ✅ |
-| 6 | [ ] **A4 加载器 adapter** 拆出 compressed-tensors；公共部分（分片流式读取、参数全覆盖断言、KV scale post-load）不变 | 有（同权重） | 逐张量校验和相等 + bit-exact | ✅ |
+| 6 | [x] **A4 加载器 adapter** ✅ `a4959cb`：拆出 compressed-tensors（`runtime/loading/compressed_tensors.py`）；公共部分（分片流式读取、参数全覆盖断言、KV scale post-load，`runtime/loading/common.py`）原样迁移。合并落地 §7.1 B0-1a（`language_model_only` 前缀过滤器，`runtime/loading/language_model_only.py`，torch-free）+ B0-1b（`validate_text_only` 新增必填 `language_model_only` 形参）。B0-1a/b **尚未被任何真实 vision checkpoint 验证**，只有构造张量名单测 | 有（同权重） | 逐张量 SHA256 校验和 724/724 相等 ✅ + 贪心 bit-exact ✅（GPU 验收见 [`../notes/2026-08-02-track-a-step6-gpu-verification.md`](../notes/2026-08-02-track-a-step6-gpu-verification.md)） | ✅ |
 | 7 | [ ] **A3 协调者**（**不是**统一分配器，2026-08-01 更正）：两个独立分配器 + 协调者持有不变量；前缀匹配返回 `(kv_hit, state_hit)`；逐资源驱逐预算与账目；清掉 S4 的 GDN 残迹。**动工前必读** [`hybrid-cache-prior-art`](../notes/2026-08-01-hybrid-cache-prior-art.md)（vLLM + SGLang 真源码先例，含 6 条会被踩中的坑） | **有，半径最大** | bit-exact + 接受率 + 前缀命中率不回归 + C-LIVE | ✅ |
 | 8 | [ ] **A6 验收**（硬门禁，**依赖 C-1 拍板**） | — | 见下 | ✅ |
 
@@ -264,13 +270,20 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 
 **B0 事实基线**（M2，2 周，全部 [待办·开发执行]）
 - [x] B0-1 变体清点选型，定主线 checkpoint —— ✅ **已拍板（见 §4/C-2）：官方 `nvidia/Qwen3.6-27B-NVFP4`**，
-  社区文本版 `sakamakismile/...-Text-NVFP4-MTP` 留作交叉验证。**衍生任务（未开工）**：
-  - [ ] B0-1a 写一个按 tensor 名前缀跳过 `vision.*` 的加载过滤器（333 个张量，机械工作，一次写好可复用于
-    任何带 vision tower 的衍生 Qwen3.6 checkpoint）
-  - [ ] B0-1b A1 的 `validate_text_only` 语义要跟着调整（见 §4/C-2 的附带发现）：从"config 里有
-    `vision_config` 就整体拒绝"改成"允许 `vision_config` 存在，但要求 loader 处于
-    `language_model_only=True` 并断言零 vision 张量被实际加载"——这条不改 `architecture.md`，
-    在 A1 落地时一并处理
+  社区文本版 `sakamakismile/...-Text-NVFP4-MTP` 留作交叉验证。**衍生任务**：
+  - [x] B0-1a ✅ `a4959cb`（随 Track A 第 6 步落地，见 §6）：`runtime/loading/language_model_only.py`
+    的 `filter_language_model_only`，按 tensor 名前缀跳过（默认前缀 `model.visual.`——2026-08-02
+    对照 `nvidia/Qwen3.6-27B-NVFP4`/`unsloth/Qwen3.6-27B-NVFP4` 两份真实 checkpoint 索引核实，与
+    `notes/2026-08-02-qwen36-b0-fact-baseline.md` §1.4 独立互证，均为 333 个张量、同一前缀）。
+    **⚠️ 尚未被任何真实 checkpoint 触发过**：Laguna（今天唯一生产模型）没有 vision tower，
+    只用构造张量名单测（`tests/test_loading_language_model_only.py`）验证；真正对 Qwen3.6 官方
+    checkpoint 跑通留给 Track B
+  - [x] B0-1b ✅ `a4959cb`（同上）：`runtime.architecture.validate_text_only` 新增必填形参
+    `language_model_only`，语义从"config 里有 `vision_config` 就整体拒绝"改成"允许 `vision_config`
+    存在，但要求调用方的 loader 处于 `language_model_only=True`"——`runtime.model_registry.
+    resolve_config` 目前无条件传 `True`（这个 runtime 永远不建 vision tower，不是"暂未实现"）。
+    "零 vision 张量被实际加载"由 B0-1a 的过滤器结构性保证，`validate_text_only` 本身 torch-free、
+    读不到权重，不能自证这条，只能门禁调用方的承诺
 - [ ] B0-2 modelopt NVFP4 的 tensor 命名与 scale 语义**逐项确认，不猜**
 - [ ] B0-3 sparkinfer paged attention 在 `head_dim=256 / gqa_group=6 / page_size ∈ {64,128} / fp8 KV` 下的正确性与吞吐
 - [ ] B0-4 GDN 方案三选一：① FLA v0.5.2 `gated_delta_rule` ② 从 `oracle/qwen36_vllm/` 移植 ③ 自研。**建议先 ① 拿正确性，profiling 说话后再决定 ③**
@@ -540,9 +553,10 @@ DSpark）。**分两步，先做便宜的那步**：
 | ~~B0 起步~~ | ~~**P0-C/C-2 主线 checkpoint 拍板**~~ | 🟢 **已拍板**：官方 `nvidia/Qwen3.6-27B-NVFP4`；B0-1 衍生出 vision 张量过滤任务，见 §7.1 |
 | ~~A1–A6 开工~~ | ~~P0-D 设计升级到可实施~~ | 🟢 **已解锁**：规格在 `architecture.md` §3.5，第 1–4 步可立即开工且不需要 GPU |
 | ~~P0-E 第 5 步~~ | ~~**P0-B C-LIVE** + GPU~~ | 🟢 **已解锁并完成**：C-LIVE 落地（`scripts/c_live_smoke.py`，67/67）后第 5 步随即开工并通过 GPU 验收，见 [`../notes/2026-08-02-track-a-step5-gpu-verification.md`](../notes/2026-08-02-track-a-step5-gpu-verification.md) |
-| P0-E 第 6–8 步 | 第 5 步完成 + GPU | 🟡 进行中：第 6 步（A4 加载器 adapter）是下一个 |
+| ~~P0-E 第 6 步~~ | ~~第 5 步完成 + GPU~~ | 🟢 **已完成**：`a4959cb`，GPU 验收见 [`../notes/2026-08-02-track-a-step6-gpu-verification.md`](../notes/2026-08-02-track-a-step6-gpu-verification.md) |
+| P0-E 第 7–8 步 | 第 6 步完成 + GPU | 🟡 进行中：第 7 步（A3 协调者，爆炸半径最大）是下一个 |
 | ~~N8 处置~~ | ~~拍板 (a)/(b)/(c)~~ | 🟢 **已落地 (c)**：`server/engine.py`/`server/app.py` 启动期拒绝该 flag（`93f19c9`），含 `warm_continue`/`session_warm` 测试覆盖（此前零覆盖） |
-| Track B 全部 | Track A（A1–A5）完成 | 🟡 A1–A5 完成，A6（第 8 步）待 A3/A4（第 6–7 步）先行 |
+| Track B 全部 | Track A（A1–A5、A4）完成 | 🟡 A1–A5、A4（第 1–6 步）完成，A6（第 8 步）待 A3（第 7 步，爆炸半径最大）先行 |
 | B0-8 GDN 是否存在于 MTP | `investigation-queue.md` B-6（另一 agent 在查） | 🟡 进行中，**不预判**；决定 B3 的两个分支（§7.1） |
 | B3 KV dtype 选型 | `investigation-queue.md` C-2（另一 agent 在查） | 🟡 进行中，**不预判**；上游数字仅供参考，不当结论用 |
 | B2 CUDA Graph | B0-5（GDN 是否 capture-safe） | 🔴 未验证 |
