@@ -308,6 +308,164 @@ router kernel（同上）。
 
 ---
 
+## 3.5 实施规格（P0-D 定稿 · 2026-08-01）
+
+§3.2 给的是形状，本节给的是**照着能写代码的那一层**。所有事实核实自
+`main @ 619a09d`，行号会漂移，引用符号名优先。
+
+### 3.5.1 协议的真实面：13 个成员，不是 50
+
+`ServerEngine` 通过 `self.runner` 访问执行层，**全仓库唯一入口**。
+`LagunaBackend` 有 50 个方法（其中公开 24 个 + 2 个 property），
+但 `ServerEngine` 只用到 **13 个**——协议应当由这 13 个倒推，而不是照抄 24 个。
+
+| 成员 | 调用次数 | 签名（`runtime/backends/laguna.py`） |
+|---|---|---|
+| `reset_slot` | 15 | `(slot: int) -> None` |
+| `slot_state` | 6 | `(slot: int) -> LagunaSlotState` |
+| `prefill` | 1 | `(slot: int, prompt_ids: list[int]) -> int` |
+| `prefill_chunked_begin` | 1 | `(slots: list[int], prompts_per_slot: list[list[int]], chunk_size: int = 512) -> ChunkedPrefillState` |
+| `prefill_chunked_step` | 1 | `(state: ChunkedPrefillState) -> bool` |
+| `decode_batch_sampled` | 1 | `(slot_ids, token_ids, kv_lengths, params_list: list[SamplingParams], *, return_logprobs=False, top_logprobs=0) -> list[int] \| tuple[list[int], list[dict]]` |
+| `find_best_slot_for_prompt` | 1 | `(token_ids: list[int], free_slots: list[int]) -> tuple[int, int]` |
+| `reconcile_prefix_hit` | 1 | `(token_ids: list[int]) -> int` |
+| `has_speculative_decode` | 1 | `() -> bool` |
+| `enable_dflash` | 1 | `(*, num_speculative_tokens: int) -> bool` |
+| `mtp_verify_and_commit_batch` | 1 | `(slots, anchors: dict[int,int], drafts: dict[int,list[int]], *, return_logprobs=False, top_logprobs=0) -> dict[int, dict]` |
+| `capture_decode_cuda_graph` | 1 | `() -> int \| None` |
+| **`mtp_prefill_warm_continue`** | 1 | ⚠️ **`LagunaBackend` 没有这个方法** —— 见 3.5.6 |
+
+伴随的两个数据类型也属于协议面：
+
+- `LagunaSlotState`（frozen）：`kv_len: int`、`committed_tokens: tuple[int, ...]`、
+  `is_fresh` property。文档字符串已经写明它是"只读的服务端视图"——**这正是协议应有的形状，
+  可以直接提升为 `SlotState`**，改名去掉 `Laguna` 前缀即可。
+- `ChunkedPrefillState`：分块 prefill 的不透明句柄，`begin` 产出、`step` 消费。
+  协议层应保持它不透明（`TypeVar` 绑定到具体 backend），不下沉字段。
+
+### 3.5.2 观测层的只读状态视图（关掉 `/metrics` 那条故障类）
+
+`server/app.py` 现在**直接读执行层内部**，三处：
+
+| 位置 | 读的东西 | 问题 |
+|---|---|---|
+| `app.py:673` | `runner._prefix_cache_kv_len[i]` | **私有属性** |
+| `app.py:676` | `runner._prefix_cache_tokens` | **私有属性** |
+| `app.py:1182-1221` | `slot_kv_len`，经 `_slot_kv_len()` 容错读取 | 公开属性，但**形状假设**（list vs mapping）不属于任何契约 |
+
+2026-08-01 当天 `/metrics` 两次 500 都出自这里：一次是聚合字典的键数不一致，
+一次是把 list 当 mapping 读。`619a09d` 加的 `_slot_kv_len()` 容错helper 是正确的止血，
+但它治的是症状——**根因是观测层没有一个属于自己的契约**。
+
+**定稿**：协议提供一个只读快照方法，观测层只准读它：
+
+```
+SlotSnapshot   (frozen)  slot: int · kv_len: int · is_fresh: bool
+PrefixSnapshot (frozen)  slot: int · cached_kv_len: int · cached_tokens: int
+BackendSnapshot(frozen)  slots: tuple[SlotSnapshot, ...]
+                         prefix: tuple[PrefixSnapshot, ...]
+```
+
+`snapshot() -> BackendSnapshot` 是协议成员。观测层拿到的是**值**，不是引用，
+形状由协议保证，backend 换实现不会再把 `/metrics` 带下去。
+`_slot_kv_len()` 容错helper 在切换完成后删除——它存在的理由随之消失。
+
+### 3.5.3 能力查询：frozen dataclass，不是字符串
+
+§3.2-B 说"投机 / 前缀缓存 / CUDA Graph 都是可选能力，通过能力查询暴露"，未定形状。
+
+**定稿**：协议暴露 `capabilities` property，返回 frozen dataclass：
+
+```
+BackendCapabilities (frozen)
+    speculative_decode: bool      # 决定 mtp_* / enable_dflash 是否可调
+    prefix_cache:       bool      # 决定 reconcile_prefix_hit / find_best_slot 是否可调
+    cuda_graph:         bool      # 决定 capture_decode_cuda_graph 是否可调
+    chunked_prefill:    bool      # 决定 prefill_chunked_* 是否可调
+    warm_continue:      bool      # 见 3.5.6
+```
+
+选它而不选 `supports("spec_decode")`：字符串拼错不会报错、无法静态检查、
+IDE 补全不到；dataclass 三样都成立，且**可以直接序列化进 bfdiag run record 与 `/metrics`**，
+让"这次运行到底开了什么"变成有记录的事实。这同时是 Track C2 分级降级的判定输入——
+降级路径读的就是这五个布尔。
+
+**约束**：能力为 `False` 时，对应方法族**不允许被调用**（协议不要求实现），
+调度层在调用前查能力，而不是 `try/except AttributeError`。3.5.6 正是后者的代价。
+
+### 3.5.4 第三个消费者：bfdiag 的耦合点
+
+协议不只有 `ServerEngine` 一个消费者。`bfdiag/` 有 4 个模块直接 import 执行层，
+其中**两处摸的是私有成员**：
+
+| 模块 | 依赖 | 处置 |
+|---|---|---|
+| `bfdiag/daemon/provider.py` | `LagunaBackend`、`DFlashEngine` | 改为按协议持有，热引擎因此能托管任意 backend |
+| `bfdiag/sensitivity/measure.py` | `LagunaBackend`、`DFlashEngine` | 同上 |
+| `bfdiag/workloads.py` | **`_physical_slot`**、**`_ring_prefix_reuse_is_safe`**（私有）、`DRAFT_WINDOW` | 私有依赖必须显式化：要么提升为协议成员，要么在 bfdiag 侧独立复现并标注（`shapes/` 已有这个先例且是刻意的） |
+| `bfdiag/shapes/__init__.py`、`bfdiag/divergence/thresholds.py` | `dflash_constants` 常量 | 常量依赖，风险低，保持 |
+
+**这条不做的代价**：诊断平台会在重构中静默失效——正是 C0 审计（`notes/2026-08-01-bfdiag-assertion-audit.md`）
+刚揭示过的那类问题，且当时的结论是"会说谎的诊断平台比没有诊断平台更危险"。
+
+### 3.5.5 迁移顺序与回滚点
+
+roadmap 只说"逐步切换而非一次性替换"，未给顺序。**定稿的原则是按爆炸半径从小到大，
+把零行为变更的步骤排在前面，让最危险的一步在护栏最强的时候做。**
+
+注意这与 roadmap 的 A1→A6 编号顺序**不同**：A3（`SlotResourceManager`）被移到最后。
+理由是它touch 前缀缓存这套最微妙的机制，而在 Track B 的递归状态到来之前它**没有真实消费者**——
+先做它等于承担最大风险换取零收益。
+
+| # | 步骤 | 行为变更 | 门禁 | 回滚 | **需要 GPU？** |
+|---|---|---|---|---|---|
+| 1 | **A2-shadow**：定义 Protocol，静态+运行时断言 `LagunaBackend` 满足它，不改调用点 | 无 | 类型检查 + 一致性单测 | revert 单文件 | ❌ |
+| 2 | **D-2 状态视图**：`snapshot()` 落地，`app.py` 三处私有读改走它，删 `_slot_kv_len` | 无（同值） | 单测 + **C-LIVE metrics 两条断言** | revert | ❌ 写；✅ C-LIVE |
+| 3 | **A1 ModelSpec（影子模式）**：解析 Laguna 的 `config.json`，断言其结果与当前硬编码值逐字段相等，暂不驱动任何东西 | 无 | 影子一致性单测 | revert | ❌ |
+| 4 | **A5 Registry（影子模式）**：路径 → `(spec, backend, loader)`，断言等于今天的硬编码选择 | 无 | 影子一致性单测 | revert | ❌ |
+| 5 | **切换**：Registry 成为唯一真相源，删 `ServerEngine.MODEL` / `BACKEND` / `SERVER_MODEL_BACKEND` | **有** | **贪心 bit-exact** + C-LIVE | 回到第 4 步提交 | ✅ |
+| 6 | **A4 加载器 adapter**：拆出 compressed-tensors adapter | 有（同权重） | 权重逐张量校验和相等 + bit-exact | 回到第 5 步提交 | ✅ |
+| 7 | **A3 SlotResourceManager**：`block_pool` 升级，两类资源统一（递归状态部分随 Track B 落地） | **有，爆炸半径最大** | bit-exact + 接受率 + 前缀命中率不回归 + C-LIVE | 回到第 6 步提交 | ✅ |
+| 8 | **A6 验收** | — | 三条迁移不变量（§3.3）全过 | — | ✅ |
+
+**关键结论：第 1–4 步完全不需要 GPU**（协议一致性、config 解析、注册表解析都是纯 CPU）。
+在没有 GPU 的窗口里，Track A 可以一路推进到第 4 步结束——那已经是 A1/A2/A5 的主体。
+
+### 3.5.6 N8：`--session-affinity` 当前 100% 失效（本次定稿中发现）
+
+`server/engine.py:971` 调用 `self.runner.mtp_prefill_warm_continue(slot, prompt_ids, prior_len)`。
+该方法**只存在于 `oracle/qwen36_vllm/`**（`backends/qwen36.py:1560`、`direct_model_runner.py:1991`），
+是 Qwen3.6 被截肢时留下的残肢。`LagunaBackend` 没有它，也没有 `__getattr__` 转发（已核实）。
+
+调用点被 `try/except Exception` 包着（`engine.py:972-978`），所以：
+
+- 每次 warm-continue 尝试抛 `AttributeError` → 被吞 → 记一条 `warm-continue failed` 日志
+  → 回退到 `reset_slot` + 重新排队 → `session_warm_fallbacks` +1；
+- 输出**仍然正确**，只是永远拿不到 warm 续接的加速；
+- `session_warm_continuations` 恒为 0；
+- `tests/` 对 `warm_continue` / `session_warm` **零覆盖**（已核实）。
+
+默认关闭（`engine.py:203` 默认 `False`，`QSR_SERVER_ENABLE_SESSION_AFFINITY` 默认 `"0"`），
+但 `--session-affinity` 是**面向用户的文档化 CLI 开关**（`app.py:1116,1127`），
+`benchmarks/server_e2e_check.py:98` 也会打开它。
+
+**这正是 3.5.3 那条约束存在的理由**：用 `try/except` 兜底可选能力，
+换来的是一个"看起来在工作、实际永远走降级路径"的功能。改用能力查询后，
+这类问题在调用前就被拦住，而不是变成日志里的一行异常。
+
+**三个选项，需要拍板（本文档不代选）**：
+
+| 选项 | 含义 | 代价 |
+|---|---|---|
+| (a) 为 Laguna 实现 warm-continue | 恢复功能 | 需要设计 + GPU 验证；收益取决于会话场景占比 |
+| (b) 删除该 flag 与相关代码路径 | 承认它不属于当前产品面 | 丢掉 P4b 那批已写好的调度逻辑 |
+| (c) 启动期拒绝该 flag（能力查询为 `False` 时报错） | 最小改动，把静默降级变成显式失败 | 功能仍缺，但不再骗人 |
+
+**倾向 (c) 作为立即动作**（零 GPU、可当天落地、消除"静默降级"），
+(a)/(b) 作为 Track A 完成后基于能力查询重新评估的事项。
+
+---
+
 ## 4. 观测与诊断
 
 `bfdiag`（CLI `bf`）是这个仓库排查问题的**默认入口**，不是可选工具：

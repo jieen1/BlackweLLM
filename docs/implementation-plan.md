@@ -22,8 +22,9 @@ roadmap §1.2 / §1.3 / §4 里这些条目**已经关闭**，排期时不要再
 | N3 `seed` 每 token 重播种 | 🔴 | 🟢 已修为每请求推进单一 generator（`0700b25`） |
 | N1 结构化输出是空壳 | 🔴 最严重 | 🟡 **危险性已消除、功能缺口仍在**：`b2d73cb` 改为显式拒绝 `json_object`/`json_schema`，不再静默失败。`GrammarState.apply_mask` 依旧无调用点 → **降级为普通功能开发，不再是 P0 事故** |
 | N4 / C0 bfdiag 隔离保证失效 | 🔴 优先 | 🟡 **主体已完成**：审计成文（341 行），逐模块判定 real / fake / honest-split，删掉伪装成回归门禁的合成张量 demo，新增真调用 `restore_checkpoint`、`reset_laguna_engine` 的测试。剩余见 C0R |
-| **Track A 设计定稿**（M1 交付物） | — | 🟡 **草案已成文**：`architecture.md` §3.1–3.4 已有目标分层、五个关键抽象（A–E，对应 A1–A5）、三条迁移不变量、Qwen3.6 增量清单。**缺的是可实施级细节**，见 P0-D |
-| **A2 工作量** | "`LagunaBackend` 有 50+ 公开方法" | 🟢 **被高估**：实测 **24 个公开方法 + 2 个 property**；`ServerEngine` 实际只调用其中 **13 个**。协议倒推的输入是这 13 个 |
+| **Track A 设计定稿**（M1 交付物） | — | 🟢 **已完成 2026-08-01**：草案（`architecture.md` §3.1–3.4）已升级为可实施规格 **§3.5**——13 个成员的完整签名、观测层只读快照、能力查询形状、bfdiag 耦合处置、8 步迁移顺序与回滚点 |
+| **A2 工作量** | "`LagunaBackend` 有 50+ 公开方法" | 🟢 **被高估**：50 是**方法总数**（含私有），公开只有 **24 个 + 2 个 property**；而 `ServerEngine` 实际只调用其中 **13 个**。协议倒推的输入是这 13 个 |
+| **N8**（本次定稿中发现） | — | 🔴 **`--session-affinity` 100% 失效**：`engine.py:971` 调用的 `mtp_prefill_warm_continue` 只存在于 `oracle/qwen36_vllm/`，`LagunaBackend` 没有且无 `__getattr__` 转发。异常被 `try/except` 吞掉 → 永远静默回退冷 prefill，`session_warm_continuations` 恒为 0，测试零覆盖。详见 `architecture.md` §3.5.6 |
 
 ### 0.1 roadmap 里没有、但必须进 P0 的一条
 
@@ -73,13 +74,12 @@ P0-C 拍板 D6 ─────────────────────�
 
 比 roadmap 预估的小得多——`.gitignore` 已经覆盖了绝大部分，剩下的是分支残留。
 
-- [ ] **A-1** 删 4 个**已并入 main** 的分支及其 worktree：
-  - `fix/engine-lost-wakeup`（`d9e52ce`）
-  - `fix/live-thinking-and-metrics`（`2c06355`，worktree `…-fix`）
-  - `fix/metrics-busy-500`（`619a09d`，worktree `…-wake`）
-  - `worktree-laguna-mid-conversation-system`（`7ed6ee1`，worktree 在 `.claude/worktrees/`）
-- [ ] **A-2** 处置 `perf/repro-2ce5-baseline-20260730`（`060fabb`，**未并入**，含 1 个未合并的性能提交 "Cache loop-invariant values in generate_verify_only decode loop"）→ 归入 Track F 待评估，或明确废弃
-- [ ] **A-3** 处置唯一的 untracked 文件 `benchmarks/repro_prefix_cache_slowdown.py`：按 `benchmarks/README.md` 规约决定收编、转 `bf exec`、还是删
+- [x] **A-1** 删已并入 main 且**无活动状态**的分支/worktree（2026-08-01 执行）：
+  - ✅ `fix/engine-lost-wakeup`（`d9e52ce`，无 worktree）
+  - ✅ `fix/live-thinking-and-metrics`（`2c06355`，worktree `…-fix` 干净）→ worktree + 分支已删
+  - ⏸️ `fix/metrics-busy-500`、`worktree-laguna-mid-conversation-system` —— **当时有未提交改动，未动**；worktree 侧后由用户自行处理
+- [ ] **A-2** 处置 `perf/repro-2ce5-baseline-20260730`（`060fabb`，**未并入**，含 1 个性能提交 "Cache loop-invariant values in generate_verify_only decode loop"，作者自评"perf 影响在噪声内 ~0.5%"）→ 归入 Track F/F7 评估，或明确废弃
+- [ ] **A-3** 处置 untracked 文件 `benchmarks/repro_prefix_cache_slowdown.py`：按 `benchmarks/README.md` 规约决定收编、转 `bf exec`、还是删（在主工作区，留给持有者操作）
 - [ ] **A-4**（可选）主工作区磁盘杂物：9 个 `*.log`、`build/`、`evalplus_results/` —— **已被 gitignore，不影响仓库**，纯占盘
 - [ ] **A-5** N6 结案规则落文进 `AGENTS.md` 或 `diagnostics-guide.md`：**若再复现，直接贴带线程列表的失败输出，不许重跑**；若 M2 结束前零复现，从 roadmap 移除该条目
 
@@ -128,45 +128,54 @@ P0-C 拍板 D6 ─────────────────────�
 
 ---
 
-## 5. P0-D · Track A 设计：草案 → 可实施（约 1 周）
+## 5. P0-D · Track A 设计：草案 → 可实施 ✅ 已完成（2026-08-01）
 
-`architecture.md` §3.1–3.4 已经有：目标分层图、五个关键抽象（A–E）、三条迁移不变量、
-Qwen3.6 增量清单。**不需要重新设计**，需要补的是让人能照着写代码的那一层：
+**产出：[`architecture.md` §3.5 实施规格](architecture.md)**。全部零 GPU 完成。
 
-- [ ] **D-1 `ModelBackend` 协议的完整签名**：草案只列了方法族名称（prefill / decode / 槽位 / 前缀 / 投机 / 图），没有参数、返回类型、异常契约
-  - 输入已经确定：**`ServerEngine` 实际调用的 13 个成员**（`reset_slot` ×15、`slot_state` ×6、`prefill`、`prefill_chunked_begin`、`prefill_chunked_step`、`decode_batch_sampled`、`find_best_slot_for_prompt`、`reconcile_prefix_hit`、`has_speculative_decode`、`enable_dflash`、`mtp_prefill_warm_continue`、`mtp_verify_and_commit_batch`、`capture_decode_cuda_graph`）
-  - 协议面 = 这 13 个 + 观测层需要的状态访问（见 D-2），**不是 `LagunaBackend` 的全部 24 个公开方法**
-- [ ] **D-2 观测层的状态访问形状**：`server/app.py` 现在直接读 `runner._prefix_cache_kv_len`、`runner._prefix_cache_tokens` 两个私有属性 + 假设 `slot_kv_len` 是 list。定一个只读状态视图，**这是两次 `/metrics` 500 的结构性修复**
-- [ ] **D-3 能力查询的形状**：草案只写了"投机 / 前缀缓存 / CUDA Graph 都是可选能力，通过能力查询暴露"。要定具体机制（属性？`supports(cap)`？）——它同时是 Track C2 分级降级的接口
-- [ ] **D-4 第三个消费者 bfdiag**：`bfdiag/` 有 8 处 `from runtime.backends.laguna*` 直接依赖执行层内部（`workloads.py` 等）。协议改动要一并规划，否则诊断平台会在重构中静默失效——这正是 C0 审计刚揭示过的那类问题
-- [ ] **D-5 迁移顺序与回滚点**：roadmap 只说"逐步切换而非一次性替换"，没说怎么切。要给出 A1→A6 每一步的切换边界、可回滚提交点、以及每步跑什么门禁
-- [ ] **D-6 设计评审**（M1 交付物验收）：以上五项成文，更新进 `architecture.md`
+- [x] **D-1 `ModelBackend` 协议的完整签名** → §3.5.1：13 个成员逐条签名 + 调用频次；`LagunaSlotState`（frozen，文档已自称"只读服务端视图"）可直接提升为协议的 `SlotState`；`ChunkedPrefillState` 保持不透明
+- [x] **D-2 观测层只读快照** → §3.5.2：定位到 `app.py:673`、`:676` 两处**私有属性直读** + `:1182-1221` 的 list 形状假设；定稿 `snapshot() -> BackendSnapshot`（三个 frozen 类型），观测层只拿值不拿引用，切换完成后删掉 `_slot_kv_len()` 容错helper
+- [x] **D-3 能力查询形状** → §3.5.3：定为 `capabilities` property 返回 frozen `BackendCapabilities`（五个布尔）。**否决字符串式 `supports("...")`**：拼错不报错、无法静态检查。可直接序列化进 bfdiag run record 与 `/metrics`，同时是 C2 分级降级的判定输入
+- [x] **D-4 bfdiag 耦合处置** → §3.5.4：4 个模块直接 import 执行层，**其中 `workloads.py` 摸的是私有成员** `_physical_slot` / `_ring_prefix_reuse_is_safe`；逐项给了处置
+- [x] **D-5 迁移顺序与回滚点** → §3.5.5：**8 步，A3 从第 3 位移到第 7 位**——它爆炸半径最大（touch 前缀缓存）且在 Track B 递归状态到来前**没有真实消费者**，先做等于承担最大风险换零收益。每步标了行为变更、门禁、回滚点、是否需要 GPU
+- [x] **D-6 成文进 `architecture.md`**（M1 交付物）→ 新增 §3.5.1–3.5.6
+
+**定稿过程中发现 N8**（§3.5.6）：`--session-affinity` 100% 失效，见 §0 表格与 §6 下方。
 
 ---
 
 ## 6. P0-E · Track A 实施（M1→M2，约 1.5 月，主线）
 
-**原则**：协议由现有实现倒推，不预设未来；逐步切换，每步可回滚。
+**执行顺序按 [`architecture.md` §3.5.5](architecture.md) 定稿的 8 步**，不是 roadmap 的 A1→A6 编号顺序：
+按爆炸半径从小到大，零行为变更的步骤排在前面。**前 4 步完全不需要 GPU。**
 
-- [ ] **A1 `ModelSpec` 升级为架构描述**（当前 `runtime/model_spec.py` 仅 88 行、只有层名列表 + MTP 开关）
-  - 按 `architecture.md` §3.2-A 的九个字段族实现：层类型序列 / FFN 类型 / 注意力参数 / 线性注意力参数 / RoPE / 量化 / 投机 / **每层缓存需求**
-  - 不支持的架构在**加载权重之前**失败，错误具体到字段
-  - **RK8**：显式拒绝带 vision tower 的权重（Qwen3.6 文本版与多模态版共用架构名）
-- [ ] **A2 `ModelBackend` 协议**（按 D-1 的 13 个成员 + D-2 状态视图 + D-3 能力查询落地）
-  - [ ] 同时消灭 `server/app.py` 对两个私有属性的直读 —— 关掉 `/metrics` 那条故障类
-- [ ] **A3 `SlotResourceManager`**：`block_pool` 从"KV 分页器"升级为"槽位资源管理器"，统一分页 KV（长度相关）与递归状态（长度无关、每槽固定）；**两类资源联动驱逐**。顺带清掉 S4 的 GDN 残迹（`evict_gdn_checkpoint` 等当前无活代码路径）
-- [ ] **A4 加载器 adapter**：compressed-tensors / modelopt 的命名与 scale 语义拆成两个 adapter；公共部分（分片流式读取、参数全覆盖断言、KV scale post-load）不变
-- [ ] **A5 `ModelRegistry`**：checkpoint 路径 → 读 config → 匹配架构 → 选 (spec, backend, loader, 投机策略)
-  - 消灭 `server/engine.py:188` `MODEL = "poolside/Laguna-S-2.1-NVFP4"`、`:190` `BACKEND = "laguna"`、`server/app.py:81` `SERVER_MODEL_BACKEND`
-- [ ] **A6 Laguna 迁到新抽象，零回归**（硬门禁，**依赖 C-1 拍板**）
-  - [ ] 贪心输出 **bit-exact**
-  - [ ] 性能不低于基线 3%（fox-64K 353–368 / fox-4K 353–357 / galaxy-4K 395–401 / code-4K 341–359 tok/s）
-  - [ ] 接受率不回归（96.3–100%）
-  - [ ] **C-LIVE 冒烟通过**
-  - [ ] 比数前先 `bf diff` 判可比性 —— 2026-07-27 教训
-  - [ ] [待办·开发执行] 上述均需真机
+| # | 步骤 | 行为变更 | 门禁 | GPU |
+|---|---|---|---|---|
+| 1 | [ ] **A2-shadow** 定义 Protocol（D-1 的 13 个成员 + D-3 能力查询），静态+运行时断言 `LagunaBackend` 满足它，**不改调用点** | 无 | 类型检查 + 一致性单测 | ❌ |
+| 2 | [ ] **A2-观测** `snapshot()` 落地，`app.py:673/676` 两处私有直读改走它，删 `_slot_kv_len()` | 无（同值） | 单测 + C-LIVE metrics 两条 | ❌ 写 |
+| 3 | [ ] **A1 ModelSpec（影子）** 按 §3.2-A 九个字段族解析 `config.json`，断言结果与当前硬编码值逐字段相等，暂不驱动任何东西。含 RK8：显式拒绝带 vision tower 的权重 | 无 | 影子一致性单测 | ❌ |
+| 4 | [ ] **A5 Registry（影子）** 路径 → `(spec, backend, loader, 投机策略)`，断言等于今天的硬编码选择 | 无 | 影子一致性单测 | ❌ |
+| 5 | [ ] **切换** Registry 成为唯一真相源；删 `engine.py:188` `MODEL`、`:190` `BACKEND`、`app.py:81` `SERVER_MODEL_BACKEND` | **有** | 贪心 bit-exact + C-LIVE | ✅ |
+| 6 | [ ] **A4 加载器 adapter** 拆出 compressed-tensors；公共部分（分片流式读取、参数全覆盖断言、KV scale post-load）不变 | 有（同权重） | 逐张量校验和相等 + bit-exact | ✅ |
+| 7 | [ ] **A3 SlotResourceManager** `block_pool` 升级为槽位资源管理器，两类资源联动驱逐；清掉 S4 的 GDN 残迹（`evict_gdn_checkpoint`）。递归状态部分随 Track B 落地 | **有，半径最大** | bit-exact + 接受率 + 前缀命中率不回归 + C-LIVE | ✅ |
+| 8 | [ ] **A6 验收**（硬门禁，**依赖 C-1 拍板**） | — | 见下 | ✅ |
 
-**风险 RK3**：动核心执行路径，Laguna 是唯一生产模型。**顺序不能颠倒：先 P0-B 后 P0-E。**
+**A6 验收四条**（[待办·开发执行]，均需真机）：
+- [ ] 贪心输出 **bit-exact**
+- [ ] 性能不低于基线 3%（fox-64K 353–368 / fox-4K 353–357 / galaxy-4K 395–401 / code-4K 341–359 tok/s）
+- [ ] 接受率不回归（96.3–100%）
+- [ ] C-LIVE 冒烟通过；比数前先 `bf diff` 判可比性（2026-07-27 教训）
+
+**风险 RK3**：动核心执行路径，Laguna 是唯一生产模型。**顺序不能颠倒：先 P0-B 后第 5 步。**
+
+### 6.1 N8 · `--session-affinity` 静默失效（需拍板）
+
+`engine.py:971` 调 `mtp_prefill_warm_continue`，`LagunaBackend` 没有该方法（只在 `oracle/qwen36_vllm/`），
+异常被 `try/except` 吞掉 → 每次都静默回退冷 prefill。默认关闭，但 `--session-affinity` 是文档化的 CLI 开关。
+完整证据见 [`architecture.md` §3.5.6](architecture.md)。
+
+- [ ] **N8 拍板**：(a) 为 Laguna 实现 warm-continue ／ (b) 删除该 flag 与相关调度路径 ／ (c) 启动期拒绝该 flag，把静默降级变成显式失败
+- **倾向 (c) 作为立即动作**（零 GPU、可当天落地），(a)/(b) 待 Track A 的能力查询就位后重新评估
+- [ ] 无论选哪个：补上 `warm_continue` / `session_warm` 的测试覆盖（当前**零覆盖**）
 
 ---
 
@@ -290,8 +299,9 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 |---|---|---|
 | A6 零回归验收 | **P0-C/C-1 GPU CI 拍板** → C4 位精确门禁 | 🔴 未拍板 |
 | B0 起步 | **P0-C/C-2 主线 checkpoint 拍板** | 🔴 未拍板 |
-| A1–A6 开工 | **P0-D 设计升级到可实施**（草案已有，缺签名/顺序/回滚点） | 🟡 草案在 `architecture.md` §3 |
-| Track A 的安全网 | **P0-B C-LIVE** | 🔴 未开始 |
+| ~~A1–A6 开工~~ | ~~P0-D 设计升级到可实施~~ | 🟢 **已解锁**：规格在 `architecture.md` §3.5，第 1–4 步可立即开工且不需要 GPU |
+| P0-E 第 5–8 步 | **P0-B C-LIVE** + GPU | 🔴 C-LIVE 未开始 |
+| N8 处置 | 拍板 (a)/(b)/(c) | 🔴 未拍板，倾向 (c) |
 | Track B 全部 | Track A（A1–A5）完成 | 🔴 未开始 |
 | B2 CUDA Graph | B0-5（GDN 是否 capture-safe） | 🔴 未验证 |
 | C2 分级降级的接口 | P0-D/D-3 能力查询形状 | 🔴 未定 |
