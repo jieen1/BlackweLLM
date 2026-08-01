@@ -29,6 +29,7 @@ from bfdiag.trace import ring as bfdiag_trace
 from bfprobe.routing import PROBE_ENABLED as ROUTING_PROBE_ENABLED
 from bfprobe.routing import capture_routing
 from runtime.backends.bf_attention import bf_attn_context
+from runtime.backends.protocol import BackendCapabilities
 from runtime.block_pool import ChunkedPrefillState
 from runtime.laguna_config import LagunaRuntimeConfig
 from runtime.laguna_runtime import (
@@ -2194,6 +2195,30 @@ class LagunaBackend:
         """
         self._ensure_decode_cg()
         return None if self._decode_cg is None else self._decode_cg.batch_size
+
+    @property
+    def capabilities(self) -> BackendCapabilities:
+        """What this backend can do -- see ``runtime/backends/protocol.py``.
+
+        Class-level facts, not runtime state: ``speculative_decode`` says
+        ``enable_dflash`` may be called, whereas ``has_speculative_decode``
+        below says whether it is active right now.
+
+        ``warm_continue`` is False because ``mtp_prefill_warm_continue`` has
+        no implementation here -- it survives only under
+        ``oracle/qwen36_vllm/``. ``server/engine.py`` calls it anyway, inside
+        a bare ``except Exception``, so every ``--session-affinity`` warm
+        continue raises, is swallowed, and falls back to a cold prefill.
+        Reading this flag is how a caller finds that out without an exception.
+        See ``docs/architecture.md`` §3.5.6 (N8).
+        """
+        return BackendCapabilities(
+            speculative_decode=True,
+            prefix_cache=True,
+            cuda_graph=True,
+            chunked_prefill=True,
+            warm_continue=False,
+        )
 
     @property
     def has_speculative_decode(self) -> bool:

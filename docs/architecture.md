@@ -329,7 +329,7 @@ router kernel（同上）。
 | `decode_batch_sampled` | 1 | `(slot_ids, token_ids, kv_lengths, params_list: list[SamplingParams], *, return_logprobs=False, top_logprobs=0) -> list[int] \| tuple[list[int], list[dict]]` |
 | `find_best_slot_for_prompt` | 1 | `(token_ids: list[int], free_slots: list[int]) -> tuple[int, int]` |
 | `reconcile_prefix_hit` | 1 | `(token_ids: list[int]) -> int` |
-| `has_speculative_decode` | 1 | `() -> bool` |
+| `has_speculative_decode` | 1 | **`@property` → `bool`**（不是方法；`engine.py` 按值传给 `classify_decode_slots`） |
 | `enable_dflash` | 1 | `(*, num_speculative_tokens: int) -> bool` |
 | `mtp_verify_and_commit_batch` | 1 | `(slots, anchors: dict[int,int], drafts: dict[int,list[int]], *, return_logprobs=False, top_logprobs=0) -> dict[int, dict]` |
 | `capture_decode_cuda_graph` | 1 | `() -> int \| None` |
