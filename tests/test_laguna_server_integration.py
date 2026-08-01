@@ -294,10 +294,16 @@ def test_laguna_chat_response_literal_think_mid_body_not_truncated(monkeypatch):
     silently truncated by a blind "strip to the first </think>" pass."""
     from server import app as server_app
 
-    raw = (
+    body = (
         "Sure -- the <think> tag marks reasoning, e.g. "
         "<think>like this</think>, and </think> alone closes it."
     )
+    # Laguna's chat template ends the prompt with <assistant><think>, so the
+    # model is already inside a think block and closes it before writing the
+    # answer -- every real completion starts with a bare </think> (captured
+    # live 2026-08-01). The literal tags below all sit AFTER that real
+    # boundary, which is exactly what makes them ordinary content.
+    raw = "</think>" + body
     _patch_server_app(monkeypatch, server_app, _fake_engine_returning(raw), raw)
 
     response = asyncio.run(
@@ -308,8 +314,8 @@ def test_laguna_chat_response_literal_think_mid_body_not_truncated(monkeypatch):
     )
 
     message = response["choices"][0]["message"]
-    assert message["content"] == raw
-    assert "reasoning_content" not in message
+    assert message["content"] == body
+    assert not message["content"].startswith("</think>")
 
 
 def test_anthropic_stream_reasoning_via_custom_event_not_thinking_block(monkeypatch):
@@ -331,7 +337,10 @@ def test_anthropic_stream_reasoning_via_custom_event_not_thinking_block(monkeypa
         tok = _FakeTok()
 
         async def submit_stream(self, *_args, **_kwargs):
-            text = "<think>because X</think>the answer"
+            # No opening tag: the chat template injects it into the
+            # prompt, so generation starts inside the block and only
+            # ever emits the close.
+            text = "because X</think>the answer"
             for ch in text:
                 yield [ord(ch)]
             yield {
@@ -409,7 +418,10 @@ def test_anthropic_stream_reasoning_omitted_in_strip_mode(monkeypatch):
         tok = _FakeTok()
 
         async def submit_stream(self, *_args, **_kwargs):
-            text = "<think>because X</think>the answer"
+            # No opening tag: the chat template injects it into the
+            # prompt, so generation starts inside the block and only
+            # ever emits the close.
+            text = "because X</think>the answer"
             for ch in text:
                 yield [ord(ch)]
             yield {
@@ -485,7 +497,10 @@ def test_openai_stream_reasoning_content_in_delta(monkeypatch):
             return True
 
         async def submit_stream(self, *_args, **_kwargs):
-            text = "<think>because X</think>the answer"
+            # No opening tag: the chat template injects it into the
+            # prompt, so generation starts inside the block and only
+            # ever emits the close.
+            text = "because X</think>the answer"
             for ch in text:
                 yield [ord(ch)]
             yield {

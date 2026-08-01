@@ -277,3 +277,46 @@ class TestAnthropicReasoningContentWiring:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class TestLagunaTemplateInjectsThink:
+    """Laguna's chat template ends the prompt with ``<assistant><think>``.
+
+    Captured from a live server on 2026-08-01: the decoded prompt ends
+    ``...</user>\\n<assistant><think>`` and every completion begins with a
+    bare ``</think>``. Generation therefore starts *inside* a think block,
+    which is what ``thinking_capable=True`` means.
+
+    With the flag off, no ``<think>`` sits at position 0 of the generated
+    text, the anchored span rule finds no reasoning segment, and the orphan
+    closing tag is served as the first characters of ``message.content`` --
+    observed live as ``'</think>快速排序是...'``.
+    """
+
+    def test_bare_close_tag_is_reasoning_boundary_when_template_injects(self):
+        from server.formats.stream import StreamProcessor
+
+        proc = StreamProcessor(_FakeTok(), thinking_capable=True)
+        proc.add_tokens(_FakeTok.ids("</think>Hello! How can I help you today?"))
+        assert proc.content_text() == "Hello! How can I help you today?"
+        assert "</think>" not in proc.content_text()
+
+    def test_reasoning_text_before_close_tag_is_captured(self):
+        from server.formats.stream import StreamProcessor
+
+        proc = StreamProcessor(_FakeTok(), thinking_capable=True)
+        proc.add_tokens(_FakeTok.ids("weighing options</think>the answer"))
+        assert proc.content_text() == "the answer"
+        assert proc.reasoning_content() == "weighing options"
+
+    def test_server_default_matches_the_live_template(self):
+        # server.app pulls in FastAPI (a `serving` extra); this module must
+        # still import under dev extras alone -- see the CPU-only CI job.
+        pytest.importorskip("fastapi")
+
+        import server.app as app
+
+        assert app.SERVER_THINKING_CAPABLE is True, (
+            "Laguna's template injects <think>; with this off the orphan "
+            "</think> leaks into message.content (observed live 2026-08-01)"
+        )

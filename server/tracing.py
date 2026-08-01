@@ -211,11 +211,18 @@ class RequestTracer:
         return [t.to_dict() for t in reversed(traces)]
 
     def get_stats(self) -> dict:
-        """Get aggregate tracing statistics."""
+        """Get aggregate tracing statistics.
+
+        Always returns the same key set. This used to short-circuit to a
+        two-key dict when nothing had completed yet, which made
+        ``render_prometheus`` raise ``KeyError: 'slow_count'`` -- so
+        ``/metrics`` returned 500 on every freshly started server until the
+        first request finished, which is exactly the window a scraper first
+        reaches it in. Every aggregate below already guards its own empty
+        case, so the early return bought nothing and cost a shape divergence.
+        """
         with self._lock:
             completed = list(self._completed)
-        if not completed:
-            return {"total_requests": 0, "active": len(self._active)}
         total_ms_list = [t.total_ms for t in completed if t.total_ms > 0]
         tps_list = [t.tokens_per_sec for t in completed if t.tokens_per_sec > 0]
         prefill_list = [t.prefill_ms for t in completed if t.prefill_ms > 0]

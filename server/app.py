@@ -142,11 +142,24 @@ SERVER_ENABLE_DFLASH = os.environ.get("QSR_SERVER_ENABLE_DFLASH", "0") != "0"
 SERVER_REASONING_MODE = os.environ.get("QSR_REASONING_MODE", "expose")
 if SERVER_REASONING_MODE not in ("expose", "strip"):
     raise RuntimeError(f"QSR_REASONING_MODE={SERVER_REASONING_MODE!r} must be 'expose' or 'strip'")
-# Laguna's chat template does not inject <think> into the prompt (confirmed
-# on real GPU output, see server/formats/stream.py's module docstring) --
-# any <think> in Laguna's output is the model's own choice, detected by
-# StreamProcessor purely from where it appears in the generated text.
-SERVER_THINKING_CAPABLE = False
+# Laguna's chat template DOES inject <think>. This was recorded the other way
+# round until a live server run on 2026-08-01 showed the prompt ending in:
+#
+#   ...</system>\n<user>...</user>\n<assistant><think>
+#
+# and every single generated completion starting with a bare closing tag:
+#
+#   RAW OUTPUT (10 tokens, finish=stop): </think>Hello! How can I help you today?
+#
+# So generation begins *inside* a think block. With the flag off, no <think>
+# sits at position 0 of the generated text, the anchored span rule finds no
+# reasoning segment, and the orphan </think> is served as the first characters
+# of message.content. Chat and messages endpoints only -- /v1/completions
+# applies no chat template and still returns generated text verbatim, which is
+# the distinction the 2026-07-27 incident (notes/2026-07-27-p1-http-e2e-and-
+# thinking-strip-bug.md) turned on: prepending unconditionally, on the endpoint
+# that has no template, ate whole responses.
+SERVER_THINKING_CAPABLE = os.environ.get("QSR_THINKING_CAPABLE", "1") != "0"
 
 # Selects which server/formats/tool_parsers/ shape to decode tool calls
 # with -- mirrors vLLM's --tool-call-parser NAME. Default matches this

@@ -140,3 +140,33 @@ class TestRequestTracer:
         assert trace is not None
         assert trace["request_id"] == "active-1"
         assert trace["slot"] == 2
+
+
+class TestPrometheusOnFreshServer:
+    """`/metrics` used to 500 until the first request completed.
+
+    `get_stats()` short-circuited to a two-key dict while `_completed` was
+    empty, and `render_prometheus` reads six. A scraper pointed at a freshly
+    started server therefore hit `KeyError: 'slow_count'` -- observed live on
+    2026-08-01, repeating on every scrape for the whole warm-up window.
+    """
+
+    def test_render_prometheus_before_any_request_completes(self):
+        from server.tracing import RequestTracer
+
+        tracer = RequestTracer(enabled=True)
+        rendered = tracer.render_prometheus("some-model")
+        assert "blackwellm:trace_slow_requests" in rendered
+        assert "blackwellm:trace_total_requests" in rendered
+
+    def test_get_stats_key_set_does_not_depend_on_completion(self):
+        from server.tracing import RequestTracer
+
+        empty_keys = set(RequestTracer(enabled=True).get_stats())
+
+        tracer = RequestTracer(enabled=True, sample_rate=1.0)
+        tracer.request_admitted("r1", slot=0, prompt_len=100)
+        tracer.prefill_done("r1", prefill_ms=5.0)
+        tracer.decode_round("r1", round_idx=0, tokens_committed=3, round_ms=10.0)
+        tracer.request_finished("r1", finish_reason="stop")
+        assert set(tracer.get_stats()) == empty_keys
