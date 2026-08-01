@@ -30,6 +30,7 @@
 | `2026-07-27-bfdiag-*.md`（7 篇） | 飞行记录仪 / run record / 可比性判定 / 热引擎 / 形状推导 / 确定性 / oracle 分歧 |
 | `2026-07-27-bfprobe-*.md`（2 篇） | 探针签名与 MoE 路由抓取 |
 | `prefix-cache-design.md` | 前缀缓存设计 |
+| `2026-07-27-laguna-prefix-cache-lp1-design-draft.md` | L-P1 同轮 fan-out 设计草稿，**当时未实现**。2026-08-01 从 `laguna-prefix-cache` 分支抢救（该分支的 L-P0 block-table 改动已在 main，只有这份草稿没有） |
 | `sglang-radix-cache-study.md` | radix cache 的对照研究 |
 | `2026-07-23-e1-model-abstraction-design.md` | **模型抽象层的早期设计**——Track A 的先验，必读 |
 | `2026-07-23-gpu-verification-checklist.md` | GPU 验证清单 |
