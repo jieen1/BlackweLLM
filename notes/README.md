@@ -1,6 +1,6 @@
 # notes/ 索引
 
-> 编制日期：2026-08-01 · 共 116 篇（`git ls-files notes | wc -l`）
+> 编制日期：2026-08-01 · 共 119 篇（`git ls-files notes | wc -l`）
 
 `notes/` 是**调查记录与证据档案**，不是文档。它的价值在于：当一个结论被
 质疑时，能翻出当初的实测数据、复现命令和被排除的假设。
@@ -140,6 +140,12 @@ Laguna 仍是生产模型，这些记录有效；但其中的 SWA ring、MoE、D
 `2026-07-23-cudagraph-determinism.md`、`2026-07-27-l2-server-integration-gap.md`、
 `2026-07-27-p1-http-e2e-and-thinking-strip-bug.md`、`b12x_investigation.md`、
 `compile_integration.md`、`prefix-cache-implementation-log.md`
+
+## 9. 仓库卫生 🟢
+
+| 文件 | 内容 |
+|---|---|
+| `2026-08-01-t0-7-branch-worktree-survey.md` | T0-7 分支/worktree 调研清单（只调研未执行删除）——16 个分支已合并可安全删，16 个有独有提交需人工确认 |
 
 ---
 
