@@ -190,3 +190,20 @@ class TestLagunaConformance:
         caps = cls.capabilities.fget(None)  # type: ignore[attr-defined]
         assert caps.warm_continue is False
         assert not hasattr(cls, "mtp_prefill_warm_continue")
+
+    def test_prefix_cache_capability_agrees_with_the_hasattr_probe_it_replaced(
+        self,
+    ) -> None:
+        """A3 step 7-b (docs/a3-cache-coordinator-design.md §1.1): server/
+        engine.py's admission block used to gate cache-aware slot assignment
+        on ``hasattr(self.runner, "find_best_slot_for_prompt")`` and now
+        reads ``capabilities.prefix_cache`` instead. This is the
+        shadow-consistency claim for the one real shipping backend: the new
+        mechanism must agree with what the old one would have concluded.
+        ``tests/test_engine_prefix_cache_admission.py`` covers the same
+        claim behaviorally, with fakes standing in for both possible
+        answers."""
+        cls = self._backend_cls()
+        caps = cls.capabilities.fget(None)  # type: ignore[attr-defined]
+        assert caps.prefix_cache is hasattr(cls, "find_best_slot_for_prompt")
+        assert caps.prefix_cache is hasattr(cls, "reconcile_prefix_hit")

@@ -1087,7 +1087,13 @@ class ServerEngine:
             remaining_slots = list(self.free_slots)
             for _ in range(n):
                 req = self.waiting.pop(0)
-                if hasattr(self.runner, "find_best_slot_for_prompt") and remaining_slots:
+                # A3 step 7-b (docs/a3-cache-coordinator-design.md §1.1):
+                # capability-bit query, not a hasattr probe -- the pattern
+                # protocol.py's own module docstring names as the one to
+                # eliminate ("the scheduler must consult that BEFORE calling
+                # into a family -- never try/except AttributeError"; a bare
+                # hasattr probe is the same anti-pattern's sibling).
+                if self.runner.capabilities.prefix_cache and remaining_slots:
                     best_slot, _hit = self.runner.find_best_slot_for_prompt(
                         req.prompt_ids,
                         remaining_slots,

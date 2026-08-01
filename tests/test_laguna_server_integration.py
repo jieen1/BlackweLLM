@@ -188,6 +188,29 @@ class TestLagunaBackendE1Surface:
         warm = backend.reconcile_prefix_hit([10, 20, 30, 40, 50] * 20 + [99, 98, 97])
         assert warm.state_hit == warm.kv_hit == 64
 
+    def test_find_prefix_match_unaffected_by_prefix_hit_type_change(self):
+        """A3 step 7-b (docs/a3-cache-coordinator-design.md §1.1, §5):
+        find_prefix_match is DFlash's own internal prefix-cache consumer
+        (runtime/backends/laguna_dflash.py:1379) -- it is NOT one of the 13
+        protocol members (not in CAPABILITY_MEMBERS['prefix_cache']) and is
+        keyed off different bookkeeping (slot_committed_tokens/slot_kv_len,
+        not _prefix_cache_tokens/_prefix_cache_kv_len). It must keep
+        returning a bare int, unaffected by reconcile_prefix_hit's
+        PrefixHit change -- verified here rather than only asserted in
+        prose."""
+        backend = self._bare_backend()
+        backend.slot_committed_tokens = [[10, 20, 30, 40, 50] * 20]  # 100 tokens
+        backend.slot_kv_len = [100]
+        backend.block_size = 64
+
+        cold = backend.find_prefix_match(0, [1, 2, 3])
+        assert cold == 0
+        assert isinstance(cold, int)
+
+        warm = backend.find_prefix_match(0, [10, 20, 30, 40, 50] * 20 + [99, 98, 97])
+        assert warm == 64  # block-aligned down from 100, same rule as before
+        assert isinstance(warm, int)  # NOT a PrefixHit -- this method is untouched
+
     def test_slot_state_is_immutable_scheduler_snapshot(self):
         backend = self._bare_backend()
         backend.slot_kv_len = [3]

@@ -38,7 +38,7 @@ import pytest
 
 pytest.importorskip("torch")
 
-from runtime.backends.protocol import PrefixHit
+from runtime.backends.protocol import BackendCapabilities, PrefixHit
 from server.engine import GenerationRequest, ServerEngine
 
 
@@ -75,6 +75,19 @@ class _FakeWarmRunner:
         decode_token: int = 901,
     ):
         self.has_speculative_decode = False
+        # A3 step 7-b (docs/a3-cache-coordinator-design.md §1.1): engine.py's
+        # admission path now queries capabilities.prefix_cache instead of
+        # hasattr(runner, "find_best_slot_for_prompt"). This fake never
+        # defined find_best_slot_for_prompt, so prefix_cache=False here
+        # reproduces the exact same "no cache-aware slot assignment" branch
+        # the old hasattr probe took (which was also False for this fake).
+        self.capabilities = BackendCapabilities(
+            speculative_decode=False,
+            prefix_cache=False,
+            cuda_graph=False,
+            chunked_prefill=False,
+            warm_continue=True,
+        )
         self.warm_continue_result = warm_continue_result
         self.warm_continue_error = warm_continue_error
         self.cold_anchor = cold_anchor
