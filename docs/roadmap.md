@@ -299,7 +299,25 @@ backend；滑窗作为显式 backend capability"）：这条**验证了 A1/A2 �
 参数（窗口大小、per-layer 是否滑窗）提升成 `ModelSpec`/能力查询里可查询的字段，而不是留在模型图内部。
 不新开条目，作为 A1/A2 实现时的一条设计备忘。
 
-### Track B · Qwen3.6-27B 接入（P1，M2→M4）
+### Track B · Qwen3.6-27B 重建（P1，M2→M4，有参考实现）
+
+**这不是"接入一个陌生模型"，是"重建一个曾经在 vLLM 上跑通、有实测数字的实现"。**
+`oracle/qwen36_vllm/` 有 8047 行、11 个模块的参考代码；`docs/archive/2026-07-20-PROGRESS.md`
+等处有当年的真实吞吐/接受率/质量/显存数字。完整的逐模块判定（可直接搬/需改写/已被取代/
+应废弃，逐项标新位置）、验收基线的完整来源表、以及在今天 Track A 抽象上的重建设计，见
+[`qwen36-rebuild-spec.md`](qwen36-rebuild-spec.md)——本节只摘要结论，细节与行号引用一律
+以那份文档为准。
+
+**2026-08-02 关键纠偏**（读完 `oracle/qwen36_vllm/backends/qwen36.py` 全部 2159 行后确认）：
+**模型数学本身（GDN 层 forward、mrope-interleaved RoPE、`attn_output_gate`、稠密 SwiGLU
+MLP、modelopt NVFP4 反量化）完全不在这份参考代码里**——它当年活在 vLLM pip 包自己的
+`Qwen3_5ForConditionalGeneration`/`Qwen3_5MTP` 类里，从未被 vendor 进本仓库，`get_model()`
+只是现场把它借来用。**oracle 里真正能复用的是编排层与状态管理层**：GDN checkpoint
+快照/恢复（`gdn_state.py`，466 行，判定为最高价值文件）、GDN 状态×投机解码的行寻址方案
+（`_ssm_spec_row`，**已经原样存在于 `runtime/block_pool.py:45-79`，未被删除，休眠等接线**）、
+accept/reject 判定算法（**已经完全移植完成**，就是今天的 `runtime/mtp_accept.py`）、块哈希
+前缀缓存骨架。这意味着 B1（模型图 + 正确性）比原计划更接近纯新写，B0/B2/B3（状态管理 /
+CUDA Graph 编排 / 投机回滚机制）比原计划有更多现成参照——工作量没有减少，是**性质变了**。
 
 分四段，每段有独立的验收，不允许"边写边猜"。
 
@@ -310,32 +328,52 @@ backend；滑窗作为显式 backend capability"）：这条**验证了 A1/A2 �
   `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP`（留作交叉验证 baseline）、`morosystems/ThinkingCap-...`。
   衍生任务：写一个按 tensor 名前缀跳过 `vision.*` 的加载过滤器（333 个张量，一次写好可复用）；
   A1 的 `validate_text_only` 语义要跟着调整为"允许 `vision_config` 存在但断言零 vision 张量被加载"
-  （见 RK8）。
-- Tensor 清单与 modelopt scale 语义逐项确认（不猜命名）。
+  （见 RK8；`runtime/architecture.py:292-319` 已经是这个语义，非空文档承诺）。
+- Tensor 清单与 modelopt scale 语义逐项确认（不猜命名）——`git show a9cb932^:runtime/model/nvfp4_linear.py`
+  可取回一份当年针对 compressed-tensors 格式写的、几乎完工的 NVFP4 Linear 原型（权重侧张量操作
+  `swizzle_blockscale` 等可直接搬），但参数命名要按 modelopt 真实 checkpoint 重新逐项确认，
+  见 `qwen36-rebuild-spec.md` §1.9/§3.4。
 - **[待验证]** sparkinfer paged attention 在 `head_dim=256 / gqa_group=6 /
   page_size ∈ {64,128} / fp8 KV` 下的正确性与吞吐——planner 里已有对应分支，
   但没有本机实测记录。**验证时应同时检查 warmup/autotune 是否覆盖了这个真实形状**
   （见 RK9、`investigation-queue.md` C-1，同一类"首次真实形状才暴露代价"的问题）。
-- **[待验证]** GDN 方案选型三选一：
-  1. 依赖 `flash-linear-attention`（本地已有 v0.5.2，`fla/ops/gated_delta_rule`
-     有 chunk + fused_recurrent 两条 Triton 路径）；
-  2. 从 `oracle/qwen36_vllm/` 的 vLLM 路径移植；
+- GDN 方案选型三选一，**倾向已加强为"先 1，晚点再看 3"**：
+  1. 依赖 `flash-linear-attention`（本地已有 v0.5.2；本轮新确认 `fla.ops.gated_delta_rule` 的
+     `chunk`/`fused_recurrent` 两条路径本地均可 `import` 成功、且无需 `causal_conv1d`——但**从未在
+     SM120 上实跑**，`investigation-queue.md` §F 记录的 Blackwell 相关 bug 全部是 B200/SM100，
+     无 SM120 记录，"未验证"不等于"已知能跑"）；
+  2. 从 `oracle/qwen36_vllm/` 的 vLLM 路径移植（**注：GDN 层 forward 本身不在这份代码里**，
+     真正能移植的是 `gdn_state.py` 的状态管理，不是算子本身，见 `qwen36-rebuild-spec.md` §1.0）；
   3. 自研 Triton kernel。
-  建议先 1 拿正确性，profiling 说话后再决定要不要 3。
-- **[待验证，另一 agent 在查，本文档不预判]** Qwen3.6 的 MTP 层是否带 GDN
-  （`investigation-queue.md` B-6）：若不带，B3 里"GDN 递归状态推测回滚"这一项直接不存在，
-  是本轨道当前假定的最难项——**结论出来前 B3 只写两个分支，不写死**（见 B3）。
+  **[待验证，本轮新增数据支持]**：`notes/2026-07-22-a1a-gdn-profiling.md` 实测 GDN 48 层合计
+  decode GPU 时间占比恒定在 **3.9%–5.1%**（4K 与 128K 上下文均如此，NVFP4 GEMM 才是主导，
+  71.1%→53.7%）——GDN kernel 本身**不是**性能瓶颈，支持"先 1 拿正确性，profiling 说话后再决定
+  要不要 3"这条既有建议，不改变它。
+- ✅ **Qwen3.6 的 MTP 层是否带 GDN**（`investigation-queue.md` B-6）——**已确认：不带**。
+  6 个本地 checkpoint 变体的 `mtp.*` 张量清一色 `self_attn.*`+`mlp.*`，零 `linear_attn.*`。
+  **但这不消除 B3 的 GDN 回滚项**——vLLM 那条"draft models have no mamba layers"的注释指的是
+  draft 模型自己的递归状态，草稿侧因此确实可以少做（不需要为 MTP 头单独管理 conv/ssm 状态或做
+  eagle-shift 类操作），但**主模型的 48 个 GDN 层在 verify 时照样跑完整 64 层前向**，被拒 token
+  照样污染了不可逆的递归状态更新，回滚问题原样保留在 B3，只是范围从"草稿+主模型两侧"收窄到
+  "只有主模型侧"。详见 `notes/2026-08-01-b6-mtp-gdn-verification.md`；B3 不再需要按"带/不带 GDN"
+  写两个分支，只有一个分支（见下）。
 - **[待验证，另一 agent 在查，本文档不预判]** NVFP4 KV vs FP8 KV 在我们卡上的对比
   （`investigation-queue.md` C-2）：上游第三方在 RTX PRO 5000 上的数字（NVFP4 KV prefill 慢
   1.7–1.8×）不是我们的卡也不是我们的形状，只作参考，不作决定。
 - 容量测算：64 层 / 256K 上下文 / 96 GB 下的 KV + 递归状态显存账，
-  给出 context × 并发的可行域。
+  给出 context × 并发的可行域。**旧参照数字**（vLLM 执行路径下测的，不能直接当新框架的数字用，
+  仅作方向参考）：128K/c=4/warm 约 90.7–92.9 GiB，64K/c=4/warm 约 63–65 GiB，256K/c=4/cold
+  可行（82.8% 峰值，无 OOM），200K/c=4 两侧均不可行（>95GB）——完整来源见
+  `qwen36-rebuild-spec.md` §2.4/§2.5。
 
 **验收**：一份事实基线文档，把上述每项写成"实测值 + 复现命令"。
 
 #### B1 · 正确性优先（M2→M3，约 1 个月）
 
 刻意放弃所有性能：eager、batch=1、无 CUDA Graph、无投机、无前缀缓存。
+**性质提醒**：以下五项里的 GDN 层/RoPE/MLP/门控/modelopt 加载**全部是新写代码**
+（`oracle/qwen36_vllm/` 不含模型数学，只含编排层，见本节开头的纠偏），不要按"移植"的
+工作量估计排期。
 
 - GDN 层（conv1d state + gated delta rule + 输出门）
 - Full attention 层（走 sparkinfer paged）
@@ -346,29 +384,66 @@ backend；滑窗作为显式 backend capability"）：这条**验证了 A1/A2 �
 
 **验收门禁**：与 HF transformers 参考实现在贪心解码下**逐 token 对齐**
 （至少 3 个工作负载 × 512 token）；逐层 logits 余弦相似度记录进 bfdiag。
+**质量验收基线**（Qwen3.6-vLLM 时代实测，2026-07-21/22，完整来源见
+`qwen36-rebuild-spec.md` §2.3）：MMLU-Pro **84.54%**（vs 官方 86.2，−1.7pp 噪声内）；
+HumanEval **44.5%** / HumanEval+ **43.3%**（vs 同权重 stock vLLM 43.3%/42.7%，无退化）。
+**⚠️ 这三个数字目前在 `docs/model-support.md:49` 里被错标成 Laguna 的当前质量数字**——
+引用时以本节和 `README.md` 的历史数字表为准，不要拿 `model-support.md` 当独立确认，
+详见 [`../notes/2026-08-02-laguna-docs-inherited-qwen36-numbers.md`](../notes/2026-08-02-laguna-docs-inherited-qwen36-numbers.md)。
 
 #### B2 · 服务化（M3，约 1 个月）
 
 - 接入固定槽位调度 + 连续批处理
-- 递归状态纳入槽位生命周期（reset / 复用 / 看门狗回收）
-- CUDA Graph 捕获（decode 路径；GDN 的状态更新是否 graph-safe 是关键 **[待验证]**）
-- 前缀缓存（含递归状态 checkpoint 与 KV 块的联动驱逐）
+- 递归状态纳入槽位生命周期（reset / 复用 / 看门狗回收）——协调者设计（对应 A3）见
+  `qwen36-rebuild-spec.md` §3.3，六条修改（不做统一分配器、两数字前缀匹配、投机保守释放、
+  同轮不可跨请求借用、逐资源驱逐预算、块大小对齐）来自
+  [`hybrid-cache-prior-art.md`](../notes/2026-08-01-hybrid-cache-prior-art.md)
+- CUDA Graph 捕获（decode 路径；GDN 的状态更新是否 graph-safe 是关键 **[待验证]**——
+  本轮确认这条**没有可抄的参照**：Laguna 的 decode 图从不触碰递归状态，其 warmup 复用天然
+  安全，oracle 当年的解法是保留 `2×batch_size` 专用 warmup 槽（GDN 状态非幂等，不能用真实
+  请求槽热身），这个设计要在自建 CUDA Graph 骨架上重新验证，不是照抄就对，见
+  `qwen36-rebuild-spec.md` §3.5、§6.1 判定的**第一难点**）
+- 前缀缓存（含递归状态 checkpoint 与 KV 块的联动驱逐——A3 的第一个真实用户，
+  `BlockPool._on_evict_block` 挂钩已就位但值为 `None`，是否直接接线还是被协调者新设计取代
+  留给 A3 落地时拍板）
 - 并发 ≥ 2
+- **前置条件（本批新增）**：`bfdiag/daemon/provider.py` 目前直接持有具体的 `LagunaBackend`/
+  `DFlashEngine` 类型，B2 的验收依赖 bfdiag（run record / `bf diff`），需要 Track A 把
+  `bfdiag` 的 provider 改成按协议持有，**应在 B2 开始前完成**，不是可以顺手拖到 B2 期间做的小事
+  （见 `architecture.md` §3.5.4，`qwen36-rebuild-spec.md` §3.6）
 
 **验收**：HTTP 端到端，OpenAI + Anthropic 双协议回归全绿；
 与 B1 的 eager 路径贪心 bit-exact。
 
 #### B3 · 性能与投机（M4，约 1 个月）
 
-**两个分支，取决于 B0 里"MTP 是否带 GDN"的结论（[待验证]，不预判）**：
-- 若带 GDN：MTP draft / verify（Qwen3.6 自带 1 层 MTP），含**GDN 递归状态的推测回滚**（本轨道当前
-  假定的最难项）
-- 若不带 GDN：MTP draft / verify 退化为标准 verify，**这一项直接消失**，B3 体量应下修
-- GDN kernel 调优或自研（依据 B0/B2 的 profiling）
+**只有一个分支**（B0 的 B-6 结论已定：MTP 头本身无 GDN，但主模型侧回滚问题原样保留，
+不再按"带/不带 GDN"写两个分支）：
+
+- MTP draft / verify（Qwen3.6 自带 1 层 MTP，草稿侧因头部无 GDN 而少一块状态管理），
+  含**主模型 48 层 GDN 递归状态的推测回滚**——寻址方案（`_ssm_spec_row`）与 accept/reject
+  判定算法已经现成可用（见本节开头），真正要重新解决的只是把这两者接到自建 CUDA Graph +
+  自建模型图上，与 D-3（ReplaySSM Ring Spec-Verify）合并排期
+- GDN kernel 调优或自研（依据 B0/B2 的 profiling；本轮数据显示 GDN 恒占 <5.1% decode 时间，
+  优先级应低于 NVFP4 GEMM 与 attention 调优，见 B0）
 - **KV dtype 待定**：[待验证]，取决于 B0 里 NVFP4 KV vs FP8 KV 的本机对比结果，不写死 "FP8 KV"
 - 长上下文（128K / 256K）容量与吞吐
 
 **验收**：接受率与吞吐进 bfdiag 基线；与上游框架同 prompt 同参数做 A/B。
+**性能验收基线**（Qwen3.6-vLLM 时代实测终值，完整轨迹与噪声说明见
+`qwen36-rebuild-spec.md` §2.1/§2.2）：
+
+| 指标 | 历史基线（终值） | 配置 / 日期 |
+|---|---|---|
+| 吞吐（128K, c=4, warm） | **222.44 tok/s** | MTP K=3，2026-07-21，`PROGRESS.md:4239-4244` |
+| 吞吐（64K, c=4, warm） | **236.69 tok/s**（更可信）/ 267 tok/s（较低置信度，仅架构文档回声） | 同上，2026-07-21 |
+| MTP 接受率（128K, c=4, warm） | **50.3%**（约每轮 2 token） | 与 222.44 tok/s 同批测量，2026-07-21 |
+| 256K, c=4（cold, chunked） | 1.557 tok/s，双方可行，82.8% 峰值显存 | 2026-07-19 |
+
+**新实现打不平这些数字就是退步，但对比前必须先确认口径一致**——这些数字全部是在 vLLM
+执行路径下测的（含 vLLM scheduler/ForwardContext 开销），新框架走 Track A 抽象后开销分布
+不同，理论上有改善空间但不是承诺；且接受率在当年不同测量批次间本身有 3+pp 波动（含一次
+已定位的计数 bug），不要用单次数字判定退步/进步，按仓库纪律先 `bf diff` 再比较。
 
 ### Track C · 稳定性（P1，贯穿 M1→M6）
 
@@ -611,6 +686,8 @@ drafter + 投机专用 `kv_cache_dtype`）读代码后发现**不完全对**—�
 
 - [`architecture.md`](architecture.md) — 当前架构与目标架构
 - [`model-support.md`](model-support.md) — 模型支持矩阵 + 接入新模型的操作指南
+- [`qwen36-rebuild-spec.md`](qwen36-rebuild-spec.md) — Track B 重建规格：`oracle/qwen36_vllm/`
+  逐模块判定与新位置映射、Qwen3.6-vLLM 时代验收基线、在 Track A 抽象上的重建设计、风险清单
 - [`diagnostics-guide.md`](diagnostics-guide.md) — bfdiag 使用指南（仍然有效，必读）
 - [`archive/README.md`](archive/README.md) — 已归档文档索引及归档原因
 - [`../notes/README.md`](../notes/README.md) — 116 篇调查记录的分类索引
