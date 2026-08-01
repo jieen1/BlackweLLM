@@ -271,12 +271,27 @@ class FakeEngineProvider:
         self._load_count = 0
         self._unload_count = 0
 
-    def load(self) -> None:
+    def load(self, *, on_stage: Callable[[str], None] | None = None) -> None:
+        """Signature matches ``EngineProvider.load`` exactly (see N7 in
+        docs/roadmap.md / notes/2026-08-01-bfdiag-assertion-audit.md):
+        before this fix, this method took no ``on_stage`` parameter at
+        all, while the Protocol it is supposed to satisfy declares one and
+        ``LagunaEngineProvider.load`` implements it. Every current call
+        site (``server.py``, ``canary.py``) calls ``load()`` bare, so the
+        mismatch was dormant -- passing ``on_stage=`` anywhere would have
+        raised ``TypeError`` for this provider specifically. The fake has
+        no real multi-phase loading to report sub-stages for, so it just
+        calls ``on_stage`` once at the end, matching a caller's minimum
+        expectation ("this stage name fires when load() finishes") without
+        inventing stage names the real provider doesn't also use.
+        """
         if self._load_delay_s:
             time.sleep(self._load_delay_s)
         self._loaded = True
         self._load_count += 1
         self._dirty = 0
+        if on_stage is not None:
+            on_stage("after_reset")
 
     def reset(self) -> None:
         if self._crash_on_reset:
