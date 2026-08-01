@@ -113,15 +113,20 @@ def _attempt_cg_capture(name: str, capture_fn: Callable[[], None], *, strict: bo
         capture_fn()
         return "captured"
     except Exception:
+        if strict:
+            action = "refusing to finish starting (QSR_DFLASH_REQUIRE_CG=1, the default)"
+        else:
+            action = (
+                f"degrading to {name}'s eager fallback (QSR_DFLASH_REQUIRE_CG=0, "
+                "explicitly opted out of the default)"
+            )
         logger.error(
-            "DFlash: %s CUDA Graph capture failed -- with QSR_DFLASH_REQUIRE_CG=1 "
-            "(the default) this refuses to finish starting rather than degrade "
-            "to %s's eager fallback, which has a known, not-yet-root-caused "
-            "correctness gap against the CG path at kv_len>=400 (see "
-            "notes/2026-08-02-eager-verify-cg-verify-divergence.md). Set "
-            "QSR_DFLASH_REQUIRE_CG=0 to degrade instead of refusing to start.",
+            "DFlash: %s CUDA Graph capture failed -- %s. The eager fallback has "
+            "a known, not-yet-root-caused correctness gap against the CG path at "
+            "kv_len>=400 (see notes/2026-08-02-eager-verify-cg-verify-divergence.md) "
+            "-- that gap is exactly why refusing to start is this repo's default.",
             name,
-            name,
+            action,
             exc_info=True,
         )
         if strict:

@@ -23,6 +23,16 @@ else:
 
 `self._verify_cg` 只在 `_capture_verify_cg()`（`_init_cuda_graph()` 内，构造期调用一次）里被赋值——成功赋成真实对象，失败赋 `None`。**全仓库搜索确认没有第二处赋值**，构造完成后这个值终身不变。没有任何按 shape/batch/kv_len 走的旁路条件。`_partial_verify_cgs`（`bfdiag/daemon/provider.py` 里用 `getattr(..., {})` 防御性引用）在 `runtime/` 里**根本不存在**，是给未来功能占位的引用，不是今天的第二条触发路径。
 
+## `QSR_DFLASH_REQUIRE_CG` 默认值改动的真机端到端验证
+
+用 `scripts/blackwellm_ctl.sh start`（真实 HTTP 服务，不是 `bf daemon`）在本机验证了三种场景，全部符合预期：
+
+1. **默认配置（无任何覆盖）**：服务正常起来（`verify_cg`/`draft_cg` 都正常捕获，跟以往一致）。冷启动 curl `/metrics` 确认 `blackwellm:dflash_cg_captured{graph="draft"} 1` / `{graph="verify"} 1`；发一个真实 `/v1/chat/completions` 请求（200，正常返回），再 curl 一次确认 `requests_completed_total` 计数、`dflash_cg_captured` 数值都稳定不变。
+2. **`QSR_DFLASH_DEBUG_FORCE_CG_FAIL=verify`,不覆盖 `QSR_DFLASH_REQUIRE_CG`（新默认值 `1` 生效）**：服务**启动失败**——traceback 从 `_do_capture` 一路原样往上传（`_attempt_cg_capture` → `_capture_verify_cg` → `_init_cuda_graph` → `DFlashEngine.__init__` → `LagunaBackend.enable_dflash` → `ServerEngine._load_laguna_model`），FastAPI 的 `lifespan` 捕获到后打 `Application startup failed. Exiting.`。之后 `pgrep` 确认没有 `server.app` 进程，curl `/health` 拿到 `000`（连接被拒），`nvidia-smi` 确认显存已经完全释放（回到 ~1.5GB 基线,没有半加载状态残留)。**"拒绝启动"这条路径端到端确认生效。**
+3. **`QSR_DFLASH_DEBUG_FORCE_CG_FAIL=verify QSR_DFLASH_REQUIRE_CG=0`（显式选择退回旧行为)**：服务正常起来,启动日志里能看到 `logger.error`（带 `exc_info`)明确写着"verify CUDA Graph capture failed -- degrading to verify's eager fallback...";curl `/metrics` 确认 `{graph="verify"} 0`、`{graph="draft"} 1`（只有 verify 被强制失败，draft 不受影响);发一个短 prompt 的真实请求,200 正常返回（**这只证明"没崩",不代表输出正确**——这次调查已经证明 eager verify 在 kv_len≥400 时输出会跑偏，这个请求的上下文远小于那个阈值,所以短请求成功不能反证那个分歧不存在)。
+
+三个场景加起来把"新默认值真的按预期工作"这件事从"读代码觉得应该对"变成了"真机确认过"。
+
 **结论：eager verify 今天只有一条触发路径——verify CG 在启动期捕获失败（或 `QSR_VERIFY_CUDA_GRAPH=0` 主动关闭）。** 这是一个**潜伏风险**，不是"正在发生的活跃故障"：本次会话里每一次冷启动，verify CG 和 draft CG 都捕获成功（daemon 启动日志反复确认），今天的生产服务没有理由正在通过这条路径服务任何请求。风险在于：一旦某次启动 verify CG 捕获失败，在这个数值 bug 修好之前，`QSR_DFLASH_REQUIRE_CG=1` 的默认值会让服务拒绝启动而不是带着这个缺陷继续跑。
 
 ## 实测证据
