@@ -5,6 +5,13 @@
 >
 > 本文档中所有"现状"数字均为 2026-08-01 在本仓库实测所得，来源在正文标注。
 > 标注 **[待验证]** 的条目是尚未在本机跑过的假设，不作为决策依据，只作为待办。
+>
+> **2026-08-01 二次修订**（基线推进到 `6acc4ba`）：消化
+> [`investigation-queue.md`](investigation-queue.md) §D 的上游调研结论，重排优先级；
+> §7 的 D3（GPU CI 形态）、D6（Qwen3.6 主线 checkpoint）拍板，加上 N8
+> （`--session-affinity`，见 [`implementation-plan.md`](implementation-plan.md) §6.1）拍板；
+> 新增风险 RK9（冷启动/首次真实形状路径）。本轮另有三条 [待验证] 事项由并行 agent 在查
+> （B0-8 GDN、KV dtype 选型、torch wheel 是否带 `sm_120`），本文档不预判其结论。
 
 ---
 
@@ -215,7 +222,7 @@ vision_config     : 存在（多模态）— 本路线图只做文本版
 
 ## 4. 轨道与优先级
 
-七条轨道，按优先级排列。轨道内部是有序的，轨道之间大量并行。
+九条轨道（0、A–H），按优先级排列。轨道内部是有序的，轨道之间大量并行。
 
 ### Track 0 · 止血（P0，M1 内必须清零）
 
@@ -277,25 +284,43 @@ vision_config     : 存在（多模态）— 本路线图只做文本版
 **体量**：约 1.5 个月。**风险**：这是一次动到核心执行路径的重构，
 Laguna 的性能与位精确是硬约束，必须逐步切换而非一次性替换。
 
+**2026-08-01 补充**（`investigation-queue.md` D-4，vLLM v0.26.0 "每 KV-cache group 选不同 attention
+backend；滑窗作为显式 backend capability"）：这条**验证了 A1/A2 的设计方向，不改变它**——A1 本就按
+层类型序列描述架构（full / sliding / linear-attention 逐层区分），Qwen3.6 的 16 full + 48 GDN 混合
+正是这个设计要接住的形状。**唯一的具体补充**：`BackendCapabilities`（§3.5.3）目前只有五个布尔标志，
+没有把"滑窗"显式建模成一等能力——当前 Laguna 的 SWA 是通过层类型隐式处理的。A1/A2 落地时应把滑窗
+参数（窗口大小、per-layer 是否滑窗）提升成 `ModelSpec`/能力查询里可查询的字段，而不是留在模型图内部。
+不新开条目，作为 A1/A2 实现时的一条设计备忘。
+
 ### Track B · Qwen3.6-27B 接入（P1，M2→M4）
 
 分四段，每段有独立的验收，不允许"边写边猜"。
 
 #### B0 · 事实基线（M2，约 2 周）
 
-- 本地已有变体清点与选型：`nvidia/Qwen3.6-27B-NVFP4`、`unsloth/...`、
-  `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP`（含 MTP 层，单文件）、
-  `morosystems/ThinkingCap-...`。确定**主线 checkpoint**（倾向文本版 + 带 MTP）。
+- ✅ **主线 checkpoint 已拍板（见 §7 D6）：官方 `nvidia/Qwen3.6-27B-NVFP4`**。本地其余变体：
+  `unsloth/...`（compressed-tensors，不是 modelopt——量化格式必须逐 checkpoint 读，不能按架构推断）、
+  `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP`（留作交叉验证 baseline）、`morosystems/ThinkingCap-...`。
+  衍生任务：写一个按 tensor 名前缀跳过 `vision.*` 的加载过滤器（333 个张量，一次写好可复用）；
+  A1 的 `validate_text_only` 语义要跟着调整为"允许 `vision_config` 存在但断言零 vision 张量被加载"
+  （见 RK8）。
 - Tensor 清单与 modelopt scale 语义逐项确认（不猜命名）。
 - **[待验证]** sparkinfer paged attention 在 `head_dim=256 / gqa_group=6 /
   page_size ∈ {64,128} / fp8 KV` 下的正确性与吞吐——planner 里已有对应分支，
-  但没有本机实测记录。
+  但没有本机实测记录。**验证时应同时检查 warmup/autotune 是否覆盖了这个真实形状**
+  （见 RK9、`investigation-queue.md` C-1，同一类"首次真实形状才暴露代价"的问题）。
 - **[待验证]** GDN 方案选型三选一：
   1. 依赖 `flash-linear-attention`（本地已有 v0.5.2，`fla/ops/gated_delta_rule`
      有 chunk + fused_recurrent 两条 Triton 路径）；
   2. 从 `oracle/qwen36_vllm/` 的 vLLM 路径移植；
   3. 自研 Triton kernel。
   建议先 1 拿正确性，profiling 说话后再决定要不要 3。
+- **[待验证，另一 agent 在查，本文档不预判]** Qwen3.6 的 MTP 层是否带 GDN
+  （`investigation-queue.md` B-6）：若不带，B3 里"GDN 递归状态推测回滚"这一项直接不存在，
+  是本轨道当前假定的最难项——**结论出来前 B3 只写两个分支，不写死**（见 B3）。
+- **[待验证，另一 agent 在查，本文档不预判]** NVFP4 KV vs FP8 KV 在我们卡上的对比
+  （`investigation-queue.md` C-2）：上游第三方在 RTX PRO 5000 上的数字（NVFP4 KV prefill 慢
+  1.7–1.8×）不是我们的卡也不是我们的形状，只作参考，不作决定。
 - 容量测算：64 层 / 256K 上下文 / 96 GB 下的 KV + 递归状态显存账，
   给出 context × 并发的可行域。
 
@@ -328,9 +353,12 @@ Laguna 的性能与位精确是硬约束，必须逐步切换而非一次性替�
 
 #### B3 · 性能与投机（M4，约 1 个月）
 
-- MTP draft / verify（Qwen3.6 自带 1 层 MTP），含**GDN 递归状态的推测回滚**
+**两个分支，取决于 B0 里"MTP 是否带 GDN"的结论（[待验证]，不预判）**：
+- 若带 GDN：MTP draft / verify（Qwen3.6 自带 1 层 MTP），含**GDN 递归状态的推测回滚**（本轨道当前
+  假定的最难项）
+- 若不带 GDN：MTP draft / verify 退化为标准 verify，**这一项直接消失**，B3 体量应下修
 - GDN kernel 调优或自研（依据 B0/B2 的 profiling）
-- FP8 KV
+- **KV dtype 待定**：[待验证]，取决于 B0 里 NVFP4 KV vs FP8 KV 的本机对比结果，不写死 "FP8 KV"
 - 长上下文（128K / 256K）容量与吞吐
 
 **验收**：接受率与吞吐进 bfdiag 基线；与上游框架同 prompt 同参数做 A/B。
@@ -353,9 +381,17 @@ Laguna 的性能与位精确是硬约束，必须逐步切换而非一次性替�
   每级降级都要出指标（现在部分已有，需成体系）。
 - **C3 看门狗覆盖**：已有 stale slot 回收，需要覆盖测试 + 故障注入。
 - **C4 确定性与可复现**：per-request seed 已有；补 bit-exactness 回归门禁，
-  纳入 CI（GPU 侧需要一台可用机器，**需要拍板 GPU CI 怎么做**，见 D3）。
+  纳入 CI。**D3 已拍板 (b)**：本地 pre-push 门禁 + 人工签核，落地机制（`make gate-local` +
+  PR 签核勾选项）见 [`implementation-plan.md`](implementation-plan.md) §7.3。
 - **C5 长稳测试**：24h soak，监控显存碎片、host 内存、槽位分布、指标漂移。
 - **C6 崩溃可诊断**：进程级异常要留下 bfdiag run record，不是只有一行 traceback。
+- **C7 冷启动 / 首次真实形状路径审计**（本批新增，见 RK9）：`235f51e` 修的是"每个未见过的
+  page-table 宽度都触发 30–100s JIT 重编译"，但修复自己的提交记录留了一条明确未闭合的口子——
+  DFlash 的 eager verify 回退路径不在启动期预热覆盖范围内，而且 CUDA Graph 捕获**成功**的
+  可观测性目前是 0（只有失败会显式可见）。这不是孤立 bug，是"首次遇到真实形状/真实路径的代价被
+  系统性低估"这一模式的又一个实例——`investigation-queue.md` C-1（sparkinfer warmup/autotune
+  是否用真实形状）与 B0-3 的验证范围都属于同一类别。详细任务拆解见
+  [`implementation-plan.md`](implementation-plan.md) §7.3/C7。
 
 ### Track D · 易用性（P1，M2→M5）
 
@@ -391,19 +427,68 @@ Laguna 的性能与位精确是硬约束，必须逐步切换而非一次性替�
   把结果做成一张兼容性表放进文档。
 - **E4 reasoning 内容的正确暴露**：OpenAI 的 `reasoning_content` /
   Anthropic 的 `thinking` block，而不是一刀切删除（与 T0-3 同一件事的下游）。
+- **E5 chunked input-logprob 默认开启**（本批新增，`investigation-queue.md` D-8，来自
+  SGLang v0.5.16）：削峰值显存，我们已有 logprobs 路径、双协议都暴露 `top_logprobs`。
+  **小而自足，不依赖 Track A，也不用等 M3**——建议提前排进 M2，跟 Track F 的 F1 窗口扫测
+  蹭同一个 GPU 验证窗口一起做（见 Track F）。
 
-### Track F · 性能（P2，机会主义，M3→M6）
+### Track F · 性能（P2，机会主义，M3→M6 —— 但两条例外见下）
 
 **降级为机会主义轨道**：只在有明确 roofline 依据、且不损害 Track C/D 的
-前提下做。已知的候选方向（来自 2026-07-31 的研究记录）：
+前提下做。已知的候选方向（来自 2026-07-31 的研究记录，以及本批 2026-08-01 消化的
+`investigation-queue.md` §D 上游调研）：
+
+**2026-08-01 本批新增两条例外，从"机会主义/P2"提升到 P1、排进 M2**——不是因为它们比
+Track A 更急，是因为它们**不依赖 Track A、成本低，且直指本项目当前两个最硬的约束**
+（吞吐上限、显存上限），有本机实测数据支撑，不是纯粹的"顺手试试"：
+
+- **接受率 96.3–100% 但投机窗口固定**（D-2）：Laguna 的接受率实测 96.3–100%（§1.1，
+  2026-07-31/08-01 复现），而 DFlash 的 `NUM_SPECULATIVE_TOKENS` 固定为 15——这个组合
+  说明**限制吞吐的很可能是窗口本身，不是接受率上限**。第一步是便宜的：不实现自适应
+  控制器（DSpark 风格），先把窗口从 15 静态调大，`bf diff` 测吞吐与接受率；只有静态调大
+  见顶了才上置信度驱动的自适应窗口——vllm #49369 报告 DSpark 在某些负载上比不开投机还慢，
+  不是白捡，必须按工作负载分别 A/B。
+- **显存是硬约束，且比想象中紧**（D-3）：Laguna 权重 66.8 GB ≈ 67 GB（59.5 GB MoE +
+  7.3 GB non-MoE，`notes/2026-07-29-gpu-memory-audit.md`），96 GB 卡上给 KV + 投机
+  scratch 的预算很紧。协调者在本轮任务中的实时汇报：生产服务实测显存 94.2/97.9 GB
+  （**98.8% 占用**）；2026-07-29 的静态审计（1 slot/131K 配置）测得的是 76.0/95.6 GB
+  （79.5% 占用），两次配置不同、不能直接对比，但方向一致——**投机 scratch 在跟 KV 抢一块
+  越来越紧的预算**。ReplaySSM Ring Spec-Verify 报告的 11.5 GB → 1.8 GB 是别人的卡、
+  别人的形状，不能当我们的数字用，第一步是补一次带日期来源的本机审计，再判断这个技巧
+  有多少能在我们自己的调度/scratch 复用层面拿到（我们做），有多少要动 sparkinfer 的
+  kernel 内部（转 SparkInfer，写清楚交接，不直接改源码）。这条的结论应该喂给 Track A 的
+  A3 协调者设计——投机 scratch 迟早要变成 A3 管理的资源类型之一。
+- **调度纪律**：这两条不需要 Track A，可以现在做；但都需要真机 GPU 时间，**应优先蹭
+  P0-E 第 5 步或 C-LIVE 的 GPU 窗口，不单独申请专用时段**——本机只有一块 GPU，任何需要
+  GPU 的验收项天然串行（RK5），这也是 D3 选 (b) 而不是 (a) 的同一条理由。
+- 完整任务拆解（F1/F2 的分步骤清单）见 [`implementation-plan.md`](implementation-plan.md) §7.6。
+
+**已核实、从待办移除的一条**：`investigation-queue.md` D-5（hybrid SWA+full DFlash
+drafter + 投机专用 `kv_cache_dtype`）读代码后发现**不完全对**——投机专用 `kv_cache_dtype`
+已经是现状（draft KV cache 按 FP8/uint8 分配，与主模型该层自己的 dtype 选择独立）；
+"hybrid drafter"这个 vLLM 新能力我们走的是另一条路（固定 6 层全 SWA 的专用小 draft
+模型，KV cache 只有 0.007 GB），已经用不同手段达到类似的省显存效果。**这不是降级，
+是核实后发现已经做到**，见 [`implementation-plan.md`](implementation-plan.md) §7.6。
+
+其余仍是机会主义、不设强制时间表：
 
 - TURBO_ATTN（FP8 QK MMA）的质量回归修复：per-head descale / Hadamard 旋转 /
   自适应 FP8-BF16 切换。收益 +6%，但 code 工作负载接受率会从 97.8% 掉到 58.6%，
   当前默认关闭。
 - FA4 技法用于 prefill / extend 路径（TMA、persistent scheduler、FP8 softmax）。
+  **T0 触发条件**（`investigation-queue.md` D-6，**保持观察，不要提前动**）：FlashAttention
+  维护者已合入 sm120 PR（#2413，"WIP"），并有面向 5090 的 TMA + warp specialization PR
+  在做（#2440，正是这里计划要移植的技法）。但 FA4 算法本体上不了 SM120（缺 tcgen05/TMEM）；
+  当前 sm120 路径只有 FP16/BF16、`main` 上部分路径仍报错、在 5090 上比 FA2 **慢约 5%**。
+  触发条件是"那批 PR 落到 main 且在 sm120 上跑赢 FA2"——到那时才从"自己移植"变成
+  "评估采纳"。
 - FP8 attention 的 `num_stages≥2`（SMEM 36 KB « 99 KB，有余量）。
 - MoE 输出中心并行（Warp Decode 类方案），2–4 周量级，长期备选。
 - GDN kernel 自研（依赖 Track B 的 profiling 结论）。
+- **NVFP4 per-token online MoE 量化**（`investigation-queue.md` D-7，vLLM v0.26.0 +
+  CuTe-DSL MXFP4）：Laguna 是 256 专家 NVFP4 MoE，直接可比。**kernel 形状 → 写清楚交给
+  SparkInfer 团队评估，不直接改其源码**（按 `AGENTS.md` 规矩）——这条我们自己要做的部分
+  只是写一份技术提案文档，不是实现。
 - **sparkinfer 里还有 9 处未放宽的 gate**（本批发现）：`7a1d69d` 只放宽了 13 处中的 4 处
   （decode / prefill 的 analytic graph dispatch 谓词），其余 9 处——verify-graph 识别、
   各 CTA trait 选择分支、SWA budget、graph-replay 路径选择——是当初**刻意留下**的
@@ -442,7 +527,7 @@ Laguna 的性能与位精确是硬约束，必须逐步切换而非一次性替�
 | 里程碑 | 时间 | 交付 | 验收 |
 |---|---|---|---|
 | **M1** | 2026-08 | Track 0 全清；Track A 设计定稿；文档基线（本次） | CI 绿、测试全绿、依赖可复现、抽象层设计评审通过 |
-| **M2** | 2026-09 | Track A 落地，Laguna 迁移零回归；Track B0 事实基线；Track B1 起步 | Laguna 贪心 bit-exact + 性能不低于基线 3%；Qwen3.6 事实基线文档 |
+| **M2** | 2026-09 | Track A 落地，Laguna 迁移零回归；Track B0 事实基线（含 B0-8 GDN-in-MTP 结论）；Track B1 起步；Track F 的 F1-1/F2-0 机会窗口测试（蹭 A6/C-LIVE 的 GPU 时段）；Track E 的 E5 | Laguna 贪心 bit-exact + 性能不低于基线 3%；Qwen3.6 事实基线文档 |
 | **M3** | 2026-10 | Qwen3.6-27B B1 正确性验收 + B2 服务化；Track D 第一批（D1/D2/D3） | Qwen3.6 逐 token 对齐；HTTP 端到端双协议绿；一条命令能起服务 |
 | **M4** | 2026-11 | Qwen3.6-27B B3 性能与 MTP；25B-A3B B0/B1 | 接受率与吞吐进基线；25B-A3B 正确性对齐 |
 | **M5** | 2026-12 | 25B-A3B 服务化；Track D 收口（D4/D5/D6）；Track E 客户端矩阵 | 三个模型系列同一套配置流程；兼容性表全绿 |
@@ -461,10 +546,11 @@ Laguna 的性能与位精确是硬约束，必须逐步切换而非一次性替�
 | RK2 | **sparkinfer 本地补丁未上游** | 发布阻塞；换机器复现不出性能 | T0-5 优先；在合入前用版本钉 + 启动校验让问题显性 |
 | RK3 | **抽象层重构回归 Laguna 性能** | 唯一的生产模型退化 | A6 的 bit-exact + 性能门禁作为硬约束；逐步切换、每步可回滚 |
 | RK4 | **25B-A3B 配置未知** | Track G 无法排期 | 尽早拉 config；在此之前 Track G 的时间是占位而非承诺 |
-| RK5 | **单 GPU、无并行的开发环境** | 每次验证成本以分钟计，是迭代速度的硬上限 | 严格执行 bfdiag 三条法则（不写一次性脚本、比数前先 `bf diff`、失败先读 trace） |
-| RK6 | **依赖链漂移**（torch / cutlass-dsl / sparkinfer / transformers） | 静默变慢或变错 | T0-6 版本合同 + 启动期校验 + CI 锁定 |
-| RK7 | **GPU CI 缺失** | 位精确与性能门禁只能人工跑 | 需要拍板（见 D3）：自托管 runner，还是本地 pre-push 钩子 + 人工签核 |
-| RK8 | **Qwen3.6 多模态字段** | 文本版 checkpoint 与多模态版共用架构名，加载器可能误判 | A1 的架构校验要显式拒绝带 vision tower 的权重，给明确错误 |
+| RK5 | **单 GPU、无并行的开发环境** | 每次验证成本以分钟计，是迭代速度的硬上限；**2026-08-01 补充**：任何需要 GPU 的验收项（A6 bit-exact、C-LIVE、F1/F2 的实测、B0/B3 的 profiling）**天然串行，不能靠并行 agent 压缩工期**——本轮已出现多个并行 agent 同时想起服务的风险，协调者已加互斥锁 + 显存守卫应对。这条也是 D3 选 (b) 而不是 (a) 的直接支撑：单卡机器上一个自托管 runner 本身就是又一个要排队抢卡的进程，不会绕开这条串行约束，只会再制造一个抢卡方 | 严格执行 bfdiag 三条法则（不写一次性脚本、比数前先 `bf diff`、失败先读 trace）；GPU 验收任务按优先级排队，不并发申请 |
+| RK6 | **依赖链漂移**（torch / cutlass-dsl / sparkinfer / transformers） | 静默变慢或变错 | T0-6 版本合同 + 启动期校验 + CI 锁定；`investigation-queue.md` C-3（PyTorch 2.13.0 wheel 是否带 `sm_120`）**另一 agent 在查，[待验证]，不预判**——若带，自编译要求终结，直接解这条风险 |
+| RK7 | ~~**GPU CI 缺失**~~ | 位精确与性能门禁只能人工跑 | ✅ **2026-08-01 已拍板 (b)**：本地 pre-push 门禁 + 人工签核（理由见 §7 D3）。RK5 补充的"GPU 验收天然串行"是这个选择成立的前提——自托管 runner（选项 a）不解决串行问题，只是把它挪到另一个进程里，还多了排队开销。机制落地见 [`implementation-plan.md`](implementation-plan.md) §7.3/C4 |
+| RK8 | **Qwen3.6 多模态字段** | 文本版 checkpoint 与多模态版共用架构名，加载器可能误判 | A1 的架构校验要显式拒绝带 vision tower 的权重，给明确错误。**2026-08-01 更新**：D6 拍板选了official `nvidia/Qwen3.6-27B-NVFP4`——这份 checkpoint **本身带 vision tower**，所以"拒绝带 vision tower 的权重"这条规则要改窄：不是"config 里出现 `vision_config` 就整体拒绝"，是"接受该 checkpoint，但要求 loader 显式处于 `language_model_only=True` 模式，断言零 vision 张量被实际加载"。这条留给 A1 落地时处理，不改 `architecture.md`，见 [`implementation-plan.md`](implementation-plan.md) §4/C-2 与 §7.1/B0-1b |
+| RK9 | **冷启动/首次真实生产形状路径系统性覆盖不足**（本批新增，2026-08-01） | `235f51e` 修的是"每个未见过的 page-table 宽度都触发 30–100s JIT 重编译"，而这个修复自己的提交记录留了一条**尚未坐实的同类缺口**：DFlash 的 eager verify 回退路径（`mode="verify"`）不在启动期预热覆盖范围内，且 CUDA Graph 捕获**成功**的可观测性目前是 0（只有失败会打 warning，成功只打 info，默认日志配置下不可见）——这不是一次性 bug，是一个模式："首次遇到的真实形状/真实路径"这一类代价一直系统性地被低估，直到真机流量把它暴露出来。`investigation-queue.md` C-1（sparkinfer warmup/autotune 是否用真实形状，另一 agent 在查）与 B0-3（sparkinfer paged attention 的验证范围）都属于同一类别 | 见 [`implementation-plan.md`](implementation-plan.md) §7.3/C7：C7-1（DFlash verify 路径预热覆盖，需 GPU 复现）、C7-2（CUDA Graph 捕获成功可观测性，可蹭 P0-E 第 5 步零增量 GPU 成本）、C7-3（呼应 investigation-queue C-1，纳入 B0-3 的验证范围）|
 
 ---
 
@@ -476,10 +562,11 @@ Laguna 的性能与位精确是硬约束，必须逐步切换而非一次性替�
 |---|---|---|
 | ~~**D1**~~ | ~~thinking / reasoning 的产品契约~~ | ✅ **已定案 2026-08-01**：按协议暴露 + `QSR_REASONING_MODE` 开关。Anthropic 侧因签名不可伪造而采用非标准事件，理由与可推翻条件见 §1.4 |
 | ~~**D2**~~ | ~~CI 与 torch 的关系~~ | ✅ **已定案 2026-08-01**：两条都要——CPU-only job 守契约，CPU-torch job 扩覆盖 |
-| **D3** | **GPU CI 形态** | (a) 自托管 runner；(b) 本地 pre-push 门禁 + 人工签核；(c) 只在里程碑节点人工全量跑 |
+| ~~**D3**~~ | ~~**GPU CI 形态**~~ | ✅ **已定案 2026-08-01：(b) 本地 pre-push 门禁 + 人工签核**。理由：这台机器只有一块 GPU（RK5），自托管 runner（选项 a）本身也要抢卡，不解决"GPU 验收天然串行"这条约束，只是换一个进程排队；而"一次验证以分钟计"正是本项目全部效率问题的根源（RK5），选项 (a) 会再制造一个抢卡方，不是治它。(c)（只在里程碑人工全量跑）门禁太松，位精确回归会在里程碑之间悄悄漂移而没人发现。落地机制（`make gate-local` + PR 签核勾选项）见 [`implementation-plan.md`](implementation-plan.md) §4/C-1、§7.3/C4 |
 | **D4** | **重命名时机** | 包目录 `qwen-sm120-runtime` → `blackwellm`、环境变量 `QSR_` → `BWLLM_`：随 Track D 一起做，还是推到 `0.2.0` 发布前一次性做 |
 | **D5** | **`oracle/qwen36_vllm/` 的处置** | (a) 保留为只读参考（当前）；(b) Track B 完成后整体删除；(c) 现在就删，需要时从 git 历史取 |
-| **D6** | **Qwen3.6 主线 checkpoint** | 带 MTP 的文本版 vs 官方 NVFP4 版——前者能做投机但来源是社区量化，后者官方但需另找 MTP 层 |
+| ~~**D6**~~ | ~~**Qwen3.6 主线 checkpoint**~~ | ✅ **已定案 2026-08-01：官方 `nvidia/Qwen3.6-27B-NVFP4`**。前提已被更正——两份候选（官方版、社区版 `sakamakismile/...-Text-NVFP4-MTP`）都带 15 个 `mtp.*` 张量，真正的取舍不是"谁能投机"，是 **provenance vs 过滤 333 个 vision 张量**。排除 vision 张量是一次性机械工作（按 tensor 名前缀跳过 `vision.*`），衍生模型（微调版、下一代 Qwen）迟早都会带 vision tower，这个过滤器无论选哪份 checkpoint 都要写；反过来 provenance 不可逆，发布时官方来源比社区量化站得住。社区文本版留作交叉验证 baseline，不弃用。<br>**衍生影响**：这个决定要求 A1 的 `validate_text_only`（RK8）从"检测到 `vision_config` 就整体拒绝"改成"接受该 checkpoint，但要求 loader 处于 `language_model_only=True` 并断言零 vision 张量被实际加载"，见 RK8 与 [`implementation-plan.md`](implementation-plan.md) §7.1/B0-1 |
+| **N8**（原属 [`implementation-plan.md`](implementation-plan.md) §6.1） | **`--session-affinity` 静默失效** | ✅ **已定案 2026-08-01：(c) 启动期拒绝该 flag**。它调的 `mtp_prefill_warm_continue` 只存在于已退役的 `oracle/qwen36_vllm/`，异常被 `try/except` 吞掉 → 每次静默回退冷 prefill、指标恒为 0、零测试覆盖——把静默降级变成显式失败。真要做 warm-continue，等 Track A 的能力查询（§3.5.3 `BackendCapabilities.warm_continue`）落地后再评估 (a) 才划算；现在做，协议地基未定，很可能要重写。落地清单见 [`implementation-plan.md`](implementation-plan.md) §6.1 |
 
 ---
 
@@ -497,6 +584,19 @@ Laguna 的性能与位精确是硬约束，必须逐步切换而非一次性替�
 - [ ] `Qwen3.6-25B-A3B` 的 `config.json`（专家数 / top-k / 是否 hybrid / 是否带 MTP）
 - [ ] sparkinfer `moe.fused_moe` 在非 256/top-10 形状下的可用性与性能
 - [ ] 现有 4 个失败测试各自的"正确期望"是什么（尤其 thinking tag 那个）
+- [ ] **（本批新增）** Qwen3.6 的 MTP 层是否带 GDN（`investigation-queue.md` B-6，另一 agent 在查）——
+  决定 Track B3 走哪个分支
+- [ ] **（本批新增）** NVFP4 KV vs FP8 KV 在我们卡上的 prefill/decode 对比（`investigation-queue.md`
+  C-2，另一 agent 在查）——决定 B3 的 KV dtype 选型
+- [ ] **（本批新增）** PyTorch 2.13.0 PyPI wheel 是否带 `sm_120`（`investigation-queue.md` C-3，
+  另一 agent 在查）——影响 RK6 与 H1"可从公开源安装"
+- [ ] **（本批新增）** 当前生产配置下的真实显存占用带日期来源的审计（Track F/F2-0）——协调者本轮
+  实时汇报的"94.2/97.9 GB，98.8%"与 2026-07-29 静态审计的"76.0/95.6 GB，79.5%"配置不同、
+  未经交叉验证，需要一次新的、注明并发/上下文配置的 bfdiag run record
+- [ ] **（本批新增）** DFlash 的 eager verify 回退路径（`mode="verify"`）是否真的会在生产流量下
+  被打到，以及 CUDA Graph 捕获成功的可观测性缺口（见 RK9 / `implementation-plan.md` §7.3/C7）
+- [ ] **（本批新增）** `NUM_SPECULATIVE_TOKENS` 从 15 静态调大是否能在不损失接受率的前提下提升吞吐
+  （Track F/F1-1）
 
 ---
 
