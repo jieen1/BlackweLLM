@@ -75,21 +75,58 @@ STEM 强、人文弱），继续在它身上做深度优化的边际收益不足
 
 > README 里的 222 / 267 tok/s 是旧数字，已在本次文档整理中更正。
 
-### 1.2 现在是红灯的（必须先止血）
+### 1.2 曾经是红灯的（Track 0 止血，2026-08-01 处理）
 
-| # | 问题 | 证据 | 影响 |
+R1–R6、R8 已在 2026-08-01 的 Track 0 批次里解决，保留在表里是为了记录**问题的形状**——
+下一次同类问题该往哪看。R7、R9 仍然开着。
+
+| # | 问题 | 证据 | 状态 |
 |---|---|---|---|
-| R1 | **CI 是红的** | `tests/test_swa_scratch_lifecycle.py` 裸 `import torch`；CI 只装 `.[dev]`（无 torch）→ 收集期就 ImportError。`test_bfdiag_cold_capacity.py` / `test_bfdiag_ring.py` 同样问题 | "CPU-only 单元测试"这条护栏实际已失效 |
-| R2 | **4 个测试失败** | 装了 torch 后：`926 passed, 4 failed` | 3× `test_bfdiag_ring.py::TestVerifyOnlyTrace`（fake backend 缺 `block_size`/`device`，fixture 过时）；1× `test_laguna_server_integration.py::test_laguna_chat_response_preserves_generated_think_tags` |
-| R3 | **thinking 标签契约自相矛盾** | `d52a3b1` "Strip thinking tags from all API responses" 与断言"保留 think 标签"的测试同时存在于 main；该 commit 的 message 写着 "Tested: unit tests pass"，但那个测试当时就是红的 | 产品行为未定义 |
-| R4 | **thinking 剥离逻辑有误伤风险** | `server/formats/thinking.py` 的 `_ORPHAN_CLOSE_RE = r"\A.*?</think>"` 会把响应里**任何** `</think>` 之前的全部内容删掉；`_UNCLOSED_THINK_RE = r"<think>.*\Z"` 会把 `<think>` 之后全部删掉 | 让模型"讲解 `<think>` 标签"这类请求会被静默截断——对代码模型是高频场景 |
-| R5 | **依赖的 sparkinfer 是本地改过的** | 2026-07-31 的性能提升来自改 sparkinfer 的 gating 判定（`attention/paged/_forward.py`、`planner.py`），这些改动在 `/home/bot/project/sparkinfer` 本地，未上游 | 换一台机器 / 装 PyPI 版 sparkinfer 就复现不出当前性能；发布阻塞项 |
-| R6 | **torch 版本合同不一致** | `pyproject.toml` 钉 `torch==2.11.0`；实际测试环境是 `2.13.0a0`；sparkinfer README 要求 `torch>=2.12` | 按 pyproject 装出来的环境跑不了 |
-| R7 | **Qwen3.6 支持已被摘除** | `ff4d858` / `a9cb932` 把 Qwen3.6 + DirectModelRunner 整体移入 `oracle/qwen36_vllm/`（8370 行，仍依赖 vLLM）；`ServerEngine.__init__` 对 `backend != "laguna"` 直接抛 `ValueError` | 不是"退化"，是"截肢"——要恢复等于重写 |
-| R8 | **文档全面过期** | `AGENTS.md` 指名的 4 个模块（`direct_model_runner.py` / `compat_vllm.py` / `metadata_builders.py` / `cuda_graphs.py`）都已不存在；README 英文段说"Currently optimized for Qwen3.6-27B"，中文段说"当前生产模型为 Laguna-S-2.1"，互相矛盾 | 本次整理已处理 |
-| R9 | **仓库卫生** | `server/engine.py.bak` / `.orig`、`runtime/backends/laguna.py.bak`、根目录 9 个 `*.log`、`build/`、21 个残留分支 / worktree | |
+| R1 | **CI 是红的** | 原诊断是 `tests/test_swa_scratch_lifecycle.py` 等裸 `import torch` 导致 pytest 收集期 ImportError。**实测后修正：流水线根本没走到 pytest**——`ruff check .` 这一步就先红了（`benchmarks/quick_check.py` 自 `e6793bc` 起有 4 个未使用 import）。而且真正违反 CPU-only 契约的模块不是 3 个而是 **5 个**，其余 4 个是经 `bfdiag.workloads` 摸到 sparkinfer、需要 fastapi、`monkeypatch.setattr` 的字符串目标会真的 import sparkinfer 子模块——**只有真跑才暴露，grep 看不见** | ✅ 已解决 |
+| R2 | **4 个测试失败** | 装了 torch 后 `926 passed, 4 failed`：3× `test_bfdiag_ring.py::TestVerifyOnlyTrace`（假 backend 缺 `block_size`/`device`，测试替身漂移，非生产 bug）；1× thinking 契约冲突 | ✅ 已解决 |
+| R3 | **thinking 标签契约自相矛盾** | `d52a3b1` "Strip thinking tags from all API responses" 与断言"保留 think 标签"的测试同时存在于 main；该 commit 写着 "Tested: unit tests pass"，但那个测试当时就是红的 | ✅ 已定契约，见 §1.4 |
+| R4 | **thinking 剥离逻辑有误伤风险** | 根因比"贪婪"更准确：两条正则**没有锚定**，把文本里任何位置的 `<think>`/`</think>` 都当成删除信号。`_ORPHAN_CLOSE_RE = r"\A.*?</think>"` 删掉任何 `</think>` 之前的全部内容 | ✅ 已解决 |
+| R5 | **sparkinfer 的性能补丁不可复现** | 2026-07-31 的 gating 放宽**从未提交到任何分支**，工作区被清后丢失（所以按分支做 pickaxe 搜索找不到）。已从悬空提交 `1e306d7`/`ec8bb1eb` 恢复，rebase 到 upstream `3bd3a2e`，现为 `jieen1/sparkinfer` `origin/master` 的 `7a1d69d`/`0844a4f` | ✅ 已解决，见 [`sparkinfer-fork-delta.md`](sparkinfer-fork-delta.md) |
+| R6 | **torch 版本合同不一致** | `pyproject.toml` 钉 `torch==2.11.0`；实测环境 `2.13.0a0`；sparkinfer 要求 `>=2.12` | ✅ 钉 `torch==2.13.0` |
+| R7 | **Qwen3.6 支持已被摘除** | `ff4d858` / `a9cb932` 把 Qwen3.6 + DirectModelRunner 整体移入 `oracle/qwen36_vllm/`（8370 行，仍依赖 vLLM）；`ServerEngine.__init__` 对 `backend != "laguna"` 直接抛 `ValueError` | 🔴 未动——不是"退化"是"截肢"，走 Track A/B 重新接入 |
+| R8 | **文档全面过期** | `AGENTS.md` 指名的 4 个模块都已不存在；README 英文段说"Currently optimized for Qwen3.6-27B"，中文段说"当前生产模型为 Laguna-S-2.1" | ✅ 已解决 |
+| R9 | **仓库卫生** | `server/engine.py.bak` / `.orig`、`runtime/backends/laguna.py.bak`、根目录 9 个 `*.log`、`build/`、21 个残留分支 / worktree | 🟡 部分——sparkinfer 侧的 `blackforge-main` 已删，仓库自身待清 |
 
-### 1.3 结构性短板（不是 bug，是设计债）
+**这一批的方法论教训**（值得比修复本身更认真地记住）：
+
+- **三个分支各自全绿、合起来是红的。** api 分支在装了 fastapi 的环境里验证，ci 分支在没装的环境里验证，直到合并才暴露 `test_format_regression.py` 违反了它自己 docstring 声明的 CPU-only 契约。**并行分工必须配一次真实的合并验证**，否则每个分支的"绿"都是局部的。
+- **诊断要跑，不能读。** R1 的原始诊断（我方）是错的——错在只看代码不看流水线实际死在哪一步。
+- **提交信息里的 `Tested:` 是有约束力的。** `d52a3b1` 声称 "unit tests pass" 却带着红测试进了 main，直接制造了 R2/R3。
+
+### 1.3 这一批新发现的问题（尚未解决）
+
+| # | 问题 | 证据 | 归属 |
+|---|---|---|---|
+| N1 | **结构化输出是空壳** | `runtime/structured_output.py` 的 `GrammarState.apply_mask()` / `apply_mask_batch()` 在 `server/engine.py` 里**从未被调用**。`json_object` / `json_schema` 请求会被正常接受，但**完全不约束生成**——静默失败，客户端拿到的是普通文本 | Track E |
+| N2 | **`stop` 序列完全未实现** | 两套协议都是 | Track E |
+| N3 | **`seed` 语义可疑** | 每个 token 重新播种，而不是推进同一个 generator | Track E |
+| N4 | **bfdiag 的隔离保证可能已经失效** | `bfdiag/checkpoint/state.py` 有一条 `"bug_found_not_fixed"` 手册条目 + 专门的回归测试，指向 `laguna.py:1647,1653` 的张量轴错误。但真实的 `reset_slot` 已被重写（现在 1945-1965），为前缀缓存保留而**完全不再清零 KV 内存**；那两个行号现在指向另一个函数。连带问题：`bfdiag/checkpoint/restore.py` 明确依赖 `reset_slot` 清掉 checkpoint 范围外的残留来保证恢复隔离性。那个回归测试仍然绿，因为它**从不调用真实函数**，只在合成张量上复现抽象的切片 bug 模式 | Track C（**优先**——诊断平台自己说谎比一般 bug 危险） |
+| N5 | **Anthropic 侧拿不到规范形态的 reasoning** | 见 §1.4 | Track E |
+| N6 | **全套件下的 flaky** | `test_bfdiag_record.py::test_cli_ls_labels_an_unfinished_record_running`。已缩窄：单文件 8/8 过；bfdiag 子集 + 12 路 CPU 满载 3/3 过；只在**全套件**且机器有 GPU 负载时出现（3/5）。排除了两个显而易见的猜测——标签逻辑是 `finished_at is None → "running"`，**与时间无关**，不是老化阈值；`default_store()`/`bfdiag_dir()` 每次调用都重读环境变量，不是缓存 store。结论：来自 `tests/test_bfdiag_*` 之外某个测试的跨测试副作用 | Track 0 收尾 |
+| N7 | **`FakeEngineProvider.load` 与 Protocol 不符** | 没接 `EngineProvider` 声明、`LagunaEngineProvider` 实现了的 `on_stage` 参数。当前休眠（调用点没传），改了就炸 | Track C |
+
+### 1.4 thinking / reasoning 契约（D1 已定案）
+
+**契约**：`content` / `text` 永不包含 reasoning；OpenAI 侧走 `reasoning_content`（delta / message）；
+`QSR_REASONING_MODE=expose|strip`，默认 `expose`。判定规则从"对最终文本跑正则"改成
+**生成流上的锚定状态机**——只有当 `<think>` 是生成文本的第一个字符时才认定存在 reasoning 段，
+`StreamProcessor` 是这条规则的唯一实现，非流式路径复用同一个状态机。
+
+**Anthropic 侧是非标准的**，这是一个有据可查的取舍而非疏忽：`f13fd4a`（2026-07-22）记录了一次
+真实生产事故——Claude Desktop 会校验 thinking block 的加密签名，伪造的 32 位十六进制签名被拒后，
+客户端**静默丢弃后续所有 content block，包括 tool_use**，用户的工具选择返回 "(no content)"。
+那次修复留下了明确指令：`Do NOT re-add thinking block emission without a valid signature source`。
+签名是服务端加密产物，我们造不出来。所以 Anthropic 侧发的是非标准的
+`reasoning_content_delta` 事件 + 顶层字段，而不是规范的 `thinking` content block。
+
+**可推翻的条件**：拿到合法签名来源。在那之前不要"顺手改回规范形态"——那正是 `f13fd4a` 修掉的 bug。
+
+### 1.5 结构性短板（不是 bug，是设计债）
 
 | # | 短板 | 具体表现 |
 |---|---|---|
@@ -182,25 +219,33 @@ vision_config     : 存在（多模态）— 本路线图只做文本版
 把 §1.2 的红灯全部解决。这是所有后续工作的前置——在一个 CI 红、
 测试红、依赖不可复现的仓库上做架构重构，等于没有护栏。
 
-- **T0-1 CI 恢复绿灯**：裸 `import torch` 改 `pytest.importorskip`；或者反过来，
-  承认 CI 需要 torch 并在 CI 装 CPU 版 torch。**需要拍板选哪条**。
-- **T0-2 修 3 个 bfdiag_ring 失败**：fake backend fixture 补 `block_size` / `device`。
-  顺带审一遍：还有多少测试用的是已经跟真实 backend 脱节的假对象。
-- **T0-3 thinking / reasoning 契约定稿**（见 §7 待拍板 D1），然后让代码和测试一致。
-- **T0-4 thinking 剥离逻辑重做**：从"正则删除"改为"基于生成状态机切分"——
-  服务端知道 `<think>` 是不是模板注入的、知道 `</think>` 出现的位置，
-  不该退化到对最终文本做贪婪正则。
-- **T0-5 sparkinfer 本地改动上游化**：整理 2026-07-31 的 gating 放宽改动，
-  写清楚交给 sparkinfer 团队（本仓库不直接改 sparkinfer 源码）；
-  在上游合入前，用一个明确的版本钉子 + 启动期校验，让"跑在未打补丁的
-  sparkinfer 上"变成一个响亮的错误而不是静默变慢。
-- **T0-6 依赖版本合同统一**：torch / sparkinfer / nvidia-cutlass-dsl / transformers
-  各钉一个实测通过的版本，写进 `pyproject.toml`，并在启动期校验。
-- **T0-7 仓库卫生**：删 `.bak` / `.orig` / 根目录日志；清理已合并分支与
+- ✅ **T0-1 CI 恢复绿灯**。**两条路都走了**：保留 CPU-only job 作为契约守门人
+  （5 个违规模块改 `pytest.importorskip`），另加一个装 CPU torch 的 job 扩大覆盖面。
+  第二个 job 有个非显然的前提：光装 torch 不够——多个模块假定"有 torch 就有
+  numpy/safetensors/huggingface_hub/transformers/triton"，这在完整 GPU 环境里成立，
+  对裸 torch wheel 不成立，最小可用集是 `.[dev,serving]` + CPU torch wheel + triton。
+  另外修掉 `benchmarks/quick_check.py` 的 4 个未使用 import——`ruff check .` 是 CI
+  的第一步，它红着，流水线从来没走到 pytest。
+- ✅ **T0-2 修 bfdiag_ring 失败**：确认是测试替身漂移而非生产 bug
+  （`DFlashEngine.__init__` 合法地从 backend 取 `device`/`block_size`/`_draft_blocks_per_slot`，
+  测试用 `object.__new__` 绕过了构造函数）。顺带审了全部假对象，`test_bf_attention.py` /
+  `test_cudagraph_buffers.py` 的同类写法对得上真实类，无需改动。
+- ✅ **T0-3 / T0-4 thinking 契约定稿并重做**：见 §1.4。
+- ✅ **T0-5 sparkinfer 补丁**。**结论与原计划不同**：补丁不是"未上游"，是**从未提交、已丢失**。
+  已从悬空提交恢复、rebase 到新 upstream、合入 `jieen1/sparkinfer` 的 `origin/master`
+  （fork 归我们所有，`upstream` 才是另一个团队的——原计划把这两者搞混了）。
+  启动期校验保留：`check_sparkinfer_analytic_decode_gate` 用真实生产形状去探活的 gate，
+  探测到关闭报 **warning 而非 fatal**（性能显著下降但功能正常，不该拦住启动）。
+- ✅ **T0-6 依赖版本合同统一**：`torch==2.13.0`；补上三个漏声明的直接依赖
+  （`huggingface_hub` / `nvidia-cutlass-dsl` / `triton`）；`transformers` 从 `serving` 移到 `cuda`；
+  sparkinfer 钉 `origin/master @ 0844a4f`；`runtime/preflight.py` 九项启动期校验，
+  接在 `server/app.py:main()` 的 `uvicorn.run` 之前。
+- 🔴 **T0-7 仓库卫生**：未做。删 `.bak` / `.orig` / 根目录日志；清理已合并分支与
   `.claude/worktrees/` 残留；`benchmarks/` 分流（保留的进 `benchmarks/`，
   一次性诊断残留删除或转为 `bf exec` 脚本）。
+- 🔴 **T0-8 收尾**（本批新增）：N6 的全套件 flaky 定位；N7 的 Protocol 不符。
 
-**体量**：约 0.5 个月。
+**体量**：约 0.5 个月，其中 T0-1～T0-6 已于 2026-08-01 完成。
 
 ### Track A · 模型抽象层（P0，M1→M2）
 
@@ -217,7 +262,7 @@ vision_config     : 存在（多模态）— 本路线图只做文本版
   先用 Laguna 做唯一实现，**协议由现有实现倒推**，不预设未来。
 - **A3 缓存资源抽象**：`block_pool` 从"KV 分页器"升级为"槽位资源管理器"，
   统一管理两类资源——分页 KV（长度相关）与递归状态（长度无关、每槽固定）。
-  前缀缓存的驱逐必须对两类资源联动（这正是 §1.3-S4 里那些残迹当年要解决的问题）。
+  前缀缓存的驱逐必须对两类资源联动（这正是 §1.5-S4 里那些残迹当年要解决的问题）。
 - **A4 加载器抽象**：compressed-tensors / modelopt 两套 NVFP4 布局的
   tensor 命名与 scale 语义分离成两个 adapter，公共部分（分片流式读取、
   参数全覆盖断言、KV scale post-load）保持不变。
@@ -292,6 +337,12 @@ Laguna 的性能与位精确是硬约束，必须逐步切换而非一次性替�
 不是一个阶段，是一条持续的轨道。核心思路：**把每一种失败都变成一个
 有名字、有指标、有降级路径的已知状态**。
 
+- **C0 诊断平台自身的可信度**（本批新增，**优先于本轨道其它条目**）：N4 揭示的问题是
+  `bfdiag/checkpoint` 依赖一个已经不成立的前提（`reset_slot` 会清零 KV），而守护它的
+  回归测试从不调用真实函数，所以一直是绿的。**一个会说谎的诊断平台比没有诊断平台更危险**——
+  它让错误结论带着"有测试保证"的权重传播。要做的：审计 `bfdiag/` 里所有"对真实
+  backend 行为的断言"，区分哪些真的在验证真实代码、哪些只是在合成数据上复现抽象模式；
+  后者必须显式标注成"模式演示"而不是"回归门禁"。
 - **C1 故障面清单**：显存不足、槽位卡死、CUDA Graph 捕获失败、kernel JIT 失败、
   长请求超时、客户端断连、tokenizer 边界、非法采样参数、并发抢占。
   每一项要有：检测点、指标、日志、用户可见错误、恢复动作。
@@ -309,7 +360,7 @@ Laguna 的性能与位精确是硬约束，必须逐步切换而非一次性替�
 
 - **D1 单命令启动**：`blackwellm serve <model-path-or-id>`，自动推导槽位与块数。
 - **D2 显存规划器**：给定「模型 + 目标上下文 + 目标并发」算出配置并校验；
-  或给定显存反推可行域。这直接消灭 §1.3-S7 那个四变量耦合陷阱。
+  或给定显存反推可行域。这直接消灭 §1.5-S7 那个四变量耦合陷阱。
 - **D3 启动前置检查**：SM120 检测、显存、CUDA / driver、sparkinfer 版本、
   checkpoint 完整性、架构是否受支持——**全部在加载权重之前**，
   失败给出人能读懂的、带修复建议的错误。
@@ -320,10 +371,17 @@ Laguna 的性能与位精确是硬约束，必须逐步切换而非一次性替�
 
 ### Track E · 兼容性（P2，M3→M6）
 
-- **E1 API 面补齐审计**：逐项核对 OpenAI / Anthropic 规范——
-  `n>1`、`stop` 序列、`seed`、usage 统计准确性、错误码语义、
-  structured output（`runtime/structured_output.py` 已有骨架，需验证是否真正生效）。
-- **E2 采样 + 投机共存**（消灭 §1.3-S8）：`temperature>0` 时的投机验证
+- **E1 API 面补齐审计**：2026-08-01 已做了第一轮，结果比预期差，**这几条现在是
+  已确认的功能缺口而不是待核查项**（见 §1.3）：
+  - **N1 结构化输出是空壳**——`json_object` / `json_schema` 被接受但完全不约束生成，
+    静默失败。这是最严重的一条：客户端以为拿到了 JSON 保证，实际没有。
+    优先级应高于本轨道其它条目。
+  - **N2 `stop` 序列完全未实现**（两套协议）。
+  - **N3 `seed` 每 token 重新播种**而非推进同一个 generator。
+  - 错误码语义已修（FastAPI 曾把错误体双重包进 `{"detail": ...}`，两套协议的
+    规范形状都不匹配）。
+  - 仍待核查：`n>1`、usage token 统计准确性。
+- **E2 采样 + 投机共存**（消灭 §1.5-S8）：`temperature>0` 时的投机验证
   （拒绝采样 / typical acceptance），这是当前最明显的功能缺口。
 - **E3 客户端验证矩阵**：openai-python、anthropic-sdk、Claude Code、
   Cline / Roo、OpenWebUI、LiteLLM——每个跑一遍真实会话，
@@ -343,6 +401,13 @@ Laguna 的性能与位精确是硬约束，必须逐步切换而非一次性替�
 - FP8 attention 的 `num_stages≥2`（SMEM 36 KB « 99 KB，有余量）。
 - MoE 输出中心并行（Warp Decode 类方案），2–4 周量级，长期备选。
 - GDN kernel 自研（依赖 Track B 的 profiling 结论）。
+- **sparkinfer 里还有 9 处未放宽的 gate**（本批发现）：`7a1d69d` 只放宽了 13 处中的 4 处
+  （decode / prefill 的 analytic graph dispatch 谓词），其余 9 处——verify-graph 识别、
+  各 CTA trait 选择分支、SWA budget、graph-replay 路径选择——是当初**刻意留下**的
+  scope 限制，不是遗漏。逐项清单与安全性分析见
+  [`sparkinfer-fork-delta.md`](sparkinfer-fork-delta.md)。
+  **动它之前必须知道的一条硬风险**：`planner.py` 的 grid occupancy 预算常量是按
+  `num_kv_heads=4` 推导的，用到 8 不是放宽谓词就够，需要重新推导。
 
 **纪律**：任何性能改动必须走 `bf diff` 判可比性 + 接受率与质量回归门禁，
 2026-07-27 那次"两个不可比的接受率被当成打平证据、损失一整天"的教训写在
@@ -406,8 +471,8 @@ Laguna 的性能与位精确是硬约束，必须逐步切换而非一次性替�
 
 | # | 议题 | 选项 |
 |---|---|---|
-| **D1** | **thinking / reasoning 的产品契约** | (a) 服务端一律剥离（当前代码行为）；(b) 按协议暴露——OpenAI `reasoning_content` / Anthropic `thinking` block；(c) 由请求参数控制。影响 Track E4 与所有下游 agent 客户端的行为 |
-| **D2** | **CI 与 torch 的关系** | (a) 坚持 CPU-only、所有 torch 测试 `importorskip`；(b) CI 装 CPU 版 torch，扩大可测面。当前是"声称 (a)、实际两者都不成立" |
+| ~~**D1**~~ | ~~thinking / reasoning 的产品契约~~ | ✅ **已定案 2026-08-01**：按协议暴露 + `QSR_REASONING_MODE` 开关。Anthropic 侧因签名不可伪造而采用非标准事件，理由与可推翻条件见 §1.4 |
+| ~~**D2**~~ | ~~CI 与 torch 的关系~~ | ✅ **已定案 2026-08-01**：两条都要——CPU-only job 守契约，CPU-torch job 扩覆盖 |
 | **D3** | **GPU CI 形态** | (a) 自托管 runner；(b) 本地 pre-push 门禁 + 人工签核；(c) 只在里程碑节点人工全量跑 |
 | **D4** | **重命名时机** | 包目录 `qwen-sm120-runtime` → `blackwellm`、环境变量 `QSR_` → `BWLLM_`：随 Track D 一起做，还是推到 `0.2.0` 发布前一次性做 |
 | **D5** | **`oracle/qwen36_vllm/` 的处置** | (a) 保留为只读参考（当前）；(b) Track B 完成后整体删除；(c) 现在就删，需要时从 git 历史取 |

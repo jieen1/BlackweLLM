@@ -135,8 +135,9 @@ blackwellm/
 
 - NVIDIA Blackwell GPU, SM120 / CC 12.0 (RTX PRO 6000, RTX 5090)
 - CUDA 13.x, Python 3.10+, ~96 GB GPU memory for 256K context
-- A local SparkInfer checkout (see [Known issues](#known-issues) — the pinned
-  version currently requires local patches)
+- A checkout of [this project's SparkInfer fork](https://github.com/jieen1/sparkinfer)
+  — `master` carries two commits on top of upstream that the analytic decode path
+  needs (see [`docs/sparkinfer-fork-delta.md`](docs/sparkinfer-fork-delta.md))
 
 ### Install
 
@@ -144,8 +145,14 @@ blackwellm/
 git clone https://github.com/jieen1/BlackweLLM.git
 cd BlackweLLM
 python -m pip install -e '.[cuda,dev,serving]'   # does not install vLLM
-python -m pip install -e /path/to/sparkinfer     # pinned local provider
+
+git clone https://github.com/jieen1/sparkinfer.git
+python -m pip install -e ./sparkinfer             # verified at master @ 0844a4f
 ```
+
+Startup runs a preflight check (GPU architecture, CUDA, torch, SparkInfer,
+checkpoint) before any weights load, and refuses to start on a fatal mismatch.
+`--skip-preflight` bypasses it.
 
 ### Serve
 
@@ -222,21 +229,28 @@ numbers; when something fails, read the existing trace instead of re-running.
 
 ## Known issues
 
-Tracked in [`docs/roadmap.md`](docs/roadmap.md) §1.2. As of 2026-08-01:
+Tracked in [`docs/roadmap.md`](docs/roadmap.md) §1.3. As of 2026-08-01, CI, the
+test suite, the dependency contract and the thinking/reasoning contract have all
+been repaired; what remains open:
 
-- **CI is red.** Three test modules import `torch` unconditionally while CI
-  installs only `[dev]` (no torch), so collection fails. The "CPU-only unit test"
-  guarantee is currently not upheld.
-- **4 tests fail** with torch present (`926 passed, 4 failed`): three stale
-  bfdiag fixtures, and one that contradicts the current thinking-tag behaviour.
-- **Thinking-tag handling is undefined behaviour.** The server strips `<think>`
-  blocks with greedy regexes that will also truncate legitimate answers
-  discussing those tags. The product contract is a pending decision.
-- **SparkInfer requires local patches.** The current performance figures depend
-  on gating relaxations that are not upstream, so a stock SparkInfer install
-  will not reproduce them.
-- **Version contract is inconsistent.** `pyproject.toml` pins `torch==2.11.0`;
-  the validated environment runs 2.13; SparkInfer asks for ≥2.12.
+- **Structured output is a skeleton.** `response_format` with `json_object` /
+  `json_schema` is accepted but **does not constrain generation at all** — the
+  grammar mask is never applied. Requests silently come back as free text. Do not
+  rely on JSON mode.
+- **`stop` sequences are not implemented** on either protocol.
+- **`seed` re-seeds per token** rather than advancing one generator, so it gives
+  determinism but not the usual sampling semantics.
+- **Anthropic reasoning is non-standard.** Reasoning is delivered as a
+  `reasoning_content_delta` SSE event and a top-level field, *not* as a spec
+  `thinking` content block — emitting that block requires a cryptographic
+  signature we cannot produce, and a fake one makes Claude Desktop silently drop
+  every subsequent content block including `tool_use`
+  (see [`docs/roadmap.md`](docs/roadmap.md) §1.4).
+- **One known flaky test** surfaces only in a full-suite run under machine load
+  (`test_bfdiag_record.py::test_cli_ls_labels_an_unfinished_record_running`).
+- **SparkInfer must be this project's fork.** A stock upstream install starts and
+  runs correctly but silently loses the analytic decode path; startup preflight
+  reports this as a warning.
 
 ## Limitations
 

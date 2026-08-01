@@ -335,8 +335,10 @@ Prometheus 指标在 `blackwellm:*` 命名空间下覆盖三个维度：
 |---|---|
 | `ruff check .` 全仓绿 | ✅ 强制 |
 | `ruff format --check` 生产包 | ✅ 强制 |
-| 单元测试 | ⚠️ **当前红**——见 [`roadmap.md`](roadmap.md) §1.2 R1/R2 |
-| CI（push + PR） | ⚠️ **当前红**——CPU-only 契约已失效 |
-| 位精确回归门禁 | 有脚本，无自动化（GPU CI 缺失，待拍板） |
+| 单元测试（CPU-only） | ✅ 绿——CI 的契约守门人，无 torch 环境下必须零收集错误 |
+| 单元测试（CPU torch） | ✅ 绿——扩大覆盖面的第二个 job |
+| 启动期环境校验 | ✅ `runtime/preflight.py`，九项，接在模型加载之前 |
+| CI（push + PR） | ✅ 绿（2026-08-01 恢复）。一个已知 flaky：见 [`roadmap.md`](roadmap.md) §1.3 N6 |
+| 位精确回归门禁 | 有脚本，无自动化（GPU CI 缺失，待拍板 D3） |
 | 性能回归门禁 | bfdiag run record + `bf diff`，人工触发 |
 
