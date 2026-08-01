@@ -9,9 +9,62 @@ description = "Blackwell-native CUDA inference engine for SM120 GPUs — custom 
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
-cuda = ["numpy>=2,<3", "safetensors>=0.6.2", "torch==2.11.0"]
-dev = ["pytest>=8", "ruff>=0.8"]
-serving = ["requests>=2.31", "transformers>=4.45", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
+# --- Version contract (docs/roadmap.md T0-6) ---------------------------------
+# These bounds are a *floor + ceiling*, not an exact pin, because the one
+# machine this runtime targets runs a PyTorch built from source (editable
+# install of `/home/bot/pytorch-build`, reporting `2.13.0a0+gitcf30153`,
+# CUDA 13.3, driver 610.47) — that exact string is not resolvable from PyPI
+# or any nightly index, so pinning `torch==2.13.0a0+...` here would make
+# `pip install -e '.[cuda]'` fail on a clean machine. The floor (`>=2.12`)
+# matches SparkInfer's own hard requirement
+# (`/home/bot/project/sparkinfer/pyproject.toml`: `torch>=2.12.0`); the
+# ceiling (`<2.14`) is a tripwire so a future major/minor bump doesn't get
+# silently absorbed without someone re-verifying the whole stack. If you are
+# setting up a fresh box: build/obtain a torch >=2.12,<2.14 for SM120/CC 12.0
+# yourself (a stock PyPI wheel will not have Blackwell kernels at this
+# writing) — this constraint is necessary, not sufficient. Record whatever
+# exact build you verify in `runtime/preflight.py`'s `VERIFIED_TORCH_VERSION`
+# comment and here.
+#
+# All other floors/ceilings below are the exact versions verified working in
+# the project's reference environment on 2026-08-01 (see
+# `docs/sparkinfer-upstream-handoff.md` for how that environment was
+# audited), widened to the current minor-version ceiling so routine patch
+# releases don't require touching this file.
+cuda = [
+  "numpy>=2,<3",                    # verified 2.3.5
+  "safetensors>=0.7,<1",            # verified 0.7.0
+  "torch>=2.12,<2.14",               # verified 2.13.0a0+gitcf30153 (from-source build, see note above)
+  "triton>=3.6,<4",                  # verified 3.6.0 — runtime/kernels/*.py import triton directly
+  "transformers>=5,<6",              # verified 5.8.0 — runtime/laguna_config.py imports this directly
+                                      # (moved here from `serving`: it is a core runtime dependency,
+                                      # needed even when running without the HTTP layer)
+  "huggingface_hub>=1,<2",           # verified 1.13.0 — runtime/laguna_config.py imports this directly;
+                                      # previously undeclared and only reached transitively via transformers
+  "nvidia-cutlass-dsl>=4.5,<5",       # verified 4.5.2 — transitive SparkInfer build dependency; pinned here
+                                      # too because runtime/backends/laguna_sparkinfer_moe.py has a
+                                      # sys.path workaround tied to this package's on-disk layout
+]
+dev = ["pytest>=8,<9", "ruff>=0.8,<1"]
+serving = ["requests>=2.31,<3", "fastapi>=0.110,<1", "uvicorn>=0.29,<1", "httpx>=0.27,<1"]
+# --- SparkInfer: deliberately absent from every extra above ------------------
+# SparkInfer (/home/bot/project/sparkinfer) is a private, separately
+# maintained SM120 kernel library, not published to PyPI. It cannot be listed
+# as `sparkinfer>=X` here — pip would try to resolve that from PyPI and fail
+# outright on any machine, including CI. It also should not be hardcoded as a
+# `sparkinfer @ file:///home/bot/project/sparkinfer` direct reference: that
+# path is a per-machine convention, not guaranteed by this repo, and baking
+# it into pyproject.toml would make `pip install -e '.[cuda]'` fail the
+# instant someone's checkout lives anywhere else (including the CPU-only
+# verification venvs used to sanity-check this file). Install it as a
+# separate, explicit step instead:
+#
+#   pip install -e /home/bot/project/sparkinfer
+#
+# after installing this project's `cuda` extra. `runtime/preflight.py`
+# validates at startup that SparkInfer is importable and version-contract-
+# compliant — see `check_sparkinfer_contract` — so a missing/mismatched
+# SparkInfer install fails loudly there instead of silently at import time.
 
 [project.scripts]
 bf = "bfdiag.cli:main"

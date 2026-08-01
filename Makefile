@@ -21,7 +21,7 @@ help: ## Show available targets
 install: ## Install package with dev + serving extras (editable)
 	$(PYTHON) -m pip install -e '.[dev,serving]'
 
-install-cuda: ## Install the pinned PyTorch CUDA runtime extra
+install-cuda: ## Install the CUDA runtime extra (torch + kernel deps; see pyproject.toml)
 	$(PYTHON) -m pip install -e '.[cuda]'
 
 lint: ## Ruff lint gate for the whole repo (must stay green)
