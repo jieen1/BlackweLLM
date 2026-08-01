@@ -297,13 +297,23 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 
 ### 7.3 P1 · Track C · 稳定性（贯穿）
 
+> **2026-08-02 补充**：C0R–C7 的分期、新增 C8/C9、以及"如何证明新门禁真的会红"的通用
+> 方法论，已详细展开进 [`e2e-and-quality-plan.md`](e2e-and-quality-plan.md) §3/§4/§5——
+> 本节保留可勾选的执行清单，细节和调度理由不重复。
+
 - [ ] **C0R** C0 审计残余：① `bfdiag/` 的 **code_ref 行号系统性漂移**（约定改为引用符号名；从命中率最高的 5 个文件起：`checkpoint/state.py`、`daemon/session.py`、`invariants/checks.py`、`shapes/attention.py`、`determinism.py`）② `cold_capacity.py` / `det_cli.py` 未逐行核实 ③ 两条无调用点的不变量（`aux_hidden_alignment`、`cg_replay_slot_consistency`）接线或明确标记
-- [ ] **C1 故障面清单**：显存不足 / 槽位卡死 / 图捕获失败 / kernel JIT 失败 / 长请求超时 / 客户端断连 / tokenizer 边界 / 非法采样参数 / 并发抢占 —— 每项要有检测点、指标、日志、用户可见错误、恢复动作
-- [ ] **C2 分级降级**：CUDA Graph → eager；投机 → 非投机；前缀缓存命中 → 冷 prefill，每级出指标（**接口形状来自 P0-D 的 D-3 能力查询**）
-- [ ] **C3 看门狗覆盖**：补覆盖测试 + 故障注入
+- [ ] **C1 故障面清单**（**2026-08-02 按 GPU 窗口拆成三段，见 `e2e-and-quality-plan.md` §3.1**）：
+  - [ ] C1-backend：显存不足 / CUDA Graph 捕获失败 / kernel JIT 失败 / 并发抢占——蹭 P0-E 第 5–8 步窗口
+  - [ ] C1-protocol：客户端断连 / tokenizer 边界 / 非法采样参数 / 长请求超时——与 Track E 的 E3 共享同一个热身服务器
+  - [ ] C1-slot：槽位卡死——随 A3（第 7 步）落地同窗口验证
+  每项要有检测点、指标、日志、用户可见错误、恢复动作
+- [ ] **C2 分级降级**：CUDA Graph → eager；投机 → 非投机；前缀缓存命中 → 冷 prefill，每级出指标（**接口形状来自 P0-D 的 D-3 能力查询**）。三个触发点各自蹭对应子系统落地时的 GPU 窗口，不单独申请
+- [ ] **C3 看门狗覆盖**：补覆盖测试 + 故障注入。**大部分故障注入用 Python 层 mock 掉 CUDA 异常即可**，不需要真实 OOM；只有少量场景需要真机确认，见缝插针
 - [ ] **C4 确定性与可复现**：补 bit-exactness 回归门禁并纳入 CI。**C-1 已拍板**（§4，(b) 本地 pre-push
   + 人工签核）——实现载体是 `make gate-local` + PR 签核勾选项，是 A6 验收的门禁本体
-- [ ] **C5 长稳测试**：24h soak [待办·开发执行]
+- [ ] **C5 长稳测试**：24h soak [待办·开发执行]。**唯一真正需要独占一整天 GPU、不能蹭窗口的条目**——
+  排在 M3 末（Track B 的 B1/B2 验收完成、B3 性能冲刺前的天然间隙）与 M6 末（发布前）两个检查点，
+  需要提前和 Track B 协调时间，不能假设"顺路"
 - [ ] **C6 崩溃可诊断**：进程级异常留下 bfdiag run record
 - [ ] **C7 冷启动 / 首次真实形状路径审计**（本批新增，2026-08-01）：`235f51e` 修的是"每个未见过的
   page-table 宽度都触发 30–100s 重编译"，根因是**编译缓存键覆盖了整个模型该走的 layer-group，
@@ -329,11 +339,30 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
   - **为什么现在记录、但不立即安排 GPU 时间**：C7-1/C7-3 都需要真机复现，且是**假设未坐实**（`235f51e`
     的作者本人也说"两个假设都没彻底坐实"）；C7-2（可观测性）不需要额外 GPU，可以和 P0-E 第 5 步
     的第一次真机验证捆一起做，零增量 GPU 成本
+  - **2026-08-02 交叉引用**：Track E 的 E3（SDK 矩阵）每个客户端第一次对新代码发请求都天然处于
+    冷启动窗口，某些 SDK 的默认超时可能比 JIT 停顿更短——E3 的完成判据应包含"首请求"场景，
+    是 C7 的又一个验证入口，见 §7.5/E3
+- [ ] **C8 门禁可信度周期审计**（本批新增，2026-08-02）：把 N4/C0 揪出的"从不调用真实函数、一直是
+  绿的假门禁"变成常设动作，不是一次性事故处理。每两个里程碑（M2/M4/M6）抽 12–15 个现有测试/门禁，
+  逐条回答"它真的红过吗""如果没红过，能不能构造一个会让它红的输入"，答不出来的记入门禁债务清单。
+  首轮（M2）优先审计 `bfdiag/checkpoint`（N4 事发模块群，验证修复后的状态经得起这两个问题）。
+  方法见 [`e2e-and-quality-plan.md`](e2e-and-quality-plan.md) §3.2。零 GPU
+- [ ] **C9 质量回归**（本批新增，2026-08-02）：MMLU-Pro（分层子集）+ evalplus HumanEval+/MBPP+ 对
+  **Laguna** 跑一次——现有 harness（`benchmarks/official/mmlu_pro_eval.py` + `quality_regression.py`，
+  `92f8b34`，2026-07-22）从建成起没有指向过当前生产模型，指向的是已退役的 Qwen3.6/vLLM。
+  **[待验证]**：`roadmap.md` §0 引用的"Laguna-S-2.1 MMLU-Pro 84.5%"疑似是那次旧评测（84.54%）的
+  误引，需要 C9-a 跑出真数字来核实或替换。
+  - [ ] C9-a [待办·开发执行] M2，蹭窗口：对现有 harness 做存在性验证，跑一次小规模 Laguna 子集
+  - [ ] C9-b M2→M3：包装成 bfdiag run record，纳入 `bf diff` 可比性纪律，锁定回归基线
+  - [ ] C9-c [待办·开发执行] M3→M4（Track B B1/B2 落地后）：加一份 Qwen3.6-27B 覆盖，独立基线
+  - [ ] C9-d [待办·开发执行] M6 发布前：全量或接近全量规模跑一次，作为 H1 的一项输入
+  方法见 [`e2e-and-quality-plan.md`](e2e-and-quality-plan.md) §3.3
 - **风险登记**：见 `roadmap.md` §6 RK9（本批新增，"冷启动/首次真实形状路径系统性覆盖不足"是一个模式，
   不是一次性 bug；这条把它显式列成风险而不是留在一条已关闭 commit 的尾巴里）
 
-**插入时机**：C0R 与 C-LIVE 一起在 M1；C1/C2 随 Track A 落地；C3/C4 在 M3；C5/C6 在 M6 发布门禁前；
-C7-2 随 P0-E 第 5 步捆绑；C7-1/C7-3 在拿到 GPU 窗口后见缝插针，不单独申请专用时段。
+**插入时机**：C0R 与 C-LIVE 一起在 M1；C1/C2 随 Track A 落地；C3/C4 在 M2→M3；C5/C6 在 M6 发布门禁前
+（C5 另有 M3 末检查点）；C7-2 随 P0-E 第 5 步捆绑；C7-1/C7-3 在拿到 GPU 窗口后见缝插针，不单独申请
+专用时段；C8 每两个里程碑一次（M2/M4/M6），零 GPU；C9 M2 起首次基线，随 Track B 推进加 Qwen3.6 覆盖。
 
 ### 7.4 P1 · Track G · Qwen3.6-25B-A3B（M4→M5）
 
@@ -346,15 +375,56 @@ C7-2 随 P0-E 第 5 步捆绑；C7-1/C7-3 在拿到 GPU 窗口后见缝插针，
 
 ### 7.5 P2 · Track E · 兼容性（M3→M6）
 
-- [ ] **E2 采样 + 投机共存**（消灭 S8）：`temperature > 0` 当前直接退化成无投机自回归，需要拒绝采样 / typical acceptance。**这是最明显的功能缺口，排在 E1 之前**
-- [ ] **E1-N1 结构化输出真正实现**：`GrammarState.apply_mask` / `apply_mask_batch` 接进采样环。**优先级已从"P0 事故"降为普通功能**——`b2d73cb` 后是显式拒绝而非静默失败
-- [ ] **E1-剩余**：`n>1`、usage token 统计准确性
-- [ ] **E3 客户端验证矩阵** [待办·开发执行]：openai-python / anthropic-sdk / Claude Code / Cline / Roo / OpenWebUI / LiteLLM，结果做成兼容性表
-- [ ] **E4 reasoning 正确暴露**：OpenAI `reasoning_content` 已接（`c86858a`）。**Anthropic 侧维持非标准事件，除非拿到合法签名来源**——`f13fd4a` 的生产事故明确禁止无签名重发 thinking block
+> **2026-08-02 补充**：`docs/api-layer-design.md` §5/§7 已经把 N1/N2/N3/`n>1`/usage token
+> 五条逐项核实过；下面按核实后的真实状态重排。分期细节、每步"如何证明测到了协议层"的
+> 方法、GPU 窗口调度，见 [`e2e-and-quality-plan.md`](e2e-and-quality-plan.md) §2/§4/§5。
+> **已关闭，不再列入本节待办**：N2 `stop`（已接通）、N3 `seed`（`PersistentSeed` 已接通）、
+> `n>1`（`server/app.py:447` 已显式 400 拒绝，`api-layer-design.md` §5.3——不是"仍待核查"）。
+
+- [ ] **E2 采样 + 投机共存**（消灭 S8）：`temperature > 0` 当前直接退化成无投机自回归
+  （`_greedy_accept_reject`，`runtime/backends/laguna_dflash.py:76`），需要拒绝采样 /
+  typical acceptance。**这是最明显的功能缺口，排在 E-N1 之前**
+  - [ ] E2-a（M2，零 GPU）：拒绝采样/typical-acceptance 算法本身的正确性，CPU 合成分布验证
+  - [ ] E2-b [待办·开发执行]（M2→M3，蹭 P0-E 剩余窗口或 Track F F1 窗口）：接进
+    `laguna_dflash.py` 的验证步骤；完成判据 = 接受率进 bfdiag 基线 + 采样分布统计学匹配
+    非投机路径（KS 检验或等价方法，不是肉眼比较）
+- [ ] **E-N1 结构化输出真正实现**（原 E1-N1，重新核实后拆分）：`GrammarState.apply_mask` /
+  `apply_mask_batch` 逻辑本身没问题，真正阻塞是解码循环没有可用掩码注入点——admission
+  阶段裸 `argmax`、CUDA Graph 贪心重放把贪心烤进 graph、eager 贪心分支绕过
+  `sample_from_logits`；默认 `temperature=0.0` 使得最常见请求形态恰好总走这三条不可达
+  路径（`docs/api-layer-design.md` §7.1）。**已明确排除**：只接通 `temperature>0` 时唯一
+  可达的窄缝——比完全不接更危险（默认场景看起来接上了但仍不受约束）。
+  - [ ] E-N1-a（M2，零 GPU，决策备忘）：把两个中间态选项（等全量修复 vs 显式限定
+    `temperature>0`-only）写清楚交给需要拍板的人，不代为决定
+  - [ ] E-N1-b [待办·开发执行]（拍板后，M3→M4，需 GPU，**前提是 Track A 对
+    `laguna.py`/`laguna_cuda_graph.py` 的改动已稳定**——文件归属边界）：实施选定方案；
+    完成判据 = N≥20 个样本、覆盖 ≥3 种 schema 复杂度，100% 通过 JSON Schema 校验
+- [ ] **E3 客户端 SDK 一致性矩阵**（本批扩充为结构性资产）：现有 `test_api_compat.py`/
+  `c_live_smoke.py` 全部手搓 `http.client`，**没有一个用真实厂商 SDK 解析响应**。
+  分四步，便宜且本机已装的先做：
+  - [ ] E3-a [待办·开发执行]（M2）：openai-python（2.34.0）+ anthropic-sdk-python
+    （0.99.0）**[待验证：具体安装在哪个 venv]**——非流式/流式 chat、一次工具调用、一次
+    故意触发的 400/422，确认 SDK 把错误体映射成正确的异常类型。首次真机运行蹭 P0-E 第 5
+    步或 C-LIVE B-4 的窗口。产出锁定基线（bfdiag run record 或等价 transcript）
+  - [ ] E3-b [待办·开发执行]（M3）：LiteLLM——协议归一化层，能捕获两个原生 SDK 都不会
+    触发的归一化 bug
+  - [ ] E3-c [待办·开发执行]（M4）：Claude Code 本身跑一次真实编码会话（吃自己的狗粮）
+  - [ ] E3-d [待办·开发执行]（M5）：Cline / Roo + OpenWebUI（下游集成，排最后）
+  - 完成判据 + "如何证明会红"（历史 bug 父提交回放，同 C-LIVE B-4 标准）+ 与 RK9 的交叉
+    检查（真实 SDK 默认超时可能比 JIT 停顿更短），见
+    [`e2e-and-quality-plan.md`](e2e-and-quality-plan.md) §2.4
+- [ ] **E4 reasoning 正确暴露**：OpenAI `reasoning_content` 已接（`c86858a`）。**Anthropic
+  侧维持非标准事件，除非拿到合法签名来源**——`f13fd4a` 的生产事故明确禁止无签名重发
+  thinking block。**建议补一条零成本常驻回归测试**：断言 Anthropic 流式路径不产出未签名
+  的规范 `thinking` block，写一次不需要里程碑节奏
 - [ ] **E5 chunked input-logprob 默认开启**（本批新增，来自 SGLang v0.5.16，`investigation-queue.md` D-8）：
   我们已有 logprobs 路径，双协议都暴露 `top_logprobs`；长 prompt 的峰值显存是真问题（Track F 的
   F1/F2 也在争这块显存）。**小而自足，不依赖 Track A**——建议提前到 M2 跟 F1 的窗口扫测一起做，
   不用等 Track E 默认的 M3 窗口
+- [ ] **usage token 两个小缺口**（2026-08-02 从"待核查"降级为"已知的两个小缺口"，
+  `api-layer-design.md` §5.5）：
+  - [ ] `usage.completion_tokens_details.reasoning_tokens` 细分字段缺失——独立、小，可随时排期
+  - [ ] `<usage>` 标签剥离流式/非流式语义不统一——需先拍板统一到哪种语义，再改
 
 ### 7.6 P2 · Track F · 性能（机会主义，但 F1/F2 例外）
 
@@ -475,6 +545,8 @@ AWQ/GPTQ/INT4 等其他量化 · 通用 HF 架构自动支持 · 复活 `oracle/
 ## 11. 配套文档
 
 - [`roadmap.md`](roadmap.md) — 目标、理由、风险登记、待拍板事项（**权威**）
+- [`e2e-and-quality-plan.md`](e2e-and-quality-plan.md) — Track C/Track E 的详细分期、GPU 窗口调度、
+  "反复审查"节奏机制、每条新门禁"如何证明会红"的方法论
 - [`architecture.md`](architecture.md) — 现状架构 + **目标架构与五个关键抽象（Track A 设计草案，§3）**
 - [`model-support.md`](model-support.md) — 模型支持矩阵 + 接入新模型的操作指南
 - [`diagnostics-guide.md`](diagnostics-guide.md) — bfdiag 使用指南（必读）
