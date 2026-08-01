@@ -11,19 +11,21 @@
 
 ---
 
-## A. 需要你拍板（阻塞其它工作）
+## A. 需要你拍板（阻塞其它工作）—— ✅ 三条已于 2026-08-01 拍板
 
-- [ ] **A-1 · D3 GPU CI 形态** —— (a) 自托管 runner ／ (b) 本地 pre-push 门禁 + 人工签核 ／ (c) 只在里程碑人工跑
-  **卡**：C4 位精确门禁 → A6"Laguna 零回归"验收。不定，Track A 第 5–8 步写完也宣布不了完成。
+- [x] **A-1 · D3 GPU CI 形态** —— ✅ **已拍板 (b) 本地 pre-push 门禁 + 人工签核**。理由：单 GPU 机器上
+  自托管 runner（选项 a）本身也要抢卡，不解决"GPU 验收天然串行"这条约束；(c) 门禁太松。
+  详见 [`roadmap.md`](roadmap.md) §7/D3、[`implementation-plan.md`](implementation-plan.md) §4/C-1、§7.3/C4。
 
-- [ ] **A-2 · D6 Qwen3.6 主线 checkpoint** —— **注意前提已被更正**
-  roadmap 写的是"社区版能投机 / 官方版需另找 MTP 层"，实测**两份都带 15 个 `mtp.*` 张量**。
-  真正的取舍是：**官方 provenance + 需排除 333 个 vision 张量** vs **社区量化 + 天生文本版**（0 vision、单文件）。
-  **卡**：B0 起步。
+- [x] **A-2 · D6 Qwen3.6 主线 checkpoint** —— ✅ **已拍板：官方 `nvidia/Qwen3.6-27B-NVFP4`**。
+  真正的取舍是 **官方 provenance + 需排除 333 个 vision 张量** vs **社区量化 + 天生文本版**（0 vision、
+  单文件）；provenance 不可逆、vision 过滤是一次性机械工作，社区版留作交叉验证。
+  详见 [`roadmap.md`](roadmap.md) §7/D6、[`implementation-plan.md`](implementation-plan.md) §4/C-2、§7.1/B0-1。
 
-- [ ] **A-3 · N8 `--session-affinity` 静默失效** —— (a) 为 Laguna 实现 warm-continue ／ (b) 删除该 flag ／ **(c) 启动期拒绝该 flag（倾向）**
-  `engine.py:971` 调的 `mtp_prefill_warm_continue` 只存在于 `oracle/qwen36_vllm/`,异常被 `try/except` 吞掉 → 每次静默回退冷 prefill，`session_warm_continuations` 恒为 0，测试零覆盖。
-  详见 [`architecture.md`](architecture.md) §3.5.6。**(c) 零 GPU、可当天落地。**
+- [x] **A-3 · N8 `--session-affinity` 静默失效** —— ✅ **已拍板 (c) 启动期拒绝该 flag**。
+  `mtp_prefill_warm_continue` 只存在于已退役的 `oracle/qwen36_vllm/`；把静默降级变成显式失败，
+  (a) 留给 Track A 能力查询落地后重新评估。详见 [`architecture.md`](architecture.md) §3.5.6、
+  [`implementation-plan.md`](implementation-plan.md) §6.1（落地清单，尚待实现）。
 
 ---
 
@@ -51,6 +53,12 @@
 
 ## C. 自查 —— 需要 GPU（留给开发执行）
 
+> **状态（2026-08-01）**：C-1/C-2/C-3 三条**由另一个并行 agent 在查**——`roadmap.md`/
+> `implementation-plan.md` 已把下游结论（B3 的 GDN 分支、KV dtype 选型、RK6/H1 的 sm_120 wheel）
+> 写成显式 [待验证]，**不预判**任何一条的结论。C-1 与 `roadmap.md` §6 RK9（冷启动/首次真实形状
+> 路径的系统性覆盖不足）是同一类问题，C7 审计（`implementation-plan.md` §7.3）已把 DFlash
+> 的一个具体已知缺口（verify 路径预热覆盖）纳入这条调查范围。
+
 - [ ] **C-1 · warmup / autotune / CUDA Graph 捕获是否用真实形状**
   依据 flashinfer #3255：失败**不在** autotuner 第一个小的合成形状上，而在后面一个匹配真实模型维度的形状上。
   本项目已有同型伤疤（fp8 舍入平局：合成随机数据复现不出真实数据的 bug）。
@@ -69,46 +77,61 @@
 
 ---
 
-## D. 值得吸收的上游做法（ADOPT 候选，按价值排序）
+## D. 值得吸收的上游做法（ADOPT 候选，按价值排序）—— ✅ 2026-08-01 已全部消化
 
 > 分工：**kernel 形状 → 写清楚交给 SparkInfer 团队**（按 `AGENTS.md` 规矩不直接改其源码）；
 > 调度 / 缓存 / API / 模型支持 → 我们自己做。
+>
+> **本节 D-1～D-8 已全部处理**：分派到 `roadmap.md` 对应 Track 与 `implementation-plan.md`
+> 的执行条目，保留在此处作为triage 记录（不删除，同 D-1 的先例）。
 
 - [x] **D-1 · 混合缓存（KV + 递归状态）先例** —— ✅ **已读并转成 A3 设计输入**
   见 [`../notes/2026-08-01-hybrid-cache-prior-art.md`](../notes/2026-08-01-hybrid-cache-prior-art.md)。
   产出 6 条对 A3 的修改（抽象拆分、双数字前缀匹配、投机保守释放、同轮不可跨请求借用、逐资源驱逐预算、块大小对齐）。
   **A3 动工前必读。**
 
-- [ ] **D-2 · DSpark：置信度驱动的自适应 verify 窗口**
-  分块半自回归起草，**用草稿自身置信度决定每个 verify 窗口大小**。SGLang v0.5.16 报 383.7 tok/s、接受长度约 5；vLLM 也有，两边都有 tracking（sglang #30344），参数 `--speculative-dspark-block-size`。
-  **为什么对我们成立**：我们 DFlash 是固定 `NUM_SPECULATIVE_TOKENS=15`,而接受率实测 **96.3–100%**——限制吞吐的**可能是固定窗口而不是接受率**。
-  **警告**：vllm #49369 报告 DSpark 在某负载上比不开投机还慢，不是白捡。
-  **去向**：我们做（投机策略）。
+- [x] **D-2 · DSpark：置信度驱动的自适应 verify 窗口** —— ✅ **升级为 P1，见 `roadmap.md` Track F /
+  `implementation-plan.md` §7.6/F1**。分块半自回归起草，**用草稿自身置信度决定每个 verify 窗口
+  大小**。SGLang v0.5.16 报 383.7 tok/s、接受长度约 5；vLLM 也有，两边都有 tracking（sglang #30344），
+  参数 `--speculative-dspark-block-size`。**为什么对我们成立**：我们 DFlash 是固定
+  `NUM_SPECULATIVE_TOKENS=15`,而接受率实测 **96.3–100%**——限制吞吐的**可能是固定窗口而不是接受率**。
+  **警告**：vllm #49369 报告 DSpark 在某负载上比不开投机还慢，不是白捡。**去向**：我们做（投机策略），
+  已排出两步（先静态调宽，再考虑自适应）。
 
-- [ ] **D-3 · ReplaySSM Ring Spec-Verify：投机 scratch 显存降 6.4×**
-  11.5 GB → 1.8 GB。Laguna 权重已占 67 GB，96 GB 卡上只剩约 29 GB——投机 scratch 在和 KV 抢这块。
-  **去向**：我们做（槽位/显存），若节省在 kernel 侧则转 SparkInfer。
+- [x] **D-3 · ReplaySSM Ring Spec-Verify：投机 scratch 显存降 6.4×** —— ✅ **升级为 P1，见 `roadmap.md`
+  Track F / `implementation-plan.md` §7.6/F2**。11.5 GB → 1.8 GB 是别人的卡、别人的形状，不能直接当
+  我们的数字用；Laguna 权重已占 67 GB（`notes/2026-07-29-gpu-memory-audit.md` 逐项相加，非猜测），
+  96 GB 卡上给 KV + 投机 scratch 的预算很紧——投机 scratch 在和 KV 抢这块。**去向**：我们做（先补显存
+  审计 + 判断多少能在调度层拿到），若节省在 kernel 侧则转 SparkInfer。
 
-- [ ] **D-4 · 每 KV-cache group 选不同 attention backend；sliding-window 作为显式 backend capability**
-  vLLM v0.26.0。与我们今天落地的 A2 `BackendCapabilities` 独立收敛到同一设计。
-  **我们没有的是 per-group 后端选择**,而 Qwen3.6 正是 16 full + 48 GDN 混合。
-  **去向**：我们做（A2/A3）。
+- [x] **D-4 · 每 KV-cache group 选不同 attention backend；sliding-window 作为显式 backend capability**
+  —— ✅ **验证了 Track A 的既有设计方向，追加一条设计备忘**，见 `roadmap.md` Track A。
+  vLLM v0.26.0。与我们今天落地的 A2 `BackendCapabilities` 独立收敛到同一设计；A1 已按层类型序列
+  描述架构，Qwen3.6 的 16 full + 48 GDN 混合正是这个设计要接住的形状。**唯一具体补充**：滑窗应从
+  "模型图内部隐式处理"提升为 `ModelSpec`/能力查询里可查询的显式字段。**去向**：我们做（A1/A2 实现时）。
 
-- [ ] **D-5 · Hybrid (SWA + full) DFlash drafters；投机专用 `kv_cache_dtype`**
-  vLLM v0.26.0。DFlash 就是我们的投机引擎，Laguna 正是 36 SWA + 12 full——直接对口。
-  独立的 draft KV dtype 是那 29 GB 上的显存杠杆。
-  **去向**：我们做（DFlash），kernel 半边可能转 SparkInfer。
+- [x] **D-5 · Hybrid (SWA + full) DFlash drafters；投机专用 `kv_cache_dtype`** —— ✅ **读代码后核实：
+  不完全对，已从待办移除**，见 `roadmap.md`/`implementation-plan.md` §7.6。①投机专用 `kv_cache_dtype`
+  **已经是现状**——`laguna_dflash.py` 里 draft KV cache 按 `# Self-allocated: FP8 as uint8` 分配，
+  与主模型该层自己的 dtype 选择独立；②我们的 draft 模型走的是另一条路——固定 6 层全 SWA
+  （window=512）、bf16 权重，KV cache 只有 0.007 GB（`notes/2026-07-29-gpu-memory-audit.md`），已经
+  靠"专用小 draft 模型"达到类似的省显存效果，没有证据表明改成 vLLM 式 hybrid drafter 会更好。
+  **这不是降级，是核实后发现已经做到。**
 
-- [ ] **D-6 · FlashAttention 的 SM120 路径进展** —— **持续观察，不是现在动**
-  维护者已合入 sm120 PR（#2413，"WIP"），并有**面向 5090 的 TMA + warp specialization** PR 在做（#2440）——正是 Track F2 计划要移植的技法。
-  但：**FA4 算法本体上不了 SM120**（缺 tcgen05/TMEM）；当前 sm120 路径只有 FP16/BF16、`main` 上部分路径仍报错、在 5090 上比 FA2 **慢约 5%**。
-  **T0 触发条件**：那批 PR 落到 main 且在 sm120 上跑赢 FA2 —— 到那时 F2 从"自己移植"变成"评估采纳"。
+- [x] **D-6 · FlashAttention 的 SM120 路径进展** —— ✅ **保持"持续观察，不是现在动"**，已写入
+  `roadmap.md` Track F（含完整 T0 触发条件）。维护者已合入 sm120 PR（#2413，"WIP"），并有**面向 5090
+  的 TMA + warp specialization** PR 在做（#2440）——正是 `implementation-plan.md` F4（原编号 F2，
+  Track F 重排后顺延）计划要移植的技法。但：**FA4 算法本体上不了 SM120**（缺 tcgen05/TMEM）；当前
+  sm120 路径只有 FP16/BF16、`main` 上部分路径仍报错、在 5090 上比 FA2 **慢约 5%**。**T0 触发条件**：
+  那批 PR 落到 main 且在 sm120 上跑赢 FA2 —— 到那时才从"自己移植"变成"评估采纳"。
 
-- [ ] **D-7 · NVFP4 per-token online MoE 量化**（vLLM v0.26.0）+ CuTe-DSL MXFP4
-  Laguna 是 256 专家 NVFP4 MoE，直接可比。**去向**：kernel 形状 → **写清楚交给 SparkInfer**。
+- [x] **D-7 · NVFP4 per-token online MoE 量化**（vLLM v0.26.0）+ CuTe-DSL MXFP4 —— ✅ **排入
+  `implementation-plan.md` §7.6/F10**。Laguna 是 256 专家 NVFP4 MoE，直接可比。**去向**：kernel 形状
+  → **写清楚交给 SparkInfer**，我们自己只写一份技术提案文档，不实现。
 
-- [ ] **D-8 · chunked input-logprob 默认开启（削峰值显存）**（SGLang v0.5.16）
-  我们有 logprobs 路径、双协议都暴露 `top_logprobs`;单卡上长 prompt 的峰值显存是真问题。小而自足。
+- [x] **D-8 · chunked input-logprob 默认开启（削峰值显存）**（SGLang v0.5.16）—— ✅ **排入
+  `roadmap.md` Track E / `implementation-plan.md` §7.5/E5，提前到 M2**。我们有 logprobs 路径、双协议
+  都暴露 `top_logprobs`;单卡上长 prompt 的峰值显存是真问题。小而自足，不依赖 Track A。
   **去向**：我们做（Track E / 显存）。
 
 ---
@@ -138,8 +161,11 @@
 
 ## 处理建议顺序
 
-1. **A 节三条拍板**（A-3 的 (c) 可当天落地）
-2. **B-5、B-6**（零 GPU，各半天，B-6 可能删掉 B3 一整项）
-3. **C-3**（零 GPU，一条命令）
-4. **A3 动工前读 D-1 的笔记**
-5. 其余按 Track 排期并入 [`implementation-plan.md`](implementation-plan.md)
+1. ~~**A 节三条拍板**~~ —— ✅ **2026-08-01 已完成**（A-3 的 (c) 实现清单仍待落地，见
+   [`implementation-plan.md`](implementation-plan.md) §6.1）
+2. **B-5、B-6**（零 GPU，各半天，B-6 可能删掉 B3 一整项）—— **B-6 由另一 agent 在查，本轮不重复**
+3. **C-3**（零 GPU，一条命令）—— **由另一 agent 在查，本轮不重复**
+4. **A3 动工前读 D-1 的笔记** —— 已读完，见 D-1
+5. ~~其余按 Track 排期并入 implementation-plan.md~~ —— ✅ **D 节全部（D-2～D-8）已排期**，见 §D
+   逐条的分派记录；C-1/C-2 由另一 agent 在查，不预判结论，结论回来后其下游（Track B3、RK6/H1）
+   会需要再更新一轮
