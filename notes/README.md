@@ -53,7 +53,8 @@
 | `2026-07-24-moe-b12x-cudagraph-incompat-fix.md` | MoE kernel 与 CUDA Graph 不兼容 |
 | `2026-08-01-bfdiag-assertion-audit.md` | **bfdiag 断言可信度审计(Track C0)**——`reset_slot` 隔离保证失效(checkpoint/restore + daemon reset 两处都依赖已经不成立的"reset_slot 会清零 KV");两份手册误称 `reconcile_prefix_hit` 是 stub(实为生产代码);已删除的 `bug_found_not_fixed` 条目;`bfdiag/` 其余模块的真假断言普查 |
 | `2026-08-01-prefill-shape-buckets-root-cause.md` | **prefill 每轮 30+ 秒卡顿**——真正的编译缓存键轴是 sparkinfer `page_table` 宽度（`kv_len+qo_len` 的函数），不是最初怀疑的 `q.shape[0]`（源码 + 本机实测编译缓存直接证伪）；修复是让 `SparkinferPrefillWorkspace` 按 `(mode, window_left)` 建固定容量 workspace，不是按形状重建 |
-| `2026-08-01-c1-c2-gpu-investigation.md` | **C-1/C-2 GPU 排查**——CG 捕获/warmup 用的都是生产真实容量，但顺着 warmup 缺口往下查，发现 DFlash 的 eager verify 回退（`_forward_verify_with_aux`）会直接 `ValueError` 崩掉（GPU 实测坐实，容量估算函数按 extend 语义误用到 verify 契约）；NVFP4 KV vs FP8 KV prefill 对比测不了——SparkInfer 内核只认 fp16/bf16/fp8，这个 runtime 也三处硬编码 fp8 KV，没有第二个配置可比 |
+| `2026-08-01-c1-c2-gpu-investigation.md` | **C-1/C-2 GPU 排查**——CG 捕获/warmup 用的都是生产真实容量，但顺着 warmup 缺口往下查，发现 DFlash 的 eager verify 回退（`_forward_verify_with_aux`）会直接 `ValueError` 崩掉（GPU 实测坐实，容量估算函数按 extend 语义误用到 verify 契约，后续在 2026-08-02 那份笔记里发现连"按 verify 图容量规划器估"这个第一次修复也是错的，真正修法是跑一次真实 eager planner）；NVFP4 KV vs FP8 KV prefill 对比测不了——SparkInfer 内核只认 fp16/bf16/fp8，这个 runtime 也三处硬编码 fp8 KV，没有第二个配置可比 |
+| `2026-08-02-eager-verify-cg-verify-divergence.md` | **eager verify 修完容量能跑了，但和 CG-verify 数值不一致**（未根因，独立立项）——kv_len=64 bit-exact，kv_len≥400 起 argmax 真的选错 token（峰值 raw logit 差 26.7），分界点不是 SWA window=512；双 slot 隔离排除了测试脚本副作用假设。把"响亮失败"变成了"沉默失败"，`QSR_DFLASH_REQUIRE_CG` 默认值因此从 `0` 改成 `1`（拒绝启动）。触发面确认：今天生产里 eager verify 只有一条触发路径（verify CG 捕获失败），全仓库搜索排除了其它旁路——是潜伏风险，不是正在发生的活跃故障 |
 
 ## 3. SM120 kernel 研究 🟢
 

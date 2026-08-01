@@ -81,39 +81,45 @@ def _attempt_cg_capture(name: str, capture_fn: Callable[[], None], *, strict: bo
       ``warning`` and ``error`` already clear that bar, but ``error``
       correctly signals "this degrades a real capability" to anyone who does
       have logging configured, rather than reading as a routine notice.
-    - If ``strict`` (``QSR_DFLASH_REQUIRE_CG=1``): re-raise. This refuses to
-      finish constructing a ``DFlashEngine`` (and therefore finish server
-      startup) with a CUDA Graph that failed to capture, for deployments
-      that would rather fail fast than ever run in a degraded mode.
-    - If not ``strict`` (the default -- preserves today's "keep serving"
-      behavior for transient capture failures): swallow and return
-      ``"failed"``. The caller must record that in ``self.cg_status`` (read
-      by ``bf daemon status`` / tests / anyone auditing a running process)
-      so "which paths are degraded right now" is a single attribute read,
-      never a log grep.
+    - If ``strict`` (``QSR_DFLASH_REQUIRE_CG`` -- defaults to ``"1"``, see
+      ``DFlashEngine.__init__``'s comment on ``self._require_cg`` for why):
+      re-raise. This refuses to finish constructing a ``DFlashEngine`` (and
+      therefore finish server startup) with a CUDA Graph that failed to
+      capture, rather than falling through to a fallback with a known
+      correctness gap.
+    - If not ``strict`` (explicit opt-out, ``QSR_DFLASH_REQUIRE_CG=0``):
+      swallow and return ``"failed"``. The caller must record that in
+      ``self.cg_status`` (read by ``bf daemon status`` / tests / anyone
+      auditing a running process) so "which paths are degraded right now" is
+      a single attribute read, never a log grep.
 
-    Choosing "loud failure, opt-in" over "always refuse to start" here
-    (rather than making strict the unconditional default): DFlash's eager
-    fallback for every mode it can reach is now capacity-correct (see
-    SparkinferPrefillWorkspace's mode-aware capacity, laguna_sparkinfer_
-    attn.py) rather than a silently-broken trap, so degrading to it is a
-    real, working choice with a real perf cost -- not a landmine. A single
-    transient CUDA Graph capture failure (OOM at that exact moment, a driver
-    hiccup) taking down the whole server by default would be a worse
-    default for uptime than degrading loudly and letting an operator decide
-    whether to restart. ``QSR_DFLASH_REQUIRE_CG=1`` is there for anyone who
-    wants the stricter gate (CI, a canary deployment, anywhere a degraded
-    DFlash is worse than not starting).
+    History of this default (read ``self._require_cg``'s comment for the
+    live version -- this is a summary, not the source of truth): originally
+    shipped as "loud failure, opt-in strict" on the theory that DFlash's
+    eager fallback, once capacity-correct (see
+    ``SparkinferPrefillWorkspace``'s mode-aware capacity fix,
+    laguna_sparkinfer_attn.py), was a real working degraded mode, not a
+    landmine -- so a transient capture failure taking down the whole server
+    by default seemed like the worse trade for uptime. That premise did not
+    survive its own bit-exact cross-check: capacity-correct turned out to
+    mean "does not crash", not "computes the same thing" -- the eager path
+    diverges from the CG-verify path's real output once kv_len grows past
+    short-context values (see notes/2026-08-02-eager-verify-cg-verify-
+    divergence.md). Strict is now the default because a refused startup is
+    a visible, retriable availability cost, while silently wrong tokens are
+    neither.
     """
     try:
         capture_fn()
         return "captured"
     except Exception:
         logger.error(
-            "DFlash: %s CUDA Graph capture failed -- degrading to %s's eager "
-            "fallback for the rest of this process's life "
-            "(QSR_DFLASH_REQUIRE_CG=1 would refuse to start instead of "
-            "degrading; see notes/2026-08-01-c1-c2-gpu-investigation.md)",
+            "DFlash: %s CUDA Graph capture failed -- with QSR_DFLASH_REQUIRE_CG=1 "
+            "(the default) this refuses to finish starting rather than degrade "
+            "to %s's eager fallback, which has a known, not-yet-root-caused "
+            "correctness gap against the CG path at kv_len>=400 (see "
+            "notes/2026-08-02-eager-verify-cg-verify-divergence.md). Set "
+            "QSR_DFLASH_REQUIRE_CG=0 to degrade instead of refusing to start.",
             name,
             name,
             exc_info=True,
@@ -256,12 +262,45 @@ class DFlashEngine:
         # or directly (e.g. `bf daemon status` surfaces it through
         # LagunaEngineProvider.describe()).
         self.cg_status: dict[str, str] = {}
-        # QSR_DFLASH_REQUIRE_CG=1: refuse to finish constructing this engine
-        # if any CUDA Graph capture fails, instead of degrading to that
-        # path's (now capacity-correct) eager fallback. See
-        # _attempt_cg_capture's docstring for the reasoning on why the
-        # default (0) degrades loudly rather than refusing to start.
-        self._require_cg = os.environ.get("QSR_DFLASH_REQUIRE_CG", "0") == "1"
+        # QSR_DFLASH_REQUIRE_CG: refuse to finish constructing this engine if
+        # any CUDA Graph capture fails, instead of degrading to that path's
+        # eager fallback. Defaults to "1" (refuse to start) -- NOT because
+        # refusing to start is conservative-by-default, but because of a
+        # specific, confirmed fact:
+        #
+        #   the eager verify fallback (_forward_verify_with_aux), the ONLY
+        #   thing DFlash falls back to when verify CG capture fails, is
+        #   *capacity-correct* (see the C-1 capacity fix in
+        #   laguna_sparkinfer_attn.py) but NOT numerically equivalent to the
+        #   CG-verify path once kv_len grows past ordinary short-context
+        #   values. Direct GPU cross-check (identical inputs, two isolated
+        #   slots, one per path) found bit-exact agreement at kv_len=64 but
+        #   real argmax flips (wrong committed tokens, not float noise) from
+        #   kv_len=400 onward, peaking at a 26.7 raw-logit difference at
+        #   kv_len=500. Full evidence and the ruled-out hypotheses (SWA
+        #   window=512 alignment, test-script cross-slot contamination) are
+        #   in notes/2026-08-02-eager-verify-cg-verify-divergence.md; root
+        #   cause is NOT YET FOUND (needs a separate bf-divergence
+        #   investigation).
+        #
+        #   In other words: fixing the capacity crash turned a LOUD failure
+        #   (ValueError, visible, retriable) into a SILENT one (wrong tokens
+        #   served to a real user, indistinguishable from correct output
+        #   without an independent check). For an inference runtime,
+        #   correctness IS the product -- a refused startup costs
+        #   availability, which is visible, alertable, and retriable; wrong
+        #   output costs correctness invisibly and poisons everything
+        #   downstream of it (conversation history, any tool-call the model
+        #   made from the bad token, cached prefixes). That asymmetry is why
+        #   this defaults to the stricter choice.
+        #
+        # Once the divergence above is root-caused and fixed, this default
+        # should be revisited -- it is deliberately NOT permanent conservatism,
+        # it is "we know of a live correctness gap in the fallback and are
+        # choosing not to serve through it by default until that gap closes."
+        # Do not flip this back to "0" without either fixing that gap or
+        # replacing this whole paragraph with a new, equally specific reason.
+        self._require_cg = os.environ.get("QSR_DFLASH_REQUIRE_CG", "1") == "1"
         # Debug-only fault injector, comma-separated subset of
         # {"verify","draft","decode"}: makes the corresponding
         # _do_capture() raise instead of attempting real capture, so the

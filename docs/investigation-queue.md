@@ -51,21 +51,31 @@
 
 ## C. 自查 —— 需要 GPU（留给开发执行）
 
-- [x] **C-1 · warmup / autotune / CUDA Graph 捕获是否用真实形状** —— ✅ **部分成立，且挖到一个更严重的活 bug**
-  详见 [`../notes/2026-08-01-c1-c2-gpu-investigation.md`](../notes/2026-08-01-c1-c2-gpu-investigation.md#c-1)。
+- [x] **C-1 · warmup / autotune / CUDA Graph 捕获是否用真实形状** —— ✅ **成立，已修，但修复过程中挖到一个更严重的活 bug，未根因**
+  详见 [`../notes/2026-08-01-c1-c2-gpu-investigation.md`](../notes/2026-08-01-c1-c2-gpu-investigation.md#c-1)
+  和 [`../notes/2026-08-02-eager-verify-cg-verify-divergence.md`](../notes/2026-08-02-eager-verify-cg-verify-divergence.md)。
   CUDA Graph 捕获（`laguna_cuda_graph.py`/`laguna_dflash_cudagraph.py`）和
   `warmup_paged_attention_shapes()` 对它们覆盖的 contract 确实用生产真实容量，不是占位小形状——
   flashinfer #3255 字面那种模式在这两处不成立。但沿着 `warmup_paged_attention_shapes()`
   自己承认的缺口（`mode="verify"` 未被预热）往下查，**GPU 实测坐实**：DFlash 主模型的
   eager verify 回退（`_forward_verify_with_aux`）直接调用生产函数会 `ValueError` 崩掉——
   `SparkinferPrefillWorkspace.forward()` 不分 mode 永远用为 `extend` 设计的
-  `eager_extend_work_items_capacity` 估算容量，套到 `verify` 契约上就低估了。今天线上不是
-  正在发生的故障（本次冷启动 verify CG/draft CG 都正常捕获成功），但只要某次启动 verify CG
-  捕获失败（异常被吞掉，`self._verify_cg` 永久 `None`），该进程余下生命周期里 DFlash 每一轮
-  都会崩，不只是变慢。**建议**：`SparkinferPrefillWorkspace` 应像 `LagunaCudaGraphVerify`
-  那样先用未定容量的 `for_contract` 跑一次真实 plan 拿到 sparkinfer 自己算出的容量，再固化为
-  `for_fixed_capacity`，而不是套用 extend 语义的估算函数。属于 `runtime/backends/
-  laguna_sparkinfer_attn.py`，写清楚交给开发，不在本次改。run record: `bf show 940b708aa0f8`。
+  `eager_extend_work_items_capacity` 估算容量，套到 `verify` 契约上低估了。**已修**：改为按
+  mode 分派，`verify` 用一次真实 eager planner（`create_paged_plan(enable_cuda_graph=False,
+  mode="verify")`）在该组声明的最大容量上跑出真实数字（第一次尝试用 sparkinfer 的
+  `plan_verify_graph_capacity` 也是错的——那是为 CUDA Graph 重放设计的不同调度策略，实测同样
+  低估，已改用真实 eager planner 本身）。真正不足的维度是 `max_partial_rows`（硬编码 0），
+  不是 `max_work_items`。
+
+  **但修完之后做"贪心位精确交叉验证"时挖到更严重的问题**：容量修好后 eager verify 能跑了，
+  但跟 CG-verify 路径数值不一致——kv_len=64 bit-exact，kv_len≥400 起 argmax 真的选错 token
+  （峰值 raw logit 差 26.7），分界点不是 SWA window=512，双 slot 隔离排除了测试脚本副作用。
+  **修容量的 bug 把一个响亮失败（`ValueError`）变成了沉默失败（悄悄送错 token）**。
+  触发面确认（读代码）：今天 eager verify 只有一条触发路径——verify CG 启动期捕获失败——
+  是潜伏风险，不是正在发生的活跃故障（本次所有冷启动 verify CG 都捕获成功）。**响应**：
+  `QSR_DFLASH_REQUIRE_CG` 默认值从 `0`（降级但响亮）改成 `1`（拒绝启动），直到这个数值分歧
+  被根因排查并修掉。根因排查需要 `bf divergence` 逐层定位，**独立立项，不在本次任务范围**。
+  run record: `bf show 940b708aa0f8`。
 
 - [x] **C-2 · NVFP4 KV vs FP8 KV 在我们卡上的 prefill 对比** —— ✅ **查完：这个对比在当前技术栈上跑不起来，理由比预想更硬**
   详见 [`../notes/2026-08-01-c1-c2-gpu-investigation.md`](../notes/2026-08-01-c1-c2-gpu-investigation.md#c-2)。
