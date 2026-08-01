@@ -44,9 +44,14 @@ unverified here — flagged again in §3.1.
    anyone writes code against it** (§2.5, §3): the "S4 GDN remnants" are not remnants —
    `docs/qwen36-rebuild-spec.md` §1.5/§1.10 already found this and my own read of
    `runtime/block_pool.py` confirms it — and "vLLM/SGLang return `(kv_hit, state_hit)`"
-   is true of SGLang but **not** of vLLM's default scheduling path, which converges to a
-   single number before the scheduler ever sees two (§3.1). This matters because it
-   changes what "faithful to upstream precedent" means for A3's own return type (§4.2).
+   as a pair the *scheduler* chooses between is true of **neither**: vLLM's default
+   scheduling path converges to one number before the scheduler ever sees two (§3.1),
+   and tracing SGLang's `match_prefix` to its actual truncation point shows its
+   scheduler-facing hit is collapsed to the state-constrained number too (§3.2) — the
+   second number SGLang carries answers a different question entirely. This matters
+   because it changes what "faithful to upstream precedent" means for A3's own return
+   type (§4.2): no surveyed system is precedent for branching scheduling logic on two
+   competing hit lengths, only for keeping a second, differently-purposed number around.
 2. **Laguna's production prefix cache does not use `runtime/block_pool.py` at all.**
    `LagunaBackend.reconcile_prefix_hit` (`runtime/backends/laguna.py:2179-2220`) is a
    same-slot linear token comparison over private per-slot arrays
@@ -81,10 +86,13 @@ unverified here — flagged again in §3.1.
    `notes/prefix-cache-design.md` §5 already used once (P0–P4) and Track A's own
    "zero-behavior-change steps before the risky one" discipline (steps 1–4 of the 8-step
    plan).
-6. **Five decisions in §6 need a human call**, not a default from this document — most
-   consequentially, whether `runtime/block_pool.py`'s dormant `_on_evict_block` hook is
-   the mechanism the coordinator uses, or whether the coordinator supersedes it per the
-   two-independent-allocators framing.
+6. **Six decisions in §6 need a human call**, not a default from this document — most
+   consequentially (Decision 0), whether A3 should also rewire Laguna's own prefix cache
+   onto the new content-addressed allocator while the machinery is being built anyway, or
+   leave that structurally separate and out of scope for this step (recommended). Second
+   most consequential (Decision 1): whether `runtime/block_pool.py`'s dormant
+   `_on_evict_block` hook is the mechanism the coordinator uses, or whether the
+   coordinator supersedes it per the two-independent-allocators framing.
 
 ---
 
@@ -217,7 +225,7 @@ a known failure mode of documents inheriting stale numbers from each other
 |---|---|---|---|
 | `docs/roadmap.md` §1.5-S4 | pre-2026-08-01 | `block_pool.py` GDN hooks are dead-code remnants | **stale** |
 | `docs/qwen36-rebuild-spec.md` §1.5/§1.10 | 2026-08-02 | Same hooks are clean, reusable, dormant infrastructure | **current, confirmed independently in §2.2/§2.3 above** |
-| `notes/2026-08-01-hybrid-cache-prior-art.md` | 2026-08-01 | vLLM and SGLang both keep allocators separate; A3 should return `(kv_hit, state_hit)` | **partly stale — see §3.1**: the "keep allocators separate" half is confirmed for both projects; the "both return a two-number pair" half is true only of SGLang |
+| `notes/2026-08-01-hybrid-cache-prior-art.md` | 2026-08-01 | vLLM and SGLang both keep allocators separate; A3 should return `(kv_hit, state_hit)` | **partly stale — see §3.1/§3.2**: the "keep allocators separate" half is confirmed for both projects; the "both hand the scheduler a two-number pair to choose between" half holds for **neither** — vLLM converges to one number before scheduling, and SGLang's scheduler-facing `device_indices` is traced to the same collapsed-to-`state_hit` value (`hi_mamba_radix_cache.py:1083`); SGLang's second field (`mamba_branching_seqlen`) answers a cache-population question, not a competing hit length |
 
 ---
 
@@ -679,6 +687,39 @@ sweep.
 ## 6. Decisions needing a human call
 
 **[OPEN]** — options given, no default silently assumed elsewhere in this document.
+
+### Decision 0 — Should A3 also move Laguna onto the new content-addressed allocator?
+
+The most consequential fork in this whole document, surfaced explicitly rather than left
+as a background assumption inside §4.4/§5: §2.1 established that Laguna's real prefix
+cache (same-slot linear token scan) is structurally separate from `BlockPool`'s
+content-addressed, cross-request sharing. That separation is *why* zero behavior change
+is close to automatic — but it is also a live, real limitation of what Laguna can do
+today (no cross-slot/cross-request sharing of a repeated system prompt, for instance),
+and A3 is precisely the step that builds the machinery that would fix it.
+
+- **(a) Leave Laguna's mechanism untouched; A3 builds only the new infrastructure for a
+  second (not-yet-existing) cache resource type.** This is the assumption every other
+  section of this document is written against. Cost: a real, valuable improvement to
+  Laguna (cross-request KV sharing) sits unbuilt for another cycle, even though the
+  allocator that would provide it already exists and is already tested.
+- **(b) While A3 is being built anyway, also rewire Laguna's `reconcile_prefix_hit`/
+  `find_best_slot_for_prompt` onto `BlockPool`.** This would be a genuine behavior
+  change for Laguna (better cache hit rates, possibly different latency
+  characteristics under load) layered onto **already the highest-blast-radius step in
+  the entire 8-step plan** (`architecture.md:436`'s own characterization). It reintroduces
+  exactly the risk the plan's "zero-behavior-change steps before the risky one" ordering
+  (`architecture.md:428-437`) was built to avoid, and would need its own bit-exact-under-
+  the-new-mechanism gate distinct from A3's.
+- **[JUDGMENT] Recommendation: (a).** Bundling a real Laguna behavior change into the one
+  step this project's own risk register already flags as the largest-blast-radius item is
+  the specific failure mode Track A's whole sequencing discipline exists to prevent — "we
+  were already in there, so we also changed X" is how scope creep turns a contained step
+  into an uncontained one. If (b) is worth doing, it is worth doing as its own
+  small, independently-gated step *after* A3 lands (using exactly the "does the KV-only
+  path get slower or better" bit-exact + throughput comparison A6 already runs), not
+  folded into it. This recommendation is why §4.4/§5 write "out of scope for this step"
+  as if settled — it is this document's judgment, not yet anyone else's decision.
 
 ### Decision 1 — Does the coordinator reuse `BlockPool._on_evict_block`, or supersede it?
 
