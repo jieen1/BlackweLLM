@@ -265,6 +265,138 @@ def check_cg_replay_slot_consistency(slot: int, replay_slot: int) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# A3 (docs/a3-cache-coordinator-design.md §2/§7 step 7-e): the four
+# invariants that table marks as having NO automated assertion today
+# (INV-A3-2/3/4/8). Wired here, not into a real call site yet -- the same
+# shape as check_cg_replay_slot_consistency/check_aux_hidden_alignment
+# above, which name their intended call site in their own docstrings but
+# are not called from any production code either. Step 7-g (out of scope
+# for this task) is where a real caller would start passing these live
+# values; until then, these exist tested and ready.
+# ---------------------------------------------------------------------------
+
+
+def check_prefix_hit_state_le_kv(slot: int, kv_hit: int, state_hit: int) -> None:
+    """INV-A3-2: ``state_hit <= kv_hit`` always holds -- the region
+    ``[state_hit, kv_hit)`` has KV physically resident but no matching
+    recurrent-state checkpoint, so treating it as safe to skip would start a
+    recurrent layer's forward from a state that is stale for those
+    positions (docs/a3-cache-coordinator-design.md §2/§3).
+
+    ``runtime.backends.protocol.PrefixHit.__post_init__`` already enforces
+    this unconditionally (always-on, raises ``ValueError``, cannot be
+    constructed otherwise) -- this bfdiag check is deliberate defense in
+    depth, not a substitute: it exists for a call site that wants the
+    trace-ring-annotated ``InvariantViolation`` message this module's
+    ``check()`` produces (recent trace events embedded, per
+    ``bfdiag.invariants.registry``'s own docstring), or that is checking the
+    relationship against values read back out of some OTHER representation
+    (e.g. a logged/serialized hit) rather than a live ``PrefixHit`` instance
+    the dataclass guard already protected. A violation here that the
+    dataclass did NOT already catch would mean something is bypassing
+    ``PrefixHit`` construction entirely -- worth knowing on its own."""
+    check(
+        1,
+        "prefix_hit_state_hit_le_kv_hit",
+        state_hit <= kv_hit,
+        slot=slot,
+        kv_hit=kv_hit,
+        state_hit=state_hit,
+    )
+
+
+def check_lockstep_eviction(
+    key: object,
+    *,
+    kv_hash_dropped: bool,
+    checkpoint_dropped: bool,
+    kv_ref_cnt: int,
+) -> None:
+    """INV-A3-3: bidirectional, asymmetric lockstep eviction between the KV
+    and recurrent-state resources (docs/a3-cache-coordinator-design.md
+    §2/§4; ``oracle/qwen36_vllm/gdn_state.py:183-209``'s comment block is
+    the real-code fact this is grounded in, reimplemented in
+    ``runtime.recurrent_state_pool.RecurrentStatePool.evict`` -- A3 step
+    7-c).
+
+    Two sub-conditions checked together, since they are the same named
+    invariant in docs/a3-cache-coordinator-design.md §2's table:
+
+    * Forward (KV-triggered): if the KV resource's hash was dropped
+      (``kv_hash_dropped``), the co-keyed checkpoint MUST also have been
+      dropped (``checkpoint_dropped``) -- a KV block is never evicted while
+      its checkpoint survives, which would let a future reconcile find a
+      ghost attention hit with no matching state.
+    * Reverse (checkpoint-triggered), the asymmetric half: if the co-keyed
+      KV resource is still referenced (``kv_ref_cnt > 0``) at the moment the
+      checkpoint is evicted, its hash MUST NOT have been dropped
+      (``kv_hash_dropped`` must be ``False``) -- losing only the checkpoint
+      is a safe compute miss (``L = G <= A`` still holds); reclaiming a
+      still-referenced KV block's memory instead would be a
+      use-after-free-shaped correctness bug, not a performance one."""
+    forward_ok = (not kv_hash_dropped) or checkpoint_dropped
+    reverse_ok = (kv_ref_cnt <= 0) or (not kv_hash_dropped)
+    check(
+        1,
+        "lockstep_eviction_bidirectional_asymmetric",
+        forward_ok and reverse_ok,
+        key=key,
+        kv_hash_dropped=kv_hash_dropped,
+        checkpoint_dropped=checkpoint_dropped,
+        kv_ref_cnt=kv_ref_cnt,
+    )
+
+
+def check_referenced_resource_never_evicted(
+    resource_id: object, ref_cnt: int, was_evicted: bool
+) -> None:
+    """INV-A3-4: a resource with a live reference (``ref_cnt > 0``, or
+    equivalently an actively-occupied slot) is never evicted by either
+    allocator (docs/a3-cache-coordinator-design.md §2; mirrors
+    ``runtime.block_pool.BlockPool.allocate``'s own hard, always-on
+    ``RuntimeError`` on true exhaustion, and
+    ``runtime.recurrent_state_pool.RecurrentStatePool.evict``'s hard
+    ``RuntimeError`` on a pinned key -- A3 step 7-c). This is the
+    resource-agnostic, level-gated form usable at a call site that does not
+    hold a reference to either concrete allocator, e.g. a coordinator
+    (A3 step 7-d) auditing an eviction decision it did not itself make."""
+    check(
+        1,
+        "referenced_resource_never_evicted",
+        not (ref_cnt > 0 and was_evicted),
+        resource_id=resource_id,
+        ref_cnt=ref_cnt,
+        was_evicted=was_evicted,
+    )
+
+
+def check_reserved_physical_slots_agree(
+    context: str, state_pool_reserved: int, backend_reserved: int
+) -> None:
+    """INV-A3-8: a state allocator's ``RESERVED_PHYSICAL_SLOTS`` convention
+    must match the KV-side runtime it is paired with -- NOT be assumed
+    equal by default (docs/a3-cache-coordinator-design.md §1.8: this
+    project already has one real, documented divergence,
+    ``runtime.block_pool.RESERVED_PHYSICAL_SLOTS == 1`` vs
+    ``runtime.backends.laguna.RESERVED_PHYSICAL_SLOTS == 0``, and one prior
+    100%-deterministic wrong-output incident traced to physical index 0's
+    addressing assumptions, per ``block_pool.py``'s own
+    ``RESERVED_PHYSICAL_SLOTS`` comment). A mismatch here means a state
+    pool and the backend it is meant to serve disagree about which physical
+    address is off-limits -- exactly the class of bug that has already
+    happened once in this project, this time caught by an assertion instead
+    of by a debugging session."""
+    check(
+        1,
+        "reserved_physical_slots_agree",
+        state_pool_reserved == backend_reserved,
+        context=context,
+        state_pool_reserved=state_pool_reserved,
+        backend_reserved=backend_reserved,
+    )
+
+
 if __name__ == "__main__":
     import bfdiag.invariants.registry as registry
     from bfdiag.invariants.registry import InvariantViolation
@@ -319,6 +451,54 @@ if __name__ == "__main__":
     # only ever sized/clipped to 6: exactly the latent bug.
     try:
         check_page_table_covers_seqlen("swa", cache_seqlens=800, n_filled_pages=6, page_size=128)
+        raise AssertionError("expected InvariantViolation")
+    except InvariantViolation:
+        pass
+
+    # A3 step 7-e: INV-A3-2/3/4/8.
+    check_prefix_hit_state_le_kv(slot=0, kv_hit=900, state_hit=400)
+    try:
+        check_prefix_hit_state_le_kv(slot=0, kv_hit=100, state_hit=101)
+        raise AssertionError("expected InvariantViolation")
+    except InvariantViolation:
+        pass
+
+    check_lockstep_eviction(
+        key=1, kv_hash_dropped=True, checkpoint_dropped=True, kv_ref_cnt=0
+    )
+    check_lockstep_eviction(
+        key=1, kv_hash_dropped=False, checkpoint_dropped=True, kv_ref_cnt=5
+    )
+    try:
+        # Forward direction violated: KV hash dropped but checkpoint survived.
+        check_lockstep_eviction(
+            key=1, kv_hash_dropped=True, checkpoint_dropped=False, kv_ref_cnt=0
+        )
+        raise AssertionError("expected InvariantViolation")
+    except InvariantViolation:
+        pass
+    try:
+        # Reverse direction violated: a still-referenced KV block's hash was
+        # dropped anyway (the asymmetry INV-A3-3 exists to prevent).
+        check_lockstep_eviction(
+            key=1, kv_hash_dropped=True, checkpoint_dropped=True, kv_ref_cnt=3
+        )
+        raise AssertionError("expected InvariantViolation")
+    except InvariantViolation:
+        pass
+
+    check_referenced_resource_never_evicted(resource_id=1, ref_cnt=1, was_evicted=False)
+    check_referenced_resource_never_evicted(resource_id=1, ref_cnt=0, was_evicted=True)
+    try:
+        check_referenced_resource_never_evicted(resource_id=1, ref_cnt=1, was_evicted=True)
+        raise AssertionError("expected InvariantViolation")
+    except InvariantViolation:
+        pass
+
+    check_reserved_physical_slots_agree("laguna", state_pool_reserved=0, backend_reserved=0)
+    try:
+        # The real, documented §1.8 divergence: block_pool.py=1 vs laguna.py=0.
+        check_reserved_physical_slots_agree("laguna", state_pool_reserved=1, backend_reserved=0)
         raise AssertionError("expected InvariantViolation")
     except InvariantViolation:
         pass
