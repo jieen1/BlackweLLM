@@ -55,10 +55,14 @@ class StateItem:
       (ring write-pointer/phase, next-round anchor/draft-tokens) and "it
       turns out to need no storage, here is why" is itself a checkable
       claim, not an omission.
-    * ``"not_applicable"``  -- named in the task spec by analogy with
-      ``DirectModelRunner``'s state, but does not exist on the Laguna
-      backend at all (verified against current code, not assumed from the
-      spec's wording).
+    * ``"not_applicable"``  -- not checkpoint SAVE content, for one of two
+      reasons (see ``note`` for which): either (a) named in the task spec
+      by analogy with ``DirectModelRunner``'s state, but does not exist on
+      the Laguna backend at all; or (b) the mechanism is real and does
+      apply, but restoring it verbatim would be actively wrong (e.g. the
+      persistent prefix-cache entry below, which restore must CLEAR rather
+      than save/restore, so the restored slot doesn't inherit its previous
+      occupant's cache identity) -- restore-relevant, not save-relevant.
     """
 
     name: str
@@ -105,8 +109,8 @@ SLOT_STATE_ITEMS: tuple[StateItem, ...] = (
             "token whose own KV row does not exist yet (see that check's "
             "docstring for the exact derivation). Restoring this list "
             "verbatim is also what makes DFlashEngine.generate_verify_"
-            "only's find_prefix_match reuse (laguna.py:1800-1818) 'just "
-            "work' post-restore for free -- see that item below."
+            "only's find_prefix_match reuse 'just work' post-restore for "
+            "free -- see that item below."
         ),
     ),
     StateItem(
@@ -117,27 +121,38 @@ SLOT_STATE_ITEMS: tuple[StateItem, ...] = (
             "backend.kv_caches[name][:, full_start:full_end] for name in "
             "backend._full_layer_names, where full_start = physical_slot * "
             "blocks_per_slot and full_end = full_start + ceil(kv_len / "
-            "block_size) -- NOTE the leading `:,`: this package deliberately "
-            "does NOT replicate reset_slot's own missing-leading-colon bug, "
-            "see the dedicated bug_found_not_fixed item below"
+            "block_size) -- NOTE the leading `:,`: dim 0 is the K/V axis "
+            "(size 2), dim 1 is the block axis; slicing dim 0 instead would "
+            "hit the wrong axis entirely (an older reset_slot had exactly "
+            "this bug -- fixed since, see tests/test_bfdiag_checkpoint_"
+            "restore.py's multi-slot isolation tests, which would catch a "
+            "regression of it in THIS package's own code)"
         ),
         code_ref=(
-            "runtime/backends/laguna.py:1643-1647 (reset_slot's own "
-            "addressing, which zeros the FULL blocks_per_slot allocation); "
-            ":290-306 (allocation, shape (2, n_blocks, block_size, "
-            "num_kv_heads, head_dim))"
+            "runtime/backends/laguna.py reset_slot (bookkeeping only -- see "
+            "note for why this package cannot rely on it to zero KV); "
+            ":290-306ish (allocation, shape (2, n_blocks, block_size, "
+            "num_kv_heads, head_dim); exact line numbers drift, re-grep "
+            "before citing further)"
         ),
         note=(
-            "IMPORTANT SIZE OPTIMIZATION vs. reset_slot: reset_slot clears "
-            "the entire static blocks_per_slot allocation (it must, since "
-            "any future prefill up to that capacity could land there); a "
-            "checkpoint only needs ceil(kv_len / block_size) blocks -- the "
-            "ones that actually hold live data. Saving the full "
-            "blocks_per_slot allocation regardless of actual context "
-            "length would be up to ~8x oversized for a typical 64K-in-a-"
-            "512K-capacity slot. This is exactly why the volume table in "
-            "notes/2026-07-27-bfdiag-checkpoint-restore.md scales with "
-            "context length, not with the configured capacity."
+            "UPDATED 2026-08-02 (see notes/2026-08-01-bfdiag-assertion-"
+            "audit.md): this note used to say 'reset_slot clears the "
+            "entire static blocks_per_slot allocation' -- true of an OLDER "
+            "reset_slot, false of the current one, which preserves KV "
+            "content across resets for Laguna's own prefix cache (see the "
+            "persistent-prefix-cache item below) and touches no tensor at "
+            "all. bfdiag/checkpoint/restore.py can therefore no longer "
+            "assume reset_slot zeroed anything -- it explicitly zeros this "
+            "slot's WHOLE static blocks_per_slot allocation itself "
+            "(state.full_slot_block_range) before writing the checkpoint's "
+            "own SMALLER ceil(kv_len / block_size)-block range on top. That "
+            "smaller range is still all a checkpoint needs to SAVE -- "
+            "saving the full blocks_per_slot allocation regardless of "
+            "actual context length would be up to ~8x oversized for a "
+            "typical 64K-in-a-512K-capacity slot. This is exactly why the "
+            "volume table in notes/2026-07-27-bfdiag-checkpoint-restore.md "
+            "scales with context length, not with the configured capacity."
         ),
     ),
     StateItem(
@@ -149,14 +164,13 @@ SLOT_STATE_ITEMS: tuple[StateItem, ...] = (
             "backend._swa_layer_names, where ring_start = physical_slot * "
             "_ring_blocks_per_slot and ring_end = ring_start + "
             "_ring_blocks_per_slot (the FULL ring capacity, always -- see "
-            "note; leading `:,` again deliberate, see the bug_found_not_"
-            "fixed item below)"
+            "note)"
         ),
         code_ref=(
-            "runtime/backends/laguna.py:1648-1653 (reset_slot's addressing, "
-            "which this mirrors exactly, unlike the full-attention item "
-            "above); :278-281 (_ring_blocks_per_slot / _ring_slots_per_slot "
-            "derivation from _swa_window + block_size + SWA_QO_MAX)"
+            "runtime/backends/laguna.py :278-281ish "
+            "(_ring_blocks_per_slot / _ring_slots_per_slot derivation from "
+            "_swa_window + block_size + SWA_QO_MAX; exact line numbers "
+            "drift, re-grep before citing further)"
         ),
         note=(
             "Unlike full-attention KV, always save the WHOLE ring capacity "
@@ -286,7 +300,10 @@ SLOT_STATE_ITEMS: tuple[StateItem, ...] = (
         category="derived_no_store",
         per_layer=False,
         source="n/a -- pure function of slot_committed_tokens + slot_kv_len, both already listed",
-        code_ref="runtime/backends/laguna.py:1800-1818",
+        code_ref=(
+            "runtime/backends/laguna.py find_prefix_match "
+            "(line drifted since last check; re-grep before citing further)"
+        ),
         note=(
             "find_prefix_match walks backend.slot_committed_tokens[slot] "
             "against a new prompt and returns how many tokens already "
@@ -315,57 +332,17 @@ SLOT_STATE_ITEMS: tuple[StateItem, ...] = (
         note=(
             "Not separate checkpoint CONTENT (it's not something to save), "
             "but it dictates restore's write order: restore_checkpoint "
-            "must call backend.reset_slot(slot) (plus zero the draft ring "
-            "range for that slot) BEFORE writing the checkpointed tensors "
-            "in, exactly the same discipline session.reset_laguna_engine "
-            "uses for a cold load() -- otherwise warmup residue (or a "
-            "PREVIOUS experiment's leftovers, in a hot daemon) could "
-            "corrupt the tail of a ring whose live window doesn't happen "
-            "to cover every position this checkpoint restores. Listed here "
-            "as 'not_applicable' to the SAVE side but load-bearing on the "
-            "RESTORE side."
-        ),
-    ),
-    StateItem(
-        name="BUG FOUND (not fixed): reset_slot's block-range slice hits the wrong tensor axis",
-        category="bug_found_not_fixed",
-        per_layer=False,
-        source="n/a -- this is a finding about runtime/ code, not a checkpoint content item",
-        code_ref="runtime/backends/laguna.py:1647,1653 (reset_slot)",
-        note=(
-            "Discovered while writing this package's own save/restore tensor "
-            "slicing (a multi-slot smoke test -- num_slots=2 -- surfaced it "
-            "immediately; NOT fixed, runtime/ is out of scope for this task, "
-            "flagged here for whoever owns runtime/backends/laguna.py, same "
-            "as bfdiag/daemon/session.py's RESET_CHECKLIST already flags an "
-            "unrelated self._decode_cg.reset() bug). KV cache tensors are "
-            "allocated as shape (2, num_blocks, block_size, num_kv_heads, "
-            "head_dim) -- dim 0 is the K/V axis (size 2), dim 1 is the block "
-            "index (laguna.py:301 comment: 'dim=0: 0=K, 1=V'; confirmed by "
-            "every OTHER access site in the file, e.g. "
-            "_copy_scratch_to_ring's `ring[:, db, do:do+n]`, which always "
-            "slices dim 0 with a bare `:` and indexes dim 1 by block). "
-            "reset_slot's own block-clearing lines are the ONE place in the "
-            "file that omits the leading `:,`: `self.kv_caches[name]"
-            "[full_start:full_end].zero_()` slices dim 0 (size 2), not dim 1 "
-            "-- for slot 0 (full_start=0) this clips to the whole dim 0 and "
-            "leaves dim 1 (blocks) UNRESTRICTED, zeroing every slot's "
-            "blocks at once; for any slot > 0, full_start already exceeds "
-            "dim 0's size and the slice is empty, so reset_slot(slot>0) "
-            "zeros NOTHING. This is completely masked in current "
-            "production use because DFlash requires capacity==1 "
-            "(ServerEngine enforces num_slots==1 whenever DFlash speculative "
-            "decoding is enabled, per laguna_dflash.py's docstring on "
-            "mtp_verify_and_commit_batch) -- with exactly one slot, 'zero "
-            "everything' and 'zero slot 0's blocks' are the same operation, "
-            "so the bug has no observable effect today. It would matter the "
-            "moment Laguna is ever run with num_slots > 1. This package's "
-            "OWN code (state.py/store.py/restore.py/testing.py) does NOT "
-            "replicate this bug -- every block-range slice here uses the "
-            "correct `tensor[:, start:end]` form, verified by "
-            "tests/test_bfdiag_checkpoint_state.py's dedicated regression "
-            "test and by this package's own multi-slot (num_slots=2) test "
-            "coverage, which would have caught exactly this class of error."
+            "must call backend.reset_slot(slot) for its bookkeeping AND "
+            "explicitly zero this slot's full-attention + draft-ring KV "
+            "itself (see the 'full-attention KV cache blocks' item above --"
+            " reset_slot no longer zeros anything) BEFORE writing the "
+            "checkpointed tensors in, exactly the same discipline "
+            "session.reset_laguna_engine uses for a cold load() -- "
+            "otherwise warmup residue (or a PREVIOUS experiment's "
+            "leftovers, in a hot daemon) could corrupt the tail of a ring "
+            "whose live window doesn't happen to cover every position "
+            "this checkpoint restores. Listed here as 'not_applicable' to "
+            "the SAVE side but load-bearing on the RESTORE side."
         ),
     ),
     StateItem(
@@ -385,21 +362,47 @@ SLOT_STATE_ITEMS: tuple[StateItem, ...] = (
         ),
     ),
     StateItem(
-        name="Content-addressed persistent prefix cache (BlockPool / prefix_cache.py)",
+        name=(
+            "Laguna's own persistent, per-slot prefix cache "
+            "(_prefix_cache_tokens/_prefix_cache_kv_len) -- CLEARED by restore, not saved"
+        ),
         category="not_applicable",
         per_layer=False,
-        source="n/a -- LagunaBackend has no persistent prefix cache",
-        code_ref="runtime/backends/laguna.py:1655-1658 (reconcile_prefix_hit stub returns 0)",
+        source=(
+            "n/a as checkpoint SAVE content -- but restore_checkpoint explicitly clears "
+            "backend._prefix_cache_tokens[slot]/_prefix_cache_kv_len[slot] as part of its "
+            "target-slot reset (see restore.py step 2), same as it explicitly zeros the "
+            "full-attention KV range there"
+        ),
+        code_ref=(
+            "runtime/backends/laguna.py reset_slot (populates these two lists, never "
+            "clears them) and reconcile_prefix_hit (reads them); server/engine.py "
+            "(the real production admission call site)"
+        ),
         note=(
-            "Re-verified directly: LagunaBackend.reconcile_prefix_hit is an "
-            "explicit stub ('E1: Laguna has no persistent content-"
-            "addressed prefix cache yet (roadmap L2/L3 TODO) -- every "
-            "admission is a cold miss'). runtime/block_pool.py and "
-            "runtime/prefix_cache.py are exclusively used by "
-            "runtime/direct_model_runner.py, never referenced from "
-            "runtime/backends/laguna*.py. If/when Laguna grows a real "
-            "persistent prefix cache (notes/2026-07-27-laguna-prefix-"
-            "cache-scoping.md), this checklist needs a matching new item."
+            "CORRECTED 2026-08-02 (see notes/2026-08-01-bfdiag-assertion-"
+            "audit.md): this item used to claim 'LagunaBackend has no "
+            "persistent prefix cache' and cited reconcile_prefix_hit as an "
+            "explicit stub -- both false against the current source, and at "
+            "since-moved line numbers. reconcile_prefix_hit is real, fully "
+            "implemented, and called directly from server/engine.py's "
+            "request admission path; it is the reason reset_slot no longer "
+            "zeros KV (see the 'full-attention KV cache blocks' item above) "
+            "-- reset_slot conditionally SAVES the slot's token history "
+            "into _prefix_cache_tokens/_prefix_cache_kv_len specifically so "
+            "a later same-content admission can reuse this slot's warm KV. "
+            "This item is 'not_applicable' to checkpoint SAVE content (it "
+            "is not something a checkpoint should preserve) for a "
+            "different reason than the usual one: restoring a checkpoint "
+            "must NOT let the target slot inherit its PREVIOUS occupant's "
+            "prefix-cache identity (whatever reset_slot just saved right "
+            "before the checkpoint's own tensors get written in), so "
+            "restore.py explicitly clears both lists to None/0 instead. "
+            "runtime/block_pool.py and runtime/prefix_cache.py (the "
+            "DirectModelRunner/BlockPool machinery this item originally "
+            "described) genuinely do not apply to Laguna -- that half of "
+            "the original claim was correct -- but this is a separate, "
+            "Laguna-native mechanism that very much does."
         ),
     ),
 )
@@ -501,6 +504,19 @@ def full_block_range(geom: SlotGeometry, kv_len: int) -> tuple[int, int]:
     used_blocks = -(-kv_len // geom.block_size)  # ceil division
     used_blocks = min(used_blocks, geom.blocks_per_slot)
     return start, start + used_blocks
+
+
+def full_slot_block_range(geom: SlotGeometry) -> tuple[int, int]:
+    """The WHOLE static ``blocks_per_slot`` allocation for full-attention
+    layers, regardless of ``kv_len`` -- unlike :func:`full_block_range`
+    (which returns only the live-data sub-range for save/restore payload
+    sizing). ``restore_checkpoint`` uses THIS range to zero the target
+    slot's full-attention KV before writing the checkpoint's own (smaller)
+    live range on top -- see the "full-attention KV cache blocks" item's
+    note for why this zeroing can no longer be delegated to
+    ``backend.reset_slot``."""
+    start = geom.physical_slot * geom.blocks_per_slot
+    return start, start + geom.blocks_per_slot
 
 
 def swa_ring_block_range(geom: SlotGeometry) -> tuple[int, int]:

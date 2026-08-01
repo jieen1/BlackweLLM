@@ -55,12 +55,26 @@ class ResetStep:
 RESET_CHECKLIST: tuple[ResetStep, ...] = (
     ResetStep(
         name="slot_kv_len / slot_committed_tokens / full-attention + SWA-ring KV cache blocks",
-        location="runtime/backends/laguna.py:1504 LagunaBackend.reset_slot",
+        location=(
+            "runtime/backends/laguna.py LagunaBackend.reset_slot (bookkeeping only) "
+            "+ reset_laguna_engine's own explicit KV zeroing below (see note)"
+        ),
         applies_to_laguna=True,
         note=(
-            "Per logical slot: zeros the physical full-attention and SWA "
-            "ring-KV blocks for that slot and clears slot_kv_len/"
-            "slot_committed_tokens. Must be called for EVERY slot in "
+            "UPDATED 2026-08-02 (see notes/2026-08-01-bfdiag-assertion-"
+            "audit.md): this entry used to say 'reset_slot zeros the "
+            "physical full-attention and SWA ring-KV blocks for that slot', "
+            "citing a since-moved line number. That was true of an OLDER "
+            "reset_slot; the CURRENT one was rewritten to preserve KV "
+            "content across resets so Laguna's own per-slot prefix cache "
+            "can reuse it on a same-slot prefix hit, and no longer touches "
+            "any tensor -- it only clears slot_kv_len/slot_committed_tokens "
+            "(plus the prefix-chunk snapshot). reset_laguna_engine below "
+            "therefore does its OWN explicit zeroing of the full-attention "
+            "and SWA-ring blocks for every slot, rather than assuming "
+            "reset_slot already did it -- same fix applied to "
+            "bfdiag/checkpoint/restore.py's target-slot reset for the same "
+            "reason. Must be called for EVERY slot in "
             "range(backend.num_slots), not just whichever slot(s) the "
             "previous experiment happened to touch -- see the CUDA Graph "
             "capture entry below for why slot 0 in particular is never "
@@ -161,19 +175,41 @@ RESET_CHECKLIST: tuple[ResetStep, ...] = (
         ),
     ),
     ResetStep(
-        name="Content-addressed persistent prefix cache (BlockPool hash index)",
-        location="runtime/block_pool.py; runtime/prefix_cache.py",
-        applies_to_laguna=False,
+        name="Laguna's own persistent, per-slot content-addressed prefix cache",
+        location=(
+            "runtime/backends/laguna.py LagunaBackend.reset_slot "
+            "(_prefix_cache_tokens/_prefix_cache_kv_len) + reconcile_prefix_hit; "
+            "server/engine.py (ServerEngine's real admission call site)"
+        ),
+        applies_to_laguna=True,
         note=(
-            "Does not apply either: LagunaBackend.reconcile_prefix_hit is an "
-            "explicit stub ('E1: Laguna has no persistent content-addressed "
-            "prefix cache yet (roadmap L2/L3 TODO) -- every admission is a "
-            "cold miss', runtime/backends/laguna.py:1520-1523). "
-            "block_pool.py/prefix_cache.py belong to DirectModelRunner, same "
-            "as GDN above -- not loaded by LagunaEngineProvider. If/when "
-            "Laguna grows a real persistent prefix cache (see "
-            "notes/2026-07-27-laguna-prefix-cache-scoping.md), this "
-            "checklist and reset_laguna_engine() must grow a matching step."
+            "CORRECTED 2026-08-02 (see notes/2026-08-01-bfdiag-assertion-"
+            "audit.md): this entry used to say reconcile_prefix_hit was an "
+            "explicit stub ('every admission is a cold miss') and that this "
+            "belonged only to the separate DirectModelRunner/BlockPool path "
+            "-- both false against the current source. reconcile_prefix_hit "
+            "is real, fully implemented, and wired into PRODUCTION request "
+            "admission (server/engine.py calls "
+            "self.runner.reconcile_prefix_hit(p) directly) -- it is the "
+            "reason reset_slot was rewritten to preserve KV instead of "
+            "zeroing it (reset_slot conditionally SAVES the slot's token "
+            "history into _prefix_cache_tokens/_prefix_cache_kv_len rather "
+            "than clearing them). runtime/block_pool.py/runtime/prefix_"
+            "cache.py (the DirectModelRunner/BlockPool machinery the "
+            "original note described) genuinely do NOT apply to Laguna --  "
+            "that half was correct -- but this is a SEPARATE, Laguna-native "
+            "mechanism, not the same one, and it does apply. "
+            "reset_laguna_engine() now explicitly clears "
+            "_prefix_cache_tokens/_prefix_cache_kv_len for every slot after "
+            "reset_slot (which itself only POPULATES them, never clears "
+            "them -- that is its contract) so a canary run cannot "
+            "spuriously prefix-hit whatever the previous experiment left "
+            "behind. bfdiag's own LagunaEngineProvider/canary path never "
+            "constructs a ServerEngine, so it does not currently call "
+            "reconcile_prefix_hit either way -- this fix is defense in "
+            "depth against that changing (a future provider routing "
+            "through ServerEngine, or restore.py/session.py being reused "
+            "somewhere that does), not a response to an observed failure."
         ),
     ),
     ResetStep(
@@ -233,6 +269,16 @@ def reset_laguna_engine(engine: Any) -> list[str]:
        because CUDA Graph capture dirties slot 0 (and the tail slots) as a
        side effect that has nothing to do with which slots any particular
        experiment used (see RESET_CHECKLIST's CUDA Graph entry).
+    1b. An explicit ``.zero_()`` of every slot's full-attention and
+        SWA-ring KV blocks. This USED to be ``reset_slot``'s own job (see
+        the RESET_CHECKLIST entry above); the current ``reset_slot`` was
+        rewritten to preserve KV content across resets for Laguna's own
+        prefix cache, so it no longer zeros anything -- this function
+        cannot assume it did. Reuses
+        ``bfdiag.checkpoint.state.slot_geometry``/``full_slot_block_range``/
+        ``swa_ring_block_range`` (the same addressing arithmetic
+        ``bfdiag/checkpoint/restore.py`` uses for the identical reason)
+        rather than re-deriving physical-slot math a second time here.
     2. Zeroing every tensor in ``engine._draft_kv_caches`` (the DFlash
        draft model's ring KV cache), matching established practice in
        ``benchmarks/diag_acceptance_v2.py``.
@@ -242,12 +288,39 @@ def reset_laguna_engine(engine: Any) -> list[str]:
     non-DFlash backend passed in by mistake) just skips that step rather
     than raising, so this function stays safe to call defensively.
     """
+    from bfdiag.checkpoint.state import full_slot_block_range, slot_geometry, swa_ring_block_range
+
     backend = engine.backend
     performed: list[str] = []
 
     for slot in range(backend.num_slots):
         backend.reset_slot(slot)
+        geom = slot_geometry(backend, engine, slot)
+        full_start, full_end = full_slot_block_range(geom)
+        for layer_name in geom.full_layer_names:
+            backend.kv_caches[layer_name][:, full_start:full_end].zero_()
+        if geom.ring_blocks_per_slot > 0:
+            ring_start, ring_end = swa_ring_block_range(geom)
+            for layer_name in geom.swa_layer_names:
+                backend.kv_caches[layer_name][:, ring_start:ring_end].zero_()
     performed.append("slot_kv_len/slot_committed_tokens/full+SWA KV cache blocks (all slots)")
+
+    # reset_slot(slot) above ALSO (by its own design) just saved whatever
+    # each slot was running into the persistent prefix cache
+    # (backend._prefix_cache_tokens/_prefix_cache_kv_len) -- correct
+    # behavior for reset_slot in isolation, but wrong for a function whose
+    # whole point is "make this indistinguishable from a fresh cold load",
+    # where those lists start out all-None/all-zero. Clear them explicitly
+    # so a canary run right after this cannot spuriously prefix-hit
+    # whatever the previous experiment left behind via
+    # backend.reconcile_prefix_hit -- see RESET_CHECKLIST's
+    # "Content-addressed persistent prefix cache" entry above.
+    prefix_cache_tokens = getattr(backend, "_prefix_cache_tokens", None)
+    if prefix_cache_tokens is not None:
+        for slot in range(backend.num_slots):
+            prefix_cache_tokens[slot] = None
+            backend._prefix_cache_kv_len[slot] = 0
+        performed.append("persistent prefix cache metadata (all slots)")
 
     draft_kv_caches = getattr(engine, "_draft_kv_caches", None)
     if draft_kv_caches:

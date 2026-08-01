@@ -150,6 +150,90 @@ def test_restoring_into_nonzero_slot_does_not_disturb_other_live_slots(tmp_path:
         assert torch.equal(after["full"][name], tensor)
 
 
+# --- 1b. real regression coverage for the reset_slot isolation gap ---------
+#
+# Background (see notes/2026-08-01-bfdiag-assertion-audit.md and
+# bfdiag/checkpoint/restore.py's docstring): FakeBackend.reset_slot used to
+# zero a slot's full-attention/SWA-ring KV, matching an OLDER version of the
+# real LagunaBackend.reset_slot. The real one was rewritten to preserve KV
+# across resets for Laguna's own prefix cache and no longer zeros anything;
+# FakeBackend was updated to match (see its docstring). These two tests
+# exercise the REAL restore_checkpoint function against that corrected
+# fake -- if restore_checkpoint's own explicit zeroing (added alongside the
+# fake's correction) were ever removed or broken, these would fail; before
+# that fix landed, the first one WOULD have failed against the corrected
+# fake (residue from the target slot's own longer, unrelated previous
+# occupant leaking past the restored checkpoint's live range).
+
+
+def test_restore_zeros_target_slots_leftover_full_attention_blocks_beyond_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """Restore a SHORT checkpoint into a slot that previously held a LONGER
+    context. Blocks beyond the checkpoint's own live range must be zeroed,
+    not still hold the target slot's own previous (longer, unrelated)
+    occupant's KV bytes."""
+    src = _fresh_engine()
+    _prime_slot(src, slot=0, prompt_len=20, rounds=1)  # short-lived checkpoint
+    store.save_checkpoint(src, 0, "short", root=tmp_path, baseline_steps=1)
+    src_snapshot = _snapshot_slot_state(src, 0)
+    checkpoint_full_end = src_snapshot["ranges"]["full"][1]
+
+    target = _fresh_engine()
+    _prime_slot(target, slot=0, prompt_len=90, rounds=8)  # long-lived previous occupant
+    geom = state.slot_geometry(target.backend, target, slot=0)
+    slot_full_start, slot_full_end = state.full_slot_block_range(geom)
+    assert checkpoint_full_end < slot_full_end, (
+        "test setup: the checkpoint must use fewer blocks than the target "
+        "slot's full static capacity, or this test can't distinguish "
+        "'zeroed' from 'never touched'"
+    )
+    # Sanity: the target slot's blocks beyond where the checkpoint will end
+    # are genuinely non-zero (real leftover data) before restore.
+    for name in geom.full_layer_names:
+        beyond = target.backend.kv_caches[name][:, checkpoint_full_end:slot_full_end]
+        assert bool(beyond.any()), "test setup: expected real leftover data in this range"
+
+    restore.restore_checkpoint(
+        target, 0, "short", root=tmp_path, verify_after=False, derive_next_round=False
+    )
+
+    for name in geom.full_layer_names:
+        beyond = target.backend.kv_caches[name][:, checkpoint_full_end:slot_full_end]
+        assert not bool(beyond.any()), (
+            "restore_checkpoint left leftover data from the target slot's "
+            "own previous, longer occupant past the restored checkpoint's "
+            "live range -- the isolation guarantee is broken"
+        )
+
+
+def test_restore_clears_stale_persistent_prefix_cache_entry_for_target_slot(
+    tmp_path: Path,
+) -> None:
+    """After restoring into a slot, backend._prefix_cache_tokens[slot] must
+    not describe the slot's PREVIOUS occupant -- reconcile_prefix_hit would
+    otherwise match this slot's newly-restored KV against the wrong token
+    history."""
+    src = _fresh_engine()
+    _prime_slot(src, slot=0, prompt_len=20, rounds=1)
+    store.save_checkpoint(src, 0, "short", root=tmp_path, baseline_steps=1)
+
+    target = _fresh_engine()
+    _prime_slot(target, slot=0, prompt_len=90, rounds=8)
+    previous_committed_tokens = list(target.backend.slot_committed_tokens[0])
+
+    restore.restore_checkpoint(
+        target, 0, "short", root=tmp_path, verify_after=False, derive_next_round=False
+    )
+
+    # reset_slot() (called internally by restore_checkpoint) would, left
+    # alone, have just saved the previous occupant's tokens here -- prove
+    # restore_checkpoint clears it back out afterward.
+    assert target.backend._prefix_cache_tokens[0] is None
+    assert target.backend._prefix_cache_kv_len[0] == 0
+    assert target.backend._prefix_cache_tokens[0] != previous_committed_tokens
+
+
 # --- 2. verified full round trip (via verify_after=True) ------------------
 
 

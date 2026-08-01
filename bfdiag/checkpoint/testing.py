@@ -117,6 +117,13 @@ class FakeBackend:
 
         self.slot_kv_len: list[int] = [0] * num_slots
         self.slot_committed_tokens: list[list[int]] = [[] for _ in range(num_slots)]
+        # Mirrors the real backend's persistent, cross-reset prefix cache
+        # bookkeeping exactly (see reset_slot below) -- NOT a stub. The real
+        # LagunaBackend.reconcile_prefix_hit reads these two lists; it is
+        # wired into production admission (server/engine.py), not the
+        # "explicit stub" bfdiag/checkpoint/state.py used to describe.
+        self._prefix_cache_tokens: list[list[int] | None] = [None] * num_slots
+        self._prefix_cache_kv_len: list[int] = [0] * num_slots
 
     # ── addressing, mirrors runtime/backends/laguna.py exactly ──────────
 
@@ -147,21 +154,38 @@ class FakeBackend:
                 self.kv_caches[name][:, block, off, :, :] = _byte_at(h, name, pos)
 
     def reset_slot(self, slot: int) -> None:
-        """Mirrors ``LagunaBackend.reset_slot`` (laguna.py:1639-1653)
-        exactly: zero this slot's full-attention blocks and SWA ring
-        blocks, clear kv_len/committed_tokens."""
+        """Mirrors the CURRENT ``LagunaBackend.reset_slot``
+        (``runtime/backends/laguna.py``, ~line 1975 at the time this was
+        last checked against the source) exactly: bookkeeping only.
+
+        This used to also zero the slot's full-attention and SWA-ring KV
+        blocks, matching an OLDER version of the real ``reset_slot``. That
+        real function was rewritten to preserve KV content across resets
+        so Laguna's own per-slot prefix cache can reuse it on a same-slot
+        prefix hit (``_prefix_cache_tokens``/``_prefix_cache_kv_len`` on the
+        real backend) -- it no longer touches any tensor. Keeping this fake
+        zeroing KV after that rewrite would silently validate every test in
+        this package against behavior production code no longer has; see
+        notes/2026-08-01-bfdiag-assertion-audit.md for the finding and
+        bfdiag/checkpoint/restore.py's own explicit full-attention zeroing,
+        which exists precisely because this fake (and the real backend) no
+        longer do it here.
+
+        It DOES still mirror the real function's conditional save into the
+        persistent prefix cache (``_prefix_cache_tokens``/
+        ``_prefix_cache_kv_len``) -- real ``reset_slot`` populates those
+        from whatever the slot was running right before this call, and
+        does NOT clear them itself (by design: that is what makes them
+        survive a reset for later reuse). A caller that wants "no leftover
+        prefix-cache entry for this slot" (checkpoint restore,
+        engine-wide pristine reset) has to clear them explicitly -- see
+        ``restore.py``/``bfdiag/daemon/session.py::reset_laguna_engine``.
+        """
+        if self.slot_committed_tokens[slot] and self.slot_kv_len[slot] > 0:
+            self._prefix_cache_tokens[slot] = list(self.slot_committed_tokens[slot])
+            self._prefix_cache_kv_len[slot] = self.slot_kv_len[slot]
         self.slot_kv_len[slot] = 0
         self.slot_committed_tokens[slot] = []
-        phys = self._physical_slot(slot)
-        full_start = phys * self.blocks_per_slot
-        full_end = full_start + self.blocks_per_slot
-        for name in self._full_layer_names:
-            self.kv_caches[name][:, full_start:full_end].zero_()
-        if self._ring_blocks_per_slot > 0:
-            ring_start = phys * self._ring_blocks_per_slot
-            ring_end = ring_start + self._ring_blocks_per_slot
-            for name in self._swa_layer_names:
-                self.kv_caches[name][:, ring_start:ring_end].zero_()
 
     def prefill(self, slot: int, prompt_ids: list[int]) -> int:
         """Mirrors ``LagunaBackend.prefill`` (laguna.py:1225-1240): writes
@@ -317,9 +341,21 @@ class FakeDFlashEngine:
 def reset_all(engine: FakeDFlashEngine) -> None:
     """Test convenience mirroring
     ``bfdiag.daemon.session.reset_laguna_engine`` against the fakes: reset
-    every slot's backend state, zero every draft KV tensor entirely."""
+    every slot's backend state, zero every full-attention/SWA-ring KV block
+    (explicitly -- ``backend.reset_slot`` no longer does this, see its
+    docstring), zero every draft KV tensor entirely."""
     backend = engine.backend
     for slot in range(backend.num_slots):
         backend.reset_slot(slot)
+        phys = backend._physical_slot(slot)
+        full_start = phys * backend.blocks_per_slot
+        full_end = full_start + backend.blocks_per_slot
+        for name in backend._full_layer_names:
+            backend.kv_caches[name][:, full_start:full_end].zero_()
+        if backend._ring_blocks_per_slot > 0:
+            ring_start = phys * backend._ring_blocks_per_slot
+            ring_end = ring_start + backend._ring_blocks_per_slot
+            for name in backend._swa_layer_names:
+                backend.kv_caches[name][:, ring_start:ring_end].zero_()
     for tensor in engine._draft_kv_caches.values():
         tensor.zero_()
