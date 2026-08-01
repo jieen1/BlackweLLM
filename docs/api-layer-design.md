@@ -570,6 +570,51 @@ admission 阶段就能拿到的掩码钩子，并解决 CUDA Graph 重放下"贪
 graph"的架构冲突（关掉该批次的 CG 重放，或者把逐 token 变化的 bitmask
 做成 graph 的一个输入）。在此之前不要重新"顺手接上"§5.1 提到的窄路径。
 
+### 7.2 N2（`stop` / `stop_sequences`）—— 已接通
+
+思路：stop 是**文本**层面的语义，但解码是**token**层面的——沿用
+`server/formats/stream.py::_trim_ambiguous_tail` 已有的"扣住可能还会变成
+标记的尾部字节"思路，泛化到 N 个候选串（新模块
+`server/formats/stop.py::find_earliest_stop_match`/
+`trim_ambiguous_stop_tail`），再在 `server/engine.py` 里给每个配置了
+`stop` 的 slot 维护一个私有的 `StreamProcessor`（`_stop_check_token`/
+`_flush_stop_pending`/`_drop_stop_pending_from_committed`），逐 token 判断：
+
+- 完整匹配 → 截断 `committed_tokens`（连同 `logprobs_acc`），以 `"stop"`
+  结束，Anthropic 侧记录命中的具体串。
+- 是某个候选串的严格前缀（歧义，可能被后续 token 补全）→ 扣住，不进
+  stream channel，也不算进最终结果。
+- 排除歧义后确认安全 → 一次性 flush 给 stream channel（顺序不变，从未
+  出现"先发后撤"）。
+
+**与 reasoning 状态机的交互**：只对 content 生效，不对 reasoning 生效——
+私有 tracker 复用 `StreamProcessor.thinking_done`；只要还在 reasoning 阶段
+（`thinking_done=False`），token 立即 flush（不因为 stop 逻辑给 reasoning
+显示增加延迟），完全不进入 stop 匹配。理由：OpenAI 真实 API 的
+`reasoning_content`/思维链内容不受 `stop` 截断，这是主流实现的行为；本次
+选择跟随这个约定而不是自创语义。
+
+**覆盖的解码路径**：贪心 MTP 验证/提交批量路径（`mtp_verify_and_commit_batch`，
+一轮可提交多个 token，逐 token 检查、命中即截断丢弃该轮剩余草稿）、
+自回归采样路径（`decode_batch_sampled`，逐 token）、admission 阶段的
+anchor token（每个请求的第一个 token，同样跑一遍检查，且必须无条件喂给
+tracker——否则后续匹配会静默漏掉这个 token 的贡献）。**未覆盖**：
+CUDA Graph 贪心重放路径——但这不是短板，是路由规则的必然结果：
+`decode_batch_sampled` 的 CG 重放要求整批 `all(p.is_greedy)`且无
+logprobs，配了 `stop_sequences` 的 slot 走的是同一份逐 token 检查代码，
+不依赖 CG 是否命中；CG 命中与否只影响"贪心怎么拿到 token"，不影响"拿到
+token 之后怎么判断 stop"。
+
+**未精确处理、已知且可接受的近似**：一个 pending 批次里，如果匹配点之前
+还夹着"安全"文本（同一批被扣住的 token 里，前面部分其实不歧义），本次
+选择整批一起扣住/一起 flush，不去拆某个 token 内部的字符边界——因为
+stream channel 是按 token id 传的，拆到字符级需要把文字重新编码回
+token，不可靠。这只影响**延迟**（安全文本多等一轮才 flush），从不导致
+泄漏（stop 序列本身或其后内容永不发出）。同理，命中匹配截断
+`committed_tokens`/`logprobs_acc` 时，如果 pending 缓冲区里第一个 token
+恰好是 anchor（没有对应的 logprobs 条目），可能多裁一条 `logprobs_acc`——
+方向上安全（从不残留错位数据，最多少算一两条）。
+
 ### 7.3 N3（`seed`）—— 已接通，不改 `runtime/backends/laguna.py`
 
 根因和 §5.4 一致：`runtime/backends/laguna.py` 三个采样调用点

@@ -30,7 +30,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from runtime.sampling import SamplingParams
+from server.formats.stop import find_earliest_stop_match, trim_ambiguous_stop_tail
+from server.formats.stream import StreamProcessor
 from server.tracing import tracer
+
+# N2: stop-sequence matching must exclude the reasoning phase (OpenAI's
+# reasoning_content is not truncated by `stop` -- see _activate_slot /
+# _stop_check_token). Laguna's chat template never injects <think> into
+# the prompt, so thinking_capable=False here -- mirrors
+# server/app.py::SERVER_THINKING_CAPABLE, which is hardcoded the same way
+# for the same (currently single-model) reason. If a future model needs
+# template-injected thinking, both constants need to move together.
+_STOP_TRACKER_THINKING_CAPABLE = False
 
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("SM120_GQA_USE_V2_DECODE_KERNEL", "1")
@@ -119,6 +130,7 @@ class GenerationRequest:
     session_id: str | None = None
     stream_channel: StreamChannel | None = None
     sampling_params: SamplingParams = field(default_factory=SamplingParams)
+    stop_sequences: list[str] | None = None
     logprobs: bool = False
     top_logprobs: int = 0
 
@@ -461,6 +473,7 @@ class ServerEngine:
         max_tokens: int,
         session_id: str | None = None,
         sampling_params: SamplingParams | None = None,
+        stop_sequences: list[str] | None = None,
         logprobs: bool = False,
         top_logprobs: int = 0,
     ) -> dict:
@@ -474,6 +487,7 @@ class ServerEngine:
             future=fut,
             session_id=session_id,
             sampling_params=sampling_params or SamplingParams(),
+            stop_sequences=stop_sequences,
             logprobs=logprobs,
             top_logprobs=top_logprobs,
         )
@@ -491,6 +505,7 @@ class ServerEngine:
         session_id: str | None = None,
         sampling_params: SamplingParams | None = None,
         cancel_ref: list | None = None,
+        stop_sequences: list[str] | None = None,
         logprobs: bool = False,
         top_logprobs: int = 0,
     ):
@@ -511,6 +526,7 @@ class ServerEngine:
             session_id=session_id,
             stream_channel=channel,
             sampling_params=sampling_params or SamplingParams(),
+            stop_sequences=stop_sequences,
             logprobs=logprobs,
             top_logprobs=top_logprobs,
         )
@@ -662,25 +678,145 @@ class ServerEngine:
                 self._stream_close(req.stream_channel)
             self._finish_request(slot, req, committed_tokens=[], finish_reason="stop")
             return
-        committed_tokens = [anchor]
-        if req.stream_channel is not None:
-            self._stream_put(req.stream_channel, [anchor])
-        if len(committed_tokens) >= req.max_tokens:
-            self._finish_request(
-                slot, req, committed_tokens=committed_tokens, finish_reason="length"
-            )
-            return
+
+        stop_sequences = req.stop_sequences or None
         self.active[slot] = {
             "req": req,
             "anchor": anchor,
             "drafts": drafts,
-            "committed_tokens": committed_tokens,
+            "committed_tokens": [],
             "sampled": not req.sampling_params.is_greedy,
             "last_token": anchor,
             "last_progress_round": self.stats["rounds"],
             "start_time": time.perf_counter(),
+            "stop_sequences": stop_sequences,
         }
+        st = self.active[slot]
+        if stop_sequences:
+            # N2: private tracker, separate from the client-facing
+            # StreamProcessor app.py builds from the same token stream --
+            # this one only exists to know (a) whether the reasoning phase
+            # has ended (stop must not fire on reasoning text) and (b)
+            # which raw tokens are still withheld from the stream channel
+            # because their content contribution is an unresolved prefix
+            # of a configured stop sequence. See _stop_check_token.
+            st["stop_tracker"] = StreamProcessor(
+                self.tok, thinking_capable=_STOP_TRACKER_THINKING_CAPABLE
+            )
+            st["stop_pending_ids"] = []
+            st["stop_pending_text"] = ""
         tracer.request_admitted(req.request_id, slot, len(req.prompt_ids))
+
+        # The anchor is the request's first generated token -- it must go
+        # through the same stop-sequence check as every later token (a
+        # single-token stop sequence could match here), and MUST be fed to
+        # the tracker even when it doesn't match, or all later matching
+        # would be silently missing this token's contribution.
+        st["committed_tokens"].append(anchor)
+        matched = self._stop_check_token(st, anchor) if stop_sequences else None
+        if matched is not None:
+            self._drop_stop_pending_from_committed(st)
+            self._finish_request(
+                slot, req, st["committed_tokens"], "stop", matched_stop_sequence=matched
+            )
+            del self.active[slot]
+            return
+
+        if not stop_sequences and req.stream_channel is not None:
+            self._stream_put(req.stream_channel, [anchor])
+
+        if len(st["committed_tokens"]) >= req.max_tokens:
+            self._flush_stop_pending(st)
+            self._finish_request(slot, req, st["committed_tokens"], finish_reason="length")
+            del self.active[slot]
+            return
+
+    def _stop_check_token(self, st: dict, tok: int) -> str | None:
+        """Feed one just-committed token through the slot's stop-sequence
+        tracker (N2). ``tok`` must already be the last entry appended to
+        ``st["committed_tokens"]`` when this is called.
+
+        Returns the matched stop string if committing ``tok`` completes a
+        configured stop sequence -- the caller MUST then pop the last
+        ``len(st["stop_pending_ids"])`` entries off ``committed_tokens``
+        (that count includes ``tok`` itself) and stop generating for this
+        slot: none of those tokens were ever flushed to the stream
+        channel, so there is nothing to retract, but they must not remain
+        in the authoritative committed/result token list either.
+
+        Returns ``None`` when generation should continue normally. ``tok``
+        may still be sitting in the pending buffer at that point, withheld
+        from the stream channel until a later call resolves the
+        ambiguity -- see ``_flush_stop_pending``.
+        """
+        tracker: StreamProcessor = st["stop_tracker"]
+        stop_sequences: list[str] = st["stop_sequences"]
+        tracker.add_tokens([tok])
+        st["stop_pending_ids"].append(tok)
+        st["stop_pending_text"] += "".join(tracker.drain_content())
+
+        if not tracker.thinking_done:
+            # Still inside (or ambiguously might still become) the
+            # reasoning phase: `drain_content()` reveals nothing here
+            # (stop_pending_text stays ""), so there is no content for a
+            # stop sequence to match against yet. Nothing is being
+            # withheld FOR STOP-MATCHING PURPOSES either -- flush
+            # immediately so reasoning keeps streaming to the client with
+            # the same latency as a request with no stop_sequences
+            # configured (only content, never reasoning, is held back by
+            # this method -- see the module docstring's reasoning/content
+            # rationale).
+            self._flush_stop_pending(st)
+            return None
+
+        match = find_earliest_stop_match(st["stop_pending_text"], stop_sequences)
+        if match is not None:
+            return match[1]
+
+        trimmed = trim_ambiguous_stop_tail(st["stop_pending_text"], stop_sequences)
+        if trimmed == st["stop_pending_text"]:
+            self._flush_stop_pending(st)
+        return None
+
+    def _drop_stop_pending_from_committed(self, st: dict) -> None:
+        """After ``_stop_check_token`` returns a match: pop
+        ``len(st["stop_pending_ids"])`` entries off the tail of
+        ``committed_tokens`` (never flushed, must not appear in the
+        result) and, in lockstep, off ``logprobs_acc`` if logprobs were
+        requested.
+
+        The one narrow exception: the very first pending token can be the
+        request's anchor (fed through the tracker in ``_activate_slot``),
+        which has no ``logprobs_acc`` entry of its own. If an ambiguous
+        stop-sequence prefix happens to start at the anchor and only
+        resolves into a match rounds later, this can trim one entry more
+        than strictly necessary from ``logprobs_acc``. That is the safe
+        direction (never leaves ``logprobs_acc`` misaligned with the
+        *kept* tokens, at worst a couple of legitimate entries short) and
+        is accepted rather than tracked precisely -- see docs/api-layer-design.md.
+        """
+        n_drop = len(st["stop_pending_ids"])
+        del st["committed_tokens"][-n_drop:]
+        logprobs_acc = st.get("logprobs_acc")
+        if logprobs_acc:
+            del logprobs_acc[-n_drop:]
+        st["stop_pending_ids"] = []
+        st["stop_pending_text"] = ""
+
+    def _flush_stop_pending(self, st: dict) -> None:
+        """Release any tokens withheld by ``_stop_check_token`` to the
+        stream channel, once their content is confirmed free of stop-
+        sequence ambiguity (or generation is ending for an unrelated
+        reason -- EOS/max_tokens -- so no further tokens can ever arrive
+        to complete a match)."""
+        ids = st.get("stop_pending_ids")
+        if not ids:
+            return
+        req: GenerationRequest = st["req"]
+        if req.stream_channel is not None:
+            self._stream_put(req.stream_channel, list(ids))
+        st["stop_pending_ids"] = []
+        st["stop_pending_text"] = ""
 
     def _finish_request(
         self,
@@ -689,11 +825,13 @@ class ServerEngine:
         committed_tokens: list[int],
         finish_reason: str,
         logprobs_data: list[dict] | None = None,
+        matched_stop_sequence: str | None = None,
     ) -> None:
         tracer.request_finished(req.request_id, finish_reason)
         result = {
             "committed_token_ids": committed_tokens,
             "finish_reason": finish_reason,
+            "matched_stop_sequence": matched_stop_sequence,
             "prompt_tokens": len(req.prompt_ids),
             "completion_tokens": len(committed_tokens),
             "prefix_cache_hit_tokens": getattr(req, "_prefix_cache_hit_tokens", 0),
@@ -971,7 +1109,7 @@ class ServerEngine:
         active_slots = list(self.active.keys())
         # N1: structured output (json_object/json_schema) is rejected at
         # the API layer (server/app.py::_reject_unsupported_response_format)
-        # rather than routed here -- see docs/api-layer-design.md §7.1 for
+        # rather than routed here -- see docs/api-layer-design.md §5.1 for
         # why grammar-masking has no reachable hook in this decode loop.
         # grammar_slots stays permanently empty; classify_decode_slots keeps
         # the parameter (still covered by tests/test_laguna_server_integration.py)
@@ -1020,6 +1158,7 @@ class ServerEngine:
                 st = self.active[s]
                 req: GenerationRequest = st["req"]
                 if len(st["committed_tokens"]) >= req.max_tokens:
+                    self._flush_stop_pending(st)
                     self._finish_request(
                         s,
                         req,
@@ -1030,6 +1169,7 @@ class ServerEngine:
                     newly_finished.append(s)
                     continue
                 if tok in self.eos_token_ids:
+                    self._flush_stop_pending(st)
                     self._finish_request(
                         s,
                         req,
@@ -1044,9 +1184,27 @@ class ServerEngine:
                 st["last_progress_round"] = self.stats["rounds"]
                 if lp_batch is not None and st["req"].logprobs:
                     st.setdefault("logprobs_acc", []).append(lp_batch[i])
-                if req.stream_channel is not None:
+                # N2: stop-sequence check (must run before streaming tok --
+                # see _stop_check_token/_flush_stop_pending).
+                stop_sequences = st.get("stop_sequences")
+                if stop_sequences:
+                    matched = self._stop_check_token(st, tok)
+                    if matched is not None:
+                        self._drop_stop_pending_from_committed(st)
+                        self._finish_request(
+                            s,
+                            req,
+                            st["committed_tokens"],
+                            "stop",
+                            logprobs_data=st.get("logprobs_acc"),
+                            matched_stop_sequence=matched,
+                        )
+                        newly_finished.append(s)
+                        continue
+                elif req.stream_channel is not None:
                     self._stream_put(req.stream_channel, [tok])
                 if len(st["committed_tokens"]) >= req.max_tokens:
+                    self._flush_stop_pending(st)
                     self._finish_request(
                         s,
                         req,
@@ -1088,20 +1246,36 @@ class ServerEngine:
                 if 0 <= na < len(self.stats["mtp_acceptance_histogram"]):
                     self.stats["mtp_acceptance_histogram"][na] += 1
 
+                # N2: a single MTP round can commit several draft tokens at
+                # once -- a stop sequence can land anywhere inside that
+                # batch, so tokens are appended to committed_tokens (and,
+                # for stop-configured slots, fed through the tracker) ONE
+                # AT A TIME rather than batched via `kept` + extend-at-end,
+                # so the loop can stop exactly at the match and discard
+                # everything the backend drafted past it.
+                stop_sequences = st.get("stop_sequences")
+                matched_stop: str | None = None
                 finish_reason: str | None = None
                 kept: list[int] = []
                 for t in new_tokens:
-                    if len(st["committed_tokens"]) + len(kept) >= req.max_tokens:
+                    if len(st["committed_tokens"]) >= req.max_tokens:
                         finish_reason = "length"
                         break
                     if t in self.eos_token_ids:
                         finish_reason = "stop"
                         break
+                    st["committed_tokens"].append(t)
                     kept.append(t)
-                st["committed_tokens"].extend(kept)
+                    if stop_sequences:
+                        matched_stop = self._stop_check_token(st, t)
+                        if matched_stop is not None:
+                            finish_reason = "stop"
+                            break
                 if kept:
                     st["last_progress_round"] = self.stats["rounds"]
-                if kept and req.stream_channel is not None:
+                if matched_stop is not None:
+                    self._drop_stop_pending_from_committed(st)
+                elif not stop_sequences and kept and req.stream_channel is not None:
                     self._stream_put(req.stream_channel, kept)
                 if finish_reason is None and len(st["committed_tokens"]) >= req.max_tokens:
                     finish_reason = "length"
@@ -1112,12 +1286,15 @@ class ServerEngine:
                     tracer.decode_round(req.request_id, self.stats["rounds"], len(kept), _round_ms)
                     continue
 
+                if stop_sequences and matched_stop is None:
+                    self._flush_stop_pending(st)
                 self._finish_request(
                     s,
                     req,
                     st["committed_tokens"],
                     finish_reason,
                     logprobs_data=st.get("logprobs_acc"),
+                    matched_stop_sequence=matched_stop,
                 )
                 newly_finished.append(s)
 

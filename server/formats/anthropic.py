@@ -172,6 +172,7 @@ def build_response(
     output_tokens: int,
     cache_read_input_tokens: int = 0,
     reasoning_content: str | None = None,
+    stop_sequence: str | None = None,
 ) -> dict:
     """Build a non-streaming Anthropic Messages API response.
 
@@ -186,9 +187,18 @@ def build_response(
     thinking block emission without a valid signature source"). An
     additive top-level field is ignored by permissive clients instead of
     being validated as a member of the ``content`` block type union.
+
+    ``stop_sequence``: the user-configured ``stop_sequences`` entry that
+    ended generation, if any (N2). When set, ``stop_reason`` is
+    ``"stop_sequence"`` per spec, overriding the plain EOS/max_tokens
+    inference below (and overridden itself by ``tool_use``, matching real
+    Anthropic behavior: a tool call always wins as the reported reason).
     """
     visible_text, tool_calls = parse_tool_calls(text)
-    stop_reason = "end_turn" if finish_reason == "stop" else "max_tokens"
+    if stop_sequence:
+        stop_reason = "stop_sequence"
+    else:
+        stop_reason = "end_turn" if finish_reason == "stop" else "max_tokens"
 
     content_blocks: list[dict] = []
     if visible_text:
@@ -206,7 +216,7 @@ def build_response(
         "content": content_blocks,
         "model": model,
         "stop_reason": stop_reason,
-        "stop_sequence": None,
+        "stop_sequence": stop_sequence if stop_reason == "stop_sequence" else None,
         "usage": {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -225,12 +235,17 @@ def build_sse_events(
     finish_reason: str,
     input_tokens: int,
     output_tokens: int,
+    stop_sequence: str | None = None,
 ):
     """Generate Anthropic SSE stream events (yields strings)."""
     visible_text, tool_calls = parse_tool_calls(text)
-    stop_reason = "end_turn" if finish_reason == "stop" else "max_tokens"
+    if stop_sequence:
+        stop_reason = "stop_sequence"
+    else:
+        stop_reason = "end_turn" if finish_reason == "stop" else "max_tokens"
     if tool_calls:
         stop_reason = "tool_use"
+        stop_sequence = None
 
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -293,7 +308,7 @@ def build_sse_events(
 
     msg_delta = {
         "type": "message_delta",
-        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence},
         "usage": {"output_tokens": output_tokens},
     }
     yield f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"

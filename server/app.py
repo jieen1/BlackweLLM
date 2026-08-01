@@ -417,6 +417,7 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict | None = None
     session_id: str | None = None
     response_format: dict | None = None
+    stop: str | list[str] | None = None
     logprobs: bool | None = False
     top_logprobs: int | None = None
     # Forwarded to the chat template (e.g. {"enable_thinking": False} for
@@ -435,6 +436,7 @@ class CompletionRequest(BaseModel):
     n: int | None = None
     stream: bool | None = False
     response_format: dict | None = None
+    stop: str | list[str] | None = None
     logprobs: bool | None = False
     top_logprobs: int | None = None
     # P4b session affinity (opt-in) -- see ChatCompletionRequest.session_id.
@@ -527,6 +529,31 @@ def _reject_unsupported_response_format(response_format: dict | None) -> None:
             "text, not a JSON guarantee. Omit response_format and validate/parse "
             "JSON on the client side instead."
         )
+
+
+def _normalize_stop(
+    stop: str | list[str] | None, *, max_count: int | None = None
+) -> list[str] | None:
+    """Normalize OpenAI's ``stop`` (string or list of strings) / Anthropic's
+    ``stop_sequences`` (list of strings) into one shared shape.
+
+    Empty strings are dropped (an empty stop sequence trivially "matches"
+    at position 0 of any output and has no sensible use); an all-empty
+    result normalizes to ``None`` (no stop sequences configured) rather
+    than an empty list, so callers can treat ``None``/``[]`` as one case.
+    ``max_count`` enforces OpenAI's documented limit of 4; Anthropic's
+    ``stop_sequences`` has no such documented cap, so callers for that
+    protocol pass ``max_count=None``.
+    """
+    if stop is None:
+        return None
+    seqs = [stop] if isinstance(stop, str) else list(stop)
+    seqs = [s for s in seqs if s]
+    if not seqs:
+        return None
+    if max_count is not None and len(seqs) > max_count:
+        raise _invalid_request(f"stop supports at most {max_count} sequences, got {len(seqs)}")
+    return seqs
 
 
 def _validate_capacity(prompt_ids: list[int], max_tokens: int) -> None:
@@ -649,6 +676,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         n=req.n,
     )
     _reject_unsupported_response_format(req.response_format)
+    stop_sequences = _normalize_stop(req.stop, max_count=4)
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
     t0 = time.perf_counter()
 
@@ -703,6 +731,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 session_id=req.session_id,
                 sampling_params=sampling_params,
                 cancel_ref=_cancel_ref,
+                stop_sequences=stop_sequences,
                 logprobs=bool(req.logprobs),
                 top_logprobs=req.top_logprobs or 0,
             ):
@@ -832,6 +861,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         max_tokens,
         session_id=req.session_id,
         sampling_params=sampling_params,
+        stop_sequences=stop_sequences,
         logprobs=bool(req.logprobs),
         top_logprobs=req.top_logprobs or 0,
     )
@@ -885,6 +915,7 @@ async def completions(req: CompletionRequest, request: Request):
         n=req.n,
     )
     _reject_unsupported_response_format(req.response_format)
+    stop_sequences = _normalize_stop(req.stop, max_count=4)
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
     t0 = time.perf_counter()
     prompt_ids = await _tokenize_encode(engine, req.prompt)
@@ -896,6 +927,7 @@ async def completions(req: CompletionRequest, request: Request):
         max_tokens,
         session_id=req.session_id,
         sampling_params=sampling_params,
+        stop_sequences=stop_sequences,
         logprobs=bool(req.logprobs),
         top_logprobs=req.top_logprobs or 0,
     )
@@ -1322,6 +1354,9 @@ async def anthropic_messages(request: Request):
         top_k=body.get("top_k"),
         seed=body.get("seed"),
     )
+    # Anthropic's stop_sequences has no documented count limit (unlike
+    # OpenAI's stop, capped at 4) -- see _normalize_stop's docstring.
+    stop_sequences = _normalize_stop(body.get("stop_sequences"))
 
     # Parse through the Anthropic format layer (handles array content, tool_use, tool_result)
     chat_messages = anthropic_format.parse_messages(body)
@@ -1381,6 +1416,7 @@ async def anthropic_messages(request: Request):
                 effective_max,
                 sampling_params=sampling_params,
                 cancel_ref=_cancel_ref,
+                stop_sequences=stop_sequences,
             ):
                 if await request.is_disconnected():
                     if _cancel_ref[0]:
@@ -1432,7 +1468,13 @@ async def anthropic_messages(request: Request):
                 block_index += 1
 
             finish = final_result["finish_reason"] if final_result else "stop"
-            stop_reason = "end_turn" if finish == "stop" else "max_tokens"
+            matched_stop_sequence = (
+                final_result.get("matched_stop_sequence") if final_result else None
+            )
+            if matched_stop_sequence:
+                stop_reason = "stop_sequence"
+            else:
+                stop_reason = "end_turn" if finish == "stop" else "max_tokens"
             visible_text, tool_calls = proc.finalize()
             out_tokens = len(proc.all_ids)
             if tool_calls:
@@ -1482,7 +1524,7 @@ async def anthropic_messages(request: Request):
 
             msg_delta = {
                 "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "delta": {"stop_reason": stop_reason, "stop_sequence": matched_stop_sequence},
                 "usage": {"output_tokens": out_tokens},
             }
             yield f"event: message_delta\ndata: {_json.dumps(msg_delta)}\n\n"
@@ -1506,6 +1548,7 @@ async def anthropic_messages(request: Request):
         prompt_ids,
         effective_max,
         sampling_params=sampling_params,
+        stop_sequences=stop_sequences,
     )
     _raw_anth = await _tokenize_decode(engine, result["committed_token_ids"])
     # Same state machine as the streaming path (server/formats/stream.py).
@@ -1535,4 +1578,5 @@ async def anthropic_messages(request: Request):
         output_tokens=result["completion_tokens"],
         cache_read_input_tokens=result.get("prefix_cache_hit_tokens", 0),
         reasoning_content=reasoning_content,
+        stop_sequence=result.get("matched_stop_sequence"),
     )
