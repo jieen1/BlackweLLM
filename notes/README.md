@@ -85,6 +85,7 @@ Track F（性能，机会主义）的输入。
 | `2026-07-22-quality-baseline-and-official-scores.md` | 质量基线与官方分数对标方法论 |
 | `2026-08-02-evaluation-artifact-provenance.md` | **评测产物归属存根**——五份产物的 `model` 字段全是 `qwen3.6`，仓库里没有任何 Laguna 评测数据。因 `evalplus_results/` 被 gitignore、随时可能消失而固化 |
 | `2026-08-02-track-a-step5-gpu-verification.md` | Track A 第 5 步 GPU 验收：贪心 bit-exact 用真实 revert worktree 实测确认（非推理）；接受率逐工作负载几乎精确匹配基线；**fox-64K tok/s 低基线 ~19%，与第 5 步无关**（bfdiag provider 绕过 `ServerEngine`）**，用直接 A/B 排除了 C-1 verify 容量修复**（回退容量计算、保留 `REQUIRE_CG=1`，数字与信号形状原样复现），**又靠读代码（零 GPU）排除了前缀缓存假设**（`enable_prefix_cache=False` 在两层都生效，`_prefill_with_prefix_hit` 在这个 benchmark 里根本不可达），仍未根因；对基线数字本身的可信度也给了直接判断；记录了复现基线所需的完整环境变量三件套（漏一个就测不准） |
+| `2026-08-02-prefix-cache-baseline.md` | Track A 7-g「前缀缓存命中率不回归」的**切换前基线**（`main@1cf482f`，未合并）。核实并纠正了 `docs/implementation-plan.md` 阻塞记录里对 `hits=1/misses=10/hit_rate=0.0909` 成因的猜测（读代码证实：admission bootstrap check 走独立的 `runner.prefill(ref_slot,...)`，从不经过计数路径；真正原因是 e2e 脚本多个子测试共享同一进程级、无重置、跨会话的计数器）；论证 `hit_rate` 即便正确限定范围仍对"浅命中"不敏感，推荐改用逐轮 `hit_L / ideal_L`（`ideal_L` = 上一轮 `prompt_tokens` 按 block_size 取整）当回归信号；固定负载（8 组独立 6 轮增长对话，各带随机 marker 防串味）+ 逐轮完整序列（不只汇总），配套脚本 `benchmarks/prefix_cache_baseline.py` 供 7-g 后原样重跑做 A/B |
 
 ## 5. Laguna 专属实现记录 🟡
 
