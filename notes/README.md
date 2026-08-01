@@ -84,6 +84,7 @@ Track F（性能，机会主义）的输入。
 | `2026-07-29-moe-ab-test.md` | MoE A/B |
 | `2026-07-22-quality-baseline-and-official-scores.md` | 质量基线与官方分数对标方法论 |
 | `2026-08-02-evaluation-artifact-provenance.md` | **评测产物归属存根**——五份产物的 `model` 字段全是 `qwen3.6`，仓库里没有任何 Laguna 评测数据。因 `evalplus_results/` 被 gitignore、随时可能消失而固化 |
+| `2026-08-02-track-a-step5-gpu-verification.md` | Track A 第 5 步 GPU 验收：贪心 bit-exact 用真实 revert worktree 实测确认（非推理）；接受率逐工作负载几乎精确匹配基线；**fox-64K tok/s 低基线 ~19%，已查未根因，证据指向与第 5 步无关**（bfdiag provider 完全绕过 `ServerEngine`）；记录了复现基线所需的完整环境变量三件套（漏一个就测不准） |
 
 ## 5. Laguna 专属实现记录 🟡
 
