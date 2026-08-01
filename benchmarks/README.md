@@ -2,8 +2,8 @@
 
 **Before adding a file here, read this.** This directory used to hold 136
 one-off scripts with zero compounding value (see `AGENTS.md` and
-`docs/diagnostics-guide.md`). 29 of them were removed in the T0-7 cleanup
-(2026-08-01) because nothing referenced them. **Do not repeat the pattern.**
+`docs/diagnostics-guide.md`). 34 of them were removed in the T0-7 cleanup
+(2026-08-01) — see "What was removed" below. **Do not repeat the pattern.**
 
 > **New experiment? Submit it to the warm engine instead of adding a file
 > here: `bf exec <script>` (see `docs/diagnostics-guide.md`).** The daemon
@@ -100,17 +100,16 @@ this is a template; most hardcode a specific historical scenario.
 `batch_decode_signal_probe.py`, `capacity_w1w2_check.py`,
 `cudagraph_decode_sanitizer_repro.py`, `cudagraph_sanitizer_micro.py`.
 
-## Bit-exact validation family (`_phase*_bitexact_validate*.py`)
+## `b1_d1_gpu_verify.py` — kept as a Track B starting point
 
-`_phase1_bitexact_validate.py` (+ `_long`), `_phase3_dflash_bitexact_validate.py`
-(+ `_long`), `_phase5_e2e_bitexact_validate.py` — bit-exact validation of the
-self-built model/loader against the (now retired) vLLM path, one script per
-phase of that migration, real weights + real KV caches, real-text corpora
-(not synthetic). `_phase5` is cited from
-`notes/2026-07-27-vllm-complete-removal-implementation-plan.md`; the others
-are cited from each other's docstrings. Kept as a family for that reason —
-see "Needs a human decision" below, since vLLM removal has since completed
-and this family may now be purely historical.
+Targets roadmap Track B's `B1` (Qwen3.6-27B correctness) milestone, which
+hasn't started yet. Uses `oracle.qwen36_vllm.direct_model_runner` and an
+external path (`/home/bot/project/sm120-flash-attention/vllm_integration`)
+that lives outside this repo. Flagged during the T0-7 cleanup and resolved
+by the user (2026-08-01): keep it as a head start for B1 rather than delete
+and rebuild from scratch once Track A's backend abstraction lands. Expect
+it to need rework against whatever `ModelSpec`/backend-protocol shape
+Track A produces before it runs again.
 
 ## `official/`, `phase1/`, `fixtures/`
 
@@ -125,25 +124,6 @@ and this family may now be purely historical.
   `fixtures/speed_baseline.json` as a checked-in baseline, not scratch
   output: re-generating them moves what every other script is compared
   against.
-
-## Needs a human decision
-
-Flagged during the T0-7 cleanup — kept (conservative default), not deleted,
-but worth a deliberate call:
-
-- **`_phase1_bitexact_validate*.py`, `_phase3_dflash_bitexact_validate*.py`,
-  `_phase5_e2e_bitexact_validate.py`** — the vLLM-removal bit-exact
-  validation family. Now that vLLM removal has landed, is this family done
-  and ready to move to `docs/archive/` or `notes/`, or does it still get
-  rerun when the `QSR_LAGUNA`/`DFLASH_MODEL_LOADER=vllm` fallback switches
-  are finally deleted?
-- **`b1_d1_gpu_verify.py`** — targets roadmap Track B's `B1` (Qwen3.6-27B
-  correctness) milestone, which hasn't started yet. Uses
-  `oracle.qwen36_vllm.direct_model_runner` and an external path
-  (`/home/bot/project/sm120-flash-attention/vllm_integration`) that lives
-  outside this repo. Worth keeping as a head start for B1, or better to
-  delete now and rebuild against whatever Track A's backend abstraction
-  produces?
 
 ## What was removed (2026-08-01, T0-7)
 
@@ -161,3 +141,24 @@ early duplicate of the kept `decode_step_profile.py`;
 `repro_80tok_m1_decode_cg_mainrepo.py` duplicated the kept
 `repro_80tok_m1_decode_cg.py`). See the git log for the full list and
 per-file reasoning.
+
+A second pass the same day removed the whole vLLM-removal bit-exact
+validation family — `_phase1_bitexact_validate.py` (+ `_long`),
+`_phase3_dflash_bitexact_validate.py` (+ `_long`), and
+`_phase5_e2e_bitexact_validate.py` — per explicit user decision (the T0-7
+cleanup had originally flagged this family as "needs a human decision"
+rather than deleting it outright, since `_phase5` was cited from
+`notes/2026-07-27-vllm-complete-removal-implementation-plan.md`; the user
+confirmed vLLM removal is complete and the family serves no further
+purpose). That note now carries a superseded-pointer at the top saying so.
+One dangling citation could not be fixed from here: `runtime/laguna_config.py`
+around line 310 cites `benchmarks/_phase5_e2e_bitexact_validate.py` in a
+docstring explaining `build_laguna_config`'s kwarg surface — `runtime/` is
+outside this cleanup's file boundary (another agent owns it), so that
+comment still names a file that no longer exists. The claim itself (which
+call sites were grepped) is unaffected; only the path in the comment is
+now stale. Whoever next touches `runtime/laguna_config.py` should drop or
+reword that clause.
+
+All 34 removed scripts are fully recoverable from git history
+(`git log --diff-filter=D -- benchmarks/<name>.py`).
