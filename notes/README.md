@@ -156,6 +156,15 @@ Laguna 仍是生产模型，这些记录有效；但其中的 SWA ring、MoE、D
 | `2026-08-01-t0-7-branch-worktree-survey.md` | T0-7 分支/worktree 调研清单（只调研未执行删除）——16 个分支已合并可安全删，16 个有独有提交需人工确认 |
 | `2026-08-02-laguna-docs-inherited-qwen36-numbers.md` | **文档数字污染**：`docs/roadmap.md:27`/`docs/model-support.md:49` 的 MMLU-Pro 84.54% 与 `README.md:79` 的容量表都是 Qwen3.6 时代数字被误标成 Laguna 当前数字（前者与 Laguna 自己的显存审计矛盾）；未修复，只记录，供 roadmap/model-support/README owner 处理 |
 
+## 10. Track B0 事实基线（Qwen3.6 重建）🟢
+
+零 GPU、只读 safetensors header/JSON config 的事实核实，是
+`qwen36-rebuild-spec.md` B0-2/B0-6/B0-7 的证据来源。
+
+| 文件 | 内容 |
+|---|---|
+| `2026-08-02-qwen36-b0-fact-baseline.md` | **B0-2**：`nvidia/Qwen3.6-27B-NVFP4` 是混合精度（GDN/self_attn 投影 FP8，稠密 MLP+lm_head 才是 NVFP4 weight-only/W4A16），逐张量命名与 Laguna compressed-tensors 对照表；**最大发现**——checkpoint 声明 `kv_cache_quant_algo=FP8` 但零 k_scale/v_scale 张量（Laguna 对照组确认这不是量化格式的通例，是这份 checkpoint 特有的缺口）；333 个 vision 张量前缀 `model.visual.` 精确复现。**B0-6**：mrope-interleaved 纯文本退化为标准 1D RoPE，附 `transformers==5.8.0` 的 `modeling_qwen3_5.py` 源码行号证据（`Qwen3_5TextModel.forward`/`compute_3d_position_ids` 的 position_ids 恒等链路）。**B0-7**：GDN 递归状态每槽固定 ~75–150 MiB（dtype 待定，标注 [待验证]）、与上下文长度无关；权重实测仅 18.8 GiB（纯文本，比 Laguna 67 GiB 小很多），据此给出 context×并发可行域算术推导（非 GPU 实测） |
+
 ---
 
 ## 写新 note 的约定
