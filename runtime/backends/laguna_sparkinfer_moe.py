@@ -33,6 +33,8 @@ from collections.abc import Sequence
 
 import torch
 
+from runtime.backends._sparkinfer_import import ensure_sparkinfer_path
+
 logger = logging.getLogger("qwen_sm120_runtime.sparkinfer_moe")
 
 # Enable deterministic MoE output (ROUTE_BUFFER_TOPK_SUM instead of ATOMIC_SCATTER)
@@ -47,9 +49,12 @@ os.environ.setdefault("SPARKINFER_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
 # scale that prevents the underflow.  Must be set before sparkinfer import.
 os.environ.setdefault("SPARKINFER_ENABLE_DYNAMIC_DOWN_SCALE", "1")
 
-_BF_SPARKINFER_PATH = os.environ.get("BF_SPARKINFER_PATH", "")
-if _BF_SPARKINFER_PATH and _BF_SPARKINFER_PATH not in sys.path:
-    sys.path.insert(0, _BF_SPARKINFER_PATH)
+# Route through the single controlled resolver (see
+# runtime/backends/_sparkinfer_import.py) instead of inserting BF_SPARKINFER_PATH
+# into sys.path directly here -- laguna.py's _patch_moe_sparkinfer touches
+# `sparkinfer` before this module is even imported on the real Laguna startup
+# path, so a local-only sys.path.insert here was consistently too late.
+ensure_sparkinfer_path()
 
 try:
     from sparkinfer._lib.intrinsics import swizzle_block_scale

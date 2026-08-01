@@ -590,6 +590,16 @@ class LagunaBackend:
         run formula this replaces). Patches each MoE layer's forward to:
         router → sparkinfer → shared.
         """
+        # This is the first touch of the `sparkinfer` name in the real
+        # Laguna startup path (LagunaBackend.__init__ -> here), so
+        # BF_SPARKINFER_PATH must be resolved into sys.path BEFORE the
+        # import directly below -- see
+        # runtime/backends/_sparkinfer_import.py's module docstring for why
+        # doing this only in laguna_sparkinfer_attn.py/laguna_sparkinfer_moe.py
+        # (as it used to be) was too late to have any effect.
+        from runtime.backends._sparkinfer_import import ensure_sparkinfer_path
+
+        ensure_sparkinfer_path()
         from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
 
         from runtime.backends.laguna_sparkinfer_moe import (

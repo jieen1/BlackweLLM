@@ -16,6 +16,7 @@ from bfdiag.checkpoint import store, verify
 from bfdiag.checkpoint.state import (
     draft_ring_block_range,
     full_block_range,
+    full_slot_block_range,
     slot_geometry,
     swa_ring_block_range,
 )
@@ -63,12 +64,26 @@ def restore_checkpoint(
        the live engine's own geometry. ANY mismatch raises
        :class:`store.FingerprintMismatchError` naming every mismatched
        field -- this is checked BEFORE touching any tensor.
-    2. Defensively reset ONLY the target slot (``backend.reset_slot(slot)``
-       + zero this slot's draft-KV ring range) -- not the whole engine, so
-       restoring into slot N of a warm multi-slot daemon does not disturb
-       whatever is already live in other slots. See state.py's "CUDA Graph
-       capture-time warmup residue" item for why this must happen before
-       writing checkpointed tensors in.
+    2. Defensively reset ONLY the target slot: ``backend.reset_slot(slot)``
+       for its bookkeeping (``slot_kv_len``/``slot_committed_tokens``/
+       prefix-chunk snapshot), PLUS an explicit ``.zero_()`` of this slot's
+       WHOLE full-attention block range and its draft-KV ring range --
+       not the whole engine, so restoring into slot N of a warm multi-slot
+       daemon does not disturb whatever is already live in other slots.
+       See state.py's "CUDA Graph capture-time warmup residue" item for why
+       this must happen before writing checkpointed tensors in, and the
+       "full-attention KV cache blocks" item for why the explicit zeroing
+       here (rather than relying on ``reset_slot`` to have already done it)
+       is required: ``LagunaBackend.reset_slot`` was rewritten to preserve
+       KV content for Laguna's own prefix cache, so it no longer zeros
+       anything -- this function cannot assume it did. (The SWA ring needs
+       no separate zeroing: step 3 below always overwrites its FULL
+       capacity regardless of ``kv_len``, never just a sub-range.) Also
+       clears ``backend._prefix_cache_tokens[slot]``/``_prefix_cache_kv_len``
+       (which ``reset_slot`` itself just populated from whatever this slot
+       was running before -- that is its contract, not a bug here) so a
+       later ``reconcile_prefix_hit`` cannot match this slot's restored KV
+       against the PREVIOUS occupant's token history.
     3. Write the full-attention / SWA-ring / draft-ring tensors back into
        their exact block ranges (recomputed from the manifest's own
        ``slot_kv_len``, not the live engine's, since the slot was just
@@ -125,10 +140,37 @@ def restore_checkpoint(
         )
 
     # Step 2: defensive, target-slot-only reset (see docstring point 2).
+    # backend.reset_slot(slot) still handles the bookkeeping reset
+    # (slot_kv_len/slot_committed_tokens/prefix-chunk snapshot), but it no
+    # longer zeros any KV memory -- it was rewritten to preserve KV content
+    # across resets so Laguna's own prefix cache can reuse it (see
+    # runtime/backends/laguna.py's current reset_slot docstring). This
+    # function's own isolation guarantee -- "this slot's leftover state
+    # does not leak into the restored result" -- therefore has to zero the
+    # full-attention range itself now, exactly like it already does for the
+    # draft ring below (which was never reset_slot's job to begin with).
     backend.reset_slot(slot)
+    full_slot_start, full_slot_end = full_slot_block_range(geom)
+    for layer_name in geom.full_layer_names:
+        backend.kv_caches[layer_name][:, full_slot_start:full_slot_end].zero_()
     draft_start, draft_end = draft_ring_block_range(geom)
     for layer_name in geom.draft_layer_names:
         engine._draft_kv_caches[layer_name][:, draft_start:draft_end].zero_()
+    # backend.reset_slot(slot) just above ALSO (by its own design) saved
+    # whatever this slot was running right before this call into the
+    # persistent prefix cache (backend._prefix_cache_tokens[slot] /
+    # _prefix_cache_kv_len[slot]) -- that is reset_slot's contract, not a
+    # bug. But the checkpoint tensors written in step 3 below describe a
+    # DIFFERENT conversation (whatever was saved), so leaving that
+    # just-populated entry in place would make a later
+    # backend.reconcile_prefix_hit(...) match this slot's KV against the
+    # WRONG token history. Restoring a checkpoint is not "this slot's
+    # previous occupant paused and resumed" -- it must not inherit that
+    # occupant's prefix-cache identity either.
+    prefix_cache_tokens = getattr(backend, "_prefix_cache_tokens", None)
+    if prefix_cache_tokens is not None:
+        prefix_cache_tokens[slot] = None
+        backend._prefix_cache_kv_len[slot] = 0
 
     # Step 3: write tensors back, recomputing ranges from the MANIFEST's
     # kv_len (the live slot is at kv_len=0 right after reset_slot above).

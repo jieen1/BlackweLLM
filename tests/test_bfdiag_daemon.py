@@ -30,6 +30,7 @@ from bfdiag.daemon.client import Client, DaemonNotRunning
 from bfdiag.daemon.protocol import Response
 from bfdiag.daemon.provider import (
     LOAD_TIME_ENV_VARS,
+    EngineProvider,
     FakeEngineProvider,
     LagunaEngineProvider,
     _rebind_instance_class,
@@ -139,6 +140,50 @@ class TestHotReloadMechanics:
         assert "importlib.reload(provider_module)" in client_stub.code
         assert "provider.__class__ = provider_module.LagunaEngineProvider" in client_stub.code
         assert "provider.hot_reload_code()" in client_stub.code
+
+
+class TestEngineProviderProtocolConformance:
+    """N7 (docs/roadmap.md; see notes/2026-08-01-bfdiag-assertion-audit.md):
+    ``FakeEngineProvider.load`` used to take no ``on_stage`` parameter at
+    all, while the ``EngineProvider`` Protocol declares one and
+    ``LagunaEngineProvider.load`` implements it. Every current call site
+    calls ``load()`` bare, so this was dormant -- a future call site that
+    started passing ``on_stage=`` would have raised ``TypeError`` for the
+    fake specifically, breaking every test that constructs a daemon with
+    the default (fake) provider.
+
+    ``isinstance(provider, EngineProvider)`` would NOT have caught this:
+    ``@runtime_checkable`` Protocol isinstance checks are structural on
+    method NAMES only, never signatures -- ``load`` existed either way.
+    The real regression gate is calling ``load(on_stage=...)`` directly."""
+
+    def test_fake_provider_is_a_structural_engine_provider(self) -> None:
+        assert isinstance(FakeEngineProvider(), EngineProvider)
+
+    def test_fake_provider_load_accepts_on_stage_without_raising(self) -> None:
+        stages: list[str] = []
+        provider = FakeEngineProvider()
+        provider.load(on_stage=stages.append)
+        assert stages == ["after_reset"]
+
+    def test_fake_provider_load_still_works_called_bare(self) -> None:
+        # Every current call site (server.py, canary.py) calls load() with
+        # no arguments at all -- must keep working exactly as before.
+        provider = FakeEngineProvider()
+        provider.load()
+        assert provider.describe()["loaded"] is True
+
+    def test_laguna_provider_load_signature_matches_the_protocol(self) -> None:
+        """Doesn't call it (needs torch/CUDA/real weights) -- just proves
+        the two providers' load() signatures stay in sync so this class
+        of drift can't silently reappear on the OTHER side either."""
+        import inspect
+
+        fake_params = inspect.signature(FakeEngineProvider.load).parameters
+        real_params = inspect.signature(LagunaEngineProvider.load).parameters
+        assert "on_stage" in fake_params
+        assert "on_stage" in real_params
+        assert fake_params["on_stage"].kind == real_params["on_stage"].kind
 
 
 class TestLifecycle:
