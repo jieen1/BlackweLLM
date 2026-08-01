@@ -151,6 +151,7 @@ Laguna 仍是生产模型，这些记录有效；但其中的 SWA ring、MoE、D
 | 文件 | 内容 |
 |---|---|
 | `2026-08-01-t0-7-branch-worktree-survey.md` | T0-7 分支/worktree 调研清单（只调研未执行删除）——16 个分支已合并可安全删，16 个有独有提交需人工确认 |
+| `2026-08-02-laguna-docs-inherited-qwen36-numbers.md` | **文档数字污染**：`docs/roadmap.md:27`/`docs/model-support.md:49` 的 MMLU-Pro 84.54% 与 `README.md:79` 的容量表都是 Qwen3.6 时代数字被误标成 Laguna 当前数字（前者与 Laguna 自己的显存审计矛盾）；未修复，只记录，供 roadmap/model-support/README owner 处理 |
 
 ---
 
