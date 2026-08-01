@@ -294,8 +294,9 @@ def parse_architecture(config: dict[str, Any]) -> ArchitectureSpec:
     )
 
 
-def validate_text_only(spec: ArchitectureSpec) -> None:
-    """Enforce RK8: refuse a checkpoint whose weights carry a vision tower.
+def validate_text_only(spec: ArchitectureSpec, *, language_model_only: bool) -> None:
+    """Enforce RK8: refuse a vision-bearing checkpoint unless the loader that
+    will read its weights runs in ``language_model_only`` mode.
 
     Detection lives in :func:`parse_architecture`; the policy lives here, so
     that changing the policy does not require changing the parser.
@@ -307,18 +308,52 @@ def validate_text_only(spec: ArchitectureSpec) -> None:
     happily accept a multimodal checkpoint and fail much later, on a tensor
     name it did not expect.
 
-    ``language_model_only: true`` is treated as authoritative when present: it
-    is the checkpoint stating what it is, and on the one local checkpoint that
-    sets it, it agrees with the absence of both ``vision_config`` and any
-    ``visual.*`` tensor.
+    **2026-08-02 semantics change (B0-1b,** ``docs/implementation-plan.md``
+    **§4/C-2 and §7.1/B0-1):** this used to reject *any* checkpoint carrying
+    ``vision_config``, full stop. That was written before D6 picked
+    ``nvidia/Qwen3.6-27B-NVFP4`` as the Track B checkpoint -- which ships a
+    real vision tower (333 tensors, verified against its own
+    ``model.safetensors.index.json``; see
+    ``notes/2026-08-02-qwen36-b0-fact-baseline.md`` §1.4) -- so the original
+    rule would have refused the checkpoint the project committed to. The rule
+    is now: a vision tower is fine *if* the caller can show the loader will
+    not actually load it. ``language_model_only`` is that caller-side
+    guarantee, not a config.json field -- it says "the loader that is about
+    to read this checkpoint's weights will run
+    ``runtime.loading.language_model_only.filter_language_model_only`` with
+    ``language_model_only=True``" (B0-1a). This function cannot itself verify
+    that promise (it is torch-free and runs before any weight is read, by
+    design -- see module docstring); it only gates on the caller having made
+    it. The real "zero vision tensors loaded" guarantee is enforced at
+    weight-load time by the filter itself, structurally (a name that matches
+    a vision prefix never reaches ``model.load_weights(...)`` at all when the
+    filter runs with ``language_model_only=True`` -- see that module's
+    docstring for the precise claim and what has/has not been verified
+    against a real checkpoint).
+
+    ``language_model_only: true`` in ``config.json`` (``spec.
+    declares_language_model_only``) is a *different* thing from the
+    ``language_model_only`` parameter here, and is treated as authoritative
+    on its own when present: it is the checkpoint stating what it is, and on
+    the one local checkpoint that sets it, it agrees with the absence of both
+    ``vision_config`` and any ``visual.*`` tensor. The parameter is this
+    runtime's own operating mode, decided by the caller regardless of what
+    the checkpoint claims about itself -- necessarily so, since the official
+    Qwen3.6 checkpoint's own ``config.json`` sets ``language_model_only:
+    false`` (verified) while still being exactly the checkpoint this
+    parameter is meant to let through.
     """
     if spec.declares_language_model_only is True:
         return
-    if spec.has_vision_tower:
-        raise UnsupportedArchitectureError(
-            f"checkpoint declares a vision tower (config.json has 'vision_config', "
-            f"and 'language_model_only' is {spec.declares_language_model_only!r}); "
-            f"this runtime serves text only. Use a text-only build of "
-            f"{spec.architecture} -- one that sets 'language_model_only': true "
-            f"and omits 'vision_config'."
-        )
+    if not spec.has_vision_tower:
+        return
+    if language_model_only:
+        return
+    raise UnsupportedArchitectureError(
+        f"checkpoint declares a vision tower (config.json has 'vision_config', "
+        f"and 'language_model_only' is {spec.declares_language_model_only!r}); "
+        f"this runtime serves text only. Either use a text-only build of "
+        f"{spec.architecture} -- one that sets 'language_model_only': true "
+        f"and omits 'vision_config' -- or load with language_model_only=True "
+        f"so the loader filters vision.* tensors instead of loading them."
+    )
