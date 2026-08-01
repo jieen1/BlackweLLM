@@ -12,15 +12,13 @@ from __future__ import annotations
 import json
 
 from runtime.preflight import (
-    MAX_TORCH_VERSION,
-    MIN_TORCH_VERSION,
     REQUIRED_COMPUTE_CAPABILITY,
+    REQUIRED_TORCH_VERSION,
     CheckResult,
     GpuProbe,
     PreflightReport,
     SparkInferProbe,
     _parse_version_prefix,
-    _version_tuple_in_range,
     check_checkpoint_config,
     check_checkpoint_path,
     check_compute_capability,
@@ -108,13 +106,6 @@ def test_parse_version_prefix_handles_nightly_and_local_suffix() -> None:
     assert _parse_version_prefix("not-a-version") is None
 
 
-def test_version_tuple_in_range() -> None:
-    assert _version_tuple_in_range((2, 13, 0), (2, 12, 0), (2, 14, 0))
-    assert not _version_tuple_in_range((2, 11, 9), (2, 12, 0), (2, 14, 0))
-    assert not _version_tuple_in_range((2, 14, 0), (2, 12, 0), (2, 14, 0))
-    assert not _version_tuple_in_range(None, (2, 12, 0))
-
-
 # --- GPU checks ---------------------------------------------------------------
 
 
@@ -162,9 +153,28 @@ def test_compute_capability_handles_missing_device() -> None:
     assert "unknown" in result.actual
 
 
-def test_torch_version_accepts_verified_nightly() -> None:
-    result = check_torch_version(_healthy_gpu_probe())
+def test_torch_version_accepts_exact_pypi_release() -> None:
+    probe = _healthy_gpu_probe(torch_version=".".join(map(str, REQUIRED_TORCH_VERSION)))
+    assert check_torch_version(probe).passed
+
+
+def test_torch_version_accepts_local_prerelease_build_of_same_release() -> None:
+    """The core scenario this check exists for: the reference environment
+    reports `2.13.0a0+gitcf30153` — a self-compiled pre-release of the pinned
+    `2.13.0`, not a stock PyPI wheel. It must pass, not fail just because the
+    version string carries an `a0` pre-release marker and a `+git...` local
+    build segment.
+    """
+    probe = _healthy_gpu_probe(torch_version="2.13.0a0+gitcf30153")
+    result = check_torch_version(probe)
     assert result.passed
+    assert result.severity == "fatal"
+
+
+def test_torch_version_accepts_other_prerelease_and_local_suffix_spellings() -> None:
+    for spelling in ("2.13.0rc1", "2.13.0.dev20260731", "2.13.0+cu126"):
+        probe = _healthy_gpu_probe(torch_version=spelling)
+        assert check_torch_version(probe).passed, spelling
 
 
 def test_torch_version_rejects_too_old() -> None:
@@ -174,8 +184,12 @@ def test_torch_version_rejects_too_old() -> None:
     assert result.severity == "fatal"
 
 
-def test_torch_version_rejects_too_new() -> None:
-    probe = _healthy_gpu_probe(torch_version=f"{MAX_TORCH_VERSION[0]}.{MAX_TORCH_VERSION[1]}.0")
+def test_torch_version_rejects_prerelease_of_a_different_release() -> None:
+    """A pre-release only satisfies the contract if its release segment
+    (major.minor.patch) matches exactly -- `2.14.0a0` is not `2.13.0` just
+    because both are pre-release-flavored version strings.
+    """
+    probe = _healthy_gpu_probe(torch_version="2.14.0a0+gitdeadbeef")
     result = check_torch_version(probe)
     assert not result.passed
 
@@ -185,11 +199,6 @@ def test_torch_version_fails_when_not_importable() -> None:
     result = check_torch_version(probe)
     assert not result.passed
     assert result.severity == "fatal"
-
-
-def test_torch_version_boundary_is_inclusive_at_minimum() -> None:
-    probe = _healthy_gpu_probe(torch_version=".".join(map(str, MIN_TORCH_VERSION)))
-    assert check_torch_version(probe).passed
 
 
 def test_cuda_driver_version_is_warning_severity_and_advisory_when_unknown() -> None:

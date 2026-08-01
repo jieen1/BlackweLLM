@@ -10,28 +10,71 @@
 
 ## 0. Headline finding — read this first
 
-**As of `/home/bot/project/sparkinfer` HEAD `1621c1e` (2026-07-30, branch
-`master`, clean working tree), the gating relaxation described below is NOT
-present in the checkout.** All 13 call sites listed in §2 still require the
-exact TP=2 shape (24 or 36 query heads, 4 KV heads, `page_size==128`).
+**Update:** the patch is not lost — it exists, unmerged, as two dangling
+commits in `/home/bot/project/sparkinfer`'s object database, unreferenced by
+any branch or tag:
 
-This matters because `notes/2026-07-31-session-summary.md` in this repo
-records a **local, in-place edit** to `sparkinfer/attention/paged/_forward.py`
-and `planner.py` that relaxed exactly this gating, and reports throughput
-gains measured against that edited checkout (4K: 353-401 tok/s, 64K: 353-368
-tok/s, "Analytic Decode Path (no TURBO) — RECOMMENDED"). That edit was never
-committed to `/home/bot/project/sparkinfer` — `git log`/`git status`/`git
-reflog`/pickaxe search across every local branch found no trace of it — so it
-is not just "not upstream," it is **currently absent from the local checkout
-that produced those numbers**. Whoever benchmarks this stack next, without
-first re-applying a patch, should expect a real regression from the
-2026-07-31 figures, not a reproduction of them.
+- **`1e306d7`** — "Unlock Laguna analytic decode kernel for TP=1 (48/8
+  heads, page_size=64)" (2026-07-31, parent `a2a8214`;
+  `sparkinfer/attention/paged/_forward.py` -6/+2,
+  `sparkinfer/attention/paged/planner.py` -6/+4, total -12/+6). **This is**
+  the gating relaxation §2-4 below are about.
+- **`ec8bb1eb`** — "FA4-inspired: decouple FP8 PV from FP8 QK for verify
+  path" (2026-07-31, child of `1e306d7`; `_forward.py` -2/+7). A separate,
+  orthogonal FP8-precision change to the verify path's PV/QK MMA coupling —
+  not part of the gating generalization this document proposes. Noted here
+  only because it shares the same recovered commit lineage and the same
+  session's throughput numbers were measured with both applied.
+
+Because neither commit is reachable from any branch, `git log --all` and a
+pickaxe search across every branch — which is what an earlier revision of
+this document ran — cannot find them; that search only walks referenced
+history. Both hashes above are directly `git show`-able from the object
+database regardless. Recovery/reproduction onto a real branch is being
+handled separately from this document.
+
+**What `1e306d7` actually changed** is narrower than the full 13-location
+generalization proposed in §4. It touched exactly 4 of the 13 locations in
+§2 — `_use_laguna_verify_forward_kernel` (#6), `_use_laguna_decode_analytic_kernel`
+(#7), `_is_laguna_fp8_gqa6_analytic_decode_graph` (#10), and
+`_is_laguna_fp8_gqa6_full_prefill_graph` (#12) — dropping the
+`num_q_heads`/`num_kv_heads` exact-equality conjuncts and widening `page_size
+== 128` to `page_size in (64, 128)`. It deliberately left untouched: verify-
+graph identification (#11), all five CTA-trait-selection branches (#1-5), the
+inline merge-pairing predicate (#8), the SWA one-wave chunk budget (#9), and
+the CUDA-graph replay path selection (#13) — consistent with its own commit
+message ("SWA layers (72/8, gqa=9) remain on the generic path by
+construction... no gqa=9 register fastpath") and its own `Scope-risk:
+moderate` self-assessment. In `planner.py`, the two touched functions
+recompute the ratio inline as `int(num_q_heads) // max(int(num_kv_heads), 1)
+== 6` rather than reusing an already-available `gqa_group_size` field —
+functionally equivalent for this shape, but worth normalizing to match
+locations #1-9/#13, which already read `gqa_group_size` directly, if this
+lands upstream.
+
+**Baseline / drift warning:** §2's line-number table is pinned to sparkinfer
+HEAD `1621c1e` (2026-07-30) — the same baseline `1e306d7`/`ec8bb1eb` are
+built on. The local `master` is being resynced to `origin/master` separately
+from this document (28 commits ahead as of this writing), and 3 of the
+incoming commits touch `sparkinfer/attention/paged/` — `b38a60e`, `6a2babc`,
+`9b852b2` (SM121 paged-attention decode/capacity work). Treat §2's line
+numbers as provisional against `1621c1e` until re-derived post-sync; that
+re-derivation (and the rebase/cherry-pick of `1e306d7`/`ec8bb1eb` onto the
+new tree) is being done separately and is not repeated here.
+
+This matters operationally regardless of the exact line numbers:
+`notes/2026-07-31-session-summary.md` in this repo reports throughput
+numbers (4K: 353-401 tok/s, 64K: 353-368 tok/s) measured with `1e306d7`
+(and, per that note, `ec8bb1eb`'s FP8 PV path) applied. Until one of those
+commits is cherry-picked onto whatever branch actually gets deployed,
+re-benchmarking will not reproduce those numbers.
 
 `runtime/preflight.py`'s `check_sparkinfer_analytic_decode_gate` (this repo)
-detects this condition functionally (calls the live gate with production
-shape parameters) and reports it as a loud, non-fatal startup warning — see
-that module's docstring for how it works and where it is meant to be wired
-in. Right now, on this checkout, that check fails (warns).
+detects the unpatched state functionally (calls the live gate with
+production shape parameters) and reports it as a loud, non-fatal startup
+warning — see that module's docstring for how it works and where it is meant
+to be wired in. On a checkout that has not cherry-picked `1e306d7` (or an
+upstream equivalent), that check fails (warns).
 
 ## 1. Background: why the fast path never fires in production
 
@@ -72,9 +115,14 @@ invariant to how you shard KV heads — so the gates are checking a proxy
 (absolute head count) for a quantity (warp/CTA-internal work shape) that is
 actually determined by `gqa_group_size`.
 
-## 2. Exact locations (verified against HEAD `1621c1e`)
+## 2. Exact locations (verified against HEAD `1621c1e`, 2026-07-30)
 
-All paths relative to `/home/bot/project/sparkinfer/`.
+All paths relative to `/home/bot/project/sparkinfer/`. **Line numbers below
+are pinned to `1621c1e` and are known to drift** once the local `master` is
+resynced to `origin/master` (see §0's baseline/drift warning) — re-derive
+them post-sync rather than trusting the numbers here at that point. Function
+names and file names are the stable identifiers; use those for search if the
+line numbers have moved.
 
 | # | File | Lines | Function | Family | Current gate (abbreviated) |
 |---|---|---|---|---|---|
@@ -134,6 +182,17 @@ flagged: "改一行就完事" is the wrong mental model here.
 
 ## 4. Recommended change, split by who does what
 
+**A starting point already exists for 4 of the 13 locations.** Dangling
+commit `1e306d7` (see §0) already implements this proposal for
+`_use_laguna_verify_forward_kernel` (#6), `_use_laguna_decode_analytic_kernel`
+(#7), `_is_laguna_fp8_gqa6_analytic_decode_graph` (#10), and
+`_is_laguna_fp8_gqa6_full_prefill_graph` (#12) — dropping the head-count
+conjuncts and widening `page_size` to `(64, 128)`, exactly as described
+below. Whoever picks this up should rebase/cherry-pick `1e306d7` onto the
+current tree first (once the `origin/master` resync in §0 lands) rather than
+re-deriving those 4 diffs from scratch, and treat the remaining 9 locations
+as net-new work.
+
 **Upstream (SparkInfer team, this handoff):** at the 13 locations in §2,
 replace the absolute-head-count conjuncts
 (`num_q_heads == 24/36 and num_kv_heads == 4`) with a check on
@@ -151,6 +210,10 @@ correctness-test that on real `num_kv_heads=8` inputs, *then* tackle the
 occupancy-budget functions (#9-12) as a distinct follow-up with their own
 benchmark pass, since a wrong occupancy constant degrades performance without
 being a correctness bug and is easy to miss in a quick regression check.
+`1e306d7` itself deliberately stopped short of the verify-graph (#11) and
+CTA-trait-selection (#1-5, #13) locations — its own commit message frames
+this as a `Scope-risk: moderate` decision, not an oversight, so treat those
+as still fully open rather than assuming partial coverage there.
 
 **Downstream (this repo, already scoped, not part of this ask):** the
 `page_size` 64→128 migration is tracked independently
@@ -163,6 +226,17 @@ the `page_size` relaxation suggested above, still leaves every gate false on
 production's current `page_size=64`.
 
 ## 5. Correctness verification method (repeatable, no BlackweLLM engine required)
+
+**What `1e306d7` itself already claims** (from its own commit trailer, not
+independently re-verified by this document): `Tested: Full acceptance
+regression suite (13 workloads, 3 measurements each)`; hard constraints it
+says it checked directly — SMEM 36KB ≤ 50KB budget, register budgets, the LSE
+fill literal `Int32(6)` matching `gqa=6`, a TMA `page_size=64` branch existing,
+and the row-0 merge fastpath supporting `group_size in {6, 8}`. Its own
+`Not-tested` line: `batch>2 analytic scope, ncu occupancy validation at
+kv_heads=8` — i.e. even the author of the recovered patch did not claim the
+occupancy re-validation in §3 was done. Treat the commit as a well-evidenced
+starting diff, not as something that has already cleared the bar in §3-4.
 
 This repo already has the methodology, validated during the block_size-128
 investigation (`notes/2026-07-27-block-size-128-accept-rate-root-cause-CLOSED.md`):
@@ -209,8 +283,13 @@ the generalization:
 ## 6. Summary for reviewers
 
 - **What changed conceptually:** nothing in any `.cu`/kernel-launch source.
-  Nine boolean gate predicates, across 4 Python files, that decide *which*
+  Boolean gate predicates, across 4 Python files (13 locations total; 4
+  already have a recovered starting diff, see below), that decide *which*
   already-compiled kernel variant runs for a given attention call.
+- **The patch is not lost:** dangling commits `1e306d7` (the gating
+  relaxation) and `ec8bb1eb` (an unrelated FP8 PV/QK precision change) exist
+  in the object database, unreferenced by any branch — see §0. `1e306d7`
+  covers 4 of the 13 locations (#6, #7, #10, #12); the other 9 are still open.
 - **Why it's safe to relax the CTA-selection half:** the CTA-internal
   resource formulas these gates guard are already parameterized by
   `gqa_group_size`, a TP-invariant quantity — not by the absolute head counts
@@ -218,6 +297,9 @@ the generalization:
 - **Why it's not "just flip a flag":** the grid-level occupancy budget
   functions in `planner.py` *do* hardcode `num_kv_heads=4`-specific SM
   occupancy constants and need independent re-derivation and re-benchmarking
-  for `num_kv_heads=8`, per §3-4.
-- **What this repo needs from SparkInfer:** the generalization in §4,
+  for `num_kv_heads=8`, per §3-4. Even `1e306d7`'s author flags this as
+  not-yet-done (`Not-tested: ... ncu occupancy validation at kv_heads=8`).
+- **What this repo needs from SparkInfer:** cherry-pick/rebase `1e306d7`
+  (and separately evaluate `ec8bb1eb` on its own merits) onto a real branch,
+  then complete the generalization in §4 for the remaining 9 locations,
   verified per §5. This repo will not modify SparkInfer source directly.

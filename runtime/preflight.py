@@ -45,13 +45,18 @@ from typing import Literal
 Severity = Literal["fatal", "warning"]
 
 # --- Version contract (docs/roadmap.md T0-6) --------------------------------
-# Kept in sync with pyproject.toml's `cuda` extra. See that file's comments
-# for why these are floors/ceilings rather than exact pins, and for the exact
-# build verified working as of 2026-08-01.
-MIN_TORCH_VERSION: tuple[int, int, int] = (2, 12, 0)
-MAX_TORCH_VERSION: tuple[int, int, int] = (2, 14, 0)  # exclusive
+# Kept in sync with pyproject.toml's `cuda` extra: `torch==2.13.0` there is
+# the declared target (the newest PyPI final release at verification time).
+# The verified reference environment runs a self-compiled pre-release of that
+# same minor version (`2.13.0a0+gitcf30153`, from-source build of
+# `/home/bot/pytorch-build`) — by decision, that pre-release/local-build form
+# is treated as satisfying the contract: `check_torch_version` matches on the
+# release segment (major.minor.patch) only and deliberately ignores any
+# pre-release (`a0`, `rc1`, ...) or local (`+git...`) suffix, so a from-source
+# `2.13.0aN+...` build passes exactly like a stock PyPI `2.13.0` wheel would.
+REQUIRED_TORCH_VERSION: tuple[int, int, int] = (2, 13, 0)
 VERIFIED_TORCH_VERSION = (
-    "2.13.0a0+gitcf30153"  # ~/.venvs/vllm, from-source build of /home/bot/pytorch-build
+    "2.13.0a0+gitcf30153"  # reference environment, from-source build of /home/bot/pytorch-build
 )
 VERIFIED_CUDA_RUNTIME_VERSION = "13.3"  # torch.version.cuda in the verified environment
 MIN_CUDA_RUNTIME_VERSION: tuple[int, int] = (13, 0)
@@ -128,20 +133,6 @@ def _parse_version_prefix(version: str) -> tuple[int, ...] | None:
     if not match:
         return None
     return tuple(int(g) for g in match.groups() if g is not None)
-
-
-def _version_tuple_in_range(
-    actual: tuple[int, ...] | None,
-    minimum: tuple[int, ...],
-    maximum: tuple[int, ...] | None = None,
-) -> bool:
-    if actual is None:
-        return False
-    if actual < minimum:
-        return False
-    if maximum is not None and actual >= maximum:
-        return False
-    return True
 
 
 # --- GPU / torch / driver probe ---------------------------------------------
@@ -354,12 +345,19 @@ def check_cuda_runtime_version(gpu: GpuProbe | None = None) -> CheckResult:
 
 
 def check_torch_version(gpu: GpuProbe | None = None) -> CheckResult:
+    """Match on the release segment (major.minor.patch) only.
+
+    Pre-release identifiers (`a0`, `rc1`, ...) and local build segments
+    (`+git...`) are deliberately ignored: the reference environment runs a
+    self-compiled pre-release of `REQUIRED_TORCH_VERSION`
+    (`2.13.0a0+gitcf30153`), and by decision that counts as satisfying the
+    same `2.13.0` contract pyproject.toml pins via `torch==2.13.0` — it is
+    not treated as "older" just because PEP 440 pre-release ordering would
+    sort it before the final release.
+    """
     gpu = gpu if gpu is not None else probe_gpu()
-    expected = (
-        f">= {'.'.join(map(str, MIN_TORCH_VERSION))}, "
-        f"< {'.'.join(map(str, MAX_TORCH_VERSION))} "
-        f"(verified: {VERIFIED_TORCH_VERSION})"
-    )
+    required = ".".join(map(str, REQUIRED_TORCH_VERSION))
+    expected = f"{required} (release segment only; verified build: {VERIFIED_TORCH_VERSION})"
     if not gpu.torch_importable or gpu.torch_version is None:
         return CheckResult(
             name="torch_version",
@@ -370,7 +368,7 @@ def check_torch_version(gpu: GpuProbe | None = None) -> CheckResult:
             remediation="Install torch per pyproject.toml's `cuda` extra: `pip install -e .[cuda]`",
         )
     parsed = _parse_version_prefix(gpu.torch_version)
-    ok = _version_tuple_in_range(parsed, MIN_TORCH_VERSION, MAX_TORCH_VERSION)
+    ok = parsed == REQUIRED_TORCH_VERSION
     return CheckResult(
         name="torch_version",
         passed=ok,
@@ -381,10 +379,10 @@ def check_torch_version(gpu: GpuProbe | None = None) -> CheckResult:
             ""
             if ok
             else (
-                "SparkInfer itself hard-requires torch>=2.12 "
-                "(/home/bot/project/sparkinfer/pyproject.toml). Rebuild/reinstall "
-                "the torch used by this venv; see pyproject.toml's `cuda` extra "
-                "comment for why an exact PyPI pin is not possible here."
+                f"pyproject.toml pins torch=={required}. Rebuild/reinstall the "
+                "torch used by this venv to match that release segment (a "
+                "same-minor pre-release/local build, e.g. "
+                f"`{required}aN+git...`, also satisfies this check)."
             )
         ),
     )

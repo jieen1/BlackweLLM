@@ -10,21 +10,26 @@ requires-python = ">=3.10"
 
 [project.optional-dependencies]
 # --- Version contract (docs/roadmap.md T0-6) ---------------------------------
-# These bounds are a *floor + ceiling*, not an exact pin, because the one
-# machine this runtime targets runs a PyTorch built from source (editable
-# install of `/home/bot/pytorch-build`, reporting `2.13.0a0+gitcf30153`,
-# CUDA 13.3, driver 610.47) — that exact string is not resolvable from PyPI
-# or any nightly index, so pinning `torch==2.13.0a0+...` here would make
-# `pip install -e '.[cuda]'` fail on a clean machine. The floor (`>=2.12`)
-# matches SparkInfer's own hard requirement
-# (`/home/bot/project/sparkinfer/pyproject.toml`: `torch>=2.12.0`); the
-# ceiling (`<2.14`) is a tripwire so a future major/minor bump doesn't get
-# silently absorbed without someone re-verifying the whole stack. If you are
-# setting up a fresh box: build/obtain a torch >=2.12,<2.14 for SM120/CC 12.0
-# yourself (a stock PyPI wheel will not have Blackwell kernels at this
-# writing) — this constraint is necessary, not sufficient. Record whatever
-# exact build you verify in `runtime/preflight.py`'s `VERIFIED_TORCH_VERSION`
-# comment and here.
+# torch is pinned exactly: `torch==2.13.0` is the declared target version —
+# the newest PyPI final release at verification time, and the version
+# `pip install -e '.[cuda]'` will actually resolve on a clean machine.
+#
+# The reference environment this project was verified against instead runs a
+# self-compiled *pre-release* of that same minor version (editable install of
+# `/home/bot/pytorch-build`, reporting `2.13.0a0+gitcf30153`, CUDA 13.3,
+# driver 610.47) — built from source because Blackwell/CC 12.0 support at
+# verification time predated a stock PyPI wheel that had it. That exact
+# string is not itself resolvable from PyPI (pip cannot pip-install a git
+# hash), so it is not what is pinned here; by decision, that from-source
+# pre-release is treated as satisfying this `2.13.0` contract, not as a
+# different/incompatible version — `runtime/preflight.py`'s
+# `check_torch_version` implements this by matching on the release segment
+# (major.minor.patch) only and ignoring the `a0`/`+git...` suffix. If a fresh
+# box installs the plain `torch==2.13.0` PyPI wheel instead, that also
+# satisfies the same check. SparkInfer's own floor
+# (`/home/bot/project/sparkinfer/pyproject.toml`: `torch>=2.12.0`) is
+# comfortably below this pin. Record whatever exact build you verify next in
+# `runtime/preflight.py`'s `VERIFIED_TORCH_VERSION` comment and here.
 #
 # All other floors/ceilings below are the exact versions verified working in
 # the project's reference environment on 2026-08-01 (see
@@ -34,7 +39,7 @@ requires-python = ">=3.10"
 cuda = [
   "numpy>=2,<3",                    # verified 2.3.5
   "safetensors>=0.7,<1",            # verified 0.7.0
-  "torch>=2.12,<2.14",               # verified 2.13.0a0+gitcf30153 (from-source build, see note above)
+  "torch==2.13.0",                   # declared target; reference env runs 2.13.0a0+gitcf30153 (see note above)
   "triton>=3.6,<4",                  # verified 3.6.0 — runtime/kernels/*.py import triton directly
   "transformers>=5,<6",              # verified 5.8.0 — runtime/laguna_config.py imports this directly
                                       # (moved here from `serving`: it is a core runtime dependency,
