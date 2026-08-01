@@ -197,10 +197,34 @@ compressed-tensors 格式（从 vLLM 的 `CompressedTensorsW4A4Fp4` + `CutlassNv
   GEMM 路径里最具体的单个空白**：需要换成 `sparkinfer.quantization.nvfp4`
   （`sparkinfer/quantization/nvfp4/api.py`：`plan(m,k)`/`allocate_outputs`/`run`，
   CUTLASS-DSL TMA-based bf16→packed-FP4+scale 量化器，SM120/121 已支持）。
-- **格式警告**：这份被删代码的参数命名（`weight_packed`/`weight_global_scale`/
-  `input_global_scale`/跨分片 `.max()`-merge）是 compressed-tensors 专属。Qwen3.6 的
-  modelopt checkpoint 命名/scale 语义不同——需要照真实 modelopt checkpoint 逐项确认
-  （本轮未定位到 modelopt 参考实现，不猜字段名，见第 7 节待验证清单）。
+- **格式警告（2026-08-02 B0-2 更新，不再是未知）**：这份被删代码的参数命名
+  （`weight_packed`/`weight_global_scale`/`input_global_scale`/跨分片 `.max()`-merge）
+  是 compressed-tensors 专属。Qwen3.6 的 modelopt checkpoint 已逐项实测确认，命名
+  与语义都不同，完整命名表、逐 scale dtype/shape、与 Laguna 的对照表见
+  [`../notes/2026-08-02-qwen36-b0-fact-baseline.md`](../notes/2026-08-02-qwen36-b0-fact-baseline.md) §1。
+  **比命名差异更重要的是量化算法本身不同**：官方 `nvidia/Qwen3.6-27B-NVFP4` 是
+  **混合精度 checkpoint**（`quantization_config.quant_algo: "MIXED_PRECISION"`），
+  不是"整模型 NVFP4"——
+  - self_attn（q/k/v/o_proj）与 GDN 的 `in_proj_qkv`/`in_proj_z`/`out_proj`：**FP8**
+    （权重+激活都量化，`.weight` F8_E4M3 不 pack + `.weight_scale`/`.input_scale`
+    各一个 F32 标量，静态）。
+  - 稠密 MLP（`gate/up/down_proj`）与 `lm_head`：NVFP4，但 `quantized_layers` 里
+    标的算法名是 **`W4A16_NVFP4`**——weight 4-bit、activation 16-bit，即
+    **weight-only**，`config_groups` 里这一组的 `input_activations` 显式是
+    `None`（未声明量化方案）。**这与上面提炼自 `CompressedTensorsW4A4Fp4` 的假设
+    不同**：Laguna 的 NVFP4（MoE 专家 FFN）是 **W4A4**（激活也动态量化到 FP4，
+    `input_global_scale` 真实参与计算）,而 Qwen3.6 的稠密 MLP 不要求把激活量化到
+    FP4。下面"唯一未完工的缝"那条结论需要重新审视，见第 3.4/5.2 节。
+  - GDN 的 `A_log`/`dt_bias`/`conv1d.weight`/`in_proj_a`/`in_proj_b`/`norm.weight`、
+    全部 RMSNorm/`q_norm`/`k_norm`、`embed_tokens`、`mtp.*`（15 个张量）：完全不量化，
+    BF16。
+  - **KV cache scale 缺口**：`quantization_config`/`hf_quant_config.json` 都声明
+    `kv_cache_quant_algo: "FP8"`，但整个 checkpoint **零 `k_scale`/`v_scale`/
+    `kv_scale` 张量**（穷举 2194 个张量名确认）。对照 Laguna 的
+    `poolside/Laguna-S-2.1-NVFP4`（同样 `dynamic: False` 但确实有真实
+    `self_attn.k_scale`/`v_scale` BF16 标量张量）说明这不是量化格式的通例，是
+    这份 checkpoint 特有的缺口——FP8 KV 的 scale 从哪来（下游自己校准？固定
+    1.0？还是干脆不用 FP8 KV）是一个新的待拍板点，见第 7 节。
 
 ### 1.10 汇总：分布与"已经休眠就位"的机制
 
@@ -416,21 +440,58 @@ modelopt quant、MTP 层数）、`runtime/model_registry.py`（151 行，已注�
 `runtime/model_registry.py` 已经把 `"modelopt"` 列为 `LOADER_FOR_QUANT_METHOD` 的
 一个值（第 41-44 行），但目前只有名字，没有实现。需要新写：
 
-- **权重侧**：`git show a9cb932^:runtime/model/nvfp4_linear.py` 的
+- **权重侧（2026-08-02 B0-2 已确认，不再是未知）**：`git show
+  a9cb932^:runtime/model/nvfp4_linear.py` 的
   `swizzle_blockscale`/`pad_nvfp4_weight_for_cutlass`/`slice_nvfp4_output` 三个纯
-  张量函数可直接搬（1.9 节），但参数命名要从 compressed-tensors 风格
-  （`weight_packed`/`weight_global_scale`）换成 modelopt 的真实命名——**本轮未确认
-  modelopt 的确切张量名/scale 语义**，是 B0-2 的原始任务，不能猜（`roadmap.md`
-  §待验证清单已列）。
-- **激活侧量化**：`torch.ops._C.scaled_fp4_quant`（vLLM 编译扩展）必须换成
-  `sparkinfer.quantization.nvfp4`（`plan(m,k)`/`allocate_outputs`/`run`）——这是
-  整条 GEMM 路径里最具体的单个空白，1.9 节已定位。
-- **GEMM 本身**：`sparkinfer.gemm.blockscaled.mm` vs 复活
-  `runtime/kernels/nvfp4_gemm_sm120.cu`（自研，源码还在，1.8 节），需要一次
-  GPU A/B（**[待验证]**，见第 7 节）。
-- **333 个 vision 张量过滤**：D6 已拍板用官方 `nvidia/Qwen3.6-27B-NVFP4`，需要一个
-  按 tensor 名前缀跳过 `vision.*` 的加载过滤器（一次性机械工作，`roadmap.md` B0-1a
-  已列，可复用于任何带 vision tower 的衍生 checkpoint）。
+  张量函数仍可直接搬（1.9 节，纯 block-scale 布局操作，硬件定义不是格式定义）。
+  参数命名要从 compressed-tensors 风格（`weight_packed`/`weight_global_scale`/
+  `input_global_scale`）换成 modelopt 的真实命名 `weight`/`weight_scale`/
+  `weight_scale_2`/`input_scale`——完整对照表、每个字段的 dtype/shape/block 粒度见
+  [`../notes/2026-08-02-qwen36-b0-fact-baseline.md`](../notes/2026-08-02-qwen36-b0-fact-baseline.md) §1.2/§1.6。
+  **加载器不能只按张量名后缀分支**：同一个 `.weight` 后缀在这份 checkpoint 里
+  可能是 U8-packed-NVFP4（MLP/lm_head）、也可能是 F8_E4M3-未 pack（self_attn/GDN
+  的 in_proj/out_proj）、也可能是 BF16 明文（GDN 的 `A_log`/`conv1d` 等、全部
+  norm、`embed_tokens`、`mtp.*`）——**必须先查 `quantization_config.
+  quantized_layers[name]`（或按模块类型+`ignore`/`exclude_modules` 列表推导）才能
+  知道怎么解释 `.weight`，不能像 compressed-tensors 那样靠后缀自解释**。
+- **激活侧量化：原假设已被证伪，MLP/lm_head 是 weight-only（W4A16），不是 W4A4**——
+  1.9 节"唯一未完工的缝是 `torch.ops._C.scaled_fp4_quant` → `sparkinfer.
+  quantization.nvfp4`"这条结论建立在"MLP 也像 Laguna MoE 专家那样激活量化到
+  FP4"的假设上。实测 `quantization_config.config_groups` 里 MLP/lm_head 那组的
+  `input_activations` 是 `None`，`quantized_layers` 标的算法名是
+  `"W4A16_NVFP4"`——**weight 4-bit、activation 16-bit，激活不量化到 FP4**。
+  **只有 self_attn/GDN 的 FP8 投影层（W8A8，权重+激活都量化）才是真的需要
+  激活侧动态量化的路径**，且是 FP8 不是 FP4，量化目标 dtype 也不同。
+- **GEMM 本身（2026-08-02 第二轮已确认，不再是空白）**：`sparkinfer.gemm.
+  blockscaled.mm` 确认吃不了这个语义——其底层 `sparkinfer._lib.dense_gemm.
+  dense_gemm` 的签名是 `lhs/rhs: Tuple[Tensor, Tensor]`（值+scale 二元组），
+  结构性地要求两个操作数都带 scale，逐个读完 `sparkinfer/gemm/` 下全部 9 个
+  op（`_bmm`/`bf16_gemv`/`block_fp8_linear`/`blockscaled`/
+  `mla_query_projection`/`mxfp8_linear`/`tensor_fp8_linear`/`trellis_linear`/
+  `wo_projection`）确认没有第十条路：除 `trellis_linear`（EXL3 trellis 编码，
+  数值格式不对，不是 NVFP4 block-scale）外全部基于同一个对称 `dense_gemm`。
+  **但 `sparkinfer/moe/_shared/kernels/w4a16/` 这个 MoE 子树已经原生支持我们
+  要的语义**：`prepare_w4a16_modelopt_nvfp4_weights`（`prepare.py:987`）
+  docstring 直接写"NVFP4 K/16 scale grid"，姐妹函数 `prepare_w4a16_modelopt_
+  native_weights` 的 docstring 更进一步写明是"GLM serving 需要 A4 prefill +
+  A16 decode 共享同一份权重"这个真实场景的实现，且底层 `_compile_w4a16_
+  gemm_launch`（`kernel.py:680`）对 `num_experts` 只有"必须为正"的下限
+  （`kernel.py:9378`），没有任何 E≥2 的限制，`weight_layout="modelopt"` 是
+  独立于 MoE 路由的合法值。**结论：走公开的 `moe.fused_moe(quant_mode=
+  "w4a16", source_format="modelopt_nvfp4")` 配 `num_experts=1`/单专家退化
+  路由即可，不需要新 SparkInfer 功能，不需要复活自研 `.cu`**——原来"自研 vs
+  sparkinfer 二选一 GPU A/B"这个问题被替换成"验证公开 API 在 E=1 下能不能
+  跑通、跑多快"，**[待验证 GPU，本轮只读代码，未跑一行 CUDA]**。完整证据链、
+  9 个 op 的逐一排除表、调用形状推断见
+  [`../notes/2026-08-02-qwen36-b0-fact-baseline.md`](../notes/2026-08-02-qwen36-b0-fact-baseline.md) §4。
+- **333 个 vision 张量过滤（2026-08-02 已确认前缀）**：D6 已拍板用官方
+  `nvidia/Qwen3.6-27B-NVFP4`，实测 333 个张量精确复现，前缀统一为
+  **`model.visual.`**（不是笼统的 `vision.*`——穷举确认没有其它带"vision"字样
+  的张量落在这个前缀之外），过滤器可以简单到 `name.startswith("model.visual.")`，
+  见 B0 笔记 §1.4（一次性机械工作，`roadmap.md` B0-1a 已列，可复用于任何带
+  vision tower 的衍生 checkpoint）。checkpoint 顶层 `config.json` 的
+  `language_model_only` 字段默认是 `false`——加载器要主动设置/断言纯文本模式，
+  不能假设 checkpoint 元数据已经替我们声明了这一点。
 
 ### 3.5 CUDA Graph：状态中立捕获是全新问题
 
@@ -457,9 +518,20 @@ B2 期间顺手做的小事。
 ## 4. 已确认的事实（汇总，逐条标来源）
 
 - **架构事实**（config.json 实测）：64 层 = 48 linear_attention(GDN) + 16
-  full_attention（interval 4）；hidden 5120；head_dim 256；24 q 头/4 kv 头（GQA 6）；
-  partial_rotary_factor 0.25；mrope interleaved；`attn_output_gate: True`；稠密
-  SwiGLU intermediate 17408；`mtp_num_hidden_layers: 1`；modelopt NVFP4 + fp8 KV。
+  full_attention（interval 4）；hidden 5120；head_dim 256；24 q 头/4 kv 头（GQA 6，
+  但 `q_proj` 实际输出宽度是 `24×256×2=12288`——后一半是与 `attn_output_gate`
+  融合的 gate logit，不是独立权重，见 B0 笔记 §1.7）；partial_rotary_factor 0.25；
+  mrope interleaved（**2026-08-02 B0-6 已确认：纯文本输入下退化为标准 1D RoPE**，
+  三个 mrope 维度的 position_ids 恒等，见下方 B0-6 条目与 B0 笔记 §2）；
+  `attn_output_gate: True`（`sigmoid` 门控，config 字段名 `output_gate_type:
+  "swish"` 容易误导——实际不是 silu/swish 激活，是纯 sigmoid gate，源码见 B0
+  笔记 §1.7）；稠密 SwiGLU intermediate 17408；`mtp_num_hidden_layers: 1`。
+  **"modelopt NVFP4 + fp8 KV" 这句 2026-08-02 前的描述不够准确**——实测是
+  **混合精度**：self_attn/GDN 投影层是 FP8（W8A8），只有稠密 MLP/`lm_head` 是
+  NVFP4（且是 **weight-only, W4A16**，不是 W4A4）；KV 的 FP8 声明
+  （`kv_cache_quant_algo: "FP8"`）在 checkpoint 里没有对应的 `k_scale`/`v_scale`
+  张量，与 Laguna 对照组不同——完整证据见
+  [`../notes/2026-08-02-qwen36-b0-fact-baseline.md`](../notes/2026-08-02-qwen36-b0-fact-baseline.md)。
   来源：`runtime/architecture.py` 已解析并通过 `TestAgainstRealCheckpoints` 验证
   （`tests/test_architecture_spec.py`），`docs/model-support.md` §3.1 交叉确认。
 - **B-6 结论（不可推翻，只核实）**：6 个本地 checkpoint 的 `mtp.*` 张量清一色
@@ -469,6 +541,10 @@ B2 期间顺手做的小事。
   与此结论完全一致，未发现矛盾证据。
 - **C-2 结论**：sparkinfer 的 paged kernel 显式拒绝 fp16/bf16/fp8_e4m3 之外的 KV
   dtype，NVFP4 KV today 不存在可测对象。B3 用 FP8 KV。来源：`investigation-queue.md` C-2。
+  **2026-08-02 补充（不推翻这条决定，但补充一个新约束）**：如果 B3 真的用 FP8
+  KV，scale 从哪来是一个新问题——官方 checkpoint 声明了 FP8 KV 但不带
+  `k_scale`/`v_scale` 张量（B0-2，见 §1 与 B0 笔记 §1.3），需要自己定一个默认值
+  （如 1.0）或自己跑一遍校准，不能假设 checkpoint 会提供。
 - **D6 已拍板**：主线 checkpoint 用官方 `nvidia/Qwen3.6-27B-NVFP4`，需排除 333 个
   vision 张量，`validate_text_only` 已经是"接受但断言零 vision 张量被加载"的语义
   （`runtime/architecture.py:292-319` 已实现，非空文档承诺）。
@@ -517,15 +593,33 @@ B2 期间顺手做的小事。
 
 ### 5.2 其余风险（按判断的确定性排序，非难度）
 
-- **NVFP4 GEMM 到底选自研 `.cu` 还是 sparkinfer**——需要一次 GPU A/B（3.4 节），
-  在此之前无法判断这条工作是"选一个现成的"还是"两边都要调"。
+- **NVFP4 GEMM 到底选自研 `.cu` 还是 sparkinfer——2026-08-02 第二轮已解出候选，
+  不再是开放问题**。`sparkinfer.moe.fused_moe(quant_mode="w4a16",
+  source_format="modelopt_nvfp4")` 配 `num_experts=1` 单专家退化路由，公开
+  API、已确认覆盖我们的确切数值语义（见 §3.4、B0 笔记 §4）。**仍然
+  [待验证 GPU]**（本轮只读代码，未跑一行 CUDA），但风险性质从"候选集不明"
+  降到"验证一条已知候选能不能跑通/多快"，且已经确认不需要复活自研 `.cu`
+  也不需要 SparkInfer team 新写代码。
 - **`RESERVED_PHYSICAL_SLOTS=1` 是否还需要**——1.4 节已指出这可能是纯 vLLM 调度器
   伪影，Laguna 用 0 也能跑，但"新实现要不要保留 1"需要在自建栈上实证检查，不能
   两头都假设。
 - **`_MAX_DECODE_QO_LEN=16` 等常量绑定旧 kernel 的测试范围**——换新 GEMM/attention
   kernel 后这类边界常量需要逐个重新核实，不能整包沿用。
-- **modelopt 张量命名/scale 语义未确认**（B0-2，本轮未做，不是本文档职责范围但
-  是紧邻的下一步）。
+- **GDN 递归状态的存储 dtype——2026-08-02 第二轮已确认落盘 BF16，但机制比原来
+  描述的更精确，不是简单"哪个候选对"的问题**：本机真装了可 import 的 `fla`，
+  参考实现实际走的是 FLA 真 kernel（`fla/ops/gated_delta_rule/
+  fused_recurrent.py:209-212`、`fla/ops/common/chunk_delta_h.py:637,640`
+  确认其内部把 `final_state` 硬编码分配成 `torch.float32`），不是 B0 第一轮
+  误读的 torch 兜底函数；但 HF 通用 `Cache` 类落盘时用同一 forward 调用里
+  `conv_states` 先锁定的 BF16 把这个 FP32 结果降精度存回（`transformers/
+  cache_utils.py:772-784`，`dtype=self.dtype` 不是 `dtype=recurrent_states.
+  dtype`）。净效果：**"单步 FP32 计算、跨步 BF16 舍入"**，不是"全程 BF16"
+  也不是"全程 FP32"——B1 若要对这份参考实现 bit-exact，需要复刻这个具体的
+  舍入动作，不能只是"选 bf16 或 fp32 其中一个，从头到尾都用它"。单槽显存
+  数字不变（~75 MiB，因为落盘确实是 BF16），变的是"为什么"与"精确到什么
+  程度才算对齐"。完整证据链见 B0 笔记 §5。
+- **modelopt 张量命名/scale 语义——2026-08-02 B0-2 已确认，不再是未知**，见 §1.9/
+  §3.4 与 B0 笔记；**KV cache scale 缺失**是本轮唯一没有闭环的子项（见 §4/§7）。
 - **chunked prefill 跨步交织（Phase B）连 oracle 自己都没做完**——B1/B2 阶段可以
   先用 Laguna 式的非增量 stub，B2 结束前要明确决定是否补这块，不要放到 B3 才发现
   服务化门禁需要它。
@@ -534,19 +628,55 @@ B2 期间顺手做的小事。
 
 ## 6. 待验证清单（本轮不动 GPU，明确列出留给下一步）
 
-- [ ] sparkinfer `blockscaled.mm` vs 自研 `nvfp4_gemm_sm120.cu` 在 Qwen3.6 真实
-  稠密 shape（34816/17408/6144/5120/96）上的 A/B（3.4 节，1.8 节）
+**2026-08-02 B0-2/B0-6/B0-7 已核实闭环的条目**（原清单里的，勾掉，证据见
+[`../notes/2026-08-02-qwen36-b0-fact-baseline.md`](../notes/2026-08-02-qwen36-b0-fact-baseline.md)）：
+
+- [x] modelopt NVFP4 的 tensor 命名与 scale 语义逐项确认（B0-2）——混合精度、
+  三条命名规则（FP8/NVFP4-weight-only/不量化）、与 Laguna 逐项对照表，见 §1/§3.4
+- [x] mrope-interleaved 在纯文本下能否退化为标准 1D RoPE（B0-6）——**确认可以**，
+  HF transformers 源码行号证据见 B0 笔记 §2
+- [x] Qwen3.6-27B 在 96 GB 上的 context × 并发可行域，新框架记账口径下的算术
+  推导（B0-7）——GDN 状态每槽固定 ~75–150 MiB，权重仅 18.8 GiB（纯文本），
+  可行域比 Laguna 宽松很多，见 B0 笔记 §3。**注意：这仍是算术推导，不是 GPU
+  实测**，运行时开销（~3 GiB 假设）与 KV/状态实际分配器行为仍需要 B0-3/B2 补测，
+  这条不算完全闭环，只是从"完全未知"变成"有公式和量级，缺一个实测系数"。
+
+**2026-08-02 第二轮已核实闭环的条目**（读码确认，仍缺 GPU 实测，证据见 B0 笔记 §4/§5/§6）：
+
+- [x] **`sparkinfer.gemm.blockscaled.mm` 是否支持纯 FP4×FP4 之外的输入**——
+  **确认不支持**（底层 `dense_gemm` 结构性要求两个操作数都带 scale），但
+  **`sparkinfer/moe/_shared/kernels/w4a16` 原生支持 modelopt NVFP4 weight-only
+  语义**，逐个排查完 `sparkinfer/gemm/` 全部 9 个 op 后确认没有第十条路。原来
+  "自研 `.cu` vs sparkinfer 二选一 A/B"这个问题被替换成"验证 `moe.fused_moe
+  (quant_mode="w4a16")` 配 `num_experts=1` 能不能跑通/多快"，**[待验证 GPU]**。
+- [x] **GDN 递归状态的存储 dtype**——**落盘确认 BF16**，但机制是"单步 FP32
+  计算（真实 FLA kernel 内部硬编码 fp32）+ 跨步 BF16 舍入（HF 通用 `Cache`
+  类按 conv_states 先锁定的 dtype 存回）"，不是简单的"全程 bf16"或"全程
+  fp32"。`mamba_ssm_dtype: "float32"` 这个 config 字段仍确认未被这条链路
+  读取。B1 若要 bit-exact 对齐需要复刻这个具体的舍入动作。**[仍是读码结论，
+  未跑一次 dummy forward 实测确认]**。
+- [x] **FP8 KV scale 缺失时上游框架怎么办**——**vLLM/SGLang 都是默认
+  `k_scale=v_scale=1.0`+运行时告警**，vLLM 正在弃用运行时校准选项
+  （`--calculate-kv-scales`，v0.19 移除），官方声明口径是"有则读、没有就
+  1.0"。这条不代表我们的 KV dtype 最终决定（仍待 C-2），但排除了"要不要自己
+  搭一套校准流水线"的额外未知数——先用 1.0，除非质量评测证明不够。
+
+**仍未闭环的条目**：
+
+- [ ] **modelopt `input_scale` 在 W4A16（weight-only）组的实际语义**——张量
+  存在但 `config_groups` 声明 `input_activations: None`（B0-2，§1.2）；不确定
+  推理时是否真的被消费，还是纯校准期遗留。
+- [ ] `sparkinfer.moe.fused_moe(quant_mode="w4a16")` 配 `num_experts=1` 在
+  Qwen3.6 真实稠密 shape（`hidden=5120`/`intermediate=17408`）上的实测跑通
+  与吞吐（3.4 节，B0 笔记 §4.2，候选集已确定，只差实跑）
 - [ ] FLA `gated_delta_rule`（chunk / fused_recurrent 两条路径）在 SM120 上的正确性
-  与速度实测——本轮只确认了本地可 `import`，未做任何 GPU 执行
+  与速度实测——本轮只确认了本地可 `import`、以及参考实现真的会走这两个真 kernel
+  （不是 torch 兜底，见 B0 笔记 §5.1），未做任何 GPU 执行
 - [ ] GDN 递归状态更新在自建 CUDA graph 骨架上是否 capture-safe（3.5 节，第 6.1 节
   第一难点的具体验证动作）
 - [ ] `RESERVED_PHYSICAL_SLOTS=1` 在自建栈上是否仍必要（5.2 节）
 - [ ] `runtime/kernels/fused_rms_norm.py` 的 `BLOCK_SIZE`/`num_warps` 假设在
   Qwen3.6 hidden=5120 下是否仍安全（1.8 节）
-- [ ] modelopt NVFP4 的 tensor 命名与 scale 语义逐项确认（B0-2，紧邻下一步，非本文档产出）
-- [ ] Qwen3.6-27B 在 96 GB 上的 context × 并发可行域——**本文档第 2.4/2.5 节的数字
-  是 vLLM 执行路径下测的**，新框架的 KV/递归状态显存记账方式不同（参照 Laguna 的
-  `notes/2026-07-29-gpu-memory-audit.md` 式审计），需要重新测，不能直接套旧数字
 
 ---
 
@@ -555,7 +685,26 @@ B2 期间顺手做的小事。
 - **`oracle/qwen36_vllm/` 的处置时机**——`roadmap.md` §7 D5 已列出三个选项
   （保留只读参考 / B 完成后删除 / 现在就删）。本文档大量引用了它的具体行号，
   **建议在 Track B3 验收通过前保持 (a) 不变**，否则本文档的可核查性会打折。
-- **B0-2（modelopt 张量命名确认）与 B0-4（GDN 方案三选一：FLA/移植/自研）的排期
+- **（2026-08-02 第二轮，已有明确建议但仍需人确认）FP8 KV 的 scale 从哪来**——
+  B0-2 实测官方 checkpoint 声明 `kv_cache_quant_algo: FP8` 但不带任何
+  `k_scale`/`v_scale` 张量（§1.3/§4）。**vLLM/SGLang 的现成答案是默认 1.0+
+  告警**（B0 笔记 §6），vLLM 自己正在把运行时校准这条路废弃。C-2 仍在判断
+  要不要用 FP8 KV（另一 agent 的结论，本文档不预判），但"scale 从哪来"这个
+  子问题已经有主流框架的现成先例可循——**建议**：若 C-2 最终判定用 FP8 KV，
+  直接采用 vLLM/SGLang 同款策略（固定 1.0 + 告警），不要在验证到"1.0 不够"
+  之前先去搭一套校准流水线。人需要拍板的只是"要不要采纳这个建议"，不是
+  "从哪找答案"。
+- **（2026-08-02 第二轮已解决，不再需要拍板）Qwen3.6 稠密 MLP 的 GEMM
+  路线**——B0-2 证伪了"MLP 也是 W4A4"的假设，实测是 W4A16（weight-only，
+  §3.4/§5.2）。第二轮读完 `sparkinfer/gemm/` 全部 9 个 op 与
+  `sparkinfer/moe/_shared/kernels/w4a16/` 源码后确认：公开的
+  `moe.fused_moe(quant_mode="w4a16", source_format="modelopt_nvfp4")` 配
+  `num_experts=1` 单专家退化路由已经原生覆盖这个语义，不需要新 SparkInfer
+  功能，不需要复活自研 `.cu`，不需要在"反量化+bf16"与"混合精度 kernel"之间
+  选择——**这条不再是待拍板事项，只剩"实测跑通/测吞吐"这个纯执行动作**
+  （见 §6 待验证清单），完整证据链见
+  [`../notes/2026-08-02-qwen36-b0-fact-baseline.md`](../notes/2026-08-02-qwen36-b0-fact-baseline.md) §4。
+- **B0-2（modelopt 张量命名确认，已完成，见 §1）与 B0-4（GDN 方案三选一：FLA/移植/自研）的排期
   顺序**——本文档判定 GDN kernel 本身不是性能瓶颈（2.6 节），建议 B0-4 直接选①
   FLA 拿正确性，把"要不要自研③"推迟到 B3 profiling 之后再看，这条 roadmap 已经
   这么建议，本文档只是补充了量化证据（GDN 恒占 <5.1% decode 时间）支持这个建议，
@@ -585,5 +734,9 @@ B2 期间顺手做的小事。
   MTP 不含 GDN 的结论与纠偏
 - [`../notes/2026-08-02-laguna-docs-inherited-qwen36-numbers.md`](../notes/2026-08-02-laguna-docs-inherited-qwen36-numbers.md) ——
   本轮发现的文档数字污染记录
+- [`../notes/2026-08-02-qwen36-b0-fact-baseline.md`](../notes/2026-08-02-qwen36-b0-fact-baseline.md) ——
+  **B0-2/B0-6/B0-7 的原始证据**：modelopt 逐张量命名/scale 语义 + 与 Laguna
+  compressed-tensors 逐项对照表、mrope 退化的 HF transformers 源码行号证据、
+  GDN 状态与 KV cache 的容量算术推导。第 1/3.4/4/5.2/6/7 节的更正均以此为据
 - [`roadmap.md`](roadmap.md) Track B —— 排期与里程碑，已同步本文档结论
 - [`model-support.md`](model-support.md) §3 —— Qwen3.6 架构事实与接入六步流程
