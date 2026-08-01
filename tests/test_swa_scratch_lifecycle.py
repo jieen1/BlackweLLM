@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-import torch
-from torch import nn
+# runtime.backends.laguna imports torch eagerly, so it must be imported only
+# after the importorskip below has confirmed torch is present -- ruff's
+# import-order/position checks are relaxed accordingly for this file.
+# ruff: noqa: E402, I001
+
+import pytest
+
+torch = pytest.importorskip("torch")
 
 from runtime.backends.laguna import _LayerForwardHooks
 
 
-class _ScratchWriter(nn.Module):
+class _ScratchWriter(torch.nn.Module):
     def __init__(self, scratch: torch.Tensor, value: int) -> None:
         super().__init__()
         self.scratch = scratch

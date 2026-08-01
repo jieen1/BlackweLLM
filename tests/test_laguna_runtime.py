@@ -59,12 +59,16 @@ def test_laguna_runtime_modules_do_not_import_qwen_legacy_vllm() -> None:
     ):
         tree = ast.parse((root / relative_path).read_text(encoding="utf-8"), filename=relative_path)
         assert not any(
-            (isinstance(node, ast.ImportFrom) and node.module in {
-                "runtime.compat_vllm",
-                "runtime.compat_vllm_qwen36",
-                "oracle.qwen36_vllm.vllm_compat",
-                "oracle.qwen36_vllm.attention_compat",
-            })
+            (
+                isinstance(node, ast.ImportFrom)
+                and node.module
+                in {
+                    "runtime.compat_vllm",
+                    "runtime.compat_vllm_qwen36",
+                    "oracle.qwen36_vllm.vllm_compat",
+                    "oracle.qwen36_vllm.attention_compat",
+                }
+            )
             or (
                 isinstance(node, ast.Import)
                 and any(
@@ -83,9 +87,9 @@ def test_laguna_runtime_modules_do_not_import_qwen_legacy_vllm() -> None:
 
 
 def test_laguna_backend_has_no_dead_vllm_patch_hooks() -> None:
-    source = (
-        Path(__file__).resolve().parents[1] / "runtime" / "backends" / "laguna.py"
-    ).read_text(encoding="utf-8")
+    source = (Path(__file__).resolve().parents[1] / "runtime" / "backends" / "laguna.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "patch_nvfp4_" not in source
     assert "_patch_rmsnorm_triton" not in source
@@ -120,6 +124,7 @@ import runtime.backends.laguna_dflash
 
 
 def test_server_app_defaults_to_the_only_supported_backend() -> None:
+    pytest.importorskip("fastapi")
     completed = subprocess.run(
         [sys.executable, "-c", "import server.app; print(server.app.SERVER_MODEL_BACKEND)"],
         check=False,
