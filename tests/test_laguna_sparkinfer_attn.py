@@ -312,11 +312,16 @@ def test_declare_verify_capacity_is_monotonic():
     assert workspace2._max_verify_query_len == 16
 
 
-def test_prefill_workspace_verify_mode_uses_verify_capacity_planner(monkeypatch):
-    """Once capacity is declared, mode="verify" must ask sparkinfer's own
-    verify-graph capacity planner (plan_verify_graph_capacity) for
-    max_work_items/max_partial_rows -- never the extend-shaped
-    eager_extend_work_items_capacity heuristic that under-provisioned it.
+def test_prefill_workspace_verify_mode_sizes_capacity_from_the_real_eager_planner(monkeypatch):
+    """Once capacity is declared, mode="verify" must size its fixed capacity
+    from sparkinfer's own REAL eager planner (create_paged_plan with
+    enable_cuda_graph=False -- the exact function every real verify call
+    uses), run once against a synthetic worst-case call -- never the
+    extend-shaped eager_extend_work_items_capacity heuristic that
+    under-provisioned it, and never the OTHER (CUDA-Graph-mode) capacity
+    planner either (planner.plan_verify_graph_capacity) -- that one measured
+    wrong on real GPU, see _work_item_capacity's docstring and
+    notes/2026-08-01-c1-c2-gpu-investigation.md's follow-up section.
     """
     pytest.importorskip("sparkinfer")
     calls: list[str] = []
@@ -343,24 +348,29 @@ def test_prefill_workspace_verify_mode_uses_verify_capacity_planner(monkeypatch)
         def _copy_plan_metadata(self, plan):
             pass
 
+    def fake_create_paged_plan(
+        q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q, **kwargs
+    ):
+        calls.append("create_paged_plan")
+        assert kwargs["mode"] == "verify"
+        assert kwargs["enable_cuda_graph"] is False
+        return SimpleNamespace(new_batch_size=4321, total_num_partial_rows=99, split_kv=True)
+
     def fake_plan_verify_graph_capacity(**kwargs):
-        calls.append("plan_verify_graph_capacity")
-        assert kwargs["query_len"] == 16
-        assert kwargs["batch"] == 1
-        assert kwargs["window_left"] == -1
-        return SimpleNamespace(max_work_items=4321, max_partial_rows=99)
+        calls.append("plan_verify_graph_capacity")  # must never be called (see docstring)
+        raise AssertionError("plan_verify_graph_capacity is the wrong-mode capacity source")
 
     monkeypatch.setattr(
         "sparkinfer.attention.paged.workspace.PagedAttentionWorkspace",
         FakeWorkspace,
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged.planner.plan_verify_graph_capacity",
-        fake_plan_verify_graph_capacity,
+        "sparkinfer.attention.paged.planner.create_paged_plan",
+        fake_create_paged_plan,
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged.planner.create_paged_plan",
-        lambda *args, **kwargs: object(),
+        "sparkinfer.attention.paged.planner.plan_verify_graph_capacity",
+        fake_plan_verify_graph_capacity,
     )
     monkeypatch.setattr(
         "sparkinfer.attention.paged._scratch.build_paged_attention_binding",
@@ -392,10 +402,17 @@ def test_prefill_workspace_verify_mode_uses_verify_capacity_planner(monkeypatch)
         plan_cache_key=object(),
     )
 
-    assert calls.count("plan_verify_graph_capacity") == 1
+    # Once for the up-front worst-case capacity discovery, once for the real
+    # call's own plan.
+    assert calls.count("create_paged_plan") == 2
     assert calls.count("eager_extend_work_items_capacity") == 0, (
         "mode='verify' must not size its fixed capacity via the extend-shaped "
         "estimator -- that is exactly the C-1 under-provisioning bug"
+    )
+    assert calls.count("plan_verify_graph_capacity") == 0, (
+        "mode='verify' must not size its fixed capacity via the CUDA-Graph-mode "
+        "capacity planner either -- measured wrong on real GPU (different, "
+        "smaller chunking policy than the eager path actually uses)"
     )
     assert calls.count("workspace") == 1
 
