@@ -271,16 +271,43 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
     `vision_config` 就整体拒绝"改成"允许 `vision_config` 存在，但要求 loader 处于
     `language_model_only=True` 并断言零 vision 张量被实际加载"——这条不改 `architecture.md`，
     在 A1 落地时一并处理
-- [ ] B0-2 modelopt NVFP4 的 tensor 命名与 scale 语义**逐项确认，不猜**
+- [x] B0-2 modelopt NVFP4 的 tensor 命名与 scale 语义**逐项确认，不猜** —— ✅ **已核实**：checkpoint
+  是**混合精度**，不是"整模型 NVFP4"——GDN/`self_attn` 的投影层是 FP8（W8A8，`.weight`
+  F8_E4M3 不 pack + `.weight_scale`/`.input_scale` 各一个 F32 标量）；仅稠密 MLP 与
+  `lm_head` 是 NVFP4 **weight-only**（W4A16，`.weight` U8-packed + `.weight_scale`
+  F8_E4M3 per-block(block=16) + `.weight_scale_2` F32 全局标量）。**最大发现**：
+  `kv_cache_quant_algo=FP8` 有声明但**零个** `k_scale`/`v_scale`/`kv_cache_scale` 张量
+  （Laguna 对照组证实这不是格式通例）。证据：`notes/2026-08-02-trackB-b0-facts.md` §B0-2、
+  `notes/2026-08-02-qwen36-b0-fact-baseline.md` §1、`docs/qwen36-rebuild-spec.md` §1.9/§3.4
 - [ ] B0-3 sparkinfer paged attention 在 `head_dim=256 / gqa_group=6 / page_size ∈ {64,128} / fp8 KV` 下的正确性与吞吐
 - [ ] B0-4 GDN 方案三选一：① FLA v0.5.2 `gated_delta_rule` ② 从 `oracle/qwen36_vllm/` 移植 ③ 自研。**建议先 ① 拿正确性，profiling 说话后再决定 ③**
 - [ ] B0-5 GDN 递归状态更新是否 **CUDA Graph capture-safe**（决定 B2 可行性）
-- [ ] B0-6 mrope-interleaved 在纯文本下能否退化为标准 1D RoPE
-- [ ] B0-7 容量测算：64 层 / 256K / 96 GB 的 KV + 递归状态显存账 → context × 并发可行域
-- [ ] **B0-8 · Qwen3.6 的 MTP 层是否带 GDN**（`investigation-queue.md` B-6，**另一 agent 正在查，本文档不预判结论**）：
-  vLLM 注释 "draft models have no mamba layers, so no eagle shift"——若我们的 MTP 层也不含 GDN，
-  **B3 最难的一项（GDN 递归状态推测回滚）直接不存在**。查法：读 checkpoint `config.json` 里 MTP 段的
-  `layer_types` + `mtp.*` 张量名，零 GPU。**应在 B3 排期前答掉**，见下方 B3 的两个分支
+- [x] B0-6 mrope-interleaved 在纯文本下能否退化为标准 1D RoPE —— ✅ **确认退化，可直接当断言用**：
+  纯文本请求（无 `image_grid_thw`/`video_grid_thw`）下 T/H/W 三个 mrope 维度的 position_ids
+  是同一个 `.expand()` 视图，逐元素恒等，`apply_interleaved_mrope`
+  （`modeling_qwen3_5.py:157-172`）的覆盖是数值无操作——等价于**标准 1D RoPE +
+  `partial_rotary_factor=0.25`（仅转前 64/256 维）+ `rope_theta=10,000,000`**，prefill/decode
+  每一步都成立。B1 可直接复用标准 1D RoPE kernel 加 partial-rotary 支持，不需要三维 mrope
+  插值。证据：`notes/2026-08-02-trackB-b0-facts.md` §B0-6（含 `transformers==5.8.0` 行号）、
+  `docs/qwen36-rebuild-spec.md` §4/§6
+- [x] B0-7 容量测算：64 层 / 256K / 96 GB 的 KV + 递归状态显存账 → context × 并发可行域 —— ✅
+  **已测算（算术推导，非 GPU 实测）**：权重实测 18.767 GiB（纯文本，`nvidia/Qwen3.6-27B-NVFP4`，
+  比 Laguna 67 GiB 小 3.4×）；GDN 递归状态每槽固定 ~72–150 MiB（取决于状态 dtype，与上下文
+  长度无关，相对 KV 可忽略）；96GB 卡扣除权重+3GiB 运行时假设后 ≈73 GiB 可用于 KV：
+  256K/FP8-KV 可行到 **c=8**，256K/BF16-KV 可行到 **c=4**，128K/FP8-KV 可行到 **c≈17**。
+  **[待验证]**：3 GiB 运行时开销假设需 B0-3/B2 GPU 实测替换。证据：
+  `notes/2026-08-02-trackB-b0-facts.md` §B0-7、`notes/2026-08-02-qwen36-b0-fact-baseline.md` §3
+- [x] **B0-8 · Qwen3.6 的 MTP 层是否带 GDN**（`investigation-queue.md` B-6）—— ✅ **确认不带，
+  但不能删掉 B3 那一项**：`nvidia/Qwen3.6-27B-NVFP4` 与 `unsloth/Qwen3.6-27B-NVFP4` 两个
+  checkpoint 的 `mtp.*` 张量（15 个）逐一核对，清一色 `self_attn.{q,k,v,o}_proj` +
+  `mlp.{gate,up,down}_proj` + 层归一化，**零个** `linear_attn.*`/`A_log`/`conv1d`/`dt_bias`
+  之类的 GDN 张量。**但 vLLM 那条注释说的是草稿模型自己的递归状态管理**（MTP 头不需要自己
+  shift 状态，这条确实被消掉）——**verify 阶段仍要把 MTP 候选 token 整段跑一遍主模型完整
+  64 层（含 48 层 GDN），一旦候选被拒绝，主模型的 GDN 状态已被不可逆更新，这个问题跟 MTP
+  头本身有没有 GDN 无关**（独立佐证：`vllm-project/vllm#47572` ReplaySSM RFC，与本仓库 D-3
+  是同一问题）。**对 B3 的影响见下方，已改写两分支措辞**。证据：
+  `notes/2026-08-01-b6-mtp-gdn-verification.md`、`notes/2026-08-02-trackB-b0-facts.md` §B0-8、
+  `docs/investigation-queue.md` B-6
 
 **B1 正确性优先**（M2→M3，1 月）：eager、batch=1、无图、无投机、无前缀缓存
 - [ ] GDN 层（conv1d state + gated delta rule + 输出门）· Full attention（sparkinfer paged）· 稠密 SwiGLU（NVFP4）· RoPE partial 0.25 + mrope · modelopt 加载 · 注意力输出门控
@@ -290,11 +317,15 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 - [ ] 固定槽位 + 连续批处理 · 递归状态纳入槽位生命周期 · CUDA Graph（依赖 B0-5）· 前缀缓存联动驱逐（A3 的第一个真实用户）· 并发 ≥ 2
 - **门禁**：双协议回归全绿 + **C-LIVE 通过** + 与 B1 eager 贪心 bit-exact
 
-**B3 性能与投机**（M4，1 月）—— **[待验证] 两个分支，取决于 B0-8 的结论，不预判**：
-- 若 B0-8 结论 = MTP 含 GDN：MTP draft/verify 含 **GDN 递归状态推测回滚**（本轨道最难）
-- 若 B0-8 结论 = MTP 不含 GDN：MTP draft/verify 退化为标准 verify（无递归状态回滚），
-  **本轨道最难的一项直接消失**，B3 体量应下修
-- [ ] GDN kernel 调优 · 128K/256K 容量与吞吐（两个分支都要）
+**B3 性能与投机**（M4，1 月）—— **B0-8 已答（✅ MTP 不含 GDN），体量按下文收窄，不是两个分支待选**：
+- 草稿侧（MTP 头）**已确认简化**：MTP 不需要自己的 conv/ssm 递归状态，不需要 eagle-shift
+  类操作——这部分复杂度真实消失，比原队列设想的"两个分支"更小但仍是真实的简化。
+- 主模型侧**没有消失，且是本轨道最难的一项**：verify 阶段把 MTP 候选 token 整段跑一遍主模型
+  完整 64 层（含 48 层 GDN），候选被拒绝时主模型 GDN 递归状态已被不可逆更新——**这条应与
+  `investigation-queue.md` D-3（ReplaySSM，投机 scratch 显存 11.5GB→1.8GB）合并排期**，
+  ReplaySSM 把"状态回滚"问题转化成"缓存最近输入、O(1) ring-buffer 指针移动"，是候选机制而非
+  从零设计。
+- [ ] GDN kernel 调优 · 128K/256K 容量与吞吐 · 主模型侧 GDN 递归状态回滚（与 D-3 合并排期）
 - [ ] **KV dtype 待定**：`investigation-queue.md` C-2 正在测 NVFP4 KV vs FP8 KV 在我们卡上的 prefill/decode
   对比（另一 agent 进行中）。上游第三方在 RTX PRO 5000 上的数字（NVFP4 KV prefill 慢 1.7–1.8×，
   decode 更快）不是我们的卡也不是我们的形状，**只作为倾向 FP8 KV 的参考，不作为决定**——等 C-2 本机
