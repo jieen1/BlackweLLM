@@ -12,8 +12,13 @@ needs a GPU to import.
 
 This does not replace ``runtime/model_spec.py``. That one is the Qwen3.6-era
 runner spec (layer *names* discovered from a live model, plus MTP wiring) and
-is still what ``LagunaBackend`` constructs. The two merge at step 5, when call
-sites move.
+is still what ``LagunaBackend`` constructs. Step 5 landed
+(``runtime.model_registry`` -- which uses this module -- became
+``server/engine.py``'s and ``server/app.py``'s real backend-selection source
+of truth) without merging the two: that step only needed *which* backend to
+pick, not to change what ``LagunaBackend`` itself builds internally. The
+merge remains open for whichever step next needs ``LagunaBackend`` to
+consume ``ArchitectureSpec`` directly.
 
 Why the layout is the way it is
 -------------------------------

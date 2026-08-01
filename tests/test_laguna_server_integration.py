@@ -69,6 +69,41 @@ class TestServerEngineBackendSelection:
         engine = ServerEngine(capacity=1, num_slots=1, enable_cudagraph=False, production=True)
         assert engine.backend_name == "laguna"
 
+    def test_model_and_backend_class_attributes_are_gone(self):
+        # Track A migration step 5 (docs/architecture.md §3.5.5): MODEL and
+        # BACKEND used to be class attributes ServerEngine read a hardcoded
+        # value from. Both are now constructor-parameter defaults instead --
+        # runtime.model_registry.IMPLEMENTED_BACKENDS, not a class attribute,
+        # is what validates `backend` now (see the next test).
+        assert not hasattr(ServerEngine, "MODEL")
+        assert not hasattr(ServerEngine, "BACKEND")
+
+    def test_model_is_now_an_explicit_constructor_parameter(self):
+        # Before step 5, `model` was not a parameter at all -- passing it
+        # raised TypeError, since the value came only from the (now-deleted)
+        # MODEL class attribute.
+        engine = ServerEngine(
+            model="poolside/Laguna-S-2.1-NVFP4",
+            backend="laguna",
+            capacity=1,
+            num_slots=1,
+            enable_cudagraph=False,
+            production=True,
+        )
+        assert engine.MODEL == "poolside/Laguna-S-2.1-NVFP4"
+
+    def test_backend_is_validated_against_the_registry_not_a_hardcoded_string(self):
+        from runtime.model_registry import IMPLEMENTED_BACKENDS
+
+        # Today's implemented set happens to still be a singleton -- the
+        # point of this test is that ServerEngine consults this frozenset
+        # (registry's own notion of what exists) rather than comparing
+        # against one hardcoded string, so this passing is what's asserted,
+        # not the singleton-ness of the set.
+        assert IMPLEMENTED_BACKENDS == frozenset({"laguna"})
+        with pytest.raises(ValueError, match="implemented backends"):
+            ServerEngine(backend="qwen36", capacity=1, num_slots=1)
+
     def test_laguna_backend_overrides_model_and_k(self):
         engine = ServerEngine(
             backend="laguna", capacity=1, num_slots=1, enable_cudagraph=False, production=True

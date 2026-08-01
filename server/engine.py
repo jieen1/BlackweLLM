@@ -29,6 +29,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from runtime.model_registry import IMPLEMENTED_BACKENDS
 from runtime.sampling import SamplingParams
 from server.formats.stop import find_earliest_stop_match, trim_ambiguous_stop_tail
 from server.formats.stream import StreamProcessor
@@ -183,15 +184,24 @@ class ServerEngine:
     Threading: a dedicated engine thread owns the CUDA context and runs all
     GPU operations. The asyncio event loop communicates via lock-free deques
     and os.pipe() wakeups for maximum throughput and minimum latency.
-    """
 
-    MODEL = "poolside/Laguna-S-2.1-NVFP4"
-    K = 0
-    BACKEND = "laguna"
+    ``model``/``backend`` used to be the class attributes ``MODEL``/
+    ``BACKEND`` (a single hardcoded Laguna checkpoint and backend name).
+    Track A migration step 5 (docs/architecture.md §3.5.5) deleted them:
+    ``model`` is now a constructor default carrying the same value, and
+    ``backend`` is validated against :data:`runtime.model_registry.
+    IMPLEMENTED_BACKENDS` rather than a single string -- the registry's own
+    notion of "which backends actually exist" instead of a private copy of
+    it. ``server/app.py``'s ``lifespan()`` is registry's first real
+    production consumer: it resolves ``backend`` from the checkpoint's
+    ``config.json`` via ``model_registry.resolve_checkpoint`` rather than
+    hardcoding it, and passes the result in here.
+    """
 
     def __init__(
         self,
         *,
+        model: str = "poolside/Laguna-S-2.1-NVFP4",
         backend: str = "laguna",
         capacity: int = 1,
         num_slots: int = 2,
@@ -209,11 +219,14 @@ class ServerEngine:
         watchdog_max_stale_rounds: int = 200,
         request_timeout_s: float = 600.0,
     ) -> None:
-        if backend != self.BACKEND:
-            raise ValueError(f"backend={backend!r} is unsupported; expected {self.BACKEND!r}")
-        self.backend_name = self.BACKEND
+        if backend not in IMPLEMENTED_BACKENDS:
+            raise ValueError(
+                f"backend={backend!r} is unsupported; implemented backends are "
+                f"{sorted(IMPLEMENTED_BACKENDS)}"
+            )
+        self.backend_name = backend
         self.enable_dflash = enable_dflash
-        self.MODEL = self.__class__.MODEL
+        self.MODEL = model
         self.K = 0
 
         if enable_dflash:
@@ -262,16 +275,16 @@ class ServerEngine:
             # nothing told the operator their flag was a no-op. Reject here,
             # at construction time and before any GPU work, instead. Hardcodes
             # LagunaBackend rather than going through the backend registry
-            # because `backend != self.BACKEND` above already guarantees
-            # self.BACKEND == "laguna" is the only value reachable here --
-            # revisit once step 5 (registry becomes the source of truth for
-            # backend selection) lands.
+            # because IMPLEMENTED_BACKENDS == {"laguna"} today, so the
+            # validation above already guarantees self.backend_name ==
+            # "laguna" is the only value reachable here -- revisit once
+            # Track B adds a second implemented backend.
             from runtime.backends.laguna import LagunaBackend
 
             if not LagunaBackend.capabilities.fget(None).warm_continue:
                 raise ValueError(
                     "enable_session_affinity requires a backend with warm_continue "
-                    f"capability; backend={self.BACKEND!r} does not support it "
+                    f"capability; backend={self.backend_name!r} does not support it "
                     "(see docs/architecture.md §3.5.6, N8)"
                 )
 

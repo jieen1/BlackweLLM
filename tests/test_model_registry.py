@@ -32,9 +32,11 @@ def checkpoint_dir(repo: str):
 
 class TestLagunaResolvesToTodaysChoice:
     def test_resolution_matches_the_hardcoded_backend(self):
-        # server/engine.py:190 BACKEND = "laguna"; server/app.py:81
-        # SERVER_MODEL_BACKEND = "laguna". Both disappear at step 5, and this
-        # is the assertion that they can.
+        # server/engine.py's BACKEND = "laguna" class attribute and
+        # server/app.py's SERVER_MODEL_BACKEND = "laguna" module constant
+        # both disappeared at step 5 -- this was the assertion that they
+        # could, and now that they are gone, the assertion that
+        # runtime.model_registry (their replacement) still agrees.
         resolution = resolve_config(load_config(LAGUNA))
         assert resolution.backend == "laguna"
 

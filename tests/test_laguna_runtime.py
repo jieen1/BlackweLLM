@@ -129,15 +129,45 @@ import runtime.backends.laguna_dflash
     assert completed.returncode == 0, completed.stderr
 
 
-def test_server_app_defaults_to_the_only_supported_backend() -> None:
+def test_server_app_model_path_defaults_to_laguna() -> None:
+    # Track A migration step 5 (docs/architecture.md §3.5.5): SERVER_MODEL_
+    # BACKEND used to be a hardcoded module constant, importable and
+    # printable with no I/O. It is gone -- the backend is now resolved
+    # inside lifespan() from the checkpoint's own config.json (see
+    # test_server_app_resolves_the_default_model_to_the_laguna_backend
+    # below), which needs a real checkpoint directory, not a bare import.
+    # SERVER_MODEL_PATH is what is left that a plain import can still
+    # assert on: the checkpoint identity itself.
     pytest.importorskip("fastapi")
     completed = subprocess.run(
-        [sys.executable, "-c", "import server.app; print(server.app.SERVER_MODEL_BACKEND)"],
+        [sys.executable, "-c", "import server.app; print(server.app.SERVER_MODEL_PATH)"],
         check=False,
         cwd=Path(__file__).resolve().parents[1],
         capture_output=True,
         text=True,
-        env={key: value for key, value in os.environ.items() if key != "QSR_SERVER_MODEL_BACKEND"},
+        env={key: value for key, value in os.environ.items() if key != "QSR_SERVER_MODEL_PATH"},
     )
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "laguna"
+    assert completed.stdout.strip() == "poolside/Laguna-S-2.1-NVFP4"
+
+
+def test_server_app_resolves_the_default_model_to_the_laguna_backend() -> None:
+    # The other half of the claim the old test made: not just "the constant
+    # says laguna" but "resolving it actually produces laguna". Exercises
+    # the exact functions lifespan() calls (_resolve_laguna_model_dir then
+    # resolve_checkpoint), offline, reading only config.json -- no weights,
+    # no GPU. Skips rather than fails if this machine has no local HF cache
+    # entry for the checkpoint, same as tests/test_model_registry.py's
+    # checkpoint_dir() helper.
+    pytest.importorskip("fastapi")
+    from runtime.laguna_config import _resolve_laguna_model_dir
+
+    try:
+        model_dir = _resolve_laguna_model_dir("poolside/Laguna-S-2.1-NVFP4")
+    except Exception:
+        pytest.skip("poolside/Laguna-S-2.1-NVFP4 not present in the local HF cache")
+
+    from runtime.model_registry import resolve_checkpoint
+
+    resolution = resolve_checkpoint(model_dir)
+    assert resolution.backend == "laguna"

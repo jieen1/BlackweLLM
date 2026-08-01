@@ -1,10 +1,14 @@
 """Checkpoint path -> which backend, loader, and speculative strategy to use.
 
-Step 4 of the Track A migration (``docs/architecture.md`` §3.5.5), in shadow
-mode: it resolves, and the tests assert the resolution equals the choice the
-server hardcodes today. Nothing calls it yet. ``ServerEngine.MODEL`` and
-``BACKEND`` disappear at step 5, which is the first step that changes
-behavior.
+Step 4 of the Track A migration (``docs/architecture.md`` §3.5.5) landed this
+in shadow mode: it resolved, and the tests asserted the resolution equalled
+the choice the server hardcoded. Step 5 gave it its first real production
+consumer -- ``server/app.py``'s ``lifespan()`` now calls
+:func:`resolve_checkpoint` to decide ``backend`` instead of reading the
+hardcoded ``ServerEngine.MODEL`` / ``BACKEND`` class attributes and
+``server/app.py``'s ``SERVER_MODEL_BACKEND`` constant, all three of which are
+gone. ``server/engine.py`` validates its ``backend`` parameter against
+:data:`IMPLEMENTED_BACKENDS` below rather than a single hardcoded string.
 
 Torch-free, like :mod:`runtime.architecture`, because the whole point is to
 decide -- and to refuse -- before any weight is read.
