@@ -9,6 +9,7 @@
 | 了解项目现在是什么、要去哪 | [`roadmap.md`](roadmap.md) |
 | **知道下一个动作是什么、谁卡着谁** | [`implementation-plan.md`](implementation-plan.md) |
 | **有哪些待排查 / 待拍板的事项** | [`investigation-queue.md`](investigation-queue.md) |
+| **E2E 测试 / 兼容性 / 稳定性怎么分期、GPU 窗口怎么排** | [`e2e-and-quality-plan.md`](e2e-and-quality-plan.md) |
 | 了解系统怎么搭的、准备改核心代码 | [`architecture.md`](architecture.md) |
 | 接入一个新模型 / 想知道支持哪些模型 | [`model-support.md`](model-support.md) |
 | **排查任何问题、写任何诊断代码之前** | [`diagnostics-guide.md`](diagnostics-guide.md) |
@@ -26,6 +27,7 @@
 | [`roadmap.md`](roadmap.md) | 定位、现状盘点、轨道与里程碑、风险、待拍板事项 | 里程碑推进、优先级变化、拍板落地 |
 | [`implementation-plan.md`](implementation-plan.md) | roadmap 的执行视图：按优先级排序的实施清单、状态核实、阻塞依赖速查 | 条目完成、拍板落地、发现新阻塞 |
 | [`investigation-queue.md`](investigation-queue.md) | 待排查 / 待拍板队列：来自上游代码阅读与生态扫描的输入，不在原路线图里 | 新增外部输入、自查完成、条目并入 implementation-plan |
+| [`e2e-and-quality-plan.md`](e2e-and-quality-plan.md) | roadmap Track C/Track E 的执行细节展开：E2E 三层金字塔、兼容性/稳定性分期、"反复审查"节奏机制、GPU 窗口调度 | Track C/E 阶段完成、新增门禁、里程碑节奏调整 |
 | [`architecture.md`](architecture.md) | 当前架构、目标架构、五个关键抽象、迁移不变量 | 核心执行路径或分层变化 |
 | [`model-support.md`](model-support.md) | 支持矩阵、各模型架构事实、接入新模型的六步流程、跨模型陷阱 | 新模型接入、支持状态变化 |
 | [`diagnostics-guide.md`](diagnostics-guide.md) | bfdiag 使用指南、三条黄金法则、温冷引擎边界 | bfdiag 能力变化 |
