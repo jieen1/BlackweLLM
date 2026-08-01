@@ -55,6 +55,85 @@ from runtime.mtp_accept import determine_accept_reject_from_predictions
 logger = logging.getLogger("qwen_sm120_runtime.dflash")
 
 
+def _attempt_cg_capture(name: str, capture_fn: Callable[[], None], *, strict: bool) -> str:
+    """Run one CUDA Graph capture attempt; return ``"captured"`` or ``"failed"``.
+
+    Historically each capture site (``_capture_verify_cg``, ``_capture_draft_cg``)
+    caught its own exception, logged it at ``warning``, and left the
+    corresponding ``_*_cg`` attribute at ``None`` -- silently degrading to
+    that path's eager fallback for the rest of the process's life
+    (``_cg_captured`` is set unconditionally right after ``_init_cuda_graph()``
+    runs, so nothing ever retries). That combination is what let
+    notes/2026-08-01-c1-c2-gpu-investigation.md's C-1 bug lurk for as long as
+    it did: a startup capture failure was observable only by grepping logs
+    for one specific line, and the degraded path it silently fell back to
+    (DFlash's eager verify forward) turned out to be broken on ordinary real
+    shapes -- nobody could have known without independently reading the
+    source and reasoning through the fallback.
+
+    This is the single choke point every capture site now goes through, so
+    that choice is made once, consistently, and out loud:
+
+    - Always log at ``error`` (not the previous ``warning``) with a full
+      traceback (``exc_info=True``). This repo's loggers have no
+      ``basicConfig`` attached anywhere, so the *effective* level under
+      default configuration is the root logger's ``WARNING`` -- both
+      ``warning`` and ``error`` already clear that bar, but ``error``
+      correctly signals "this degrades a real capability" to anyone who does
+      have logging configured, rather than reading as a routine notice.
+    - If ``strict`` (``QSR_DFLASH_REQUIRE_CG`` -- defaults to ``"1"``, see
+      ``DFlashEngine.__init__``'s comment on ``self._require_cg`` for why):
+      re-raise. This refuses to finish constructing a ``DFlashEngine`` (and
+      therefore finish server startup) with a CUDA Graph that failed to
+      capture, rather than falling through to a fallback with a known
+      correctness gap.
+    - If not ``strict`` (explicit opt-out, ``QSR_DFLASH_REQUIRE_CG=0``):
+      swallow and return ``"failed"``. The caller must record that in
+      ``self.cg_status`` (read by ``bf daemon status`` / tests / anyone
+      auditing a running process) so "which paths are degraded right now" is
+      a single attribute read, never a log grep.
+
+    History of this default (read ``self._require_cg``'s comment for the
+    live version -- this is a summary, not the source of truth): originally
+    shipped as "loud failure, opt-in strict" on the theory that DFlash's
+    eager fallback, once capacity-correct (see
+    ``SparkinferPrefillWorkspace``'s mode-aware capacity fix,
+    laguna_sparkinfer_attn.py), was a real working degraded mode, not a
+    landmine -- so a transient capture failure taking down the whole server
+    by default seemed like the worse trade for uptime. That premise did not
+    survive its own bit-exact cross-check: capacity-correct turned out to
+    mean "does not crash", not "computes the same thing" -- the eager path
+    diverges from the CG-verify path's real output once kv_len grows past
+    short-context values (see notes/2026-08-02-eager-verify-cg-verify-
+    divergence.md). Strict is now the default because a refused startup is
+    a visible, retriable availability cost, while silently wrong tokens are
+    neither.
+    """
+    try:
+        capture_fn()
+        return "captured"
+    except Exception:
+        if strict:
+            action = "refusing to finish starting (QSR_DFLASH_REQUIRE_CG=1, the default)"
+        else:
+            action = (
+                f"degrading to {name}'s eager fallback (QSR_DFLASH_REQUIRE_CG=0, "
+                "explicitly opted out of the default)"
+            )
+        logger.error(
+            "DFlash: %s CUDA Graph capture failed -- %s. The eager fallback has "
+            "a known, not-yet-root-caused correctness gap against the CG path at "
+            "kv_len>=400 (see notes/2026-08-02-eager-verify-cg-verify-divergence.md) "
+            "-- that gap is exactly why refusing to start is this repo's default.",
+            name,
+            action,
+            exc_info=True,
+        )
+        if strict:
+            raise
+        return "failed"
+
+
 def _ring_prefix_reuse_is_safe(
     cached_kv_len: int,
     prefix_len: int,
@@ -161,6 +240,19 @@ class DFlashEngine:
         # Pre-allocated buffers
         self._init_buffers()
 
+        # Let the main model's shared SparkinferPrefillWorkspace instances
+        # (built at LagunaBackend construction time, before this DFlashEngine
+        # existed) know the true max query length any mode="verify" call
+        # against them will ever use (this DFlash engine's fixed M=16 verify
+        # window). Must happen before ANY mode="verify" traffic can reach
+        # them -- including via the eager fallback used when
+        # QSR_DFLASH_CUDA_GRAPH=0/QSR_VERIFY_CUDA_GRAPH=0, which skips CUDA
+        # Graph capture below entirely and goes straight to eager verify
+        # calls. See LagunaBackend.declare_verify_capacity and
+        # SparkinferPrefillWorkspace's docstring (laguna_sparkinfer_attn.py)
+        # for the bug this closes (notes/2026-08-01-c1-c2-gpu-investigation.md).
+        self.backend.declare_verify_capacity(NUM_QUERY_PER_REQ)
+
         # CUDA Graph for main model decode (M=1) -- captured lazily on first
         # use by _ensure_decode_cg(), see there for why.
         self._cuda_graph = None
@@ -168,6 +260,61 @@ class DFlashEngine:
         self._verify_cg = None
         self._draft_cg = None
         self._cg_captured = False
+        # Per-graph capture outcome ("captured"/"failed"), keyed "verify"/
+        # "draft"/"decode" -- see _attempt_cg_capture's docstring for why
+        # this exists (the previous silent-swallow was exactly what let the
+        # capacity bug above lurk unnoticed). Read via cuda_graphs_healthy()
+        # or directly (e.g. `bf daemon status` surfaces it through
+        # LagunaEngineProvider.describe()).
+        self.cg_status: dict[str, str] = {}
+        # QSR_DFLASH_REQUIRE_CG: refuse to finish constructing this engine if
+        # any CUDA Graph capture fails, instead of degrading to that path's
+        # eager fallback. Defaults to "1" (refuse to start) -- NOT because
+        # refusing to start is conservative-by-default, but because of a
+        # specific, confirmed fact:
+        #
+        #   the eager verify fallback (_forward_verify_with_aux), the ONLY
+        #   thing DFlash falls back to when verify CG capture fails, is
+        #   *capacity-correct* (see the C-1 capacity fix in
+        #   laguna_sparkinfer_attn.py) but NOT numerically equivalent to the
+        #   CG-verify path once kv_len grows past ordinary short-context
+        #   values. Direct GPU cross-check (identical inputs, two isolated
+        #   slots, one per path) found bit-exact agreement at kv_len=64 but
+        #   real argmax flips (wrong committed tokens, not float noise) from
+        #   kv_len=400 onward, peaking at a 26.7 raw-logit difference at
+        #   kv_len=500. Full evidence and the ruled-out hypotheses (SWA
+        #   window=512 alignment, test-script cross-slot contamination) are
+        #   in notes/2026-08-02-eager-verify-cg-verify-divergence.md; root
+        #   cause is NOT YET FOUND (needs a separate bf-divergence
+        #   investigation).
+        #
+        #   In other words: fixing the capacity crash turned a LOUD failure
+        #   (ValueError, visible, retriable) into a SILENT one (wrong tokens
+        #   served to a real user, indistinguishable from correct output
+        #   without an independent check). For an inference runtime,
+        #   correctness IS the product -- a refused startup costs
+        #   availability, which is visible, alertable, and retriable; wrong
+        #   output costs correctness invisibly and poisons everything
+        #   downstream of it (conversation history, any tool-call the model
+        #   made from the bad token, cached prefixes). That asymmetry is why
+        #   this defaults to the stricter choice.
+        #
+        # Once the divergence above is root-caused and fixed, this default
+        # should be revisited -- it is deliberately NOT permanent conservatism,
+        # it is "we know of a live correctness gap in the fallback and are
+        # choosing not to serve through it by default until that gap closes."
+        # Do not flip this back to "0" without either fixing that gap or
+        # replacing this whole paragraph with a new, equally specific reason.
+        self._require_cg = os.environ.get("QSR_DFLASH_REQUIRE_CG", "1") == "1"
+        # Debug-only fault injector, comma-separated subset of
+        # {"verify","draft","decode"}: makes the corresponding
+        # _do_capture() raise instead of attempting real capture, so the
+        # QSR_DFLASH_REQUIRE_CG / cg_status / eager-fallback-capacity-fix
+        # interaction can be exercised end to end without needing a real
+        # sparkinfer/CUDA failure to occur. Never set outside diagnosis.
+        self._debug_force_cg_fail = {
+            name for name in os.environ.get("QSR_DFLASH_DEBUG_FORCE_CG_FAIL", "").split(",") if name
+        }
         self._use_cuda_graph = os.environ.get("QSR_DFLASH_CUDA_GRAPH", "1") != "0"
         self._cuda_graph_capture_deferred = bool(defer_cuda_graph_capture)
         if self._use_cuda_graph and not self._cuda_graph_capture_deferred:
@@ -443,29 +590,39 @@ class DFlashEngine:
         """Capture main-model verify graph (M=16 extend planner with runtime worklist update)."""
         from runtime.backends.laguna_cuda_graph import LagunaCudaGraphVerify
 
-        try:
+        def _do_capture() -> None:
+            if "verify" in self._debug_force_cg_fail:
+                raise RuntimeError(
+                    "QSR_DFLASH_DEBUG_FORCE_CG_FAIL=verify forced failure for testing"
+                )
             cg = LagunaCudaGraphVerify(self.backend, num_tokens=NUM_QUERY_PER_REQ)
             cg.capture()
             self._verify_cg = cg
             logger.info("DFlash: verify CG captured (M=%d)", NUM_QUERY_PER_REQ)
-        except Exception as e:
-            logger.warning("DFlash: verify CG capture failed: %s", e)
-            import traceback
 
-            traceback.print_exc()
+        status = _attempt_cg_capture("verify", _do_capture, strict=self._require_cg)
+        self.cg_status["verify"] = status
+        if status == "failed":
             self._verify_cg = None
 
     def _capture_draft_cg(self) -> None:
         """Capture the M=16 draft graph before any request owns slot state."""
-        try:
+
+        def _do_capture() -> None:
+            if "draft" in self._debug_force_cg_fail:
+                raise RuntimeError(
+                    "QSR_DFLASH_DEBUG_FORCE_CG_FAIL=draft forced failure for testing"
+                )
             from runtime.backends.laguna_dflash_cudagraph import DFlashDraftCudaGraph
 
             cg = DFlashDraftCudaGraph(self)
             cg.capture()
             self._draft_cg = cg
             logger.info("DFlash: draft CUDA Graph captured")
-        except Exception as e:
-            logger.warning("DFlash: draft CG failed: %s", e)
+
+        status = _attempt_cg_capture("draft", _do_capture, strict=self._require_cg)
+        self.cg_status["draft"] = status
+        if status == "failed":
             self._draft_cg = None
 
     def _ensure_decode_cg(self) -> None:
@@ -476,19 +633,42 @@ class DFlashEngine:
         reserved slots (never slot 0), so it's safe to capture at any point,
         including before the first prefill -- lazy here purely to skip the
         cost entirely for callers (generate_verify_only) that never need it.
+
+        Because this runs lazily (not from __init__), QSR_DFLASH_REQUIRE_CG=1
+        surfaces a capture failure here on first use rather than at startup
+        -- still loud (raises out of this call, which every caller already
+        propagates), just later than verify/draft's __init__-time capture.
         """
         if not self._use_cuda_graph or self._cuda_graph is not None:
             return
         from runtime.backends.laguna_cuda_graph import LagunaCudaGraphDecode
 
-        try:
+        def _do_capture() -> None:
+            if "decode" in self._debug_force_cg_fail:
+                raise RuntimeError(
+                    "QSR_DFLASH_DEBUG_FORCE_CG_FAIL=decode forced failure for testing"
+                )
             cg = LagunaCudaGraphDecode(self.backend, batch_size=1)
             cg.capture()
             self._cuda_graph = cg
             logger.info("DFlash: CUDA Graph captured for main decode (M=1, lazy)")
-        except Exception as e:
-            logger.warning("DFlash: main decode CUDA Graph failed: %s", e)
+
+        status = _attempt_cg_capture("decode", _do_capture, strict=self._require_cg)
+        self.cg_status["decode"] = status
+        if status == "failed":
             self._cuda_graph = None
+
+    def cuda_graphs_healthy(self) -> bool:
+        """True iff every CUDA Graph capture attempted so far succeeded.
+
+        Only reflects graphs actually attempted (``self.cg_status``'s keys) --
+        e.g. before the first M=1 decode call, "decode" is simply absent, not
+        counted as failed. Returns True (vacuously) if none has been
+        attempted yet or CUDA Graphs are disabled entirely
+        (QSR_DFLASH_CUDA_GRAPH=0), matching "nothing is currently known to be
+        degraded".
+        """
+        return all(status == "captured" for status in self.cg_status.values())
 
     def _forward_main_with_aux(
         self,

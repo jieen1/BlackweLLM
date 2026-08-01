@@ -81,20 +81,52 @@
 
 ## C. 自查 —— 需要 GPU（留给开发执行）
 
-> **状态（2026-08-01）**：C-1/C-2/C-3 三条**由另一个并行 agent 在查**——`roadmap.md`/
-> `implementation-plan.md` 已把下游结论（B3 的 GDN 分支、KV dtype 选型、RK6/H1 的 sm_120 wheel）
-> 写成显式 [待验证]，**不预判**任何一条的结论。C-1 与 `roadmap.md` §6 RK9（冷启动/首次真实形状
-> 路径的系统性覆盖不足）是同一类问题，C7 审计（`implementation-plan.md` §7.3）已把 DFlash
-> 的一个具体已知缺口（verify 路径预热覆盖）纳入这条调查范围。
+> **状态（2026-08-02）**：C-1/C-2/C-3 三条已全部查完并结案。C-1 的结论比原假设更重
+> ——沿着它挖出一个独立的、**未根因**的数值分歧（eager verify vs CG verify，kv_len≥400 起
+> argmax 翻转），见下方条目与 [`../notes/2026-08-02-eager-verify-cg-verify-divergence.md`]
+> (../notes/2026-08-02-eager-verify-cg-verify-divergence.md)。C-1 同时印证了 `roadmap.md` §6
+> RK9（冷启动/首次真实形状路径的系统性覆盖不足）是真实存在的一类盲区，而不只是从 JIT
+> 那个 bug 泛化出来的猜测。
 
-- [ ] **C-1 · warmup / autotune / CUDA Graph 捕获是否用真实形状**
-  依据 flashinfer #3255：失败**不在** autotuner 第一个小的合成形状上，而在后面一个匹配真实模型维度的形状上。
-  本项目已有同型伤疤（fp8 舍入平局：合成随机数据复现不出真实数据的 bug）。
-  查：CUDA Graph 捕获与 DFlash warmup 用的是生产形状还是占位形状。
+- [x] **C-1 · warmup / autotune / CUDA Graph 捕获是否用真实形状** —— ✅ **成立，已修，但修复过程中挖到一个更严重的活 bug，未根因**
+  详见 [`../notes/2026-08-01-c1-c2-gpu-investigation.md`](../notes/2026-08-01-c1-c2-gpu-investigation.md#c-1)
+  和 [`../notes/2026-08-02-eager-verify-cg-verify-divergence.md`](../notes/2026-08-02-eager-verify-cg-verify-divergence.md)。
+  CUDA Graph 捕获（`laguna_cuda_graph.py`/`laguna_dflash_cudagraph.py`）和
+  `warmup_paged_attention_shapes()` 对它们覆盖的 contract 确实用生产真实容量，不是占位小形状——
+  flashinfer #3255 字面那种模式在这两处不成立。但沿着 `warmup_paged_attention_shapes()`
+  自己承认的缺口（`mode="verify"` 未被预热）往下查，**GPU 实测坐实**：DFlash 主模型的
+  eager verify 回退（`_forward_verify_with_aux`）直接调用生产函数会 `ValueError` 崩掉——
+  `SparkinferPrefillWorkspace.forward()` 不分 mode 永远用为 `extend` 设计的
+  `eager_extend_work_items_capacity` 估算容量，套到 `verify` 契约上低估了。**已修**：改为按
+  mode 分派，`verify` 用一次真实 eager planner（`create_paged_plan(enable_cuda_graph=False,
+  mode="verify")`）在该组声明的最大容量上跑出真实数字（第一次尝试用 sparkinfer 的
+  `plan_verify_graph_capacity` 也是错的——那是为 CUDA Graph 重放设计的不同调度策略，实测同样
+  低估，已改用真实 eager planner 本身）。真正不足的维度是 `max_partial_rows`（硬编码 0），
+  不是 `max_work_items`。
 
-- [ ] **C-2 · NVFP4 KV vs FP8 KV 在我们卡上的 prefill 对比**
-  依据 flashinfer #4269：第三方在 RTX PRO 5000 Blackwell 上实测 **NVFP4 KV 的 paged causal prefill 比 FP8 KV 慢 1.7–1.8 倍**,而 decode 更快（带宽瓶颈）。
-  不是我们的卡也不是我们的形状。用 `bf diff` 判可比性后再比数。**支持 B3 选 FP8 KV，并警告别把 NVFP4 扩到 KV。**
+  **但修完之后做"贪心位精确交叉验证"时挖到更严重的问题**：容量修好后 eager verify 能跑了，
+  但跟 CG-verify 路径数值不一致——kv_len=64 bit-exact，kv_len≥400 起 argmax 真的选错 token
+  （峰值 raw logit 差 26.7），分界点不是 SWA window=512，双 slot 隔离排除了测试脚本副作用。
+  **修容量的 bug 把一个响亮失败（`ValueError`）变成了沉默失败（悄悄送错 token）**。
+  触发面确认（读代码）：今天 eager verify 只有一条触发路径——verify CG 启动期捕获失败——
+  是潜伏风险，不是正在发生的活跃故障（本次所有冷启动 verify CG 都捕获成功）。**响应**：
+  `QSR_DFLASH_REQUIRE_CG` 默认值从 `0`（降级但响亮）改成 `1`（拒绝启动），直到这个数值分歧
+  被根因排查并修掉。根因排查需要 `bf divergence` 逐层定位，**独立立项，不在本次任务范围**。
+  run record: `bf show 940b708aa0f8`。
+
+- [x] **C-2 · NVFP4 KV vs FP8 KV 在我们卡上的 prefill 对比** —— ✅ **查完：这个对比在当前技术栈上跑不起来，理由比预想更硬**
+  详见 [`../notes/2026-08-01-c1-c2-gpu-investigation.md`](../notes/2026-08-01-c1-c2-gpu-investigation.md#c-2)。
+  SparkInfer 的 paged-attention 内核（唯一的 attention 内核，零 FlashInfer 依赖）只接受
+  fp16/bf16/fp8_e4m3 三种 KV dtype（`sparkinfer/attention/paged/traits.py:120-121` 显式
+  `TypeError`），本 runtime 自己也三处硬编码 `kv_cache_dtype="fp8"`。所以 flashinfer #4269
+  （第三方在 RTX PRO 5000 上测的 NVFP4 KV prefill 慢 1.7–1.8x）在我们的栈上**连对照组都不
+  存在**——`bf diff` 判可比性这步在"跑第二个配置"就跑不下去，不是被忽略。退而测了唯一真实
+  存在的 FP8 KV 在生产真实形状（`block_size=64`、`blocks_per_slot=4096`，走
+  `backend.prefill_with_aux`）上的 prefill 基线：64 tok 284ms、512 tok 146ms、2048 tok
+  331ms、8192 tok 1106ms、32768 tok 5048ms、16384 tok(全新长度)2313ms——未观察到
+  30-100s 级别的重编译尖峰。**结论支持原计划：选 FP8 KV，不扩 NVFP4 到 KV**，且门槛从
+  "跑得起来但慢" 升级为 "内核库现在直接不支持，要支持得先让 SparkInfer 团队新增内核路径"。
+  run record: `bf show 940b708aa0f8`（同一次 `bf exec`）。
 
 - [x] **C-3 · PyTorch 2.13.0 PyPI wheel 是否带 `sm_120`** —— ✅ **带，自编译要求终结**
   详见 [`../notes/2026-08-01-c3-torch-pypi-wheel-sm120.md`](../notes/2026-08-01-c3-torch-pypi-wheel-sm120.md)。

@@ -350,3 +350,113 @@ class TestPrefixChunkSnapshot:
         LagunaBackend._capture_prefix_chunk_snapshot(backend, 0, 8)
 
         assert LagunaBackend.prepare_exact_prefix_replay(backend, 0, [2] * 16, 7) is None
+
+
+class TestCgCaptureFailureHandling:
+    """Regression tests for the C-1 second bug: a CUDA Graph capture
+    failure must never be silently swallowed into an unobservable, and
+    (before the SparkinferPrefillWorkspace capacity fix) actively broken,
+    eager fallback. See notes/2026-08-01-c1-c2-gpu-investigation.md and
+    _attempt_cg_capture's docstring in runtime/backends/laguna_dflash.py.
+
+    _attempt_cg_capture is a plain function (no torch/CUDA/model needed),
+    so these run in every lane, including the no-torch `.[dev]` venv --
+    laguna_dflash.py itself imports torch at module scope, so the import is
+    still guarded by importorskip("torch") to skip cleanly there rather
+    than erroring at collection.
+    """
+
+    def test_returns_captured_and_does_not_log_on_success(self, caplog):
+        pytest.importorskip("torch")
+        from runtime.backends.laguna_dflash import _attempt_cg_capture
+
+        calls: list[str] = []
+        status = _attempt_cg_capture("verify", lambda: calls.append("ran"), strict=False)
+
+        assert status == "captured"
+        assert calls == ["ran"]
+        assert not any(record.levelname == "ERROR" for record in caplog.records)
+
+    def test_swallows_and_returns_failed_when_not_strict(self, caplog):
+        pytest.importorskip("torch")
+        import logging
+
+        from runtime.backends.laguna_dflash import _attempt_cg_capture
+
+        def _boom():
+            raise ValueError("fixed-capacity paged workspace exceeded")
+
+        with caplog.at_level(logging.ERROR, logger="qwen_sm120_runtime.dflash"):
+            status = _attempt_cg_capture("verify", _boom, strict=False)
+
+        assert status == "failed"
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(error_records) == 1
+        assert "verify" in error_records[0].message
+        # exc_info=True must carry the real traceback, not just the message
+        # -- that is the whole point of upgrading past the old bare
+        # `logger.warning("...: %s", e)`.
+        assert error_records[0].exc_info is not None
+
+    def test_reraises_when_strict(self):
+        pytest.importorskip("torch")
+        from runtime.backends.laguna_dflash import _attempt_cg_capture
+
+        def _boom():
+            raise ValueError("fixed-capacity paged workspace exceeded")
+
+        with pytest.raises(ValueError, match="fixed-capacity paged workspace exceeded"):
+            _attempt_cg_capture("verify", _boom, strict=True)
+
+    def test_strict_capture_failure_is_not_silently_recorded_as_failed(self):
+        """Strict mode's contract is "never returns failed" -- it either
+        returns captured or the caller's exception propagates. A caller that
+        forgot this and still recorded cg_status on the (unreachable) return
+        path would be dead code, not a bug, but assert the actual contract
+        rather than assume it."""
+        pytest.importorskip("torch")
+        from runtime.backends.laguna_dflash import _attempt_cg_capture
+
+        def _boom():
+            raise RuntimeError("boom")
+
+        try:
+            _attempt_cg_capture("draft", _boom, strict=True)
+        except RuntimeError:
+            pass
+        else:
+            pytest.fail("expected the RuntimeError to propagate in strict mode")
+
+
+class TestCudaGraphsHealthy:
+    """DFlashEngine.cuda_graphs_healthy() is a pure function of cg_status --
+    test it against a bare stand-in object (no real engine/GPU/model
+    needed), matching this file's existing "fake object, real method" style.
+    """
+
+    def test_healthy_when_all_attempted_graphs_captured(self):
+        pytest.importorskip("torch")
+        from runtime.backends.laguna_dflash import DFlashEngine
+
+        class Fake:
+            cg_status = {"verify": "captured", "draft": "captured"}
+
+        assert DFlashEngine.cuda_graphs_healthy(Fake()) is True
+
+    def test_unhealthy_when_any_attempted_graph_failed(self):
+        pytest.importorskip("torch")
+        from runtime.backends.laguna_dflash import DFlashEngine
+
+        class Fake:
+            cg_status = {"verify": "captured", "draft": "failed"}
+
+        assert DFlashEngine.cuda_graphs_healthy(Fake()) is False
+
+    def test_vacuously_healthy_before_anything_is_attempted(self):
+        pytest.importorskip("torch")
+        from runtime.backends.laguna_dflash import DFlashEngine
+
+        class Fake:
+            cg_status: dict[str, str] = {}
+
+        assert DFlashEngine.cuda_graphs_healthy(Fake()) is True
