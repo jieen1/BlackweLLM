@@ -105,9 +105,20 @@ def _attempt_cg_capture(name: str, capture_fn: Callable[[], None], *, strict: bo
     mean "does not crash", not "computes the same thing" -- the eager path
     diverges from the CG-verify path's real output once kv_len grows past
     short-context values (see notes/2026-08-02-eager-verify-cg-verify-
-    divergence.md). Strict is now the default because a refused startup is
-    a visible, retriable availability cost, while silently wrong tokens are
-    neither.
+    divergence.md).
+
+    A dense fp32 attention oracle later established that BOTH paths are
+    correct at the attention op itself (cosine >= 0.999997 against the
+    oracle, above this repo's >= 0.999991 bar for a correct kernel variant).
+    The two differ only in split-KV chunk count, and MoE's discrete top-10
+    of 256 routing amplifies that small numerical difference into different
+    token choices downstream. So the accurate statement is *different*
+    output, not *wrong* output.
+
+    Strict remains the default anyway, for the sharper reason: this runtime
+    promises bit-exact greedy decoding, and a mid-life fallback to eager
+    would silently break that promise -- same class of failure, reached by
+    reproducibility rather than by arithmetic.
     """
     try:
         capture_fn()
@@ -289,13 +300,21 @@ class DFlashEngine:
         #   investigation).
         #
         #   In other words: fixing the capacity crash turned a LOUD failure
-        #   (ValueError, visible, retriable) into a SILENT one (wrong tokens
-        #   served to a real user, indistinguishable from correct output
-        #   without an independent check). For an inference runtime,
-        #   correctness IS the product -- a refused startup costs
-        #   availability, which is visible, alertable, and retriable; wrong
-        #   output costs correctness invisibly and poisons everything
-        #   downstream of it (conversation history, any tool-call the model
+        #   (ValueError, visible, retriable) into a SILENT one (output that
+        #   differs from what the captured graph would have produced,
+        #   indistinguishable from it without an independent check).
+        #
+        #   Severity was later refined, not withdrawn: a dense fp32 oracle
+        #   showed both paths correct at the attention op (both >= 0.999997
+        #   cosine), so this is a *divergence*, not arithmetic error -- MoE
+        #   routing amplifies the small split-KV chunking difference into
+        #   different token choices. Strict still stands, because a runtime
+        #   that promises bit-exact greedy decoding breaks that promise just
+        #   as silently by drifting as by computing wrongly. A refused
+        #   startup costs availability, which is visible, alertable, and
+        #   retriable; a silent mid-life path switch costs reproducibility
+        #   and poisons everything downstream of it (conversation history,
+        #   any tool-call the model
         #   made from the bad token, cached prefixes). That asymmetry is why
         #   this defaults to the stricter choice.
         #
