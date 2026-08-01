@@ -68,7 +68,7 @@ workload, including fox-64K (96.9% both) — strong evidence the *computation* i
 unaffected. The fox-64K throughput gap is the one number that does not clear the
 "within 3% of baseline" bar.
 
-### fox-64K throughput: investigated, not root-caused, evidence points away from step 5
+### fox-64K throughput: investigated, C-1 capacity fix ruled out by direct A/B, still not root-caused
 
 Within a single run's raw fixture data (`benchmarks/fixtures/
 acceptance_regression_20260802.json`, `fox-64K` entry): `steps` is identical (17)
@@ -79,19 +79,57 @@ is doing the same work slower, and it stabilizes after the first call rather tha
 drifting further, which reads more like a one-time state change (memory layout,
 allocator behavior, or a clock/thermal step) than continuous degradation.
 
+**Coordinator's specific hypothesis, checked directly**: the timeline lines up
+(the 353–368 baseline was measured 2026-07-31/08-01, *before* `e9ee7de`'s C-1
+verify-capacity fix, `dfa22f9`+`7903997`), fox-64K is exactly the long-context
+workload the verify path is most sensitive on, and a bigger declared capacity
+could plausibly change kernel selection, split-KV policy, or workspace memory
+pressure. Tested directly rather than argued about:
+
+- In a throwaway worktree (same commit otherwise), edited
+  `SparkinferPrefillWorkspace._work_item_capacity`'s `mode == "verify"` branch
+  to route through the same `eager_extend_work_items_capacity` call
+  extend/decode use — the exact pre-`dfa22f9`/`7903997` behavior ("always sized
+  via the extend estimator regardless of mode", per `dfa22f9`'s own commit
+  message) — while leaving `declare_verify_capacity`, `_attempt_cg_capture`,
+  `cg_status`, and `QSR_DFLASH_REQUIRE_CG`'s default untouched, per instruction
+  not to conflate the throughput question with the (unrelated) CG-requirement
+  default. A mechanical `git revert --no-commit` of both commits was tried
+  first and conflicts with `85f7fb9` (the later `REQUIRE_CG` default flip,
+  which touches the same function's neighborhood) — the manual edit was the
+  clean way to isolate exactly one variable.
+- Started a daemon from that worktree with the identical config (all three
+  baseline env vars, same num-slots/blocks-per-slot/block-size/gpu-mem-util).
+  It reached `READY` with `cg_status: {"verify": "captured"}` — the smaller,
+  reverted capacity was still sufficient for verify-CG capture to succeed at
+  this shape, so the A/B is a real apples-to-apples comparison, not "one side
+  crashed."
+- Ran the identical `benchmarks/acceptance_regression.py` suite:
+  **fox-64K = 298.1 tok/s (accept 96.9%, `steps=17` all four calls) — not back
+  to 353–368.** The per-round timing signature reproduced exactly: warmup
+  13.684s, three measured rounds 21.938s/21.951s/22.092s. Same shape, same
+  magnitude, same stabilization-after-first-call pattern, with the capacity
+  fix's code path not even reachable.
+
+**Conclusion (the coordinator's second enumerated outcome): the C-1 capacity
+fix is ruled out as the cause.** Reverting it reproduces the same throughput
+and the same timing signature, which is only possible if whatever is actually
+responsible sits elsewhere. Filed as an open, unattributed performance item —
+still not root-caused, but one specific, plausible suspect has now been
+eliminated by direct measurement rather than by argument.
+
 Not chased further because: (a) `nvidia-smi` showed no other compute process, low
 utilization/power/temperature at the time, so no obvious external contention; (b)
-the bfdiag Laguna provider bypasses `ServerEngine` entirely (§ above), so this
-number cannot be attributed to step 5's diff regardless of its cause; (c) three
-separate daemon restarts already spent on this session's GPU window, and further
-isolation (e.g. running fox-64K alone, first, on a completely fresh daemon) is
-the natural next step for whoever picks this up, not urgent for step 5's own
-sign-off given (b).
+the bfdiag Laguna provider bypasses `ServerEngine` entirely regardless (§ above),
+so this number was never attributable to step 5 either way; (c) the natural next
+step for whoever picks this up is isolating the warmup-vs-measured timing jump
+itself (e.g. profile the first vs. second fox-64K call directly, or check
+whether *any* first-call-after-load is fast regardless of workload) rather than
+another capacity-shaped hypothesis.
 
 **Recommendation**: file as its own investigation item (perf, not correctness) —
-does not block Track A step 5, since step 5 cannot be its cause. Bit-exact (§1)
-and acceptance rate (this section) are the gates that actually test step 5's
-diff and both hold.
+does not block Track A step 5 or step 6. Bit-exact (§1) and acceptance rate
+(§2 table) are the gates that actually test step 5's diff, and both hold.
 
 ## 4. `bf diff` before comparing
 
