@@ -39,6 +39,90 @@
 
 ---
 
+## `bf` 与 worktree —— 陷阱和现在的保证
+
+这台机器长期同时存在十几个这个仓库的 git worktree(`git worktree list`
+能看到),经常有好几个 agent 同时在不同 worktree 里改代码。**`bf` 是唯一
+被要求"在任何 worktree 里都测的是那个 worktree 自己的代码"的工具** —— 这正
+是它作为诊断平台可信度的底线,所以下面这段必须先读。
+
+### 陷阱本身
+
+venv 的 `bf` console script 装在 `~/.venvs/vllm/bin/bf`。Python 解析
+`import bfdiag`(`runtime`、`server`、`benchmarks` 同理)时,`sys.path[0]`
+是**脚本自己所在目录**(venv 的 `bin/`),那里没有项目代码,解析于是落到
+venv 里 `pip install -e '.[dev]'` 装的 pip-editable finder —— 而那个 finder
+把**当时执行 `pip install -e .` 那个目录**硬编码成了包源位置,和你现在
+`cd` 进哪个 worktree、从哪里敲 `bf` 完全无关。
+
+**净效果(修复前)**:`cd <某个 worktree> && bf daemon start` 会静默加载
+**另一个 checkout** 的 `bfdiag`/`runtime`/`server`/`benchmarks`——不只是
+`bf` 自己的代码,连 `bfdiag/daemon/cli.py::_repo_root()`、
+`bfdiag/daemon/server.py::bfdiag_dir()` 这些"从 `__file__` 反推仓库根"的
+函数也全部指向错误的仓库,于是 daemon 子进程、run record、`.bfdiag` 状态
+全都来自错误的 checkout。**不报错,不警告。** 2026-08-01 之前从 worktree
+跑的任何 `bf` 测量都可能测的是别的 checkout。
+
+### 现在的保证
+
+`bf`(`bfdiag/cli.py::main()`)在做任何事之前,先比较"`bfdiag` 实际从哪
+个仓库加载"和"当前目录属于哪个仓库"(从 cwd 向上找同时有
+`bfdiag/__init__.py` 和声明 `name = "blackwellm"` 的 `pyproject.toml` 的
+最近祖先目录)。两者一致就什么都不做,零开销。不一致时:
+
+1. 打印一行 stderr 提示("bf: bfdiag resolved to X but the current
+   directory is inside Y -- relaunching..."),然后
+2. 通过 `python -m bfdiag.cli` 重新执行整个进程(带上正确的
+   `PYTHONPATH`)—— `-m` 让 `sys.path[0]` 变成当前目录而不是脚本所在目录,
+   stdlib 的 `PathFinder` 因此在 pip-editable finder(挂在
+   `sys.meta_path` 末尾)之前拿到 `bfdiag`。
+3. 如果一次重新执行之后不一致依旧存在(不应该发生),**拒绝继续并抛出
+   异常**,而不是静默用错误的 checkout 跑下去。
+
+**"加载了错误 checkout" 现在对 `bf` 来说是不可能的,不是"变成响亮的
+错误"——常见情形下它会自动纠正并继续跑,只在自动纠正本身失败时才报错。**
+用两个真实 worktree + 一个独立 venv 验证过(见
+`notes/2026-08-01-sparkinfer-patch-recovery-and-repro.md` §7.1 的后续更
+新和 `tests/test_bfdiag_cli.py`)。
+
+`scripts/bf-t0.sh`(手动 `PYTHONPATH=<worktree> bf ...` 的绕法)和
+`scripts/bf_sparkinfer_bootstrap/`(`sitecustomize.py` 抢跑 shim,见下一
+节)在这个修复落地后已经删除 —— 它们的唯一价值是绕开一个现在已经在源头
+修掉的 bug,继续留着只会让人误以为还需要额外步骤。直接用 `bf`。
+
+**这个保证只覆盖 `bf` 本身。** 普通 `python scripts/foo.py` 仍然会撞同一
+个陷阱(`sys.path[0]` 是 `scripts/`,不是仓库根)——需要显式
+`PYTHONPATH=.` 或者改用 `bf exec scripts/foo.py`(daemon 进程本身已经在
+正确的 checkout 里)。`scripts/verify_sparkinfer_load.py` 的文档字符串里
+有具体例子。
+
+### `BF_SPARKINFER_PATH` —— 曾经是个坏掉的逃生口,现在真的生效
+
+这个变量用来切到另一个 SparkInfer checkout(比如对照用的纯上游
+`sparkinfer-ctrl`)。它曾经只被 `laguna_sparkinfer_attn.py` 和
+`laguna_sparkinfer_moe.py` 读,各自在自己的 `import sparkinfer...` 前插
+一次 `sys.path`。但 `runtime/backends/laguna.py` 的 `_patch_moe_sparkinfer`
+有自己的直接导入 `from sparkinfer.moe.fused_moe._impl import
+allocate_tp_moe_workspace_pool`,而那是整个 `LagunaBackend.__init__` 里对
+`sparkinfer` 名字的**第一次触碰**——导入结果进了 `sys.modules`,后面两个
+文件里的 `sys.path` 插入就再也追不回去了(Python 的包导入语义:子模块通
+过已缓存的父包 `__path__` 解析,不会重新搜一遍 `sys.path`)。净效果:这
+个变量在真实 Laguna 启动路径上**根本不生效**,而且不报错。
+
+现在所有三处(`laguna.py`、`laguna_sparkinfer_attn.py`、
+`laguna_sparkinfer_moe.py`)在各自第一次涉及 `sparkinfer` 之前,都先调用
+`runtime/backends/_sparkinfer_import.py::ensure_sparkinfer_path()`——集中
+到一个受控函数,谁先执行都行,`sys.modules` 已经缓存了 `sparkinfer` 但来
+源和请求的路径不一致时**直接抛 `RuntimeError`**,不再假装切换成功了。
+用 `sparkinfer-ctrl`(纯上游 `3bd3a2e`,无 Laguna 门控补丁)和默认的
+`sparkinfer`(fork `0844a4f`,有门控补丁)在真实 GPU 上跑过
+`scripts/verify_sparkinfer_load.py`:两者加载的 `git HEAD` 与请求的路径
+一致,且门控行为如预期不同(默认 checkout 的 FULL attention 门控
+OPEN,`sparkinfer-ctrl` 全部 closed)——不只是路径字符串对,行为也真的
+不同。
+
+---
+
 ## 症状 → 工具
 
 ### 接受率下降
@@ -257,6 +341,7 @@ oracle 侧激活值按 `(model_revision, prompt_hash)` 缓存到
 | `QSR_BFD_SOCKET` | `.bfdiag/bfd.sock` | daemon socket |
 | `QSR_BFD_CANARY` | `1` | daemon 金丝雀自检 |
 | `QSR_BFD_TIMEOUT_S` | `30` | exec 默认超时 |
+| `BF_SPARKINFER_PATH` | `/home/bot/project/sparkinfer` | 切换 SparkInfer checkout(加载时生效,换了要重启 daemon)。见上面"`bf` 与 worktree"一节 |
 
 ---
 
