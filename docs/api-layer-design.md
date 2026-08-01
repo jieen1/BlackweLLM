@@ -394,6 +394,10 @@ thinking 所必需的、低风险的结构调整"的授权范围——之所以�
 
 ## 5. 任务 3：已知缺口核查结论
 
+> **2026-08-01 更新（`fix/t0b-api`）**：本节 §5.1/§5.2/§5.4 三个缺口在这一批
+> 全部处理完毕，结论见 §7。本节原文保留不改——它是审计当时的证据记录，
+> §7 记录的是后续基于这份证据做出的决定和落地细节。
+
 ### 5.1 结构化输出（`runtime/structured_output.py`）—— **只有骨架，不生效**
 
 `server/engine.py:693`（`_activate_slot`）确实会在 `response_format` 存在
@@ -514,3 +518,132 @@ seed，逐 token 的 logits 分布不同 ⇒ 结果仍然是确定且可复现�
   这是模型抽象层的工作，不是协议层的工作，协议层这边的接口
   （`StreamProcessor(thinking_capable=...)`）已经是"按 backend 能力"设计的，
   不需要再改。
+
+## 7. N1/N2/N3 落地（`fix/t0b-api`，2026-08-01）
+
+在 §5 审计基础上，这一批把 N1/N2/N3 三个缺口都处理完毕。文件归属边界
+（另有两个 agent 并行改 `runtime/backends/**`/CUDA Graph 相关代码）不变，
+所以三条都在不碰那些文件的前提下完成——其中 N1 的结论是"确认接不通，
+选择响亮失败"，N2/N3 是"确认能在 `server/**` + `runtime/sampling.py` 范围
+内接通，已接通"。
+
+### 7.1 N1（结构化输出）—— 选择"响亮失败"，不是"接上"
+
+深入到具体调用点后，结论比 §5.1 当时更细：`GrammarState.apply_mask()`/
+`apply_mask_batch()` 本身逻辑没问题（bitmask 解包、掩码应用都是对的），
+真正的障碍是**这条解码循环里根本没有可用的掩码注入点**，覆盖到会实际生效
+的路径：
+
+- `runtime/backends/laguna.py::prefill_chunked_begin`/`_forward` 计算的
+  admission 阶段 anchor token（每个请求的第一个 token，不分是否请求了
+  `response_format`）是裸的无约束 `argmax`，连 `SamplingParams` 都没有传进去。
+- `decode_batch_sampled` 里 CUDA Graph 重放路径把贪心 argmax 直接烤进了
+  已捕获的 graph，没有逐 token 的 logits 张量可掩码。
+- 同一函数里 eager 路径自己的 `if params.is_greedy: argmax(...)` 分支
+  直接绕过了 `sample_from_logits`——这是本模块唯一可能钩进去的缝。
+- 本运行时未显式指定 `temperature` 时默认值是 `0.0`（贪心），也就是说
+  "给我保证的 JSON"这种最常见请求形态，恰好总是走上面三条不可达路径，
+  包括第一个 token。
+
+即使只接通那条唯一可达的缝（`sample_from_logits`，只有 `temperature>0`
+时的第 2 个及以后 token 才会经过），默认/常见场景仍然完全不受约束——
+这和"完全没接"在实践中几乎没有区别，却会让人误以为已经接上了，是同一类
+静默失败换了个位置，不是修复。
+
+**决定**：`server/app.py::_reject_unsupported_response_format` 在
+`/v1/chat/completions`（流式 + 非流式）和 `/v1/completions` 三个位置，
+请求体里 `response_format.type` 是 `json_object`/`json_schema` 时直接
+400（`invalid_request_error`），在真正开始生成前拒绝。Anthropic
+`/v1/messages` 协议本身没有 `response_format` 字段，不需要改。
+
+配套清理：`server/engine.py` 里原来那套"创建 `GrammarState`、每 token
+`accept()`、`classify_decode_slots` 的 `grammar_slots`"全部移除——response_format
+被拒绝在 API 层之后，那套代码永远不会被触发,继续留着只是另一种形式的
+"看起来接上了"。`classify_decode_slots` 函数签名保留 `grammar_slots`
+参数（`tests/test_laguna_server_integration.py` 仍覆盖，调用处永远传
+`[]`），给以后真正接通留一个已测试的钩子。`runtime/structured_output.py`
+不删——`GrammarState`/`ResponseFormat`/bitmask 解包都是对的，模块顶部
+docstring 记录了现在为什么没接、接通需要什么条件。
+
+**可推翻的条件**：有人在 `runtime/backends/laguna.py` 里加一个从
+admission 阶段就能拿到的掩码钩子，并解决 CUDA Graph 重放下"贪心已经烤进
+graph"的架构冲突（关掉该批次的 CG 重放，或者把逐 token 变化的 bitmask
+做成 graph 的一个输入）。在此之前不要重新"顺手接上"§5.1 提到的窄路径。
+
+### 7.2 N2（`stop` / `stop_sequences`）—— 已接通
+
+思路：stop 是**文本**层面的语义，但解码是**token**层面的——沿用
+`server/formats/stream.py::_trim_ambiguous_tail` 已有的"扣住可能还会变成
+标记的尾部字节"思路，泛化到 N 个候选串（新模块
+`server/formats/stop.py::find_earliest_stop_match`/
+`trim_ambiguous_stop_tail`），再在 `server/engine.py` 里给每个配置了
+`stop` 的 slot 维护一个私有的 `StreamProcessor`（`_stop_check_token`/
+`_flush_stop_pending`/`_drop_stop_pending_from_committed`），逐 token 判断：
+
+- 完整匹配 → 截断 `committed_tokens`（连同 `logprobs_acc`），以 `"stop"`
+  结束，Anthropic 侧记录命中的具体串。
+- 是某个候选串的严格前缀（歧义，可能被后续 token 补全）→ 扣住，不进
+  stream channel，也不算进最终结果。
+- 排除歧义后确认安全 → 一次性 flush 给 stream channel（顺序不变，从未
+  出现"先发后撤"）。
+
+**与 reasoning 状态机的交互**：只对 content 生效，不对 reasoning 生效——
+私有 tracker 复用 `StreamProcessor.thinking_done`；只要还在 reasoning 阶段
+（`thinking_done=False`），token 立即 flush（不因为 stop 逻辑给 reasoning
+显示增加延迟），完全不进入 stop 匹配。理由：OpenAI 真实 API 的
+`reasoning_content`/思维链内容不受 `stop` 截断，这是主流实现的行为；本次
+选择跟随这个约定而不是自创语义。
+
+**覆盖的解码路径**：贪心 MTP 验证/提交批量路径（`mtp_verify_and_commit_batch`，
+一轮可提交多个 token，逐 token 检查、命中即截断丢弃该轮剩余草稿）、
+自回归采样路径（`decode_batch_sampled`，逐 token）、admission 阶段的
+anchor token（每个请求的第一个 token，同样跑一遍检查，且必须无条件喂给
+tracker——否则后续匹配会静默漏掉这个 token 的贡献）。**未覆盖**：
+CUDA Graph 贪心重放路径——但这不是短板，是路由规则的必然结果：
+`decode_batch_sampled` 的 CG 重放要求整批 `all(p.is_greedy)`且无
+logprobs，配了 `stop_sequences` 的 slot 走的是同一份逐 token 检查代码，
+不依赖 CG 是否命中；CG 命中与否只影响"贪心怎么拿到 token"，不影响"拿到
+token 之后怎么判断 stop"。
+
+**未精确处理、已知且可接受的近似**：一个 pending 批次里，如果匹配点之前
+还夹着"安全"文本（同一批被扣住的 token 里，前面部分其实不歧义），本次
+选择整批一起扣住/一起 flush，不去拆某个 token 内部的字符边界——因为
+stream channel 是按 token id 传的，拆到字符级需要把文字重新编码回
+token，不可靠。这只影响**延迟**（安全文本多等一轮才 flush），从不导致
+泄漏（stop 序列本身或其后内容永不发出）。同理，命中匹配截断
+`committed_tokens`/`logprobs_acc` 时，如果 pending 缓冲区里第一个 token
+恰好是 anchor（没有对应的 logprobs 条目），可能多裁一条 `logprobs_acc`——
+方向上安全（从不残留错位数据，最多少算一两条）。
+
+### 7.3 N3（`seed`）—— 已接通，不改 `runtime/backends/laguna.py`
+
+根因和 §5.4 一致：`runtime/backends/laguna.py` 三个采样调用点
+（`prefill_sampled`/`decode_sampled`/`decode_batch_sampled`）每次都是
+`gen = make_generator(params.seed); sample_from_logits(..., generator=gen)`，
+`seed` 是裸 `int` 时 `make_generator` 每次都新建一个 generator 并
+`manual_seed(seed)`——同一个 seed 每一步都被"重置"回同一个初始状态,而不是
+沿着一条流前进。
+
+修法不改调用点（调用点在 `runtime/backends/laguna.py`，不在本次范围内），
+改**调用点传进去的值本身**：新增 `runtime/sampling.py::PersistentSeed`，
+包一层薄壳在 `.seed` 字段上——它是一个持有"惰性创建的 `torch.Generator`"
+的普通对象，`make_generator()` 识别到 `PersistentSeed` 时直接返回它内部
+缓存的 generator（第一次调用才真正创建+播种），不重新播种。因为
+`GenerationRequest.sampling_params`（因此 `.seed`）在一个请求的全部解码轮
+之间是**同一个对象**，`runtime/backends/laguna.py` 里那三处调用点在同一个
+请求的不同轮次里，拿到的是同一个 `PersistentSeed` 实例，从而拿到同一个、
+持续前进的 generator——完全不需要改调用点的代码，因为调用点做的事
+(`make_generator(params.seed)`) 没变，变的是 `params.seed` 这个值自己的
+身份和行为。
+
+`server/app.py::_build_sampling_params` 是唯一的构造点：每个 HTTP 请求
+`seed is not None` 时新建一个 `PersistentSeed(seed)` 实例（按对象身份而非
+数值区分，两个恰好都传 `seed=42` 的并发请求各自拿到独立实例、独立
+generator，不会互相污染随机流）。
+
+**贪心位精确不受影响**：`SamplingParams.is_greedy`（`temperature<=0`）
+分支在 `sample_from_logits`/`decode_batch_sampled` 里都是直接
+`logits.argmax(...)`，完全不触碰 `make_generator`/`seed`——`PersistentSeed`
+对贪心路径是彻底惰性的，从未被实例化的 generator 也就没有任何东西可以
+影响。`tests/test_sampling.py::TestPersistentSeed::
+test_greedy_path_never_touches_seed` 直接断言这一点。
