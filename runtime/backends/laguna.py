@@ -33,6 +33,7 @@ from runtime.backends.bf_attention import bf_attn_context
 from runtime.backends.protocol import (
     BackendCapabilities,
     BackendSnapshot,
+    PrefixHit,
     PrefixSnapshot,
     SlotSnapshot,
 )
@@ -2176,20 +2177,30 @@ class LagunaBackend:
         self.slot_committed_tokens[slot] = []
         self._prefix_chunk_snapshots[slot] = None
 
-    def reconcile_prefix_hit(self, token_ids: list[int]) -> int:
+    def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
         """Content-aware prefix match against warm KV in available slots.
 
         Finds the longest token-prefix match between ``token_ids`` and any
-        slot's saved token history. Returns block-aligned hit depth (tokens).
-        The result is stored per-slot in ``_pending_prefix_hits`` for
-        ``prefill_chunked_begin`` to consume.
+        slot's saved token history. Returns a :class:`PrefixHit` carrying the
+        block-aligned hit depth (tokens). The result is stored per-slot in
+        ``_pending_prefix_hits`` for ``prefill_chunked_begin`` to consume
+        (that side-table is keyed by :attr:`PrefixHit.effective`, same as
+        before this method returned a bare ``int``).
 
         Correctness: same-slot reuse guarantees the full-attention KV at
         positions [0, hit) is identical (causal determinism — same model,
         same tokens, same positions). SWA ring is rebuilt during prefill.
+
+        Laguna has no recurrent (GDN) layers (``ArchitectureSpec.
+        needs_two_cache_families`` is ``False`` for every Laguna checkpoint,
+        ``tests/test_architecture_spec.py::test_laguna_has_no_recurrent_
+        layers``), so there is no second resource to disagree with the
+        first: ``state_hit`` always equals ``kv_hit`` (INV-A3-6). This keeps
+        every existing caller's arithmetic (``if L > 0``, ``+= L``) correct
+        unchanged when it reads :attr:`PrefixHit.effective`.
         """
         if not token_ids:
-            return 0
+            return PrefixHit(kv_hit=0, state_hit=0)
         prompt_len = len(token_ids)
         best_hit = 0
         best_slot = -1
@@ -2217,7 +2228,7 @@ class LagunaBackend:
                 best_slot = s
         if best_hit > 0 and best_slot >= 0:
             self._pending_prefix_hits[best_slot] = best_hit
-        return best_hit
+        return PrefixHit(kv_hit=best_hit, state_hit=best_hit)
 
     def find_best_slot_for_prompt(
         self,

@@ -141,17 +141,22 @@ class TestLagunaBackendE1Surface:
             LagunaBackend(None, block_size=16)
 
     def test_reconcile_prefix_hit_cold_miss(self):
-        """No warm cache → always returns 0 (cold miss)."""
+        """No warm cache → always returns a PrefixHit whose .effective is 0
+        (cold miss). A3 (docs/a3-cache-coordinator-design.md §8 decision 2):
+        reconcile_prefix_hit's return type changed in place from a bare
+        ``int`` to :class:`PrefixHit`; ``.effective`` is the value the old
+        ``int`` used to be."""
         backend = self._bare_backend()
         backend._prefix_cache_tokens = [None, None]
         backend._prefix_cache_kv_len = [0, 0]
         backend._pending_prefix_hits = {}
         backend.block_size = 64
-        assert backend.reconcile_prefix_hit([1, 2, 3]) == 0
-        assert backend.reconcile_prefix_hit([]) == 0
+        assert backend.reconcile_prefix_hit([1, 2, 3]).effective == 0
+        assert backend.reconcile_prefix_hit([]).effective == 0
 
     def test_reconcile_prefix_hit_warm_match(self):
-        """Warm cache with matching prefix → returns block-aligned hit depth."""
+        """Warm cache with matching prefix → .effective is the block-aligned
+        hit depth, unchanged from the pre-A3 bare-int value."""
         backend = self._bare_backend()
         backend._prefix_cache_tokens = [[10, 20, 30, 40, 50] * 20, None]  # 100 tokens
         backend._prefix_cache_kv_len = [100, 0]
@@ -160,8 +165,28 @@ class TestLagunaBackendE1Surface:
         # Prompt shares first 100 tokens → hit = 64 (block-aligned)
         prompt = [10, 20, 30, 40, 50] * 20 + [99, 98, 97]
         hit = backend.reconcile_prefix_hit(prompt)
-        assert hit == 64  # block-aligned down from 100
+        assert hit.effective == 64  # block-aligned down from 100
         assert backend._pending_prefix_hits.get(0) == 64
+
+    def test_reconcile_prefix_hit_state_equals_kv_hit_invariant_a3_6(self):
+        """INV-A3-6 (docs/a3-cache-coordinator-design.md §2): a backend with
+        no recurrent layers has no second resource to disagree with the
+        first, so state_hit must equal kv_hit on every call, cold or warm.
+        Laguna's checkpoint has ``ArchitectureSpec.needs_two_cache_families
+        is False`` (tests/test_architecture_spec.py::
+        test_laguna_has_no_recurrent_layers), which is exactly the
+        precondition this invariant is conditioned on."""
+        backend = self._bare_backend()
+        backend._prefix_cache_tokens = [[10, 20, 30, 40, 50] * 20, None]
+        backend._prefix_cache_kv_len = [100, 0]
+        backend._pending_prefix_hits = {}
+        backend.block_size = 64
+
+        cold = backend.reconcile_prefix_hit([1, 2, 3])
+        assert cold.state_hit == cold.kv_hit == 0
+
+        warm = backend.reconcile_prefix_hit([10, 20, 30, 40, 50] * 20 + [99, 98, 97])
+        assert warm.state_hit == warm.kv_hit == 64
 
     def test_slot_state_is_immutable_scheduler_snapshot(self):
         backend = self._bare_backend()

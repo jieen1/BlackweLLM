@@ -38,6 +38,7 @@ import pytest
 
 pytest.importorskip("torch")
 
+from runtime.backends.protocol import PrefixHit
 from server.engine import GenerationRequest, ServerEngine
 
 
@@ -95,8 +96,11 @@ class _FakeWarmRunner:
         return self.warm_continue_result
 
     # -- cold admission path (fallback lands here) --
-    def reconcile_prefix_hit(self, token_ids: list[int]) -> int:
-        return 0
+    def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
+        # PrefixHit(0, 0): a fake standing in for a real backend must return
+        # the same shape a real ModelBackend does (runtime/backends/
+        # protocol.py) -- engine.py now reads .effective off this value.
+        return PrefixHit(kv_hit=0, state_hit=0)
 
     def prefill_chunked_begin(self, slots, prompts_per_slot, chunk_size: int = 512):
         result = {s: {"anchor": self.cold_anchor, "draft_tokens": []} for s in slots}

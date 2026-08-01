@@ -1103,7 +1103,11 @@ class ServerEngine:
                 for slot, _ in admit_now:
                     if not self.runner.slot_state(slot).is_fresh:
                         self.runner.reset_slot(slot)
-                hit_depths = [self.runner.reconcile_prefix_hit(p) for p in new_prompts]
+                # reconcile_prefix_hit returns a PrefixHit (runtime/backends/
+                # protocol.py); .effective is the length safe to skip prefill
+                # for (== state_hit, never kv_hit -- see PrefixHit's own
+                # docstring and docs/a3-cache-coordinator-design.md §3).
+                hit_depths = [self.runner.reconcile_prefix_hit(p).effective for p in new_prompts]
                 prefill_state = self.runner.prefill_chunked_begin(
                     new_slots, new_prompts, chunk_size=self._prefill_chunk_size
                 )
