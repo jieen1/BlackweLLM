@@ -2443,7 +2443,16 @@ class LagunaBackend:
         Cheap by construction: O(num_slots) over small lists, bounded token
         heads, no tensor reads. It has to stay safe to call while the engine
         thread is mid-round, because a scraper does not coordinate with it.
+
+        ``dflash_cg_status``: ``()`` when DFlash was never enabled
+        (``self._dflash is None``) -- never an attribute error, never a
+        differently-shaped guess for ``/metrics`` to trip on. See
+        ``BackendSnapshot.dflash_cg_status``'s docstring and
+        notes/2026-08-01-c1-c2-gpu-investigation.md for why this exists:
+        a CUDA Graph capture failure used to be observable only by grepping
+        startup logs for one exact line, invisible to Prometheus entirely.
         """
+        dflash = self._dflash
         return BackendSnapshot(
             slots=tuple(
                 SlotSnapshot(slot=i, kv_len=kv_len, is_fresh=kv_len == 0)
@@ -2457,6 +2466,9 @@ class LagunaBackend:
                     head=tuple(tokens[:5]) if tokens else (),
                 )
                 for i, tokens in enumerate(self._prefix_cache_tokens)
+            ),
+            dflash_cg_status=(
+                tuple(sorted(dflash.cg_status.items())) if dflash is not None else ()
             ),
         )
 

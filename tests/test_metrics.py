@@ -233,7 +233,7 @@ class _FakeSnapshotRunner:
     the tests below go red.
     """
 
-    def __init__(self, kv_lens, prefix=()):
+    def __init__(self, kv_lens, prefix=(), dflash_cg_status=()):
         from runtime.backends.protocol import BackendSnapshot, PrefixSnapshot, SlotSnapshot
 
         self._snapshot = BackendSnapshot(
@@ -244,6 +244,7 @@ class _FakeSnapshotRunner:
                 PrefixSnapshot(slot=i, cached_kv_len=kv, cached_tokens=len(t), head=tuple(t[:5]))
                 for i, (kv, t) in enumerate(prefix)
             ),
+            dflash_cg_status=dflash_cg_status,
         )
 
     def snapshot(self):
@@ -317,6 +318,39 @@ class TestMetricsEndpointItself:
         body = self._call(monkeypatch, engine)
         # Falls back to the slot-count approximation rather than failing.
         assert "blackwellm:kv_cache_used_blocks" in body
+        # Third failure mode this metric must not add (see
+        # notes/2026-08-01-c1-c2-gpu-investigation.md): a backend outside the
+        # snapshot contract at all must still get a well-formed, empty
+        # dflash_cg_captured block, not a crash and not a missing HELP/TYPE
+        # header.
+        assert "# TYPE blackwellm:dflash_cg_captured gauge" in body
+        assert "dflash_cg_captured{" not in body
+
+    def test_scrape_reports_no_dflash_cg_series_when_dflash_disabled(self, monkeypatch):
+        # The common case: DFlash never enabled, or enabled but no capture
+        # attempted yet (self._dflash is None / cg_status == {} in
+        # LagunaBackend.snapshot()). Must still be a valid, non-raising
+        # Prometheus block with zero series -- not absent, not an exception.
+        engine = _FakeEngine(_FakeSnapshotRunner([0, 0, 0, 0]))
+        body = self._call(monkeypatch, engine)
+        assert "# HELP blackwellm:dflash_cg_captured" in body
+        assert "# TYPE blackwellm:dflash_cg_captured gauge" in body
+        assert "dflash_cg_captured{" not in body
+
+    def test_scrape_reports_dflash_cg_status_per_graph(self, monkeypatch):
+        # This is the actual point of C-1's second fix: a CUDA Graph capture
+        # failure must be visible to Prometheus, not just to someone grepping
+        # startup logs. "captured" -> 1, "failed" -> 0, one series per graph
+        # DFlash actually attempted.
+        engine = _FakeEngine(
+            _FakeSnapshotRunner(
+                [0, 0],
+                dflash_cg_status=(("draft", "captured"), ("verify", "failed")),
+            )
+        )
+        body = self._call(monkeypatch, engine)
+        assert 'blackwellm:dflash_cg_captured{model_name="test/model",graph="draft"} 1' in body
+        assert 'blackwellm:dflash_cg_captured{model_name="test/model",graph="verify"} 0' in body
 
     def test_endpoint_does_not_reach_past_the_contract(self, monkeypatch):
         # The nail this whole step is driven around. This backend carries a

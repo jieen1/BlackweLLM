@@ -1274,6 +1274,34 @@ async def metrics_endpoint():
         f'blackwellm:kv_cache_used_blocks{{model_name="{engine.MODEL}"}} {used_blocks}',
     ]
 
+    # DFlash CUDA Graph capture health, one gauge per graph DFlash has
+    # actually attempted to capture ("verify"/"draft"/"decode"). Before this,
+    # a capture failure was observable only by grepping startup logs for one
+    # exact line -- Prometheus never saw it, so "degrade but loud" was loud
+    # only to someone already looking. See
+    # notes/2026-08-01-c1-c2-gpu-investigation.md and
+    # BackendSnapshot.dflash_cg_status's docstring.
+    #
+    # Always emits the HELP/TYPE header even with zero series below (DFlash
+    # disabled, snapshot unavailable, or no capture attempted yet) -- that is
+    # valid Prometheus exposition format and keeps this metric's presence
+    # stable across scrapes instead of appearing/disappearing. Never raises:
+    # `snapshot` is already None-safe from `_backend_snapshot` above, and
+    # `dflash_cg_status` is `()` (not missing, not an attribute error) in
+    # every case that isn't "at least one real capture attempt happened".
+    lines.append(
+        "# HELP blackwellm:dflash_cg_captured Whether a DFlash CUDA Graph is "
+        "captured (1) or degraded to its eager fallback (0)."
+    )
+    lines.append("# TYPE blackwellm:dflash_cg_captured gauge")
+    cg_status = snapshot.dflash_cg_status if snapshot is not None else ()
+    for graph_name, status in cg_status:
+        captured = 1 if status == "captured" else 0
+        lines.append(
+            f'blackwellm:dflash_cg_captured{{model_name="{engine.MODEL}",graph="{graph_name}"}} '
+            f"{captured}"
+        )
+
     # Accuracy/correctness signal: the admission bootstrap check re-runs each
     # speculative prefill on an independent reference slot and compares the
     # first committed token. A non-zero failure count means the MTP path
