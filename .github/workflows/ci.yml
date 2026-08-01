@@ -43,22 +43,28 @@ jobs:
         with:
           python-version: "3.12"
 
-      # `serving` pulls in transformers/fastapi, and transitively numpy/
-      # safetensors/huggingface_hub -- several test modules import torch
-      # AND one of those (e.g. runtime/backends/laguna.py needs numpy,
-      # runtime/laguna_config.py needs huggingface_hub+transformers) at
-      # module scope, guarded only by pytest.importorskip("torch") on the
-      # assumption that torch's presence implies the rest, which is true
-      # in the real GPU dev venv but not for a bare torch-only install.
-      # triton is likewise a hard module-level import of several kernel
-      # wrappers (fused_kv_scatter, cg_decode_metadata) once torch is
-      # present. Installing all of them here (still CPU-only, no GPU
-      # needed to import any of them) is what actually lets those tests
-      # run instead of erroring at collection.
+      # Several test modules are guarded only by pytest.importorskip("torch")
+      # and then import, at module scope, something that merely travels with
+      # torch in a real GPU venv -- numpy, huggingface_hub, transformers,
+      # safetensors. Once torch is installed the guard passes and those
+      # imports run for real, so a torch-only install errors at collection
+      # instead of skipping.
+      #
+      # Those four live in the `cpu-test` extra rather than being listed here.
+      # This job used to rely on `serving` carrying transformers transitively;
+      # T0-6 moved transformers to `cuda` and that assumption broke silently,
+      # leaving the job red. Declaring the requirement in pyproject.toml puts
+      # it next to the version contract it belongs to, where the same edit
+      # cannot break it again without being visible.
+      #
+      # torch comes from PyTorch's CPU index (not the pinned CUDA build), and
+      # triton is installed separately because its wheel is Linux-only. None
+      # of this needs a GPU to import; sparkinfer and cutlass are deliberately
+      # absent, so GPU-only tests still self-skip via their own guards.
       - name: Install dev dependencies + CPU torch
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e '.[dev,serving]'
+          python -m pip install -e '.[dev,serving,cpu-test]'
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install triton
 

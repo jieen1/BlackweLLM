@@ -52,6 +52,30 @@ cuda = [
 ]
 dev = ["pytest>=8,<9", "ruff>=0.8,<1"]
 serving = ["requests>=2.31,<3", "fastapi>=0.110,<1", "uvicorn>=0.29,<1", "httpx>=0.27,<1"]
+# --- cpu-test: what the suite needs at module scope, minus the GPU stack ------
+# Several test modules are guarded only by `pytest.importorskip("torch")` and
+# then import something that merely *travels with* torch in a real GPU venv --
+# numpy (runtime/backends/laguna.py), huggingface_hub and transformers
+# (runtime/laguna_config.py), safetensors (the loader). Once torch is present
+# the guard passes and those imports run for real, so a torch-only install
+# fails at collection rather than skipping.
+#
+# CI's cpu-torch job used to get these transitively through `serving`, which
+# then carried transformers. T0-6 moved transformers to `cuda` and that
+# assumption silently stopped holding -- the job has been red ever since. This
+# extra exists so the requirement is declared here rather than re-derived in a
+# workflow comment: the same file that owns the version contract owns this too.
+#
+# Deliberately excludes torch (CI installs the CPU wheel from PyTorch's own
+# index), triton (Linux-only wheel; CI installs it separately), and
+# nvidia-cutlass-dsl (part of the SM120 kernel stack, which CI does not have).
+# Ranges mirror `cuda` above -- if one changes, change both.
+cpu-test = [
+  "numpy>=2,<3",
+  "safetensors>=0.7,<1",
+  "transformers>=5,<6",
+  "huggingface_hub>=1,<2",
+]
 # --- SparkInfer: deliberately absent from every extra above ------------------
 # SparkInfer (/home/bot/project/sparkinfer) is not published to PyPI. It
 # cannot be listed as `sparkinfer>=X` here — pip would try to resolve that

@@ -1,0 +1,299 @@
+"""Execution-layer contract between the scheduler and a model backend.
+
+This module is **deliberately torch-free** so the CPU-only test job can import
+it: it holds only typing declarations and frozen value types. Importing a
+concrete backend (which does need torch) is the caller's problem.
+
+Scope, and why it is this small
+-------------------------------
+``LagunaBackend`` defines 50 methods, 24 of them public. ``ServerEngine``
+reaches the execution layer through exactly one attribute -- ``self.runner``
+-- and touches only **13** members of it. Those 13 are the contract; the rest
+is incidental surface that a second backend must not be forced to reproduce.
+See ``docs/architecture.md`` §3.5.1 for the derivation and call counts.
+
+Optional capability families
+----------------------------
+Not every backend can do everything. A backend advertises what it supports
+through :attr:`ModelBackend.capabilities`, and the scheduler must consult
+that **before** calling into a family -- never ``try/except AttributeError``.
+
+That rule is not theoretical. ``server/engine.py`` currently calls
+``mtp_prefill_warm_continue`` inside a bare ``except Exception``; no shipping
+backend defines it (it survives only under ``oracle/qwen36_vllm/``), so every
+``--session-affinity`` warm continue raises, is swallowed, and silently falls
+back to a cold prefill. Outputs stay correct and the counter stays at zero,
+which is why it went unnoticed. ``warm_continue`` below is that bug expressed
+as a fact the scheduler can read. See ``docs/architecture.md`` §3.5.6 (N8).
+
+Naming debt
+-----------
+Three member names still carry model-specific vocabulary inherited from the
+current implementation: ``enable_dflash``, ``mtp_verify_and_commit_batch``,
+``mtp_prefill_warm_continue``. They are declared here under today's names on
+purpose -- this module ships as a shadow contract that must hold with **zero**
+edits to call sites. The rename to neutral names (``enable_speculative_decode``,
+``verify_and_commit_batch``, ``prefill_warm_continue``) lands with step 5 of
+the migration, where call sites change anyway. See §3.5.5.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, keeps this module torch-free
+    from runtime.block_pool import ChunkedPrefillState
+    from runtime.sampling import SamplingParams
+
+
+@dataclass(frozen=True)
+class BackendCapabilities:
+    """What a backend can do, as data rather than as duck typing.
+
+    Chosen over a ``supports("spec_decode")`` string lookup: a mistyped string
+    fails silently and cannot be checked statically, while these fields can be
+    type-checked, completed by an editor, and -- because this is a plain frozen
+    dataclass -- serialized straight into a bfdiag run record or ``/metrics``.
+    That turns "what was actually enabled for this run" into a recorded fact
+    instead of something to reconstruct from logs.
+
+    These describe what the backend *can* do, not what is currently switched
+    on. ``speculative_decode=True`` means ``enable_dflash`` may be called; ask
+    :attr:`ModelBackend.has_speculative_decode` whether it is active right now.
+    """
+
+    speculative_decode: bool
+    prefix_cache: bool
+    cuda_graph: bool
+    chunked_prefill: bool
+    warm_continue: bool
+
+
+@dataclass(frozen=True)
+class SlotSnapshot:
+    slot: int
+    kv_len: int
+    is_fresh: bool
+
+
+@dataclass(frozen=True)
+class PrefixSnapshot:
+    slot: int
+    cached_kv_len: int
+    cached_tokens: int
+    #: First few cached token ids, for eyeballing which prefix a slot holds.
+    #: Bounded on purpose -- a snapshot is a diagnostic, not a transcript.
+    head: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class BackendSnapshot:
+    """Values, not references -- the shape observability is allowed to depend on.
+
+    ``server/app.py`` currently reads ``runner._prefix_cache_kv_len`` and
+    ``runner._prefix_cache_tokens`` (both private) and assumes ``slot_kv_len``
+    is list-shaped. Both ``/metrics`` 500s on 2026-08-01 came out of that seam:
+    one from an aggregate dict whose key count diverged, one from reading a
+    list as a mapping. Handing out frozen values means a differently-shaped
+    backend can no longer take the monitoring signal down with it.
+
+    ``slots`` and ``prefix`` are indexed by slot and cover every slot, so a
+    caller may zip them or index them directly without a bounds check.
+    See ``docs/architecture.md`` §3.5.2.
+    """
+
+    slots: tuple[SlotSnapshot, ...]
+    prefix: tuple[PrefixSnapshot, ...]
+
+
+@runtime_checkable
+class SlotStateView(Protocol):
+    """Read-only server view of one slot.
+
+    ``LagunaSlotState`` already satisfies this structurally, and its own
+    docstring already describes itself this way ("must not mutate Laguna's
+    cache bookkeeping directly"), so this promotes an existing idea rather
+    than introducing one.
+    """
+
+    kv_len: int
+    committed_tokens: tuple[int, ...]
+
+    @property
+    def is_fresh(self) -> bool: ...
+
+
+class ModelBackend(Protocol):
+    """The 13 members ``ServerEngine`` actually depends on, plus capabilities.
+
+    Deliberately *not* ``@runtime_checkable``: ``isinstance`` against a
+    Protocol only checks that attribute names exist, which would report a
+    backend as conforming while its signatures disagree. Use
+    :func:`check_conformance` instead -- it compares parameters.
+    """
+
+    # -- always required ---------------------------------------------------
+
+    @property
+    def capabilities(self) -> BackendCapabilities: ...
+
+    def reset_slot(self, slot: int) -> None: ...
+
+    def slot_state(self, slot: int) -> SlotStateView: ...
+
+    def snapshot(self) -> BackendSnapshot: ...
+
+    def prefill(self, slot: int, prompt_ids: list[int]) -> int: ...
+
+    def decode_batch_sampled(
+        self,
+        slot_ids: list[int],
+        token_ids: list[int],
+        kv_lengths: list[int],
+        params_list: list[SamplingParams],
+        *,
+        return_logprobs: bool = False,
+        top_logprobs: int = 0,
+    ) -> list[int] | tuple[list[int], list[dict]]: ...
+
+    # -- capabilities.chunked_prefill --------------------------------------
+
+    def prefill_chunked_begin(
+        self,
+        slots: list[int],
+        prompts_per_slot: list[list[int]],
+        chunk_size: int = 512,
+    ) -> ChunkedPrefillState: ...
+
+    def prefill_chunked_step(self, state: ChunkedPrefillState) -> bool: ...
+
+    # -- capabilities.prefix_cache -----------------------------------------
+
+    def reconcile_prefix_hit(self, token_ids: list[int]) -> int: ...
+
+    def find_best_slot_for_prompt(
+        self,
+        token_ids: list[int],
+        free_slots: list[int],
+    ) -> tuple[int, int]: ...
+
+    # -- capabilities.speculative_decode -----------------------------------
+
+    @property
+    def has_speculative_decode(self) -> bool: ...
+
+    def enable_dflash(self, *, num_speculative_tokens: int) -> bool: ...
+
+    def mtp_verify_and_commit_batch(
+        self,
+        slots: list[int],
+        anchors: dict[int, int],
+        drafts: dict[int, list[int]],
+        *,
+        return_logprobs: bool = False,
+        top_logprobs: int = 0,
+    ) -> dict[int, dict]: ...
+
+    # -- capabilities.cuda_graph -------------------------------------------
+
+    def capture_decode_cuda_graph(self) -> int | None: ...
+
+    # -- capabilities.warm_continue ----------------------------------------
+
+    def mtp_prefill_warm_continue(
+        self,
+        slot: int,
+        prompt: list[int],
+        prior_len: int,
+    ) -> dict: ...
+
+
+#: Which protocol members each capability flag governs. Members not listed
+#: here are unconditionally required.
+CAPABILITY_MEMBERS: dict[str, tuple[str, ...]] = {
+    "chunked_prefill": ("prefill_chunked_begin", "prefill_chunked_step"),
+    "prefix_cache": ("reconcile_prefix_hit", "find_best_slot_for_prompt"),
+    "speculative_decode": (
+        "has_speculative_decode",
+        "enable_dflash",
+        "mtp_verify_and_commit_batch",
+    ),
+    "cuda_graph": ("capture_decode_cuda_graph",),
+    "warm_continue": ("mtp_prefill_warm_continue",),
+}
+
+REQUIRED_MEMBERS: tuple[str, ...] = (
+    "capabilities",
+    "reset_slot",
+    "slot_state",
+    "snapshot",
+    "prefill",
+    "decode_batch_sampled",
+)
+
+
+def _signature_of(obj: Any, name: str) -> Any:
+    import inspect
+
+    attr = inspect.getattr_static(obj, name, None)
+    if attr is None:
+        return None
+    if isinstance(attr, property):
+        return "property"
+    try:
+        return inspect.signature(attr)
+    except (TypeError, ValueError):  # pragma: no cover - builtins/slots
+        return None
+
+
+def _comparable(sig: Any) -> Any:
+    """Parameter names, kinds, and whether each has a default.
+
+    Annotations are excluded on purpose: ``from __future__ import annotations``
+    leaves them as strings whose spelling ("list[int]" vs "List[int]") differs
+    without any difference in contract.
+    """
+    if sig is None or sig == "property":
+        return sig
+    return tuple(
+        (p.name, p.kind, p.default is not p.empty)
+        for p in sig.parameters.values()
+        if p.name != "self"
+    )
+
+
+def check_conformance(backend_cls: type, capabilities: BackendCapabilities) -> list[str]:
+    """Return a list of contract violations; empty means the class conforms.
+
+    Checks presence *and* parameters. A member governed by a capability that is
+    ``False`` is not required -- but if the class defines it anyway, it is still
+    checked, because a backend that advertises "no" while carrying a mismatched
+    implementation is exactly the drift this is meant to catch.
+    """
+    problems: list[str] = []
+    governed = {m: cap for cap, members in CAPABILITY_MEMBERS.items() for m in members}
+
+    for name in (*REQUIRED_MEMBERS, *governed):
+        expected = _comparable(_signature_of(ModelBackend, name))
+        actual_raw = _signature_of(backend_cls, name)
+        cap = governed.get(name)
+
+        if actual_raw is None:
+            if cap is None:
+                problems.append(f"{name}: missing, but unconditionally required")
+            elif getattr(capabilities, cap):
+                problems.append(f"{name}: missing, but capabilities.{cap} is True")
+            continue
+
+        actual = _comparable(actual_raw)
+        if expected == "property" and actual != "property":
+            problems.append(f"{name}: protocol declares a property, class defines a method")
+        elif actual == "property" and expected != "property":
+            problems.append(f"{name}: class defines a property, protocol declares a method")
+        elif expected != actual:
+            problems.append(
+                f"{name}: signature differs\n    protocol: {expected}\n    class:    {actual}"
+            )
+
+    return problems
