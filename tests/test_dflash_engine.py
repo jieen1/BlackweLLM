@@ -275,25 +275,34 @@ class TestPrefillChunkRanges:
         assert all(0 < end - start <= 8192 for start, end in ranges)
 
     def test_prefix_replay_uses_last_shared_cold_chunk_boundary(self):
-        assert self._replay_boundary(
-            prefix_len=55488,
-            prompt_len=65536,
-            snapshot_boundary=49152,
-        ) == 49152
+        assert (
+            self._replay_boundary(
+                prefix_len=55488,
+                prompt_len=65536,
+                snapshot_boundary=49152,
+            )
+            == 49152
+        )
 
     def test_prefix_replay_rejects_a_boundary_inside_new_cold_chunk(self):
-        assert self._replay_boundary(
-            prefix_len=55488,
-            prompt_len=65536,
-            snapshot_boundary=55488,
-        ) is None
+        assert (
+            self._replay_boundary(
+                prefix_len=55488,
+                prompt_len=65536,
+                snapshot_boundary=55488,
+            )
+            is None
+        )
 
     def test_prefix_replay_rejects_snapshot_beyond_textual_match(self):
-        assert self._replay_boundary(
-            prefix_len=55488,
-            prompt_len=65536,
-            snapshot_boundary=57344,
-        ) is None
+        assert (
+            self._replay_boundary(
+                prefix_len=55488,
+                prompt_len=65536,
+                snapshot_boundary=57344,
+            )
+            is None
+        )
 
 
 class TestPrefixChunkSnapshot:
@@ -309,9 +318,7 @@ class TestPrefixChunkSnapshot:
             slot_kv_len = [12]
             slot_committed_tokens = [[1] * 12]
             _prefix_chunk_snapshots = [None]
-            kv_caches = {
-                "swa": torch.arange(16, dtype=torch.uint8).reshape(2, 2, 4, 1, 1)
-            }
+            kv_caches = {"swa": torch.arange(16, dtype=torch.uint8).reshape(2, 2, 4, 1, 1)}
 
         backend = Backend()
         LagunaBackend._capture_prefix_chunk_snapshot(backend, 0, 8)

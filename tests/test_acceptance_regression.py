@@ -20,9 +20,7 @@ def test_fixture_provenance_keeps_paired_source_identity() -> None:
                 "qwen-sm120-runtime": SimpleNamespace(
                     sha="runtime-sha", branch="main", dirty=False
                 ),
-                "sparkinfer": SimpleNamespace(
-                    sha="sparkinfer-sha", branch="master", dirty=True
-                ),
+                "sparkinfer": SimpleNamespace(sha="sparkinfer-sha", branch="master", dirty=True),
             }
         ),
     )

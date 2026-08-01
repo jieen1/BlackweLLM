@@ -116,6 +116,7 @@ def test_build_config_resolves_cached_repo_id_to_local_snapshot(monkeypatch, tmp
     loaded: dict[str, object] = {}
 
     monkeypatch.setattr(laguna_config, "snapshot_download", lambda **_: str(tmp_path))
+
     def load(model, **_):
         loaded["model"] = model
         return SimpleNamespace()

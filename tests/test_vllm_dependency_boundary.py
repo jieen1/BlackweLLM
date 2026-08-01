@@ -90,9 +90,7 @@ def _dynamic_import_files(package: str) -> set[str]:
                 target = node.args[0]
                 if not isinstance(target, ast.Constant) or not isinstance(target.value, str):
                     continue
-                is_import = (
-                    isinstance(node.func, ast.Name) and node.func.id == "__import__"
-                ) or (
+                is_import = (isinstance(node.func, ast.Name) and node.func.id == "__import__") or (
                     isinstance(node.func, ast.Attribute) and node.func.attr == "import_module"
                 )
                 if is_import and (
