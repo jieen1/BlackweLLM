@@ -151,6 +151,97 @@ class TestSamplingParamsTorch:
         assert high_counts[0] > 0
 
 
+class TestComputeSamplingDistribution:
+    """E2-b: compute_sampling_distribution is the extracted "full
+    distribution" half of sample_from_logits, reused by
+    runtime.mtp_accept.sample_accept_reject's non-greedy speculative
+    accept/reject. Must apply the EXACT same transform sample_from_logits
+    uses (temperature/top-k/top-p/softmax) -- these tests pin that down."""
+
+    @pytest.fixture(autouse=True)
+    def _require_torch(self):
+        pytest.importorskip("torch")
+
+    def test_rejects_greedy_params(self):
+        import torch
+
+        from runtime.sampling import compute_sampling_distribution
+
+        logits = torch.randn(1, 10)
+        with pytest.raises(AssertionError):
+            compute_sampling_distribution(logits, SamplingParams(temperature=0.0))
+
+    def test_sums_to_one(self):
+        import torch
+
+        from runtime.sampling import compute_sampling_distribution
+
+        logits = torch.randn(3, 37)
+        for params in (
+            SamplingParams(temperature=0.8),
+            SamplingParams(temperature=1.0, top_k=5),
+            SamplingParams(temperature=0.5, top_p=0.9),
+        ):
+            probs = compute_sampling_distribution(logits, params)
+            assert torch.allclose(probs.sum(dim=-1), torch.ones(3), atol=1e-6)
+            assert bool((probs >= 0).all())
+
+    def test_matches_softmax_at_temperature_one_no_filtering(self):
+        import torch
+
+        from runtime.sampling import compute_sampling_distribution
+
+        logits = torch.tensor([[1.0, 2.0, 3.0, 0.5]])
+        probs = compute_sampling_distribution(logits, SamplingParams(temperature=1.0))
+        expected = torch.softmax(logits, dim=-1)
+        assert torch.allclose(probs, expected, atol=1e-7)
+
+    def test_top_k_zeroes_excluded_tokens(self):
+        import torch
+
+        from runtime.sampling import compute_sampling_distribution
+
+        logits = torch.zeros(1, 5)
+        logits[0, 1] = 10.0
+        logits[0, 3] = 9.0
+        probs = compute_sampling_distribution(logits, SamplingParams(temperature=1.0, top_k=2))
+        assert probs[0, 1] > 0 and probs[0, 3] > 0
+        assert probs[0, 0] == 0 and probs[0, 2] == 0 and probs[0, 4] == 0
+
+    def test_sample_from_logits_multinomial_draws_from_this_distribution(self):
+        """sample_from_logits must be sampling from EXACTLY this
+        distribution, not a second hand-rolled copy -- checked
+        statistically (chi-square) rather than by re-reading the source."""
+        import torch
+
+        from runtime.sampling import (
+            compute_sampling_distribution,
+            make_generator,
+            sample_from_logits,
+        )
+
+        logits = torch.tensor([[2.0, 1.0, 0.5, -1.0, 3.0]])
+        params = SamplingParams(temperature=0.9, top_k=4)
+        expected = compute_sampling_distribution(logits, params)[0]
+
+        gen = make_generator(123, device="cpu")
+        n = 20_000
+        counts = [0] * 5
+        for _ in range(n):
+            tok = int(sample_from_logits(logits, params, generator=gen).item())
+            counts[tok] += 1
+
+        stat = sum(
+            (c - n * max(p.item(), 1e-9)) ** 2 / (n * max(p.item(), 1e-9))
+            for c, p in zip(counts, expected)
+        )
+        # 5 categories, one has zero probability (top_k=4 excludes it) -> 3 df.
+        from tests.test_mtp_accept_sampling import chi_square_sf
+
+        pvalue = chi_square_sf(stat, 3)
+        assert pvalue > 0.01, (counts, expected.tolist(), stat, pvalue)
+
+
 class TestPersistentSeed:
     """N3: seed must advance ONE generator across a request's decode
     rounds, not reseed an identical initial state at every token -- see

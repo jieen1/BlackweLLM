@@ -50,7 +50,8 @@ from runtime.backends.laguna import (
     _ring_blocks_for_window,
 )
 from runtime.laguna_runtime import LagunaAttentionMetadata, bind_laguna_kv_cache
-from runtime.mtp_accept import determine_accept_reject_from_predictions
+from runtime.mtp_accept import determine_accept_reject_from_predictions, sample_accept_reject
+from runtime.sampling import SamplingParams, compute_sampling_distribution, make_generator
 
 logger = logging.getLogger("qwen_sm120_runtime.dflash")
 
@@ -211,6 +212,35 @@ def _verify_only_accept_reject(
     }
 
 
+def _sample_verify_only_accept_reject(
+    draft_tokens: list[int],
+    draft_probs: torch.Tensor,
+    target_probs: torch.Tensor,
+    *,
+    generator: torch.Generator | None,
+) -> dict:
+    """Non-greedy (E2-b, docs/e2e-and-quality-plan.md §2.2) sibling of
+    ``_verify_only_accept_reject``: same KV-state-vs-output-shape
+    bookkeeping (``context_count``/``next_anchor``), but the accept/reject
+    decision itself comes from ``runtime.mtp_accept.sample_accept_reject``
+    (rejection sampling) rather than an argmax comparison. Unlike the
+    greedy version, this needs no ``bonus_token`` argument: rejection
+    sampling's per-position decision only depends on that position's own
+    ``draft_probs``/``target_probs`` row, not on what anchored the draft
+    sequence -- the anchor only matters for the KV-state bookkeeping below,
+    which is identical to the greedy path (whatever the target model
+    verified against IS what is now real context, regardless of how the
+    token at each position was chosen).
+    """
+    decision = sample_accept_reject(draft_tokens, draft_probs, target_probs, generator=generator)
+    committed = decision["committed"]
+    return {
+        **decision,
+        "context_count": 1 + decision["num_accepted"],
+        "next_anchor": committed[-1],
+    }
+
+
 class DFlashEngine:
     """DFlash speculative decoding engine wrapping LagunaBackend.
 
@@ -336,6 +366,17 @@ class DFlashEngine:
         }
         self._use_cuda_graph = os.environ.get("QSR_DFLASH_CUDA_GRAPH", "1") != "0"
         self._cuda_graph_capture_deferred = bool(defer_cuda_graph_capture)
+        # E2-b (docs/e2e-and-quality-plan.md §2.2): the draft distribution
+        # (q) used to sample this slot's PENDING draft tokens -- produced by
+        # whichever call last drafted for this slot (``dflash_prefill_bootstrap``
+        # or ``dflash_round`` itself), consumed by the NEXT ``dflash_round``
+        # call's non-greedy accept/reject test
+        # (``runtime.mtp_accept.sample_accept_reject`` needs both the draft's
+        # own q and the target's own p at each position, not just the drafted
+        # token ids). Only ever populated for non-greedy (``temperature>0``)
+        # requests; the greedy path has no use for it (argmax has no
+        # distribution to preserve) and never touches this dict.
+        self._pending_draft_probs: dict[int, torch.Tensor] = {}
         if self._use_cuda_graph and not self._cuda_graph_capture_deferred:
             self._init_cuda_graph()
 
@@ -819,15 +860,20 @@ class DFlashEngine:
             causal=True,
         )
 
-    def _draft_forward(
+    def _draft_forward_logits(
         self,
         slot: int,
         bonus_token: int,
         kv_len: int,
-    ) -> list[int]:
-        """Run draft model forward with 16 tokens (1 bonus + 15 mask).
-
-        Returns 15 draft tokens (greedy argmax).
+    ) -> torch.Tensor:
+        """Shared setup + forward for the eager draft path: 16 tokens
+        (1 bonus + 15 mask) in, raw draft logits for the 15 mask positions
+        out. Extracted (E2-b, docs/e2e-and-quality-plan.md §2.2) so the
+        greedy ``_draft_forward`` (argmax) and the non-greedy
+        ``_draft_forward_sampled`` (temperature/top-k/top-p + multinomial)
+        below share this identical body instead of keeping two copies of
+        the attention-metadata plumbing in sync by hand -- ``_draft_forward``
+        is UNCHANGED in behavior, just calling through this extraction.
         """
         num_tokens = NUM_QUERY_PER_REQ  # 16
 
@@ -876,13 +922,62 @@ class DFlashEngine:
                 inputs_embeds=None,
             )
 
-        # Compute draft logits and sample greedily. Position 0's logits are
-        # never used (only positions 1..15, the mask positions, predict the
-        # next tokens) -- slice before compute_logits so the vocab-size GEMM
-        # only pays for the 15 positions that matter.
-        draft_logits = self.draft_model.compute_logits(draft_hidden[1:num_tokens])
+        # Position 0's logits are never used (only positions 1..15, the
+        # mask positions, predict the next tokens) -- slice before
+        # compute_logits so the vocab-size GEMM only pays for the 15
+        # positions that matter.
+        return self.draft_model.compute_logits(draft_hidden[1:num_tokens])
+
+    def _draft_forward(
+        self,
+        slot: int,
+        bonus_token: int,
+        kv_len: int,
+    ) -> list[int]:
+        """Run draft model forward with 16 tokens (1 bonus + 15 mask).
+
+        Returns 15 draft tokens (greedy argmax).
+        """
+        draft_logits = self._draft_forward_logits(slot, bonus_token, kv_len)
         draft_tokens = draft_logits.argmax(dim=-1)
         return draft_tokens.tolist()
+
+    def _draft_forward_sampled(
+        self,
+        slot: int,
+        bonus_token: int,
+        kv_len: int,
+        params: SamplingParams,
+        generator: torch.Generator | None,
+    ) -> tuple[list[int], torch.Tensor]:
+        """Non-greedy sibling of ``_draft_forward`` (E2-b,
+        docs/e2e-and-quality-plan.md §2.2): samples each of the 15 draft
+        positions from the SAME temperature/top-k/top-p distribution
+        ``runtime.sampling.sample_from_logits`` would use for a
+        non-speculative decode step, instead of always taking the argmax.
+        Also returns the per-position draft distribution (``draft_probs``,
+        ``[15, vocab]``) -- the ``q`` speculative sampling's rejection test
+        needs alongside the verifier's own ``p``, see
+        ``runtime.mtp_accept.sample_accept_reject``. Using the SAME
+        transform as the non-speculative sampled path is required, not
+        optional: any divergence here (e.g. plain softmax without the
+        temperature/top-k/top-p filtering) would make the draft model
+        propose from a distribution the acceptance test does not actually
+        match against, silently corrupting the output distribution.
+
+        Eager only (no CUDA Graph): unlike ``_draft_forward``, whose
+        argmax post-processing happens outside the graph replay (so the
+        SAME captured graph serves it), sampling needs a fresh per-call
+        random draw that the graph's fixed replay buffers do not carry.
+        ``dflash_round`` never replays ``self._draft_cg`` when ``params``
+        is non-greedy -- same precedent as
+        ``LagunaBackend._decode_cg_batch_eligible`` refusing CG replay for
+        any non-greedy request on the plain (non-DFlash) decode path.
+        """
+        draft_logits = self._draft_forward_logits(slot, bonus_token, kv_len)
+        draft_probs = compute_sampling_distribution(draft_logits, params)
+        draft_tokens = torch.multinomial(draft_probs, 1, generator=generator).squeeze(-1)
+        return draft_tokens.tolist(), draft_probs
 
     def _precompute_context_kv(
         self,
@@ -1682,6 +1777,7 @@ class DFlashEngine:
         prompt_ids: list[int],
         *,
         prefix_hit: int = 0,
+        params: SamplingParams | None = None,
     ) -> dict:
         """DFlash-aware prefill for ServerEngine's admission path.
 
@@ -1692,6 +1788,25 @@ class DFlashEngine:
         previous request's decode); initial draft quality degrades gracefully
         but correctness is maintained by the verify step. The decode loop
         gradually rebuilds draft context KV from verify aux_hidden_states.
+
+        ``params`` (E2-b, docs/e2e-and-quality-plan.md §2.2): when given and
+        non-greedy (``temperature>0``), the FIRST batch of 15 draft tokens
+        (the ones ``dflash_round``'s first call for this slot will verify)
+        is sampled -- not argmax'd -- via ``_draft_forward_sampled``, and
+        the resulting draft distribution is cached in
+        ``self._pending_draft_probs[slot]`` for that first ``dflash_round``
+        call to consume. ``None`` (the default) or greedy ``params``
+        preserves this function's exact prior behavior byte-for-byte
+        (argmax draft, CUDA Graph draft replay when available) -- this
+        parameter is purely additive.
+
+        The anchor/first token itself (``first_token`` above, from
+        ``prefill_with_aux``) is unaffected by ``params`` either way: it was
+        already chosen the same way for every request regardless of
+        temperature before E2-b, and closing that gap is out of this
+        change's scope (see ``docs/e2e-and-quality-plan.md`` §2.2 -- E2-b
+        is specifically about the DRAFT/verify speculative loop, not the
+        anchor token selection admission already does).
 
         Returns ``{"anchor": int, "draft_tokens": list[int]}``.
         """
@@ -1712,10 +1827,18 @@ class DFlashEngine:
 
         bonus_token = first_token
         kv_len = backend.slot_kv_len[slot]
-        if self._draft_cg is not None:
-            draft_tokens = self._draft_cg.replay(slot, bonus_token, kv_len)
+        if params is not None and not params.is_greedy:
+            generator = make_generator(params.seed)
+            draft_tokens, draft_probs = self._draft_forward_sampled(
+                slot, bonus_token, kv_len, params, generator
+            )
+            self._pending_draft_probs[slot] = draft_probs
         else:
-            draft_tokens = self._draft_forward(slot, bonus_token, kv_len)
+            self._pending_draft_probs.pop(slot, None)
+            if self._draft_cg is not None:
+                draft_tokens = self._draft_cg.replay(slot, bonus_token, kv_len)
+            else:
+                draft_tokens = self._draft_forward(slot, bonus_token, kv_len)
 
         if self._use_cuda_graph and not self._cg_captured:
             self._lazy_capture_cg()
@@ -1728,6 +1851,7 @@ class DFlashEngine:
         anchor: int,
         draft_tokens: list[int],
         *,
+        params: SamplingParams | None = None,
         return_logprobs: bool = False,
         top_logprobs: int = 0,
     ) -> dict:
@@ -1747,14 +1871,36 @@ class DFlashEngine:
         drafted-but-never-consumed next round when the caller stops after
         this one is harmless (the physical slot's KV/committed-token state
         gets reset before its next real use).
+
+        ``params`` (E2-b, docs/e2e-and-quality-plan.md §2.2): ``None`` or
+        greedy ``params`` (the default) takes the EXACT prior code path --
+        CUDA-Graph verify/draft replay when available, argmax accept/reject
+        via ``_verify_only_accept_reject``. Non-greedy ``params`` instead:
+        (a) never replays ``self._verify_cg``/``self._draft_cg`` (see
+        ``_draft_forward_sampled``'s docstring for why -- the graphs' fixed
+        replay buffers don't carry sampling's fresh per-call random draws),
+        always running the eager verify/draft forward instead; (b) resolves
+        the accept/reject decision via rejection sampling
+        (``_sample_verify_only_accept_reject`` /
+        ``runtime.mtp_accept.sample_accept_reject``) against this slot's
+        PENDING draft distribution (``self._pending_draft_probs[slot]``,
+        populated by whichever call last drafted for this slot --
+        ``dflash_prefill_bootstrap`` for the first round, this same
+        function's tail for every round after) instead of an argmax
+        comparison. Everything else -- the verify forward itself, the KV
+        bookkeeping (``context_count``/``next_anchor``), logprobs, EOS/
+        length handling upstream -- is IDENTICAL code for both branches:
+        those steps only care how many tokens got committed and what the
+        last one was, not how that decision was reached.
         """
         backend = self.backend
         bonus_token = anchor
         kv_len = backend.slot_kv_len[slot]
         _bf_row = bfdiag_trace.begin_round(slot, kv_len) if bfdiag_trace.TRACE_ENABLED else -1
+        sampled = params is not None and not params.is_greedy
 
         verify_tokens = [bonus_token] + draft_tokens
-        if self._verify_cg is not None:
+        if self._verify_cg is not None and not sampled:
             verify_logits, verify_aux = self._verify_cg.replay_with_aux(slot, verify_tokens, kv_len)
         else:
             verify_logits, verify_aux = self._forward_verify_with_aux(
@@ -1763,8 +1909,25 @@ class DFlashEngine:
         if bfdiag_trace.TRACE_ENABLED:
             bfdiag_trace.mark(_bf_row, bfdiag_events.PHASE_VERIFY)
 
-        all_argmax = verify_logits[:NUM_QUERY_PER_REQ].argmax(dim=-1).tolist()
-        decision = _verify_only_accept_reject(all_argmax, draft_tokens, bonus_token)
+        generator = make_generator(params.seed) if sampled else None
+        if sampled:
+            draft_probs = self._pending_draft_probs.get(slot)
+            if draft_probs is None:
+                raise RuntimeError(
+                    f"dflash_round: no pending draft distribution for slot {slot} -- a "
+                    "non-greedy round must be preceded by a non-greedy draft "
+                    "(dflash_prefill_bootstrap or a prior dflash_round call, both with "
+                    "the same non-greedy params) for this same slot"
+                )
+            target_probs = compute_sampling_distribution(
+                verify_logits[: len(verify_tokens)], params
+            )
+            decision = _sample_verify_only_accept_reject(
+                draft_tokens, draft_probs, target_probs, generator=generator
+            )
+        else:
+            all_argmax = verify_logits[:NUM_QUERY_PER_REQ].argmax(dim=-1).tolist()
+            decision = _verify_only_accept_reject(all_argmax, draft_tokens, bonus_token)
         committed = decision["committed"]
         new_bonus = decision["next_anchor"]
         context_count = decision["context_count"]
@@ -1809,10 +1972,17 @@ class DFlashEngine:
             bfdiag_trace.mark(_bf_row, bfdiag_events.PHASE_COMMIT)
 
         new_kv_len = backend.slot_kv_len[slot]
-        if self._draft_cg is not None:
-            next_draft_tokens = self._draft_cg.replay(slot, new_bonus, new_kv_len)
+        if sampled:
+            next_draft_tokens, next_draft_probs = self._draft_forward_sampled(
+                slot, new_bonus, new_kv_len, params, generator
+            )
+            self._pending_draft_probs[slot] = next_draft_probs
         else:
-            next_draft_tokens = self._draft_forward(slot, new_bonus, new_kv_len)
+            self._pending_draft_probs.pop(slot, None)
+            if self._draft_cg is not None:
+                next_draft_tokens = self._draft_cg.replay(slot, new_bonus, new_kv_len)
+            else:
+                next_draft_tokens = self._draft_forward(slot, new_bonus, new_kv_len)
         if bfdiag_trace.TRACE_ENABLED:
             bfdiag_trace.finish_dflash_round(
                 _bf_row,

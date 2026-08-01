@@ -98,7 +98,9 @@ class _FakeWarmRunner:
     def reconcile_prefix_hit(self, token_ids: list[int]) -> int:
         return 0
 
-    def prefill_chunked_begin(self, slots, prompts_per_slot, chunk_size: int = 512):
+    def prefill_chunked_begin(
+        self, slots, prompts_per_slot, chunk_size: int = 512, *, params_per_slot=None
+    ):
         result = {s: {"anchor": self.cold_anchor, "draft_tokens": []} for s in slots}
         return SimpleNamespace(done=True, result=result)
 

@@ -2263,12 +2263,23 @@ class LagunaBackend:
         slots: list[int],
         prompts_per_slot: list[list[int]],
         chunk_size: int = 512,
+        *,
+        params_per_slot: dict[int, SamplingParams] | None = None,
     ) -> ChunkedPrefillState:
         """Prefill with prefix cache: skip cached prefix, prefill only suffix.
 
         Prefix cache uses same-slot KV reuse: the slot's full-attention KV
         is preserved from the previous request and reused in-place when the
         new prompt shares a token prefix. No cross-slot KV copies.
+
+        ``params_per_slot`` (E2-b, docs/e2e-and-quality-plan.md §2.2):
+        optional per-slot ``SamplingParams``, forwarded to
+        ``DFlashEngine.dflash_prefill_bootstrap`` so a non-greedy
+        (``temperature>0``) request's FIRST batch of draft tokens is
+        sampled (and its distribution cached) instead of always argmax'd --
+        see that function's docstring. ``None`` (the default) or a missing
+        entry for a given slot preserves this function's exact prior
+        behavior for that slot.
         """
         if len(slots) != len(prompts_per_slot):
             raise ValueError("slots and prompts_per_slot must have equal length")
@@ -2276,6 +2287,7 @@ class LagunaBackend:
             return ChunkedPrefillState(done=True, result={})
         result: dict[int, dict] = {}
         for slot, prompt in zip(slots, prompts_per_slot):
+            slot_params = params_per_slot.get(slot) if params_per_slot else None
             # Check for prefix hit on THIS slot (same-slot reuse)
             prefix_hit = self._pending_prefix_hits.pop(slot, 0)
             # Validate: hit must not exceed prompt length and must leave
@@ -2295,6 +2307,7 @@ class LagunaBackend:
                         slot,
                         prompt,
                         prefix_hit=prefix_hit,
+                        params=slot_params,
                     )
                 else:
                     first_token, _ = self.prefill_with_aux(
@@ -2305,7 +2318,9 @@ class LagunaBackend:
                     result[slot] = {"anchor": first_token, "draft_tokens": []}
             else:
                 if self._dflash is not None:
-                    result[slot] = self._dflash.dflash_prefill_bootstrap(slot, prompt)
+                    result[slot] = self._dflash.dflash_prefill_bootstrap(
+                        slot, prompt, params=slot_params
+                    )
                 else:
                     first_token, _ = self.prefill_with_aux(slot, prompt)
                     result[slot] = {"anchor": first_token, "draft_tokens": []}
@@ -2323,13 +2338,18 @@ class LagunaBackend:
         anchors: dict[int, int],
         drafts: dict[int, list[int]],
         *,
+        params_per_slot: dict[int, SamplingParams] | None = None,
         return_logprobs: bool = False,
         top_logprobs: int = 0,
     ) -> dict[int, dict]:
         """E1: DFlash's sibling of ``DirectModelRunner.mtp_verify_and_commit_batch``,
-        called by the SAME ``ServerEngine._step_sync`` greedy-MTP branch
+        called by the SAME ``ServerEngine._step_sync`` MTP branch
         (``classify_decode_slots`` routes here once ``self.spec.has_mtp`` is
         true -- see ``self._dflash`` / ``ServerEngine._load_laguna_model``).
+        Despite the historical "greedy-MTP branch" name, E2-b
+        (docs/e2e-and-quality-plan.md §2.2) extended this branch to also
+        carry non-greedy (``temperature>0``) requests -- see
+        ``params_per_slot`` below.
 
         DFlash's draft/verify CUDA Graphs are captured for exactly one
         physical slot (see ``DFlashEngine._init_buffers``), so this only
@@ -2339,6 +2359,11 @@ class LagunaBackend:
         sequentially, no batched replay) rather than silently assuming the
         constraint, in case that capacity guard is ever loosened without
         updating this method.
+
+        ``params_per_slot``: optional per-slot ``SamplingParams``, forwarded
+        to ``DFlashEngine.dflash_round``. A missing entry (or ``None``
+        altogether) preserves this function's exact prior (greedy-only)
+        behavior for that slot.
         """
         if self._dflash is None:
             raise RuntimeError("mtp_verify_and_commit_batch called without a DFlashEngine wired up")
@@ -2347,6 +2372,7 @@ class LagunaBackend:
                 slot,
                 anchors[slot],
                 drafts[slot],
+                params=(params_per_slot.get(slot) if params_per_slot else None),
                 return_logprobs=return_logprobs,
                 top_logprobs=top_logprobs,
             )

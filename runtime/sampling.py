@@ -114,6 +114,48 @@ class SamplingParams:
             raise ValueError(f"top_p must be in (0, 1], got {self.top_p}")
 
 
+def compute_sampling_distribution(logits: torch.Tensor, params: SamplingParams) -> torch.Tensor:
+    """The proper probability distribution ``sample_from_logits`` samples
+    from for non-greedy ``params`` -- temperature scale, then top-k, then
+    top-p, then softmax -- stopping short of the final ``multinomial``
+    draw. Extracted (2026-08-02, E2-b, docs/e2e-and-quality-plan.md §2.2)
+    so a caller that needs the FULL distribution rather than one sample can
+    reuse the exact same transform ``sample_from_logits`` uses, instead of
+    hand-rolling a second copy that could silently drift out of sync.
+
+    The motivating caller is speculative decoding's rejection-sampling
+    accept/reject test (``runtime.mtp_accept.sample_accept_reject``): it
+    needs both the draft model's and the target model's own ``p(x)``/``q(x)``
+    at specific tokens to compute an acceptance probability and a residual
+    distribution, not just "a" sampled token from each -- passing it
+    anything other than the SAME distribution ``sample_from_logits`` would
+    have sampled from (e.g. raw softmax without the temperature/top-k/top-p
+    transform) would silently change what speculative decoding accepts,
+    defeating the entire point of matching the non-speculative sampling
+    distribution.
+
+    Precondition: ``not params.is_greedy`` -- greedy has no non-degenerate
+    distribution (the whole point of greedy is a single deterministic
+    argmax), so callers on the greedy path have no use for this and should
+    not call it.
+    """
+    assert not params.is_greedy, "compute_sampling_distribution is only defined for temperature>0"
+    import torch as _torch
+
+    logits_f32 = logits.float()
+
+    if params.temperature != 1.0:
+        logits_f32 = logits_f32 / params.temperature
+
+    if params.top_k > 0:
+        logits_f32 = _apply_top_k(logits_f32, params.top_k)
+
+    if params.top_p < 1.0:
+        logits_f32 = _apply_top_p(logits_f32, params.top_p)
+
+    return _torch.softmax(logits_f32, dim=-1)
+
+
 def sample_from_logits(
     logits: torch.Tensor,
     params: SamplingParams,
@@ -135,18 +177,7 @@ def sample_from_logits(
     if params.is_greedy:
         return logits.argmax(dim=-1)
 
-    logits_f32 = logits.float()
-
-    if params.temperature != 1.0:
-        logits_f32 = logits_f32 / params.temperature
-
-    if params.top_k > 0:
-        logits_f32 = _apply_top_k(logits_f32, params.top_k)
-
-    if params.top_p < 1.0:
-        logits_f32 = _apply_top_p(logits_f32, params.top_p)
-
-    probs = _torch.softmax(logits_f32, dim=-1)
+    probs = compute_sampling_distribution(logits, params)
     if generator is not None and probs.device != generator.device:
         probs = probs.to(generator.device)
         result = _torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)

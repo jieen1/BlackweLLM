@@ -78,22 +78,31 @@ def classify_decode_slots(
     grammar_slots: list[int],
     mtp_capable: bool,
 ) -> tuple[list[int], list[int]]:
-    """Split one round's active slots into (greedy_speculative, sampled).
+    """Split one round's active slots into (mtp_slots, plain_sampled_slots).
 
-    Speculative verify/commit only ever applies to a greedy request on a
-    backend whose runner reports ``spec.has_mtp``. Everything else --
-    explicit sampling, grammar-constrained structured output, or Laguna
-    without DFlash wired up -- goes through the plain per-step
-    ``decode_batch_sampled`` path. Greedy there is just temperature=0, so
-    this is only a routing distinction.
+    Before E2-b (docs/e2e-and-quality-plan.md §2.2), speculative verify/
+    commit only ever applied to a GREEDY request on a backend whose runner
+    reports ``spec.has_mtp`` -- every ``temperature>0`` request was routed
+    to the plain per-step ``decode_batch_sampled`` path instead, silently
+    losing all speculative acceleration the moment a caller asked for
+    sampling (roadmap Track E, S8 -- "the most obvious functional gap").
+    E2-b closed that: ``DFlashEngine.dflash_round`` now resolves accept/
+    reject via rejection sampling (``runtime.mtp_accept.sample_accept_reject``)
+    for non-greedy requests instead of an argmax comparison, so ``mtp_slots``
+    below carries BOTH greedy and sampled requests whenever the backend is
+    MTP-capable -- greedy vs sampled is no longer a routing distinction here.
+
+    Only grammar-constrained requests (structured output has no mask hook
+    into the speculative verify step yet -- see E-N1,
+    ``docs/api-layer-design.md`` §7.1) or every request on a backend with
+    no MTP capability at all still go through the plain
+    ``decode_batch_sampled`` path (``plain_sampled_slots``).
     """
     if not mtp_capable:
         return [], list(active_slots)
-    greedy_slots = [
-        s for s in active_slots if not active[s].get("sampled") and s not in grammar_slots
-    ]
-    sampled_slots = [s for s in active_slots if active[s].get("sampled") or s in grammar_slots]
-    return greedy_slots, sampled_slots
+    mtp_slots = [s for s in active_slots if s not in grammar_slots]
+    plain_sampled_slots = [s for s in active_slots if s in grammar_slots]
+    return mtp_slots, plain_sampled_slots
 
 
 logger = logging.getLogger("qwen_sm120_server.engine")
@@ -385,6 +394,25 @@ class ServerEngine:
             "watchdog_events": [],
             "mtp_acceptance_histogram": [0] * 5,
             "sampled_decode_rounds": 0,
+            # E2-b (docs/e2e-and-quality-plan.md §2.2): non-greedy MTP rounds'
+            # acceptance is tracked SEPARATELY from mtp_acceptance_histogram
+            # above (which is greedy-only and has always been) -- the
+            # completion criterion is "recorded separately from the greedy
+            # path's acceptance rate, not required to be the same" (rejection
+            # sampling's acceptance probability depends on how much the draft
+            # and target distributions agree, which is a different question
+            # from greedy top-1 agreement). Accumulated as raw totals rather
+            # than a fixed-size histogram bucketed by num_accepted, both to
+            # avoid mtp_acceptance_histogram's own pre-existing "silently
+            # drops any num_accepted >= 4" quirk (its 5 buckets look sized for
+            # a different, smaller-K backend) and because "accepted/drafted"
+            # is the number this criterion actually asks for -- the same
+            # ratio ``DFlashEngine.generate_verify_only``'s own
+            # ``stats["acceptance_rate"]`` already reports for the greedy
+            # standalone-generate path.
+            "mtp_sampled_total_accepted": 0,
+            "mtp_sampled_total_draft": 0,
+            "mtp_sampled_rounds": 0,
         }
 
         self.runner = None
@@ -1104,8 +1132,23 @@ class ServerEngine:
                     if not self.runner.slot_state(slot).is_fresh:
                         self.runner.reset_slot(slot)
                 hit_depths = [self.runner.reconcile_prefix_hit(p) for p in new_prompts]
+                # E2-b: only non-greedy requests carry an entry -- see the
+                # MTP-round call site's identical comment on why a missing
+                # entry preserves prior (greedy) behavior byte-for-byte.
+                # Harmless/ignored on a backend without DFlash enabled
+                # (LagunaBackend.prefill_chunked_begin's non-DFlash branch
+                # never looks at it -- those requests already go through
+                # decode_batch_sampled exclusively, per classify_decode_slots).
+                params_per_slot = {
+                    slot: req.sampling_params
+                    for slot, req in admit_now
+                    if not req.sampling_params.is_greedy
+                }
                 prefill_state = self.runner.prefill_chunked_begin(
-                    new_slots, new_prompts, chunk_size=self._prefill_chunk_size
+                    new_slots,
+                    new_prompts,
+                    chunk_size=self._prefill_chunk_size,
+                    params_per_slot=params_per_slot,
                 )
             except Exception as exc:
                 logger.exception("admission failed for %d request(s)", len(admit_now))
@@ -1191,9 +1234,11 @@ class ServerEngine:
         # grammar_slots stays permanently empty; classify_decode_slots keeps
         # the parameter (still covered by tests/test_laguna_server_integration.py)
         # for the day a real implementation lands.
-        # E1: a backend with no MTP (e.g. Laguna) routes every slot through
-        # the sampled path regardless of is_greedy -- see classify_decode_slots.
-        greedy_slots, sampled_slots = classify_decode_slots(
+        # E2-b: a backend with no MTP (e.g. Laguna without DFlash) routes
+        # every slot through the plain sampled path regardless of is_greedy;
+        # an MTP-capable backend (Laguna+DFlash) now routes BOTH greedy and
+        # sampled requests through the MTP branch -- see classify_decode_slots.
+        mtp_slots, plain_sampled_slots = classify_decode_slots(
             active_slots, self.active, [], self.runner.has_speculative_decode
         )
 
@@ -1202,10 +1247,10 @@ class ServerEngine:
 
         newly_finished: list[int] = []
 
-        # -- sampled decode (no MTP, simple autoregressive) --
-        if sampled_slots:
+        # -- plain sampled decode (no MTP, simple autoregressive) --
+        if plain_sampled_slots:
             self.stats["sampled_decode_rounds"] += 1
-            slot_ids = sampled_slots
+            slot_ids = plain_sampled_slots
             token_ids = [self.active[s]["last_token"] for s in slot_ids]
             kv_lengths = [self.runner.slot_state(s).kv_len for s in slot_ids]
             params_list = [self.active[s]["req"].sampling_params for s in slot_ids]
@@ -1291,28 +1336,38 @@ class ServerEngine:
                     )
                     newly_finished.append(s)
 
-        # -- MTP verify/commit round (greedy path, unchanged) --
-        if greedy_slots:
+        # -- MTP verify/commit round (E2-b: greedy AND sampled) --
+        if mtp_slots:
             _round_t0 = time.perf_counter()
-            any_lp_g = any(self.active[s]["req"].logprobs for s in greedy_slots)
+            any_lp_g = any(self.active[s]["req"].logprobs for s in mtp_slots)
             top_lp_g = (
                 max(
-                    (self.active[s]["req"].top_logprobs for s in greedy_slots),
+                    (self.active[s]["req"].top_logprobs for s in mtp_slots),
                     default=0,
                 )
                 if any_lp_g
                 else 0
             )
+            # Only slots actually marked "sampled" (temperature>0) carry a
+            # SamplingParams entry -- a missing entry (or None) makes
+            # dflash_round/mtp_verify_and_commit_batch take the exact prior
+            # (greedy) code path for that slot, byte-for-byte.
+            params_per_slot = {
+                s: self.active[s]["req"].sampling_params
+                for s in mtp_slots
+                if self.active[s].get("sampled")
+            }
             decisions = self.runner.mtp_verify_and_commit_batch(
-                greedy_slots,
-                {s: self.active[s]["anchor"] for s in greedy_slots},
-                {s: self.active[s]["drafts"] for s in greedy_slots},
+                mtp_slots,
+                {s: self.active[s]["anchor"] for s in mtp_slots},
+                {s: self.active[s]["drafts"] for s in mtp_slots},
+                params_per_slot=params_per_slot,
                 return_logprobs=any_lp_g,
                 top_logprobs=top_lp_g,
             )
             _round_ms = (time.perf_counter() - _round_t0) * 1000
 
-            for s in greedy_slots:
+            for s in mtp_slots:
                 st = self.active[s]
                 req = st["req"]
                 decision = decisions[s]
@@ -1320,7 +1375,13 @@ class ServerEngine:
                 na = decision.get("num_accepted", 0)
                 if req.logprobs and "logprobs" in decision:
                     st.setdefault("logprobs_acc", []).extend(decision["logprobs"])
-                if 0 <= na < len(self.stats["mtp_acceptance_histogram"]):
+                if st.get("sampled"):
+                    # E2-b: recorded separately from mtp_acceptance_histogram
+                    # (greedy-only) -- see the stats dict's own comment for why.
+                    self.stats["mtp_sampled_total_accepted"] += na
+                    self.stats["mtp_sampled_total_draft"] += len(st["drafts"])
+                    self.stats["mtp_sampled_rounds"] += 1
+                elif 0 <= na < len(self.stats["mtp_acceptance_histogram"]):
                     self.stats["mtp_acceptance_histogram"][na] += 1
 
                 # N2: a single MTP round can commit several draft tokens at

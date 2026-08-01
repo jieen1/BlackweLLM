@@ -24,35 +24,59 @@ from server.engine import ServerEngine, classify_decode_slots
 
 
 class TestClassifyDecodeSlots:
-    def test_mtp_capable_reproduces_original_split(self):
+    def test_mtp_capable_routes_sampled_slots_through_mtp_too(self):
+        """E2-b (docs/e2e-and-quality-plan.md §2.2): before this change, this
+        test was named ``test_mtp_capable_reproduces_original_split`` and
+        asserted ``mtp_slots == [1, 3]`` / ``plain_sampled_slots == [2]`` --
+        i.e. a ``sampled=True`` slot (temperature>0) was ALWAYS excluded
+        from the MTP branch, unconditionally silently losing all
+        speculative acceleration the moment a caller asked for sampling
+        (roadmap Track E, S8). Confirmed to fail against that old assertion
+        before this test was updated (that failure -- not a hypothetical --
+        is this change's "how does this prove it would go red": the
+        assertion below is the exact opposite of what the pre-E2-b function
+        returned for the same input). ``DFlashEngine.dflash_round`` now
+        resolves accept/reject for sampled requests via rejection sampling
+        instead of an argmax comparison, so an MTP-capable backend routes
+        BOTH greedy and sampled requests through the MTP branch -- only
+        grammar-constrained slots (see the next test) still don't.
+        """
         active = {
             1: {"sampled": False},
             2: {"sampled": True},
             3: {"sampled": False},
         }
-        greedy, sampled = classify_decode_slots(
+        mtp_slots, plain_sampled_slots = classify_decode_slots(
             [1, 2, 3], active, grammar_slots=[], mtp_capable=True
         )
-        assert greedy == [1, 3]
-        assert sampled == [2]
+        assert mtp_slots == [1, 2, 3]
+        assert plain_sampled_slots == []
 
-    def test_mtp_capable_grammar_slots_forced_to_sampled(self):
+    def test_mtp_capable_grammar_slots_forced_to_plain_sampled(self):
         active = {1: {"sampled": False}, 2: {"sampled": False}}
-        greedy, sampled = classify_decode_slots([1, 2], active, grammar_slots=[2], mtp_capable=True)
-        assert greedy == [1]
-        assert sampled == [2]
+        mtp_slots, plain_sampled_slots = classify_decode_slots(
+            [1, 2], active, grammar_slots=[2], mtp_capable=True
+        )
+        assert mtp_slots == [1]
+        assert plain_sampled_slots == [2]
 
-    def test_non_mtp_backend_routes_everything_to_sampled(self):
-        """Laguna (mtp_capable=False): even a 'greedy' slot skips MTP."""
+    def test_non_mtp_backend_routes_everything_to_plain_sampled(self):
+        """Laguna without DFlash (mtp_capable=False): even a 'greedy' slot
+        skips MTP -- unaffected by E2-b, DFlash still has to be enabled at
+        all for any speculative path (greedy or sampled) to exist."""
         active = {1: {"sampled": False}, 2: {"sampled": True}}
-        greedy, sampled = classify_decode_slots([1, 2], active, grammar_slots=[], mtp_capable=False)
-        assert greedy == []
-        assert sampled == [1, 2]
+        mtp_slots, plain_sampled_slots = classify_decode_slots(
+            [1, 2], active, grammar_slots=[], mtp_capable=False
+        )
+        assert mtp_slots == []
+        assert plain_sampled_slots == [1, 2]
 
     def test_empty_active_slots(self):
-        greedy, sampled = classify_decode_slots([], {}, grammar_slots=[], mtp_capable=True)
-        assert greedy == []
-        assert sampled == []
+        mtp_slots, plain_sampled_slots = classify_decode_slots(
+            [], {}, grammar_slots=[], mtp_capable=True
+        )
+        assert mtp_slots == []
+        assert plain_sampled_slots == []
 
 
 class TestServerEngineBackendSelection:

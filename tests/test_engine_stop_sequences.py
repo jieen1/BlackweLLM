@@ -234,7 +234,14 @@ class _FakeRunner:
         return [round_tokens[s][0] for s in slot_ids]
 
     def mtp_verify_and_commit_batch(
-        self, slot_ids, anchors, drafts, *, return_logprobs=False, top_logprobs=0
+        self,
+        slot_ids,
+        anchors,
+        drafts,
+        *,
+        params_per_slot=None,
+        return_logprobs=False,
+        top_logprobs=0,
     ):
         round_tokens = self._rounds.pop(0)
         decisions = {}
