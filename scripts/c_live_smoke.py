@@ -27,10 +27,23 @@ The six checks (implementation-plan.md §3.2):
   2. /metrics while a request is ACTIVELY RUNNING (engine.active non-empty)
      returns 200 -- this is the exact shape of the second 500 on 2026-08-01
      (a list read as a mapping).
-  3. Two back-to-back conversation turns, the second fired < 200ms after
-     the first's response lands -- the exact window of the lost-wakeup bug
-     (server/engine.py's _step_sync comment: an agent's follow-up turn
-     landed 152ms after the previous one finished and froze the engine).
+  3. KNOWN GAP, do not trust a PASS here as coverage: many back-to-back
+     conversation turns over one persistent connection, no gap between
+     them, reaching for the lost-wakeup bug's window (server/engine.py's
+     _step_sync comment: an agent's follow-up turn landed 152ms after the
+     previous one finished and froze the engine). Verified empirically on
+     53f0dca (the bug's own parent commit, where it is 100% present): 20
+     rapid-fire rounds over a persistent connection, zero sleep, zero
+     print -- fastest 0.21s, slowest 0.28s, zero stalls. It did not catch
+     it. Root cause (read from _step_sync, not guessed): the real window is
+     the gap between two adjacent Python statements
+     (_drain_requests()/_drain_pipe()) inside one engine round, not a
+     client-observable span of wall-clock time -- no black-box HTTP timing
+     can reliably land inside it. d9e52ce's own regression test needed to
+     hook _drain_pipe directly to hit it deterministically. This check
+     stays in as a cheap sanity net (it WOULD catch a coarser regression
+     that turned the whole idle path pathologically slow) but a green run
+     provides no evidence the specific lost-wakeup race is fixed or absent.
   4. OpenAI + Anthropic, streaming + non-streaming, one tool call each --
      delegated to tests/test_api_compat.py.
   5. Thinking contract: on a real model whose chat template injects
@@ -166,12 +179,16 @@ def run(base_url: str) -> tuple[int, int]:
     # Must be the FIRST generation-adjacent check -- see module docstring.
     print("\n=== 1. /metrics: cold-start window (zero requests completed) ===")
     pre_status, pre_body = client.get("/metrics")
+    # Only the value line matters -- the two comment lines Prometheus text
+    # format always emits ("# HELP ...", "# TYPE ...") also contain the
+    # metric name and would make this always look "warm" if not excluded.
+    value_lines = [
+        line
+        for line in pre_body.splitlines()
+        if line.startswith("blackwellm:requests_completed_total{")
+    ]
     already_warm = (
-        pre_status == 200
-        and "requests_completed_total" in pre_body
-        and not all(
-            "} 0" in line for line in pre_body.splitlines() if "requests_completed_total" in line
-        )
+        pre_status == 200 and value_lines and not all(line.endswith("} 0") for line in value_lines)
     )
     if already_warm:
         print(
@@ -236,41 +253,64 @@ def run(base_url: str) -> tuple[int, int]:
     passed += api_passed
     failed += api_failed
 
-    # ── 5. Lost-wakeup: back-to-back turns < 200ms apart ─────────────────
-    print("\n=== 5. Back-to-back turns < 200ms apart (lost-wakeup window) ===")
-    status1, raw1 = client.post(
-        "/v1/chat/completions",
-        {
-            "model": "qwen3.6-rt",
-            "max_tokens": 32,
-            "messages": [{"role": "user", "content": "Say hello in one word."}],
-        },
-        timeout=60,
-    )
-    check("turn 1: status 200", status1 == 200, f"got {status1}: {raw1[:200]}")
-    # No sleep here on purpose -- the whole point is to fire turn 2 as fast
-    # as this process can, which is comfortably under the 152ms window that
-    # triggered the bug live.
-    t0 = time.perf_counter()
-    status2, raw2 = client.post(
-        "/v1/chat/completions",
-        {
-            "model": "qwen3.6-rt",
-            "max_tokens": 32,
-            "messages": [
-                {"role": "user", "content": "Say hello in one word."},
-                {"role": "assistant", "content": "Hello."},
-                {"role": "user", "content": "Say goodbye in one word."},
-            ],
-        },
-        timeout=30,
-    )
-    turn2_ms = (time.perf_counter() - t0) * 1000
+    # ── 5. Lost-wakeup: N rapid-fire turns, no gap between them ──────────
+    # First cut of this check (single back-to-back pair over a fresh
+    # http.client.HTTPConnection each time) did NOT reproduce the bug on
+    # 53f0dca -- confirmed by running it there. Root cause, from reading
+    # _step_sync itself: the race is a request landing between
+    # _drain_requests() and _drain_pipe() at the top of the round where the
+    # engine is *also* about to find active+waiting both empty and block --
+    # a window on the order of the gap between two consecutive Python
+    # statements, not 200ms. A fresh HTTPConnection per call spends that
+    # 200ms budget on TCP handshake + Python overhead sitting AFTER the
+    # engine has already reached its blocking read, where a new byte wakes
+    # it normally -- i.e. exactly the case that is NOT buggy. This version
+    # reuses ONE persistent connection across every turn (no new handshake,
+    # no sleep, no print inside the loop) to shrink client-side latency as
+    # close to zero as an HTTP client can get, and repeats it many times
+    # since each idle transition is an independent chance to land in the
+    # window, not a one-shot dice roll.
+    print("\n=== 5. Rapid-fire back-to-back turns (lost-wakeup window) ===")
+    n_rapid = 20
+    slow_round_s = 8.0  # generous vs. a small completion's real latency, tiny vs. a real hang
+    per_round: list[float | None] = []
+    conn = http.client.HTTPConnection(client.host, client.port, timeout=slow_round_s + 5)
+    for i in range(n_rapid):
+        body = json.dumps(
+            {
+                "model": "qwen3.6-rt",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": f"Reply with just the number {i}."}],
+            }
+        )
+        t0 = time.perf_counter()
+        try:
+            conn.request("POST", "/v1/chat/completions", body, {"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            resp.read()
+            per_round.append(time.perf_counter() - t0)
+        except OSError:
+            # A dead/reset connection after a stall is itself a symptom, not
+            # a script bug -- record it as a stall and get a fresh
+            # connection so the remaining rounds can still run.
+            per_round.append(None)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = http.client.HTTPConnection(client.host, client.port, timeout=slow_round_s + 5)
+    conn.close()
+    stalled = [i for i, t in enumerate(per_round) if t is None or t > slow_round_s]
+    fast_times = [t for t in per_round if t is not None]
     check(
-        f"turn 2 (fired <1ms after turn 1 landed): status 200 within 30s (took {turn2_ms:.0f}ms)",
-        status2 == 200,
-        f"got {status2}: {raw2[:200]} -- a hang here IS the lost-wakeup bug, "
-        f"not a slow-model false positive (see server/engine.py _step_sync)",
+        f"{n_rapid} rapid-fire turns: every round < {slow_round_s:.0f}s "
+        f"(fastest={min(fast_times):.2f}s slowest={max(fast_times):.2f}s)"
+        if fast_times
+        else f"{n_rapid} rapid-fire turns: every round < {slow_round_s:.0f}s (none completed)",
+        not stalled,
+        f"stalled rounds (0-indexed): {stalled} -- a stall here IS the lost-wakeup bug "
+        f"(see server/engine.py _step_sync), not a slow-model false positive; "
+        f"per_round={['-' if t is None else round(t, 2) for t in per_round]}",
     )
 
     # ── 6. Busy /metrics (engine.active non-empty) ───────────────────────
