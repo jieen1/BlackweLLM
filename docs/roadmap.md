@@ -10,8 +10,9 @@
 > [`investigation-queue.md`](investigation-queue.md) §D 的上游调研结论，重排优先级；
 > §7 的 D3（GPU CI 形态）、D6（Qwen3.6 主线 checkpoint）拍板，加上 N8
 > （`--session-affinity`，见 [`implementation-plan.md`](implementation-plan.md) §6.1）拍板；
-> 新增风险 RK9（冷启动/首次真实形状路径）。本轮另有三条 [待验证] 事项由并行 agent 在查
-> （B0-8 GDN、KV dtype 选型、torch wheel 是否带 `sm_120`），本文档不预判其结论。
+> 新增风险 RK9（冷启动/首次真实形状路径）。本轮那三条 [待验证] 事项**已全部答完**
+> （B0-8 GDN、KV dtype 选型、torch wheel 是否带 `sm_120`），结论见下方待验证清单与
+> [`investigation-queue.md`](investigation-queue.md) C-1/C-2/C-3。
 
 ---
 
@@ -745,17 +746,30 @@ drafter + 投机专用 `kv_cache_dtype`）读代码后发现**不完全对**—�
 - [ ] `Qwen3.6-25B-A3B` 的 `config.json`（专家数 / top-k / 是否 hybrid / 是否带 MTP）
 - [ ] sparkinfer `moe.fused_moe` 在非 256/top-10 形状下的可用性与性能
 - [ ] 现有 4 个失败测试各自的"正确期望"是什么（尤其 thinking tag 那个）
-- [ ] **（本批新增）** Qwen3.6 的 MTP 层是否带 GDN（`investigation-queue.md` B-6，另一 agent 在查）——
-  决定 Track B3 走哪个分支
-- [ ] **（本批新增）** NVFP4 KV vs FP8 KV 在我们卡上的 prefill/decode 对比（`investigation-queue.md`
-  C-2，另一 agent 在查）——决定 B3 的 KV dtype 选型
-- [ ] **（本批新增）** PyTorch 2.13.0 PyPI wheel 是否带 `sm_120`（`investigation-queue.md` C-3，
-  另一 agent 在查）——影响 RK6 与 H1"可从公开源安装"
+- [x] ~~Qwen3.6 的 MTP 层是否带 GDN~~ —— ✅ **已答（B-6 + B0-8 两轮独立核实，两个 checkpoint
+  的 `mtp.*` 张量全是 `self_attn.*`/`mlp.*`，零 `linear_attn.*`/`A_log`/`conv1d`）**。
+  ⚠️ **但由此推不出"B3 最难的一项消失"**——原判断把草稿侧与验证侧混为一谈了：verify 是把候选
+  token 整段跑一遍**主模型完整 64 层（含 48 层 GDN）**，候选被拒时主模型递归状态已被不可逆推进，
+  这跟 MTP 头的架构无关。真正消失的只有草稿侧那块。B3 体量**不下修**，见
+  [`implementation-plan.md`](implementation-plan.md) §7.1/B3 与 `investigation-queue.md` D-3（ReplaySSM）
+- [x] ~~NVFP4 KV vs FP8 KV 在我们卡上的对比~~ —— ✅ **已答：这个对比在当前技术栈上没有对照组**。
+  sparkinfer paged-attention（唯一的 attention 内核）只接受 fp16/bf16/fp8_e4m3 三种 KV dtype，
+  NVFP4 KV 会直接 `TypeError`。所以 B3 的"KV dtype 选型"**不是一个待选项**，FP8 是唯一可行值。
+  见 `investigation-queue.md` C-2
+- [x] ~~PyTorch 2.13.0 PyPI wheel 是否带 `sm_120`~~ —— ✅ **带**（干净 venv 实测
+  `2.13.0+cu130 [... 'sm_100', 'sm_120']`）。**自编译要求终结**，RK6 与 H1"可从公开源安装"解除
+  这一处阻塞。见 `investigation-queue.md` C-3
 - [ ] **（本批新增）** 当前生产配置下的真实显存占用带日期来源的审计（Track F/F2-0）——协调者本轮
   实时汇报的"94.2/97.9 GB，98.8%"与 2026-07-29 静态审计的"76.0/95.6 GB，79.5%"配置不同、
   未经交叉验证，需要一次新的、注明并发/上下文配置的 bfdiag run record
-- [ ] **（本批新增）** DFlash 的 eager verify 回退路径（`mode="verify"`）是否真的会在生产流量下
-  被打到，以及 CUDA Graph 捕获成功的可观测性缺口（见 RK9 / `implementation-plan.md` §7.3/C7）
+- [x] ~~DFlash 的 eager verify 回退路径是否真的会在生产流量下被打到~~ —— ✅ **已答：不会**。
+  今天它只有一条触发路径（verify CG 启动期捕获失败），是潜伏风险不是活跃故障；且
+  `QSR_DFLASH_REQUIRE_CG=1` 已让它在生产中不可达。沿途挖出的 eager-vs-CG 数值分歧**也已结案**：
+  稠密 fp32 oracle 判定两条路径在 attention 算子层面都对（cos ≥ 0.999997，高于本仓库 ≥0.999991 的
+  标准），分歧来自 MoE 离散路由放大微小数值差，**不是 split-KV merge 有 bug**。见
+  `investigation-queue.md` C-1
+- [ ] CUDA Graph 捕获**成功**的可观测性缺口仍在（只有失败打 warning，成功打 info，默认日志下不可见）——
+  见 RK9 / `implementation-plan.md` §7.3/C7-2
 - [ ] **（本批新增）** `NUM_SPECULATIVE_TOKENS` 从 15 静态调大是否能在不损失接受率的前提下提升吞吐
   （Track F/F1-1）
 
