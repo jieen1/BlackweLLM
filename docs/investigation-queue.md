@@ -81,9 +81,10 @@
 
 ## C. 自查 —— 需要 GPU（留给开发执行）
 
-> **状态（2026-08-02）**：C-1/C-2/C-3 三条已全部查完并结案。C-1 的结论比原假设更重
-> ——沿着它挖出一个独立的、**未根因**的数值分歧（eager verify vs CG verify，kv_len≥400 起
-> argmax 翻转），见下方条目与 [`../notes/2026-08-02-eager-verify-cg-verify-divergence.md`]
+> **状态（2026-08-02，晚间更新）**：C-1/C-2/C-3 三条已全部查完并结案。C-1 沿途挖出的
+> 数值分歧（eager verify vs CG verify，kv_len≥400 起 argmax 翻转）**现已根因并定级**：
+> 稠密 fp32 attention oracle 判定**两条路径在 attention 算子层面都是对的**，严重性从
+> "静默送错 token"下调为"两条路径输出不同"，见下方条目与 [`../notes/2026-08-02-eager-verify-cg-verify-divergence.md`]
 > (../notes/2026-08-02-eager-verify-cg-verify-divergence.md)。C-1 同时印证了 `roadmap.md` §6
 > RK9（冷启动/首次真实形状路径的系统性覆盖不足）是真实存在的一类盲区，而不只是从 JIT
 > 那个 bug 泛化出来的猜测。
@@ -113,6 +114,35 @@
   `QSR_DFLASH_REQUIRE_CG` 默认值从 `0`（降级但响亮）改成 `1`（拒绝启动），直到这个数值分歧
   被根因排查并修掉。根因排查需要 `bf divergence` 逐层定位，**独立立项，不在本次任务范围**。
   run record: `bf show 940b708aa0f8`。
+
+  **根因与定级（2026-08-02 晚，独立立项已完成）**：造了一个稠密 fp32 causal attention
+  oracle（`bfdiag/dense_attention_oracle.py`，完全不碰 sparkinfer 的 `create_paged_plan` /
+  `paged_attention_forward`），在单层隔离、不回灌模型的条件下三方对比。结论：**kv_len=
+  64/400/500 上 eager 与 CG-style 对 oracle 都是 cos ≥ 0.999997**，高于本仓库对"正确 kernel
+  变体"的 ≥0.999991 标准——**两种分块策略在 attention 算子层面都是对的**，split-KV merge
+  没有 bug。全模型那个 26.7 logit 差与 argmax 翻转来自 **MoE 的 top-10/256 离散路由把
+  微小数值差放大**（本仓库历史数据显示正常工作的 MoE 本身就在 cos ~0.95–0.97，远比
+  attention 的 ~0.999999 嘈杂）。
+
+  **方法上的一个坑，值得记住**：第一次尝试把 oracle 接进全部 12 个 full-attention 层，在
+  **kv_len=64**——那个已被证明 CG 与 eager 完全 bit-exact 的点——oracle 与它们的共识只有
+  cos=0.845。没有采信：两个独立实现且互相 bit-exact 的路径共享同一个 bug，远不如"新写的
+  oracle 有 bug"来得可能。改单层隔离后 oracle 对真实 eager 输出 cos=0.999999，证明 oracle
+  数学本身没错，混淆源正是 MoE 放大。**多层同时替换 + 活体前向 = 不可用的判据。**
+
+  同时更正上一轮一个真实错误：之前的 chunk-size 探测用了 sparkinfer 自带的 TP=2 分片形状
+  提示（24Q/4KV），而本部署真实是 TP=1（48Q/8KV，见 `model-support.md`）；数字已更正
+  （17600 → 37632 tokens），mismatch 计数结论不变。
+
+  **由此改变的决策**：`QSR_DFLASH_REQUIRE_CG=1` **保持默认，但理由换了**——不再是"merge
+  内核未经验证"，而是"本运行时承诺贪心逐位可复现，中途回退到 eager 会静默毁掉这个承诺"。
+  同一类失败，从可复现性而非算术抵达。方向 1（让 eager 也塌成单 chunk）现在风险更低，
+  但**只会缩小、不会消除**分歧，因为 MoE 会放大任何残余实现差异。
+
+  **诚实的缺口**：12 个 full-attention 层只逐层验证了第 0 层；一个手搓的 "CG-style"
+  workspace helper 有容量估算 bug，导致 OOM 后 `cudaErrorIllegalAddress` 污染了 daemon 的
+  CUDA context，遂停手而非反复重试（该 helper 未进仓库）。
+  详见 [`../notes/2026-08-02-eager-verify-cg-verify-divergence.md`](../notes/2026-08-02-eager-verify-cg-verify-divergence.md)。
 
 - [x] **C-2 · NVFP4 KV vs FP8 KV 在我们卡上的 prefill 对比** —— ✅ **查完：这个对比在当前技术栈上跑不起来，理由比预想更硬**
   详见 [`../notes/2026-08-01-c1-c2-gpu-investigation.md`](../notes/2026-08-01-c1-c2-gpu-investigation.md#c-2)。
