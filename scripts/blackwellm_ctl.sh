@@ -8,7 +8,7 @@
 # like vLLM -- the engine runs in a background thread of the same
 # `python -m server.app` process, so a plain PID/pgrep match is enough).
 #
-# Usage: scripts/blackwellm_ctl.sh {start|stop|restart|status|logs [n]|config|relay}
+# Usage: scripts/blackwellm_ctl.sh {start|stop|restart|status|logs [n]|config|relay|smoke}
 #
 # `start` also brings up a WSL2 relay (0.0.0.0:9000 -> 127.0.1.1:$PORT) so
 # external scrapers (Prometheus included) hit a stable port across server
@@ -287,6 +287,23 @@ cmd_relay() {
     launch_relay
 }
 
+# P0-B/C-LIVE (docs/implementation-plan.md §3): run the smoke gate against
+# an already-running server. Deliberately does NOT start/stop the server
+# itself -- reloading a fresh model is a multi-minute GPU operation (see
+# AGENTS.md's warm-engine-vs-cold-start distinction), and this is meant to
+# run after every change to server/ or runtime/backends/, not once. Restart
+# first if you want the cold-start /metrics check (scripts/c_live_smoke.py
+# check 1) to mean anything -- it only tests the real cold-start branch on
+# the FIRST generation request the server has ever served.
+cmd_smoke() {
+    if [ -z "$(find_pids)" ]; then
+        echo "ERROR: server not running on port $PORT -- start it first ('$0 start')" >&2
+        return 1
+    fi
+    cd "$REPO_ROOT" || { echo "ERROR: cannot cd to $REPO_ROOT" >&2; return 1; }
+    "$VENV_BIN/python" scripts/c_live_smoke.py --base-url "http://localhost:$PORT"
+}
+
 case "${1:-}" in
     start)   cmd_start ;;
     stop)    cmd_stop ;;
@@ -295,8 +312,9 @@ case "${1:-}" in
     logs)    cmd_logs "${2:-100}" ;;
     config)  cmd_config ;;
     relay)   cmd_relay ;;
+    smoke)   cmd_smoke ;;
     *)
-        echo "usage: $0 {start|stop|restart|status|logs [n_lines]|config|relay}"
+        echo "usage: $0 {start|stop|restart|status|logs [n_lines]|config|relay|smoke}"
         exit 1
         ;;
 esac
