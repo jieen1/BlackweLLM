@@ -76,7 +76,12 @@ the recorded ranges on 7 of 8 samples. See
 | code-4K | 341–359 tok/s | 97.8% |
 | fox-64K | 353–368 tok/s | 96.9% |
 
-Context capacity: 256K @ concurrency 2 (~93 GB), 128K @ concurrency 4 (~70 GB).
+Context capacity: **[unverified for Laguna]** — the figures previously quoted
+here (256K @ concurrency 2, 128K @ concurrency 4) come from Qwen3.6-27B's old
+capacity table and contradict Laguna's own memory audit. A live 3-slot × 256K
+configuration was measured at 94.2 / 97.9 GB on 2026-08-01; Laguna's weights
+alone are 67 GB. Re-deriving Laguna's real context × concurrency envelope is
+tracked as roadmap item D2 (memory planner).
 
 > We publish kernel-level latency comparisons only under identical conditions.
 > End-to-end throughput vs other engines depends on cache state, scheduling, and

@@ -46,8 +46,11 @@ RoPE           : full 层 yarn（theta 5e5, factor 32, partial 0.5）
 **当前性能**（2026-07-31 实测，2026-08-01 复现确认，analytic decode，无 TURBO）：
 4K 约 353–401 tok/s、64K 约 353–368 tok/s、接受率 96.3–100%。
 
-**质量**：MMLU-Pro 84.54%（414 题分层抽样）vs 官方 86.2；
-HumanEval+ 与上游框架同权重 A/B 打平。
+**质量**：⚠️ **无 Laguna 的评测数据。** 本仓库从未对 Laguna 跑过 MMLU-Pro /
+HumanEval+ —— `evalplus_results/official/` 下三份结果的 `model` 字段都是
+`qwen3.6`（2026-07-22）。此处原先引用的 84.54% / HumanEval+ 打平，是
+**Qwen3.6-27B** 在已退役的 vLLM 执行路径上的成绩，被误标到了 Laguna 名下。
+补测 Laguna 的质量基线已排为 Track C 的 C9。
 
 ---
 
