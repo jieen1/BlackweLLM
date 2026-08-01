@@ -66,16 +66,30 @@ LOAD_TIME_CONFIG_KEYS: frozenset[str] = frozenset(
 #: LagunaBackend.__init__/DFlashEngine.__init__ -- runtime/backends/
 #: laguna.py:305 (QSR_PREFILL_CHUNK), :342 (QSR_DECODE_CUDA_GRAPH);
 #: runtime/backends/laguna_dflash.py:168 (QSR_DFLASH_CUDA_GRAPH), :384
-#: (QSR_VERIFY_CUDA_GRAPH). Setting any of these on an already-loaded hot
-#: daemon has NO effect on the running engine -- see queue.py's sweep
-#: guard, which refuses to silently sweep one of these through a hot
-#: daemon and produce measurements that never actually changed anything.
+#: (QSR_VERIFY_CUDA_GRAPH), and (added alongside the C-1 capacity fix, see
+#: notes/2026-08-01-c1-c2-gpu-investigation.md) QSR_DFLASH_REQUIRE_CG --
+#: read once into DFlashEngine._require_cg, governs whether a CUDA Graph
+#: capture failure refuses to finish construction or degrades to that
+#: path's eager fallback. Defaults to "1" (refuse to start): the eager
+#: verify fallback, while capacity-correct, was found to diverge from the
+#: CG-verify path's real output at kv_len>=400 (not yet root-caused, see
+#: notes/2026-08-02-eager-verify-cg-verify-divergence.md) -- see
+#: DFlashEngine.__init__'s comment on self._require_cg for the live
+#: reasoning. -- and QSR_DFLASH_DEBUG_FORCE_CG_FAIL, a debug-only fault
+#: injector (comma-separated subset of "verify","draft","decode") read
+#: once into DFlashEngine._debug_force_cg_fail, never set outside
+#: diagnosis. Setting any of these on an already-loaded hot daemon has NO
+#: effect on the running engine -- see queue.py's sweep guard, which
+#: refuses to silently sweep one of these through a hot daemon and produce
+#: measurements that never actually changed anything.
 LOAD_TIME_ENV_VARS: frozenset[str] = frozenset(
     {
         "QSR_PREFILL_CHUNK",
         "QSR_DECODE_CUDA_GRAPH",
         "QSR_DFLASH_CUDA_GRAPH",
         "QSR_VERIFY_CUDA_GRAPH",
+        "QSR_DFLASH_REQUIRE_CG",
+        "QSR_DFLASH_DEBUG_FORCE_CG_FAIL",
     }
 )
 
@@ -583,6 +597,14 @@ class LagunaEngineProvider:
                 "gpu_memory_utilization": self._gpu_memory_utilization,
                 "dflash_model_path": self._dflash_model_path,
             },
+            # DFlashEngine.cg_status ("verify"/"draft"/"decode" ->
+            # "captured"/"failed"): a startup capture failure used to be
+            # observable only by grepping logs for one exact line (see
+            # notes/2026-08-01-c1-c2-gpu-investigation.md's C-1). Surfacing
+            # it here means `bf daemon status` shows whether any path is
+            # currently running in its (now capacity-correct, but slower)
+            # eager fallback, without needing to know that line exists.
+            "cg_status": dict(getattr(self._engine, "cg_status", {})) if self._engine else {},
         }
 
     def is_healthy(self) -> bool:

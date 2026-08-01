@@ -110,10 +110,20 @@ class BackendSnapshot:
     ``slots`` and ``prefix`` are indexed by slot and cover every slot, so a
     caller may zip them or index them directly without a bounds check.
     See ``docs/architecture.md`` §3.5.2.
+
+    ``dflash_cg_status`` is ``()`` when DFlash is not enabled or has not
+    attempted any CUDA Graph capture yet -- never missing, never raising --
+    so ``/metrics`` can iterate it unconditionally. Each entry is
+    ``(graph_name, "captured"|"failed")`` for a graph DFlash actually
+    attempted to capture (see ``DFlashEngine.cg_status``,
+    notes/2026-08-01-c1-c2-gpu-investigation.md). Tuple-of-pairs rather than
+    a dict to keep this dataclass's fields all plain immutable values,
+    matching ``slots``/``prefix`` above.
     """
 
     slots: tuple[SlotSnapshot, ...]
     prefix: tuple[PrefixSnapshot, ...]
+    dflash_cg_status: tuple[tuple[str, str], ...] = ()
 
 
 @runtime_checkable

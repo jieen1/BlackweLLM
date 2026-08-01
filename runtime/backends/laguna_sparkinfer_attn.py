@@ -153,6 +153,52 @@ class SparkinferPrefillWorkspace:
     against a fixed-capacity workspace measure ~4ms regardless of how much
     the real ``qo_len``/``kv_len`` differs from the previous call, vs ~32s
     for the very first call against any new workspace.
+
+    A second, distinct bug lived in how ``forward()`` sized that fixed
+    capacity (see notes/2026-08-01-c1-c2-gpu-investigation.md §C-1): it
+    always called ``PagedAttentionWorkspace.eager_extend_work_items_capacity``
+    -- an estimator whose name and design are for ``mode="extend"`` (its
+    ``max_work_items`` scales with ``max_total_q``, which is what extend's
+    real work-item count tracks) -- regardless of the ``mode`` actually being
+    requested. DFlash's eager verify fallback (``_forward_verify_with_aux``)
+    shares this same per-``(window_left, num_heads, num_kv_heads, head_size)``
+    workspace object with ordinary prefill, and calls it with ``mode="verify"``,
+    whose real work-item count does NOT scale with ``max_total_q`` the same
+    way (verify's query is a fixed, tiny 1-16 token window; its work items
+    scale with how many KV chunks the context needs, driven by kv_len/window,
+    not by query length) -- so the extend-shaped estimate silently
+    under-provisions it. Confirmed on real GPU: a direct call to
+    ``DFlashEngine._forward_verify_with_aux`` at an ordinary shape
+    (kv_len~2016, 16-token verify window) raised sparkinfer's
+    ``_ensure_capacity``: ``ValueError: fixed-capacity paged workspace
+    exceeded``, immediately, before any attention math ran.
+
+    Fix: ``forward()`` now dispatches the capacity estimate by ``mode``.
+    ``extend``/``decode`` keep ``eager_extend_work_items_capacity`` (the API
+    sparkinfer itself names and designs for that case). ``verify`` runs
+    sparkinfer's own real eager planner (``planner.create_paged_plan`` with
+    ``enable_cuda_graph=False`` -- the exact function every real verify call
+    below will use) once, up front, against a synthetic worst-case call at
+    this group's declared max capacity, and reads its actual
+    ``new_batch_size``/``total_num_partial_rows`` -- not a new,
+    independently-invented number, and not sparkinfer's OTHER (graph-mode)
+    capacity planner either.
+
+    An earlier version of this fix tried ``planner.plan_verify_graph_capacity``
+    on the theory that it was "the same capacity math LagunaCudaGraphVerify
+    already trusts" -- measured wrong on real GPU (see ``_work_item_capacity``'s
+    docstring): that planner computes a schedule for CUDA-Graph replay, a
+    different (and, empirically, smaller) chunking policy than the eager
+    path's own per-call schedule, so it under-provisioned the exact same way
+    the original bug did, just by a different amount. Both attempts, and why
+    the second one is right, are recorded in
+    notes/2026-08-01-c1-c2-gpu-investigation.md's follow-up section.
+    Deliberately NOT "call the extend estimator and multiply by a safety
+    factor" either: a fudge factor only moves the hard failure to some
+    larger shape nobody has tried yet, and there is no principled way to
+    know if any given factor is enough (see notes for why this project has
+    hit exactly that trap before, with a real per-shape kv_len+qo_len bound
+    rather than a coefficient).
     """
 
     def __init__(self, device: torch.device, *, max_total_q: int, max_page_table_width: int):
@@ -172,6 +218,38 @@ class SparkinferPrefillWorkspace:
         # (prefill is always single-slot; DFlash verify is always
         # single-slot -- see laguna.py and laguna_dflash.py call sites).
         self._max_batch = 1
+        # Upper bound on the query length any mode="verify" call will ever
+        # use against this instance. Zero (unset) means "no caller has
+        # declared verify traffic for this (window_left, heads, head_size)
+        # group yet" -- forward() raises loudly rather than guessing if
+        # mode="verify" shows up before declare_verify_capacity() is called.
+        # Set via declare_verify_capacity(), monotonically (max of every
+        # call), so multiple independent callers (main model's own verify
+        # users, if any is ever added, plus DFlash) can't shrink an
+        # already-declared bound.
+        self._max_verify_query_len = 0
+
+    def declare_verify_capacity(self, max_query_len: int) -> None:
+        """Declare that this workspace's ``mode="verify"`` calls never use a
+        query length above ``max_query_len``.
+
+        Must be called before the first real ``mode="verify"`` call reaches
+        ``forward()`` -- see the class docstring's second bug for why
+        skipping this is not "safe by default": there is no sound default
+        capacity for a mode this workspace has no other way to bound. Callers
+        (e.g. ``DFlashEngine.__init__`` via ``LagunaBackend.
+        declare_verify_capacity``) should pass the true maximum verify window
+        (``NUM_QUERY_PER_REQ``), not a per-call value -- this is a fixed
+        capacity contract, the same as ``max_total_q``/``max_page_table_width``
+        above, not a per-call hint.
+        """
+        max_query_len = int(max_query_len)
+        if max_query_len <= 1:
+            raise ValueError(
+                f"declare_verify_capacity requires max_query_len > 1, got {max_query_len} "
+                "(a single-token verify call is not a real contract this workspace serves)"
+            )
+        self._max_verify_query_len = max(self._max_verify_query_len, max_query_len)
 
     @staticmethod
     def _key(
@@ -205,6 +283,128 @@ class SparkinferPrefillWorkspace:
             int(v_cache.shape[3]),
             int(window_left),
         )
+
+    def _work_item_capacity(
+        self,
+        *,
+        mode: str,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        num_q_heads: int,
+        num_kv_heads: int,
+        window_left: int,
+    ) -> tuple[int, int]:
+        """Return ``(max_work_items, max_partial_rows)`` for a fixed-capacity
+        workspace serving ``mode`` at this group's declared capacity.
+
+        ``extend``/``decode``: sparkinfer's own eager-mode estimator, scaled
+        off ``max_total_q`` -- correct because extend/decode's real
+        work-item count tracks total query tokens (a plain one-token decode
+        call is comfortably inside a budget sized for up to
+        ``max_total_q`` extend tokens). ``max_partial_rows`` is always 0
+        here: matches ``PagedExtendGraphCapacity``, which has no
+        ``max_partial_rows`` field at all (no split-KV merge buffer for
+        these contracts).
+
+        ``verify``: ``max_total_q`` is not a valid proxy -- see the class
+        docstring's second bug.
+
+        First attempt at the real fix (superseded, kept here as a documented
+        dead end -- see notes/2026-08-01-c1-c2-gpu-investigation.md's
+        follow-up): reuse ``planner.plan_verify_graph_capacity``, on the
+        theory that it is "the same capacity math LagunaCudaGraphVerify
+        already trusts". Measured wrong on real GPU: at a perfectly ordinary
+        shape (kv_len~2000, 16-token window) the REAL eager plan
+        (``create_paged_plan(enable_cuda_graph=False, mode="verify", ...)``)
+        needed ``work_items=96, partial_rows=256``, while
+        ``plan_verify_graph_capacity`` predicted only ``47``/``112`` for the
+        same group at its declared max capacity. Root cause:
+        ``plan_verify_graph_capacity`` computes a schedule for the OTHER
+        execution mode -- one fixed, capture-static chunking policy that
+        must stay valid for every possible replay length under CUDA Graph
+        capture. The eager path computes a fresh, shape-specific schedule
+        per call (that is the whole point of not being graph-captured), and
+        that schedule can legitimately need MORE work items for the same
+        bounds than the graph policy's "worst case" -- the two modes are not
+        interchangeable capacity sources despite both being sparkinfer's own
+        code.
+
+        Actual fix: run the real eager planner itself
+        (``create_paged_plan(enable_cuda_graph=False, mode="verify", ...)``,
+        the exact function every real call below will use) once, up front,
+        against a synthetic worst-case call at this group's own declared
+        max capacity (``num_cache_pages`` full pages, ``query_len`` at the
+        caller-declared ``declare_verify_capacity()`` bound) -- the same
+        "build the real max-capacity plan, then trust its numbers" recipe
+        ``LagunaCudaGraphVerify``/``DFlashDraftCudaGraph`` already use
+        (``max_kv = max_pages * block_size - 1``), just read directly
+        instead of discovered via ``_ensure_capacity``'s auto-grow (which
+        eager's ``for_fixed_capacity`` workspace does not get, by design --
+        it must hard-fail on any later underestimate, not silently grow).
+        Confirmed monotonically increasing with kv_len on real GPU (full
+        attention: 6 work items at kv_len=0 -> 12288 at max kv_len=262127),
+        so sizing at the max bound is a genuine upper bound, not another
+        guess.
+        """
+        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+
+        if mode in ("extend", "decode"):
+            max_work_items = PagedAttentionWorkspace.eager_extend_work_items_capacity(
+                max_total_q=self._max_total_q,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+            )
+            return max_work_items, 0
+
+        if mode == "verify":
+            if self._max_verify_query_len <= 0:
+                raise RuntimeError(
+                    "SparkinferPrefillWorkspace: mode='verify' requested but no "
+                    "verify capacity was declared for this "
+                    f"(window_left={window_left}, num_q_heads={num_q_heads}, "
+                    f"num_kv_heads={num_kv_heads}) group. Call "
+                    "declare_verify_capacity(max_query_len) -- e.g. via "
+                    "LagunaBackend.declare_verify_capacity(), which DFlashEngine."
+                    "__init__ must call before any mode='verify' traffic can "
+                    "reach this workspace -- guessing a capacity here would "
+                    "repeat the exact under-provisioning bug this check exists "
+                    "to prevent (see notes/2026-08-01-c1-c2-gpu-investigation.md)."
+                )
+            from sparkinfer.attention.paged.planner import create_paged_plan
+
+            num_cache_pages = int(k_cache.shape[0])
+            page_size = int(k_cache.shape[1])
+            max_kv = max(num_cache_pages * page_size - 1, 1)
+            worst_page_table = torch.arange(
+                num_cache_pages, dtype=torch.int32, device=q.device
+            ).unsqueeze(0)
+            worst_cache_seqlens = torch.tensor([max_kv], dtype=torch.int32, device=q.device)
+            worst_cu_seqlens_q = torch.tensor(
+                [0, self._max_verify_query_len], dtype=torch.int32, device=q.device
+            )
+            worst_q = torch.empty(
+                self._max_verify_query_len,
+                num_q_heads,
+                int(q.shape[2]),
+                dtype=q.dtype,
+                device=q.device,
+            )
+            worst_plan = create_paged_plan(
+                worst_q,
+                k_cache,
+                v_cache,
+                worst_page_table,
+                worst_cache_seqlens,
+                worst_cu_seqlens_q,
+                mode="verify",
+                enable_cuda_graph=False,
+                window_left=window_left,
+            )
+            max_partial_rows = int(worst_plan.total_num_partial_rows) if worst_plan.split_kv else 0
+            return int(worst_plan.new_batch_size), max_partial_rows
+
+        raise ValueError(f"SparkinferPrefillWorkspace: unknown mode {mode!r}")
 
     def forward(
         self,
@@ -243,27 +443,34 @@ class SparkinferPrefillWorkspace:
         if is_new_workspace:
             num_q_heads = int(q.shape[1])
             num_kv_heads = int(k_cache.shape[2])
-            max_work_items = PagedAttentionWorkspace.eager_extend_work_items_capacity(
-                max_total_q=self._max_total_q,
+            max_work_items, max_partial_rows = self._work_item_capacity(
+                mode=mode,
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
                 num_q_heads=num_q_heads,
                 num_kv_heads=num_kv_heads,
+                window_left=window_left,
             )
             logger.info(
                 "SparkinferPrefillWorkspace: new fixed-capacity contract "
                 "mode=%s window_left=%d q_heads=%d kv_heads=%d "
-                "max_total_q=%d max_page_table_width=%d -- the *next* "
-                "paged_attention_forward call below pays sparkinfer's "
-                "one-time CuTe compile for this (mode, window_left); every "
-                "later call at any shape within this capacity reuses it "
-                "(and it stays warm across process restarts via sparkinfer's "
-                "own on-disk cache). See "
-                "notes/2026-08-01-prefill-shape-buckets-root-cause.md.",
+                "max_total_q=%d max_page_table_width=%d max_work_items=%d "
+                "max_partial_rows=%d -- the *next* paged_attention_forward "
+                "call below pays sparkinfer's one-time CuTe compile for this "
+                "(mode, window_left); every later call at any shape within "
+                "this capacity reuses it (and it stays warm across process "
+                "restarts via sparkinfer's own on-disk cache). See "
+                "notes/2026-08-01-prefill-shape-buckets-root-cause.md and "
+                "notes/2026-08-01-c1-c2-gpu-investigation.md.",
                 mode,
                 window_left,
                 num_q_heads,
                 num_kv_heads,
                 self._max_total_q,
                 self._max_page_table_width,
+                max_work_items,
+                max_partial_rows,
             )
             self._workspace = PagedAttentionWorkspace.for_fixed_capacity(
                 mode=mode,
@@ -279,7 +486,7 @@ class SparkinferPrefillWorkspace:
                 max_batch=self._max_batch,
                 max_page_table_width=self._max_page_table_width,
                 max_work_items=max_work_items,
-                max_partial_rows=0,
+                max_partial_rows=max_partial_rows,
                 num_cache_pages=int(k_cache.shape[0]),
                 use_cuda_graph=False,
             )

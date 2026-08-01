@@ -58,14 +58,28 @@ ROUTER_EXPORTS = runtime/kernels/laguna_router_sm120.exports
 ROUTER_GENERATED_DIR = runtime/kernels/_generated
 ROUTER_LIBRARY = $(ROUTER_GENERATED_DIR)/laguna_router_sm120.so
 ROUTER_MANIFEST = $(ROUTER_GENERATED_DIR)/laguna_router_sm120.manifest.json
-ROUTER_FLAGS = -std=c++17 -O3 --shared -Xcompiler -fPIC -Xcompiler -fvisibility=hidden -gencode arch=compute_120,code=sm_120a -cudart static -Xlinker --version-script=$(ROUTER_EXPORTS)
+# SM120 target family: use the `f` (family-specific, forward-compatible) virtual
+# architecture and matching real target, not the generic virtual arch paired with
+# the `a`-suffixed real target. Feature gating for SM120's block-scaled MMA (NVFP4)
+# lives on the *virtual* arch (`compute_120` vs `compute_120f`/`compute_120a`), not
+# on `code=`. `arch=compute_120,code=sm_120a` (the old form) elaborates device code
+# against the generic compute_120 feature set, then labels the cubin `sm_120a`; any
+# kernel that needs the family-gated block-scaled MMA path compiles clean but the
+# kernel body degrades to a `BPT.TRAP`/`EXIT` stub that faults at launch (verified
+# 2026-08-01 against runtime/kernels/nvfp4_gemm_sm120.cu — see docs/investigation-queue.md
+# B-5). `compute_120f,code=sm_120f` gets the same block-scaled MMA feature access as
+# `compute_120a,code=sm_120a` (SASS-instruction-identical, verified byte-for-byte) while
+# staying loadable across the whole 120 family (sm_121 / DGX Spark included), where
+# `sm_120a` cubins are rejected. Today's router only uses baseline warp-shuffle ISA, so
+# this change is a no-op for it (verified byte-identical SASS across both flag forms).
+ROUTER_FLAGS = -std=c++17 -O3 --shared -Xcompiler -fPIC -Xcompiler -fvisibility=hidden -gencode arch=compute_120f,code=sm_120f -cudart static -Xlinker --version-script=$(ROUTER_EXPORTS)
 
 build-laguna-router: ## Build the fixed-contract SM120 Laguna router artifact
 	@mkdir -p $(ROUTER_GENERATED_DIR)
 	@set -eu; tmp_library="$(ROUTER_LIBRARY).tmp"; \
 	$(NVCC) $(ROUTER_FLAGS) $(ROUTER_SOURCE) -o "$$tmp_library"; \
 	mv "$$tmp_library" "$(ROUTER_LIBRARY)"
-	@$(PYTHON) -c 'import hashlib,json,subprocess,sys; from pathlib import Path; library=Path(sys.argv[1]); manifest=Path(sys.argv[2]); source=Path(sys.argv[3]); flags=sys.argv[4]; payload={"abi_version":1,"target_sm":"sm_120a","nvcc":subprocess.check_output([sys.argv[5],"--version"],text=True).strip(),"ptxas":subprocess.check_output(["ptxas","--version"],text=True).strip(),"compile_flags":flags,"source_sha256":hashlib.sha256(source.read_bytes()).hexdigest(),"runtime_git_sha":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"library_sha256":hashlib.sha256(library.read_bytes()).hexdigest(),"provenance":{"license":"Apache-2.0","upstream":"vLLM csrc/libtorch_stable/moe/topk_softmax_kernels.cu","specialization":"256-expert BF16/FP32 sigmoid top-k router"}}; temporary=manifest.with_suffix(".tmp"); temporary.write_text(json.dumps(payload,indent=2,sort_keys=True)+"\n"); temporary.replace(manifest)' "$(ROUTER_LIBRARY)" "$(ROUTER_MANIFEST)" "$(ROUTER_SOURCE)" "$(ROUTER_FLAGS)" "$(NVCC)"
+	@$(PYTHON) -c 'import hashlib,json,subprocess,sys; from pathlib import Path; library=Path(sys.argv[1]); manifest=Path(sys.argv[2]); source=Path(sys.argv[3]); flags=sys.argv[4]; payload={"abi_version":1,"target_sm":"sm_120f","nvcc":subprocess.check_output([sys.argv[5],"--version"],text=True).strip(),"ptxas":subprocess.check_output(["ptxas","--version"],text=True).strip(),"compile_flags":flags,"source_sha256":hashlib.sha256(source.read_bytes()).hexdigest(),"runtime_git_sha":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"library_sha256":hashlib.sha256(library.read_bytes()).hexdigest(),"provenance":{"license":"Apache-2.0","upstream":"vLLM csrc/libtorch_stable/moe/topk_softmax_kernels.cu","specialization":"256-expert BF16/FP32 sigmoid top-k router"}}; temporary=manifest.with_suffix(".tmp"); temporary.write_text(json.dumps(payload,indent=2,sort_keys=True)+"\n"); temporary.replace(manifest)' "$(ROUTER_LIBRARY)" "$(ROUTER_MANIFEST)" "$(ROUTER_SOURCE)" "$(ROUTER_FLAGS)" "$(NVCC)"
 	@$(MAKE) verify-laguna-router
 
 verify-laguna-router: ## Verify the generated router ABI and dynamic dependencies
