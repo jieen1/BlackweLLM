@@ -19,7 +19,18 @@ if TYPE_CHECKING:
 ABI_VERSION = 1
 EXPERTS = 256
 TOP_K = 10
-TARGET_SM = "sm_120a"
+# Must match what `make build-laguna-router` stamps into the manifest. B-5
+# (2026-08-01, d9b635e) moved the build from `arch=compute_120,code=sm_120a`
+# to `compute_120f,code=sm_120f`: identical SASS for this kernel, but loadable
+# across the whole 120 family (sm_121 / DGX Spark) where `a` is rejected. The
+# check below is a real gate -- it refuses a library built for a different
+# target -- so leaving this at the old value made every freshly built router
+# fail to load, and with it the whole Laguna model.
+#
+# `sm_120a` stays accepted so an already-built artifact from before that
+# change still loads; both encode the same feature set for this kernel.
+TARGET_SM = "sm_120f"
+ACCEPTED_TARGET_SM = ("sm_120f", "sm_120a")
 
 _KERNEL_DIR = Path(__file__).with_name("kernels")
 _GENERATED_DIR = _KERNEL_DIR / "_generated"
@@ -120,9 +131,10 @@ class LagunaRouterLibrary:
             raise LagunaRouterError(
                 f"Laguna router ABI mismatch: expected {ABI_VERSION}, got {manifest.abi_version}"
             )
-        if manifest.target_sm != TARGET_SM:
+        if manifest.target_sm not in ACCEPTED_TARGET_SM:
             raise LagunaRouterError(
-                f"Laguna router target mismatch: expected {TARGET_SM}, got {manifest.target_sm}"
+                f"Laguna router target mismatch: expected one of "
+                f"{', '.join(ACCEPTED_TARGET_SM)}, got {manifest.target_sm}"
             )
         if _sha256(library_path) != manifest.library_sha256:
             raise LagunaRouterError("Laguna router library SHA256 does not match its manifest")
