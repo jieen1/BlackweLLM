@@ -493,9 +493,16 @@ def _build_sampling_params(
 ) -> SamplingParams:
     """Validate and build SamplingParams from API request fields.
 
-    ``temperature == 0`` (or ``None``) selects greedy decode with MTP
-    speculative verification.  ``temperature > 0`` enables true sampling
-    (autoregressive, no MTP).
+    ``temperature == 0`` (or ``None``) selects greedy decode. Both greedy
+    and ``temperature > 0`` (true sampling) get MTP speculative
+    verification when the backend has DFlash enabled -- E2-b
+    (docs/e2e-and-quality-plan.md §2.2) closed the gap where sampling used
+    to silently fall back to non-speculative autoregressive decode
+    (``DFlashEngine.dflash_round`` resolves accept/reject via rejection
+    sampling instead of an argmax comparison for non-greedy requests; see
+    ``server/engine.py::classify_decode_slots``). A backend without DFlash
+    enabled, or a grammar-constrained request, still always uses the plain
+    autoregressive path regardless of temperature.
     """
     if n is not None and n != 1:
         raise _invalid_request(

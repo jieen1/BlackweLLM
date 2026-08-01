@@ -115,7 +115,9 @@ class _FakeWarmRunner:
         # protocol.py) -- engine.py now reads .effective off this value.
         return PrefixHit(kv_hit=0, state_hit=0)
 
-    def prefill_chunked_begin(self, slots, prompts_per_slot, chunk_size: int = 512):
+    def prefill_chunked_begin(
+        self, slots, prompts_per_slot, chunk_size: int = 512, *, params_per_slot=None
+    ):
         result = {s: {"anchor": self.cold_anchor, "draft_tokens": []} for s in slots}
         return SimpleNamespace(done=True, result=result)
 

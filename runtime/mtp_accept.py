@@ -2,6 +2,20 @@
 
 从 direct_model_runner.py 提取的 determine_accept_reject* 纯函数。
 纯移动不改逻辑（B5 parity 门禁）。
+
+E2-a (docs/e2e-and-quality-plan.md §2.2) adds the non-greedy sibling of the
+functions above: rejection-sampling accept/reject for ``temperature>0``
+speculative decoding (``sample_accept_reject`` and its two building blocks,
+``acceptance_probability`` / ``residual_distribution``, near the bottom of
+this file). The greedy functions never sample (``argmax`` is deterministic
+and needs no distribution-preservation argument); the non-greedy ones draw
+random numbers, so "produces *a* token" is not enough -- it must produce a
+token whose marginal distribution equals the target model's own sampling
+distribution, otherwise speculative decoding silently changes what the
+model outputs. See ``sample_accept_reject``'s docstring for the algorithm
+and ``tests/test_mtp_accept_sampling.py`` for the exact-rational proof that
+this file's formulas satisfy that property (not just "looks right on a
+synthetic example").
 """
 
 from __future__ import annotations
@@ -128,3 +142,189 @@ def determine_accept_reject_batch(
             "rejected_at": na if na < k else None,
         }
     return decisions
+
+
+# --------------------------------------------------------------------------
+# E2-a: non-greedy (rejection-sampling) accept/reject.
+# --------------------------------------------------------------------------
+#
+# Reference: Leviathan, Kalman & Matias, "Fast Inference from Transformers
+# via Speculative Decoding" (https://arxiv.org/abs/2211.17192) and Chen et
+# al., "Accelerating Large Language Model Decoding with Speculative
+# Sampling" (https://arxiv.org/abs/2302.01318) -- the same algorithm vLLM
+# ships in ``vllm/v1/sample/rejection_sampler.py`` (read locally at
+# ``/home/bot/vllm/vllm/v1/sample/rejection_sampler.py`` while implementing
+# this) and SGLang implements for its EAGLE path. This module is a plain
+# eager/CPU-tensor re-derivation of that same algorithm -- not a novel one --
+# scoped for E2-a (CPU-only correctness) and reusable by E2-b's GPU
+# integration once it lands.
+#
+# ``determine_accept_reject*`` above only ever needs to prove "picks the
+# same token the greedy target model would have picked" -- an equality
+# check. The functions below instead must prove a *distributional*
+# property: draw K draft tokens ``x_0..x_{K-1}`` from a draft distribution
+# ``q_0..q_{K-1}`` (independent per position, one row per verify position);
+# for each position in turn, accept ``x_p`` with probability
+# ``min(1, p_p(x_p) / q_p(x_p))``; on the first rejection at position ``r``,
+# resample from the *residual* distribution
+# ``norm(max(0, p_r - q_r))`` and stop (later positions are discarded, same
+# as the greedy path -- their target distributions were computed under a
+# now-invalidated hypothesized context and are never real). If every
+# position is accepted, sample one "bonus" token directly from ``p_K``
+# (position K's target distribution needed no acceptance test -- it was
+# never proposed by the draft model, so there is nothing to correct).
+#
+# The correctness claim -- unconditional on ``q`` -- is that the output
+# token's marginal distribution at any position that is *reached* equals
+# ``p`` at that position, exactly:
+#
+#   P(output = x) = q(x) * min(1, p(x)/q(x))                    [accepted]
+#                  + (1 - sum_y q(y)*min(1, p(y)/q(y))) * r(x)   [rejected]
+#                  = min(p(x), q(x)) + max(0, p(x) - q(x))       [algebra]
+#                  = p(x)                                        for every x
+#
+# (``min(a,b) + max(0,a-b) == a`` for any reals ``a,b`` -- case split on
+# ``a>=b`` vs ``a<b`` -- so this holds token-by-token with no assumption
+# about ``q`` at all, in particular without requiring ``q`` and ``p`` to
+# share support). ``tests/test_mtp_accept_sampling.py`` checks this
+# algebraic identity with ``fractions.Fraction`` (exact rational arithmetic,
+# not float comparison) across hand-picked edge cases (identical
+# distributions, disjoint support, one-hot/deterministic distributions) and
+# randomized rational distributions, then separately checks that *this
+# file's* ``acceptance_probability``/``residual_distribution`` functions
+# reproduce those same exact values, then separately runs a statistical
+# (chi-square) goodness-of-fit test on actual samples drawn through
+# ``sample_accept_reject`` to confirm the RNG-driven code path (not just the
+# closed-form formula) reproduces the target distribution.
+
+
+def acceptance_probability(
+    target_row: torch.Tensor, draft_row: torch.Tensor, token: int
+) -> torch.Tensor:
+    """``min(1, p(token)/q(token))`` -- the probability of accepting a draft
+    token proposed at this position, given the target distribution
+    ``target_row`` (``p``) and the draft distribution ``draft_row`` (``q``)
+    at the SAME position. Returns a 0-d tensor so callers can compare it
+    against a uniform draw without a host round trip.
+
+    ``q(token) <= 0`` returns 0 (always reject): a token actually sampled
+    from ``q`` has ``q(token) > 0`` almost surely, so this branch is a
+    defensive floor against float underflow, not a case the algorithm's
+    derivation depends on (mirrors vLLM's
+    ``accepted = draft_prob > 0 and target_prob / draft_prob >= uniform_prob``).
+    """
+    q_x = draft_row[token]
+    if q_x <= 0:
+        return torch.zeros((), dtype=target_row.dtype, device=target_row.device)
+    p_x = target_row[token]
+    return torch.clamp(p_x / q_x, max=1.0)
+
+
+def residual_distribution(target_row: torch.Tensor, draft_row: torch.Tensor) -> torch.Tensor:
+    """``norm(max(0, p - q))`` -- the distribution a rejection resamples
+    from. Deterministic (no RNG): the random part of "resample from the
+    residual" is entirely in the caller's ``torch.multinomial`` draw, so
+    this function's output can be checked exactly against a hand-derived
+    expectation without needing to reason about any sampler.
+
+    ``total <= 0`` (only possible when ``target_row == draft_row``
+    everywhere, i.e. ``p == q``) falls back to ``p`` itself. This is an
+    unreachable branch in the real accept/reject loop -- a rejection at
+    token ``x`` requires ``p(x) < q(x)``, which by conservation of
+    probability mass (``sum p == sum q == 1``) forces
+    ``sum_{y != x} (p(y) - q(y)) == q(x) - p(x) > 0``, hence residual mass
+    strictly greater than 0 elsewhere; see
+    ``tests/test_mtp_accept_sampling.py`` for the exact-rational proof of
+    that conservation argument. Kept anyway as a defensive floor against
+    float cancellation (``target_row - draft_row`` summing to a tiny
+    negative or zero value instead of the true positive one).
+    """
+    residual = (target_row - draft_row).clamp_min(0.0)
+    total = residual.sum()
+    if total <= 0:
+        residual = target_row.clamp_min(0.0)
+        total = residual.sum()
+    return residual / total
+
+
+def sample_accept_reject(
+    draft_tokens: list[int],
+    draft_probs: torch.Tensor,
+    target_probs: torch.Tensor,
+    *,
+    generator: torch.Generator | None = None,
+) -> dict:
+    """Non-greedy (rejection-sampling) MTP accept/reject -- the
+    ``temperature>0`` sibling of ``determine_accept_reject_from_predictions``.
+
+    Args:
+        draft_tokens: K draft continuation tokens (NOT including the
+            anchor -- unlike the greedy functions above, there is no
+            "anchor" concept here: position ``p``'s acceptance test only
+            ever needs ``draft_tokens[p]``, ``draft_probs[p]`` and
+            ``target_probs[p]``).
+        draft_probs: ``[K, vocab]``. Row ``p`` is the draft model's own
+            sampling distribution (post temperature/top-k/top-p, i.e. the
+            same distribution ``runtime.sampling.sample_from_logits`` would
+            have normalized to) at the position where it produced
+            ``draft_tokens[p]``. MUST be the distribution actually sampled
+            from -- passing ``argmax``-derived probabilities here would
+            silently change the acceptance math (this is precisely the gap
+            E2-b has to close: today's draft forward always samples
+            greedily, so it has no non-degenerate ``q`` to hand this
+            function yet).
+        target_probs: ``[K+1, vocab]``. Rows ``0..K-1`` are the target
+            (main) model's distribution at each of the K verify positions,
+            used for that position's acceptance test. Row ``K`` is the
+            target distribution one position past the last draft token,
+            used ONLY for the bonus token when every draft is accepted.
+        generator: optional seeded ``torch.Generator`` (CPU or CUDA,
+            matching the tensors' device) for reproducible sampling --
+            same role as ``runtime.sampling.sample_from_logits``'s
+            ``generator`` argument. Every random draw in this function
+            (acceptance tests, residual resampling, bonus sampling) reads
+            from this ONE generator in sequence, so a
+            ``runtime.sampling.PersistentSeed``-backed generator advances
+            consistently across an entire request's decode, same as the
+            existing sampled decode path.
+
+    Returns:
+        Same contract as ``determine_accept_reject_from_predictions``:
+        ``{"num_accepted": int, "committed": list[int], "rejected_at":
+        int | None}``. ``committed`` is the accepted draft prefix plus
+        EXACTLY one trailing recovery-or-bonus token, so this is a drop-in
+        return-shape match for ``_verify_only_accept_reject`` in
+        ``runtime/backends/laguna_dflash.py`` once E2-b wires the two
+        together -- E2-a does not touch that file (it needs a live GPU
+        model to actually produce ``draft_probs``, see the module-level
+        docstring's "not yet available" callout above).
+    """
+    k = len(draft_tokens)
+    if draft_probs.shape[0] != k:
+        raise ValueError(
+            f"draft_probs must have one row per draft token (need {k}, "
+            f"got {draft_probs.shape[0]})"
+        )
+    if target_probs.shape[0] < k + 1:
+        raise ValueError(
+            "target_probs must contain K verifier distributions plus one bonus "
+            f"distribution (need {k + 1}, got {target_probs.shape[0]})"
+        )
+
+    device = draft_probs.device
+    committed: list[int] = []
+    for p in range(k):
+        token = draft_tokens[p]
+        accept_prob = acceptance_probability(target_probs[p], draft_probs[p], token)
+        u = torch.rand((), generator=generator, dtype=torch.float64, device=device)
+        if bool(u < accept_prob):
+            committed.append(token)
+            continue
+        residual = residual_distribution(target_probs[p], draft_probs[p])
+        recovered = int(torch.multinomial(residual, 1, generator=generator).item())
+        committed.append(recovered)
+        return {"num_accepted": p, "committed": committed, "rejected_at": p}
+
+    bonus = int(torch.multinomial(target_probs[k], 1, generator=generator).item())
+    committed.append(bonus)
+    return {"num_accepted": k, "committed": committed, "rejected_at": None}

@@ -235,6 +235,8 @@ class ModelBackend(Protocol):
         slots: list[int],
         prompts_per_slot: list[list[int]],
         chunk_size: int = 512,
+        *,
+        params_per_slot: dict[int, SamplingParams] | None = None,
     ) -> ChunkedPrefillState: ...
 
     def prefill_chunked_step(self, state: ChunkedPrefillState) -> bool: ...
@@ -262,6 +264,7 @@ class ModelBackend(Protocol):
         anchors: dict[int, int],
         drafts: dict[int, list[int]],
         *,
+        params_per_slot: dict[int, SamplingParams] | None = None,
         return_logprobs: bool = False,
         top_logprobs: int = 0,
     ) -> dict[int, dict]: ...

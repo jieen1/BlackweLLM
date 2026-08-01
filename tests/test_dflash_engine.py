@@ -193,6 +193,94 @@ class TestVerifyOnlyAcceptReject:
         }
 
 
+class TestSampleVerifyOnlyAcceptReject:
+    """E2-b (docs/e2e-and-quality-plan.md §2.2): the non-greedy sibling of
+    TestVerifyOnlyAcceptReject above, exercising the REAL
+    ``runtime.backends.laguna_dflash._sample_verify_only_accept_reject`` --
+    same ``context_count``/``next_anchor`` bookkeeping contract, but the
+    accept/reject decision itself comes from rejection sampling
+    (``runtime.mtp_accept.sample_accept_reject``, already proven correct in
+    tests/test_mtp_accept_sampling.py) instead of an argmax comparison.
+    These tests use deterministic (RNG-independent) accept/reject edge
+    cases -- q==p forces certain acceptance, disjoint support forces
+    certain rejection -- so the CONTRACT (context_count/next_anchor
+    derivation, dict shape) can be locked down here without re-deriving
+    E2-a's statistical proof.
+    """
+
+    def _decide(self, draft_tokens, draft_probs, target_probs, generator=None):
+        pytest.importorskip("numpy")
+        torch = pytest.importorskip("torch")
+        from runtime.backends.laguna_dflash import _sample_verify_only_accept_reject
+
+        return _sample_verify_only_accept_reject(
+            draft_tokens,
+            draft_probs,
+            target_probs,
+            generator=generator or torch.Generator().manual_seed(0),
+        )
+
+    def test_certain_accept_matches_greedy_shape(self):
+        """q == p at every position: certain full accept, same dict shape
+        TestVerifyOnlyAcceptReject.test_full_accept_emits_target_bonus
+        locks down for the greedy path (context_count = K+1, next_anchor =
+        the bonus token)."""
+        torch = pytest.importorskip("torch")
+
+        uniform = torch.full((5,), 0.2, dtype=torch.float64)
+        draft_probs = torch.stack([uniform, uniform, uniform])
+        bonus_row = torch.tensor([0.1, 0.2, 0.3, 0.2, 0.2], dtype=torch.float64)
+        target_probs = torch.stack([uniform, uniform, uniform, bonus_row])
+
+        decision = self._decide([0, 1, 2], draft_probs, target_probs)
+        assert decision["num_accepted"] == 3
+        assert decision["rejected_at"] is None
+        assert decision["committed"][:3] == [0, 1, 2]
+        assert decision["context_count"] == 4
+        assert decision["next_anchor"] == decision["committed"][3]
+
+    def test_certain_reject_matches_greedy_shape(self):
+        """Disjoint support: certain rejection at position 0, same dict
+        shape TestVerifyOnlyAcceptReject.test_first_reject locks down for
+        the greedy path (context_count = 1, next_anchor = the recovery
+        token)."""
+        torch = pytest.importorskip("torch")
+
+        q = torch.tensor([0.5, 0.5, 0.0, 0.0], dtype=torch.float64)
+        p = torch.tensor([0.0, 0.0, 0.6, 0.4], dtype=torch.float64)
+        draft_probs = q.unsqueeze(0)
+        target_probs = torch.stack([p, p])
+
+        decision = self._decide([0], draft_probs, target_probs)
+        assert decision["num_accepted"] == 0
+        assert decision["rejected_at"] == 0
+        assert len(decision["committed"]) == 1
+        assert decision["committed"][0] in (2, 3)  # p's support, never q's
+        assert decision["context_count"] == 1
+        assert decision["next_anchor"] == decision["committed"][0]
+
+    def test_middle_reject_matches_greedy_shape(self):
+        """First position certain-accepts (q==p), second certain-rejects
+        (disjoint support) -- exercises the early-return-after-K=1-of-2
+        path, mirroring TestVerifyOnlyAcceptReject.test_middle_reject's
+        shape (context_count = 2, next_anchor = the recovery token)."""
+        torch = pytest.importorskip("torch")
+
+        uniform = torch.full((4,), 0.25, dtype=torch.float64)
+        q1 = torch.tensor([0.5, 0.5, 0.0, 0.0], dtype=torch.float64)
+        p1 = torch.tensor([0.0, 0.0, 0.6, 0.4], dtype=torch.float64)
+        draft_probs = torch.stack([uniform, q1])
+        target_probs = torch.stack([uniform, p1, p1])  # 3rd row unused (rejects at 1)
+
+        decision = self._decide([0, 0], draft_probs, target_probs)
+        assert decision["num_accepted"] == 1
+        assert decision["rejected_at"] == 1
+        assert decision["committed"][0] == 0
+        assert decision["committed"][1] in (2, 3)
+        assert decision["context_count"] == 2
+        assert decision["next_anchor"] == decision["committed"][1]
+
+
 class TestRingBlocksForDraft:
     """Verify draft KV cache sizing against the REAL ring-blocks formula
     (runtime.backends.laguna._ring_blocks_for_window), not a hand-copied
