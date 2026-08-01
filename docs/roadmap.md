@@ -156,7 +156,7 @@ R1–R6、R8 已在 2026-08-01 的 Track 0 批次里解决，保留在表里是�
 | S1 | **模型是硬编码的，不是配置** | `ServerEngine.MODEL = "poolside/Laguna-S-2.1-NVFP4"`；`BACKEND = "laguna"` 且拒绝其他值；`server/app.py` 里 `SERVER_MODEL_BACKEND = "laguna"` |
 | S2 | **没有 backend 协议** | `LagunaBackend` 有 50+ 公开方法，`ServerEngine` 直接调用，没有任何接口约束。加第二个模型时无从下手 |
 | S3 | **ModelSpec 是空壳** | `runtime/model_spec.py` 88 行，只有层名列表和 MTP 开关；不描述层类型序列、RoPE 类型、量化格式、MLP 类型 |
-| S4 | **只有一类缓存** | `block_pool.py` 只管 paged KV；GDN/SSM 递归状态的挂钩（`evict_gdn_checkpoint` 等）是 Qwen3.6 时代留下的**残迹**，当前 Laguna 无 GDN 层，这条路径没有活代码 |
+| S4 | **只有一类缓存** | `block_pool.py` 只管 paged KV；GDN/SSM 递归状态的挂钩（`evict_gdn_checkpoint` 等）是为 Qwen3.6 写的**休眠原语**（措辞已于 2026-08-02 更正，此前误称"残迹"——它经过验证、有测试，不是待清理物），当前 Laguna 无 GDN 层，这条路径没有活代码。第 7 步复用它，不重写 |
 | S5 | **加载器只认一种量化格式** | 只支持 compressed-tensors（Laguna）；Qwen3.6 NVFP4 是 modelopt 格式 |
 | S6 | **router kernel 写死 Laguna** | `runtime/laguna_router.py`：`EXPERTS = 256`、`TOP_K = 10` 是模块级常量 |
 | S7 | **容量配置要人肉算** | 启动要同时设对 `QSR_SERVER_CAPACITY` / `NUM_SLOTS` / `BLOCKS_PER_SLOT` / `PRODUCTION`，四者有耦合约束，算错就是 OOM 或白白浪费显存 |
@@ -285,7 +285,7 @@ vision_config     : 存在（多模态）— 本路线图只做文本版
   先用 Laguna 做唯一实现，**协议由现有实现倒推**，不预设未来。
 - **A3 缓存资源抽象**：`block_pool` 从"KV 分页器"升级为"槽位资源管理器"，
   统一管理两类资源——分页 KV（长度相关）与递归状态（长度无关、每槽固定）。
-  前缀缓存的驱逐必须对两类资源联动（这正是 §1.5-S4 里那些残迹当年要解决的问题）。
+  前缀缓存的驱逐必须对两类资源联动（这正是 §1.5-S4 里那些休眠原语当年要解决的问题）。
 - **A4 加载器抽象**：compressed-tensors / modelopt 两套 NVFP4 布局的
   tensor 命名与 scale 语义分离成两个 adapter，公共部分（分片流式读取、
   参数全覆盖断言、KV scale post-load）保持不变。
