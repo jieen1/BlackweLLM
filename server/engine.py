@@ -1086,6 +1086,29 @@ class ServerEngine:
         # If waiting has requests (e.g. admission failed and re-queued),
         # we must loop back to retry admission, NOT block on the pipe.
         if not self.active and not self.waiting and self._pending_prefill is None:
+            # Re-drain immediately before blocking. `self.waiting` was filled
+            # at the top of this round and `_drain_pipe` right after it ate
+            # every wakeup byte then pending -- so a request appended between
+            # those two lines is in `_req_deque` with its wakeup byte already
+            # consumed, and the emptiness test above cannot see it. Blocking
+            # here would then sleep forever on a request that has already
+            # arrived.
+            #
+            # Observed live 2026-08-01: an agent's follow-up turn landed 152 ms
+            # after the previous one finished -- precisely while the engine was
+            # winding down into this branch -- and the engine stopped stepping
+            # (`rounds` frozen, GPU idle, `active`/`waiting` both empty) until
+            # the client timed out. Not intermittent: a conversational client
+            # sends its next turn in exactly this window every time.
+            #
+            # Ordering is what makes this airtight, so keep it: a request that
+            # arrives before the re-drain is seen here; one that arrives after
+            # it still has its wakeup byte in the pipe, because nothing drains
+            # the pipe between the re-drain and the blocking read.
+            self._drain_requests()
+            if self.waiting:
+                return
+
             # Set pipe to blocking mode for efficient idle wait
             os.set_blocking(self._req_pipe_r, True)
             try:
