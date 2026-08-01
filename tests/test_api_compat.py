@@ -583,11 +583,23 @@ def test_anthropic_array_content(base_url):
     check_no_thinking_leak(text, "anthropic array content")
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
-    args = parser.parse_args()
-    base = args.base_url.rstrip("/")
+def run(base_url: str) -> tuple[int, int, list[tuple[str, str, str]]]:
+    """Run every check against ``base_url`` and return (passed, failed,
+    results) without exiting the process -- C-LIVE (scripts/c_live_smoke.py)
+    calls this directly to reuse this file's dual-protocol x stream/
+    non-stream x tool-call coverage instead of re-deriving it.
+
+    PASS_COUNT/FAIL_COUNT/RESULTS are module-level (every ``report()`` call
+    from any of the test_* functions above touches them via ``global``) --
+    reset them here rather than threading a result object through ten
+    functions that predate this refactor. Not safe for concurrent calls in
+    the same interpreter; nothing here needs that.
+    """
+    global PASS_COUNT, FAIL_COUNT, RESULTS
+    PASS_COUNT = 0
+    FAIL_COUNT = 0
+    RESULTS = []
+    base = base_url.rstrip("/")
 
     print("BlackweLLM API Compatibility Test")
     print("Target: " + base)
@@ -608,7 +620,6 @@ def main():
     test_anthropic_multi_turn(base)
     test_anthropic_array_content(base)
 
-    # Summary
     print("")
     print("=" * 60)
     total = PASS_COUNT + FAIL_COUNT
@@ -620,7 +631,15 @@ def main():
             if status == "FAIL":
                 print("  - " + name + ": " + detail)
     print("=" * 60)
-    sys.exit(1 if FAIL_COUNT > 0 else 0)
+    return PASS_COUNT, FAIL_COUNT, RESULTS
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    args = parser.parse_args()
+    _passed, failed, _results = run(args.base_url)
+    sys.exit(1 if failed > 0 else 0)
 
 
 if __name__ == "__main__":

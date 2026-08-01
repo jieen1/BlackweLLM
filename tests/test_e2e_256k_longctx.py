@@ -146,24 +146,35 @@ def run_concurrent(
     return [r if r is not None else (0, "timeout", 0.0) for r in results]
 
 
-def main():
-    parser = argparse.ArgumentParser(description="256K long-context E2E test")
-    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
-    args = parser.parse_args()
+def run(base_url: str) -> tuple[int, int]:
+    """Run every phase against ``base_url`` and return (passed, failed)
+    without exiting the process. PASS/FAILED/RESULTS are module-level
+    (every ``check()`` call touches them via ``global``); reset here so a
+    second call in the same interpreter doesn't accumulate. Not safe for
+    concurrent calls in the same interpreter; nothing here needs that.
 
-    client = Client(args.base_url)
+    Raises ``RuntimeError`` if the server is unreachable, rather than the
+    original bare ``sys.exit(2)`` -- a caller driving this as a subroutine
+    (as opposed to a standalone script) needs an exception it can catch,
+    not a process exit.
+    """
+    global PASSED, FAILED, RESULTS
+    PASSED = 0
+    FAILED = 0
+    RESULTS = []
+
+    client = Client(base_url)
     mem_baseline = gpu_mem_mib()
 
     print("=" * 72)
     print("  256K Full-Context · Max-Concurrency · Multi-Turn E2E Test")
     print(f"  Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  Server: {args.base_url}")
+    print(f"  Server: {base_url}")
     print(f"  GPU baseline: {mem_baseline} MiB")
     print("=" * 72)
 
     if not client.health():
-        print("FATAL: server not reachable")
-        sys.exit(2)
+        raise RuntimeError(f"server not reachable at {base_url}")
 
     filler_200k = make_filler(200_000)
     filler_128k = make_filler(128_000)
@@ -348,7 +359,19 @@ def main():
     print(f"  RESULTS: {PASSED} passed, {FAILED} failed, {PASSED + FAILED} total")
     print(f"  GPU: baseline={mem_baseline}MiB → final={gpu_mem_mib()}MiB")
     print(f"{'=' * 72}")
-    sys.exit(1 if FAILED else 0)
+    return PASSED, FAILED
+
+
+def main():
+    parser = argparse.ArgumentParser(description="256K long-context E2E test")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    args = parser.parse_args()
+    try:
+        _passed, failed = run(args.base_url)
+    except RuntimeError as exc:
+        print(f"FATAL: {exc}")
+        sys.exit(2)
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":
