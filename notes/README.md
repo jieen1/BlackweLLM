@@ -50,6 +50,7 @@
 | `2026-07-27-ptxas-ice-diagnosis.md` | ptxas 编译器崩溃诊断 |
 | `2026-07-29-cg-slot-doubling-fix.md` | CUDA Graph 槽位重复分配 |
 | `2026-07-24-moe-b12x-cudagraph-incompat-fix.md` | MoE kernel 与 CUDA Graph 不兼容 |
+| `2026-08-01-bfdiag-assertion-audit.md` | **bfdiag 断言可信度审计(Track C0)**——`reset_slot` 隔离保证失效(checkpoint/restore + daemon reset 两处都依赖已经不成立的"reset_slot 会清零 KV");两份手册误称 `reconcile_prefix_hit` 是 stub(实为生产代码);已删除的 `bug_found_not_fixed` 条目;`bfdiag/` 其余模块的真假断言普查 |
 
 ## 3. SM120 kernel 研究 🟢
 
