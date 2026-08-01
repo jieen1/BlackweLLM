@@ -51,14 +51,35 @@
 
 ## C. 自查 —— 需要 GPU（留给开发执行）
 
-- [ ] **C-1 · warmup / autotune / CUDA Graph 捕获是否用真实形状**
-  依据 flashinfer #3255：失败**不在** autotuner 第一个小的合成形状上，而在后面一个匹配真实模型维度的形状上。
-  本项目已有同型伤疤（fp8 舍入平局：合成随机数据复现不出真实数据的 bug）。
-  查：CUDA Graph 捕获与 DFlash warmup 用的是生产形状还是占位形状。
+- [x] **C-1 · warmup / autotune / CUDA Graph 捕获是否用真实形状** —— ✅ **部分成立，且挖到一个更严重的活 bug**
+  详见 [`../notes/2026-08-01-c1-c2-gpu-investigation.md`](../notes/2026-08-01-c1-c2-gpu-investigation.md#c-1)。
+  CUDA Graph 捕获（`laguna_cuda_graph.py`/`laguna_dflash_cudagraph.py`）和
+  `warmup_paged_attention_shapes()` 对它们覆盖的 contract 确实用生产真实容量，不是占位小形状——
+  flashinfer #3255 字面那种模式在这两处不成立。但沿着 `warmup_paged_attention_shapes()`
+  自己承认的缺口（`mode="verify"` 未被预热）往下查，**GPU 实测坐实**：DFlash 主模型的
+  eager verify 回退（`_forward_verify_with_aux`）直接调用生产函数会 `ValueError` 崩掉——
+  `SparkinferPrefillWorkspace.forward()` 不分 mode 永远用为 `extend` 设计的
+  `eager_extend_work_items_capacity` 估算容量，套到 `verify` 契约上就低估了。今天线上不是
+  正在发生的故障（本次冷启动 verify CG/draft CG 都正常捕获成功），但只要某次启动 verify CG
+  捕获失败（异常被吞掉，`self._verify_cg` 永久 `None`），该进程余下生命周期里 DFlash 每一轮
+  都会崩，不只是变慢。**建议**：`SparkinferPrefillWorkspace` 应像 `LagunaCudaGraphVerify`
+  那样先用未定容量的 `for_contract` 跑一次真实 plan 拿到 sparkinfer 自己算出的容量，再固化为
+  `for_fixed_capacity`，而不是套用 extend 语义的估算函数。属于 `runtime/backends/
+  laguna_sparkinfer_attn.py`，写清楚交给开发，不在本次改。run record: `bf show 940b708aa0f8`。
 
-- [ ] **C-2 · NVFP4 KV vs FP8 KV 在我们卡上的 prefill 对比**
-  依据 flashinfer #4269：第三方在 RTX PRO 5000 Blackwell 上实测 **NVFP4 KV 的 paged causal prefill 比 FP8 KV 慢 1.7–1.8 倍**,而 decode 更快（带宽瓶颈）。
-  不是我们的卡也不是我们的形状。用 `bf diff` 判可比性后再比数。**支持 B3 选 FP8 KV，并警告别把 NVFP4 扩到 KV。**
+- [x] **C-2 · NVFP4 KV vs FP8 KV 在我们卡上的 prefill 对比** —— ✅ **查完：这个对比在当前技术栈上跑不起来，理由比预想更硬**
+  详见 [`../notes/2026-08-01-c1-c2-gpu-investigation.md`](../notes/2026-08-01-c1-c2-gpu-investigation.md#c-2)。
+  SparkInfer 的 paged-attention 内核（唯一的 attention 内核，零 FlashInfer 依赖）只接受
+  fp16/bf16/fp8_e4m3 三种 KV dtype（`sparkinfer/attention/paged/traits.py:120-121` 显式
+  `TypeError`），本 runtime 自己也三处硬编码 `kv_cache_dtype="fp8"`。所以 flashinfer #4269
+  （第三方在 RTX PRO 5000 上测的 NVFP4 KV prefill 慢 1.7–1.8x）在我们的栈上**连对照组都不
+  存在**——`bf diff` 判可比性这步在"跑第二个配置"就跑不下去，不是被忽略。退而测了唯一真实
+  存在的 FP8 KV 在生产真实形状（`block_size=64`、`blocks_per_slot=4096`，走
+  `backend.prefill_with_aux`）上的 prefill 基线：64 tok 284ms、512 tok 146ms、2048 tok
+  331ms、8192 tok 1106ms、32768 tok 5048ms、16384 tok(全新长度)2313ms——未观察到
+  30-100s 级别的重编译尖峰。**结论支持原计划：选 FP8 KV，不扩 NVFP4 到 KV**，且门槛从
+  "跑得起来但慢" 升级为 "内核库现在直接不支持，要支持得先让 SparkInfer 团队新增内核路径"。
+  run record: `bf show 940b708aa0f8`（同一次 `bf exec`）。
 
 - [ ] **C-3 · PyTorch 2.13.0 PyPI wheel 是否带 `sm_120`** —— *其实不需要 GPU*
   ```bash
