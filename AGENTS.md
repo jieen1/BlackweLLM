@@ -154,10 +154,44 @@ Graph replay. For quantized kernels, record error metrics and top-k-logit
 agreement; greedy fixtures must not show systematic token drift.
 
 Unit tests must not require downloading model weights unless explicitly marked as
-integration tests. Torch-dependent tests should self-skip via
-`pytest.importorskip` — **three modules currently violate this and break CI**
-(`test_swa_scratch_lifecycle.py`, `test_bfdiag_cold_capacity.py`,
-`test_bfdiag_ring.py`); fixing that is roadmap T0-1.
+integration tests. Torch-dependent tests must self-skip via `pytest.importorskip`.
+CI runs a torch-free job, so a bare `import torch` at module scope fails
+collection there even when the whole suite is green locally. Verify with the
+CPU-only interpreter, not just the full one:
+
+```bash
+/tmp/ci-sim/bin/python -m pytest -q     # torch-free, mirrors CI job 1
+~/.venvs/vllm/bin/python -m pytest -q   # full, mirrors CI job 2
+```
+
+### Verifying from a git worktree
+
+`~/.venvs/vllm` has `blackwellm` installed **editable**, and that install's
+finder hard-wires `runtime`/`server` to a static path pointing at the *main*
+worktree, regardless of cwd. Measured 2026-08-02:
+
+| How you invoke it | `runtime.__file__` resolves to |
+|---|---|
+| `python -m pytest` from a worktree | that worktree ✅ |
+| `python <script>` where the script sits outside the worktree root | **the main worktree** ❌ silent |
+
+`-m` puts cwd on `sys.path[0]`, which is why the test gates are trustworthy
+from any worktree. A standalone script is not: `python foo.py` puts *the
+script's own directory* on `sys.path[0]`, so a script living in a scratch
+directory imports main's code and says nothing.
+
+This is exactly the shape of an ad-hoc GPU verification script, where the
+whole point is comparing one worktree against another. Such a script can
+report a perfect match because it loaded the same code twice. Assert the
+path before trusting any number:
+
+```python
+import sys, pathlib
+EXPECTED = "/home/bot/project/<your-worktree>"
+sys.path.insert(0, EXPECTED)
+import runtime
+assert runtime.__file__.startswith(EXPECTED), runtime.__file__
+```
 
 Correctness before performance, always. The most expensive bugs in this
 repository's history — the block_size-128 acceptance regression, the
