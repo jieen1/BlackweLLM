@@ -84,7 +84,7 @@ Track F（性能，机会主义）的输入。
 | `2026-07-29-moe-ab-test.md` | MoE A/B |
 | `2026-07-22-quality-baseline-and-official-scores.md` | 质量基线与官方分数对标方法论 |
 | `2026-08-02-evaluation-artifact-provenance.md` | **评测产物归属存根**——五份产物的 `model` 字段全是 `qwen3.6`，仓库里没有任何 Laguna 评测数据。因 `evalplus_results/` 被 gitignore、随时可能消失而固化 |
-| `2026-08-02-track-a-step5-gpu-verification.md` | Track A 第 5 步 GPU 验收：贪心 bit-exact 用真实 revert worktree 实测确认（非推理）；接受率逐工作负载几乎精确匹配基线；**fox-64K tok/s 低基线 ~19%，与第 5 步无关**（bfdiag provider 绕过 `ServerEngine`）**，用直接 A/B 排除了 C-1 verify 容量修复这个具体嫌疑**（回退容量计算、保留 `REQUIRE_CG=1`，数字与信号形状原样复现），仍未根因；记录了复现基线所需的完整环境变量三件套（漏一个就测不准） |
+| `2026-08-02-track-a-step5-gpu-verification.md` | Track A 第 5 步 GPU 验收：贪心 bit-exact 用真实 revert worktree 实测确认（非推理）；接受率逐工作负载几乎精确匹配基线；**fox-64K tok/s 低基线 ~19%，与第 5 步无关**（bfdiag provider 绕过 `ServerEngine`）**，用直接 A/B 排除了 C-1 verify 容量修复**（回退容量计算、保留 `REQUIRE_CG=1`，数字与信号形状原样复现），**又靠读代码（零 GPU）排除了前缀缓存假设**（`enable_prefix_cache=False` 在两层都生效，`_prefill_with_prefix_hit` 在这个 benchmark 里根本不可达），仍未根因；对基线数字本身的可信度也给了直接判断；记录了复现基线所需的完整环境变量三件套（漏一个就测不准） |
 
 ## 5. Laguna 专属实现记录 🟡
 

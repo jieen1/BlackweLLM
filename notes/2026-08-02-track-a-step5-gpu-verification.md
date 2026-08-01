@@ -118,14 +118,86 @@ responsible sits elsewhere. Filed as an open, unattributed performance item —
 still not root-caused, but one specific, plausible suspect has now been
 eliminated by direct measurement rather than by argument.
 
+**Second hypothesis, checked by reading the code instead of another GPU restart
+(the coordinator's inverted-warmup observation: first call *faster* than every
+later identical call, not the usual slow-then-fast JIT-warmup shape — 22s→298
+tok/s vs. 13.7s→~480 tok/s on the first call, well above baseline)**: prefix
+cache doing same-slot reuse + SWA-ring rebuild on every call after the first,
+and that path being slower than cold prefill at long context.
+
+Ruled out without touching the GPU, by reading the exact call path
+`benchmarks/acceptance_regression.py`'s `run_once()` exercises:
+
+- `run_once()` calls `engine.generate_verify_only(..., enable_prefix_cache=False,
+  slot=0)` on *every* call, warmup included (`runtime/backends/laguna_dflash.py`
+  `generate_verify_only`, the `if enable_prefix_cache:` guard around
+  `backend.find_prefix_match`/`reconcile_prefix_hit`/`prepare_exact_prefix_replay`
+  — `prefix_len` stays 0 when the flag is `False`, unconditionally).
+- With `prefix_len == 0`, `generate_verify_only` always takes the "No match:
+  full reset and prefill" branch and calls `backend.prefill_with_aux(slot,
+  prompt_ids)` with no `prefix_hit` argument, which defaults to `prefix_hit=0`
+  → the cold-path branch in `prefill_with_aux`, not `_prefill_with_prefix_hit`
+  (the same-slot-reuse-plus-SWA-ring-rebuild function the coordinator's
+  hypothesis names). That function is provably unreached in this benchmark, on
+  every single call, not just after the flag check but by the keyword default
+  a level below it too.
+- There is no separate provider/daemon-level prefix-cache construction switch
+  to additionally flip: checked `LagunaBackend.__init__`'s full signature —
+  `num_slots`, `block_size`, `blocks_per_slot`, no `enable_prefix_cache`
+  parameter at all. "Prefix cache" here is entirely the caller's per-call
+  decision, which is the one parameter already confirmed `False` above.
+  `ServerEngine`'s own `enable_prefix_cache` construction flag is a different
+  layer (governs whether `ServerEngine._finish_request` retains a slot's
+  history across separate HTTP requests) that this benchmark's direct
+  backend/engine calls never go through at all.
+- One real, unconditional side effect worth naming so it isn't mistaken for
+  the mechanism above: `LagunaBackend.reset_slot()` (called explicitly before
+  every `run_once()`, and again internally inside `generate_verify_only` when
+  `prefix_len == 0`) *always* saves `slot_committed_tokens`/`slot_kv_len` into
+  `self._prefix_cache_tokens`/`_prefix_cache_kv_len` "for prefix cache", with
+  no flag check — but its own docstring says it does not zero KV tensors and
+  only touches small Python-side bookkeeping (an int and a list), so this is
+  not a plausible multi-second cost regardless of whether it is "for" a
+  feature this benchmark never reads back from.
+
+**Conclusion: ruled out, and ruled out more cheaply than a GPU restart would
+have — the exact code path the hypothesis names cannot execute given how this
+benchmark calls the engine.** Confirmed both the top-level flag and the
+one-level-deeper keyword default independently disable it, and confirmed there
+is no separate construction-time switch to have missed.
+
 Not chased further because: (a) `nvidia-smi` showed no other compute process, low
 utilization/power/temperature at the time, so no obvious external contention; (b)
 the bfdiag Laguna provider bypasses `ServerEngine` entirely regardless (§ above),
 so this number was never attributable to step 5 either way; (c) the natural next
 step for whoever picks this up is isolating the warmup-vs-measured timing jump
-itself (e.g. profile the first vs. second fox-64K call directly, or check
-whether *any* first-call-after-load is fast regardless of workload) rather than
-another capacity-shaped hypothesis.
+itself directly (e.g. `torch.cuda.memory_stats()`/allocator snapshots before and
+after the first vs. second fox-64K call, on the theory that a repeated
+alloc/free cycle of a ~64K-token KV region interacts with PyTorch's CUDA
+caching allocator differently on the first request for that size class than on
+later ones -- a generic allocator hypothesis, not a Laguna-specific one, and
+notably consistent with "4K workloads don't show it" since their allocation
+size class is common enough to already be warm from other traffic) rather than
+another capacity- or cache-shaped hypothesis.
+
+**On whether the 353–368 baseline itself is trustworthy**: asked directly, so
+answered directly. The three per-workload numbers this session actually
+reproduced closely (fox-4K, galaxy-4K, code-4K) all landed within or just
+above their documented ranges, consistently, across every restart -- I have no
+reason to doubt those three. fox-64K specifically is now a different story: this
+session has shown that *where in a sequence of identical calls* you measure
+fox-64K changes its throughput by ~60%, and the 07-31/08-01 baseline notes
+record the summary numbers but not each run's warmup/measured call ordering in
+enough detail to know which regime produced 353–368. It is entirely possible
+07-31's baseline run happened to measure something closer to this session's
+"first call" number, or used a different warmup convention, and 353-368 was
+never a *steady-state* number for this specific workload to begin with. That
+would make it not-wrong exactly, but not-comparable to a steady-state
+measurement either -- exactly the shape of problem `bf diff` exists to catch,
+one level removed (comparing against a written summary instead of another live
+run, so there is no config/fingerprint to diff against). Recommend: next time
+fox-64K is measured, record and publish the full warmup+per-round sequence (not
+just the summary), so this question has an answer instead of a memory.
 
 **Recommendation**: file as its own investigation item (perf, not correctness) —
 does not block Track A step 5 or step 6. Bit-exact (§1) and acceptance rate
