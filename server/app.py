@@ -690,9 +690,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         top_logprobs=req.top_logprobs or 0,
     )
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
-    # Laguna responses do not use Qwen's thinking-token convention.  Preserve
-    # generated text verbatim (apart from tokenizer replacement characters).
-    text = raw_text.replace("\ufffd", "").strip()
+    # Strip thinking/reasoning blocks from model output
+    from server.formats.thinking import strip_thinking
+    text = strip_thinking(raw_text)
     metrics.record_request(
         "chat",
         result["prompt_tokens"],
@@ -749,7 +749,8 @@ async def completions(req: CompletionRequest, request: Request):
         top_logprobs=req.top_logprobs or 0,
     )
     _raw_comp = await _tokenize_decode(engine, result["committed_token_ids"])
-    text = _raw_comp.replace("�", "").strip()
+    from server.formats.thinking import strip_thinking as _st
+    text = _st(_raw_comp)
     metrics.record_request(
         "completions",
         result["prompt_tokens"],
@@ -1267,7 +1268,8 @@ async def anthropic_messages(request: Request):
         sampling_params=sampling_params,
     )
     _raw_anth = await _tokenize_decode(engine, result["committed_token_ids"])
-    text = _raw_anth.replace("�", "").strip()
+    from server.formats.thinking import strip_thinking as _st2
+    text = _st2(_raw_anth)
     metrics.record_request(
         "messages",
         result["prompt_tokens"],
