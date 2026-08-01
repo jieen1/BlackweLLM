@@ -38,6 +38,7 @@
 
 ## 2. 已定案的根因分析 🟢
 
+- [2026-08-02 anchor token 恒为贪心 argmax](2026-08-02-anchor-token-ignores-sampling-params.md) —— 所有 temperature>0 用户的首 token 是确定性的；使 E-N1 的 (b) 方案作废
 这些是"教训档案"，接入新模型时逐条对照（见 `docs/model-support.md` §6）。
 
 | 文件 | 教训 |

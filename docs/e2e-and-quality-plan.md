@@ -115,10 +115,16 @@
   决定，因为这是产品语义判断）：
   - (a) 等到 admission 阶段掩码钩子 + CUDA Graph 贪心重放的架构冲突都解决后一次性接通
     （`docs/api-layer-design.md` §7.1 的"可推翻的条件"）；
-  - (b) 先做一个**显式受限**的中间态——只接受 `temperature>0` 的结构化输出请求，
-    `temperature=0`（默认）时对 `json_object`/`json_schema` 继续 400 拒绝（而不是静默
-    只保护部分路径）。(b) 的关键是**显式**：客户端会立刻知道自己撞到了限制，而不是拿到
-    一个看起来生效但没生效的响应。
+  - ~~(b) 先做一个**显式受限**的中间态——只接受 `temperature>0` 的结构化输出请求~~
+    —— ❌ **2026-08-02 核实后作废，(b) 按原样不成立**。见
+    [`../notes/2026-08-02-anchor-token-ignores-sampling-params.md`](../notes/2026-08-02-anchor-token-ignores-sampling-params.md)：
+    每个请求的首（anchor）token 在生产路径上恒为无约束 `argmax`，**与 temperature 无关**
+    （`prefill_chunked_begin` / `dflash_prefill_bootstrap` 签名里都没有 `SamplingParams`）。
+    所以放开 `temperature>0` **约束不到首 token**——而对 JSON 来说首 token 恰恰是 `{`，
+    最需要被约束的那一个。客户端会拿到"看起来生效"的响应而首 token 从未被约束，正是
+    `server/app.py:534` 的拒绝逻辑要消灭的形状，只是换了个更窄的位置藏起来。
+    `server/app.py` 的 docstring 原本写明了限定条件（"temperature > 0, **decode tokens 2+**"），
+    本文档此前转述成选项时把 "decode tokens 2+" 丢了——这是转述失真，不是新发现。
   - **不选的选项**：文档已经明确警告过的"只接可达窄缝但不改拒绝逻辑"——那是原地不动
     换个位置藏起来，不是一个真的选项。
 - **E-N1-b（(a) 或 (b) 拍板后，M3→M4，需 GPU，前提是 `runtime/backends/laguna.py` /
@@ -329,8 +335,14 @@ soak 回答"服务还稳吗"，两者合在一起构成北极星指标第 3 条�
 
 ## 7. 待拍板 / 待验证 移交清单（本文档不代为决定）
 
-- [ ] **E-N1-a**：结构化输出的中间态选择——(a) 等全量修复 vs (b) 先做显式受限的
-  `temperature>0`-only 支持。产品语义判断，见 §2.3。
+- [x] ~~**E-N1-a**：中间态选择 (a) vs (b)~~ —— ✅ **已拍板：(a)，维持响亮拒绝**，
+  因为 (b) 经核实不成立（见 §2.3）。这不是"选了更保守的那个"，是**原来的二选一是伪命题**。
+
+  **同时新增一条前置项 E-N1-b0（独立于结构化输出就有价值）**：让 anchor token 走采样参数。
+  今天所有 `temperature>0` 的用户拿到的首 token 都是确定性的——这是一个真实的采样正确性
+  缺陷，不是结构化输出的子问题。`prefill_sampled` 已有一份可抄的实现，但它唯一的调用方
+  `generate()` 零生产调用方，**不要直接复活 `generate()`**（遗留路径，接的不是今天的准入
+  流程）。修完 b0 之后，E-N1 才存在真正的二选一。
 - [ ] **usage token 缺口 2**：`<usage>` 标签剥离统一到哪种语义（流式的"冻结"还是
   非流式的"删除后继续"）。见 §2.5。
 - [x] ~~**[待验证]** roadmap §0 "Laguna-S-2.1 MMLU-Pro 84.5%"的引用来源~~ —— ✅ **已坐实是误引，
