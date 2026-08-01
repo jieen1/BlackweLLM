@@ -513,8 +513,10 @@ HumanEval **44.5%** / HumanEval+ **43.3%**（vs 同权重 stock vLLM 43.3%/42.7%
 - **C9 质量回归**（本批新增）：MMLU-Pro（分层子集）+ evalplus HumanEval+/MBPP+ 对 **Laguna**
   跑一次——现有 harness（`benchmarks/official/mmlu_pro_eval.py` + `quality_regression.py`，
   `92f8b34`，2026-07-22）从建成起就没有指向过当前生产模型，测的是已退役的 Qwen3.6/vLLM。
-  **[待验证]**：本文档 §0 引用的"Laguna-S-2.1 MMLU-Pro 84.5%"疑似是那次旧评测结果
-  （84.54%）的误引，需要 C9 跑出真正针对 Laguna 的数字来核实或替换。M2 起首次基线，
+  **误引已于 2026-08-02 证实并更正**（`c53bd7c`）：§0 原先引用的"Laguna MMLU-Pro 84.5%"
+  确系 Qwen3.6 那次跑分（`evalplus_results/official/mmlu_pro_think_c4.json`：
+  `model=qwen3.6, acc=84.54, n=414`）。所以 **Laguna 至今没有任何质量基线数字**，
+  C9 不是"核实一个可疑数字"，而是**首次建立**它。M2 起首次基线，
   M3/M4 起随 Track B 加 Qwen3.6 覆盖，M6 发布前全量跑一次。方法与调度见
   [`e2e-and-quality-plan.md`](e2e-and-quality-plan.md) §3.3。
 
