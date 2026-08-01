@@ -3,14 +3,18 @@
 import json
 
 from server.formats.stream import StreamProcessor
+from server.formats.tool_parsers import get_parser
+from server.formats.tool_parsers.value_parsing import repair_json as _repair_json
 from server.formats.tools import (
-    _repair_json,
     convert_tools_to_chat_template,
     find_tool_call_start,
     format_tool_calls_anthropic,
     format_tool_calls_openai,
     parse_tool_calls,
 )
+
+QWEN_PARSER = get_parser("qwen3_coder")
+POOLSIDE_PARSER = get_parser("poolside_v1")
 
 TC_OPEN = chr(60) + "tool_call" + chr(62)
 TC_CLOSE = chr(60) + "/tool_call" + chr(62)
@@ -33,16 +37,19 @@ def _make_tool_call(func_name, params):
 
 
 class TestParseToolCalls:
+    """qwen3_coder shape -- parser passed explicitly so this class's
+    behavior can't drift if the process's default active parser changes."""
+
     def test_no_tool_calls(self):
         text = "Hello, world!"
-        visible, calls = parse_tool_calls(text)
+        visible, calls = parse_tool_calls(text, parser=QWEN_PARSER)
         assert visible == "Hello, world!"
         assert calls == []
 
     def test_single_tool_call(self):
         tc = _make_tool_call("get_weather", {"location": json.dumps("Paris")})
         text = "Sure! " + tc
-        visible, calls = parse_tool_calls(text)
+        visible, calls = parse_tool_calls(text, parser=QWEN_PARSER)
         assert visible == "Sure!"
         assert len(calls) == 1
         assert calls[0]["name"] == "get_weather"
@@ -52,7 +59,7 @@ class TestParseToolCalls:
         tc1 = _make_tool_call("foo", {"x": "1"})
         tc2 = _make_tool_call("bar", {"y": json.dumps("hello")})
         text = "Result: " + tc1 + " and " + tc2
-        visible, calls = parse_tool_calls(text)
+        visible, calls = parse_tool_calls(text, parser=QWEN_PARSER)
         assert visible == "Result:  and"
         assert len(calls) == 2
         assert calls[0]["name"] == "foo"
@@ -62,17 +69,17 @@ class TestParseToolCalls:
 
     def test_multiple_params(self):
         tc = _make_tool_call("search", {"query": json.dumps("python"), "limit": "10"})
-        _, calls = parse_tool_calls(tc)
+        _, calls = parse_tool_calls(tc, parser=QWEN_PARSER)
         assert calls[0]["arguments"] == {"query": "python", "limit": 10}
 
     def test_invalid_json_falls_back_to_string(self):
         tc = _make_tool_call("run", {"code": "not json at all"})
-        _, calls = parse_tool_calls(tc)
+        _, calls = parse_tool_calls(tc, parser=QWEN_PARSER)
         assert calls[0]["arguments"]["code"] == "not json at all"
 
     def test_json_repair_trailing_comma(self):
         tc = _make_tool_call("fn", {"items": "[1, 2, 3,]"})
-        _, calls = parse_tool_calls(tc)
+        _, calls = parse_tool_calls(tc, parser=QWEN_PARSER)
         assert calls[0]["arguments"]["items"] == [1, 2, 3]
 
     def test_json_repair_set_literal(self):
@@ -81,7 +88,7 @@ class TestParseToolCalls:
 
     def test_empty_arguments(self):
         tc = _make_tool_call("no_args", {})
-        _, calls = parse_tool_calls(tc)
+        _, calls = parse_tool_calls(tc, parser=QWEN_PARSER)
         assert calls[0]["name"] == "no_args"
         assert calls[0]["arguments"] == {}
 
@@ -89,7 +96,7 @@ class TestParseToolCalls:
         """A <tool_call> block matching neither known interior shape is
         left untouched -- same as a non-match, not counted as a call."""
         text = "Before " + TC_OPEN + "garbage, no known tags" + TC_CLOSE + " After"
-        visible, calls = parse_tool_calls(text)
+        visible, calls = parse_tool_calls(text, parser=QWEN_PARSER)
         assert calls == []
         assert visible == text.strip()
 
@@ -114,12 +121,14 @@ def _make_poolside_tool_call(func_name, params):
 
 class TestParseToolCallsPoolside:
     """Laguna-S-2.1's poolside_v1 tool-call shape (no <function=>/<parameter=>
-    wrapper) -- see chat_template.jinja lines ~64-73."""
+    wrapper) -- see chat_template.jinja lines ~64-73. Parser passed
+    explicitly for the same reason as TestParseToolCalls above -- it also
+    happens to be the process default, but these tests don't rely on that."""
 
     def test_single_tool_call(self):
         tc = _make_poolside_tool_call("get_weather", {"city": "Paris"})
         text = "Sure! " + tc
-        visible, calls = parse_tool_calls(text)
+        visible, calls = parse_tool_calls(text, parser=POOLSIDE_PARSER)
         assert visible == "Sure!"
         assert len(calls) == 1
         assert calls[0]["name"] == "get_weather"
@@ -127,14 +136,14 @@ class TestParseToolCallsPoolside:
 
     def test_multiple_args(self):
         tc = _make_poolside_tool_call("search", {"query": "python", "limit": "10"})
-        _, calls = parse_tool_calls(tc)
+        _, calls = parse_tool_calls(tc, parser=POOLSIDE_PARSER)
         assert calls[0]["arguments"] == {"query": "python", "limit": 10}
 
     def test_multiple_tool_calls(self):
         tc1 = _make_poolside_tool_call("foo", {"x": "1"})
         tc2 = _make_poolside_tool_call("bar", {"y": json.dumps("hello")})
         text = "Result: " + tc1 + " and " + tc2
-        visible, calls = parse_tool_calls(text)
+        visible, calls = parse_tool_calls(text, parser=POOLSIDE_PARSER)
         assert visible == "Result:  and"
         assert len(calls) == 2
         assert calls[0]["name"] == "foo"
@@ -144,25 +153,25 @@ class TestParseToolCallsPoolside:
 
     def test_zero_argument_call(self):
         tc = _make_poolside_tool_call("no_args", {})
-        _, calls = parse_tool_calls(tc)
+        _, calls = parse_tool_calls(tc, parser=POOLSIDE_PARSER)
         assert calls[0]["name"] == "no_args"
         assert calls[0]["arguments"] == {}
 
     def test_invalid_json_falls_back_to_string(self):
         tc = _make_poolside_tool_call("run", {"code": "not json at all"})
-        _, calls = parse_tool_calls(tc)
+        _, calls = parse_tool_calls(tc, parser=POOLSIDE_PARSER)
         assert calls[0]["arguments"]["code"] == "not json at all"
 
     def test_json_repair_trailing_comma(self):
         tc = _make_poolside_tool_call("fn", {"items": "[1, 2, 3,]"})
-        _, calls = parse_tool_calls(tc)
+        _, calls = parse_tool_calls(tc, parser=POOLSIDE_PARSER)
         assert calls[0]["arguments"]["items"] == [1, 2, 3]
 
     def test_non_string_value_is_json_encoded_per_template(self):
         """Template: `v | tojson if v is not string else v` -- a bool/number
         argument arrives JSON-encoded, a string argument arrives raw."""
         tc = _make_poolside_tool_call("toggle", {"enabled": "true", "count": "3"})
-        _, calls = parse_tool_calls(tc)
+        _, calls = parse_tool_calls(tc, parser=POOLSIDE_PARSER)
         assert calls[0]["arguments"] == {"enabled": True, "count": 3}
 
 
@@ -282,14 +291,14 @@ def _ids(text):
 
 class TestStreamToolDeltas:
     def test_no_tool_call_no_deltas(self):
-        proc = StreamProcessor(_FakeTok())
+        proc = StreamProcessor(_FakeTok(), tool_parser=QWEN_PARSER)
         close_think = chr(60) + "/think" + chr(62)
         proc.add_tokens(_ids("thinking" + close_think + "Just text"))
         proc.drain_content()
         assert proc.drain_tool_deltas() == []
 
     def test_tool_name_delta(self):
-        proc = StreamProcessor(_FakeTok())
+        proc = StreamProcessor(_FakeTok(), tool_parser=QWEN_PARSER)
         close_think = chr(60) + "/think" + chr(62)
         tc_open = chr(60) + "tool_call" + chr(62)
         func_open = chr(60) + "function=get_weather" + chr(62)
@@ -305,7 +314,7 @@ class TestStreamToolDeltas:
         """No arguments_delta while </parameter></function> hasn't arrived
         yet -- streaming a partial XML-ish fragment isn't valid JSON, so
         there is nothing safe to emit until the whole block is parseable."""
-        proc = StreamProcessor(_FakeTok())
+        proc = StreamProcessor(_FakeTok(), tool_parser=QWEN_PARSER)
         close_think = chr(60) + "/think" + chr(62)
         tc_open = chr(60) + "tool_call" + chr(62)
         func_open = chr(60) + "function=fn" + chr(62)
@@ -319,10 +328,16 @@ class TestStreamToolDeltas:
         """Regression test: arguments_delta must be a JSON string, not the
         raw <parameter=...> XML fragment (that XML, handed verbatim to an
         OpenAI-compatible client as `function.arguments`, fails to
-        json-decode -- exactly the reported bug)."""
-        proc = StreamProcessor(_FakeTok())
+        json-decode -- exactly the reported bug).
+
+        "Block closed" is defined by the shared outer </tool_call> (not
+        Qwen's own </function>) -- one definition shared by every parser,
+        which real generations satisfy trivially: Qwen's own chat_template
+        always emits '</function>\\n</tool_call>' back to back."""
+        proc = StreamProcessor(_FakeTok(), tool_parser=QWEN_PARSER)
         close_think = chr(60) + "/think" + chr(62)
         tc_open = chr(60) + "tool_call" + chr(62)
+        tc_close = chr(60) + "/tool_call" + chr(62)
         func_open = chr(60) + "function=fn" + chr(62)
         param_open = chr(60) + "parameter=x" + chr(62)
         param_close = chr(60) + "/parameter" + chr(62)
@@ -334,6 +349,9 @@ class TestStreamToolDeltas:
         deltas = proc.drain_tool_deltas()  # "name" fires here; args must not
         assert [d for d in deltas if d["type"] == "arguments_delta"] == []
         proc.add_tokens(_ids(func_close))
+        deltas = proc.drain_tool_deltas()  # </function> alone still isn't enough
+        assert [d for d in deltas if d["type"] == "arguments_delta"] == []
+        proc.add_tokens(_ids(tc_close))
         deltas = proc.drain_tool_deltas()
         arg_deltas = [d for d in deltas if d["type"] == "arguments_delta"]
         assert len(arg_deltas) == 1
@@ -343,7 +361,7 @@ class TestStreamToolDeltas:
         assert proc.drain_tool_deltas() == []
 
     def test_finalize_after_tool_deltas(self):
-        proc = StreamProcessor(_FakeTok())
+        proc = StreamProcessor(_FakeTok(), tool_parser=QWEN_PARSER)
         close_think = chr(60) + "/think" + chr(62)
         tc_open = chr(60) + "tool_call" + chr(62)
         tc_close = chr(60) + "/tool_call" + chr(62)
@@ -373,7 +391,7 @@ class TestStreamToolDeltas:
         assert calls[0]["arguments"] == {"x": 42}
 
     def test_content_frozen_after_tool_start(self):
-        proc = StreamProcessor(_FakeTok())
+        proc = StreamProcessor(_FakeTok(), tool_parser=QWEN_PARSER)
         close_think = chr(60) + "/think" + chr(62)
         tc_open = chr(60) + "tool_call" + chr(62)
         proc.add_tokens(_ids("think" + close_think + "Hello " + tc_open))
@@ -392,7 +410,7 @@ class TestStreamToolDeltasPoolside:
     def test_tool_name_delta_zero_arg(self):
         """Name boundary for a zero-argument call is only known once
         </tool_call> itself arrives -- not emitted before that."""
-        proc = StreamProcessor(_FakeTok())
+        proc = StreamProcessor(_FakeTok(), tool_parser=POOLSIDE_PARSER)
         close_think = chr(60) + "/think" + chr(62)
         tc_open = chr(60) + "tool_call" + chr(62)
         proc.add_tokens(_ids("think" + close_think + "Sure! " + tc_open + "get_time"))
@@ -407,7 +425,7 @@ class TestStreamToolDeltasPoolside:
         assert name_deltas[0]["index"] == 0
 
     def test_tool_name_delta_with_args(self):
-        proc = StreamProcessor(_FakeTok())
+        proc = StreamProcessor(_FakeTok(), tool_parser=POOLSIDE_PARSER)
         close_think = chr(60) + "/think" + chr(62)
         tc_open = chr(60) + "tool_call" + chr(62)
         arg_key_open = chr(60) + "arg_key" + chr(62)
@@ -423,7 +441,7 @@ class TestStreamToolDeltasPoolside:
     def test_arguments_delta_withheld_until_block_closes(self):
         """No arguments_delta while </tool_call> hasn't arrived yet --
         streaming the raw <arg_key>/<arg_value> fragment isn't valid JSON."""
-        proc = StreamProcessor(_FakeTok())
+        proc = StreamProcessor(_FakeTok(), tool_parser=POOLSIDE_PARSER)
         close_think = chr(60) + "/think" + chr(62)
         tc_open = chr(60) + "tool_call" + chr(62)
         arg_key_open = chr(60) + "arg_key" + chr(62)
@@ -453,7 +471,7 @@ class TestStreamToolDeltasPoolside:
         `function.arguments` and got the raw
         `<arg_key>path</arg_key><arg_value>.</arg_value>` XML instead of
         JSON. arguments_delta must carry valid, parseable JSON."""
-        proc = StreamProcessor(_FakeTok())
+        proc = StreamProcessor(_FakeTok(), tool_parser=POOLSIDE_PARSER)
         close_think = chr(60) + "/think" + chr(62)
         tc_open = chr(60) + "tool_call" + chr(62)
         tc_close = chr(60) + "/tool_call" + chr(62)
@@ -489,7 +507,7 @@ class TestStreamToolDeltasPoolside:
         assert proc.drain_tool_deltas() == []
 
     def test_finalize_after_tool_deltas(self):
-        proc = StreamProcessor(_FakeTok())
+        proc = StreamProcessor(_FakeTok(), tool_parser=POOLSIDE_PARSER)
         close_think = chr(60) + "/think" + chr(62)
         tc_open = chr(60) + "tool_call" + chr(62)
         tc_close = chr(60) + "/tool_call" + chr(62)
@@ -521,7 +539,7 @@ class TestStreamToolDeltasPoolside:
         assert calls[0]["arguments"] == {"x": 42}
 
     def test_multiple_tool_calls_sequential(self):
-        proc = StreamProcessor(_FakeTok())
+        proc = StreamProcessor(_FakeTok(), tool_parser=POOLSIDE_PARSER)
         close_think = chr(60) + "/think" + chr(62)
         tc_open = chr(60) + "tool_call" + chr(62)
         tc_close = chr(60) + "/tool_call" + chr(62)
@@ -537,7 +555,7 @@ class TestStreamToolDeltasPoolside:
         """Multi-key-value regression: every key in a multi-arg call, and
         every call in a multi-call round, must independently concatenate to
         valid JSON -- not just the single-arg case above."""
-        proc = StreamProcessor(_FakeTok())
+        proc = StreamProcessor(_FakeTok(), tool_parser=POOLSIDE_PARSER)
         close_think = chr(60) + "/think" + chr(62)
         tc_open = chr(60) + "tool_call" + chr(62)
         tc_close = chr(60) + "/tool_call" + chr(62)

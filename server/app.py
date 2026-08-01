@@ -96,9 +96,7 @@ SERVER_BLOCK_SIZE = int(os.environ.get("QSR_SERVER_BLOCK_SIZE", "64"))
 # Laguna default (2048 × 64 = 128K/slot) is conservative pending the SWA
 # ring-buffer optimization above -- see notes/2026-07-23-laguna-server-
 # integration-plan.md for the memory math.
-SERVER_BLOCKS_PER_SLOT = int(
-    os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "2048")
-)
+SERVER_BLOCKS_PER_SLOT = int(os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "2048"))
 # Laguna default flipped 0->1 (2026-07-27): decode CUDA Graph is now wired
 # into decode_batch_sampled (runtime/backends/laguna.py's
 # _decode_cg_batch_eligible) and verified end-to-end over a real HTTP
@@ -112,9 +110,7 @@ SERVER_ENABLE_CUDAGRAPH = os.environ.get("QSR_SERVER_ENABLE_CUDAGRAPH", "1") != 
 # ON (this is THE product value -- warm prefix hits served across requests);
 # `python -m server.app --no-prefix-cache` (or QSR_SERVER_ENABLE_PREFIX_CACHE=0)
 # turns it off => byte-for-byte the old server.
-SERVER_ENABLE_PREFIX_CACHE = (
-    os.environ.get("QSR_SERVER_ENABLE_PREFIX_CACHE", "0") != "0"
-)
+SERVER_ENABLE_PREFIX_CACHE = os.environ.get("QSR_SERVER_ENABLE_PREFIX_CACHE", "0") != "0"
 # P4b session affinity (notes/2026-07-20-p4b-session-affinity-plan.md): opt-in
 # warm-slot retention. Default OFF => byte-for-byte P4a (without a session_id, or
 # with the flag off, _finish_request does the unconditional reset_slot). Requires
@@ -134,6 +130,12 @@ SERVER_PRODUCTION = os.environ.get("QSR_SERVER_PRODUCTION", "1") != "0"
 # (ServerEngine raises otherwise) -- opt-in via QSR_SERVER_ENABLE_DFLASH=1
 # until it has run in production for a while, not flipped on by default yet.
 SERVER_ENABLE_DFLASH = os.environ.get("QSR_SERVER_ENABLE_DFLASH", "0") != "0"
+# Selects which server/formats/tool_parsers/ shape to decode tool calls
+# with -- mirrors vLLM's --tool-call-parser NAME. Default matches this
+# project's currently (and so far only) production model, poolside/
+# Laguna-S-2.1-NVFP4. A model with a differently-shaped tool-call output
+# needs its own ToolCallParser registered there, then selected here.
+SERVER_TOOL_CALL_PARSER = os.environ.get("QSR_TOOL_CALL_PARSER", "poolside_v1")
 
 engine: ServerEngine | None = None
 
@@ -304,6 +306,14 @@ async def _debug_log_stream_output(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global engine
+    # Validated and applied before the (slow) model load, so a typo in
+    # QSR_TOOL_CALL_PARSER/--tool-call-parser fails in <1s instead of after
+    # minutes of loading weights.
+    from server.formats.tool_parsers import set_active_parser
+
+    set_active_parser(SERVER_TOOL_CALL_PARSER)
+    logger.info("tool_call_parser=%s", SERVER_TOOL_CALL_PARSER)
+
     logger.info(
         "loading model backend=%s (this can take a while: model load + KV cache alloc)...",
         SERVER_MODEL_BACKEND,
@@ -506,12 +516,12 @@ async def debug_stats():
     > 1), rather than inferring it indirectly from timing alone."""
     assert engine is not None
     runner = engine.runner
-    if hasattr(runner, '_prefix_cache_tokens'):
-        engine.stats['_prefix_cache_dbg'] = {
-            f'slot_{i}': {
-                'cached_len': len(t) if t else 0,
-                'kv_len': runner._prefix_cache_kv_len[i],
-                'head': t[:5] if t else None,
+    if hasattr(runner, "_prefix_cache_tokens"):
+        engine.stats["_prefix_cache_dbg"] = {
+            f"slot_{i}": {
+                "cached_len": len(t) if t else 0,
+                "kv_len": runner._prefix_cache_kv_len[i],
+                "head": t[:5] if t else None,
             }
             for i, t in enumerate(runner._prefix_cache_tokens)
         }
@@ -702,6 +712,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
     # Strip thinking/reasoning blocks from model output
     from server.formats.thinking import strip_thinking
+
     text = strip_thinking(raw_text)
     metrics.record_request(
         "chat",
@@ -760,6 +771,7 @@ async def completions(req: CompletionRequest, request: Request):
     )
     _raw_comp = await _tokenize_decode(engine, result["committed_token_ids"])
     from server.formats.thinking import strip_thinking as _st
+
     text = _st(_raw_comp)
     metrics.record_request(
         "completions",
@@ -841,6 +853,19 @@ def main() -> None:
             "multi-slot-concurrency.md."
         ),
     )
+    from server.formats.tool_parsers import available_parsers
+
+    parser.add_argument(
+        "--tool-call-parser",
+        choices=available_parsers(),
+        default=SERVER_TOOL_CALL_PARSER,
+        help=(
+            "Tool-call output shape to decode (mirrors vLLM's "
+            "--tool-call-parser). One per model family -- see "
+            "server/formats/tool_parsers/. Default matches the currently "
+            "loaded model."
+        ),
+    )
     args = parser.parse_args()
 
     # P4b: refuse --session-affinity together with --no-prefix-cache -- a clean
@@ -863,6 +888,7 @@ def main() -> None:
     os.environ["QSR_SERVER_SESSION_TTL_S"] = str(args.session_ttl_s)
     if args.dflash:
         os.environ["QSR_SERVER_ENABLE_DFLASH"] = "1"
+    os.environ["QSR_TOOL_CALL_PARSER"] = args.tool_call_parser
 
     uvicorn.run("server.app:app", host=args.host, port=args.port, log_level="info")
 
@@ -917,10 +943,14 @@ async def metrics_endpoint():
     # not a dynamic BlockPool. Compute KV usage from active slot count.
     total_blocks = engine.num_slots * engine.blocks_per_slot
     active_slots = len(engine.active)
-    used_blocks = sum(
-        (runner.slot_kv_len.get(s, 0) + engine.block_size - 1) // engine.block_size
-        for s in engine.active
-    ) if hasattr(runner, 'slot_kv_len') else active_slots * engine.blocks_per_slot
+    used_blocks = (
+        sum(
+            (runner.slot_kv_len.get(s, 0) + engine.block_size - 1) // engine.block_size
+            for s in engine.active
+        )
+        if hasattr(runner, "slot_kv_len")
+        else active_slots * engine.blocks_per_slot
+    )
     kv_usage = used_blocks / total_blocks if total_blocks > 0 else 0.0
 
     num_running = len(engine.active)
@@ -1279,6 +1309,7 @@ async def anthropic_messages(request: Request):
     )
     _raw_anth = await _tokenize_decode(engine, result["committed_token_ids"])
     from server.formats.thinking import strip_thinking as _st2
+
     text = _st2(_raw_anth)
     metrics.record_request(
         "messages",
