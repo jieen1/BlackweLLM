@@ -1116,6 +1116,20 @@ def main() -> None:
             "--session-affinity requires the prefix cache (cannot combine with --no-prefix-cache)"
         )
 
+    # N8 (docs/architecture.md §3.5.6): fail before setting any env var or
+    # touching uvicorn, not after minutes of model loading. ServerEngine.
+    # __init__ enforces the identical check as a backstop for callers that
+    # construct it directly (tests, embedding) rather than through this CLI.
+    if args.session_affinity:
+        from runtime.backends.laguna import LagunaBackend
+
+        if not LagunaBackend.capabilities.fget(None).warm_continue:
+            parser.error(
+                "--session-affinity requires a backend with warm_continue capability; "
+                "the laguna backend does not support it yet "
+                "(see docs/architecture.md §3.5.6, N8)"
+            )
+
     os.environ["QSR_SERVER_CAPACITY"] = str(args.capacity)
     os.environ["QSR_SERVER_NUM_SLOTS"] = str(args.num_slots)
     os.environ["QSR_SERVER_BLOCKS_PER_SLOT"] = str(args.blocks_per_slot)

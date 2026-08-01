@@ -252,6 +252,28 @@ class ServerEngine:
             )
         if enable_session_affinity and not enable_prefix_cache:
             raise ValueError("enable_session_affinity requires enable_prefix_cache")
+        if enable_session_affinity:
+            # N8 (docs/architecture.md §3.5.6): mtp_prefill_warm_continue has
+            # no LagunaBackend implementation -- it survives only under
+            # oracle/qwen36_vllm/. _step_sync used to call it anyway inside a
+            # bare `except Exception`, so every warm-continue attempt raised,
+            # was swallowed, and silently fell back to a cold prefill: output
+            # stayed correct, session_warm_continuations stayed at zero, and
+            # nothing told the operator their flag was a no-op. Reject here,
+            # at construction time and before any GPU work, instead. Hardcodes
+            # LagunaBackend rather than going through the backend registry
+            # because `backend != self.BACKEND` above already guarantees
+            # self.BACKEND == "laguna" is the only value reachable here --
+            # revisit once step 5 (registry becomes the source of truth for
+            # backend selection) lands.
+            from runtime.backends.laguna import LagunaBackend
+
+            if not LagunaBackend.capabilities.fget(None).warm_continue:
+                raise ValueError(
+                    "enable_session_affinity requires a backend with warm_continue "
+                    f"capability; backend={self.BACKEND!r} does not support it "
+                    "(see docs/architecture.md §3.5.6, N8)"
+                )
 
         # -- config --
         self.capacity = capacity
