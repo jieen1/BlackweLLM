@@ -296,6 +296,27 @@ server/formats/
 独立现实案例做交叉验证（`AGENTS.md`："一个只为'将来可能'存在的抽象是
 负债"）——留给 Track E 或有第三个协议的真实需求出现时再做。
 
+### 2.4 补充：`tool_parsers/` 注册表是"按模型"，不是"按协议"
+
+本文档成稿的同时，main 上独立落地了 `server/formats/tool_parsers/`
+（`85cdf9d` / `00d0990`）：一个按模型分派的工具调用解析器注册表，
+`ToolCallParser` + `get_active_parser()` / `set_active_parser()`，
+由 `QSR_TOOL_CALL_PARSER` 选择（对标 vLLM 的 `--tool-call-parser`），
+当前有 `poolside_v1` 和 `qwen3_coder` 两个实现。
+
+**这是一个和本节正交的轴，不要混淆**：
+
+| 轴 | 变化的是 | 抽象点 |
+|---|---|---|
+| **协议**（OpenAI / Anthropic / 未来的 N） | 客户端怎么收发 | 请求解析 + 响应/流式事件序列化 |
+| **模型**（Laguna / Qwen3.6 / …） | 模型怎么吐工具调用 | `ToolCallParser`：`open_tag` + 解析成结构化参数 |
+
+`StreamProcessor` 同时贯穿两轴：它从 `tool_parser` 拿模型侧的形状，
+把结果交给协议侧序列化。所以 Track A 的多模型接入会往 `tool_parsers/`
+加条目，而加一种新协议不会——**两边各自扩展，互不牵扯**。这个注册表也是
+一个有用的先例：它是从"第二个真实模型形状出现"归纳出来的，
+不是预先设计的，正是 §2.3 结尾说的那种"等第二个独立现实案例"再抽象。
+
 ---
 
 ## 3. 内部统一表示：`StreamProcessor` 已经是它了

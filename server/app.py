@@ -147,6 +147,13 @@ if SERVER_REASONING_MODE not in ("expose", "strip"):
 # StreamProcessor purely from where it appears in the generated text.
 SERVER_THINKING_CAPABLE = False
 
+# Selects which server/formats/tool_parsers/ shape to decode tool calls
+# with -- mirrors vLLM's --tool-call-parser NAME. Default matches this
+# project's currently (and so far only) production model, poolside/
+# Laguna-S-2.1-NVFP4. A model with a differently-shaped tool-call output
+# needs its own ToolCallParser registered there, then selected here.
+SERVER_TOOL_CALL_PARSER = os.environ.get("QSR_TOOL_CALL_PARSER", "poolside_v1")
+
 engine: ServerEngine | None = None
 
 
@@ -316,6 +323,14 @@ async def _debug_log_stream_output(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global engine
+    # Validated and applied before the (slow) model load, so a typo in
+    # QSR_TOOL_CALL_PARSER/--tool-call-parser fails in <1s instead of after
+    # minutes of loading weights.
+    from server.formats.tool_parsers import set_active_parser
+
+    set_active_parser(SERVER_TOOL_CALL_PARSER)
+    logger.info("tool_call_parser=%s", SERVER_TOOL_CALL_PARSER)
+
     logger.info(
         "loading model backend=%s (this can take a while: model load + KV cache alloc)...",
         SERVER_MODEL_BACKEND,
@@ -990,6 +1005,19 @@ def main() -> None:
             "multi-slot-concurrency.md."
         ),
     )
+    from server.formats.tool_parsers import available_parsers
+
+    parser.add_argument(
+        "--tool-call-parser",
+        choices=available_parsers(),
+        default=SERVER_TOOL_CALL_PARSER,
+        help=(
+            "Tool-call output shape to decode (mirrors vLLM's "
+            "--tool-call-parser). One per model family -- see "
+            "server/formats/tool_parsers/. Default matches the currently "
+            "loaded model."
+        ),
+    )
     args = parser.parse_args()
 
     # P4b: refuse --session-affinity together with --no-prefix-cache -- a clean
@@ -1012,6 +1040,7 @@ def main() -> None:
     os.environ["QSR_SERVER_SESSION_TTL_S"] = str(args.session_ttl_s)
     if args.dflash:
         os.environ["QSR_SERVER_ENABLE_DFLASH"] = "1"
+    os.environ["QSR_TOOL_CALL_PARSER"] = args.tool_call_parser
 
     # Runs before uvicorn imports the app module, so the model is not loaded
     # yet -- a fatal environment mismatch costs seconds, not a failed load.

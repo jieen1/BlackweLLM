@@ -34,9 +34,12 @@ directive in commit f13fd4a), OpenAI gets ``reasoning_content`` in
 
 from __future__ import annotations
 
+import json
+
 from server.formats.thinking import THINK_CLOSE as _THINK_CLOSE
 from server.formats.thinking import THINK_OPEN as _THINK_OPEN
 from server.formats.thinking import find_reasoning_span, strip_usage_artifacts
+from server.formats.tool_parsers import ToolCallParser, get_active_parser
 from server.formats.tools import find_tool_call_start, parse_tool_calls
 
 _USAGE_OPEN = chr(60) + "usage" + chr(62)
@@ -72,20 +75,32 @@ class StreamProcessor:
         visible_text, tool_calls = proc.finalize()
     """
 
-    def __init__(self, tokenizer, thinking_capable: bool = True):
+    def __init__(
+        self,
+        tokenizer,
+        thinking_capable: bool = True,
+        tool_parser: ToolCallParser | None = None,
+    ):
         self._tok = tokenizer
         self._all_ids: list[int] = []
         self._thinking_capable = thinking_capable
+        # Defaults to the process's active parser (set at server startup
+        # from the loaded model's config) -- pass one explicitly to pin a
+        # specific shape regardless of what's active (e.g. in tests).
+        self._tool_parser = tool_parser or get_active_parser()
         # Whether a reasoning phase is present is resolved lazily (see
-        # _reasoning_span): for thinking_capable=False we don't know for
-        # sure until either <think> literally appears at position 0, or
-        # enough tokens have decoded to rule that out.
+        # _reasoning_span) rather than from `thinking_capable` alone: a
+        # backend declared non-thinking can still choose to emit <think>,
+        # and until either it appears at position 0 or enough tokens have
+        # decoded to rule that out, neither answer is known.
         self._thinking_done = False
         self._tool_call_started = False
         self._emitted_len = 0
         self._thinking_emitted_len = 0
         self._last_decode_len = 0
         self._cached_raw = ""
+        self._tool_names_emitted: set[int] = set()
+        self._tool_args_emitted: set[int] = set()
 
     def add_tokens(self, token_ids: list[int]) -> None:
         self._all_ids.extend(token_ids)
@@ -239,7 +254,7 @@ class StreamProcessor:
         visible = self._visible_text(raw)
 
         # Check for tool call XML start
-        tc_start = find_tool_call_start(visible)
+        tc_start = find_tool_call_start(visible, open_tag=self._tool_parser.open_tag)
         if tc_start >= 0:
             self._tool_call_started = True
             safe = visible[:tc_start]
@@ -279,76 +294,56 @@ class StreamProcessor:
 
         Returns a list of delta events:
           - {"type": "name", "index": i, "name": "func_name", "id": "call_xxx"}
-          - {"type": "arguments_delta", "index": i, "delta": "...partial json..."}
+          - {"type": "arguments_delta", "index": i, "delta": "...json..."}
 
-        Enables streaming tool_call arguments as they are generated,
-        rather than freezing until the complete tool call is parsed.
+        The ``name`` event streams as soon as the function name is known.
+        ``arguments_delta`` is emitted exactly once per tool call, once its
+        block fully closes (``</function>`` / ``</tool_call>``) -- NOT
+        incrementally character-by-character. The model's on-the-wire shape
+        (Qwen's ``<parameter=K>V</parameter>``, Poolside's
+        ``<arg_key>K</arg_key><arg_value>V</arg_value>``) is XML-ish, not
+        JSON; streaming raw slices of it as "arguments_delta" (the previous
+        implementation) handed clients a concatenated string like
+        ``<arg_key>path</arg_key><arg_value>.</arg_value>`` where the
+        OpenAI/Anthropic wire formats require a JSON object string --
+        every OpenAI-compatible client fails to json-decode that. Emitting
+        the fully-parsed, ``json.dumps``-encoded arguments as a single delta
+        once the block is known-complete is what OpenAI's own "arguments
+        arrive as one or more chunks that concatenate to valid JSON"
+        contract requires; one whole-JSON chunk trivially satisfies it (and
+        remains valid even for a client that parses eagerly on every chunk,
+        unlike a genuinely-partial JSON prefix would).
 
-        Recognizes both interior shapes (see server/formats/tools.py):
-        Qwen's ``<function=NAME>...</function>`` and Laguna's poolside_v1
-        ``NAME<arg_key>...</arg_key><arg_value>...</arg_value>`` (bare name,
-        no wrapper tag) -- detected per block the same way the final
-        ``parse_tool_calls`` does, so a block isn't misread as one shape
-        while genuinely being the other.
+        Delegates all shape knowledge to the active ``ToolCallParser``
+        (``server/formats/tool_parsers/``) -- this loop only knows about the
+        shared ``open_tag``/``close_tag`` wrapper and calls into the parser
+        for the name boundary and the final block parse, so it works
+        unchanged for any registered parser.
         """
         if not self._tool_call_started:
             return []
 
+        parser = self._tool_parser
         raw = self._get_raw()
         visible = self._visible_text(raw)
         deltas = []
 
-        tc_open = "<tool_call>"
-        tc_close = "</tool_call>"
-        func_open = "<function="
-        func_close = "</function>"
-        arg_key_open = "<arg_key>"
-
-        if not hasattr(self, "_tool_names_emitted"):
-            self._tool_names_emitted = set()
-        if not hasattr(self, "_tool_args_emitted_len"):
-            self._tool_args_emitted_len = {}
-
         search_start = 0
         tc_idx = 0
         while True:
-            tc_pos = visible.find(tc_open, search_start)
+            tc_pos = visible.find(parser.open_tag, search_start)
             if tc_pos < 0:
                 break
-            after_open = tc_pos + len(tc_open)
-
-            func_pos = visible.find(func_open, after_open)
-            arg_key_pos = visible.find(arg_key_open, after_open)
-            tc_close_pos = visible.find(tc_close, after_open)
-            # Qwen shape: <function=NAME> present, and not preceded by a
-            # poolside delimiter -- otherwise this is a poolside block.
-            is_qwen = (
-                func_pos >= 0
-                and (arg_key_pos < 0 or func_pos < arg_key_pos)
-                and (tc_close_pos < 0 or func_pos < tc_close_pos)
+            after_open = tc_pos + len(parser.open_tag)
+            close_pos = visible.find(parser.close_tag, after_open)
+            block_closed = close_pos >= 0
+            interior_so_far = (
+                visible[after_open:] if not block_closed else visible[after_open:close_pos]
             )
 
-            if is_qwen:
-                name_end = visible.find(">", func_pos + len(func_open))
-                if name_end < 0:
-                    break
-                func_name = visible[func_pos + len(func_open) : name_end].strip()
-                args_start = name_end + 1
-                args_end = visible.find(func_close, args_start)
-                args_so_far = visible[args_start:] if args_end < 0 else visible[args_start:args_end]
-                block_end = args_end + len(func_close) if args_end >= 0 else -1
-            else:
-                # Poolside shape: bare NAME up to the first <arg_key> or the
-                # closing </tool_call> (zero-argument call). Neither has
-                # arrived yet -- wait for more tokens before guessing.
-                name_end = arg_key_pos if arg_key_pos >= 0 else tc_close_pos
-                if name_end < 0:
-                    break
-                func_name = visible[after_open:name_end].strip()
-                args_so_far = (
-                    visible[name_end:] if tc_close_pos < 0 else visible[name_end:tc_close_pos]
-                )
-                block_end = tc_close_pos + len(tc_close) if tc_close_pos >= 0 else -1
+            call_name = parser.find_name_boundary(interior_so_far, block_closed)
+            if call_name is None:
+                break  # not enough arrived yet to even know the name
 
             if tc_idx not in self._tool_names_emitted:
                 self._tool_names_emitted.add(tc_idx)
@@ -356,26 +351,26 @@ class StreamProcessor:
                     {
                         "type": "name",
                         "index": tc_idx,
-                        "name": func_name,
-                        "id": f"call_{func_name}_{tc_idx}",
+                        "name": call_name,
+                        "id": f"call_{call_name}_{tc_idx}",
                     }
                 )
 
-            prev_len = self._tool_args_emitted_len.get(tc_idx, 0)
-            if len(args_so_far) > prev_len:
-                delta_text = args_so_far[prev_len:]
-                self._tool_args_emitted_len[tc_idx] = len(args_so_far)
+            if block_closed and tc_idx not in self._tool_args_emitted:
+                self._tool_args_emitted.add(tc_idx)
+                parsed = parser.parse_block(interior_so_far)
+                arguments = parsed["arguments"] if parsed is not None else {}
                 deltas.append(
                     {
                         "type": "arguments_delta",
                         "index": tc_idx,
-                        "delta": delta_text,
+                        "delta": json.dumps(arguments, ensure_ascii=False),
                     }
                 )
 
-            if block_end < 0:
+            if not block_closed:
                 break
-            search_start = block_end
+            search_start = close_pos + len(parser.close_tag)
             tc_idx += 1
 
         return deltas
@@ -386,6 +381,8 @@ class StreamProcessor:
         Reuses ``content_text()`` (same state machine as the streaming
         path -- see module docstring) then parses tool calls out of it, so
         a caller that wants tool calls does not need to re-derive the
-        reasoning-stripped text itself.
+        reasoning-stripped text itself. The parser comes from the registry
+        so a model whose tool-call output has a different shape only needs
+        an entry there, not a change here.
         """
-        return parse_tool_calls(self.content_text())
+        return parse_tool_calls(self.content_text(), parser=self._tool_parser)

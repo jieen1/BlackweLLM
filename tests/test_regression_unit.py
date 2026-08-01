@@ -16,11 +16,14 @@ from server.formats import openai as openai_format
 from server.formats.content import extract_blocks, extract_text
 from server.formats.stream import StreamProcessor
 from server.formats.thinking import strip_thinking
+from server.formats.tool_parsers import get_parser, set_active_parser
 from server.formats.tools import (
     convert_tools_to_chat_template,
     find_tool_call_start,
     parse_tool_calls,
 )
+
+QWEN_PARSER = get_parser("qwen3_coder")
 
 THINK_OPEN = chr(60) + "think" + chr(62)
 THINK_CLOSE = chr(60) + "/think" + chr(62)
@@ -91,6 +94,10 @@ class TestOpenAIResponse:
         assert r["choices"][0]["message"]["content"] == ""
 
     def test_tool_call(self):
+        """build_response has no parser param of its own -- it goes through
+        parse_tool_calls' default, i.e. whatever's process-active. Select
+        qwen3_coder (this text's shape) for the duration of the test, then
+        restore the poolside_v1 default other tests rely on."""
         text = (
             "X "
             + TOOL_OPEN
@@ -101,9 +108,13 @@ class TestOpenAIResponse:
             + FUNC_CLOSE
             + TOOL_CLOSE
         )
-        r = openai_format.build_response(
-            model="t", text=text, finish_reason="stop", prompt_tokens=10, completion_tokens=20
-        )
+        set_active_parser("qwen3_coder")
+        try:
+            r = openai_format.build_response(
+                model="t", text=text, finish_reason="stop", prompt_tokens=10, completion_tokens=20
+            )
+        finally:
+            set_active_parser("poolside_v1")
         assert r["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
         assert r["choices"][0]["finish_reason"] == "tool_calls"
 
@@ -171,16 +182,16 @@ class TestToolCallParsing:
             + FUNC_CLOSE
             + TOOL_CLOSE
         )
-        vis, tools = parse_tool_calls(text)
+        vis, tools = parse_tool_calls(text, parser=QWEN_PARSER)
         assert len(tools) == 1 and tools[0]["name"] == "get_weather" and TOOL_OPEN not in vis
 
     def test_none(self):
-        vis, tools = parse_tool_calls("Just text")
+        vis, tools = parse_tool_calls("Just text", parser=QWEN_PARSER)
         assert vis == "Just text" and tools == []
 
     def test_multiple(self):
         tc = TOOL_OPEN + FUNC_OPEN + PARAM_OPEN + "X" + PARAM_CLOSE + FUNC_CLOSE + TOOL_CLOSE
-        _, tools = parse_tool_calls("A " + tc + " B " + tc)
+        _, tools = parse_tool_calls("A " + tc + " B " + tc, parser=QWEN_PARSER)
         assert len(tools) == 2
 
 

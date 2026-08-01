@@ -1,132 +1,65 @@
 """Tool-call parsing and formatting.
 
-Models emit tool calls as XML-ish text inside their generation, sharing a
-common outer ``<tool_call>...</tool_call>`` delimiter but disagreeing on the
-interior shape:
+Each model family has its own on-the-wire shape for a tool call --
+``server/formats/tool_parsers/`` holds one ``ToolCallParser`` per shape
+(``poolside_v1`` for Laguna-S-2.1, ``qwen3_coder`` for Qwen3.6) selected via
+a registry, mirroring vLLM's own ``--tool-call-parser NAME`` design. See
+``tool_parsers/base.py`` for why a new model means a new parser module, not
+a config lookup.
 
-- Qwen3.6: ``<function=NAME>...<parameter=K>V</parameter>...</function>``
-- Laguna-S-2.1 (poolside_v1, per its ``chat_template.jinja``): bare ``NAME``
-  followed by zero or more ``<arg_key>K</arg_key><arg_value>V</arg_value>``
-  pairs -- no ``<function=>``/``<parameter=>`` wrapper at all.
-
-``parse_tool_calls`` detects which shape a block uses (the two are mutually
-exclusive) and parses accordingly. This module parses that text into
-structured tool-call objects and formats them for each API style
-(OpenAI / Anthropic).
-
-Streaming incremental deltas (``server/formats/stream.py``'s
-``drain_tool_deltas``) are NOT covered by this -- they only recognize
-Qwen's ``<function=`` shape mid-generation. A Laguna tool call still
-resolves correctly in the final response (``StreamProcessor.finalize()``
-calls ``parse_tool_calls``), it just won't stream incrementally yet.
+This module is the shape-agnostic layer above that registry: it scans text
+for ``<tool_call>...</tool_call>`` blocks using the active (or an explicitly
+passed) parser and formats the result for each API style (OpenAI /
+Anthropic). It also backs ``server/formats/stream.py``'s streaming path, so
+a tool call parses identically whether the request was streamed or not.
 """
 
 from __future__ import annotations
 
 import json
-import re
-from typing import Any
 
-_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-_QWEN_FUNCTION_RE = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
-_QWEN_PARAM_RE = re.compile(r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", re.DOTALL)
-_POOLSIDE_ARG_RE = re.compile(
-    r"<arg_key>([^<]*)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
-)
-# Real tool names are always simple identifiers (OpenAI's function-calling
-# spec requires this shape). Since the Poolside interior has no wrapper tag
-# at all, this guards against misreading arbitrary/malformed <tool_call>
-# content (e.g. prose) as a bogus zero-argument call.
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*$")
+from server.formats.tool_parsers import ToolCallParser, get_active_parser
+
+__all__ = [
+    "parse_tool_calls",
+    "format_tool_calls_openai",
+    "format_tool_calls_anthropic",
+    "convert_tools_to_chat_template",
+    "find_tool_call_start",
+]
 
 
-def _repair_json(value: str) -> str:
-    """Attempt to repair common JSON formatting errors from model output.
-
-    Models occasionally produce near-valid JSON with predictable mutations:
-    - ``{("key": ...)}`` instead of ``[{"key": ...}]`` (set-literal confusion)
-    - Trailing commas before ``]`` or ``}``
-    """
-    repaired = value.strip()
-    # Pattern: {("key": val, ...)}] -> [{"key": val, ...}]
-    # The model sometimes wraps a dict in set-literal syntax {( ... )}
-    # instead of putting it in an array [{ ... }].
-    if repaired.startswith("{("):
-        inner = repaired[2:]  # strip leading {(
-        if inner.endswith("})]"):
-            inner = inner[:-3] + "}]"
-        elif inner.endswith(")}"):
-            inner = inner[:-2] + "}]"
-        elif inner.endswith(")"):
-            inner = inner[:-1] + "}]"
-        repaired = "[{" + inner
-    # Trailing commas: ,] or ,}
-    repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
-    return repaired
-
-
-def _parse_value(raw: str) -> Any:
-    """Parse one argument value: JSON if possible, else the repaired JSON,
-    else the raw string verbatim (models occasionally emit bare strings
-    the template doesn't quote -- see chat_template.jinja's
-    ``v if v is string else v | tojson``)."""
-    try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, ValueError):
-        try:
-            return json.loads(_repair_json(raw))
-        except (json.JSONDecodeError, ValueError):
-            return raw
-
-
-def _parse_tool_call_block(block: str) -> dict | None:
-    """Parse one ``<tool_call>...</tool_call>`` block's interior.
-
-    Returns None if the block matches neither known shape (left as visible
-    text by the caller, same as if it hadn't matched at all).
-    """
-    func_match = _QWEN_FUNCTION_RE.search(block)
-    if func_match:
-        name = func_match.group(1).strip()
-        params_block = func_match.group(2)
-        arguments = {
-            m.group(1).strip(): _parse_value(m.group(2).strip())
-            for m in _QWEN_PARAM_RE.finditer(params_block)
-        }
-        return {"name": name, "arguments": arguments}
-
-    # Poolside shape: bare NAME, optionally followed by <arg_key>/<arg_value>
-    # pairs -- e.g. "get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>"
-    # or a zero-argument call, just "get_weather".
-    first_arg_idx = block.find("<arg_key>")
-    name = block[:first_arg_idx].strip() if first_arg_idx >= 0 else block.strip()
-    if not _IDENTIFIER_RE.match(name):
-        return None
-    args_block = block[first_arg_idx:] if first_arg_idx >= 0 else ""
-    arguments = {
-        m.group(1).strip(): _parse_value(m.group(2).strip())
-        for m in _POOLSIDE_ARG_RE.finditer(args_block)
-    }
-    return {"name": name, "arguments": arguments}
-
-
-def parse_tool_calls(text: str) -> tuple[str, list[dict]]:
+def parse_tool_calls(text: str, parser: ToolCallParser | None = None) -> tuple[str, list[dict]]:
     """Parse tool calls from model output.
+
+    ``parser`` defaults to the process's active parser (set once at server
+    startup from the loaded model's config) -- pass one explicitly to parse
+    a specific shape regardless of what's active (e.g. in tests).
 
     Returns (visible_text, tool_calls) where visible_text is the output
     with successfully-parsed tool_call blocks removed, and tool_calls is a
-    list of dicts with keys: name, arguments (dict). A block matching
-    neither known interior shape is left untouched in visible_text (same
-    as a non-match, not counted as a tool call).
+    list of dicts with keys: name, arguments (dict). A block whose interior
+    the parser doesn't recognize is left untouched in visible_text (same as
+    a non-match, not counted as a tool call).
     """
+    parser = parser or get_active_parser()
     tool_calls: list[dict] = []
     spans: list[tuple[int, int]] = []
-    for match in _TOOL_CALL_BLOCK_RE.finditer(text):
-        parsed = _parse_tool_call_block(match.group(1))
-        if parsed is None:
-            continue
-        tool_calls.append(parsed)
-        spans.append(match.span())
+    search_start = 0
+    while True:
+        start = text.find(parser.open_tag, search_start)
+        if start < 0:
+            break
+        interior_start = start + len(parser.open_tag)
+        end = text.find(parser.close_tag, interior_start)
+        if end < 0:
+            break
+        block_end = end + len(parser.close_tag)
+        parsed = parser.parse_block(text[interior_start:end])
+        if parsed is not None:
+            tool_calls.append(parsed)
+            spans.append((start, block_end))
+        search_start = block_end
     if not spans:
         return text.strip(), tool_calls
     pieces = []
@@ -229,11 +162,15 @@ def convert_tools_to_chat_template(tools: list[dict] | None) -> list[dict] | Non
 
 # -- Streaming tool-call detection ------------------------------------------
 
-_TOOL_CALL_OPEN = chr(60) + "tool_call" + chr(62)
+_DEFAULT_TOOL_CALL_OPEN = chr(60) + "tool_call" + chr(62)
 
 
-def find_tool_call_start(text: str) -> int:
+def find_tool_call_start(text: str, open_tag: str = _DEFAULT_TOOL_CALL_OPEN) -> int:
     """Find the earliest position where a tool call block might be starting.
+
+    ``open_tag`` defaults to the ``<tool_call>`` wrapper every parser has
+    used so far (see ``tool_parsers/base.py``); pass the active parser's
+    own ``open_tag`` explicitly if it ever differs.
 
     Returns the index of the first character of the potential tool call,
     or -1 if no tool call start is detected.
@@ -243,12 +180,12 @@ def find_tool_call_start(text: str) -> int:
     emitted '<tool' but not yet '_call>').
     """
     # Full tag present
-    idx = text.find(_TOOL_CALL_OPEN)
+    idx = text.find(open_tag)
     if idx >= 0:
         return idx
     # Partial prefixes at the very end of the text (streaming edge case)
-    for length in range(len(_TOOL_CALL_OPEN) - 1, 0, -1):
-        prefix = _TOOL_CALL_OPEN[:length]
+    for length in range(len(open_tag) - 1, 0, -1):
+        prefix = open_tag[:length]
         if text.endswith(prefix):
             return len(text) - length
     return -1
