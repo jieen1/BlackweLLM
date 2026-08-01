@@ -569,3 +569,36 @@ docstring 记录了现在为什么没接、接通需要什么条件。
 admission 阶段就能拿到的掩码钩子，并解决 CUDA Graph 重放下"贪心已经烤进
 graph"的架构冲突（关掉该批次的 CG 重放，或者把逐 token 变化的 bitmask
 做成 graph 的一个输入）。在此之前不要重新"顺手接上"§5.1 提到的窄路径。
+
+### 7.3 N3（`seed`）—— 已接通，不改 `runtime/backends/laguna.py`
+
+根因和 §5.4 一致：`runtime/backends/laguna.py` 三个采样调用点
+（`prefill_sampled`/`decode_sampled`/`decode_batch_sampled`）每次都是
+`gen = make_generator(params.seed); sample_from_logits(..., generator=gen)`，
+`seed` 是裸 `int` 时 `make_generator` 每次都新建一个 generator 并
+`manual_seed(seed)`——同一个 seed 每一步都被"重置"回同一个初始状态,而不是
+沿着一条流前进。
+
+修法不改调用点（调用点在 `runtime/backends/laguna.py`，不在本次范围内），
+改**调用点传进去的值本身**：新增 `runtime/sampling.py::PersistentSeed`，
+包一层薄壳在 `.seed` 字段上——它是一个持有"惰性创建的 `torch.Generator`"
+的普通对象，`make_generator()` 识别到 `PersistentSeed` 时直接返回它内部
+缓存的 generator（第一次调用才真正创建+播种），不重新播种。因为
+`GenerationRequest.sampling_params`（因此 `.seed`）在一个请求的全部解码轮
+之间是**同一个对象**，`runtime/backends/laguna.py` 里那三处调用点在同一个
+请求的不同轮次里，拿到的是同一个 `PersistentSeed` 实例，从而拿到同一个、
+持续前进的 generator——完全不需要改调用点的代码，因为调用点做的事
+(`make_generator(params.seed)`) 没变，变的是 `params.seed` 这个值自己的
+身份和行为。
+
+`server/app.py::_build_sampling_params` 是唯一的构造点：每个 HTTP 请求
+`seed is not None` 时新建一个 `PersistentSeed(seed)` 实例（按对象身份而非
+数值区分，两个恰好都传 `seed=42` 的并发请求各自拿到独立实例、独立
+generator，不会互相污染随机流）。
+
+**贪心位精确不受影响**：`SamplingParams.is_greedy`（`temperature<=0`）
+分支在 `sample_from_logits`/`decode_batch_sampled` 里都是直接
+`logits.argmax(...)`，完全不触碰 `make_generator`/`seed`——`PersistentSeed`
+对贪心路径是彻底惰性的，从未被实例化的 generator 也就没有任何东西可以
+影响。`tests/test_sampling.py::TestPersistentSeed::
+test_greedy_path_never_touches_seed` 直接断言这一点。

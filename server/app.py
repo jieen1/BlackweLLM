@@ -34,7 +34,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from runtime.sampling import SamplingParams
+from runtime.sampling import PersistentSeed, SamplingParams
 from runtime.structured_output import ResponseFormat
 from server import metrics
 from server.engine import ServerEngine
@@ -477,7 +477,13 @@ def _build_sampling_params(
         temperature=temp,
         top_p=resolved_top_p,
         top_k=resolved_top_k,
-        seed=seed,
+        # N3: wrap in PersistentSeed so make_generator() advances ONE
+        # generator across this request's decode rounds instead of
+        # reseeding an identical initial RNG state at every token -- see
+        # PersistentSeed's docstring (runtime/sampling.py). A fresh
+        # instance per request/per call means two different requests that
+        # happen to pass the same integer seed never share RNG state.
+        seed=PersistentSeed(seed) if seed is not None else None,
     )
 
 
