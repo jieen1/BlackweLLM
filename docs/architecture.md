@@ -122,9 +122,26 @@ OOM 或者显存白扔——这正是 [`roadmap.md`](roadmap.md) Track D 要消�
 
 ### 2.4 前缀缓存
 
-内容寻址：块级哈希 + 引用计数 + LRU 驱逐（`runtime/block_pool.py`）。
-命中后走**同槽 KV 复用**——把命中的前缀 KV 留在原槽，只对超出前缀的部分
-重新 prefill，并重建 SWA ring 窗口。
+⚠️ **本节此前描述错了现状，2026-08-02 更正。** 原文写的是"内容寻址：块级哈希 +
+引用计数 + LRU 驱逐（`runtime/block_pool.py`）"——那是 `block_pool.py` 里实现的机制，
+但**生产路径一行都没调用它**。
+
+**实际生效的机制**是同槽 KV 复用：`LagunaBackend.find_best_slot_for_prompt()` +
+`reconcile_prefix_hit()`（`runtime/backends/laguna.py:2179`/`:2222`）把命中的前缀 KV
+留在原槽，只对超出前缀的部分重新 prefill，并重建 SWA ring 窗口。`server/app.py:1249`
+的注释已经写明这一点（"LagunaBackend uses static block allocation … not a dynamic
+BlockPool"），等于代码自己否认了本节原来的说法。
+
+**`block_pool.py` 的真实状态**（518 行）：`BlockPool` / `hash_block_tokens` /
+`FreeBlockQueue` **生产调用方为零**；`runtime/` 与 `server/` 里唯一的提及是上面那句
+说明它没被用的注释。生产代码从该模块只 import 一个 `ChunkedPrefillState` dataclass
+（`laguna.py:39`）。但它**有 44 个通过的测试**（`tests/test_block_pool.py` +
+`tests/test_invariants.py`）。
+
+这个组合对 §3.5.5 第 7 步（A3 缓存协调者）很重要：它既不是"可以直接建在上面的可靠
+地基"，也不是"没人测过的死代码"，而是**测试充分但无人调用**——测试编码的是当初作者的
+假设，不是今天的生产现实。第 7 步若要复用它，必须先用真实生产路径验证，不能拿测试
+全绿当作它能工作的证据。
 
 `block_pool.py` 里仍保留着 GDN checkpoint 的联动驱逐挂钩（`evict_gdn_checkpoint`
 等），那是 Qwen3.6 时代的设计残迹：**当前 Laguna 没有任何 GDN 层，这条路径
