@@ -148,10 +148,14 @@ P0-C 拍板 D6 ─────────────────────�
 **执行顺序按 [`architecture.md` §3.5.5](architecture.md) 定稿的 8 步**，不是 roadmap 的 A1→A6 编号顺序：
 按爆炸半径从小到大，零行为变更的步骤排在前面。**前 4 步完全不需要 GPU。**
 
+> 进度：**第 1–2 步已完成（`4ed5a7b`、`f24f5ad`）**。两种环境均验证：
+> torch 环境 1116 passed（原 1100），无 torch 环境 817 passed / 93 skipped，
+> ruff 两关全过。第 3–4 步仍是零 GPU，可直接接着做。
+
 | # | 步骤 | 行为变更 | 门禁 | GPU |
 |---|---|---|---|---|
-| 1 | [ ] **A2-shadow** 定义 Protocol（D-1 的 13 个成员 + D-3 能力查询），静态+运行时断言 `LagunaBackend` 满足它，**不改调用点** | 无 | 类型检查 + 一致性单测 | ❌ |
-| 2 | [ ] **A2-观测** `snapshot()` 落地，`app.py:673/676` 两处私有直读改走它，删 `_slot_kv_len()` | 无（同值） | 单测 + C-LIVE metrics 两条 | ❌ 写 |
+| 1 | [x] **A2-shadow** ✅ `4ed5a7b`：`runtime/backends/protocol.py`（torch-free）+ `BackendCapabilities` + `check_conformance`；`LagunaBackend` 加 `capabilities`。**零调用点改动**。门禁经两种注入漂移验证会变红 | 无 | 类型检查 + 一致性单测 | ❌ |
+| 2 | [x] **A2-观测** ✅ `f24f5ad`：`snapshot()` 落地，`/metrics` 与 `/debug/stats` 改走契约，删 `_slot_kv_len()`；补上 `/metrics` **此前完全没有的路由级测试**（冷启动 + 忙时两态） | 无（同值） | 单测 ✅ + C-LIVE metrics 两条（待 GPU） | ❌ 写 |
 | 3 | [ ] **A1 ModelSpec（影子）** 按 §3.2-A 九个字段族解析 `config.json`，断言结果与当前硬编码值逐字段相等，暂不驱动任何东西。含 RK8：显式拒绝带 vision tower 的权重 | 无 | 影子一致性单测 | ❌ |
 | 4 | [ ] **A5 Registry（影子）** 路径 → `(spec, backend, loader, 投机策略)`，断言等于今天的硬编码选择 | 无 | 影子一致性单测 | ❌ |
 | 5 | [ ] **切换** Registry 成为唯一真相源；删 `engine.py:188` `MODEL`、`:190` `BACKEND`、`app.py:81` `SERVER_MODEL_BACKEND` | **有** | 贪心 bit-exact + C-LIVE | ✅ |
