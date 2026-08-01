@@ -9,9 +9,83 @@ description = "Blackwell-native CUDA inference engine for SM120 GPUs — custom 
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
-cuda = ["numpy>=2,<3", "safetensors>=0.6.2", "torch==2.11.0"]
-dev = ["pytest>=8", "ruff>=0.8"]
-serving = ["requests>=2.31", "transformers>=4.45", "fastapi>=0.110", "uvicorn>=0.29", "httpx>=0.27"]
+# --- Version contract (docs/roadmap.md T0-6) ---------------------------------
+# torch is pinned exactly: `torch==2.13.0` is the declared target version —
+# the newest PyPI final release at verification time, and the version
+# `pip install -e '.[cuda]'` will actually resolve on a clean machine.
+#
+# The reference environment this project was verified against instead runs a
+# self-compiled *pre-release* of that same minor version (editable install of
+# `/home/bot/pytorch-build`, reporting `2.13.0a0+gitcf30153`, CUDA 13.3,
+# driver 610.47) — built from source because Blackwell/CC 12.0 support at
+# verification time predated a stock PyPI wheel that had it. That exact
+# string is not itself resolvable from PyPI (pip cannot pip-install a git
+# hash), so it is not what is pinned here; by decision, that from-source
+# pre-release is treated as satisfying this `2.13.0` contract, not as a
+# different/incompatible version — `runtime/preflight.py`'s
+# `check_torch_version` implements this by matching on the release segment
+# (major.minor.patch) only and ignoring the `a0`/`+git...` suffix. If a fresh
+# box installs the plain `torch==2.13.0` PyPI wheel instead, that also
+# satisfies the same check. SparkInfer's own floor
+# (`/home/bot/project/sparkinfer/pyproject.toml`: `torch>=2.12.0`) is
+# comfortably below this pin. Record whatever exact build you verify next in
+# `runtime/preflight.py`'s `VERIFIED_TORCH_VERSION` comment and here.
+#
+# All other floors/ceilings below are the exact versions verified working in
+# the project's reference environment on 2026-08-01 (see
+# `docs/sparkinfer-fork-delta.md` for how that environment was audited),
+# widened to the current minor-version ceiling so routine patch releases
+# don't require touching this file.
+cuda = [
+  "numpy>=2,<3",                    # verified 2.3.5
+  "safetensors>=0.7,<1",            # verified 0.7.0
+  "torch==2.13.0",                   # declared target; reference env runs 2.13.0a0+gitcf30153 (see note above)
+  "triton>=3.6,<4",                  # verified 3.6.0 — runtime/kernels/*.py import triton directly
+  "transformers>=5,<6",              # verified 5.8.0 — runtime/laguna_config.py imports this directly
+                                      # (moved here from `serving`: it is a core runtime dependency,
+                                      # needed even when running without the HTTP layer)
+  "huggingface_hub>=1,<2",           # verified 1.13.0 — runtime/laguna_config.py imports this directly;
+                                      # previously undeclared and only reached transitively via transformers
+  "nvidia-cutlass-dsl>=4.5,<5",       # verified 4.5.2 — transitive SparkInfer build dependency; pinned here
+                                      # too because runtime/backends/laguna_sparkinfer_moe.py has a
+                                      # sys.path workaround tied to this package's on-disk layout
+]
+dev = ["pytest>=8,<9", "ruff>=0.8,<1"]
+serving = ["requests>=2.31,<3", "fastapi>=0.110,<1", "uvicorn>=0.29,<1", "httpx>=0.27,<1"]
+# --- SparkInfer: deliberately absent from every extra above ------------------
+# SparkInfer (/home/bot/project/sparkinfer) is not published to PyPI. It
+# cannot be listed as `sparkinfer>=X` here — pip would try to resolve that
+# from PyPI and fail outright on any machine, including CI. It also should
+# not be hardcoded as a `sparkinfer @ file:///home/bot/project/sparkinfer`
+# direct reference: that path is a per-machine convention, not guaranteed by
+# this repo, and baking it into pyproject.toml would make
+# `pip install -e '.[cuda]'` fail the instant someone's checkout lives
+# anywhere else (including the CPU-only verification venvs used to
+# sanity-check this file). Install it as a separate, explicit step instead:
+#
+#   pip install -e /home/bot/project/sparkinfer
+#
+# after installing this project's `cuda` extra.
+#
+# What's checked out at that path is THIS PROJECT'S OWN FORK
+# (`origin` = https://github.com/jieen1/sparkinfer.git), not a third-party
+# dependency we cannot touch — that description applied to an earlier
+# revision of this comment and was wrong. `origin/master` is production and
+# carries two fork-only commits beyond the last `upstream`
+# (https://github.com/local-inference-lab/sparkinfer.git) sync: a gating
+# relaxation that unlocks a fast decode/prefill kernel path for our real
+# TP=1 attention shape, and a small FP8-precision change to the verify path.
+# See `docs/sparkinfer-fork-delta.md` for exactly what those commits do and
+# why they're safe.
+#
+# Verified pin: fork `origin/master` at commit `0844a4f` (based on upstream
+# `3bd3a2e`). Record whatever commit you verify next here and in
+# `docs/sparkinfer-fork-delta.md`. `runtime/preflight.py` validates at
+# startup that SparkInfer is importable, version-contract-compliant (see
+# `check_sparkinfer_contract`), and carries the fork's gating relaxation
+# (see `check_sparkinfer_analytic_decode_gate`) — a missing or plain-upstream
+# SparkInfer install is caught there instead of silently at import time or,
+# worse, silently at 40% of the expected throughput.
 
 [project.scripts]
 bf = "bfdiag.cli:main"

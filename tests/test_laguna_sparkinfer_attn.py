@@ -37,6 +37,11 @@ def test_paged_descale_rejects_ambiguous_scale_shape():
 
 
 def test_cuda_graph_attention_rebinds_when_model_buffers_move(monkeypatch):
+    # monkeypatch.setattr below resolves its string targets by importing
+    # the real sparkinfer submodules -- unlike the plain
+    # `from runtime.backends... import ...` above (which only reaches
+    # sparkinfer lazily/conditionally), this needs the actual package.
+    pytest.importorskip("sparkinfer")
     bindings = []
 
     def build_binding(**kwargs):
@@ -87,6 +92,7 @@ def test_cuda_graph_attention_rebinds_when_model_buffers_move(monkeypatch):
 
 def test_prefill_workspace_reuses_plan_only_within_one_metadata_object(monkeypatch):
     """Layer-group sharing must not reuse a plan after the next forward."""
+    pytest.importorskip("sparkinfer")
     calls: list[str] = []
 
     class FakeWorkspace:

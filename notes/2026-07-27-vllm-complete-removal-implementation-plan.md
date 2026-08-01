@@ -1,5 +1,14 @@
 # 完全剥离 vLLM 依赖——分阶段实施计划(2026-07-27)
 
+> **2026-08-01 更新（T0-7 仓库卫生）**：本文档引用的验证脚本
+> `benchmarks/_phase1_bitexact_validate.py`（+ `_long`）、
+> `benchmarks/_phase3_dflash_bitexact_validate.py`（+ `_long`）、
+> `benchmarks/_phase5_e2e_bitexact_validate.py` 已于 2026-08-01 删除
+> （用户明确决定：vLLM 剥离主线已完成 `a9cb932`，这批验证脚本不再需要保留）。
+> 下文所有对这些文件名的引用指向的都是历史记录,脚本本身可以从 git 历史找回：
+> `git log --diff-filter=D -- benchmarks/_phase5_e2e_bitexact_validate.py`
+> （其余四个同理,把文件名换掉即可）。
+
 ## 范围确认(用户,2026-07-27)
 
 **qwen3.6(DirectModelRunner)路径本次不动,阶段4整体跳过。以 Laguna 为主,做完

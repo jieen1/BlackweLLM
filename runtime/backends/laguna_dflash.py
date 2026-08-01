@@ -1190,9 +1190,7 @@ class DFlashEngine:
                     prefix_len,
                     ring_specs,
                 ):
-                    prefix_len = backend.prepare_exact_prefix_replay(
-                        slot, prompt_ids, prompt_len
-                    )
+                    prefix_len = backend.prepare_exact_prefix_replay(slot, prompt_ids, prompt_len)
                     exact_cold_replay = prefix_len is not None
                     if exact_cold_replay:
                         logger.info(
@@ -1306,17 +1304,13 @@ class DFlashEngine:
         _draft_base = _phys * self._draft_blocks_per_slot
         _ring_slots = self._draft_blocks_per_slot * _bs
         # Pre-allocate context position buffer (max M=16 tokens per round)
-        _ctx_pos_buf = torch.arange(
-            NUM_QUERY_PER_REQ, dtype=torch.long, device=self.device
-        )
+        _ctx_pos_buf = torch.arange(NUM_QUERY_PER_REQ, dtype=torch.long, device=self.device)
 
         while len(tokens) < max_tokens:
             num_steps += 1
             total_draft += NUM_SPECULATIVE_TOKENS
             kv_len = backend.slot_kv_len[slot]
-            _bf_row = (
-                bfdiag_trace.begin_round(slot, kv_len) if _trace_enabled else -1
-            )
+            _bf_row = bfdiag_trace.begin_round(slot, kv_len) if _trace_enabled else -1
 
             # Step 1: Verify (M=16 full model forward) — replaces decode+verify
             verify_tokens = [bonus_token] + draft_tokens
@@ -1475,7 +1469,11 @@ class DFlashEngine:
         return tokens, stats
 
     def dflash_prefill_bootstrap(
-        self, slot: int, prompt_ids: list[int], *, prefix_hit: int = 0,
+        self,
+        slot: int,
+        prompt_ids: list[int],
+        *,
+        prefix_hit: int = 0,
     ) -> dict:
         """DFlash-aware prefill for ServerEngine's admission path.
 
@@ -1491,7 +1489,9 @@ class DFlashEngine:
         """
         backend = self.backend
         first_token, aux_hidden_states = backend.prefill_with_aux(
-            slot, prompt_ids, prefix_hit=prefix_hit,
+            slot,
+            prompt_ids,
+            prefix_hit=prefix_hit,
         )
 
         if aux_hidden_states is not None:

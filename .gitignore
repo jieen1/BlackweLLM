@@ -46,6 +46,9 @@ runtime/kernels/_generated/
 # Pytest
 .pytest_cache/
 
+# Ruff
+.ruff_cache/
+
 # OMX / agent state
 .omx/
 .codegraph/

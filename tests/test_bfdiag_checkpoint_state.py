@@ -59,20 +59,38 @@ def test_device_tensor_items_cover_full_swa_draft() -> None:
 
 
 def test_not_applicable_items_match_reset_checklist_findings() -> None:
-    """GDN state and the content-addressed prefix cache/BlockPool are named
-    in the task spec by analogy with DirectModelRunner but do not apply to
-    LagunaBackend -- same conclusion as
-    bfdiag/daemon/session.py::RESET_CHECKLIST, re-derived independently
-    here rather than merely trusted."""
+    """GDN state genuinely does not apply to LagunaBackend (no GDN layers)
+    -- same conclusion as bfdiag/daemon/session.py::RESET_CHECKLIST,
+    re-derived independently here rather than merely trusted.
+
+    The other "not_applicable" item, Laguna's own persistent prefix cache,
+    is 'not_applicable' for a DIFFERENT reason (see state.py's StateItem
+    category docstring, updated 2026-08-02): the mechanism is real and
+    does apply -- it is why reset_slot no longer zeros KV -- but restore
+    must CLEAR it rather than save/restore it verbatim, so it is not
+    checkpoint SAVE content. Both premises corrected 2026-08-02; see
+    notes/2026-08-01-bfdiag-assertion-audit.md."""
     na_names = {i.name for i in state.SLOT_STATE_ITEMS if i.category == "not_applicable"}
     assert any("GDN" in name for name in na_names)
-    assert any("prefix cache" in name or "BlockPool" in name for name in na_names)
+    assert any("prefix cache" in name for name in na_names)
 
 
-def test_bug_found_item_is_documented() -> None:
+def test_bug_found_not_fixed_category_is_currently_empty() -> None:
+    """As of 2026-08-02 there is no live 'bug_found_not_fixed' entry: the
+    one that used to be here ("reset_slot's block-range slice hits the
+    wrong tensor axis") described a bug in an OLDER reset_slot that has
+    since been fixed AND rewritten again (to no longer zero KV at all,
+    for the prefix-cache reasons above) -- the cited line numbers now
+    point at an unrelated function (_prefill_with_prefix_hit), and no
+    current code has the described missing-leading-colon pattern (grep
+    confirms every `kv_caches[name][...]` slice in laguna.py uses the
+    correct `[:, start:end]` form). Removed rather than left to describe a
+    bug that no longer exists -- see
+    notes/2026-08-01-bfdiag-assertion-audit.md. The category itself stays
+    in _KNOWN_CATEGORIES for future findings; this test just documents
+    that it is legitimately empty right now, not silently abandoned."""
     bug_items = [i for i in state.SLOT_STATE_ITEMS if i.category == "bug_found_not_fixed"]
-    assert len(bug_items) == 1
-    assert "reset_slot" in bug_items[0].code_ref
+    assert bug_items == []
 
 
 # --- ring_blocks_for_window matches the real formula -------------------------
@@ -172,61 +190,21 @@ def test_estimate_checkpoint_bytes_swa_ring_is_fixed_per_slot() -> None:
     assert small.full_attn_bytes < large.full_attn_bytes
 
 
-# --- regression test for the reset_slot axis bug -----------------------------
+# --- full_slot_block_range (added 2026-08-02, see restore.py's isolation fix) --
 
 
-def test_reset_slot_axis_bug_is_real_and_this_package_does_not_replicate_it() -> None:
-    """Documents (and proves, via plain tensor slicing -- no runtime.*
-    import needed) the bug recorded in SLOT_STATE_ITEMS'
-    'bug_found_not_fixed' entry: ``runtime/backends/laguna.py:1647,1653``
-    slices ``tensor[start:end]`` on a KV cache tensor shaped
-    ``(2, num_blocks, block_size, kv_heads, head_dim)`` -- dim 0 is the K/V
-    axis (size 2), so that slice hits the WRONG axis. For slot 0 (start=0)
-    it clips to the whole dim 0 and leaves every block untouched by the
-    slice itself, i.e. ``.zero_()`` wipes the ENTIRE tensor (every slot's
-    blocks); for any slot > 0 the slice is empty and ``.zero_()`` is a
-    silent no-op.
-
-    This package's own code (state.py's ``full_block_range`` used with a
-    leading ``:,`` in store.py/restore.py/testing.py) does NOT have this
-    bug -- demonstrated here by comparing the two slicing forms directly.
-    """
-    num_slots = 2
-    blocks_per_slot = 4
-    tensor = torch.arange(2 * num_slots * blocks_per_slot, dtype=torch.uint8).reshape(
-        2, num_slots * blocks_per_slot, 1, 1, 1
-    )
-
-    # Slot 0's "intended" range: blocks [0, blocks_per_slot).
-    full_start, full_end = 0 * blocks_per_slot, 1 * blocks_per_slot
-
-    buggy = tensor.clone()
-    buggy[full_start:full_end].zero_()  # the real reset_slot's exact form
-    correct = tensor.clone()
-    correct[:, full_start:full_end].zero_()  # this package's form
-
-    # The buggy slice zeros BOTH K and V for slot 0's range only if that
-    # happened to equal the whole tensor; in general (num_slots > 1) it
-    # zeros strictly more than intended (all of dim 0, every block) --
-    # provably different from the correct, block-scoped zeroing.
-    assert not torch.equal(buggy, correct), (
-        "the buggy and correct slicing forms produced identical results -- "
-        "this test's tensor shape no longer demonstrates the bug; revisit "
-        "the shape parameters"
-    )
-    # Correct form only touches slot 0's blocks; slot 1's blocks (and
-    # anything beyond blocks_per_slot in dim 1) must be untouched.
-    assert torch.equal(correct[:, blocks_per_slot:], tensor[:, blocks_per_slot:])
-    # Buggy form, by contrast, zeros dim-1 positions belonging to OTHER
-    # slots too (since it left dim 1 entirely unrestricted).
-    assert not torch.equal(buggy[:, blocks_per_slot:], tensor[:, blocks_per_slot:])
-
-    # And for slot 1 (start=blocks_per_slot >= dim-0 size 2), the buggy
-    # slice is empty -- .zero_() is a silent no-op, unlike the correct form.
-    full_start1, full_end1 = 1 * blocks_per_slot, 2 * blocks_per_slot
-    buggy1 = tensor.clone()
-    buggy1[full_start1:full_end1].zero_()
-    assert torch.equal(buggy1, tensor), "expected the buggy slice for slot>0 to be a no-op"
-    correct1 = tensor.clone()
-    correct1[:, full_start1:full_end1].zero_()
-    assert not torch.equal(correct1, tensor), "the correct slice must actually zero slot 1's blocks"
+def test_full_slot_block_range_is_the_whole_static_allocation_not_ceil_of_kv_len() -> None:
+    """Unlike full_block_range (scaled by kv_len), this is the WHOLE
+    blocks_per_slot allocation for the slot -- restore_checkpoint uses it
+    to zero a target slot's full-attention KV up front (see that module's
+    docstring for why reset_slot can no longer be relied on to do this).
+    A real, non-synthetic regression test that this zeroing actually
+    happens end-to-end (via restore_checkpoint against FakeBackend, not a
+    decoupled tensor-slicing demo) lives in
+    tests/test_bfdiag_checkpoint_restore.py."""
+    backend, engine = _fake_pair(num_slots=3, block_size=16, blocks_per_slot=8, swa_window=40)
+    geom = state.slot_geometry(backend, engine, slot=1)
+    start, end = state.full_slot_block_range(geom)
+    assert (start, end) == (8, 16)  # slot 1 -> physical offset 8, spans the whole 8 blocks
+    # Independent of kv_len, unlike full_block_range.
+    assert state.full_slot_block_range(geom) == state.full_slot_block_range(geom)

@@ -19,14 +19,14 @@ def get_hadamard_128(device: torch.device, dtype: torch.dtype = torch.bfloat16) 
     H = torch.tensor([[1.0]])
     for _ in range(7):  # 2^7 = 128
         H = torch.cat([torch.cat([H, H], dim=1), torch.cat([H, -H], dim=1)], dim=0)
-    H = H / (128.0 ** 0.5)
+    H = H / (128.0**0.5)
     _H128 = H.to(device=device, dtype=dtype)
     return _H128
 
 
 def hadamard_rotate_heads(x: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
     """Rotate the head_dim axis of a [..., num_heads*head_dim] tensor.
-    
+
     x: [..., num_heads * head_dim] (flat last dim, as from qkv split)
     Returns: same shape, Hadamard-rotated per head.
     """

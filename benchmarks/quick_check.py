@@ -1,6 +1,5 @@
 """Quick 1-round benchmark for fast iteration. Usage: bf exec benchmarks/quick_check.py"""
-import json, time, pathlib
-from benchmarks.acceptance_regression import SUITE, run_once, build_engine_and_tokenizer
+from benchmarks.acceptance_regression import SUITE, run_once
 
 def main(backend, engine, tokenizer):
     results = []

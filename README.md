@@ -1,224 +1,164 @@
 # BlackweLLM
 
-**Blackwell-native inference, built to outrun vLLM.**
+**A single-node inference runtime built exclusively for NVIDIA Blackwell SM120.**
 
-BlackweLLM is a full-stack inference engine built from the ground up for
-NVIDIA Blackwell (SM120) GPUs. It features hand-written CUDA attention
-kernels, FP8 KV cache, MTP speculative decoding, and CUDA Graph capture —
-all co-designed to extract maximum performance from SM120's unique hardware.
+BlackweLLM is an inference engine whose every design decision rests on one
+deliberately narrow contract: **one GPU architecture (SM120 / CC 12.0), one
+machine, one process, no tensor/pipeline parallelism.** Narrowing is the point —
+it is what lets the engine delete the abstractions that generic frameworks
+must carry, and hand-write the paths that matter.
 
-Currently optimized for **Qwen3.6-27B** (NVFP4). More model support coming.
+Production model today: **`poolside/Laguna-S-2.1-NVFP4`**.
+Qwen3.6 series support is the current roadmap priority — see
+[`docs/roadmap.md`](docs/roadmap.md).
 
-[中文文档](#中文文档)
+[中文说明](#中文说明) · [Documentation index](docs/README.md)
 
 ---
 
-## Why BlackweLLM?
+## Status (2026-08-01)
 
-Mainstream inference frameworks (vLLM, TGI) use generic attention kernels
-(FlashInfer, FlashAttention) targeting a wide range of GPU architectures.
-On SM120 (Blackwell consumer/workstation), these kernels leave significant
-performance on the table — they don't exploit SM120-specific features like
-16-byte `cp.async` loads or the specific shared memory bank layout.
+| | |
+|---|---|
+| **Servable models** | `Laguna-S-2.1-NVFP4` (only) |
+| **Planned** | `Qwen3.6-27B`, `Qwen3.6-25B-A3B` and derivatives |
+| **Hardware** | SM120 only (RTX PRO 6000 Blackwell, RTX 5090), single GPU |
+| **Dependencies** | Zero vLLM in the production path; SparkInfer for SM120 kernels |
+| **Maturity** | Pre-1.0. See [Known issues](#known-issues) before deploying. |
 
-BlackweLLM's decode attention kernel is **written from scratch for SM120**,
-achieving **56% lower latency** than FlashInfer on 128K-context decode
-(0.988 ms vs 1.540 ms per decode step, batch=4, GQA 24→4 heads,
-head_dim=256, FP8 KV cache, paged layout).
+> ⚠️ **Qwen3.6 is not currently servable.** It was supported by an earlier
+> vLLM-based execution path that was retired on 2026-07-30 (that code now
+> lives read-only under `oracle/qwen36_vllm/`). Re-adding it through the new
+> model abstraction layer is the M2→M4 milestone.
 
-## Key Features
+## Why
 
-- **Custom SM120 CUDA attention kernel** — 16-byte `cp.async` vectorized
-  loads, 272-byte aligned shared memory strides, split-K parallelism
-  (32 splits/request) tuned for SM120's 188 SMs
-- **FP8 (e4m3) KV cache** — halves KV memory vs FP16, enabling 256K
-  context on a single 96 GB GPU
-- **MTP speculative decoding (K=3)** — leverages Qwen3.6's built-in
-  Multi-Token Prediction layers, ~50% acceptance rate, lossless output
-- **CUDA Graph capture** — eliminates kernel launch overhead for decode
-- **Prefix caching** — content-hash KV cache reuse across multi-turn
-  conversations, block-level reference counting and eviction
-- **OpenAI + Anthropic compatible API** — `/v1/chat/completions`,
-  `/v1/completions`, `/v1/messages`, `/v1/models`, Prometheus `/metrics`
-- **Sampling support** — temperature / top-p / top-k with per-request seed
-  for reproducibility; greedy (T=0) remains bit-identical to the MTP pipeline
-- **Production hardening** — client disconnect detection, request cancellation,
-  configurable timeout, engine watchdog for stale slot reclamation
-- **Quality validated** — MMLU-Pro 84.5% vs official 86.2 (within noise),
-  HumanEval+ parity with stock vLLM, 100% tool/agent/long-context regression
-  (see [Quality Validation](#quality-validation))
+Mainstream engines target SM90/SM100 datacenter parts first. On SM120 —
+which has **no wgmma and no BF16 tensor core** — their fast paths fall back to
+slow ones. BlackweLLM writes the SM120 path directly, and because
+`world_size == 1` is a compile-time premise rather than a runtime option, the
+entire distributed abstraction layer simply does not exist.
+
+## Features
+
+- **Self-built execution stack** — model graph, weight loading, runtime config,
+  and forward context are all owned; the production import graph has no vLLM edge
+- **SparkInfer SM120 kernels** — paged attention (FP8 KV, CUDA-graph replayable)
+  and fused NVFP4 MoE
+- **Own SM120 kernels** — MoE router (`.cu`), plus RoPE / RMSNorm / KV-scatter (Triton)
+- **FP8 (e4m3) KV cache** — 256K context on a single 96 GB GPU
+- **Fixed-slot continuous batching** — dedicated engine thread owns the CUDA
+  context; the asyncio side never blocks
+- **DFlash speculative decoding** — 96.3–100% acceptance on Laguna
+- **CUDA Graph capture** — decode, draft, and verify graphs
+- **Prefix caching** — content-addressed, reference-counted, LRU eviction
+- **OpenAI + Anthropic APIs** — `/v1/chat/completions`, `/v1/completions`,
+  `/v1/messages`, `/v1/models`, SSE streaming, tool calling, Prometheus `/metrics`
+- **Production hardening** — client-disconnect detection, cancellation,
+  request timeout, watchdog for stale slot reclamation
+- **bfdiag diagnostics platform** — flight recorder, run records, run-comparability
+  checks, warm-engine daemon (see [`docs/diagnostics-guide.md`](docs/diagnostics-guide.md))
 
 ## Performance
 
-All measurements on **RTX PRO 6000 Blackwell Max-Q** (96 GB, 188 SMs),
-Qwen3.6-27B-NVFP4, FP8 KV cache, MTP K=3, CUDA Graph enabled.
+`Laguna-S-2.1-NVFP4` on **RTX PRO 6000 Blackwell Max-Q** (96 GB, 188 SMs),
+FP8 KV cache, DFlash speculative decoding, CUDA Graph on, analytic decode path.
+Measured 2026-07-31 and independently reproduced 2026-08-01 on the current
+SparkInfer fork head (run records `fc6b3376785a`, `781e1edbf37b`): acceptance
+matches to the fourth decimal on all four workloads, throughput lands inside
+the recorded ranges on 7 of 8 samples. See
+[`notes/2026-08-01-sparkinfer-patch-recovery-and-repro.md`](notes/2026-08-01-sparkinfer-patch-recovery-and-repro.md).
 
-### Decode Throughput (accepted tokens/s, warm prefix cache)
+| Workload | Throughput | Acceptance |
+|---|---|---|
+| galaxy-4K | 395–401 tok/s | 100% |
+| fox-4K | 353–357 tok/s | 96.3–97.0% |
+| code-4K | 341–359 tok/s | 97.8% |
+| fox-64K | 353–368 tok/s | 96.9% |
 
-| Context | Concurrency | Throughput |
-|---------|-------------|------------|
-| 128K    | 4           | 222 tok/s  |
-| 64K     | 4           | 267 tok/s  |
+Context capacity: 256K @ concurrency 2 (~93 GB), 128K @ concurrency 4 (~70 GB).
 
-### Kernel Latency (decode attention only)
+> We publish kernel-level latency comparisons only under identical conditions.
+> End-to-end throughput vs other engines depends on cache state, scheduling, and
+> compilation overhead, so we avoid apples-to-oranges numbers.
 
-| Context | Concurrency | BlackweLLM | FlashInfer | Speedup |
-|---------|-------------|------------|------------|---------|
-| 128K    | 4           | 0.988 ms   | 1.540 ms   | 1.56×   |
+## Quality validation
 
-### Context Capacity
+> **Read the model column.** The quality numbers below were measured on
+> **Qwen3.6-27B** in July 2026, on the execution path that has since been
+> retired. They are retained as evidence that the runtime approach does not
+> degrade quality — **they are not current-build numbers, and the current build
+> cannot serve that model.** Re-establishing them on the new path is a
+> Track B verification item.
 
-| Context Length | Max Concurrency | GPU Memory |
-|----------------|-----------------|------------|
-| 256K           | 2               | ~93 GB     |
-| 128K           | 4               | ~70 GB     |
+| Benchmark | Model | Runtime | Score | Reference |
+|---|---|---|---|---|
+| MMLU-Pro (414q, thinking, greedy) | Qwen3.6-27B-NVFP4 | BlackweLLM, 2026-07-22 | 84.54% | official card 86.2 (−1.7pp, within ±3.5% sampling noise) |
+| HumanEval | Qwen3.6-27B-NVFP4 | BlackweLLM vs stock vLLM | 0.445 vs 0.433 | +1.2pp (SE ≈ ±3.9pp) |
+| HumanEval+ | Qwen3.6-27B-NVFP4 | BlackweLLM vs stock vLLM | 0.433 vs 0.427 | +0.6pp |
 
-> **Note:** We only compare kernel-level latency under identical conditions.
-> End-to-end throughput comparisons with vLLM depend on cache state,
-> scheduling, and compilation overhead, so we avoid apples-to-oranges numbers.
+For **Laguna-S-2.1**, the live gates are the DFlash acceptance regression,
+the production CUDA Graph gate, and a bit-level router oracle — all run through
+`bfdiag`. Methodology: [`notes/2026-07-22-quality-baseline-and-official-scores.md`](notes/2026-07-22-quality-baseline-and-official-scores.md).
 
-## Quality Validation
-
-### Official-Comparable: MMLU-Pro
-
-[MMLU-Pro](https://huggingface.co/datasets/TIGER-Lab/MMLU-Pro) (414 stratified
-questions, ~30/category, thinking mode, 5-shot CoT, greedy, max_tokens=32768,
-zero truncation). Compared against the official Qwen3.6-27B model card score:
-
-| Benchmark | BlackweLLM (SM120) | Official Qwen3.6-27B | Delta   |
-|-----------|--------------------|-----------------------|---------|
-| MMLU-Pro  | **84.54%** (414q)  | 86.2                  | −1.7pp  |
-
-The −1.7pp gap is within the ±3.5% sampling noise of a 414-question stratified
-subset. **Local inference quality is NOT degraded vs the original model.**
-
-Per-category accuracy (thinking mode, greedy):
-
-| Category         | Acc    | | Category         | Acc    |
-|------------------|--------|-|------------------|--------|
-| physics          | 97.8%  | | economics        | 86.2%  |
-| math             | 95.7%  | | computer science | 85.7%  |
-| chemistry        | 92.3%  | | history          | 84.6%  |
-| biology          | 92.0%  | | law              | 81.6%  |
-| engineering      | 87.9%  | | business         | 81.5%  |
-| psychology       | 77.8%  | | health           | 75.0%  |
-| philosophy       | 64.7%  | | other            | 59.4%  |
-
-STEM categories are very strong (≥87.9%); weaker humanities reflect the model's
-natural profile, not a runtime defect (identical weights on stock vLLM score the
-same). Reproduce:
-
-```bash
-python benchmarks/official/mmlu_pro_eval.py --base-url http://localhost:8000/v1 \
-    --model qwen3.6 --limit 420 --concurrency 8 --max-tokens 32768 \
-    --out evalplus_results/official/mmlu_pro_think.json
-```
-
-### A/B Parity: HumanEval+
-
-[EvalPlus](https://github.com/evalplus/evalplus) HumanEval+ (164 problems,
-greedy decoding, temperature=0), identical OpenAI API prompts on both servers.
-Same model weights, same harness, different backend:
-
-| Benchmark  | vLLM (FlashInfer)    | BlackweLLM           | Delta  |
-|------------|----------------------|----------------------|--------|
-| HumanEval  | 71/164 = 0.433       | 73/164 = 0.445       | +1.2pp |
-| HumanEval+ | 70/164 = 0.427       | 71/164 = 0.433       | +0.6pp |
-
-Both use FP8 KV cache (e4m3) and NVFP4 weights. Per-problem differences
-(~20 in each direction) are within statistical noise (SE ≈ ±3.9pp).
-**No systematic quality degradation.**
-
-### Self-Contained Regression Suite
-
-Four-dimension regression gate (`benchmarks/quality_regression.py`), run on our
-runtime and compared against a stock-vLLM baseline via `quality_compare.py`:
-
-| Dimension     | Test                                      | Score  |
-|---------------|-------------------------------------------|--------|
-| Tool calling  | 20 tool schemas + queries, exact match     | 100%   |
-| Agent loop    | Multi-turn plan→call→observe→answer        | 100%   |
-| Long context  | Needle-in-haystack @ 8K/32K/64K/128K      | 100%   |
-| Code (A/B)    | HumanEval+ pass@1 vs stock vLLM            | parity |
-
-```bash
-python benchmarks/quality_regression.py --base-url http://localhost:8000/v1 \
-    --model qwen3.6 --out evalplus_results/quality/our_runtime.json
-```
-
-### Official Qwen3.6-27B Reference Scores
-
-For context, the official model card numbers (BF16, thinking mode):
-
-| Benchmark          | Official Score |
-|--------------------|----------------|
-| MMLU-Pro           | 86.2           |
-| GPQA Diamond       | 87.8           |
-| AIME26             | 94.1           |
-| LiveCodeBench v6   | 83.9           |
-| SWE-bench Verified | 77.2           |
-| MMLU-Redux         | 93.5           |
-| HMMT Feb 25        | 93.8           |
-
-GPQA Diamond is a gated HF dataset (requires access token); AIME26 deferred
-due to slot-wedge risk at 16K+ token generations. Full methodology in
-[`notes/2026-07-22-quality-baseline-and-official-scores.md`](notes/2026-07-22-quality-baseline-and-official-scores.md).
-
-## Architecture
+## Repository layout
 
 ```
 blackwellm/
-├── runtime/                  # Core inference engine
-│   ├── laguna_config.py          # Laguna-specific runtime/cache/draft config
-│   ├── laguna_runtime.py         # Owned forward context and cache bindings
-│   ├── model/                    # Self-built Laguna and DFlash model graphs
-│   └── backends/laguna.py        # Laguna-S-2.1 backend (SparkInfer MoE)
-├── server/                   # HTTP server (OpenAI + Anthropic API)
-│   ├── app.py                   # FastAPI endpoints + /metrics
-│   └── engine.py                # Admission, MTP loop, prefix cache
-├── model/                    # Model architecture config
-├── loader/                   # Weight loading (safetensors, NVFP4)
-├── kernels/                  # Owned SM120 kernel sources and build targets
-├── benchmarks/               # Reproducible perf & correctness checks
-├── tests/                    # Unit tests (CPU-only)
-└── oracle/                   # vLLM reference comparison utilities
+├── runtime/           Core inference engine
+│   ├── backends/          LagunaBackend + SparkInfer attn/MoE adapters,
+│   │                      CUDA Graph lifecycle, DFlash speculative engine
+│   ├── model/             Self-built model graph (decoder, linear, embedding, attention)
+│   ├── kernels/           Own SM120 kernels (.cu) + Triton kernels
+│   ├── block_pool.py      Paged KV + prefix cache (refcount, LRU)
+│   ├── model_loading.py   Self-built streaming safetensors loader
+│   └── laguna_config.py   Self-built runtime config (replaces vLLM's VllmConfig)
+├── server/            HTTP layer
+│   ├── app.py             FastAPI endpoints + /metrics
+│   ├── engine.py          Admission, fixed-slot scheduling, continuous batching
+│   └── formats/           OpenAI / Anthropic / streaming / tools / thinking
+├── bfdiag/            Diagnostics platform (CLI: `bf`) — pure stdlib
+├── bfprobe/           Runtime probes
+├── loader/            Checkpoint inspection utilities
+├── benchmarks/        Reproducible perf & correctness checks
+├── tests/             Unit tests (CPU-only)
+├── docs/              Roadmap, architecture, model support, diagnostics
+├── notes/             Investigation records and evidence archive
+└── oracle/            Offline reference utilities — NOT shipped, NOT importable
+                       from production code (includes the retired Qwen3.6 path)
 ```
 
-This repository contains the **Laguna runtime and serving layer**: fixed-slot
-scheduling, self-built Laguna/DFlash model graphs, owned CUDA Graph lifecycle,
-SparkInfer attention/MoE integration, and the OpenAI/Anthropic-compatible
-server. Production code does not import, package, or require vLLM. The
-`oracle/` directory is deliberately excluded from production distributions and
-holds only offline migration-reference utilities.
-
 > **Naming:** the product and GitHub repo are **BlackweLLM** (formerly
-> BlackForge); the package directory is historically `qwen-sm120-runtime`;
-> configuration env vars still use the legacy `QSR_` (Qwen SM120 Runtime)
-> prefix; migration target is `BWLLM_`, actual rename pending. All three
-> refer to this same system.
+> BlackForge); the working directory is historically `qwen-sm120-runtime`;
+> environment variables still use the legacy `QSR_` prefix. Unifying all three
+> on `blackwellm` / `BWLLM_` is roadmap item D5.
 
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
-- NVIDIA Blackwell GPU (SM120, CC 12.0): RTX PRO 6000, RTX 5090
-- CUDA 13.x, Python 3.10+, ~96 GB GPU memory (for 256K context)
+- NVIDIA Blackwell GPU, SM120 / CC 12.0 (RTX PRO 6000, RTX 5090)
+- CUDA 13.x, Python 3.10+, ~96 GB GPU memory for 256K context
+- A checkout of [this project's SparkInfer fork](https://github.com/jieen1/sparkinfer)
+  — `master` carries two commits on top of upstream that the analytic decode path
+  needs (see [`docs/sparkinfer-fork-delta.md`](docs/sparkinfer-fork-delta.md))
 
-### Installation
+### Install
 
 ```bash
 git clone https://github.com/jieen1/BlackweLLM.git
 cd BlackweLLM
-python -m pip install -e '.[dev,serving]'
+python -m pip install -e '.[cuda,dev,serving]'   # does not install vLLM
 
-# GPU runtime dependencies; this does not install vLLM.
-python -m pip install -e '.[cuda,dev,serving]'
-
-# Install the pinned local SparkInfer provider required by Laguna.
-python -m pip install -e /path/to/sparkinfer
+git clone https://github.com/jieen1/sparkinfer.git
+python -m pip install -e ./sparkinfer             # verified at master @ 0844a4f
 ```
 
-### Running the Server
+Startup runs a preflight check (GPU architecture, CUDA, torch, SparkInfer,
+checkpoint) before any weights load, and refuses to start on a fatal mismatch.
+`--skip-preflight` bypasses it.
+
+### Serve
 
 ```bash
 QSR_SERVER_PRODUCTION=1 \
@@ -229,109 +169,117 @@ QSR_SERVED_MODEL_NAME="laguna-s-2.1" \
 python -m server.app --host 0.0.0.0 --port 8000
 ```
 
-### API Usage
+> These four variables are coupled: get them wrong and you either OOM at load
+> time or silently waste VRAM. Automating this is roadmap item D2.
+
+### Call
 
 ```bash
 # OpenAI format
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.6","messages":[{"role":"user","content":"Hello!"}],"max_tokens":256,"temperature":0}'
+  -d '{"model":"laguna-s-2.1","messages":[{"role":"user","content":"Hello!"}],"max_tokens":256,"temperature":0}'
 
 # Anthropic format
 curl http://localhost:8000/v1/messages \
   -H "Content-Type: application/json" \
-  -d '{"model":"qwen3.6","messages":[{"role":"user","content":"Hello!"}],"max_tokens":256,"temperature":0}'
-```
-
-### Benchmarks
-
-```bash
-python -m benchmarks.prefix_cache_warm_throughput_check \
-  --fixture ctx128k --concurrency 4 --decode-rounds 12
-
-python -m pytest tests/ -q
+  -d '{"model":"laguna-s-2.1","messages":[{"role":"user","content":"Hello!"}],"max_tokens":256}'
 ```
 
 ## Configuration
 
-| Env Variable | Default | Description |
-|-------------|---------|-------------|
-| `QSR_SERVER_CAPACITY` | `1` | Max concurrent Laguna requests |
-| `QSR_SERVER_NUM_SLOTS` | `2` | Total internal slots (one CG warmup slot) |
-| `QSR_SERVER_BLOCKS_PER_SLOT` | `2048` | KV blocks per slot (×64 = tokens) ⇒ 128K context |
+| Env variable | Default | Description |
+|---|---|---|
+| `QSR_SERVER_CAPACITY` | `1` | Max concurrent requests |
+| `QSR_SERVER_NUM_SLOTS` | `2` | Total internal slots (one extra for CG warmup) |
+| `QSR_SERVER_BLOCKS_PER_SLOT` | `2048` | KV blocks per slot (×64 = tokens) |
 | `QSR_SERVER_PRODUCTION` | `1` | Production mode: skip validation slots |
-| `QSR_DEBUG_REQUESTS` | `1` | Log raw request/response (input + output) for debugging |
-| `QSR_SERVED_MODEL_NAME` | model ID | Advertised model name(s) |
 | `QSR_SERVER_ENABLE_CUDAGRAPH` | `1` | Enable CUDA Graph capture |
 | `QSR_SERVER_ENABLE_PREFIX_CACHE` | `0` | Enable prefix caching |
+| `QSR_SERVED_MODEL_NAME` | model ID | Advertised model name(s) |
+| `QSR_DEBUG_REQUESTS` | `0` | Log raw request/response |
+| `QSR_TRACE` | `0` | bfdiag flight recorder |
+| `QSR_ASSERT_LEVEL` | `0` | Runtime invariant assertions |
 
-### Context Length vs Concurrency (96 GB GPU)
+Load-time parameters (`block_size`, `blocks_per_slot`, `gpu_memory_utilization`,
+`max_model_len`) are fixed when the model loads. Changing them requires a fresh
+process — a warm-engine run will not pick them up **and will not error**.
 
-| `BLOCKS_PER_SLOT` | Context/Slot | Capacity | `NUM_SLOTS` (production) |
-|--------------------|-------------|----------|--------------------------|
-| 2048               | 128K        | 1        | 2                        |
+## Metrics
 
-Use explicit environment overrides only after a cold capacity/VRAM validation;
-`block_size`, `blocks_per_slot`, and GPU memory utilisation are load-time
-parameters and cannot be compared through a warm daemon run.
-
-## Metrics & Observability
-
-`GET /metrics` exposes Prometheus metrics in the `blackwellm:*` namespace.
-They cover speed
-(`e2e_request_latency_seconds`, `time_to_first_token_seconds`,
-`request_time_per_output_token_seconds`, prompt/generation token histograms
-and throughput counters), stability/reliability (`num_requests_running`,
-`num_requests_waiting`, `request_success_total` by finish reason,
-`request_errors_total` by status code, KV-cache utilisation), and accuracy
-(`bootstrap_checks_ok/failed_total` speculative-prefill correctness, prefix
-cache hit rate). See [`server/README.md`](server/README.md#metrics) for the
-full metric-by-metric reference and example PromQL.
+`GET /metrics` exposes Prometheus metrics under `blackwellm:*`, covering speed
+(e2e latency, TTFT, time-per-output-token, throughput counters), stability
+(running/waiting requests, success by finish reason, errors by status code, KV
+utilisation), and accuracy (speculative-prefill bootstrap checks, prefix cache
+hit rate). Full per-metric reference: [`server/README.md`](server/README.md#metrics).
 
 ## Development
 
-Common tasks are wired into the `Makefile` (run `make help` for the full
-list):
-
 ```bash
 make install        # editable install with dev + serving extras
-make lint           # ruff lint gate (whole repo, must stay green)
-make format         # ruff auto-fix + format the production packages
-make test           # CPU-only unit test suite (fast, no GPU required)
+make lint           # ruff lint gate (whole repo)
+make format         # ruff auto-fix + format production packages
+make test           # unit test suite
 make verify-cuda    # confirm an SM120 CUDA op executes
-make workloads      # print the frozen Phase-0 W1/W2 contracts
-make serve          # start the server (tune via QSR_* env vars)
+make serve          # start the server
 ```
 
-Lint and formatting are enforced by `ruff` (config in `pyproject.toml`).
-Install the pre-commit hooks to run them automatically on each commit:
+**Before writing any diagnostic code, read
+[`docs/diagnostics-guide.md`](docs/diagnostics-guide.md).** This machine has one
+GPU and no parallelism; a test run costs minutes, so the only lever on iteration
+speed is how much each GPU run tells you. Three rules override habit: don't write
+another one-off script under `benchmarks/`; run `bf diff` before comparing any two
+numbers; when something fails, read the existing trace instead of re-running.
 
-```bash
-python -m pip install pre-commit
-pre-commit install
-```
+## Known issues
 
-The same gate (ruff lint + format check + unit tests) runs in CI on every
-push and pull request (`.github/workflows/ci.yml`). The unit tests are
-CPU-only; tests that need `torch` self-skip via `pytest.importorskip`.
+Tracked in [`docs/roadmap.md`](docs/roadmap.md) §1.3. As of 2026-08-01, CI, the
+test suite, the dependency contract and the thinking/reasoning contract have all
+been repaired; what remains open:
 
-## Roadmap
-
-- [ ] More model support (Qwen3 series, other hybrid architectures)
-- [x] Streaming response support (OpenAI + Anthropic SSE)
-- [x] Temperature / top-p / top-k sampling (graph-safe, greedy bit-identical at T=0)
-- [x] Client disconnect detection + request cancellation + timeout
-- [x] Engine watchdog (stale slot reclamation)
-- [ ] Dynamic KV cache allocation (flexible context vs concurrency)
-- [ ] Structured output (JSON mode)
-- [ ] Multi-GPU support
+- **Structured output is a skeleton.** `response_format` with `json_object` /
+  `json_schema` is accepted but **does not constrain generation at all** — the
+  grammar mask is never applied. Requests silently come back as free text. Do not
+  rely on JSON mode.
+- **`stop` sequences are not implemented** on either protocol.
+- **`seed` re-seeds per token** rather than advancing one generator, so it gives
+  determinism but not the usual sampling semantics.
+- **Anthropic reasoning is non-standard.** Reasoning is delivered as a
+  `reasoning_content_delta` SSE event and a top-level field, *not* as a spec
+  `thinking` content block — emitting that block requires a cryptographic
+  signature we cannot produce, and a fake one makes Claude Desktop silently drop
+  every subsequent content block including `tool_use`
+  (see [`docs/roadmap.md`](docs/roadmap.md) §1.4).
+- **One known flaky test** surfaces only in a full-suite run under machine load
+  (`test_bfdiag_record.py::test_cli_ls_labels_an_unfinished_record_running`).
+- **SparkInfer must be this project's fork.** A stock upstream install starts and
+  runs correctly but silently loses the analytic decode path; startup preflight
+  reports this as a warning.
 
 ## Limitations
 
-- **Single model**: currently Qwen3.6-27B-NVFP4 only
-- **Single GPU**: no tensor/pipeline parallelism
-- **Sampling without MTP**: temperature > 0 uses autoregressive decode (no speculative verification); greedy (T=0) uses full MTP K=3 pipeline
-- **SM120 only**: requires compute capability 12.0
+- **Single model** — `Laguna-S-2.1-NVFP4` only, today
+- **Single GPU** — no tensor/pipeline/expert parallelism, by design
+- **SM120 only** — compute capability 12.0 required, by design
+- **Sampling disables speculation** — `temperature > 0` falls back to
+  autoregressive decode; only greedy uses the full speculative pipeline
+- **Text only** — no vision/multimodal input
+
+## Roadmap
+
+Full plan: [`docs/roadmap.md`](docs/roadmap.md).
+
+- **M1 (Aug)** — clear red CI/tests, pin the dependency contract, finalise the
+  model abstraction design
+- **M2 (Sep)** — land the abstraction layer with zero Laguna regression;
+  Qwen3.6 fact baseline
+- **M3 (Oct)** — Qwen3.6-27B correctness + serving; one-command startup
+- **M4 (Nov)** — Qwen3.6-27B performance + MTP speculation; 25B-A3B bring-up
+- **M5 (Dec)** — 25B-A3B serving; usability and compatibility close-out
+- **M6 (Jan 2027)** — soak testing, release gates, `0.2.0`
+
+Explicitly out of scope: multi-GPU, multi-node, non-SM120 architectures,
+vision/multimodal, training/fine-tuning.
 
 ## License
 
@@ -339,55 +287,25 @@ Apache 2.0 — see [LICENSE](LICENSE).
 
 ---
 
-## 中文文档
+## 中文说明
 
-### 项目简介
+**BlackweLLM 是一个只面向 NVIDIA Blackwell SM120、只做单机部署的推理运行时。**
 
-BlackweLLM 是一个专为 NVIDIA Blackwell（SM120）GPU 打造的全栈推理引擎。
-通过手写 CUDA attention kernel、FP8 KV cache、MTP 投机解码和 CUDA Graph
-捕获等深度优化，在 SM120 架构上实现极致推理性能。
+它的每个设计决策都建立在一份刻意收窄的硬件合同上：单一 GPU 架构
+（SM120 / CC 12.0）、单机、单进程、无张量/流水线并行。收窄本身就是价值来源——
+它让这个引擎可以删掉通用框架不得不背的抽象，并把关键路径手写出来。
 
-当前生产模型为 **Laguna-S-2.1**（NVFP4）。
+**当前可服务模型**：`poolside/Laguna-S-2.1-NVFP4`。
+**Qwen3.6 系列支持是当前路线图第一优先级**（曾经支持过，随 vLLM 剥离被摘除，
+将走新的模型抽象层重新接入）。
 
-### 核心优势
+完整中文文档见 [`docs/README.md`](docs/README.md)：
 
-- **自研 SM120 CUDA kernel** — 针对 Blackwell 硬件特性手写，decode attention
-  比 FlashInfer 快 56%（128K 上下文，0.988ms vs 1.540ms）
-- **FP8 KV cache** — 显存占用减半，单卡 96GB 支持 256K 上下文
-- **DFlash 投机解码** — Laguna draft/verify 路径，接受率由逐 prompt 回归门禁验证
-- **质量验证** — 生产 CUDA Graph、DFlash 接受率和 router 位级 oracle 均有独立门禁
+- [`docs/roadmap.md`](docs/roadmap.md) — 定位、现状盘点、轨道与里程碑、风险、待拍板事项
+- [`docs/architecture.md`](docs/architecture.md) — 当前架构与目标架构
+- [`docs/model-support.md`](docs/model-support.md) — 模型支持矩阵与接入新模型的操作指南
+- [`docs/diagnostics-guide.md`](docs/diagnostics-guide.md) — bfdiag 诊断平台使用指南（排查问题前必读）
 
-### 性能数据
-
-测试环境：RTX PRO 6000 Blackwell Max-Q（96GB，188 SMs）
-
-| 上下文 | 并发 | 吞吐量（warm） |
-|--------|------|----------------|
-| 128K   | 4    | 222 tok/s      |
-| 64K    | 4    | 267 tok/s      |
-
-### 快速开始
-
-```bash
-git clone https://github.com/jieen1/BlackweLLM.git
-cd BlackweLLM
-python -m pip install -e '.[dev,serving]'
-
-# GPU runtime dependencies; this does not install vLLM.
-python -m pip install -e '.[cuda,dev,serving]'
-
-# 安装 Laguna 依赖的本地 SparkInfer provider。
-python -m pip install -e /path/to/sparkinfer
-
-# 启动服务（256K 上下文，2 并发）
-QSR_SERVER_PRODUCTION=1 \
-QSR_SERVER_CAPACITY=2 \
-QSR_SERVER_NUM_SLOTS=2 \
-QSR_SERVER_BLOCKS_PER_SLOT=16384 \
-QSR_SERVED_MODEL_NAME="laguna-s-2.1" \
-python -m server.app --host 0.0.0.0 --port 8000
-```
-
-### 许可证
-
-Apache 2.0
+部署方式、配置项、性能与质量数据见上方英文段落。
+**上线前请先读 [Known issues](#known-issues)**——当前 CI 是红的，
+且有若干已知的行为未定义项。

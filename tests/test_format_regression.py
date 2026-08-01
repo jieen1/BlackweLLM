@@ -241,6 +241,48 @@ def test_anthropic_tool_use_ids_are_unique():
         assert len(tid) == 30  # "toolu_" (6) + 24 hex chars
 
 
+def test_unhandled_exception_error_shape_matches_protocol():
+    """E1 (docs/roadmap.md Track E, error code semantics): an unhandled
+    exception on /v1/messages must come back in Anthropic's error envelope
+    ({"type": "error", "error": {...}}), not OpenAI's ({"error": {...}}) --
+    found while auditing error-code semantics for the reasoning/thinking
+    fix, not from a captured client request like the fixtures above."""
+    import asyncio
+
+    # This module is CPU-only and must import cleanly under dev extras alone
+    # (see the module docstring). ``server.app`` pulls in FastAPI, which lives
+    # in the ``serving`` extra -- skip rather than break that contract.
+    pytest.importorskip("fastapi")
+
+    from server import app as server_app
+
+    class _FakeURL:
+        def __init__(self, path):
+            self.path = path
+
+    class _FakeRequest:
+        def __init__(self, path):
+            self.url = _FakeURL(path)
+
+    anthropic_resp = asyncio.run(
+        server_app._unhandled_exception_handler(_FakeRequest("/v1/messages"), RuntimeError("boom"))
+    )
+    anthropic_body = json.loads(bytes(anthropic_resp.body))
+    assert anthropic_body["type"] == "error"
+    assert anthropic_body["error"]["type"] == "internal_error"
+    assert anthropic_body["error"]["message"] == "boom"
+
+    openai_resp = asyncio.run(
+        server_app._unhandled_exception_handler(
+            _FakeRequest("/v1/chat/completions"), RuntimeError("boom")
+        )
+    )
+    openai_body = json.loads(bytes(openai_resp.body))
+    assert openai_body["error"]["type"] == "internal_error"
+    assert openai_body["error"]["message"] == "boom"
+    assert "type" not in openai_body  # no Anthropic-style top-level `type`
+
+
 def test_anthropic_cache_read_input_tokens_mapping():
     """C6: build_response must propagate cache_read_input_tokens."""
     from server.formats.anthropic import build_response

@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -322,15 +323,56 @@ def test_cli_ls_show_diff_end_to_end(monkeypatch, tmp_path: Path, capsys) -> Non
 
 
 def test_cli_ls_labels_an_unfinished_record_running(monkeypatch, tmp_path: Path, capsys) -> None:
+    """N6 (docs/roadmap.md; see notes/2026-08-01-bfdiag-assertion-audit.md
+    §7): this test was reported flaky under the FULL suite with real GPU
+    load present (observed 3/5), never under a bfdiag-only subset or a
+    single-file run. Root cause was NOT conclusively found despite:
+    ~20 full-suite reproduction attempts under synthetic real-GPU
+    (CUDA matmul loop) + real-CPU (4-way busy loop) load -- zero repeats;
+    a live thread-census right before this test in a normal full run,
+    which showed only MainThread alive (rules out a leaked background
+    thread -- e.g. from tests/test_bfdiag_daemon.py's real daemon
+    threads -- writing into this test's capsys buffer, the leading
+    hypothesis); confirmed tests/conftest.py already excludes
+    test_real_world.py/test_api_compat.py/test_e2e_256k_longctx.py (which
+    DO run real network I/O + background threads at module import time)
+    from normal collection, so they were never a factor; ruled out
+    env-var caching (bfdiag_dir()/default_store() re-read every call),
+    sys.excepthook/atexit pollution from auto_record() (never called
+    in-process, only via the subprocess-isolated tests below), and
+    QSR_TRACE's module-level caching in bfdiag/trace/ring.py (unrelated
+    code path for this test).
+
+    Since the original failure mode (a bare substring check against the
+    WHOLE captured buffer) can't be distinguished from "the expected text
+    genuinely never got printed" vs. "something unrelated got mixed into
+    the buffer and the naive substring check couldn't tell", this was
+    hardened to check the SPECIFIC output line for this run_id instead of
+    an anywhere-in-the-blob substring match, and to dump full context
+    (raw output, live threads) in the assertion message so a recurrence is
+    immediately diagnosable without a re-run -- see
+    docs/diagnostics-guide.md's "出问题时先读已有的 trace,不要急着重跑"
+    rule, applied to test failures too.
+    """
     monkeypatch.setenv("QSR_BFDIAG_DIR", str(tmp_path / ".bfdiag"))
     cli_store = RunStore(tmp_path / ".bfdiag")
     record = _make_record(run_id="unfinished", finished_at=None)
     cli_store.save(record)
 
-    assert bfdiag_cli.main(["ls"]) == 0
+    exit_code = bfdiag_cli.main(["ls"])
     output = capsys.readouterr().out
-    assert "unfinished" in output
-    assert "running" in output
+    assert exit_code == 0, f"bf ls exited {exit_code}; raw output:\n{output!r}"
+
+    matching_lines = [line for line in output.splitlines() if line.startswith("unfinished")]
+    diagnostics = (
+        f"raw output:\n{output!r}\n"
+        f"alive threads: {[(t.name, t.daemon, t.is_alive()) for t in threading.enumerate()]}"
+    )
+    assert matching_lines, f"no output line starts with the 'unfinished' run_id.\n{diagnostics}"
+    assert "running" in matching_lines[0], (
+        f"the unfinished record's own line doesn't say 'running': {matching_lines[0]!r}\n"
+        f"{diagnostics}"
+    )
 
 
 def test_cli_no_subcommand_prints_help_and_returns_nonzero(

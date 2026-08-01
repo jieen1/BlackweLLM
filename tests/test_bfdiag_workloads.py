@@ -116,6 +116,7 @@ def test_workspace_audit_attributes_a_shared_arena_by_view() -> None:
 
 
 def test_dynamic_route_tile_trace_reports_exact_order_dependency_cycles() -> None:
+    pytest.importorskip("sparkinfer")
     trace = summarize_dynamic_route_tile_trace(
         token_map=[0, 3, 2, 1],
         expert_row_counts=[2, 2],
@@ -473,6 +474,8 @@ def test_target_logits_oracle_requires_a_valid_contract():
         capture_laguna_target_logits_oracle(object(), object(), variant="", token_count=1)
     with pytest.raises(ValueError, match="token_count"):
         capture_laguna_target_logits_oracle(object(), object(), variant="m1", token_count=0)
+
+
 def test_dflash_profiler_reports_the_quick_prompt_contract_for_bad_geometry():
     class Backend:
         block_size = 1

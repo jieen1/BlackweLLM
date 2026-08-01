@@ -306,10 +306,11 @@ def build_laguna_config(
 ) -> LagunaRuntimeConfig:
     """Self-built replacement for ``EngineArgs(model=..., ...).
     create_engine_config()`` -- only the kwargs this runtime's real call
-    sites actually pass (server/engine.py's ``_load_laguna_model``,
-    benchmarks/_phase5_e2e_bitexact_validate.py; verified by grepping
-    every real ``EngineArgs(...)`` call site in the production/
-    validation paths, not vLLM's full CLI surface).
+    sites actually pass (server/engine.py's ``_load_laguna_model``, plus
+    the vLLM-removal bit-exact validation scripts that used to live under
+    benchmarks/ and were deleted 2026-08-01; verified by grepping every
+    real ``EngineArgs(...)`` call site in the production/validation paths,
+    not vLLM's full CLI surface).
     """
     model_dir = _resolve_laguna_model_dir(model)
     hf_config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True)

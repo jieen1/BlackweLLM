@@ -45,7 +45,7 @@ def test_static_headroom_gate_uses_driver_mib() -> None:
 
 
 def test_stage_checkpoint_stops_load_before_unsafe_prefill(monkeypatch) -> None:
-    import torch
+    torch = pytest.importorskip("torch")
 
     import bfdiag.cold_capacity as cold_capacity
     import bfdiag.daemon.provider as provider_module
@@ -82,7 +82,7 @@ def test_stage_checkpoint_stops_load_before_unsafe_prefill(monkeypatch) -> None:
 def test_load_only_returns_after_safe_load(monkeypatch) -> None:
     import os
 
-    import torch
+    torch = pytest.importorskip("torch")
 
     import bfdiag.cold_capacity as cold_capacity
     import bfdiag.daemon.provider as provider_module
@@ -153,7 +153,7 @@ def test_prefill_slot_limit_defaults_to_all_slots_and_rejects_invalid_values() -
 def test_prefill_slot_limit_checkpoints_each_completed_slot(monkeypatch) -> None:
     import os
 
-    import torch
+    torch = pytest.importorskip("torch")
 
     import bfdiag.cold_capacity as cold_capacity
     import bfdiag.daemon.provider as provider_module
@@ -222,6 +222,7 @@ def test_persist_record_writes_a_self_describing_artifact(tmp_path) -> None:
 
 
 def test_route_tile_trace_preserves_only_valid_physical_rows() -> None:
+    pytest.importorskip("sparkinfer")
     trace = _route_tile_trace_from_host(
         token_map=[0, 3, 2, 1, 0, 0],
         expert_row_counts=[2, 2],
@@ -242,7 +243,7 @@ def test_route_tile_trace_preserves_only_valid_physical_rows() -> None:
 
 
 def test_failed_load_preserves_spec_and_stage_snapshots(monkeypatch) -> None:
-    import torch
+    torch = pytest.importorskip("torch")
 
     import bfdiag.cold_capacity as cold_capacity
     import bfdiag.daemon.provider as provider_module

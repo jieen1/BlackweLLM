@@ -218,7 +218,9 @@ class TestDisabledPathOverhead:
 class TestVerifyOnlyTrace:
     def test_generate_verify_only_emits_one_round_when_trace_enabled(self, monkeypatch):
         """The historical E2E path must not silently bypass the flight recorder."""
-        import torch
+        import pytest
+
+        torch = pytest.importorskip("torch")
 
         from runtime.backends.laguna_dflash import DFlashEngine
 
@@ -242,6 +244,9 @@ class TestVerifyOnlyTrace:
         backend = _Backend()
         engine = object.__new__(DFlashEngine)
         engine.backend = backend
+        engine.device = torch.device("cpu")
+        engine.block_size = 1
+        engine._draft_blocks_per_slot = 514
         engine._draft_kv_caches = {}
         engine._draft_cg = None
         engine._verify_cg = None
@@ -276,7 +281,9 @@ class TestVerifyOnlyTrace:
 
     def test_generate_verify_only_replays_from_prepared_cold_boundary(self, monkeypatch):
         """A partial text match must use the backend's restored cold boundary."""
-        import torch
+        import pytest
+
+        torch = pytest.importorskip("torch")
 
         from runtime.backends.laguna_dflash import DFlashEngine
 
@@ -302,6 +309,9 @@ class TestVerifyOnlyTrace:
         backend = _Backend()
         engine = object.__new__(DFlashEngine)
         engine.backend = backend
+        engine.device = torch.device("cpu")
+        engine.block_size = 1
+        engine._draft_blocks_per_slot = 514
         engine._draft_kv_caches = {}
         engine._draft_cg = None
         engine._verify_cg = None
@@ -322,7 +332,9 @@ class TestVerifyOnlyTrace:
 
     def test_generate_verify_only_rebuilds_expired_full_hit_from_snapshot(self, monkeypatch):
         """A full text hit with an expired ring still has a replayable snapshot."""
-        import torch
+        import pytest
+
+        torch = pytest.importorskip("torch")
 
         from runtime.backends.laguna_dflash import DFlashEngine
 
@@ -351,6 +363,7 @@ class TestVerifyOnlyTrace:
         backend = _Backend()
         engine = object.__new__(DFlashEngine)
         engine.backend = backend
+        engine.device = torch.device("cpu")
         engine.block_size = 1
         engine._draft_blocks_per_slot = 514
         engine._draft_kv_caches = {}

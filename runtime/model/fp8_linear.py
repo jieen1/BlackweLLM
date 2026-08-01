@@ -85,6 +85,7 @@ class FP8Linear(nn.Module):
             size = self.shard_sizes[shard_idx]
             dst = param.data.narrow(0, offset, size)
             dst.copy_(loaded_weight)
+
         return weight_loader
 
     def _ensure_ready(self) -> None:

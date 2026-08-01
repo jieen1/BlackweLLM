@@ -30,10 +30,12 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from runtime.sampling import SamplingParams
+from runtime.sampling import PersistentSeed, SamplingParams
+from runtime.structured_output import ResponseFormat
 from server import metrics
 from server.engine import ServerEngine
 from server.formats import anthropic as anthropic_format
@@ -96,9 +98,7 @@ SERVER_BLOCK_SIZE = int(os.environ.get("QSR_SERVER_BLOCK_SIZE", "64"))
 # Laguna default (2048 × 64 = 128K/slot) is conservative pending the SWA
 # ring-buffer optimization above -- see notes/2026-07-23-laguna-server-
 # integration-plan.md for the memory math.
-SERVER_BLOCKS_PER_SLOT = int(
-    os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "2048")
-)
+SERVER_BLOCKS_PER_SLOT = int(os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "2048"))
 # Laguna default flipped 0->1 (2026-07-27): decode CUDA Graph is now wired
 # into decode_batch_sampled (runtime/backends/laguna.py's
 # _decode_cg_batch_eligible) and verified end-to-end over a real HTTP
@@ -112,9 +112,7 @@ SERVER_ENABLE_CUDAGRAPH = os.environ.get("QSR_SERVER_ENABLE_CUDAGRAPH", "1") != 
 # ON (this is THE product value -- warm prefix hits served across requests);
 # `python -m server.app --no-prefix-cache` (or QSR_SERVER_ENABLE_PREFIX_CACHE=0)
 # turns it off => byte-for-byte the old server.
-SERVER_ENABLE_PREFIX_CACHE = (
-    os.environ.get("QSR_SERVER_ENABLE_PREFIX_CACHE", "0") != "0"
-)
+SERVER_ENABLE_PREFIX_CACHE = os.environ.get("QSR_SERVER_ENABLE_PREFIX_CACHE", "0") != "0"
 # P4b session affinity (notes/2026-07-20-p4b-session-affinity-plan.md): opt-in
 # warm-slot retention. Default OFF => byte-for-byte P4a (without a session_id, or
 # with the flag off, _finish_request does the unconditional reset_slot). Requires
@@ -134,6 +132,28 @@ SERVER_PRODUCTION = os.environ.get("QSR_SERVER_PRODUCTION", "1") != "0"
 # (ServerEngine raises otherwise) -- opt-in via QSR_SERVER_ENABLE_DFLASH=1
 # until it has run in production for a while, not flipped on by default yet.
 SERVER_ENABLE_DFLASH = os.environ.get("QSR_SERVER_ENABLE_DFLASH", "0") != "0"
+# T0-3/E4 (docs/roadmap.md §7 D1): reasoning/thinking contract. "expose"
+# (default) surfaces a <think> block as OpenAI message.reasoning_content /
+# delta.reasoning_content, and Anthropic's non-standard top-level
+# reasoning_content field / reasoning_content_delta SSE event (see
+# server/formats/anthropic.py's build_response docstring for why NOT the
+# spec `thinking` content block). "strip" discards it (bandwidth-saving
+# opt-out); content/text NEVER carries reasoning either way.
+SERVER_REASONING_MODE = os.environ.get("QSR_REASONING_MODE", "expose")
+if SERVER_REASONING_MODE not in ("expose", "strip"):
+    raise RuntimeError(f"QSR_REASONING_MODE={SERVER_REASONING_MODE!r} must be 'expose' or 'strip'")
+# Laguna's chat template does not inject <think> into the prompt (confirmed
+# on real GPU output, see server/formats/stream.py's module docstring) --
+# any <think> in Laguna's output is the model's own choice, detected by
+# StreamProcessor purely from where it appears in the generated text.
+SERVER_THINKING_CAPABLE = False
+
+# Selects which server/formats/tool_parsers/ shape to decode tool calls
+# with -- mirrors vLLM's --tool-call-parser NAME. Default matches this
+# project's currently (and so far only) production model, poolside/
+# Laguna-S-2.1-NVFP4. A model with a differently-shaped tool-call output
+# needs its own ToolCallParser registered there, then selected here.
+SERVER_TOOL_CALL_PARSER = os.environ.get("QSR_TOOL_CALL_PARSER", "poolside_v1")
 
 engine: ServerEngine | None = None
 
@@ -304,6 +324,14 @@ async def _debug_log_stream_output(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global engine
+    # Validated and applied before the (slow) model load, so a typo in
+    # QSR_TOOL_CALL_PARSER/--tool-call-parser fails in <1s instead of after
+    # minutes of loading weights.
+    from server.formats.tool_parsers import set_active_parser
+
+    set_active_parser(SERVER_TOOL_CALL_PARSER)
+    logger.info("tool_call_parser=%s", SERVER_TOOL_CALL_PARSER)
+
     logger.info(
         "loading model backend=%s (this can take a while: model load + KV cache alloc)...",
         SERVER_MODEL_BACKEND,
@@ -389,6 +417,7 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: str | dict | None = None
     session_id: str | None = None
     response_format: dict | None = None
+    stop: str | list[str] | None = None
     logprobs: bool | None = False
     top_logprobs: int | None = None
     # Forwarded to the chat template (e.g. {"enable_thinking": False} for
@@ -407,6 +436,7 @@ class CompletionRequest(BaseModel):
     n: int | None = None
     stream: bool | None = False
     response_format: dict | None = None
+    stop: str | list[str] | None = None
     logprobs: bool | None = False
     top_logprobs: int | None = None
     # P4b session affinity (opt-in) -- see ChatCompletionRequest.session_id.
@@ -449,7 +479,13 @@ def _build_sampling_params(
         temperature=temp,
         top_p=resolved_top_p,
         top_k=resolved_top_k,
-        seed=seed,
+        # N3: wrap in PersistentSeed so make_generator() advances ONE
+        # generator across this request's decode rounds instead of
+        # reseeding an identical initial RNG state at every token -- see
+        # PersistentSeed's docstring (runtime/sampling.py). A fresh
+        # instance per request/per call means two different requests that
+        # happen to pass the same integer seed never share RNG state.
+        seed=PersistentSeed(seed) if seed is not None else None,
     )
 
 
@@ -460,16 +496,129 @@ def _validate_and_resolve_max_tokens(max_tokens: int | None) -> int:
     return resolved
 
 
-def _validate_capacity(prompt_ids: list[int], max_tokens: int, endpoint: str = "request") -> None:
+def _reject_unsupported_response_format(response_format: dict | None) -> None:
+    """N1: structured output (``json_object`` / ``json_schema``) has no
+    working enforcement path in this runtime -- see
+    docs/api-layer-design.md §7.1. The only reachable masking hook
+    (``runtime/sampling.py::sample_from_logits``) is never reached by:
+
+    - the prefill anchor token (the FIRST token of every request is a raw
+      unconstrained argmax inside ``runtime/backends/laguna.py``'s
+      ``prefill_chunked_begin``/``_forward``, with no ``SamplingParams``
+      involved at all);
+    - the CUDA-Graph decode replay path (greedy argmax is baked into the
+      captured graph itself);
+    - the plain eager ``if params.is_greedy: argmax(...)`` shortcut in
+      ``decode_batch_sampled`` (bypasses ``sample_from_logits`` entirely).
+
+    Since this runtime's default temperature is 0.0 (greedy) when a client
+    doesn't set one explicitly, EVERY one of those unreachable paths is
+    exactly the path a typical "give me guaranteed JSON" request (no
+    explicit temperature) takes, for every token including the first.
+    Wiring only the narrow reachable slice (temperature > 0, decode tokens
+    2+) would silently leave the common/default case completely
+    unconstrained while looking wired-in -- the same silent-failure shape
+    this check exists to eliminate, just relocated. Reject loudly instead.
+    """
+    fmt = ResponseFormat.from_api(response_format)
+    if fmt.is_constrained:
+        raise _invalid_request(
+            f"response_format type={fmt.type!r} is not supported: this runtime "
+            "does not enforce structured output (JSON mode / json_schema) during "
+            "generation -- passing it would silently return unconstrained plain "
+            "text, not a JSON guarantee. Omit response_format and validate/parse "
+            "JSON on the client side instead."
+        )
+
+
+def _normalize_stop(
+    stop: str | list[str] | None, *, max_count: int | None = None
+) -> list[str] | None:
+    """Normalize OpenAI's ``stop`` (string or list of strings) / Anthropic's
+    ``stop_sequences`` (list of strings) into one shared shape.
+
+    Empty strings are dropped (an empty stop sequence trivially "matches"
+    at position 0 of any output and has no sensible use); an all-empty
+    result normalizes to ``None`` (no stop sequences configured) rather
+    than an empty list, so callers can treat ``None``/``[]`` as one case.
+    ``max_count`` enforces OpenAI's documented limit of 4; Anthropic's
+    ``stop_sequences`` has no such documented cap, so callers for that
+    protocol pass ``max_count=None``.
+    """
+    if stop is None:
+        return None
+    seqs = [stop] if isinstance(stop, str) else list(stop)
+    seqs = [s for s in seqs if s]
+    if not seqs:
+        return None
+    if max_count is not None and len(seqs) > max_count:
+        raise _invalid_request(f"stop supports at most {max_count} sequences, got {len(seqs)}")
+    return seqs
+
+
+def _validate_capacity(prompt_ids: list[int], max_tokens: int) -> None:
+    # metrics.record_error is NOT called here: _http_exception_handler
+    # records it once, uniformly, for every raised HTTPException -- an
+    # explicit call here would double-count.
     assert engine is not None
     if not engine.capacity_ok(len(prompt_ids), max_tokens):
-        metrics.record_error(endpoint, 400)
         raise _invalid_request(
             f"prompt_tokens({len(prompt_ids)}) + max_tokens({max_tokens}) = "
             f"{len(prompt_ids) + max_tokens} exceeds this runtime's per-slot capacity of "
             f"{engine.capacity_tokens_per_slot} tokens (blocks_per_slot * block_size). "
             "Reduce the prompt length or max_tokens and retry."
         )
+
+
+def _protocol_error_body(path: str, err: dict) -> dict:
+    """Shape a ``{"message": ..., "type": ...}`` error for the protocol
+    the failing request actually used."""
+    if path.startswith("/v1/messages"):
+        return {"type": "error", "error": err}
+    return {"error": err}
+
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException):
+    """E1 (docs/roadmap.md Track E, error-code semantics): FastAPI's
+    default HTTPException handling wraps whatever ``detail`` a handler
+    raised in an extra ``{"detail": ...}`` envelope -- verified empirically
+    (see docs/api-layer-design.md): a 400 raised via ``_invalid_request()``
+    actually reached the client as
+    ``{"detail": {"error": {"message": ..., "type": ...}}}``, matching
+    NEITHER OpenAI's ``{"error": {...}}`` NOR Anthropic's
+    ``{"type": "error", "error": {...}}``. Unwrap it and reshape for
+    whichever protocol was actually called.
+    """
+    detail = exc.detail
+    if isinstance(detail, dict) and isinstance(detail.get("error"), dict):
+        err = detail["error"]
+    else:
+        err = {"message": str(detail), "type": "invalid_request_error"}
+    metrics.record_error(_endpoint_from_path(request.url.path), exc.status_code)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_protocol_error_body(request.url.path, err),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Same fix as ``_http_exception_handler``, for the OTHER shape FastAPI
+    produces on its own: a request body that fails pydantic validation
+    (e.g. a malformed/missing field) gets FastAPI's default 422
+    ``{"detail": [{"loc": ..., "msg": ..., "type": ...}, ...]}`` -- also
+    matching neither protocol. This is a common real client mistake (typo'd
+    field, wrong type), not an edge case.
+    """
+    messages = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
+    metrics.record_error(_endpoint_from_path(request.url.path), 422)
+    return JSONResponse(
+        status_code=422,
+        content=_protocol_error_body(
+            request.url.path, {"message": messages, "type": "invalid_request_error"}
+        ),
+    )
 
 
 @app.exception_handler(Exception)
@@ -479,10 +628,8 @@ async def _unhandled_exception_handler(request, exc: Exception):
     # 500 JSON body instead of an unhandled-exception stack trace / crash.
     logger.exception("unhandled exception serving %s", request.url.path)
     metrics.record_error(_endpoint_from_path(request.url.path), 500)
-    return JSONResponse(
-        status_code=500,
-        content={"error": {"message": str(exc), "type": "internal_error"}},
-    )
+    err = {"message": str(exc), "type": "internal_error"}
+    return JSONResponse(status_code=500, content=_protocol_error_body(request.url.path, err))
 
 
 @app.get("/health")
@@ -506,12 +653,12 @@ async def debug_stats():
     > 1), rather than inferring it indirectly from timing alone."""
     assert engine is not None
     runner = engine.runner
-    if hasattr(runner, '_prefix_cache_tokens'):
-        engine.stats['_prefix_cache_dbg'] = {
-            f'slot_{i}': {
-                'cached_len': len(t) if t else 0,
-                'kv_len': runner._prefix_cache_kv_len[i],
-                'head': t[:5] if t else None,
+    if hasattr(runner, "_prefix_cache_tokens"):
+        engine.stats["_prefix_cache_dbg"] = {
+            f"slot_{i}": {
+                "cached_len": len(t) if t else 0,
+                "kv_len": runner._prefix_cache_kv_len[i],
+                "head": t[:5] if t else None,
             }
             for i, t in enumerate(runner._prefix_cache_tokens)
         }
@@ -528,6 +675,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         seed=req.seed,
         n=req.n,
     )
+    _reject_unsupported_response_format(req.response_format)
+    stop_sequences = _normalize_stop(req.stop, max_count=4)
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
     t0 = time.perf_counter()
 
@@ -546,7 +695,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     await _debug_log_input(
         "OPENAI /v1/chat/completions", req.model_dump(), chat_messages, prompt_ids
     )
-    _validate_capacity(prompt_ids, max_tokens, "chat")
+    _validate_capacity(prompt_ids, max_tokens)
 
     model_name = req.model or engine.MODEL
 
@@ -557,7 +706,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         created = int(time.time())
 
         async def _sse():
-            proc = StreamProcessor(engine.tok, thinking_capable=True)
+            proc = StreamProcessor(engine.tok, thinking_capable=SERVER_THINKING_CAPABLE)
             final_result = None
             first_token_t = None
             # First chunk: role announcement (matches vLLM format)
@@ -582,7 +731,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 session_id=req.session_id,
                 sampling_params=sampling_params,
                 cancel_ref=_cancel_ref,
-                response_format=req.response_format,
+                stop_sequences=stop_sequences,
                 logprobs=bool(req.logprobs),
                 top_logprobs=req.top_logprobs or 0,
             ):
@@ -596,6 +745,22 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 proc.add_tokens(item)
                 if first_token_t is None and item:
                     first_token_t = time.perf_counter()
+                if SERVER_REASONING_MODE == "expose":
+                    for rdelta in proc.drain_thinking():
+                        rchunk = {
+                            "id": cmpl_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"reasoning_content": rdelta},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {_json.dumps(rchunk)}\n\n"
                 for delta in proc.drain_content():
                     chunk = {
                         "id": cmpl_id,
@@ -696,13 +861,17 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         max_tokens,
         session_id=req.session_id,
         sampling_params=sampling_params,
+        stop_sequences=stop_sequences,
         logprobs=bool(req.logprobs),
         top_logprobs=req.top_logprobs or 0,
     )
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
-    # Strip thinking/reasoning blocks from model output
-    from server.formats.thinking import strip_thinking
-    text = strip_thinking(raw_text)
+    # Same state machine as the streaming path (server/formats/stream.py) --
+    # not a second, independently-written parser for the non-streaming case.
+    proc = StreamProcessor(engine.tok, thinking_capable=SERVER_THINKING_CAPABLE)
+    proc.add_tokens(result["committed_token_ids"])
+    text = proc.content_text()
+    reasoning_content = proc.reasoning_content() if SERVER_REASONING_MODE == "expose" else None
     metrics.record_request(
         "chat",
         result["prompt_tokens"],
@@ -725,6 +894,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         completion_tokens=result["completion_tokens"],
         committed_token_ids=result["committed_token_ids"],
         prompt_token_ids=list(prompt_ids),
+        reasoning_content=reasoning_content,
     )
     if req.logprobs:
         resp["choices"][0]["logprobs"] = _format_logprobs_openai(
@@ -744,23 +914,33 @@ async def completions(req: CompletionRequest, request: Request):
         seed=req.seed,
         n=req.n,
     )
+    _reject_unsupported_response_format(req.response_format)
+    stop_sequences = _normalize_stop(req.stop, max_count=4)
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
     t0 = time.perf_counter()
     prompt_ids = await _tokenize_encode(engine, req.prompt)
     await _debug_log_input("OPENAI /v1/completions", req.model_dump(), req.prompt, prompt_ids)
-    _validate_capacity(prompt_ids, max_tokens, "completions")
+    _validate_capacity(prompt_ids, max_tokens)
 
     result = await engine.submit(
         prompt_ids,
         max_tokens,
         session_id=req.session_id,
         sampling_params=sampling_params,
+        stop_sequences=stop_sequences,
         logprobs=bool(req.logprobs),
         top_logprobs=req.top_logprobs or 0,
     )
     _raw_comp = await _tokenize_decode(engine, result["committed_token_ids"])
-    from server.formats.thinking import strip_thinking as _st
-    text = _st(_raw_comp)
+    # Legacy text-completions has no chat-message/reasoning_content concept
+    # to route a <think> block into (OpenAI's real /v1/completions has no
+    # such field either) and no chat template is applied here at all, so
+    # there is nothing to split -- return the generated text verbatim
+    # (replacement-char cleanup only). This endpoint is the exact site of
+    # the original P1 empty-output bug (notes/2026-07-27-p1-http-e2e-and-
+    # thinking-strip-bug.md): unconditionally wrapping raw completion output
+    # in a synthetic <think> prefix before stripping ate the entire response.
+    text = _raw_comp.replace("�", "").strip()
     metrics.record_request(
         "completions",
         result["prompt_tokens"],
@@ -802,6 +982,56 @@ async def completions(req: CompletionRequest, request: Request):
     }
 
 
+def _run_startup_preflight() -> None:
+    """Validate the environment before any weights are loaded, and abort on a
+    fatal mismatch (roadmap T0-3 / D3).
+
+    ``runtime.preflight`` deliberately never prints or exits -- it returns a
+    structured report and leaves presentation and policy to its caller. This
+    is that caller: it renders one line per check, blocks on fatal failures,
+    and lets warnings through with their remediation text.
+
+    The checkpoint checks want a local directory, but ``ServerEngine.MODEL``
+    is a HuggingFace repo id. ``_resolve_laguna_model_dir`` is the resolver
+    the loader itself uses (offline-only, no network fetch); importing the
+    private name is deliberate -- duplicating two lines of resolution logic
+    here would be free to drift away from what actually gets loaded.
+    """
+    import sys
+
+    from runtime.laguna_config import _resolve_laguna_model_dir
+    from runtime.preflight import run_preflight
+
+    try:
+        checkpoint_dir = _resolve_laguna_model_dir(ServerEngine.MODEL)
+    except Exception as exc:  # noqa: BLE001 - any resolution failure is fatal here
+        print(
+            f"preflight: cannot resolve a local checkpoint for {ServerEngine.MODEL!r}: {exc}\n"
+            f"           Download it first, or point QSR_SERVED_MODEL_NAME at a local path.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
+
+    report = run_preflight(checkpoint_dir)
+    for check in report.checks:
+        mark = "ok  " if check.passed else ("FAIL" if check.severity == "fatal" else "warn")
+        print(f"preflight [{mark}] {check.name}: {check.actual}", file=sys.stderr)
+    for check in report.warnings:
+        if check.remediation:
+            print(f"preflight        -> {check.remediation}", file=sys.stderr)
+    if report.ok:
+        return
+    print("preflight: refusing to start.", file=sys.stderr)
+    for check in report.fatal_failures:
+        print(
+            f"  {check.name}: expected {check.expected}, got {check.actual}",
+            file=sys.stderr,
+        )
+        if check.remediation:
+            print(f"    -> {check.remediation}", file=sys.stderr)
+    raise SystemExit(1)
+
+
 def main() -> None:
     import argparse
 
@@ -814,6 +1044,15 @@ def main() -> None:
     parser.add_argument("--num-slots", type=int, default=SERVER_NUM_SLOTS)
     parser.add_argument("--blocks-per-slot", type=int, default=SERVER_BLOCKS_PER_SLOT)
     parser.add_argument("--no-cudagraph", action="store_true")
+    parser.add_argument(
+        "--skip-preflight",
+        action="store_true",
+        help=(
+            "Skip the startup environment checks (GPU architecture, CUDA, torch, "
+            "SparkInfer, checkpoint). Escape hatch for deliberately unusual setups; "
+            "a fatal check normally means the server would fail later and less clearly."
+        ),
+    )
     parser.add_argument(
         "--no-prefix-cache",
         action="store_true",
@@ -841,6 +1080,19 @@ def main() -> None:
             "multi-slot-concurrency.md."
         ),
     )
+    from server.formats.tool_parsers import available_parsers
+
+    parser.add_argument(
+        "--tool-call-parser",
+        choices=available_parsers(),
+        default=SERVER_TOOL_CALL_PARSER,
+        help=(
+            "Tool-call output shape to decode (mirrors vLLM's "
+            "--tool-call-parser). One per model family -- see "
+            "server/formats/tool_parsers/. Default matches the currently "
+            "loaded model."
+        ),
+    )
     args = parser.parse_args()
 
     # P4b: refuse --session-affinity together with --no-prefix-cache -- a clean
@@ -863,6 +1115,12 @@ def main() -> None:
     os.environ["QSR_SERVER_SESSION_TTL_S"] = str(args.session_ttl_s)
     if args.dflash:
         os.environ["QSR_SERVER_ENABLE_DFLASH"] = "1"
+    os.environ["QSR_TOOL_CALL_PARSER"] = args.tool_call_parser
+
+    # Runs before uvicorn imports the app module, so the model is not loaded
+    # yet -- a fatal environment mismatch costs seconds, not a failed load.
+    if not args.skip_preflight:
+        _run_startup_preflight()
 
     uvicorn.run("server.app:app", host=args.host, port=args.port, log_level="info")
 
@@ -917,10 +1175,14 @@ async def metrics_endpoint():
     # not a dynamic BlockPool. Compute KV usage from active slot count.
     total_blocks = engine.num_slots * engine.blocks_per_slot
     active_slots = len(engine.active)
-    used_blocks = sum(
-        (runner.slot_kv_len.get(s, 0) + engine.block_size - 1) // engine.block_size
-        for s in engine.active
-    ) if hasattr(runner, 'slot_kv_len') else active_slots * engine.blocks_per_slot
+    used_blocks = (
+        sum(
+            (runner.slot_kv_len.get(s, 0) + engine.block_size - 1) // engine.block_size
+            for s in engine.active
+        )
+        if hasattr(runner, "slot_kv_len")
+        else active_slots * engine.blocks_per_slot
+    )
     kv_usage = used_blocks / total_blocks if total_blocks > 0 else 0.0
 
     num_running = len(engine.active)
@@ -1092,18 +1354,17 @@ async def anthropic_messages(request: Request):
         top_k=body.get("top_k"),
         seed=body.get("seed"),
     )
+    # Anthropic's stop_sequences has no documented count limit (unlike
+    # OpenAI's stop, capped at 4) -- see _normalize_stop's docstring.
+    stop_sequences = _normalize_stop(body.get("stop_sequences"))
 
     # Parse through the Anthropic format layer (handles array content, tool_use, tool_result)
     chat_messages = anthropic_format.parse_messages(body)
     if not chat_messages:
-        metrics.record_error("messages", 400)
-        return JSONResponse(
-            status_code=400,
-            content={
-                "type": "error",
-                "error": {"type": "invalid_request_error", "message": "no messages provided"},
-            },
-        )
+        # _invalid_request()'s shape is reshaped per-protocol by
+        # _http_exception_handler (below), so this endpoint no longer needs
+        # its own hand-rolled Anthropic-shaped JSONResponse for validation.
+        raise _invalid_request("no messages provided")
 
     # Convert tools for the chat template
     tools = convert_tools_to_chat_template(body.get("tools"))
@@ -1113,23 +1374,13 @@ async def anthropic_messages(request: Request):
 
     effective_max = min(max_tokens, engine.capacity_tokens_per_slot - len(prompt_ids) - 1)
     if effective_max < 1:
-        metrics.record_error("messages", 400)
-        return JSONResponse(
-            status_code=400,
-            content={
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "message": "prompt too long for requested max_tokens",
-                },
-            },
-        )
+        raise _invalid_request("prompt too long for requested max_tokens")
 
     if stream:
         import json as _json
 
         async def _anthropic_sse():
-            proc = StreamProcessor(engine.tok, thinking_capable=True)
+            proc = StreamProcessor(engine.tok, thinking_capable=SERVER_THINKING_CAPABLE)
             final_result = None
             first_token_t = None
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -1165,6 +1416,7 @@ async def anthropic_messages(request: Request):
                 effective_max,
                 sampling_params=sampling_params,
                 cancel_ref=_cancel_ref,
+                stop_sequences=stop_sequences,
             ):
                 if await request.is_disconnected():
                     if _cancel_ref[0]:
@@ -1176,6 +1428,20 @@ async def anthropic_messages(request: Request):
                 proc.add_tokens(item)
                 if first_token_t is None and item:
                     first_token_t = time.perf_counter()
+
+                # Reasoning is exposed via a custom, non-spec SSE event --
+                # NOT a `thinking` content block. We cannot produce the
+                # cryptographic signature real Anthropic thinking blocks
+                # carry; shipping one anyway previously broke Claude
+                # Desktop (it drops every content block, including
+                # tool_use, that follows an invalid thinking block -- see
+                # commit f13fd4a). An `event:` name outside Anthropic's
+                # documented set is safe: compliant SSE consumers switch on
+                # known event names and ignore the rest.
+                if SERVER_REASONING_MODE == "expose":
+                    for rdelta in proc.drain_thinking():
+                        rd = {"type": "reasoning_content_delta", "delta": rdelta}
+                        yield f"event: reasoning_content_delta\ndata: {_json.dumps(rd)}\n\n"
 
                 for delta in proc.drain_content():
                     if not text_open:
@@ -1202,7 +1468,13 @@ async def anthropic_messages(request: Request):
                 block_index += 1
 
             finish = final_result["finish_reason"] if final_result else "stop"
-            stop_reason = "end_turn" if finish == "stop" else "max_tokens"
+            matched_stop_sequence = (
+                final_result.get("matched_stop_sequence") if final_result else None
+            )
+            if matched_stop_sequence:
+                stop_reason = "stop_sequence"
+            else:
+                stop_reason = "end_turn" if finish == "stop" else "max_tokens"
             visible_text, tool_calls = proc.finalize()
             out_tokens = len(proc.all_ids)
             if tool_calls:
@@ -1252,7 +1524,7 @@ async def anthropic_messages(request: Request):
 
             msg_delta = {
                 "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "delta": {"stop_reason": stop_reason, "stop_sequence": matched_stop_sequence},
                 "usage": {"output_tokens": out_tokens},
             }
             yield f"event: message_delta\ndata: {_json.dumps(msg_delta)}\n\n"
@@ -1276,10 +1548,14 @@ async def anthropic_messages(request: Request):
         prompt_ids,
         effective_max,
         sampling_params=sampling_params,
+        stop_sequences=stop_sequences,
     )
     _raw_anth = await _tokenize_decode(engine, result["committed_token_ids"])
-    from server.formats.thinking import strip_thinking as _st2
-    text = _st2(_raw_anth)
+    # Same state machine as the streaming path (server/formats/stream.py).
+    proc = StreamProcessor(engine.tok, thinking_capable=SERVER_THINKING_CAPABLE)
+    proc.add_tokens(result["committed_token_ids"])
+    text = proc.content_text()
+    reasoning_content = proc.reasoning_content() if SERVER_REASONING_MODE == "expose" else None
     metrics.record_request(
         "messages",
         result["prompt_tokens"],
@@ -1301,4 +1577,6 @@ async def anthropic_messages(request: Request):
         input_tokens=result["prompt_tokens"],
         output_tokens=result["completion_tokens"],
         cache_read_input_tokens=result.get("prefix_cache_hit_tokens", 0),
+        reasoning_content=reasoning_content,
+        stop_sequence=result.get("matched_stop_sequence"),
     )

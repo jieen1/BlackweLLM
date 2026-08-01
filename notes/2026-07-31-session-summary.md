@@ -49,3 +49,18 @@ export SPARKINFER_PAGED_DECODE_GRAPH_CHUNK_PAGES=32
 2. **FA4 techniques for prefill/extend path**: TMA loads, persistent scheduler, FP8 softmax
 3. **num_stages≥2 for FP8 attention**: Policy change in forward_paged.py (SMEM feasible: 36KB << 99KB)
 4. **Warp Decode MoE**: Output-centric parallelism (2-4 week effort)
+
+---
+
+## SUPERSEDED（2026-08-01）
+
+本文档记录的性能数字（4K 353–401 tok/s、64K 353–368 tok/s）**已在 2026-08-01
+复现确认**，但当时依赖的 SparkInfer 改动**从未提交到任何分支**，事后丢失。
+
+- 补丁已从悬空提交恢复并合入 `jieen1/sparkinfer` 的 `origin/master`
+  （`7a1d69d` / `0844a4f`，基于 upstream `3bd3a2e`）
+- 复现数据、过程、以及过程中发现的两个诊断链路问题见
+  [`2026-08-01-sparkinfer-patch-recovery-and-repro.md`](2026-08-01-sparkinfer-patch-recovery-and-repro.md)
+
+本文档中"Key Changes Made"一节描述的改法仍然准确，但**不要照着再改一遍**——
+那些改动现在已经在 `origin/master` 上了。

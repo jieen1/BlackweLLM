@@ -21,7 +21,7 @@ help: ## Show available targets
 install: ## Install package with dev + serving extras (editable)
 	$(PYTHON) -m pip install -e '.[dev,serving]'
 
-install-cuda: ## Install the pinned PyTorch CUDA runtime extra
+install-cuda: ## Install the CUDA runtime extra (torch + kernel deps; see pyproject.toml)
 	$(PYTHON) -m pip install -e '.[cuda]'
 
 lint: ## Ruff lint gate for the whole repo (must stay green)
@@ -68,8 +68,11 @@ verify-laguna-router: ## Verify the generated router ABI and dynamic dependencie
 serve: ## Start the OpenAI/Anthropic-compatible server (tune via QSR_* env)
 	$(PYTHON) -m server.app --host $(HOST) --port $(PORT)
 
+verify-sparkinfer: ## Report which SparkInfer checkout the warm bfdiag daemon actually loaded
+	@bf exec scripts/verify_sparkinfer_load.py --timeout-s 60
+
 clean: ## Remove build and test caches
 	rm -rf .pytest_cache .ruff_cache build dist *.egg-info
 	find . -type d -name __pycache__ -not -path './.venv/*' -exec rm -rf {} + 2>/dev/null || true
 
-.PHONY: help install install-cuda lint format format-check test verify-cuda workloads build-laguna-router verify-laguna-router serve clean
+.PHONY: help install install-cuda lint format format-check test verify-cuda workloads build-laguna-router verify-laguna-router serve verify-sparkinfer clean

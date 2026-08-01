@@ -26,8 +26,48 @@ jobs:
       - name: Ruff format check (production packages)
         run: python -m ruff format --check runtime server loader model oracle tests tools
 
-      # Unit tests are CPU-only; torch-dependent tests (test_tensor_reader,
-      # test_capture_hooks) self-skip via pytest.importorskip when torch is
-      # absent, so no GPU or CUDA wheel is needed here.
+      # Unit tests are CPU-only; torch-dependent tests self-skip via
+      # pytest.importorskip when torch is absent, so no GPU or CUDA wheel
+      # is needed here. This job is the contract's gatekeeper: if it goes
+      # red, something reintroduced a bare torch import (or another
+      # unguarded optional dependency) into a module pytest collects here.
       - name: Unit tests (CPU-only)
+        run: python -m pytest -q
+
+  test-cpu-torch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # `serving` pulls in transformers/fastapi, and transitively numpy/
+      # safetensors/huggingface_hub -- several test modules import torch
+      # AND one of those (e.g. runtime/backends/laguna.py needs numpy,
+      # runtime/laguna_config.py needs huggingface_hub+transformers) at
+      # module scope, guarded only by pytest.importorskip("torch") on the
+      # assumption that torch's presence implies the rest, which is true
+      # in the real GPU dev venv but not for a bare torch-only install.
+      # triton is likewise a hard module-level import of several kernel
+      # wrappers (fused_kv_scatter, cg_decode_metadata) once torch is
+      # present. Installing all of them here (still CPU-only, no GPU
+      # needed to import any of them) is what actually lets those tests
+      # run instead of erroring at collection.
+      - name: Install dev dependencies + CPU torch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[dev,serving]'
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install triton
+
+      # Broader coverage than the CPU-only job above: with torch (and its
+      # common companions installed just above) present, every
+      # pytest.importorskip("torch")-guarded test actually runs instead of
+      # self-skipping. Still no GPU -- this is the CPU wheel, not the CUDA
+      # build, and sparkinfer/cutlass (the real SM120 kernel stack) are
+      # deliberately NOT installed here -- so GPU-only and sparkinfer-only
+      # tests still self-skip via their own skipif/importorskip guard.
+      - name: Unit tests (CPU torch)
         run: python -m pytest -q

@@ -35,18 +35,21 @@ import os
 os.environ.setdefault("SPARKINFER_TURBO_ATTN", "0")
 
 import logging
-import sys
 from typing import Any
 
 import torch
 
+from runtime.backends._sparkinfer_import import ensure_sparkinfer_path
 from runtime.kernels.fused_kv_scatter import fused_kv_scatter
 
 logger = logging.getLogger("qwen_sm120_runtime.sparkinfer_attn")
 
-_BF_SPARKINFER_PATH = os.environ.get("BF_SPARKINFER_PATH", "/home/bot/project/sparkinfer")
-if _BF_SPARKINFER_PATH and _BF_SPARKINFER_PATH not in sys.path:
-    sys.path.insert(0, _BF_SPARKINFER_PATH)
+# Route through the single controlled resolver (see
+# runtime/backends/_sparkinfer_import.py) instead of inserting BF_SPARKINFER_PATH
+# into sys.path directly here -- laguna.py's _patch_moe_sparkinfer touches
+# `sparkinfer` before this module is even imported on the real Laguna startup
+# path, so a local-only sys.path.insert here was consistently too late.
+ensure_sparkinfer_path()
 
 PAGE_SIZE = 64  # Default for SparkinferDecodeWorkspace.page_size; callers should
 # pass the real LagunaBackend.block_size explicitly (64 or 128 both supported).
