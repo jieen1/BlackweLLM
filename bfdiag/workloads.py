@@ -882,6 +882,174 @@ def diagnose_dflash_verify_cg_divergence(
     return {"run_id": run_id, **report}
 
 
+def diagnose_dflash_verify_split_kv_chunking(
+    engine: Any,
+    *,
+    probe_kv_lens: tuple[int, ...] = (64, 400, 500, 510, 511, 512, 513, 520, 600, 1000, 2016),
+) -> dict[str, Any]:
+    """Compare sparkinfer's verify-mode split-KV chunk sizing across the CG
+    and eager verify paths, without running the model at all.
+
+    Root-cause probe for notes/2026-08-02-eager-verify-cg-verify-divergence.md.
+    Both ``LagunaCudaGraphVerify`` (CG verify, laguna_cuda_graph.py) and
+    ``SparkinferPrefillWorkspace.forward`` (DFlash's eager verify fallback
+    reached from ``_forward_verify_with_aux``, laguna_sparkinfer_attn.py)
+    call sparkinfer's ``planner.create_paged_plan(mode="verify", ...)`` --
+    but at different times, with different ``enable_cuda_graph``/
+    ``cache_seqlens`` inputs:
+
+    - CG (``LagunaCudaGraphVerify._init_workspaces``) calls it exactly ONCE,
+      at construction, with ``enable_cuda_graph=True`` and
+      ``cache_seqlens=[max_kv]`` -- the group's entire workspace capacity
+      (``(blocks_per_slot + 16) * block_size - 1``), the worst case, not the
+      real replay length. The resulting ``plan.kv_chunk_size`` is written
+      into a device buffer (``kv_chunk_size_ptr``) once and, per
+      ``PagedAttentionWorkspace.update_prefill_graph_replay_metadata``'s
+      Triton kernel (``update_prefill_graph_work_metadata_triton``, the
+      non-``ADAPTIVE_CHUNKING`` branch -- see below for why that branch
+      never engages here), is READ BACK UNCHANGED on every replay: the
+      chunk *size* in tokens never adapts to the real replay ``kv_len``,
+      only the chunk *count* (``num_chunks_kv = ceil(pages_needed /
+      chunk_pages)``) does, using that frozen size.
+    - Eager (``SparkinferPrefillWorkspace.forward``) calls it FRESH on every
+      real verify call, with ``enable_cuda_graph=False`` and the ACTUAL
+      current ``kv_len``, under an effectively unconstrained
+      ``max_batch_size_if_split`` budget -- so it is free to pick a much
+      finer chunk size than CG's capacity-constrained worst-case one.
+
+    ``ADAPTIVE_CHUNKING`` is sparkinfer's only mechanism for re-deriving
+    chunk size at CG replay time (see
+    ``PagedAttentionWorkspace._uses_laguna_verify_analytic_schedule`` and
+    ``update_prefill_graph_work_metadata_triton``'s ``ADAPTIVE_CHUNKING``
+    branch), and it is hard-gated to one Laguna-specific fast shape:
+    ``cta_tile_q == 64`` (which itself requires ``packed_qo_len == 48``,
+    i.e. a verify query window of exactly 8 tokens under GQA6) and
+    ``page_size == 128``. This deployment's real DFlash verify window is
+    ``NUM_QUERY_PER_REQ=16`` tokens (``dflash_constants.py``), not 8, and
+    the production block size is 64, not 128 (``server/app.py``'s
+    ``SERVER_BLOCK_SIZE`` default) -- so ``cta_tile_q`` resolves to 16 for
+    both paths (confirmed below: both report the same ``cta_tile_q``) and
+    the adaptive path never engages. CG's chunk size is frozen for the
+    life of the process.
+
+    Calls ``create_paged_plan`` directly against synthetic CUDA tensors
+    (correct shapes/dtypes/devices only -- no real weights, no forward
+    pass, no KV cache reads) so this needs no model load beyond whatever
+    the caller already loaded to get ``engine``.
+    """
+    import torch
+
+    from runtime.backends.dflash_constants import NUM_QUERY_PER_REQ
+
+    backend = engine.backend
+    block_size = int(backend.block_size)
+    blocks_per_slot = int(backend.blocks_per_slot)
+    full_groups = [key for key in backend._layer_groups if key[0] == -1]
+    if not full_groups:
+        raise RuntimeError(
+            "diagnose_dflash_verify_split_kv_chunking requires a full-attention "
+            "(window_left=-1) layer group -- none found on this backend"
+        )
+    window_left, num_q_heads, num_kv_heads = full_groups[0]
+    head_dim = 128
+    device = torch.device("cuda")
+
+    def make_plan(*, cache_seqlen: int, enable_cuda_graph: bool, num_pages: int):
+        from sparkinfer.attention.paged.planner import create_paged_plan
+
+        q = torch.zeros(
+            NUM_QUERY_PER_REQ, num_q_heads, head_dim, dtype=torch.bfloat16, device=device
+        )
+        k_cache = torch.zeros(
+            num_pages,
+            block_size,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        )
+        v_cache = torch.zeros_like(k_cache)
+        page_table = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
+        cache_seqlens = torch.tensor([cache_seqlen], dtype=torch.int32, device=device)
+        cu_seqlens_q = torch.tensor([0, NUM_QUERY_PER_REQ], dtype=torch.int32, device=device)
+        return create_paged_plan(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            mode="verify",
+            enable_cuda_graph=enable_cuda_graph,
+            window_left=window_left,
+        )
+
+    # CG's own worst-case sizing call -- mirrors LagunaCudaGraphVerify.
+    # _init_workspaces exactly (max_pages, max_kv formulas copied verbatim).
+    cg_max_pages = blocks_per_slot + 16
+    cg_max_kv = cg_max_pages * block_size - 1
+    cg_plan = make_plan(cache_seqlen=cg_max_kv, enable_cuda_graph=True, num_pages=cg_max_pages)
+    cg_chunk_pages = max((int(cg_plan.kv_chunk_size) + block_size - 1) // block_size, 1)
+
+    rows = []
+    for kv_len in probe_kv_lens:
+        num_pages_needed = max((kv_len + block_size - 1) // block_size, 1)
+        eager_plan = make_plan(
+            cache_seqlen=kv_len, enable_cuda_graph=False, num_pages=num_pages_needed
+        )
+        eager_num_tiles_q = max(
+            (NUM_QUERY_PER_REQ * int(eager_plan.gqa_group_size) + int(eager_plan.cta_tile_q) - 1)
+            // int(eager_plan.cta_tile_q),
+            1,
+        )
+        eager_num_chunks_kv = int(eager_plan.new_batch_size) // eager_num_tiles_q
+        cg_num_chunks_kv_here = max((num_pages_needed + cg_chunk_pages - 1) // cg_chunk_pages, 1)
+        rows.append(
+            {
+                "kv_len": kv_len,
+                "eager_kv_chunk_size": int(eager_plan.kv_chunk_size),
+                "eager_split_kv": bool(eager_plan.split_kv),
+                "eager_num_chunks_kv": eager_num_chunks_kv,
+                "eager_cta_tile_q": int(eager_plan.cta_tile_q),
+                "cg_num_chunks_kv_if_replayed_here": cg_num_chunks_kv_here,
+                "chunk_count_mismatch": eager_num_chunks_kv != cg_num_chunks_kv_here,
+            }
+        )
+
+    report = {
+        "window_left": window_left,
+        "num_q_heads": num_q_heads,
+        "num_kv_heads": num_kv_heads,
+        "block_size": block_size,
+        "blocks_per_slot": blocks_per_slot,
+        "num_query_per_req": NUM_QUERY_PER_REQ,
+        "cg_max_kv": cg_max_kv,
+        "cg_kv_chunk_size": int(cg_plan.kv_chunk_size),
+        "cg_chunk_pages": cg_chunk_pages,
+        "cg_split_kv": bool(cg_plan.split_kv),
+        "cg_cta_tile_q": int(cg_plan.cta_tile_q),
+        "rows": rows,
+    }
+    with run_record(
+        script=__file__,
+        workload={
+            "contract": "dflash_verify_split_kv_chunking",
+            "block_size": block_size,
+            "blocks_per_slot": blocks_per_slot,
+            "num_query_per_req": NUM_QUERY_PER_REQ,
+        },
+    ) as rec:
+        artifacts = default_store().artifacts_dir(rec.run_id)
+        artifacts.mkdir(parents=True, exist_ok=True)
+        report_path = artifacts / "verify_split_kv_chunking.json"
+        report_path.write_text(json.dumps(report, indent=2, sort_keys=True))
+        rec.artifact("verify_split_kv_chunking", report_path)
+        rec.metric("cg_kv_chunk_size", report["cg_kv_chunk_size"])
+        rec.metric("mismatch_count", sum(1 for row in rows if row["chunk_count_mismatch"]))
+        run_id = rec.run_id
+    return {"run_id": run_id, **report}
+
+
 def run_historical_m1_decode_cg(
     backend: Any,
     *,
