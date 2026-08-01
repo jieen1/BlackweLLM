@@ -248,20 +248,21 @@ def test_sparkinfer_contract_passes_when_importable_and_versioned() -> None:
     assert result.passed
 
 
-def test_sparkinfer_gate_warns_not_fails_when_unpatched() -> None:
+def test_sparkinfer_gate_warns_not_fails_when_plain_upstream() -> None:
     """The core T0-5 scenario: SparkInfer is importable and fine, but the
     analytic-decode gate rejects our production (48/8) shape because the
-    local gating patch is absent. This must be a warning, not fatal — the
-    generic kernel is still correct, just slower.
+    installed SparkInfer is plain `upstream`, missing this project's fork
+    commits (docs/sparkinfer-fork-delta.md). This must be a warning, not
+    fatal — the generic kernel is still correct, just slower.
     """
     probe = _healthy_sparkinfer_probe(gate_accepts_production_shape=False)
     result = check_sparkinfer_analytic_decode_gate(probe)
     assert not result.passed
     assert result.severity == "warning"
-    assert "docs/sparkinfer-upstream-handoff.md" in result.remediation
+    assert "docs/sparkinfer-fork-delta.md" in result.remediation
 
 
-def test_sparkinfer_gate_passes_when_patched() -> None:
+def test_sparkinfer_gate_passes_on_the_fork() -> None:
     result = check_sparkinfer_analytic_decode_gate(_healthy_sparkinfer_probe())
     assert result.passed
 
@@ -392,10 +393,13 @@ def test_run_preflight_all_healthy_and_checkpoint_valid(tmp_path) -> None:
     } <= names
 
 
-def test_run_preflight_blocks_on_wrong_gpu_but_not_on_unpatched_sparkinfer(tmp_path) -> None:
+def test_run_preflight_blocks_on_wrong_gpu_but_not_on_plain_upstream_sparkinfer(
+    tmp_path,
+) -> None:
     """A single scenario exercising the exact split this module is designed
-    around: a hardware-contract violation is fatal, but an unpatched
-    SparkInfer (T0-5) is a warning that does not, by itself, block startup.
+    around: a hardware-contract violation is fatal, but a plain-upstream
+    SparkInfer install missing this project's fork commits (T0-5) is a
+    warning that does not, by itself, block startup.
     """
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "laguna"}), encoding="utf-8")
     gpu = _healthy_gpu_probe(compute_capability=(9, 0))

@@ -67,6 +67,15 @@ VERIFIED_DRIVER_VERSION = "610.47"
 REQUIRED_COMPUTE_CAPABILITY: tuple[int, int] = (12, 0)  # SM120 only — docs/architecture.md §1
 MIN_SPARKINFER_VERSION: tuple[int, int, int] = (1, 0, 0)
 VERIFIED_SPARKINFER_VERSION = "1.0.1"  # editable install of /home/bot/project/sparkinfer
+# SparkInfer is installed from this project's own fork (`origin` =
+# github.com/jieen1/sparkinfer), not from upstream (`upstream` =
+# github.com/local-inference-lab/sparkinfer) directly. `origin/master` is
+# production and carries fork-only commits beyond what the package-version
+# number above tracks — it doesn't move when those commits land. See
+# docs/sparkinfer-fork-delta.md for what they are and why the version number
+# alone can't tell you whether they're present; check_sparkinfer_analytic_decode_gate
+# below is the check that actually answers that question.
+VERIFIED_SPARKINFER_COMMIT = "0844a4f"  # fork origin/master, based on upstream 3bd3a2e
 
 # Real, unsharded (TP=1) full-attention shape SparkInfer's paged-attention
 # adapter runs in production — see runtime/backends/laguna_sparkinfer_attn.py
@@ -76,7 +85,7 @@ VERIFIED_SPARKINFER_VERSION = "1.0.1"  # editable install of /home/bot/project/s
 PRODUCTION_FULL_ATTENTION_NUM_Q_HEADS = 48
 PRODUCTION_FULL_ATTENTION_NUM_KV_HEADS = 8
 PRODUCTION_HEAD_DIM = 128
-PRODUCTION_PAGE_SIZE = 64  # current production block_size; see docs/sparkinfer-upstream-handoff.md
+PRODUCTION_PAGE_SIZE = 64  # current production block_size; see docs/sparkinfer-fork-delta.md
 
 
 @dataclasses.dataclass(frozen=True)
@@ -86,9 +95,10 @@ class CheckResult:
     `severity` distinguishes "must not start" (fatal — e.g. wrong GPU
     architecture, which is a hardware-contract violation per
     docs/architecture.md §1) from "will start, but you should know"
-    (warning — e.g. an unpatched SparkInfer that silently falls back to a
-    slower kernel). The caller decides what to do with either; this module
-    never exits or blocks on its own.
+    (warning — e.g. a plain-upstream SparkInfer install, missing this
+    project's fork commits, that silently falls back to a slower kernel).
+    The caller decides what to do with either; this module never exits or
+    blocks on its own.
     """
 
     name: str
@@ -397,7 +407,7 @@ class SparkInferProbe:
     behavior that governs whether our production shape gets SparkInfer's
     fast warp-specialized analytic decode kernel or its generic fallback.
 
-    See docs/sparkinfer-upstream-handoff.md for the full story.
+    See docs/sparkinfer-fork-delta.md for the full story.
     """
 
     importable: bool
@@ -458,7 +468,7 @@ def probe_sparkinfer(*, gpu: GpuProbe | None = None) -> SparkInferProbe:
             error=(
                 "gate function _is_laguna_fp8_gqa6_analytic_decode_graph not found "
                 "— SparkInfer's internal API has changed since "
-                "docs/sparkinfer-upstream-handoff.md was written; re-derive the probe"
+                "docs/sparkinfer-fork-delta.md was written; re-derive the probe"
             ),
         )
 
@@ -523,9 +533,12 @@ def check_sparkinfer_contract(sparkinfer_probe: SparkInferProbe | None = None) -
             actual=probe.error or "sparkinfer is not importable",
             expected=expected,
             remediation=(
-                "SparkInfer is a private local dependency, not on PyPI: "
-                "`pip install -e /home/bot/project/sparkinfer` (after activating "
-                "the venv where this project's `cuda` extra is installed)."
+                "SparkInfer is not on PyPI: `pip install -e "
+                "/home/bot/project/sparkinfer` (after activating the venv "
+                "where this project's `cuda` extra is installed). That path "
+                "should have `origin/master` checked out — this project's "
+                "own SparkInfer fork, not upstream — see "
+                "docs/sparkinfer-fork-delta.md."
             ),
         )
     parsed = _parse_version_prefix(probe.version) if probe.version else None
@@ -550,17 +563,20 @@ def check_sparkinfer_analytic_decode_gate(
     (48 query heads / 8 KV heads, gqa_group_size=6), or only for the
     upstream TP=2 shape (24/4) it ships pre-tuned for?
 
-    This is a performance check, not a correctness one — the runtime falls
-    back to SparkInfer's generic paged-attention kernel either way and
-    produces correct output. It is `severity="warning"` for exactly that
-    reason. But it must be a *loud* warning: see
-    docs/sparkinfer-upstream-handoff.md — the 2026-07-31 throughput numbers
-    (353-401 tok/s at 4K, 353-368 tok/s at 64K) were measured against a
-    locally patched SparkInfer that is not upstream and, as of this writing,
-    is not even present in the checked-out /home/bot/project/sparkinfer
-    working tree. Silently running on the unpatched checkout and still
-    expecting those numbers is exactly the failure mode this check exists to
-    prevent.
+    As of docs/sparkinfer-fork-delta.md, this project's own SparkInfer fork
+    (`origin/master`, the branch actually installed at
+    /home/bot/project/sparkinfer) carries this gating relaxation as
+    production code — no environment variable or local patch needed. A
+    passing result is therefore the *expected* default, not a bonus. A
+    failing result means the installed SparkInfer is plain `upstream`
+    (or an older fork commit predating the relaxation), which is a real,
+    measurable throughput regression versus this project's benchmarked
+    numbers (see docs/sparkinfer-fork-delta.md §1) — but not a correctness
+    problem: the runtime falls back to SparkInfer's generic paged-attention
+    kernel either way and produces correct output. That is exactly why this
+    stays `severity="warning"` rather than escalating to fatal: a slow but
+    correct kernel should not block startup, it should be loud so nobody
+    mistakes a quiet regression for a fast run.
     """
     probe = sparkinfer_probe if sparkinfer_probe is not None else probe_sparkinfer()
     expected = "accepts production shape (48 q heads / 8 kv heads, gqa_group_size=6)"
@@ -584,7 +600,7 @@ def check_sparkinfer_analytic_decode_gate(
             remediation=(
                 "Could not determine gate status (no CUDA device at preflight "
                 "time, or SparkInfer's internal API changed). Re-run on the GPU; "
-                "if it still cannot evaluate, see docs/sparkinfer-upstream-handoff.md."
+                "if it still cannot evaluate, see docs/sparkinfer-fork-delta.md."
             ),
         )
     if probe.gate_accepts_production_shape:
@@ -602,18 +618,19 @@ def check_sparkinfer_analytic_decode_gate(
         actual=(
             "rejects production shape (48/8) — falls back to SparkInfer's "
             "generic paged-attention kernel; only the upstream TP=2 shape "
-            "(24 q heads / 4 kv heads) is unlocked on this checkout"
+            "(24 q heads / 4 kv heads) is unlocked on this install"
         ),
         expected=expected,
         remediation=(
-            "This SparkInfer checkout is unpatched. The 2026-07-31 throughput "
-            "numbers (353-401 tok/s @4K, 353-368 tok/s @64K) do NOT apply here "
-            "— expect a measurable regression versus those figures. See "
-            "docs/sparkinfer-upstream-handoff.md for the exact gating change, "
-            "why it is safe, and how to verify it. This repo does not modify "
-            "SparkInfer source directly; the patch must be applied by the "
-            "SparkInfer team or reproduced locally by someone with authority "
-            "to edit /home/bot/project/sparkinfer."
+            "The installed SparkInfer is missing this project's fork "
+            "commits (expected: fork origin/master, verified at "
+            f"{VERIFIED_SPARKINFER_COMMIT}). Re-run "
+            "`pip install -e /home/bot/project/sparkinfer` after checking out "
+            "`origin/master` there — this project's own fork, not "
+            "`upstream`, is what should be installed. See "
+            "docs/sparkinfer-fork-delta.md for what the fork carries and why "
+            "it's safe. Functionally correct either way; expect a measurable "
+            "throughput regression until the fork commits are present."
         ),
     )
 
