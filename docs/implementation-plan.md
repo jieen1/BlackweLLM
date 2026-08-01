@@ -540,16 +540,36 @@ DSpark）。**分两步，先做便宜的那步**：
 | ~~B0 起步~~ | ~~**P0-C/C-2 主线 checkpoint 拍板**~~ | 🟢 **已拍板**：官方 `nvidia/Qwen3.6-27B-NVFP4`；B0-1 衍生出 vision 张量过滤任务，见 §7.1 |
 | ~~A1–A6 开工~~ | ~~P0-D 设计升级到可实施~~ | 🟢 **已解锁**：规格在 `architecture.md` §3.5，第 1–4 步可立即开工且不需要 GPU |
 | ~~P0-E 第 5 步~~ | ~~**P0-B C-LIVE** + GPU~~ | 🟢 **已解锁并完成**：C-LIVE 落地（`scripts/c_live_smoke.py`，67/67）后第 5 步随即开工并通过 GPU 验收，见 [`../notes/2026-08-02-track-a-step5-gpu-verification.md`](../notes/2026-08-02-track-a-step5-gpu-verification.md) |
-| P0-E 第 6–8 步 | 第 5 步完成 + GPU | 🟡 进行中：第 6 步（A4 加载器 adapter）是下一个 |
+| P0-E 第 6–8 步 | 第 5 步完成 + GPU | 🟡 进行中：第 6 步（A4 加载器 adapter）**已开工**，B0-1a/B0-1b 已并入（理由见下）；第 7 步**设计先行**，见 `a3-cache-coordinator-design.md` |
 | ~~N8 处置~~ | ~~拍板 (a)/(b)/(c)~~ | 🟢 **已落地 (c)**：`server/engine.py`/`server/app.py` 启动期拒绝该 flag（`93f19c9`），含 `warm_continue`/`session_warm` 测试覆盖（此前零覆盖） |
 | Track B 全部 | Track A（A1–A5）完成 | 🟡 A1–A5 完成，A6（第 8 步）待 A3/A4（第 6–7 步）先行 |
 | B0-8 GDN 是否存在于 MTP | `investigation-queue.md` B-6（另一 agent 在查） | 🟡 进行中，**不预判**；决定 B3 的两个分支（§7.1） |
+| ~~eager verify vs CG verify 数值分歧~~ | ~~根因未明~~ | 🟢 **已结案（2026-08-02）**：稠密 fp32 oracle 判定两条路径在 attention 算子层面都对（cos ≥ 0.999997），分歧源自 MoE 离散路由放大微小数值差。`QSR_DFLASH_REQUIRE_CG=1` 保持默认但理由改变，见 `investigation-queue.md` C-1 |
 | B3 KV dtype 选型 | `investigation-queue.md` C-2（另一 agent 在查） | 🟡 进行中，**不预判**；上游数字仅供参考，不当结论用 |
 | B2 CUDA Graph | B0-5（GDN 是否 capture-safe） | 🔴 未验证 |
 | C2 分级降级的接口 | P0-D/D-3 能力查询形状 | 🔴 未定 |
 | Track G 排期 | G0 拿到 config | 🔴 本地无 checkpoint |
 | H1 发布 | sparkinfer 上游化（RK2） | 🔴 仍钉私有 fork |
 | RK6/H1 "可从公开源安装" | `investigation-queue.md` C-3（PyTorch 2.13.0 wheel 是否带 `sm_120`，另一 agent 在查） | 🟡 进行中，**不预判** |
+
+### 9.1 排布依据（2026-08-02 这一批，记录以免后人重推）
+
+**为什么 B0-1a/B0-1b 并进第 6 步而不是独立排期**：B0-1a 要写"按张量名前缀跳过 `vision.*`
+的加载过滤器"，而第 6 步 A4 正在把 loader 拆成 adapter —— **两件事改同一块代码**，并行必然冲突。
+但正确的处理不是排队，是合并：vision-skip 本来就是 loader 关注点，把它作为 adapter 抽象的
+**第二个真实消费者**落地，才能验证接缝划对了位置。这与第 5 步"registry 必须有真实生产调用方"
+是同一条理由——**只有一个实现的抽象无法证明自己拆对了**。
+
+⚠️ 附带的诚实约束：Laguna 没有 vision tower，所以 B0-1a 的路径**在今天不可能被真实权重触发**，
+只能用构造的张量名清单做单测。这一点必须写在提交信息里，不能让它看起来像"已验证"。
+
+**为什么第 7 步设计先行、不直接写实现**：它是 Track A 里唯一被标注"爆炸半径最大"的一步，
+而 Laguna 是唯一生产模型。前六步全部靠"零行为变更"降风险，第 7 步是第一步做不到这点的。
+plan 里"动工前必读 `hybrid-cache-prior-art`"本来就是写死的前置条件。
+
+**这一批的 GPU 排布**：三条并行但**零竞争**——只有第 6 步需要 GPU，且只在末尾验收阶段；
+Track B 剩余 B0 条目（B0-2/6/7/8）与 A3 设计全部是读文件，零 GPU。这是排这一批的主要依据，
+不是巧合。
 
 ---
 
