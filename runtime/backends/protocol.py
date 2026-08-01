@@ -80,6 +80,58 @@ class BackendCapabilities:
 
 
 @dataclass(frozen=True)
+class PrefixHit:
+    """Result of matching a prompt against warm cache state.
+
+    ``kv_hit`` is the longest block-aligned prefix whose attention KV is
+    physically present and referenceable. ``state_hit`` is the longest
+    boundary at or below ``kv_hit`` that also has a matching recurrent-state
+    (GDN) checkpoint. A backend with no recurrent layers has no second
+    resource to disagree with the first, so ``state_hit`` always equals
+    ``kv_hit`` for it (INV-A3-6, ``ArchitectureSpec.needs_two_cache_families
+    is False`` -- see ``docs/a3-cache-coordinator-design.md`` §2).
+
+    Two fields rather than one ``int``, following ``BackendCapabilities``'s
+    own precedent for choosing a dataclass over a bare tuple/string: the
+    coordinator (step 7-d) and ``/metrics``/bfdiag need the KV-side number
+    for observability (see ``docs/a3-cache-coordinator-design.md`` §3) even
+    though the scheduler only ever acts on :attr:`effective`. A bare
+    ``tuple[int, int]`` would let ``result[0]``/``result[1]`` be swapped at a
+    call site with no error; this cannot be, because the field names are
+    part of the type.
+
+    INV-A3-2: ``0 <= state_hit <= kv_hit`` always holds -- enforced here,
+    not left as a convention call sites must remember.
+    """
+
+    kv_hit: int
+    state_hit: int
+
+    def __post_init__(self) -> None:
+        if self.state_hit > self.kv_hit:
+            raise ValueError(
+                f"INV-A3-2 violated: state_hit={self.state_hit} > kv_hit={self.kv_hit}"
+            )
+        if self.state_hit < 0 or self.kv_hit < 0:
+            raise ValueError(
+                f"prefix hit lengths must be non-negative: "
+                f"kv_hit={self.kv_hit}, state_hit={self.state_hit}"
+            )
+
+    @property
+    def effective(self) -> int:
+        """The length the scheduler should treat as safe to skip prefill for.
+
+        Always ``state_hit`` (never ``kv_hit``): the region
+        ``[state_hit, kv_hit)`` has KV physically resident but no matching
+        recurrent-state checkpoint to resume from, so treating it as a hit
+        would run a recurrent layer's forward from a state that is stale for
+        those positions. See ``docs/a3-cache-coordinator-design.md`` §3.
+        """
+        return self.state_hit
+
+
+@dataclass(frozen=True)
 class SlotSnapshot:
     slot: int
     kv_len: int
@@ -189,7 +241,7 @@ class ModelBackend(Protocol):
 
     # -- capabilities.prefix_cache -----------------------------------------
 
-    def reconcile_prefix_hit(self, token_ids: list[int]) -> int: ...
+    def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit: ...
 
     def find_best_slot_for_prompt(
         self,

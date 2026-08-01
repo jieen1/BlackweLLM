@@ -1087,7 +1087,13 @@ class ServerEngine:
             remaining_slots = list(self.free_slots)
             for _ in range(n):
                 req = self.waiting.pop(0)
-                if hasattr(self.runner, "find_best_slot_for_prompt") and remaining_slots:
+                # A3 step 7-b (docs/a3-cache-coordinator-design.md §1.1):
+                # capability-bit query, not a hasattr probe -- the pattern
+                # protocol.py's own module docstring names as the one to
+                # eliminate ("the scheduler must consult that BEFORE calling
+                # into a family -- never try/except AttributeError"; a bare
+                # hasattr probe is the same anti-pattern's sibling).
+                if self.runner.capabilities.prefix_cache and remaining_slots:
                     best_slot, _hit = self.runner.find_best_slot_for_prompt(
                         req.prompt_ids,
                         remaining_slots,
@@ -1103,7 +1109,11 @@ class ServerEngine:
                 for slot, _ in admit_now:
                     if not self.runner.slot_state(slot).is_fresh:
                         self.runner.reset_slot(slot)
-                hit_depths = [self.runner.reconcile_prefix_hit(p) for p in new_prompts]
+                # reconcile_prefix_hit returns a PrefixHit (runtime/backends/
+                # protocol.py); .effective is the length safe to skip prefill
+                # for (== state_hit, never kv_hit -- see PrefixHit's own
+                # docstring and docs/a3-cache-coordinator-design.md §3).
+                hit_depths = [self.runner.reconcile_prefix_hit(p).effective for p in new_prompts]
                 prefill_state = self.runner.prefill_chunked_begin(
                     new_slots, new_prompts, chunk_size=self._prefill_chunk_size
                 )

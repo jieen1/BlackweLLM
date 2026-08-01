@@ -136,6 +136,60 @@ class TestConcreteChecks:
         assert "pages_needed" in message and "n_filled_pages" in message
         assert "deficit" in message
 
+    @pytest.mark.parametrize("assert_level", [1], indirect=True)
+    def test_prefix_hit_state_le_kv(self, assert_level):
+        # docs/a3-cache-coordinator-design.md §3's worked example.
+        checks.check_prefix_hit_state_le_kv(slot=0, kv_hit=900, state_hit=400)
+        checks.check_prefix_hit_state_le_kv(slot=0, kv_hit=64, state_hit=64)  # equal is fine
+        with pytest.raises(InvariantViolation, match="INV-A3-2|prefix_hit_state_hit_le_kv_hit"):
+            checks.check_prefix_hit_state_le_kv(slot=0, kv_hit=100, state_hit=101)
+
+    @pytest.mark.parametrize("assert_level", [1], indirect=True)
+    def test_lockstep_eviction(self, assert_level):
+        # Forward: KV hash dropped -> checkpoint dropped too. Fine either
+        # with or without the co-keyed block still referenced (kv_ref_cnt is
+        # only meaningful for the reverse direction below).
+        checks.check_lockstep_eviction(
+            key=1, kv_hash_dropped=True, checkpoint_dropped=True, kv_ref_cnt=0
+        )
+        # Reverse: checkpoint dropped by budget pressure, KV still
+        # referenced -> hash correctly left alone (the asymmetry).
+        checks.check_lockstep_eviction(
+            key=1, kv_hash_dropped=False, checkpoint_dropped=True, kv_ref_cnt=5
+        )
+        with pytest.raises(InvariantViolation):
+            # Forward violated: hash dropped, checkpoint survived.
+            checks.check_lockstep_eviction(
+                key=1, kv_hash_dropped=True, checkpoint_dropped=False, kv_ref_cnt=0
+            )
+        with pytest.raises(InvariantViolation):
+            # Reverse violated: a still-referenced block's hash was dropped
+            # anyway -- exactly the use-after-free-shaped bug INV-A3-3's
+            # asymmetry exists to prevent.
+            checks.check_lockstep_eviction(
+                key=1, kv_hash_dropped=True, checkpoint_dropped=True, kv_ref_cnt=3
+            )
+
+    @pytest.mark.parametrize("assert_level", [1], indirect=True)
+    def test_referenced_resource_never_evicted(self, assert_level):
+        checks.check_referenced_resource_never_evicted(resource_id=1, ref_cnt=1, was_evicted=False)
+        checks.check_referenced_resource_never_evicted(resource_id=1, ref_cnt=0, was_evicted=True)
+        with pytest.raises(InvariantViolation):
+            checks.check_referenced_resource_never_evicted(
+                resource_id=1, ref_cnt=1, was_evicted=True
+            )
+
+    @pytest.mark.parametrize("assert_level", [1], indirect=True)
+    def test_reserved_physical_slots_agree(self, assert_level):
+        checks.check_reserved_physical_slots_agree(
+            "laguna", state_pool_reserved=0, backend_reserved=0
+        )
+        with pytest.raises(InvariantViolation):
+            # The real, documented §1.8 divergence: block_pool.py=1, laguna.py=0.
+            checks.check_reserved_physical_slots_agree(
+                "laguna", state_pool_reserved=1, backend_reserved=0
+            )
+
     @pytest.mark.parametrize("assert_level", [0], indirect=True)
     def test_all_concrete_checks_are_noops_at_level_0(self, assert_level):
         checks.check_committed_ahead_of_kv_by_one(slot=0, kv_len=1, committed_len=1)
@@ -146,6 +200,14 @@ class TestConcreteChecks:
         checks.check_cg_replay_slot_consistency(slot=1, replay_slot=2)
         checks.check_page_table_covers_seqlen(
             "swa", cache_seqlens=999, n_filled_pages=0, page_size=1
+        )
+        checks.check_prefix_hit_state_le_kv(slot=0, kv_hit=1, state_hit=999)
+        checks.check_lockstep_eviction(
+            key=1, kv_hash_dropped=True, checkpoint_dropped=False, kv_ref_cnt=999
+        )
+        checks.check_referenced_resource_never_evicted(resource_id=1, ref_cnt=999, was_evicted=True)
+        checks.check_reserved_physical_slots_agree(
+            "x", state_pool_reserved=1, backend_reserved=999
         )
 
 

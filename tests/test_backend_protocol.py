@@ -22,6 +22,7 @@ from runtime.backends.protocol import (
     REQUIRED_MEMBERS,
     BackendCapabilities,
     ModelBackend,
+    PrefixHit,
     check_conformance,
 )
 
@@ -60,6 +61,48 @@ class TestContractShape:
         caps = BackendCapabilities(True, True, True, True, False)
         with pytest.raises(Exception):
             caps.speculative_decode = False  # type: ignore[misc]
+
+
+class TestPrefixHit:
+    """A3 step 7-a (docs/a3-cache-coordinator-design.md §3, decision 2):
+    ``reconcile_prefix_hit`` was changed in place to return this instead of
+    a bare ``int``. These tests cover the type's own guarantees -- the
+    conformance checker (below) cannot, since it deliberately excludes
+    return-type annotations from its comparison (see this module's
+    ``_comparable`` docstring)."""
+
+    def test_kv_hit_equals_state_hit_is_allowed(self) -> None:
+        hit = PrefixHit(kv_hit=64, state_hit=64)
+        assert hit.kv_hit == 64
+        assert hit.state_hit == 64
+
+    def test_state_hit_below_kv_hit_is_allowed(self) -> None:
+        hit = PrefixHit(kv_hit=900, state_hit=400)
+        assert hit.state_hit < hit.kv_hit
+
+    def test_effective_is_always_state_hit_not_kv_hit(self) -> None:
+        # §3's worked example: kv_hit=900, state_hit=400 -> effective=400,
+        # never 900 (the [400, 900) region has KV but no recurrent-state
+        # checkpoint to resume it from) and never 0 (the [0, 400) region's
+        # hit is real and safe to use).
+        hit = PrefixHit(kv_hit=900, state_hit=400)
+        assert hit.effective == 400
+
+    def test_state_hit_above_kv_hit_raises_inv_a3_2(self) -> None:
+        # Deliberately constructed violation (INV-A3-2: state_hit <= kv_hit
+        # must always hold) -- this must actually raise, not just document
+        # the rule in a docstring.
+        with pytest.raises(ValueError, match="INV-A3-2"):
+            PrefixHit(kv_hit=100, state_hit=101)
+
+    def test_negative_hit_lengths_raise(self) -> None:
+        with pytest.raises(ValueError):
+            PrefixHit(kv_hit=-1, state_hit=-1)
+
+    def test_is_frozen(self) -> None:
+        hit = PrefixHit(kv_hit=64, state_hit=64)
+        with pytest.raises(Exception):
+            hit.kv_hit = 128  # type: ignore[misc]
 
 
 class TestConformanceChecker:
@@ -147,3 +190,20 @@ class TestLagunaConformance:
         caps = cls.capabilities.fget(None)  # type: ignore[attr-defined]
         assert caps.warm_continue is False
         assert not hasattr(cls, "mtp_prefill_warm_continue")
+
+    def test_prefix_cache_capability_agrees_with_the_hasattr_probe_it_replaced(
+        self,
+    ) -> None:
+        """A3 step 7-b (docs/a3-cache-coordinator-design.md §1.1): server/
+        engine.py's admission block used to gate cache-aware slot assignment
+        on ``hasattr(self.runner, "find_best_slot_for_prompt")`` and now
+        reads ``capabilities.prefix_cache`` instead. This is the
+        shadow-consistency claim for the one real shipping backend: the new
+        mechanism must agree with what the old one would have concluded.
+        ``tests/test_engine_prefix_cache_admission.py`` covers the same
+        claim behaviorally, with fakes standing in for both possible
+        answers."""
+        cls = self._backend_cls()
+        caps = cls.capabilities.fget(None)  # type: ignore[attr-defined]
+        assert caps.prefix_cache is hasattr(cls, "find_best_slot_for_prompt")
+        assert caps.prefix_cache is hasattr(cls, "reconcile_prefix_hit")
