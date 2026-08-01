@@ -69,7 +69,7 @@ serve: ## Start the OpenAI/Anthropic-compatible server (tune via QSR_* env)
 	$(PYTHON) -m server.app --host $(HOST) --port $(PORT)
 
 verify-sparkinfer: ## Report which SparkInfer checkout the warm bfdiag daemon actually loaded
-	@./scripts/bf-t0.sh exec scripts/verify_sparkinfer_load.py --timeout-s 60
+	@bf exec scripts/verify_sparkinfer_load.py --timeout-s 60
 
 clean: ## Remove build and test caches
 	rm -rf .pytest_cache .ruff_cache build dist *.egg-info
