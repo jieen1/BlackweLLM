@@ -123,7 +123,14 @@ P0-C 拍板 D6 ─────────────────────�
 
 - [ ] **C-1 D3 · GPU CI 形态**（RK7）：(a) 自托管 runner / (b) 本地 pre-push 门禁 + 人工签核 / (c) 只在里程碑人工全量跑
   → **卡 C4 位精确门禁 → 卡 A6 的"零回归"验收**。不定，Track A 就没有可执行的验收标准，A1–A5 写完也无法宣布完成
-- [ ] **C-2 D6 · Qwen3.6 主线 checkpoint**：带 MTP 的社区文本版 vs 官方 NVFP4 版 → **卡 B0 起步**
+- [ ] **C-2 D6 · Qwen3.6 主线 checkpoint** → **卡 B0 起步**
+  - ⚠️ **roadmap 对这个选择的描述前提不成立**（2026-08-01 读权重索引核实）：它写的是"社区版能做投机 / 官方版需另找 MTP 层"，
+    实际**两份都带 MTP**——`nvidia/Qwen3.6-27B-NVFP4` 有 15 个 `mtp.*` 张量（`mtp.fc.weight`、`mtp.layers.0.*`），
+    `sakamakismile/...-Text-NVFP4-MTP` 同样 15 个。
+  - 真正的取舍是：**官方 provenance + 需排除 333 个 vision 张量**（`language_model_only=False`，带 `vision_config`）
+    vs **社区量化 + 天生文本版**（`language_model_only=True`，0 个 vision 张量，单文件）。
+  - 附带事实：四个本地 Qwen3.6 变体里 **unsloth 那份是 compressed-tensors，不是 modelopt**——
+    量化格式必须逐 checkpoint 读，不能按架构推断。
 - [ ] （不卡任何轨道，可延后）**D4 重命名时机**、**D5 `oracle/qwen36_vllm/` 处置**
 
 ---
@@ -148,16 +155,17 @@ P0-C 拍板 D6 ─────────────────────�
 **执行顺序按 [`architecture.md` §3.5.5](architecture.md) 定稿的 8 步**，不是 roadmap 的 A1→A6 编号顺序：
 按爆炸半径从小到大，零行为变更的步骤排在前面。**前 4 步完全不需要 GPU。**
 
-> 进度：**第 1–2 步已完成（`4ed5a7b`、`f24f5ad`）**。两种环境均验证：
-> torch 环境 1116 passed（原 1100），无 torch 环境 817 passed / 93 skipped，
-> ruff 两关全过。第 3–4 步仍是零 GPU，可直接接着做。
+> 进度：**第 1–4 步全部完成**（`4ed5a7b`、`f24f5ad`、`a1287c5`），**全程零 GPU**。
+> torch 环境 1151 passed（起点 1100），无 torch 环境 852 passed / 93 skipped，ruff 两关全过。
+> **第 5 步（Registry 成为唯一真相源）是第一个需要真机的步骤**——它改行为，门禁是贪心 bit-exact。
+> 在拿到 GPU 之前，剩余的零 GPU 工作是 P0-B 的 C-LIVE 脚本编写（B-1/B-2/B-3）。
 
 | # | 步骤 | 行为变更 | 门禁 | GPU |
 |---|---|---|---|---|
 | 1 | [x] **A2-shadow** ✅ `4ed5a7b`：`runtime/backends/protocol.py`（torch-free）+ `BackendCapabilities` + `check_conformance`；`LagunaBackend` 加 `capabilities`。**零调用点改动**。门禁经两种注入漂移验证会变红 | 无 | 类型检查 + 一致性单测 | ❌ |
 | 2 | [x] **A2-观测** ✅ `f24f5ad`：`snapshot()` 落地，`/metrics` 与 `/debug/stats` 改走契约，删 `_slot_kv_len()`；补上 `/metrics` **此前完全没有的路由级测试**（冷启动 + 忙时两态） | 无（同值） | 单测 ✅ + C-LIVE metrics 两条（待 GPU） | ❌ 写 |
-| 3 | [ ] **A1 ModelSpec（影子）** 按 §3.2-A 九个字段族解析 `config.json`，断言结果与当前硬编码值逐字段相等，暂不驱动任何东西。含 RK8：显式拒绝带 vision tower 的权重 | 无 | 影子一致性单测 | ❌ |
-| 4 | [ ] **A5 Registry（影子）** 路径 → `(spec, backend, loader, 投机策略)`，断言等于今天的硬编码选择 | 无 | 影子一致性单测 | ❌ |
+| 3 | [x] **A1 ModelSpec（影子）** ✅ `a1287c5`：`runtime/architecture.py`（torch-free）解析层类型序列/FFN/RoPE/量化/MTP/**每层缓存需求**，含 RK8 的 `validate_text_only`。影子断言对真实 checkpoint 成立 | 无 | 影子一致性单测 ✅ | ❌ |
+| 4 | [x] **A5 Registry（影子）** ✅ `a1287c5`：`runtime/model_registry.py`，路径 → `(spec, backend, loader, 投机策略)`，对 Laguna 解析出 `laguna / compressed_tensors / dflash` = 今天的硬编码选择 | 无 | 影子一致性单测 ✅ | ❌ |
 | 5 | [ ] **切换** Registry 成为唯一真相源；删 `engine.py:188` `MODEL`、`:190` `BACKEND`、`app.py:81` `SERVER_MODEL_BACKEND` | **有** | 贪心 bit-exact + C-LIVE | ✅ |
 | 6 | [ ] **A4 加载器 adapter** 拆出 compressed-tensors；公共部分（分片流式读取、参数全覆盖断言、KV scale post-load）不变 | 有（同权重） | 逐张量校验和相等 + bit-exact | ✅ |
 | 7 | [ ] **A3 SlotResourceManager** `block_pool` 升级为槽位资源管理器，两类资源联动驱逐；清掉 S4 的 GDN 残迹（`evict_gdn_checkpoint`）。递归状态部分随 Track B 落地 | **有，半径最大** | bit-exact + 接受率 + 前缀命中率不回归 + C-LIVE | ✅ |
