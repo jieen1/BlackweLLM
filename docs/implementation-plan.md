@@ -58,18 +58,19 @@ P0 完成 = 下面五条同时成立：
 
 1. 仓库无已合并分支残留、无待决 untracked 文件；
 2. 存在一道**活服务器冒烟门禁**，且能在三个已知 bug 的父提交上变红；
-3. **D3（GPU CI 形态）与 D6（主线 checkpoint）已拍板**；
+3. ~~**D3（GPU CI 形态）与 D6（主线 checkpoint）已拍板**~~ —— ✅ **2026-08-01 两条均已拍板**（§4），
+   D3 的落地机制（`make gate-local`）与 D6 衍生的 vision 张量过滤任务尚未开工；
 4. Track A 设计从草案升级到**可实施**（有签名、有迁移顺序、有回滚点）；
 5. Laguna 跑在新抽象上，**贪心 bit-exact + 性能不低于基线 3% + 接受率不回归**。
 
 **关键路径**（唯一一条长串行链，决定整体交付日期）：
 
 ```
-P0-C 拍板 D3 ─┐
+✅P0-C 拍板 D3 ─┐
               ├─→ P0-D 设计定稿 ─→ A1 ─→ A2 ─→ A3 ─→ A4 ─→ A5 ─→ A6 验收
 P0-B C-LIVE ──┘                                                      │
 P0-A 卫生（不卡任何人，可随时插）                                     ↓
-P0-C 拍板 D6 ────────────────────────────────────→ Track B 才能起步
+✅P0-C 拍板 D6 ───────────────────────────────────→ Track B 才能起步
 ```
 
 **体量**：P0-A/B/C 约 1 周；P0-D 约 1 周；A1–A6 约 1.5 个月。合计 ≈ M1 剩余 + M2。
@@ -84,7 +85,7 @@ P0-C 拍板 D6 ─────────────────────�
   - ✅ `fix/engine-lost-wakeup`（`d9e52ce`，无 worktree）
   - ✅ `fix/live-thinking-and-metrics`（`2c06355`，worktree `…-fix` 干净）→ worktree + 分支已删
   - ⏸️ `fix/metrics-busy-500`、`worktree-laguna-mid-conversation-system` —— **当时有未提交改动，未动**；worktree 侧后由用户自行处理
-- [ ] **A-2** 处置 `perf/repro-2ce5-baseline-20260730`（`060fabb`，**未并入**，含 1 个性能提交 "Cache loop-invariant values in generate_verify_only decode loop"，作者自评"perf 影响在噪声内 ~0.5%"）→ 归入 Track F/F7 评估，或明确废弃
+- [ ] **A-2** 处置 `perf/repro-2ce5-baseline-20260730`（`060fabb`，**未并入**，含 1 个性能提交 "Cache loop-invariant values in generate_verify_only decode loop"，作者自评"perf 影响在噪声内 ~0.5%"）→ 归入 Track F/F9 评估，或明确废弃
 - [ ] **A-3** 处置 untracked 文件 `benchmarks/repro_prefix_cache_slowdown.py`：按 `benchmarks/README.md` 规约决定收编、转 `bf exec`、还是删（在主工作区，留给持有者操作）
 - [ ] **A-4**（可选）主工作区磁盘杂物：9 个 `*.log`、`build/`、`evalplus_results/` —— **已被 gitignore，不影响仓库**，纯占盘
 - [ ] **A-5** N6 结案规则落文进 `AGENTS.md` 或 `diagnostics-guide.md`：**若再复现，直接贴带线程列表的失败输出，不许重跑**；若 M2 结束前零复现，从 roadmap 移除该条目
@@ -234,7 +235,7 @@ P1  Track D 易用性 D1→D6                ←── M2→M5，与 B 全程并
 P1  Track C 稳定性 C0R→C6               ←── M1→M6 贯穿，不设独立里程碑
 P1  Track G 25B-A3B                     ←── M4→M5，前置=拿到 config
 P2  Track E 兼容性 E2→E1→E3→E4          ←── M3→M6，与 B/D 并行
-P2  Track F 性能                        ←── 机会主义，永不抢占 C/D
+P2  Track F 性能                        ←── 机会主义，永不抢占 C/D；F1/F2 例外，升 P1，见 §7.6
 P2  Track H 发布 0.2.0                  ←── M5→M6
 ```
 
@@ -259,6 +260,10 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 - [ ] B0-5 GDN 递归状态更新是否 **CUDA Graph capture-safe**（决定 B2 可行性）
 - [ ] B0-6 mrope-interleaved 在纯文本下能否退化为标准 1D RoPE
 - [ ] B0-7 容量测算：64 层 / 256K / 96 GB 的 KV + 递归状态显存账 → context × 并发可行域
+- [ ] **B0-8 · Qwen3.6 的 MTP 层是否带 GDN**（`investigation-queue.md` B-6，**另一 agent 正在查，本文档不预判结论**）：
+  vLLM 注释 "draft models have no mamba layers, so no eagle shift"——若我们的 MTP 层也不含 GDN，
+  **B3 最难的一项（GDN 递归状态推测回滚）直接不存在**。查法：读 checkpoint `config.json` 里 MTP 段的
+  `layer_types` + `mtp.*` 张量名，零 GPU。**应在 B3 排期前答掉**，见下方 B3 的两个分支
 
 **B1 正确性优先**（M2→M3，1 月）：eager、batch=1、无图、无投机、无前缀缓存
 - [ ] GDN 层（conv1d state + gated delta rule + 输出门）· Full attention（sparkinfer paged）· 稠密 SwiGLU（NVFP4）· RoPE partial 0.25 + mrope · modelopt 加载 · 注意力输出门控
@@ -268,8 +273,15 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 - [ ] 固定槽位 + 连续批处理 · 递归状态纳入槽位生命周期 · CUDA Graph（依赖 B0-5）· 前缀缓存联动驱逐（A3 的第一个真实用户）· 并发 ≥ 2
 - **门禁**：双协议回归全绿 + **C-LIVE 通过** + 与 B1 eager 贪心 bit-exact
 
-**B3 性能与投机**（M4，1 月）
-- [ ] MTP draft/verify 含 **GDN 递归状态推测回滚**（本轨道最难）· GDN kernel 调优 · FP8 KV · 128K/256K 容量与吞吐
+**B3 性能与投机**（M4，1 月）—— **[待验证] 两个分支，取决于 B0-8 的结论，不预判**：
+- 若 B0-8 结论 = MTP 含 GDN：MTP draft/verify 含 **GDN 递归状态推测回滚**（本轨道最难）
+- 若 B0-8 结论 = MTP 不含 GDN：MTP draft/verify 退化为标准 verify（无递归状态回滚），
+  **本轨道最难的一项直接消失**，B3 体量应下修
+- [ ] GDN kernel 调优 · 128K/256K 容量与吞吐（两个分支都要）
+- [ ] **KV dtype 待定**：`investigation-queue.md` C-2 正在测 NVFP4 KV vs FP8 KV 在我们卡上的 prefill/decode
+  对比（另一 agent 进行中）。上游第三方在 RTX PRO 5000 上的数字（NVFP4 KV prefill 慢 1.7–1.8×，
+  decode 更快）不是我们的卡也不是我们的形状，**只作为倾向 FP8 KV 的参考，不作为决定**——等 C-2 本机
+  结果回来再定，本文档暂标 **[待验证]**，不写死"FP8 KV"
 - **门禁**：接受率与吞吐进 bfdiag 基线；与上游框架同 prompt 同参数 A/B
 
 ### 7.2 P1 · Track D · 易用性（M2→M5，与 B 并行）
@@ -344,19 +356,73 @@ C7-2 随 P0-E 第 5 步捆绑；C7-1/C7-3 在拿到 GPU 窗口后见缝插针，
   F1/F2 也在争这块显存）。**小而自足，不依赖 Track A**——建议提前到 M2 跟 F1 的窗口扫测一起做，
   不用等 Track E 默认的 M3 窗口
 
-### 7.6 P2 · Track F · 性能（机会主义）
+### 7.6 P2 · Track F · 性能（机会主义，但 F1/F2 例外）
 
 **纪律**：只在有明确 roofline 依据、且不损害 Track C/D 的前提下做；必走 `bf diff` + 接受率/质量门禁。
 
-- [ ] **F1** TURBO_ATTN 质量回归修复（per-head descale / Hadamard 旋转 / 自适应切换）：收益 +6%，但 code 接受率 97.8% → 58.6%，当前默认关闭
-- [ ] **F2** FA4 技法用于 prefill / extend（TMA、persistent scheduler、FP8 softmax）
-- [ ] **F3** FP8 attention `num_stages ≥ 2`（SMEM 36 KB « 99 KB）
-- [ ] **F4** sparkinfer 剩余 9 处 gate（`7a1d69d` 只放宽 13 处中的 4 处，其余是**刻意留下**的 scope 限制）
+**2026-08-01 本批新增两条例外**：F1/F2 从"机会主义/P2"提升到 **P1**，排进 M2。理由——不是因为它们
+比 Track A 更急，是因为它们**不依赖 Track A**、成本低、且直指本项目当前两个最硬的约束（吞吐上限、
+显存上限），有本机实测数据支持，不是纯粹的"顺手试试"：
+- 接受率实测 96.3–100%（`roadmap.md` §1.1，2026-07-31/08-01 复现）但 `NUM_SPECULATIVE_TOKENS` 固定 15——
+  这个组合说明限制吞吐的很可能是窗口本身，不是接受率上限（F1）。
+- Laguna 权重 66.8 GB ≈ 67 GB（59.5 GB MoE + 7.3 GB non-MoE，`notes/2026-07-29-gpu-memory-audit.md`），
+  96 GB 卡上留给 KV + 投机 scratch + 其它的预算很紧。**协调者在本轮任务中的实时汇报（2026-08-01）**：
+  生产服务实测显存 94.2 / 97.9 GB（**98.8% 占用**）——比 2026-07-29 那份静态审计（1 slot/131K 配置，
+  76.0/95.6 GB，79.5%）紧得多，两者配置不同（并发/上下文长度未知，暂不能直接对比），但方向一致：
+  **投机 scratch 在跟 KV 抢一块越来越紧的预算**（F2）。
+
+**F1 · DFlash 固定窗口 → 加宽/自适应 verify 窗口**（来自 `investigation-queue.md` D-2，SGLang/vLLM 的
+DSpark）。**分两步，先做便宜的那步**：
+- [ ] F1-1（便宜，先做）：不实现自适应控制器，先把 `NUM_SPECULATIVE_TOKENS` 从 15 静态调大（16→24→32
+  等），用 `bf diff` 测各工作负载的 tok/s 与接受率。如果这一步就有明显收益且接受率不掉，F1-2 的
+  优先级立刻下降——没必要为了一个静态调参就能拿到的收益去接一套新的置信度估计
+- [ ] F1-2（若 F1-1 见顶但接受率仍然很高才做）：置信度驱动的自适应窗口（DSpark 风格）。
+  **警告不是白捡**：vllm #49369 报告 DSpark 在某些负载上比不开投机还慢，必须按工作负载分别 A/B，
+  不能默认全开
+- **调度**：不需要 Track A，可以现在做；但需要真机 GPU 时间，**排进 M2 时优先蹭 P0-E 第 5 步或
+  C-LIVE 的 GPU 窗口，不单独申请专用时段**——本机只有一块 GPU，任何需要 GPU 的验收项天然串行
+  （见 `roadmap.md` §6 RK5 的更新）
+
+**F2 · 投机 scratch 显存优化**（来自 `investigation-queue.md` D-3，ReplaySSM Ring Spec-Verify 报告
+11.5 GB → 1.8 GB——**别人的卡、别人的形状，不能当我们的数字用**）：
+- [ ] F2-0 先补一次带日期来源的显存审计（当前并发/上下文配置下的真实占用，与协调者汇报的
+  94.2/97.9 GB 对齐或更新），确认 DFlash 投机 scratch 实际占用多少、KV 实际还剩多少余量——没有这一步，
+  "值不值得做"无法判断
+- [ ] F2-1 读 ReplaySSM 的 ring-buffer 技巧具体怎么把 scratch 降下来的，映射到我们自己的
+  draft/verify CUDA Graph scratch 分配（`laguna_dflash_cudagraph.py`），判断有多少是**调度/复用层面**
+  能拿到（我们做），有多少要动 sparkinfer 的 kernel 内部（转 SparkInfer，按 `AGENTS.md` 规矩写清楚
+  交接，不直接改源码）
+- [ ] F2-2 若调度层面就有收益：实现 + `bf diff` 判可比性 + 接受率/bit-exact 回归门禁
+- **为什么不是"机会主义"**：显存是这个项目的硬约束；F2-0/F2-1 的结论应该喂给 A3 协调者设计
+  （P0-E 第 7 步，见 `architecture.md` §3.5.5）——投机 scratch 迟早要变成 A3 管理的资源类型之一，
+  不要各自为战
+
+**D-5（Hybrid SWA+full DFlash drafters + 投机专用 kv_cache_dtype）——已核实，无需新工作**：
+`investigation-queue.md` D-5 说"直接对口"，读代码后发现**不完全对**：①投机专用 `kv_cache_dtype`
+**已经是现状**——`laguna_dflash.py` 里 draft KV cache 显式按 `# Self-allocated: FP8 as uint8` 分配，
+与主模型该层自己的 dtype 选择独立，不是新工作；②"hybrid (SWA+full) 的 drafter"这个 vLLM 新能力，
+我们的 draft 模型走的是另一条路——固定 6 层、全 SWA（window=512）、bf16 权重，KV cache 只有
+0.007 GB（`notes/2026-07-29-gpu-memory-audit.md`），已经靠"用一个更小的专用 draft 模型"达到了跟
+"hybrid 主模型 KV dtype 独立"类似的省显存效果，没有证据表明改成 hybrid drafter 会更好。
+**结论：D-5 从待办清单移除，不是降级，是核实后发现已经做到。**
+
+- [ ] **F3** TURBO_ATTN 质量回归修复（per-head descale / Hadamard 旋转 / 自适应切换）：收益 +6%，但 code 接受率 97.8% → 58.6%，当前默认关闭
+- [ ] **F4** FA4 技法用于 prefill / extend（TMA、persistent scheduler、FP8 softmax）。
+  **T0 触发条件**（`investigation-queue.md` D-6）：FlashAttention 维护者已合入 sm120 PR（#2413）且有
+  面向 5090 的 TMA + warp specialization PR 在做（#2440），但 FA4 本体上不了 SM120（缺 tcgen05/TMEM），
+  当前 sm120 路径只有 FP16/BF16、`main` 部分路径仍报错、在 5090 上比 FA2 **慢约 5%**。**保持观察，
+  不要提前动**——触发条件是"那批 PR 落到 main 且在 sm120 上跑赢 FA2"，到那时才从"自己移植"变成
+  "评估采纳"
+- [ ] **F5** FP8 attention `num_stages ≥ 2`（SMEM 36 KB « 99 KB）
+- [ ] **F6** sparkinfer 剩余 9 处 gate（`7a1d69d` 只放宽 13 处中的 4 处，其余是**刻意留下**的 scope 限制）
   - ⚠️ **硬风险**：`planner.py` 的 grid occupancy 预算常量按 `num_kv_heads=4` 推导，用到 8 **需重新推导**，不是放宽谓词就够
   - ⚠️ sparkinfer 源码改动写清楚交给该团队，不直接改
-- [ ] **F5** MoE 输出中心并行（Warp Decode 类），2–4 周，长期备选
-- [ ] **F6** GDN kernel 自研（依赖 B0/B2 profiling）
-- [ ] **F7** 评估 `perf/repro-2ce5-baseline-20260730` 上未合并的 `060fabb`（见 P0-A/A-2）
+- [ ] **F7** MoE 输出中心并行（Warp Decode 类），2–4 周，长期备选
+- [ ] **F8** GDN kernel 自研（依赖 B0/B2 profiling）
+- [ ] **F9** 评估 `perf/repro-2ce5-baseline-20260730` 上未合并的 `060fabb`（见 P0-A/A-2）
+- [ ] **F10** NVFP4 per-token online MoE 量化（`investigation-queue.md` D-7，vLLM v0.26.0 + CuTe-DSL
+  MXFP4）：Laguna 是 256 专家 NVFP4 MoE，直接可比。**kernel 形状 → 写清楚交给 SparkInfer 团队评估，
+  不直接改其源码**（按 `AGENTS.md` 规矩）——本条目"我们做"的部分只是写一份技术提案文档
 
 ### 7.7 P2 · Track H · 发布 0.2.0（M5→M6）
 
@@ -370,8 +436,8 @@ C7-2 随 P0-E 第 5 步捆绑；C7-1/C7-3 在拿到 GPU 窗口后见缝插针，
 
 | 里程碑 | 时间 | 对应条目 | 说明 |
 |---|---|---|---|
-| **M1** | 2026-08 | **P0-A + P0-B + P0-C + P0-D**，A1/A2 起步 | Track 0 实际已近清零，M1 富余产能应投入 C-LIVE 与设计定稿 |
-| **M2** | 2026-09 | A3–A6 落地 + B0 事实基线 + B1 起步 + D1/D2 起步 | Laguna 零回归是硬门禁 |
+| **M1** | 2026-08 | **P0-A + P0-B + P0-C + P0-D**，A1/A2 起步 | Track 0 实际已近清零，M1 富余产能应投入 C-LIVE 与设计定稿；P0-C 的 D3/D6/N8 三项拍板已完成 |
+| **M2** | 2026-09 | A3–A6 落地 + B0 事实基线（含 B0-8）+ B1 起步 + D1/D2 起步 + **F1-1/F2-0 机会窗口**（蹭 A6/C-LIVE 的 GPU 时段）+ E5 | Laguna 零回归是硬门禁；B0-8/C-2/C-3 三条 [待验证]，由并行 agent 产出，回来后再定 B3 分支与 KV dtype |
 | **M3** | 2026-10 | B1 验收 + B2 服务化 + D1/D2/D3-impl 交付 + C1/C2 | 一条命令能起服务 |
 | **M4** | 2026-11 | B3 性能与 MTP + G0/G1 | 25B-A3B 正确性对齐 |
 | **M5** | 2026-12 | G2/G3 + D4/D5/D6 收口 + E3 客户端矩阵 | 三个模型系列同一套配置流程 |
@@ -383,16 +449,19 @@ C7-2 随 P0-E 第 5 步捆绑；C7-1/C7-3 在拿到 GPU 窗口后见缝插针，
 
 | 被卡的事 | 卡它的 | 状态 |
 |---|---|---|
-| A6 零回归验收 | **P0-C/C-1 GPU CI 拍板** → C4 位精确门禁 | 🔴 未拍板 |
-| B0 起步 | **P0-C/C-2 主线 checkpoint 拍板** | 🔴 未拍板 |
+| ~~A6 零回归验收~~ | ~~**P0-C/C-1 GPU CI 拍板**~~ → C4 位精确门禁 | 🟢 **已拍板 (b)**：本地 pre-push 门禁 + 人工签核；`make gate-local` 机制待落地（§7.3/C4） |
+| ~~B0 起步~~ | ~~**P0-C/C-2 主线 checkpoint 拍板**~~ | 🟢 **已拍板**：官方 `nvidia/Qwen3.6-27B-NVFP4`；B0-1 衍生出 vision 张量过滤任务，见 §7.1 |
 | ~~A1–A6 开工~~ | ~~P0-D 设计升级到可实施~~ | 🟢 **已解锁**：规格在 `architecture.md` §3.5，第 1–4 步可立即开工且不需要 GPU |
-| P0-E 第 5–8 步 | **P0-B C-LIVE** + GPU | 🔴 C-LIVE 未开始 |
-| N8 处置 | 拍板 (a)/(b)/(c) | 🔴 未拍板，倾向 (c) |
+| P0-E 第 5–8 步 | **P0-B C-LIVE** + GPU | 🔴 C-LIVE 未开始；F1-1（窗口扫测）可蹭同一 GPU 窗口一起做 |
+| ~~N8 处置~~ | ~~拍板 (a)/(b)/(c)~~ | 🟡 **已拍板 (c)**：启动期拒绝该 flag，实现清单见 §6.1，尚未落地（零 GPU） |
 | Track B 全部 | Track A（A1–A5）完成 | 🔴 未开始 |
+| B0-8 GDN 是否存在于 MTP | `investigation-queue.md` B-6（另一 agent 在查） | 🟡 进行中，**不预判**；决定 B3 的两个分支（§7.1） |
+| B3 KV dtype 选型 | `investigation-queue.md` C-2（另一 agent 在查） | 🟡 进行中，**不预判**；上游数字仅供参考，不当结论用 |
 | B2 CUDA Graph | B0-5（GDN 是否 capture-safe） | 🔴 未验证 |
 | C2 分级降级的接口 | P0-D/D-3 能力查询形状 | 🔴 未定 |
 | Track G 排期 | G0 拿到 config | 🔴 本地无 checkpoint |
 | H1 发布 | sparkinfer 上游化（RK2） | 🔴 仍钉私有 fork |
+| RK6/H1 "可从公开源安装" | `investigation-queue.md` C-3（PyTorch 2.13.0 wheel 是否带 `sm_120`，另一 agent 在查） | 🟡 进行中，**不预判** |
 
 ---
 
