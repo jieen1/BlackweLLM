@@ -36,18 +36,46 @@
 - [x] **B-3 是否踩 sm120 cuBLAS FP8 限制** —— ✅ **两重 N/A**。上游 issue 已关且维护者确认 SM120 上可跑；我们直接调 `torch._scaled_mm`(`fp8_linear.py:114`),不走 FlashInfer 的 autotuned `bmm_fp8`。对应 flashinfer #3255。
 - [x] **B-4 text-only 判据是否选对** —— ✅ **被独立验证**。sglang #27212 举的例子正是 `sakamakismile/Qwen3.6-27B-Text-NVFP4-MTP`;他们栽在按架构名强制 multimodal 且关不掉。我们按 `language_model_only` 判定 + 检测与策略分离是对的。
 
-- [ ] **B-5 · Makefile 的 gencode 形式拿不到架构特性**（本轮实测发现）
-  `Makefile:51` 用 `-gencode arch=compute_120,code=sm_120a`。实测：**门控在虚拟架构上，不在 `code=` 上**——
-  `compute_120,code=sm_120a` 编不出 NVFP4 block-scaled MMA，`compute_120f/a` 才能。
-  今天**无功能 bug**（router 只用 `__shfl_xor_sync`,属基础 ISA；`nvfp4_gemm_sm120.cu` 无构建规则）。
-  代价：拿了 `a` 的兼容性限制（编不到 sm_121 / DGX Spark），没拿到 `a` 的特性；且 manifest 记 `"target_sm": "sm_120a"` 会强化误解。
-  **建议改 `arch=compute_120f,code=sm_120f`**：特性相同、多一份家族可移植、语义与实际相符。
-  **去向**：我们做。**GPU**：不需要（仅编译）。
+- [x] **B-5 · Makefile 的 gencode 形式拿不到架构特性**（本轮实测发现） —— ✅ **已修复并验证**
+  `Makefile:51`（旧）用 `-gencode arch=compute_120,code=sm_120a`。**实测坐实**：门控在虚拟架构上，不在
+  `code=` 上。用 CUDA 13.2 + 本地 `cutlass-4.6.1` 头文件实际编译 `runtime/kernels/nvfp4_gemm_sm120.cu`
+  （未接入构建、纯探测）三种组合对比：
+  - `arch=compute_120,code=sm_120a`（旧 flag）—— **编译成功但 4 个 block-scaled MMA 核体全部退化成
+    `BPT.TRAP` + `EXIT`**（`.so` 体积 1,373,984 字节，SASS 仅 362 行，4 个函数每个约 90 行的跳转到
+    trap 的桩）。这不是"编不出来"的编译错误，是**编译干净但一跑就崩**的运行期陷阱——比编译错误更危险。
+  - `arch=compute_120a,code=sm_120a` 与 `arch=compute_120f,code=sm_120f` —— 两者产出**SASS
+    指令级完全一致**（`.so` 体积同为 1,783,584 字节；`cuobjdump --dump-sass` diff 后除
+    `.headerflags` 里 `EF_CUDA_ACCELERATORS` 标记（`a` 有、`f` 无，纯兼容性分类标记，非功能差异）外
+    零差异）。`f` 变体的 ELF `sm=` 标记是通用 `sm_120`（可跨 120 家族加载，含 sm_121/DGX Spark），
+    `a` 变体标记 `sm_120a`（只能在精确 sm_120 上加载）。
+  - Router 本身（`laguna_router_sm120.cu`，只用 `__shfl_xor_sync` 基础 ISA）在旧 flag 与新 flag 下
+    **SASS 逐行相同**，证实今天切换零风险、零回归。
+  **结论**：`arch=compute_120,code=sm_120a` 是全项目里一个活的定时炸弹——只要有人把 router 现有 flag
+  复制到 `nvfp4_gemm_sm120.cu`（或任何用 block-scaled MMA 的核）的构建规则上，产出的 `.so` 会通过编译、
+  通过任何不启动 kernel 的检查，直到真正调用时才在 GPU 上炸。**已改为 `arch=compute_120f,code=sm_120f`**
+  （`Makefile` `ROUTER_FLAGS` + manifest payload 的 `"target_sm"` 字段同步改为 `"sm_120f"`）。
+  `make build-laguna-router` 与 `make verify-laguna-router` 均已重跑通过，产物 SASS 与旧 flag 逐行相同
+  （功能零回归）。**去向**：已完成。**GPU**：不需要（仅编译对比，未上机执行）。
 
-- [ ] **B-6 · Qwen3.6 的 MTP 层是否带 GDN** —— **可能删掉 B3 最难的一项**
-  vLLM 注释：*"draft models have no mamba layers, so no eagle shift"*——若我们的 MTP 层不含 GDN，**递归状态推测回滚这件事根本不存在**。
-  查法：读 checkpoint `config.json` 里 MTP 段的 `layer_types` + `mtp.*` 张量名。
-  **去向**：我们做。**GPU**：不需要。**应在 B3 排期前答掉。**
+- [x] **B-6 · Qwen3.6 的 MTP 层是否带 GDN** —— ✅ **确认不带，但不能删掉 B3 那一项**
+  详见 [`../notes/2026-08-01-b6-mtp-gdn-verification.md`](../notes/2026-08-01-b6-mtp-gdn-verification.md)。
+  **事实**：本地全部 6 个 checkpoint 变体（`nvidia`/`unsloth`/`sakamakismile`/`morosystems`/官方
+  `Qwen3.6-27B-FP8`/`cyankiwi` AWQ-INT4）的 `mtp.*` 张量集清一色是 `self_attn.{q,k,v,o}_proj` +
+  `mlp.{gate,up,down}_proj` + 层归一化——与主模型 `full_attention` 层张量结构一致，**零个**
+  `linear_attn.*`/`A_log`/`conv1d`/`dt_bias` 之类的 GDN 张量。`config.json` 本身不够（没有
+  `mtp_layer_types` 这种字段，只有 `mtp_num_hidden_layers=1`），要靠张量名才能坐实。
+  **但队列原本的推论有误，已纠正**：vLLM 那条注释（"draft models have no mamba layers, so no eagle
+  shift"）说的是**草稿模型自身**的递归状态管理（drafting 阶段不需要 shift 自己的 GDN 状态，因为它没有）——
+  这确实被本条证据消掉了。但 **verify 阶段仍然要把 MTP 提出的候选 token 整段跑一遍主模型的完整 64 层
+  （含 48 层 GDN）**，一旦部分候选被拒绝，主模型的 GDN 递归状态已经被"没发生过的" token 污染，且这个更新
+  不可逆——这个问题跟 MTP 头本身有没有 GDN 完全无关。用 WebSearch 核实到 vLLM 自己的
+  `vllm-project/vllm#47572`（ReplaySSM RFC）原话："Speculative decoding must roll back rejected draft
+  tokens, but the SSM state update is irreversible... the current implementation keeps a separate
+  recurrent state per draft token"——这正是本文档 **D-3**（ReplaySSM，显存 11.5GB→1.8GB）已经独立记录
+  的同一个问题。**对 roadmap 的影响**：Track B3"MTP draft / verify...含 GDN 递归状态的推测回滚"**不删**，
+  但应改写为"主模型侧"问题并与 D-3 合并排期；可以删掉/减轻的是**草稿侧**的递归状态管理（MTP 头不需要自己
+  的 conv/ssm state，不需要 eagle-shift 类操作）——这是比原队列设想更小但仍然真实的简化。
+  **去向**：已完成（结论 + 纠偏）。**GPU**：不需要。
 
 ---
 
@@ -68,12 +96,21 @@
   依据 flashinfer #4269：第三方在 RTX PRO 5000 Blackwell 上实测 **NVFP4 KV 的 paged causal prefill 比 FP8 KV 慢 1.7–1.8 倍**,而 decode 更快（带宽瓶颈）。
   不是我们的卡也不是我们的形状。用 `bf diff` 判可比性后再比数。**支持 B3 选 FP8 KV，并警告别把 NVFP4 扩到 KV。**
 
-- [ ] **C-3 · PyTorch 2.13.0 PyPI wheel 是否带 `sm_120`** —— *其实不需要 GPU*
-  ```bash
-  python -m venv /tmp/torch-probe && /tmp/torch-probe/bin/pip install -q torch==2.13.0 \
-    && /tmp/torch-probe/bin/python -c "import torch; print(torch.__version__, torch.cuda.get_arch_list())"
+- [x] **C-3 · PyTorch 2.13.0 PyPI wheel 是否带 `sm_120`** —— ✅ **带，自编译要求终结**
+  详见 [`../notes/2026-08-01-c3-torch-pypi-wheel-sm120.md`](../notes/2026-08-01-c3-torch-pypi-wheel-sm120.md)。
+  干净 venv 跑指定命令，实测：
   ```
-  带 `sm_120` → 自编译要求终结，解锁 RK6 与 H1"可从公开源安装"。不带 → 确认自编译留着。
+  2.13.0+cu130 ['sm_75', 'sm_80', 'sm_86', 'sm_90', 'sm_100', 'sm_120']
+  ```
+  `sm_120` 在列。`pyproject.toml` 对 `torch` pin 的注释里已经预判"若装了公开版 wheel 也满足合同"，
+  这条把预判坐实成实测结论。**未验证的部分**（未过度声称）：本机参考环境跑的是自编译
+  `2.13.0a0+gitcf30153`（对齐 CUDA 13.3），PyPI wheel 走 `nvidia-*-cu13` 传递依赖（CUDA 13.0）——
+  两者 CUDA 子版本有差，数值/调优路径是否逐 bit 一致未验证；`nvidia-cutlass-dsl` 等其余 `cuda` extras
+  是否与纯 wheel 版 torch 一起装能装成也未重新验证（本条只测了 torch 单项，按队列给的命令原样执行）。
+  **对 roadmap 的影响**：**H1"依赖可从公开源安装"仍然被 sparkinfer 上游化（RK2）卡着**，不是被 torch
+  卡着——这条不解锁 H1，但去掉了"torch 也要求自编译"这一层叠加风险。**RK6**（依赖链漂移）不因此关闭，
+  CUDA 13.0 vs 13.3 的子版本差本身就是 RK6 类风险的一个小实例。`pyproject.toml` 该注释段落建议由该文件
+  owner 更新为"已实测确认"而非"预期满足"（本次未改 `pyproject.toml`，超出本轮文件归属范围）。
 
 ---
 
@@ -161,11 +198,16 @@
 
 ## 处理建议顺序
 
-1. ~~**A 节三条拍板**~~ —— ✅ **2026-08-01 已完成**（A-3 的 (c) 实现清单仍待落地，见
-   [`implementation-plan.md`](implementation-plan.md) §6.1）
-2. **B-5、B-6**（零 GPU，各半天，B-6 可能删掉 B3 一整项）—— **B-6 由另一 agent 在查，本轮不重复**
-3. **C-3**（零 GPU，一条命令）—— **由另一 agent 在查，本轮不重复**
+1. ~~**A 节三条拍板**~~ —— ✅ **2026-08-01 已完成**（A-3 的 (c) 已实现并合入 main，见
+   `server/engine.py` / `server/app.py` 的启动期拒绝，以及 `tests/test_engine_session_affinity.py`）
+2. ~~**B-5、B-6**~~ —— ✅ **2026-08-01 已处理**：B-5 已改 Makefile 并验证（旧 gencode 组合会让
+   block-scaled MMA kernel body 退化成 `BPT.TRAP` 桩——干净编译背后的运行时崩溃）；
+   B-6 确认 MTP 张量零 GDN，但**纠正了"会删掉 B3 一整项"的推论**——vLLM 那条注释指的是
+   draft 模型自己的递归状态，不是主模型的 48 个 GDN 层，后者在 verify 时照样跑、照样需要
+   回滚方案。见 `notes/2026-08-01-b6-mtp-gdn-verification.md`。
+3. ~~**C-3**~~ —— ✅ **2026-08-01 已处理**：PyPI `torch==2.13.0` 带 `sm_120`，自编译要求终结
+   （不解锁 H1，仍卡 sparkinfer 上游化 / RK2）。见 `notes/2026-08-01-c3-torch-pypi-wheel-sm120.md`。
 4. **A3 动工前读 D-1 的笔记** —— 已读完，见 D-1
 5. ~~其余按 Track 排期并入 implementation-plan.md~~ —— ✅ **D 节全部（D-2～D-8）已排期**，见 §D
-   逐条的分派记录；C-1/C-2 由另一 agent 在查，不预判结论，结论回来后其下游（Track B3、RK6/H1）
-   会需要再更新一轮
+   逐条的分派记录；C-1/C-2 结论已回（见 §C），其下游（Track B3 措辞收窄、与 D-3 合并排期）
+   已在 roadmap 更新
