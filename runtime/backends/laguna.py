@@ -29,7 +29,12 @@ from bfdiag.trace import ring as bfdiag_trace
 from bfprobe.routing import PROBE_ENABLED as ROUTING_PROBE_ENABLED
 from bfprobe.routing import capture_routing
 from runtime.backends.bf_attention import bf_attn_context
-from runtime.backends.protocol import BackendCapabilities
+from runtime.backends.protocol import (
+    BackendCapabilities,
+    BackendSnapshot,
+    PrefixSnapshot,
+    SlotSnapshot,
+)
 from runtime.block_pool import ChunkedPrefillState
 from runtime.laguna_config import LagunaRuntimeConfig
 from runtime.laguna_runtime import (
@@ -2247,6 +2252,36 @@ class LagunaBackend:
         return LagunaSlotState(
             kv_len=self.slot_kv_len[slot],
             committed_tokens=tuple(self.slot_committed_tokens[slot]),
+        )
+
+    def snapshot(self) -> BackendSnapshot:
+        """Whole-backend state for observability, as values rather than refs.
+
+        Everything here was previously read off this object's attributes by
+        ``server/app.py`` -- two of them private -- so the endpoints encoded
+        assumptions about internal shape that no contract held them to. Both
+        ``/metrics`` 500s on 2026-08-01 came out of that. Producing the
+        snapshot here puts the backend in charge of describing itself, so a
+        differently-shaped backend can no longer break a scrape.
+
+        Cheap by construction: O(num_slots) over small lists, bounded token
+        heads, no tensor reads. It has to stay safe to call while the engine
+        thread is mid-round, because a scraper does not coordinate with it.
+        """
+        return BackendSnapshot(
+            slots=tuple(
+                SlotSnapshot(slot=i, kv_len=kv_len, is_fresh=kv_len == 0)
+                for i, kv_len in enumerate(self.slot_kv_len)
+            ),
+            prefix=tuple(
+                PrefixSnapshot(
+                    slot=i,
+                    cached_kv_len=self._prefix_cache_kv_len[i],
+                    cached_tokens=len(tokens) if tokens else 0,
+                    head=tuple(tokens[:5]) if tokens else (),
+                )
+                for i, tokens in enumerate(self._prefix_cache_tokens)
+            ),
         )
 
     def _unpatch_impls_for_prefill(self) -> None:

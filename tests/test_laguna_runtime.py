@@ -96,7 +96,13 @@ def test_laguna_backend_has_no_dead_vllm_patch_hooks() -> None:
 
 
 def test_laguna_backend_import_does_not_require_vllm() -> None:
+    # The subprocess below imports runtime.backends.laguna, which imports torch
+    # eagerly -- so torch is what this test actually needs, not numpy. Guarding
+    # on numpy alone happened to skip under CI's dev extras (pytest + ruff, no
+    # numpy) while failing outright in any environment that has numpy but not
+    # torch. The guard now names the dependency the subprocess really requires.
     pytest.importorskip("numpy")
+    pytest.importorskip("torch")
     blocker = """
 import importlib.abc
 import sys

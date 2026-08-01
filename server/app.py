@@ -665,15 +665,15 @@ async def debug_stats():
     (``admission_batch_sizes``/``round_batch_sizes`` containing entries
     > 1), rather than inferring it indirectly from timing alone."""
     assert engine is not None
-    runner = engine.runner
-    if hasattr(runner, "_prefix_cache_tokens"):
+    snapshot = _backend_snapshot(engine.runner)
+    if snapshot is not None:
         engine.stats["_prefix_cache_dbg"] = {
-            f"slot_{i}": {
-                "cached_len": len(t) if t else 0,
-                "kv_len": runner._prefix_cache_kv_len[i],
-                "head": t[:5] if t else None,
+            f"slot_{p.slot}": {
+                "cached_len": p.cached_tokens,
+                "kv_len": p.cached_kv_len,
+                "head": list(p.head) if p.head else None,
             }
-            for i, t in enumerate(runner._prefix_cache_tokens)
+            for p in snapshot.prefix
         }
     return engine.stats
 
@@ -1179,23 +1179,29 @@ async def list_models():
     }
 
 
-def _slot_kv_len(runner, slot: int) -> int:
-    """Read one slot's KV length from a runner, tolerating either shape.
+def _backend_snapshot(runner):
+    """Ask the backend to describe itself; None if it cannot.
 
-    LagunaBackend stores this as a list indexed by slot. Reading it as a
-    mapping is what broke /metrics under load (see the call site). Kept
-    permissive so a differently-shaped backend cannot turn an observability
-    endpoint into a 500 -- metrics must never be the thing that fails.
+    Replaces the previous per-attribute reads. Those had to guess at internal
+    shape -- ``slot_kv_len`` as list or mapping, ``_prefix_cache_*`` by name --
+    and guessing wrong is what returned 500 from /metrics twice on 2026-08-01.
+    A backend that implements the contract now answers for its own shape.
+
+    Still tolerant of a backend that has no ``snapshot`` at all, and still
+    swallows failure, because the older constraint has not changed: an
+    observability endpoint that takes the monitoring signal down with it is
+    worse than one reporting a slightly wrong number. The difference is that
+    degrading now requires a backend outside the contract, rather than merely
+    one that stores its slot lengths differently.
     """
-    kv = getattr(runner, "slot_kv_len", None)
-    if kv is None:
-        return 0
+    snapshot = getattr(runner, "snapshot", None)
+    if snapshot is None:
+        return None
     try:
-        if isinstance(kv, dict):
-            return int(kv.get(slot, 0))
-        return int(kv[slot])
-    except (IndexError, KeyError, TypeError, ValueError):
-        return 0
+        return snapshot()
+    except Exception:  # pragma: no cover - defensive; see docstring
+        logger.exception("backend snapshot failed; reporting degraded metrics")
+        return None
 
 
 @app.get("/metrics")
@@ -1207,20 +1213,20 @@ async def metrics_endpoint():
     # not a dynamic BlockPool. Compute KV usage from active slot count.
     total_blocks = engine.num_slots * engine.blocks_per_slot
     active_slots = len(engine.active)
-    # LagunaBackend.slot_kv_len is a list indexed by slot, not a mapping. This
-    # read used `.get(s, 0)` and so raised AttributeError -- but only while
-    # `engine.active` was non-empty, which made /metrics return 500 exactly
-    # when the server was busy and 200 whenever it was idle. Observed live
-    # 2026-08-01 during a 68 s request; every idle scrape either side of it
-    # succeeded, which is what kept it hidden.
-    used_blocks = (
-        sum(
-            (_slot_kv_len(runner, s) + engine.block_size - 1) // engine.block_size
-            for s in engine.active
+    # This sum previously indexed the backend's own `slot_kv_len` and assumed
+    # it was a mapping; it is a list, so a busy server (non-empty
+    # `engine.active`) returned 500 while an idle one scraped fine. Observed
+    # live 2026-08-01 during a 68 s request. The snapshot removes the shape
+    # assumption rather than tolerating it; the fallback below is for a
+    # backend that does not implement the contract at all.
+    snapshot = _backend_snapshot(runner)
+    if snapshot is None:
+        used_blocks = active_slots * engine.blocks_per_slot
+    else:
+        by_slot = {s.slot: s.kv_len for s in snapshot.slots}
+        used_blocks = sum(
+            (by_slot.get(s, 0) + engine.block_size - 1) // engine.block_size for s in engine.active
         )
-        if hasattr(runner, "slot_kv_len")
-        else active_slots * engine.blocks_per_slot
-    )
     kv_usage = used_blocks / total_blocks if total_blocks > 0 else 0.0
 
     num_running = len(engine.active)

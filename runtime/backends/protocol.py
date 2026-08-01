@@ -82,6 +82,9 @@ class PrefixSnapshot:
     slot: int
     cached_kv_len: int
     cached_tokens: int
+    #: First few cached token ids, for eyeballing which prefix a slot holds.
+    #: Bounded on purpose -- a snapshot is a diagnostic, not a transcript.
+    head: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -95,8 +98,9 @@ class BackendSnapshot:
     list as a mapping. Handing out frozen values means a differently-shaped
     backend can no longer take the monitoring signal down with it.
 
-    Wired up in step 2 of the migration; declared here so the contract is in
-    one place. See ``docs/architecture.md`` §3.5.2.
+    ``slots`` and ``prefix`` are indexed by slot and cover every slot, so a
+    caller may zip them or index them directly without a bounds check.
+    See ``docs/architecture.md`` §3.5.2.
     """
 
     slots: tuple[SlotSnapshot, ...]
@@ -137,6 +141,8 @@ class ModelBackend(Protocol):
     def reset_slot(self, slot: int) -> None: ...
 
     def slot_state(self, slot: int) -> SlotStateView: ...
+
+    def snapshot(self) -> BackendSnapshot: ...
 
     def prefill(self, slot: int, prompt_ids: list[int]) -> int: ...
 
@@ -221,6 +227,7 @@ REQUIRED_MEMBERS: tuple[str, ...] = (
     "capabilities",
     "reset_slot",
     "slot_state",
+    "snapshot",
     "prefill",
     "decode_batch_sampled",
 )

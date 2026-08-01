@@ -186,33 +186,149 @@ class TestMetricsUnderLoad:
     scrapes either side of it hiding the failure.
     """
 
-    def test_slot_kv_len_reads_a_list_backend(self):
+    def test_snapshot_is_read_through_the_contract(self):
         pytest.importorskip("fastapi")
-        from server.app import _slot_kv_len
+        from runtime.backends.protocol import BackendSnapshot, SlotSnapshot
+        from server.app import _backend_snapshot
 
-        class _ListRunner:
-            slot_kv_len = [0, 4096, 0]
+        class _Runner:
+            def snapshot(self):
+                return BackendSnapshot(
+                    slots=(SlotSnapshot(slot=1, kv_len=4096, is_fresh=False),),
+                    prefix=(),
+                )
 
-        assert _slot_kv_len(_ListRunner(), 1) == 4096
+        snapshot = _backend_snapshot(_Runner())
+        assert snapshot is not None
+        assert {s.slot: s.kv_len for s in snapshot.slots}[1] == 4096
 
-    def test_slot_kv_len_tolerates_a_mapping_backend(self):
+    def test_backend_without_snapshot_degrades_instead_of_raising(self):
         pytest.importorskip("fastapi")
-        from server.app import _slot_kv_len
+        from server.app import _backend_snapshot
 
-        class _DictRunner:
-            slot_kv_len = {1: 4096}
-
-        assert _slot_kv_len(_DictRunner(), 1) == 4096
-
-    def test_slot_kv_len_never_raises_for_an_unknown_slot(self):
-        pytest.importorskip("fastapi")
-        from server.app import _slot_kv_len
-
-        class _ListRunner:
-            slot_kv_len = [0]
-
-        class _NoAttr:
+        class _NoContract:
             pass
 
-        assert _slot_kv_len(_ListRunner(), 99) == 0
-        assert _slot_kv_len(_NoAttr(), 0) == 0
+        assert _backend_snapshot(_NoContract()) is None
+
+    def test_a_raising_backend_cannot_take_metrics_down(self):
+        # The older constraint, restated at the new seam: metrics must never
+        # be the thing that fails. A backend whose snapshot explodes should
+        # cost accuracy, not the monitoring signal.
+        pytest.importorskip("fastapi")
+        from server.app import _backend_snapshot
+
+        class _Exploding:
+            def snapshot(self):
+                raise RuntimeError("backend is having a bad day")
+
+        assert _backend_snapshot(_Exploding()) is None
+
+
+class _FakeSnapshotRunner:
+    """Backend stand-in shaped like the contract, not like LagunaBackend.
+
+    Deliberately shares no internals with the real class: if the endpoints
+    ever reach past `snapshot()` again, this fake stops satisfying them and
+    the tests below go red.
+    """
+
+    def __init__(self, kv_lens, prefix=()):
+        from runtime.backends.protocol import BackendSnapshot, PrefixSnapshot, SlotSnapshot
+
+        self._snapshot = BackendSnapshot(
+            slots=tuple(
+                SlotSnapshot(slot=i, kv_len=n, is_fresh=n == 0) for i, n in enumerate(kv_lens)
+            ),
+            prefix=tuple(
+                PrefixSnapshot(slot=i, cached_kv_len=kv, cached_tokens=len(t), head=tuple(t[:5]))
+                for i, (kv, t) in enumerate(prefix)
+            ),
+        )
+
+    def snapshot(self):
+        return self._snapshot
+
+
+class _FakeEngine:
+    MODEL = "test/model"
+
+    def __init__(self, runner, active=None, block_size=16, num_slots=4, blocks_per_slot=8):
+        self.runner = runner
+        self.active = active if active is not None else {}
+        self.waiting = []
+        self.free_slots = list(range(num_slots))
+        self.block_size = block_size
+        self.num_slots = num_slots
+        self.blocks_per_slot = blocks_per_slot
+        self.capacity_tokens_per_slot = block_size * blocks_per_slot
+        self.stats = {}
+
+
+class TestMetricsEndpointItself:
+    """Route-level coverage, which /metrics had none of.
+
+    Both 500s shipped because the tests exercised `render_prometheus` and a
+    helper in isolation while nothing ever called the endpoint. These drive
+    the two states that actually broke: freshly started, and busy.
+    """
+
+    @staticmethod
+    def _call(monkeypatch, engine) -> str:
+        """Scrape /metrics and return the rendered text.
+
+        The endpoint returns a PlainTextResponse, so the body is read out
+        here -- asserting against the object's repr would pass no matter what
+        the endpoint rendered.
+        """
+        import asyncio
+
+        pytest.importorskip("fastapi")
+        import server.app as app_module
+
+        monkeypatch.setattr(app_module, "engine", engine)
+        response = asyncio.run(app_module.metrics_endpoint())
+        return response.body.decode()
+
+    def test_cold_start_scrape_succeeds(self, monkeypatch):
+        # Nothing has completed yet -- the window a scraper arrives in first,
+        # and the window `get_stats()` used to short-circuit inside.
+        engine = _FakeEngine(_FakeSnapshotRunner([0, 0, 0, 0]))
+        body = self._call(monkeypatch, engine)
+        assert "blackwellm:kv_cache_used_blocks" in body
+
+    def test_busy_scrape_succeeds_and_counts_blocks(self, monkeypatch):
+        # `engine.active` non-empty is the exact condition that turned the
+        # slot-length read into a 500.
+        engine = _FakeEngine(
+            _FakeSnapshotRunner([0, 4096, 32, 0]),
+            active={1: {}, 2: {}},
+            block_size=16,
+        )
+        body = self._call(monkeypatch, engine)
+        # 4096/16 = 256 blocks, 32/16 = 2 blocks.
+        assert 'blackwellm:kv_cache_used_blocks{model_name="test/model"} 258' in body
+
+    def test_scrape_survives_a_backend_outside_the_contract(self, monkeypatch):
+        class _NoContract:
+            pass
+
+        engine = _FakeEngine(_NoContract(), active={0: {}})
+        body = self._call(monkeypatch, engine)
+        # Falls back to the slot-count approximation rather than failing.
+        assert "blackwellm:kv_cache_used_blocks" in body
+
+    def test_endpoint_does_not_reach_past_the_contract(self, monkeypatch):
+        # The nail this whole step is driven around. This backend carries a
+        # real-shaped `slot_kv_len` list *and* a snapshot that disagrees with
+        # it. Reading the attribute -- the habit that produced both 500s --
+        # yields 1 block; going through the contract yields 256. Only one of
+        # those numbers can appear, and it must be the contract's.
+        class _TwoFaced(_FakeSnapshotRunner):
+            def __init__(self):
+                super().__init__([0, 4096])
+                self.slot_kv_len = [0, 16]
+
+        engine = _FakeEngine(_TwoFaced(), active={1: {}}, block_size=16)
+        body = self._call(monkeypatch, engine)
+        assert 'blackwellm:kv_cache_used_blocks{model_name="test/model"} 256' in body

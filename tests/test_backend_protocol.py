@@ -31,12 +31,12 @@ class TestContractShape:
 
     def test_covers_exactly_the_members_the_scheduler_uses(self) -> None:
         # 13 members are reached through ``self.runner`` in server/engine.py,
-        # plus ``capabilities``, which the scheduler will consult instead of
-        # ``hasattr``/``try-except`` once step 2 lands. Locking the count here
-        # makes silent contract growth visible in review: a 15th member means
+        # plus ``capabilities`` (consulted instead of ``hasattr``/``try-except``)
+        # and ``snapshot`` (the observability contract). Locking the count here
+        # makes silent contract growth visible in review: a 16th member means
         # someone widened what every future backend must implement.
         governed = [m for members in CAPABILITY_MEMBERS.values() for m in members]
-        assert len(set(REQUIRED_MEMBERS) | set(governed)) == 14
+        assert len(set(REQUIRED_MEMBERS) | set(governed)) == 15
 
     def test_no_member_is_governed_by_two_capabilities(self) -> None:
         seen: set[str] = set()
