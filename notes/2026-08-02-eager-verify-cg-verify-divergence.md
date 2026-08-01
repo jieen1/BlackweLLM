@@ -1,6 +1,12 @@
-# eager verify vs CG verify：真实数值分歧（未根因，独立立项）
+# eager verify vs CG verify：真实数值分歧（结构性根因已定位，见文末续查）
 
-**状态：未根因，不要现在开始查。** 这份笔记是把已有证据和排除清单存档，交给下一个专门查这个的人（或未来的我）。查法预计需要 `bf divergence` 逐层排查，是独立的调查范围，超出这次 C-1 容量修复的任务边界。
+**状态（2026-08-02 续查后更新）：结构性根因已定位并 GPU 确认——两条路径在 sparkinfer 的
+verify-mode split-KV 规划上，对同一个真实 kv_len 算出了不同的 KV 分块数（1 块 vs
+4~16 块），11 个探测点里 10 个的"块数是否一致"与笔记原表的"是否分歧"完全对应。**
+仍未定论的是更深一层：这个块数分歧本身是否暴露了 sparkinfer 多块 merge kernel 的真实
+正确性缺陷,还是"仅仅"是异常放大的 fp8 舍入效应——这部分需要 sparkinfer 团队或一次被环境
+问题拦住的端到端 oracle 对拍才能收口。详见文末「2026-08-02 续查：结构性根因定位」。
+本节以上的内容是上一轮的原始证据与排除清单，原样保留，未做任何改动。
 
 ## 背景
 
@@ -86,3 +92,168 @@ GPU：RTX PRO 6000 Blackwell Max-Q。worktree `work/gpu-20260801`。`bf daemon` 
 
 - 触发面判断、`QSR_DFLASH_REQUIRE_CG` 默认值改动：`runtime/backends/laguna_dflash.py`（`_attempt_cg_capture` 与 `DFlashEngine.__init__` 里 `self._require_cg` 的注释）。
 - C-1 容量修复本身（不是这份笔记的主题，只是让这条路径第一次跑得动）：[`2026-08-01-c1-c2-gpu-investigation.md`](2026-08-01-c1-c2-gpu-investigation.md)。
+
+---
+
+## 2026-08-02 续查：结构性根因定位
+
+`work/diverge-20260802`，先做零 GPU 代码对比、把假设收窄到一条后才上卡（GPU 用于验证
+一个不需要加载模型的纯 planner 探针，见下）。
+
+### 结论先行
+
+两条路径都会调用 sparkinfer 的 `planner.create_paged_plan(mode="verify", ...)`，但
+**调用时机、`enable_cuda_graph`、`cache_seqlens` 三者都不同**，导致两条路径对**同一个
+真实 kv_len**算出的 split-KV **KV 分块数（`num_chunks_kv`）系统性不同**：
+
+- **CG**（`LagunaCudaGraphVerify._init_workspaces`，`laguna_cuda_graph.py:709-724`）在
+  construction 期只调用一次 `create_paged_plan`，且故意用**整个 workspace 的最大容量**
+  当 `cache_seqlens`（`max_kv = (blocks_per_slot+16)*block_size-1`），不是真实 kv_len。
+  算出的 `plan.kv_chunk_size` 被写进一个设备端 buffer（`kv_chunk_size_ptr`），此后**每次
+  replay 都原样读回，从不重算**——sparkinfer 里唯一能在 replay 时重新按真实 kv_len 算
+  chunk size 的机制是 `PagedAttentionWorkspace._uses_laguna_verify_analytic_schedule` /
+  `update_prefill_graph_work_metadata_triton` 的 `ADAPTIVE_CHUNKING` 分支，而它硬编码只
+  在 `cta_tile_q==64`（等价于 verify 查询窗口正好 8 token、GQA6）且 `page_size==128` 时
+  才生效——本项目的真实配置是 `NUM_QUERY_PER_REQ=16`（`dflash_constants.py:9`，不是 8）、
+  生产 `block_size=64`（`server/app.py` 的 `SERVER_BLOCK_SIZE` 默认，不是 128），两条都
+  不满足，所以这条"自适应重算"分支在这个部署上**从未生效过**——CG 的 chunk size 对整个
+  进程生命周期都是那个"给最大容量算出来的"冻结值。
+- **eager**（`SparkinferPrefillWorkspace.forward`，`laguna_sparkinfer_attn.py:499-509`，
+  被 `_forward_verify_with_aux` 经 `SparkinferAttentionImpl.forward` 调用）在**每次真实
+  调用时都重新算 plan**，`enable_cuda_graph=False`，`cache_seqlens` 是**真实当前
+  kv_len**，且预算（`max_batch_size_if_split`）基本不设上限，所以二分搜索
+  （`_prefill_binary_search_kv_chunk_size`）总能选到 sparkinfer 允许的最小 chunk size
+  （`min_kv_chunk_size = max(128 // page_size, 1)`）。
+
+两边的 `force_split_kv` 都是 `True`（`mode=="verify"` 时的默认值，
+`planner.py:1853-1854`，与 `enable_cuda_graph` 无关），所以 `split_kv` 标志本身在两条路
+径上一直相同——**真正分歧的是 chunk *size*，进而是 chunk *数量***：chunk 数量为 1 时，
+"split" 退化成单块、单次 online-softmax、无 merge，数值上应等价于非 split；chunk 数量
+>1 时，才会真正跑多块 + 跨块 merge 的代码路径。
+
+### 怎么确认的（GPU，但不需要加载模型）
+
+`create_paged_plan` 是纯规划函数,只读张量的 shape/dtype/device 和
+`cache_seqlens`/`cu_seqlens_q` 的整数值,不读 K/V 内容——不需要真实权重、不需要
+Laguna router、不需要完整 `LagunaBackend`。新增
+`bfdiag/workloads.py::diagnose_dflash_verify_split_kv_chunking(engine)`
+（永久诊断函数，不是一次性脚本，遵照本仓库 `bf exec` 投热引擎的约定）：直接用真实生产
+形状（`num_q_heads=24, num_kv_heads=4, head_dim=128,
+kv_dtype=float8_e4m3fn, block_size=64, blocks_per_slot=4096, window_left=-1`,
+`NUM_QUERY_PER_REQ=16`）构造 synthetic CUDA 张量,分别调用一次"CG 式"（
+`enable_cuda_graph=True, cache_seqlens=[max_kv]`,精确复刻
+`LagunaCudaGraphVerify._init_workspaces`)和 11 次"eager 式"（
+`enable_cuda_graph=False`,`cache_seqlens=[kv_len]`,kv_len 取上表原始探测点
+64/400/500/510/511/512/513/520/600/1000/2016)。
+
+实测数字（`bf ls` run_id `618876c9dcaa`/`4a65871ca2ee`，两次独立运行结果一致，
+`bf diff` 确认 config 与两个关键指标零漂移）：
+
+- CG 冻结的 `kv_chunk_size=17600` token（`chunk_pages=275`，用整块容量
+  `max_kv=263167` 算出来的，且 `cta_tile_q=16` 不是 sparkinfer 那个 M64 特快路径的 64）。
+- eager 每次都选到 `kv_chunk_size=128` token（sparkinfer 允许的最小值，2 页）。
+
+| kv_len | eager 算出的 `num_chunks_kv` | CG 冻结值套到这个 kv_len 会是多少块 | 是否不一致 | 原笔记该点是否分歧 |
+|---:|---:|---:|:---:|:---:|
+| 64 | 1 | 1 | 否 | 否（bit-exact） |
+| 400 | 4 | 1 | **是** | 是 |
+| 500 | 4 | 1 | **是** | 是（26.7 那个点） |
+| 510 | 4 | 1 | **是** | 是 |
+| 511 | 4 | 1 | **是** | 是 |
+| 512 | 4 | 1 | **是** | 是 |
+| 513 | 5 | 1 | **是** | 是 |
+| 520 | 5 | 1 | **是** | 是 |
+| 600 | 5 | 1 | **是** | 是 |
+| 1000 | 8 | 1 | **是** | 是 |
+| 2016 | 16 | 1 | **是** | 是 |
+
+**11 个探测点，"块数是否一致"与原表"是否分歧"逐点完全对应**（1 个一致对应
+bit-exact，10 个不一致对应 10 个分歧点，包括 26.7 那个尖峰）。CG 一侧无论 kv_len 多大，
+只要不超过 chunk size 对应的 ~17600 token（远超所有已测长度)，块数永远是 1——这也正好
+呼应上一轮笔记里 `laguna_cuda_graph.py` 类文档注释自己写的"图用的是非 split 的 extend
+规划,尽管这在逻辑上是一次 verify forward"：`split_kv` 标志位是 `True`，但块数恒为 1
+让它在实践中等价于非 split。
+
+**这也顺带解释了上一轮"排除 SWA window 512 对齐"为什么排除得对**：SWA 层是独立的
+group，它的 CG 容量上限是 ring buffer 大小（远小于 full-attention 层的
+`blocks_per_slot=4096`），分歧真正跟着走的是 **full-attention 层组的容量**（4096
+blocks≈262144 token），跟 512 这个 SWA 窗口毫无关系——原笔记"510/511/512/513 没有
+表现出跨窗口才变化的模式"这条观察，在这个新根因下是预期结果，不是巧合。
+
+### 还没定论的部分（诚实说明，不是回避）
+
+块数不一致本身是**结构性事实**（GPU 探针直接读出来的规划器数字，不是推测），但它到底
+是不是"数值分歧的**唯一**放大因素"——即 sparkinfer 的多块 split-KV merge kernel 在真
+实跑起来时是否存在正确性缺陷——我**没有**在这次续查里直接确认。原因：
+
+- 本 worktree 目前**加载不了 Laguna 模型**——`runtime/laguna_router.py:21` 的
+  `TARGET_SM = "sm_120a"` 与 `Makefile`（`build-laguna-router` 目标，commit `d9b635e`
+  "Fix SM120 router gencode family mismatch" 之后）生成的 manifest 里
+  `"target_sm": "sm_120f"` 不一致，`LagunaRouterLibrary.load()` 直接抛
+  `LagunaRouterError: Laguna router target mismatch: expected sm_120a, got sm_120f`，
+  daemon 启动即崩（`.bfdiag/daemon.log` 有完整 traceback）。`git show d9b635e --
+  runtime/laguna_router.py` 确认那次提交只改了 `Makefile`，没有同步改这个常量——这是一个
+  **与本次分歧调查无关、但看起来会挡住这个分支上任何人加载 Laguna 模型的独立问题**，值
+  得单独排期，我没有动它（改一行常量能绕过，但那是"改无关代码"，超出这次任务授权，留给
+  你判断由谁修、怎么测）。
+  这也是为什么本次确认停在"sparkinfer planner 输出的数字"这一层，没能再往下做一次端到
+  端 logits 级别的交叉验证（本来想在原笔记表中"64 和 400 之间"找一个 eager 刚好从 1 块
+  变 2 块的 kv_len，比如 129~256 附近，直接测那里是否已经开始分歧，作为比"块数相关"更强
+  的因果证据——这个实验被上面的 router 问题挡住了，没做）。
+- 块数不一致**不等于** merge 一定错——如果 sparkinfer 的多块 merge（log-sum-exp 合并）
+  实现是对的，块数不同应该只造成 bf16/fp8 舍入顺序级别的噪声（历史上这个仓库测过的正确
+  kernel 都在 cos=0.999999 量级，见 `notes/2026-07-27-bfdiag-oracle-divergence.md` 的
+  阈值论证表）。但原笔记测到的是**真实 argmax 翻转、单点 logit 差 26.7**——这已经远超"仅
+  仅是舍入顺序不同"的量级。我倾向于认为这指向 merge kernel（或其与 fp8 K/V descale 的
+  交互）在真正被多块路径覆盖时存在缺陷，而不是良性噪声被意外放大——但这只是基于量级的
+  推断，不是我直接证实的 kernel 级证据。这部分是 sparkinfer 自己的代码（`/home/bot/
+  project/sparkinfer`），按约定我只读不改；有能力判定的应该是 sparkinfer 团队，或者拿到
+  一个真实 dense-attention oracle（`bf divergence` 设计的用途，但它自己的 GPU 采集路径
+  也从未跑过，见 `notes/2026-07-27-bfdiag-oracle-divergence.md` 第5节）后端到端比对。
+
+**已排除**（本次续查新增，不重复上一轮已排的）：
+- **不是** `cta_tile_q` 不同——两条路径对这个真实形状（`packed_qo_len=96`）都算出
+  `cta_tile_q=16`，不是 sparkinfer 那个为 `NUM_QUERY_PER_REQ=8` 调的 M64 特快路径（该
+  路径需要 `packed_qo_len==48` 且 `page_size==128`，两条都不满足）。
+- **不是** `split_kv` 标志位本身不同——两条路径的 `force_split_kv` 都是 `True`
+  （`mode=="verify"` 时的 sparkinfer 默认值，`enable_cuda_graph` 不参与这个判断）。真正
+  不同的是 chunk size/数量,不是这个布尔位。
+
+### 修复方案（未实施，报给你判断这轮修还是单独排期）
+
+三个方向，风险递增，但"确定性"也递增：
+
+1. **让 eager 也退化成单块**（改 `laguna_sparkinfer_attn.py` 里 eager 调
+   `create_paged_plan` 那处，传一个足够大的 `fixed_split_size` 或
+   `disable_split_kv=True`，强制 eager 在 verify 模式下也只用 1 块）。
+   - 范围最小、风险最低——只改本仓库一个调用点的一个参数，不碰 sparkinfer。
+   - 能让两条路径**互相一致**，但**不能证明"单块"这个算法本身相对真实 dense attention
+     是对的**——如果单块路径本身有别的、更隐蔽的问题，这个修法只是让两条路径"一起错"而
+     不再报警。
+2. **让 CG 也能按真实 kv_len 重算 chunk size**（把 `ADAPTIVE_CHUNKING` 那条门槛放宽到
+   本项目的真实形状，或者在 `update_prefill_graph_replay_metadata` 里补一条适配本项目
+   `cta_tile_q=16` 的重算路径）。
+   - 这会让 CG 也走多块 merge——如果 sparkinfer 的多块 merge 真的有缺陷，这个修法反而
+     会把缺陷带进生产路径（今天生产路径靠"冻结成单块"意外躲开了它）。
+   - 需要改 sparkinfer 或在 `laguna_cuda_graph.py` 里重新实现一套等价逻辑，工作量和风险
+     都明显更大，而且没有回避掉"到底哪个块数是对的"这个前置问题。
+3. **先做一次端到端 oracle 对拍**（真实 dense attention/bf16 参考 vs 两条路径各自的输
+   出），确定单块和多块哪个（如果有任一个）更接近真值，再决定往 1 还是往 2 修。
+   - 最扎实，但工作量最大——需要先解决 router 加载问题，可能还需要 `bf divergence` 补
+     上它自己从未跑过的 GPU 采集路径（见上），或者一个独立的纯 sparkinfer 单测（构造已
+     知答案的小 attention 问题，绕开整个 Laguna 模型）。
+
+### 是否影响 `QSR_DFLASH_REQUIRE_CG` 默认值
+
+**不影响，而且这次续查的发现进一步支持保留 `1`（拒绝启动）这个默认值。** 现在有了更具
+体的机制：eager 一旦被真正触发（verify CG 捕获失败或被主动关闭），在 kv_len 大到需要
+2 块以上时会走一条**生产路径几乎从未跑过**的 sparkinfer 代码（多块 split-KV merge）——
+这条代码路径本身尚未确认对错。在查清楚"单块/多块哪个对"之前，让服务在 CG 捕获失败时继
+续跑而不是拒绝启动，等于把一条未经生产验证的代码路径悄悄送上线。
+
+### 本次改动
+
+- `bfdiag/workloads.py`：新增 `diagnose_dflash_verify_split_kv_chunking(engine)`——永久
+  诊断函数（不是一次性脚本），后续任何人都能直接 `bf exec` 调用复核上表数字，或换
+  `probe_kv_lens` 探测新的 kv_len。
+- 本文件：更新头部状态行，追加本节。上一轮的原始证据与排除清单未做任何修改。
