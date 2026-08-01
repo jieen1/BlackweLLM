@@ -505,6 +505,16 @@ async def debug_stats():
     (``admission_batch_sizes``/``round_batch_sizes`` containing entries
     > 1), rather than inferring it indirectly from timing alone."""
     assert engine is not None
+    runner = engine.runner
+    if hasattr(runner, '_prefix_cache_tokens'):
+        engine.stats['_prefix_cache_dbg'] = {
+            f'slot_{i}': {
+                'cached_len': len(t) if t else 0,
+                'kv_len': runner._prefix_cache_kv_len[i],
+                'head': t[:5] if t else None,
+            }
+            for i, t in enumerate(runner._prefix_cache_tokens)
+        }
     return engine.stats
 
 
