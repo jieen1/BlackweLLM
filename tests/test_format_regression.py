@@ -249,6 +249,11 @@ def test_unhandled_exception_error_shape_matches_protocol():
     fix, not from a captured client request like the fixtures above."""
     import asyncio
 
+    # This module is CPU-only and must import cleanly under dev extras alone
+    # (see the module docstring). ``server.app`` pulls in FastAPI, which lives
+    # in the ``serving`` extra -- skip rather than break that contract.
+    pytest.importorskip("fastapi")
+
     from server import app as server_app
 
     class _FakeURL:
