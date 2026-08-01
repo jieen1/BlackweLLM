@@ -63,7 +63,11 @@ entire distributed abstraction layer simply does not exist.
 
 `Laguna-S-2.1-NVFP4` on **RTX PRO 6000 Blackwell Max-Q** (96 GB, 188 SMs),
 FP8 KV cache, DFlash speculative decoding, CUDA Graph on, analytic decode path.
-Measured 2026-07-31.
+Measured 2026-07-31 and independently reproduced 2026-08-01 on the current
+SparkInfer fork head (run records `fc6b3376785a`, `781e1edbf37b`): acceptance
+matches to the fourth decimal on all four workloads, throughput lands inside
+the recorded ranges on 7 of 8 samples. See
+[`notes/2026-08-01-sparkinfer-patch-recovery-and-repro.md`](notes/2026-08-01-sparkinfer-patch-recovery-and-repro.md).
 
 | Workload | Throughput | Acceptance |
 |---|---|---|

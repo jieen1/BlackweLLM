@@ -43,7 +43,7 @@ RoPE           : full 层 yarn（theta 5e5, factor 32, partial 0.5）
 投机           : 独立 draft 模型 Laguna-S-2.1-DFlash-NVFP4
 ```
 
-**当前性能**（2026-07-31 实测，analytic decode，无 TURBO）：
+**当前性能**（2026-07-31 实测，2026-08-01 复现确认，analytic decode，无 TURBO）：
 4K 约 353–401 tok/s、64K 约 353–368 tok/s、接受率 96.3–100%。
 
 **质量**：MMLU-Pro 84.54%（414 题分层抽样）vs 官方 86.2；

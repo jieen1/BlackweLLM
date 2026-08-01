@@ -64,7 +64,8 @@ STEM 强、人文弱），继续在它身上做深度优化的边际收益不足
 | bfdiag 诊断平台 | ✅ 飞行记录仪 / run record / 可比性判定 / 热引擎 | `bfdiag/`，CLI `bf`，见 [`diagnostics-guide.md`](diagnostics-guide.md) |
 | 自研 SM120 kernel | ✅ router（.cu）+ RoPE / RMSNorm / KV scatter（Triton） | `runtime/kernels/` |
 
-**Laguna 当前性能**（2026-07-31 实测，analytic decode 路径，无 TURBO）：
+**Laguna 当前性能**（2026-07-31 实测，**2026-08-01 在当前 SparkInfer fork HEAD 上复现确认**，
+analytic decode 路径，无 TURBO）：
 
 | 工作负载 | tok/s | 接受率 |
 |---|---|---|
@@ -73,7 +74,9 @@ STEM 强、人文弱），继续在它身上做深度优化的边际收益不足
 | galaxy-4K | 395–401 | 100% |
 | code-4K | 341–359 | 97.8% |
 
-> README 里的 222 / 267 tok/s 是旧数字，已在本次文档整理中更正。
+> README 里的 222 / 267 tok/s 是旧数字，已在本次文档整理中更正。复现数据、过程、
+> 以及过程中发现的两个诊断链路问题见
+> [`../notes/2026-08-01-sparkinfer-patch-recovery-and-repro.md`](../notes/2026-08-01-sparkinfer-patch-recovery-and-repro.md)。
 
 ### 1.2 曾经是红灯的（Track 0 止血，2026-08-01 处理）
 
