@@ -902,10 +902,14 @@ async def metrics_endpoint():
     """Prometheus-compatible metrics in the BlackweLLM namespace."""
     assert engine is not None
     runner = engine.runner
-    pool = runner.block_pool
-    total_blocks = pool.num_blocks - pool.reserved
-    free_blocks = len(pool._free_queue)
-    used_blocks = total_blocks - free_blocks
+    # LagunaBackend uses static block allocation (num_slots × blocks_per_slot),
+    # not a dynamic BlockPool. Compute KV usage from active slot count.
+    total_blocks = engine.num_slots * engine.blocks_per_slot
+    active_slots = len(engine.active)
+    used_blocks = sum(
+        (runner.slot_kv_len.get(s, 0) + engine.block_size - 1) // engine.block_size
+        for s in engine.active
+    ) if hasattr(runner, 'slot_kv_len') else active_slots * engine.blocks_per_slot
     kv_usage = used_blocks / total_blocks if total_blocks > 0 else 0.0
 
     num_running = len(engine.active)

@@ -2004,6 +2004,43 @@ class LagunaBackend:
             self._pending_prefix_hits[best_slot] = best_hit
         return best_hit
 
+    def find_best_slot_for_prompt(
+        self, token_ids: list[int], free_slots: list[int],
+    ) -> tuple[int, int]:
+        """Return (best_slot, hit_depth) for cache-aware slot assignment.
+
+        Checks each free slot's warm KV cache for a token-prefix match.
+        Returns the slot with the deepest block-aligned hit, or
+        ``(free_slots[0], 0)`` if no slot has a match.
+        """
+        if not token_ids or not free_slots:
+            return (free_slots[0] if free_slots else 0, 0)
+        prompt_len = len(token_ids)
+        best_hit = 0
+        best_slot = free_slots[0]
+        for s in free_slots:
+            if s >= len(self._prefix_cache_tokens):
+                continue
+            cached = self._prefix_cache_tokens[s]
+            if cached is None:
+                continue
+            cached_kv_len = self._prefix_cache_kv_len[s]
+            if cached_kv_len <= 0:
+                continue
+            match_len = 0
+            limit = min(prompt_len, len(cached), cached_kv_len)
+            for i in range(limit):
+                if token_ids[i] != cached[i]:
+                    break
+                match_len += 1
+            aligned = (match_len // self.block_size) * self.block_size
+            if aligned >= prompt_len:
+                aligned = ((prompt_len - 1) // self.block_size) * self.block_size
+            if aligned > best_hit:
+                best_hit = aligned
+                best_slot = s
+        return (best_slot, best_hit)
+
     def prefill_chunked_begin(
         self,
         slots: list[int],

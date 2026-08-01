@@ -903,7 +903,21 @@ class ServerEngine:
         # -- normal admission (starts incremental prefill, non-blocking) --
         if self._pending_prefill is None and self.free_slots and self.waiting:
             n = min(len(self.free_slots), len(self.waiting))
-            admit_now = [(self.free_slots.pop(0), self.waiting.pop(0)) for _ in range(n)]
+            # Cache-aware slot assignment: match each prompt to the free
+            # slot with the deepest warm KV prefix hit (same-slot reuse).
+            admit_now = []
+            remaining_slots = list(self.free_slots)
+            for _ in range(n):
+                req = self.waiting.pop(0)
+                if hasattr(self.runner, 'find_best_slot_for_prompt') and remaining_slots:
+                    best_slot, _hit = self.runner.find_best_slot_for_prompt(
+                        req.prompt_ids, remaining_slots,
+                    )
+                    remaining_slots.remove(best_slot)
+                else:
+                    best_slot = remaining_slots.pop(0)
+                admit_now.append((best_slot, req))
+            self.free_slots = remaining_slots
             new_slots = [s for s, _ in admit_now]
             new_prompts = [r.prompt_ids for _, r in admit_now]
             try:
