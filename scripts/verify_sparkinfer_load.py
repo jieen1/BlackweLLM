@@ -40,9 +40,8 @@ to stay on the generic path regardless.
 import pathlib
 import subprocess
 
-import torch
-
 import sparkinfer
+import torch
 from sparkinfer.attention.paged.planner import _is_laguna_fp8_gqa6_analytic_decode_graph
 
 _CASES = [

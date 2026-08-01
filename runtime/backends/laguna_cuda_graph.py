@@ -831,7 +831,7 @@ class LagunaCudaGraphVerify:
             else:
                 # Full attention: use pre-allocated sequential page table
                 pt = self._page_tables[group_key]
-                pt[0, :n_blocks_full] = self._seq_page_table[full_base:full_base + n_blocks_full]
+                pt[0, :n_blocks_full] = self._seq_page_table[full_base : full_base + n_blocks_full]
                 self._cache_seqlens[group_key][0] = new_kv_len
 
         # Full-attention slot mapping

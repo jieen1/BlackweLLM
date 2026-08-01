@@ -1246,9 +1246,7 @@ class LagunaBackend:
             result[name] = decoder_layers[layer_idx]
         return result
 
-    def _ring_to_scratch_slabs(
-        self, abs_start: int, count: int
-    ) -> list[tuple[int, int, int]]:
+    def _ring_to_scratch_slabs(self, abs_start: int, count: int) -> list[tuple[int, int, int]]:
         """Return ``(ring_position, scratch_position, length)`` copies."""
         slabs: list[tuple[int, int, int]] = []
         pos = 0
@@ -1335,12 +1333,11 @@ class LagunaBackend:
         scratch_to_ring = self._scratch_to_ring_slabs(
             scratch_copy_start, ring_copy_abs_start, copy_count
         )
-        debug_enabled = (
-            debug_chunk_index is not None
-            and os.environ.get("QSR_DEBUG_CHUNK_CHECK") in (
-                "1",
-                "2",
-            )
+        debug_enabled = debug_chunk_index is not None and os.environ.get(
+            "QSR_DEBUG_CHUNK_CHECK"
+        ) in (
+            "1",
+            "2",
         )
         debug_name = self._swa_layer_names[0]
 
@@ -1447,8 +1444,8 @@ class LagunaBackend:
         t_start = t_phys * self.blocks_per_slot
         w_start = w_phys * self.blocks_per_slot
         for name in self._full_layer_names:
-            self.kv_caches[name][:, t_start:t_start + num_blocks].copy_(
-                self.kv_caches[name][:, w_start:w_start + num_blocks]
+            self.kv_caches[name][:, t_start : t_start + num_blocks].copy_(
+                self.kv_caches[name][:, w_start : w_start + num_blocks]
             )
         # Zero out stale tokens in the partial last block
         remainder = num_tokens % self.block_size
@@ -1459,14 +1456,16 @@ class LagunaBackend:
         # Zero ALL blocks beyond the prefix (stale from previous use)
         if num_blocks < self.blocks_per_slot:
             for name in self._full_layer_names:
-                self.kv_caches[name][:, t_start + num_blocks:t_start + self.blocks_per_slot].zero_()
+                self.kv_caches[name][
+                    :, t_start + num_blocks : t_start + self.blocks_per_slot
+                ].zero_()
         # SWA ring: copy ring blocks if applicable
         if self._ring_blocks_per_slot > 0:
             t_ring = t_phys * self._ring_blocks_per_slot
             w_ring = w_phys * self._ring_blocks_per_slot
             for name in self._swa_layer_names:
-                self.kv_caches[name][:, t_ring:t_ring + self._ring_blocks_per_slot].copy_(
-                    self.kv_caches[name][:, w_ring:w_ring + self._ring_blocks_per_slot]
+                self.kv_caches[name][:, t_ring : t_ring + self._ring_blocks_per_slot].copy_(
+                    self.kv_caches[name][:, w_ring : w_ring + self._ring_blocks_per_slot]
                 )
 
     def prefill(self, slot: int, prompt_ids: list[int]) -> int:
@@ -1504,7 +1503,11 @@ class LagunaBackend:
         return first_token
 
     def prefill_with_aux(
-        self, slot: int, prompt_ids: list[int], *, prefix_hit: int = 0,
+        self,
+        slot: int,
+        prompt_ids: list[int],
+        *,
+        prefix_hit: int = 0,
     ) -> tuple[int, list[torch.Tensor] | None]:
         """Prefill prompt and return (first_token, aux_hidden_states).
 
@@ -1625,7 +1628,10 @@ class LagunaBackend:
         return first_token, aux
 
     def _prefill_with_prefix_hit(
-        self, slot: int, prompt_ids: list[int], prefix_hit: int,
+        self,
+        slot: int,
+        prompt_ids: list[int],
+        prefix_hit: int,
     ) -> tuple[int, list[torch.Tensor] | None]:
         """Prefix-cache-aware prefill: skip [0, prefix_hit), process suffix.
 
@@ -1696,14 +1702,21 @@ class LagunaBackend:
             ):
                 swa_kv = [overlap] if has_swa else None
                 logits, aux = self._forward_with_aux(
-                    [slot], suffix, [prefix_hit], qo_len=suffix_len,
-                    is_decode=False, swa_kv_lengths=swa_kv,
+                    [slot],
+                    suffix,
+                    [prefix_hit],
+                    qo_len=suffix_len,
+                    is_decode=False,
+                    swa_kv_lengths=swa_kv,
                 )
         else:
             # Long suffix: chunked prefill with overlap from ring
             aux = None
             chunk_ranges = _prefill_chunk_ranges(
-                0, suffix_len, PREFILL_CHUNK, min_final_tokens=window,
+                0,
+                suffix_len,
+                PREFILL_CHUNK,
+                min_final_tokens=window,
             )
             for _chunk_idx, (chunk_start, chunk_end) in enumerate(chunk_ranges):
                 chunk = suffix[chunk_start:chunk_end]
@@ -1727,15 +1740,22 @@ class LagunaBackend:
                     swa_kv = [overlap] if has_swa else None
                     if is_last:
                         logits, aux = self._forward_with_aux(
-                            [slot], chunk, [abs_start],
-                            qo_len=chunk_len, is_decode=False,
+                            [slot],
+                            chunk,
+                            [abs_start],
+                            qo_len=chunk_len,
+                            is_decode=False,
                             swa_kv_lengths=swa_kv,
                         )
                     else:
                         self._forward(
-                            [slot], chunk, [abs_start],
-                            qo_len=chunk_len, is_decode=False,
-                            swa_kv_lengths=swa_kv, skip_logits=True,
+                            [slot],
+                            chunk,
+                            [abs_start],
+                            qo_len=chunk_len,
+                            is_decode=False,
+                            swa_kv_lengths=swa_kv,
+                            skip_logits=True,
                         )
 
         first_token = int(logits[-1].argmax(dim=-1).item())
@@ -2008,7 +2028,9 @@ class LagunaBackend:
         return best_hit
 
     def find_best_slot_for_prompt(
-        self, token_ids: list[int], free_slots: list[int],
+        self,
+        token_ids: list[int],
+        free_slots: list[int],
     ) -> tuple[int, int]:
         """Return (best_slot, hit_depth) for cache-aware slot assignment.
 
@@ -2071,16 +2093,22 @@ class LagunaBackend:
             if prefix_hit > 0:
                 logger.info(
                     "[PREFIX_CACHE] HIT slot=%d hit=%d suffix=%d (%.1f%% cached)",
-                    slot, prefix_hit, len(prompt) - prefix_hit,
+                    slot,
+                    prefix_hit,
+                    len(prompt) - prefix_hit,
                     100.0 * prefix_hit / len(prompt),
                 )
                 if self._dflash is not None:
                     result[slot] = self._dflash.dflash_prefill_bootstrap(
-                        slot, prompt, prefix_hit=prefix_hit,
+                        slot,
+                        prompt,
+                        prefix_hit=prefix_hit,
                     )
                 else:
                     first_token, _ = self.prefill_with_aux(
-                        slot, prompt, prefix_hit=prefix_hit,
+                        slot,
+                        prompt,
+                        prefix_hit=prefix_hit,
                     )
                     result[slot] = {"anchor": first_token, "draft_tokens": []}
             else:

@@ -245,7 +245,7 @@ class RequestTracer:
             "# HELP blackwellm:trace_total_requests Total traced requests",
             "# TYPE blackwellm:trace_total_requests counter",
             f'blackwellm:trace_total_requests{{model_name="{model_name}"}} '
-            f'{stats["total_requests"]}',
+            f"{stats['total_requests']}",
             "# HELP blackwellm:trace_active_requests Currently active traced requests",
             "# TYPE blackwellm:trace_active_requests gauge",
             f'blackwellm:trace_active_requests{{model_name="{model_name}"}} {stats["active"]}',

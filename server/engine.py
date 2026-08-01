@@ -414,9 +414,7 @@ class ServerEngine:
             # _ensure_decode_cg above): DFlashEngine.__init__ captures its
             # own draft/verify CUDA Graphs, which scribble dummy warmup data
             # into physical slots.
-            dflash_cuda_graph = self.runner.enable_dflash(
-                num_speculative_tokens=self.K
-            )
+            dflash_cuda_graph = self.runner.enable_dflash(num_speculative_tokens=self.K)
             logger.info(
                 "DFlash speculative decoding wired: K=%d, cuda_graph=%s",
                 self.K,
@@ -909,9 +907,10 @@ class ServerEngine:
             remaining_slots = list(self.free_slots)
             for _ in range(n):
                 req = self.waiting.pop(0)
-                if hasattr(self.runner, 'find_best_slot_for_prompt') and remaining_slots:
+                if hasattr(self.runner, "find_best_slot_for_prompt") and remaining_slots:
                     best_slot, _hit = self.runner.find_best_slot_for_prompt(
-                        req.prompt_ids, remaining_slots,
+                        req.prompt_ids,
+                        remaining_slots,
                     )
                     remaining_slots.remove(best_slot)
                 else:
