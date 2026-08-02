@@ -64,6 +64,7 @@ not prove.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -213,6 +214,20 @@ def _build_qwen36_model_config(model_path: str) -> dict[str, Any]:
     return merged
 
 
+#: FP8 KV cache gate (2026-08-03 follow-up -- see ``runtime/model/
+#: qwen36_model.py``'s module docstring for the checkpoint fact this
+#: exists to use: the standard checkpoint ships real per-layer
+#: ``k_scale``/``v_scale`` for every full-attention layer, unlike the
+#: modelopt one). Default OFF -- production keeps shipping the established
+#: BF16 KV path regardless of this env var's presence until this flag's
+#: default is deliberately flipped in a follow-up commit backed by a
+#: passing B1-R gate. ``load_qwen36_model``'s own ``enable_fp8_kv``
+#: parameter reads this only when left at its own default (``None``), same
+#: two-layer "explicit argument wins, env var is only the outermost
+#: default" pattern ``runtime/checkpoints.py``'s env vars use.
+QSR_QWEN36_FP8_KV_ENV = "QSR_QWEN36_FP8_KV"
+
+
 def load_qwen36_model(
     model_path: str,
     *,
@@ -222,11 +237,13 @@ def load_qwen36_model(
     language_model_only: bool = True,
     warmup_attention: bool = True,
     enable_mtp: bool = False,
+    enable_fp8_kv: bool | None = None,
 ) -> Qwen36ForCausalLMSelfBuilt:
     """Construct + load a Qwen3.6-27B (``Qwen3_5ForConditionalGeneration``,
     text-only) model instance. Track B / B1 -- see ``runtime/model/
     qwen36_model.py``'s module docstring for the exact scope this covers
-    (eager, batch=1, BF16-dequantized quantized Linears, BF16 KV cache).
+    (eager, batch=1, BF16-dequantized quantized Linears; KV cache is BF16
+    by default, FP8-e4m3 when ``enable_fp8_kv`` resolves True).
 
     Unlike :func:`load_laguna_model`, ``language_model_only`` defaults to
     **True** here, not False: this runtime's only real Qwen3.6 checkpoint
@@ -259,6 +276,23 @@ def load_qwen36_model(
     otherwise ignored) -- only B3 callers doing real speculative decoding
     need True.
 
+    ``enable_fp8_kv`` (default ``None``, 2026-08-03 follow-up): FP8-e4m3
+    KV cache for every backbone full-attention layer (never the MTP head,
+    which has no checkpoint scale to consume). ``None`` resolves from
+    ``QSR_QWEN36_FP8_KV`` (``"1"`` -> True, anything else including unset
+    -> False) at call time, so a caller that never mentions this parameter
+    gets exactly today's env-driven default; pass an explicit ``True``/
+    ``False`` to override the environment for one call (every test in
+    ``tests/test_qwen36_fp8_kv.py`` does this, precisely so the suite
+    never depends on ambient environment state). Requires the checkpoint
+    to ship real ``self_attn.k_scale``/``v_scale`` tensors for every
+    full-attention layer -- true for the standard (``unsloth/``)
+    checkpoint, NOT true for the modelopt (``nvidia/``) one (see
+    ``runtime/model/qwen36_model.py``'s module docstring) -- passing True
+    against a checkpoint that ships neither tensor fails loudly at
+    ``assert_all_params_loaded`` below rather than silently running FP8
+    KV with an unset 1.0 scale.
+
     Disables autograd globally (``torch.set_grad_enabled(False)``), same
     as ``LagunaBackend.__init__`` (``runtime/backends/laguna.py:266``) --
     this is not optional cleanup: sparkinfer's paged-attention kernel
@@ -273,12 +307,17 @@ def load_qwen36_model(
     same choice, for the same reason (this runtime never trains).
     """
     torch.set_grad_enabled(False)
+    if enable_fp8_kv is None:
+        enable_fp8_kv = os.environ.get(QSR_QWEN36_FP8_KV_ENV) == "1"
     model_config = _build_qwen36_model_config(model_path)
     target_device = torch.device(device)
 
     with default_torch_dtype(dtype), target_device:
         model = Qwen36ForCausalLMSelfBuilt(
-            model_config, max_seq_len=max_seq_len, enable_mtp=enable_mtp
+            model_config,
+            max_seq_len=max_seq_len,
+            enable_mtp=enable_mtp,
+            enable_fp8_kv=enable_fp8_kv,
         )
 
         vision_filter_stats = LanguageModelOnlyStats()

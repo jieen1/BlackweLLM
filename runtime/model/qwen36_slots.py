@@ -155,6 +155,17 @@ class Qwen36SlotPool:
         self.decode_attn: dict[int, Qwen36BatchedDecodeAttention] = {}
         self.graph_attn: dict[int, Qwen36DecodeGraphAttention] = {}
         self._attn_geometry: dict[str, int] | None = None
+        #: The KV pools' own storage dtype -- read off each full-attention
+        #: layer's ``kv_cache_dtype`` (FP8 KV, 2026-08-03 follow-up: BF16
+        #: unless that layer was built with ``enable_fp8_kv=True``) rather
+        #: than assumed to equal ``dtype`` (the pool's *compute* dtype,
+        #: still used for conv/recurrent pools below, which never change).
+        #: ``getattr(..., dtype)`` falls back to ``dtype`` for a minimal
+        #: stub layer object that doesn't expose the attribute at all (e.g.
+        #: ``tests/test_qwen36_slot_pool.py``'s ``SimpleNamespace`` stub) --
+        #: same BF16-pool-dtype behavior this class always had before FP8
+        #: KV existed.
+        self._kv_dtype: torch.dtype | None = None
 
         recurrent_bytes = 0
         kv_bytes = 0
@@ -191,9 +202,22 @@ class Qwen36SlotPool:
             else:
                 num_paged += 1
                 attn = layer.self_attn
+                kv_dtype = getattr(attn, "kv_cache_dtype", dtype)
+                if self._kv_dtype is None:
+                    self._kv_dtype = kv_dtype
+                elif self._kv_dtype != kv_dtype:
+                    # One shared decode driver per batch size (below) needs
+                    # one KV dtype for the whole step -- same reasoning as
+                    # the _attn_geometry uniformity check just below this
+                    # loop, for a different attribute.
+                    raise ValueError(
+                        "Qwen36SlotPool assumes every full-attention layer shares one KV "
+                        f"cache dtype; layer {i} has {kv_dtype}, earlier layers have "
+                        f"{self._kv_dtype}"
+                    )
                 shape = (total_pages, self.page_size, attn.num_kv_heads, attn.head_dim)
-                k = torch.zeros(shape, device=self.device, dtype=dtype)
-                v = torch.zeros(shape, device=self.device, dtype=dtype)
+                k = torch.zeros(shape, device=self.device, dtype=kv_dtype)
+                v = torch.zeros(shape, device=self.device, dtype=kv_dtype)
                 self.k_pools[i] = _mark_static(k)
                 self.v_pools[i] = _mark_static(v)
                 kv_bytes += 2 * self.pages_per_slot * self.page_size * (
@@ -542,7 +566,10 @@ class Qwen36SlotPool:
             "pages_per_slot": self.pages_per_slot,
             "num_cache_pages": self._num_rows * self.pages_per_slot,
             "dtype": self.dtype,
-            "kv_dtype": self.dtype,
+            # The KV pools' own dtype (BF16 unless FP8 KV was enabled --
+            # see __init__'s _kv_dtype uniformity check), NOT necessarily
+            # self.dtype (the compute dtype) now that the two can diverge.
+            "kv_dtype": self._kv_dtype,
             "device": self.device,
         }
 
