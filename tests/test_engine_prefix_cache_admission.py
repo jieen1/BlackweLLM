@@ -78,7 +78,14 @@ class _FakeCacheAwareRunner:
     def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
         return PrefixHit(kv_hit=0, state_hit=0)
 
-    def prefill_chunked_begin(self, slots, prompts_per_slot, chunk_size: int = 512):
+    def prefill_chunked_begin(
+        self, slots, prompts_per_slot, chunk_size: int = 512, *, params_per_slot=None
+    ):
+        # `params_per_slot` (E2-b) is accepted and ignored: this fake exercises
+        # slot *assignment*, not sampling. Omitting it made every admission raise
+        # TypeError inside ServerEngine's admission try/except, which fails the
+        # futures and leaves the engine with nothing to do -- so `_step_sync`
+        # reached its idle blocking read and the test hung instead of failing.
         result = {s: {"anchor": 900 + s, "draft_tokens": []} for s in slots}
         return SimpleNamespace(done=True, result=result)
 
@@ -115,7 +122,14 @@ class _FakeNoCacheRunner:
     def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
         return PrefixHit(kv_hit=0, state_hit=0)
 
-    def prefill_chunked_begin(self, slots, prompts_per_slot, chunk_size: int = 512):
+    def prefill_chunked_begin(
+        self, slots, prompts_per_slot, chunk_size: int = 512, *, params_per_slot=None
+    ):
+        # `params_per_slot` (E2-b) is accepted and ignored: this fake exercises
+        # slot *assignment*, not sampling. Omitting it made every admission raise
+        # TypeError inside ServerEngine's admission try/except, which fails the
+        # futures and leaves the engine with nothing to do -- so `_step_sync`
+        # reached its idle blocking read and the test hung instead of failing.
         result = {s: {"anchor": 700 + s, "draft_tokens": []} for s in slots}
         return SimpleNamespace(done=True, result=result)
 
