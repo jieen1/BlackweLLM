@@ -219,6 +219,7 @@ def load_qwen36_model(
     max_seq_len: int = 4096,
     language_model_only: bool = True,
     warmup_attention: bool = True,
+    enable_mtp: bool = False,
 ) -> Qwen36ForCausalLMSelfBuilt:
     """Construct + load a Qwen3.6-27B (``Qwen3_5ForConditionalGeneration``,
     text-only) model instance. Track B / B1 -- see ``runtime/model/
@@ -249,6 +250,13 @@ def load_qwen36_model(
     ``scripts/b1_probe_extend_jit_buckets.py`` and
     ``scripts/b1_verify_prefill_jit_and_greedy.py`` do).
 
+    ``enable_mtp`` (default False, B3): construct and load
+    :attr:`Qwen36ForCausalLMSelfBuilt.mtp`, the MTP draft head, from this
+    same checkpoint's ``mtp.*`` tensors. False reproduces B1/B2's exact
+    behavior (those tensors are counted in ``model.skipped_mtp_count`` and
+    otherwise ignored) -- only B3 callers doing real speculative decoding
+    need True.
+
     Disables autograd globally (``torch.set_grad_enabled(False)``), same
     as ``LagunaBackend.__init__`` (``runtime/backends/laguna.py:266``) --
     this is not optional cleanup: sparkinfer's paged-attention kernel
@@ -267,7 +275,9 @@ def load_qwen36_model(
     target_device = torch.device(device)
 
     with default_torch_dtype(dtype), target_device:
-        model = Qwen36ForCausalLMSelfBuilt(model_config, max_seq_len=max_seq_len)
+        model = Qwen36ForCausalLMSelfBuilt(
+            model_config, max_seq_len=max_seq_len, enable_mtp=enable_mtp
+        )
 
         vision_filter_stats = LanguageModelOnlyStats()
         weights = filter_language_model_only(

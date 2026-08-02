@@ -1250,6 +1250,7 @@ class Qwen36Attention(nn.Module):
         quantized: dict[str, str],
         *,
         max_seq_len: int,
+        weight_prefix: str | None = None,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -1267,7 +1268,22 @@ class Qwen36Attention(nn.Module):
             "would need a different q_proj shape and forward path, not handled here"
         )
 
-        prefix = f"model.language_model.layers.{layer_idx}.self_attn"
+        # ``weight_prefix`` (B3): overrides the derived
+        # ``model.language_model.layers.{layer_idx}`` checkpoint prefix used
+        # for quantization classification (``_make_linear``'s ``dotted_name``
+        # arg -- see ``classify_module``). Every real call site before B3
+        # left this ``None`` (backbone full-attention layers, whose
+        # checkpoint tensors really do live at that prefix); the MTP draft
+        # head (``Qwen36MTPHead``) is the first caller to pass a real
+        # override, because its checkpoint tensors live under ``mtp.layers.0``
+        # instead -- reusing this class unmodified for the MTP head's
+        # self-attention sublayer beats hand-duplicating its forward() (RoPE
+        # + sparkinfer paged attention + sigmoid output gate), which has
+        # already been through B1/B2 GPU verification for every OTHER
+        # full-attention layer in this model.
+        prefix = weight_prefix if weight_prefix is not None else (
+            f"model.language_model.layers.{layer_idx}.self_attn"
+        )
         qkv_in = self.hidden_size
         kv_out = self.num_kv_heads * self.head_dim
         q_out = self.num_heads * self.head_dim * 2
@@ -1466,11 +1482,23 @@ class Qwen36Attention(nn.Module):
 
 
 class Qwen36MLP(nn.Module):
-    def __init__(self, config: dict[str, Any], layer_idx: int, quantized: dict[str, str]) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        layer_idx: int,
+        quantized: dict[str, str],
+        *,
+        weight_prefix: str | None = None,
+    ) -> None:
         super().__init__()
         hidden_size = config["hidden_size"]
         intermediate_size = config["intermediate_size"]
-        prefix = f"model.language_model.layers.{layer_idx}.mlp"
+        # See Qwen36Attention.__init__'s ``weight_prefix`` docstring -- same
+        # override, same reason (Qwen36MTPHead's checkpoint prefix is
+        # ``mtp.layers.0.mlp``, not ``model.language_model.layers.N.mlp``).
+        prefix = weight_prefix if weight_prefix is not None else (
+            f"model.language_model.layers.{layer_idx}.mlp"
+        )
         self.gate_proj = _make_linear(
             quantized, f"{prefix}.gate_proj", hidden_size, intermediate_size
         )
@@ -1586,6 +1614,182 @@ class Qwen36DecoderLayer(nn.Module):
         return residual + hidden_states
 
 
+# ---------------------------------------------------------------------------
+# B3: MTP (multi-token-prediction) draft head.
+# ---------------------------------------------------------------------------
+#
+# Checkpoint fact (verified directly against two real checkpoints, plus
+# re-confirmed against ``nvidia/Qwen3.6-27B-NVFP4``'s own
+# ``model.safetensors.index.json`` while building this): exactly 15
+# ``mtp.*`` tensors, none of them ``linear_attn.*`` -- ``mtp.fc.weight``,
+# ``mtp.pre_fc_norm_embedding.weight``, ``mtp.pre_fc_norm_hidden.weight``,
+# ``mtp.norm.weight``, and ``mtp.layers.0.{input_layernorm,
+# post_attention_layernorm, self_attn.{q,k,v,o}_proj, self_attn.{q,k}_norm,
+# mlp.{gate,up,down}_proj}.weight``. Structurally this is ONE ordinary
+# full-attention decoder layer (``config["layer_types"][0]`` says
+# "linear_attention" -- irrelevant here, the MTP head is unconditionally
+# full-attention regardless of what layer 0 of the *backbone* is) plus a
+# small fusion block in front of it. No GDN anywhere in the draft head, so
+# none of B3's GDN-state-rollback machinery
+# (``Qwen36GatedDeltaNet.spec_forward``/``commit_spec_snapshot``) applies to
+# this class -- that machinery exists entirely for the TARGET model's
+# recursive layers, which the draft head never touches.
+#
+# All 15 tensors are plain BF16 in the real checkpoint (no ``*_scale``
+# siblings; confirmed via direct safetensors dtype inspection) --
+# ``_make_linear`` naturally resolves them to :class:`PlainLinear` because
+# ``mtp.*`` never appears in ``quantization_config.quantized_layers``. This
+# matches a known NVFP4-checkpoint quirk vLLM works around explicitly
+# (``/home/bot/vllm/vllm/model_executor/models/qwen3_5_mtp.py``, read
+# ONLY as an external reference while designing this class, never
+# imported: "mtp.fc is stored as BF16 in NVFP4 checkpoints but is missing
+# from hf_quant_config.json exclude_modules. Force unquantized.").
+#
+# Forward structure and the embedding-then-hidden concat order are
+# transcribed from that same file's ``Qwen3_5MultiTokenPredictor.forward``
+# (read-only reference -- this repository has no vLLM runtime dependency,
+# see module docstring). The target hidden state MTP consumes is the
+# TARGET model's post-final-norm hidden state -- confirmed by tracing
+# vLLM's ``gpu_model_runner.py`` (``target_hidden_states = hidden_states``,
+# where ``hidden_states`` is exactly what ``Qwen3NextModel.forward``
+# returns after its own ``self.norm(...)`` call, for the non-EAGLE3
+# ``use_aux_hidden_state_outputs=False`` path this checkpoint uses) --
+# i.e. the SAME hidden state ``compute_logits`` reads for the target's own
+# prediction, not a pre-norm intermediate.
+class Qwen36MTPLayer(nn.Module):
+    """One MTP decoder layer: input_layernorm -> self_attn -> residual ->
+    post_attention_layernorm -> mlp -> residual. Byte-for-byte the same op
+    sequence as :meth:`Qwen36DecoderLayer.forward`'s full-attention branch
+    (deliberately not shared code with that method -- see this class's
+    module-level docstring for why instantiating ``Qwen36DecoderLayer``
+    itself is wrong here: it picks GDN vs attention from
+    ``config["layer_types"][layer_idx]``, which for ``layer_idx=0`` says
+    "linear_attention" in the real backbone and would build a GDN layer
+    instead of the full-attention one this checkpoint's ``mtp.layers.0.*``
+    tensors actually are).
+    """
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        quantized: dict[str, str],
+        *,
+        max_seq_len: int,
+        weight_prefix: str,
+    ) -> None:
+        super().__init__()
+        eps = config["rms_norm_eps"]
+        hidden_size = config["hidden_size"]
+        self.self_attn = Qwen36Attention(
+            config,
+            0,
+            quantized,
+            max_seq_len=max_seq_len,
+            weight_prefix=f"{weight_prefix}.self_attn",
+        )
+        self.mlp = Qwen36MLP(config, 0, quantized, weight_prefix=f"{weight_prefix}.mlp")
+        self.input_layernorm = Qwen36RMSNorm(hidden_size, eps=eps)
+        self.post_attention_layernorm = Qwen36RMSNorm(hidden_size, eps=eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        attn_cache: Qwen36PagedAttentionCache,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, positions, cos_sin_cache, attn_cache)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return residual + hidden_states
+
+
+class Qwen36MTPHead(nn.Module):
+    """B3 draft head: ``fc(cat([norm_embed(next_token), norm_hidden(prev)]))
+    -> Qwen36MTPLayer -> norm``.
+
+    Shares ``embed_tokens``/``lm_head`` with the target model (checkpoint
+    declares ``mtp_use_dedicated_embeddings: false``, and there is no
+    ``mtp.embed_tokens``/``mtp.lm_head`` tensor in the checkpoint to load
+    even if it didn't) -- callers pass in an already-computed token
+    embedding and read the returned hidden state back out through the
+    target model's own ``lm_head``, rather than this class owning either.
+
+    Has its own :class:`Qwen36PagedAttentionCache` (via its own
+    ``Qwen36Attention`` instance's ``new_cache()``), independent of the
+    target model's per-layer caches, because the draft head's self-attention
+    needs causal context over the sequence of positions IT has processed
+    -- which, during chained multi-token drafting, includes its own
+    previously-drafted positions, not just positions the target model has
+    committed. Rollback after a partial accept is a plain ``cache.seq_len``
+    rewind (same trick ``Qwen36SlotPool.rewind_slot`` uses for prefix-cache
+    truncation) -- unlike the target's GDN layers, nothing here needs
+    snapshot/restore, because a causal KV cache's "state at position m" is
+    just "the first m rows", always recoverable by truncation alone.
+    """
+
+    def __init__(
+        self, config: dict[str, Any], quantized: dict[str, str], *, max_seq_len: int
+    ) -> None:
+        super().__init__()
+        hidden_size = config["hidden_size"]
+        eps = config["rms_norm_eps"]
+        num_mtp_layers = config.get("mtp_num_hidden_layers", 1)
+        assert num_mtp_layers == 1, (
+            f"Qwen36MTPHead only verified against mtp_num_hidden_layers=1 (the real "
+            f"checkpoint's value); got {num_mtp_layers}. A checkpoint with more MTP "
+            "layers needs new verification (which of the N layers a given spec_step "
+            "picks, matching vLLM's `spec_step_idx % self.num_mtp_layers`) before "
+            "this class can be trusted for it."
+        )
+        self.pre_fc_norm_embedding = Qwen36RMSNorm(hidden_size, eps=eps)
+        self.pre_fc_norm_hidden = Qwen36RMSNorm(hidden_size, eps=eps)
+        self.fc = _make_linear(quantized, "mtp.fc", hidden_size * 2, hidden_size)
+        self.layers = nn.ModuleList(
+            [
+                Qwen36MTPLayer(
+                    config, quantized, max_seq_len=max_seq_len, weight_prefix=f"mtp.layers.{i}"
+                )
+                for i in range(num_mtp_layers)
+            ]
+        )
+        self.norm = Qwen36RMSNorm(hidden_size, eps=eps)
+
+    def new_cache(self, *, device: torch.device, dtype: torch.dtype) -> Qwen36PagedAttentionCache:
+        return self.layers[0].self_attn.new_cache(device=device, dtype=dtype)
+
+    def forward(
+        self,
+        next_token_embeds: torch.Tensor,
+        prev_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        attn_cache: Qwen36PagedAttentionCache,
+        *,
+        layer_idx: int = 0,
+    ) -> torch.Tensor:
+        """One MTP step. ``next_token_embeds``/``prev_hidden``:
+        ``[1, seq_len, hidden_size]`` each -- the (already embedded) real or
+        self-drafted token(s) this step conditions on, and the hidden state
+        (target's own, for the very first draft step of a round; this
+        head's own previous output, for every later chained step) from the
+        position immediately before. Returns the post-``norm`` hidden state,
+        ready for the shared ``lm_head`` to turn into draft logits.
+        """
+        fused = torch.cat(
+            [self.pre_fc_norm_embedding(next_token_embeds), self.pre_fc_norm_hidden(prev_hidden)],
+            dim=-1,
+        )
+        hidden_states = self.fc(fused)
+        hidden_states = self.layers[layer_idx](hidden_states, positions, cos_sin_cache, attn_cache)
+        return self.norm(hidden_states)
+
+
 class Qwen36TextModelSelfBuilt(nn.Module):
     """Embedding -> N decoder layers -> final norm. Batch=1, no vision."""
 
@@ -1683,6 +1887,118 @@ class Qwen36TextModelSelfBuilt(nn.Module):
             return hidden_states, per_layer_hidden
         return hidden_states
 
+    def verify_forward(
+        self, draft_token_ids: torch.Tensor, state: Qwen36GenerationState
+    ) -> tuple[torch.Tensor, dict[int, list[GdnLayerState]]]:
+        """B3: run ``K`` draft tokens through every layer in ONE pass,
+        WITHOUT committing ``state`` -- the target-model half of MTP verify.
+
+        ``draft_token_ids``: ``[1, K]``, the K speculative token ids to
+        verify (NOT including the anchor -- ``state`` already reflects
+        having processed the anchor, exactly like
+        :meth:`Qwen36GatedDeltaNet.spec_forward`'s own precondition on each
+        GDN layer's state -- see that method's docstring).
+
+        For each layer, in order:
+          * ``linear_attention`` (GDN) layers use
+            :meth:`Qwen36GatedDeltaNet.spec_forward` instead of the
+            ordinary ``forward()`` -- the only layer type that cannot
+            expose intermediate states from a single multi-token call (its
+            docstring explains why: the chunk algorithm only returns the
+            state after ALL K positions). Its ``K+1`` state snapshots are
+            collected here, keyed by layer index, for :meth:`commit_verify`
+            to resolve later once accept/reject is decided.
+          * ``full_attention`` layers use the SAME ``self_attn`` call an
+            ordinary multi-token prefill already uses (B1-proven,
+            unmodified) -- a causal attention kernel over a K-token query
+            block against an already-materialized KV cache computes every
+            position's correct output in one shot, unlike GDN's fused
+            recurrence, so no per-position snapshot mechanism is needed
+            here. This eagerly appends all K positions' KV to the cache;
+            :meth:`commit_verify` rewinds ``cache.seq_len`` back down on a
+            partial accept (the appended-but-rejected KV bytes are simply
+            never read again -- same trick
+            ``Qwen36SlotPool.rewind_slot`` uses for prefix-cache
+            truncation).
+
+        Returns ``(post_norm_hidden, gdn_snapshots)``: ``post_norm_hidden``
+        is ``[1, K, hidden_size]`` -- feed to ``lm_head`` for verify logits,
+        and (row-wise) to :class:`Qwen36MTPHead` as the next round's
+        ``prev_hidden`` once accept/reject picks which row. ``gdn_snapshots
+        [layer_idx]`` has ``K+1`` entries, same contract as
+        :meth:`Qwen36GatedDeltaNet.spec_forward`'s own return.
+
+        Does not touch ``state.num_tokens_seen``; :meth:`commit_verify` is
+        the only place ``state`` is actually resolved.
+        """
+        assert draft_token_ids.dim() == 2 and draft_token_ids.shape[0] == 1
+        seq_len = draft_token_ids.shape[1]
+        past_len = state.num_tokens_seen
+        positions = torch.arange(
+            past_len, past_len + seq_len, device=draft_token_ids.device, dtype=torch.long
+        )
+        hidden_states = self.embed_tokens(draft_token_ids)
+        cos_sin_cache = self.cos_sin_cache.to(hidden_states.device)
+
+        gdn_snapshots: dict[int, list[GdnLayerState]] = {}
+        for layer in self.layers:
+            residual = hidden_states
+            hidden_states = layer.input_layernorm(hidden_states)
+
+            if layer.layer_type == "linear_attention":
+                gdn_state = state.gdn_states[layer.layer_idx]
+                assert gdn_state is not None
+                out, snapshots = layer.linear_attn.spec_forward(hidden_states, gdn_state)
+                gdn_snapshots[layer.layer_idx] = snapshots
+                hidden_states = out
+            else:
+                attn_cache = state.attn_caches[layer.layer_idx]
+                assert attn_cache is not None
+                hidden_states = layer.self_attn(hidden_states, positions, cos_sin_cache, attn_cache)
+
+            hidden_states = residual + hidden_states
+
+            residual = hidden_states
+            hidden_states = layer.post_attention_layernorm(hidden_states)
+            hidden_states = layer.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+
+        return self.norm(hidden_states), gdn_snapshots
+
+    def commit_verify(
+        self,
+        state: Qwen36GenerationState,
+        gdn_snapshots: dict[int, list[GdnLayerState]],
+        *,
+        past_len: int,
+        accepted_count: int,
+    ) -> None:
+        """Resolve a :meth:`verify_forward` call: roll every GDN layer's
+        state back to ``accepted_count`` (the O(1) half of B3's rollback,
+        :func:`commit_spec_snapshot`) and rewind every attention layer's
+        KV cache to the same effective length (plain integer truncation --
+        see :meth:`verify_forward`'s docstring for why that alone is
+        sufficient for attention, unlike GDN).
+
+        ``past_len`` must be the ``state.num_tokens_seen`` value
+        :meth:`verify_forward` read before running -- passed explicitly,
+        not re-read from ``state`` here, so a caller that has already
+        mutated ``state.num_tokens_seen`` for some other reason between
+        the two calls cannot silently corrupt this one.
+        """
+        for layer in self.layers:
+            if layer.layer_type == "linear_attention":
+                commit_spec_snapshot(
+                    state.gdn_states[layer.layer_idx],
+                    gdn_snapshots[layer.layer_idx],
+                    accepted_count,
+                )
+            else:
+                attn_cache = state.attn_caches[layer.layer_idx]
+                assert attn_cache is not None
+                attn_cache.seq_len = past_len + accepted_count
+        state.num_tokens_seen = past_len + accepted_count
+
     def decode_batch(self, batch: Qwen36DecodeBatch) -> torch.Tensor:
         """Batched single-token continuation for ``B`` slots -> ``[B, 1, H]``.
 
@@ -1705,7 +2021,9 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
     (NVFP4-quantized, per B0-2). Not tied to ``embed_tokens`` (checkpoint
     declares ``tie_word_embeddings: false``, verified)."""
 
-    def __init__(self, config: dict[str, Any], *, max_seq_len: int) -> None:
+    def __init__(
+        self, config: dict[str, Any], *, max_seq_len: int, enable_mtp: bool = False
+    ) -> None:
         super().__init__()
         self.config = config
         # `config` is the merged dict runtime.model_loading.load_qwen36_model
@@ -1717,6 +2035,15 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         assert not config.get("tie_word_embeddings", False)
         self.lm_head = _make_linear(
             quantized, "lm_head", config["hidden_size"], config["vocab_size"]
+        )
+        # B3: MTP draft head, off by default (B1/B2 never load or construct
+        # it -- see module docstring above Qwen36MTPHead). Constructing it
+        # adds ~1 GiB of BF16 params on top of the backbone's much larger
+        # dequant-cache floor (notes/2026-08-02-qwen36-dequant-cache-memory-
+        # floor.md); negligible relative to that, but still opt-in so every
+        # existing B1/B2 caller's memory footprint is unchanged byte-for-byte.
+        self.mtp: Qwen36MTPHead | None = (
+            Qwen36MTPHead(config, quantized, max_seq_len=max_seq_len) if enable_mtp else None
         )
 
     def new_generation_state(
@@ -1795,6 +2122,71 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
 
+    # -- B3: MTP verify + draft head ------------------------------------
+
+    def verify_forward(
+        self, draft_token_ids: torch.Tensor, state: Qwen36GenerationState
+    ) -> tuple[torch.Tensor, dict[int, list[GdnLayerState]]]:
+        """See :meth:`Qwen36TextModelSelfBuilt.verify_forward`."""
+        return self.model.verify_forward(draft_token_ids, state)
+
+    def commit_verify(
+        self,
+        state: Qwen36GenerationState,
+        gdn_snapshots: dict[int, list[GdnLayerState]],
+        *,
+        past_len: int,
+        accepted_count: int,
+    ) -> None:
+        """See :meth:`Qwen36TextModelSelfBuilt.commit_verify`."""
+        self.model.commit_verify(
+            state, gdn_snapshots, past_len=past_len, accepted_count=accepted_count
+        )
+
+    def mtp_new_cache(
+        self, *, device: torch.device, dtype: torch.dtype
+    ) -> Qwen36PagedAttentionCache:
+        """A fresh KV cache for :attr:`mtp`'s own self-attention layer --
+        independent of any backbone layer's cache (see
+        :class:`Qwen36MTPHead`'s docstring)."""
+        assert self.mtp is not None, "mtp_new_cache called but enable_mtp=False at construction"
+        return self.mtp.new_cache(device=device, dtype=dtype)
+
+    def mtp_step(
+        self,
+        next_token_ids: torch.Tensor,
+        prev_hidden: torch.Tensor,
+        position: int,
+        mtp_cache: Qwen36PagedAttentionCache,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One MTP draft step -> ``(draft_token_id, post_norm_hidden)``.
+
+        ``next_token_ids``: ``[1, 1]`` int64, the token this step conditions
+        on (the real just-committed token for the first step of a round,
+        or this method's own previous return value's argmax for every
+        later chained step -- see :class:`Qwen36MTPHead`'s module
+        docstring). ``prev_hidden``: ``[1, 1, hidden_size]``, the hidden
+        state from the position immediately before (target's own, for the
+        first step; this method's own previous ``post_norm_hidden``
+        return, for chained steps). ``position``: this step's absolute
+        RoPE position (same numbering as the backbone's own -- see
+        :class:`Qwen36MTPHead`'s module docstring for why matching, not
+        independent, position numbers is correct here).
+
+        Returns the greedy draft token id (``[1]`` int64) and the
+        post-``norm`` hidden state (``[1, 1, hidden_size]``) this step
+        produced, for the caller to feed straight back in as the next
+        step's ``next_token_ids``/``prev_hidden``.
+        """
+        assert self.mtp is not None, "mtp_step called but enable_mtp=False at construction"
+        embeds = self.model.embed_tokens(next_token_ids)
+        positions = torch.tensor([position], device=next_token_ids.device, dtype=torch.long)
+        cos_sin_cache = self.model.cos_sin_cache.to(embeds.device)
+        hidden = self.mtp(embeds, prev_hidden, positions, cos_sin_cache, mtp_cache)
+        logits = self.lm_head(hidden)
+        draft_token = logits[:, -1, :].argmax(dim=-1)
+        return draft_token, hidden
+
     # -- Weight loading ------------------------------------------------
 
     def load_weights(self, weights) -> set[str]:
@@ -1807,11 +2199,17 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         already a 1:1 checkpoint tensor, verified against the real
         safetensors index, B0-2/B1). Top-level prefixes recognized:
         ``model.language_model.`` (backbone), ``lm_head.`` (head),
-        ``mtp.`` (skipped -- B1 has no MTP head, see module docstring),
-        ``model.visual.`` (should already be filtered out by the caller's
-        ``language_model_only`` loader stage; if any slip through here,
-        that is exactly the B0-1a/b guarantee failing, so this raises
-        rather than silently accepting them).
+        ``mtp.`` (B3: loaded into :attr:`mtp` when ``enable_mtp=True`` was
+        passed at construction -- the checkpoint's ``mtp.*`` names map
+        1:1 onto :class:`Qwen36MTPHead`'s own module tree by construction
+        (``self.mtp.fc``, ``self.mtp.layers.0.self_attn.q_proj``, ...), so
+        no remapping is needed, unlike the backbone's
+        ``model.language_model.`` -> ``model.`` rewrite below; skipped
+        (B1's original behavior) when ``enable_mtp=False``, i.e. ``mtp`` is
+        ``None``), ``model.visual.`` (should already be filtered out by
+        the caller's ``language_model_only`` loader stage; if any slip
+        through here, that is exactly the B0-1a/b guarantee failing, so
+        this raises rather than silently accepting them).
         """
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
@@ -1822,7 +2220,16 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
             if name.endswith(_IGNORED_WEIGHT_SUFFIXES):
                 continue
             if name.startswith("mtp."):
-                self.skipped_mtp_count += 1
+                if self.mtp is None:
+                    self.skipped_mtp_count += 1
+                    continue
+                mapped = name
+                if mapped not in params_dict:
+                    continue
+                param = params_dict[mapped]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, tensor)
+                loaded.add(mapped)
                 continue
             if name.startswith("model.visual."):
                 raise RuntimeError(
