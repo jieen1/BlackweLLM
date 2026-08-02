@@ -277,11 +277,45 @@ def test_gate_requires_three_workloads() -> None:
     assert any("workload" in r for r in reasons)
 
 
-def test_gate_requires_the_full_step_count() -> None:
+def test_gate_requires_a_per_workload_floor() -> None:
     report = _report(_clean_workload("w0", n=100), _clean_workload("w1"), _clean_workload("w2"))
     passed, reasons = passes_b1r_gate(report, UNCALIBRATED_THRESHOLDS)
     assert not passed
-    assert any("fewer than 512 steps" in r for r in reasons)
+    assert any("fewer than 128 steps" in r for r in reasons)
+
+
+def test_gate_requires_a_total_step_budget() -> None:
+    """The per-workload floor is deliberately low -- HF's own greedy
+    continuation hits EOS at 140 tokens on one real B1 workload -- so the
+    sample-size requirement lives on the total instead."""
+    report = _report(*(_clean_workload(f"w{i}", n=150) for i in range(3)))
+    passed, reasons = passes_b1r_gate(report, UNCALIBRATED_THRESHOLDS)
+    assert not passed
+    assert any("compared steps in total" in r for r in reasons)
+
+
+def test_gate_fails_on_a_raised_typical_gap_error() -> None:
+    """The reduction that actually discriminates. A bug that lifts the
+    whole distribution without producing any single spectacular step is
+    invisible to max() and obvious to p90/median."""
+    steps = [_step(i, gap=1.0) for i in range(512)]
+    report = _report(*(_workload(f"w{i}", steps) for i in range(3)))
+    passed, reasons = passes_b1r_gate(report, UNCALIBRATED_THRESHOLDS)
+    assert not passed
+    assert any("p90_gap_error" in r for r in reasons)
+    assert any("median_gap_error" in r for r in reasons)
+
+
+def test_max_gap_error_alone_cannot_separate_a_lifted_distribution() -> None:
+    """Pins the measured 2026-08-02 result that motivated adding p90: a
+    single outlier step puts max() above a uniformly-worse run's max, so
+    max() ranks the worse implementation as better."""
+    clean_with_outlier = [_step(i, gap=0.05) for i in range(511)] + [_step(511, gap=11.0)]
+    uniformly_worse = [_step(i, gap=1.0) for i in range(512)]
+    a = _report(*(_workload(f"w{i}", clean_with_outlier) for i in range(3)))
+    b = _report(*(_workload(f"w{i}", uniformly_worse) for i in range(3)))
+    assert a.max_gap_error > b.max_gap_error
+    assert a.p90_gap_error < b.p90_gap_error
 
 
 def test_gate_fails_on_a_single_confident_disagreement() -> None:
@@ -424,6 +458,57 @@ def test_gate_checks_logprob_error_against_the_sglang_comparable_bar() -> None:
     )
     assert not passed
     assert any("max_logprob_error" in r for r in reasons)
+
+
+def _with(**overrides) -> AgreementThresholds:
+    return AgreementThresholds.from_dict({**UNCALIBRATED_THRESHOLDS.to_dict(), **overrides})
+
+
+def test_gate_checks_the_nll_leg_when_gated() -> None:
+    clean = _report(*(_clean_workload(f"w{i}") for i in range(3)))
+    thresholds = _with(max_nll_relative_excess=0.01)
+    assert not passes_b1r_gate(clean, thresholds)[0]  # unmeasured
+    ok = AgreementReport(workloads=clean.workloads, nll_relative_excess=0.0001)
+    assert passes_b1r_gate(ok, thresholds)[0]
+    bad = AgreementReport(workloads=clean.workloads, nll_relative_excess=0.033)
+    passed, reasons = passes_b1r_gate(bad, thresholds)
+    assert not passed
+    assert any("nll_relative_excess" in r for r in reasons)
+
+
+def test_nll_leg_is_one_sided_like_vllms_ppl_tol() -> None:
+    """A candidate that is *better* than the reference is not a failure --
+    vllm/tests/models/language/generation_ppl_test/ppl_utils.py makes the
+    same choice explicitly ("We are not concerned that the vllm PPL is
+    less than Transformers")."""
+    clean = _report(*(_clean_workload(f"w{i}") for i in range(3)))
+    better = AgreementReport(workloads=clean.workloads, nll_relative_excess=-0.05)
+    assert passes_b1r_gate(better, _with(max_nll_relative_excess=0.01))[0]
+
+
+def test_gate_checks_the_logits_cosine_leg_when_gated() -> None:
+    clean = _report(*(_clean_workload(f"w{i}") for i in range(3)))
+    thresholds = _with(min_logits_cosine=0.999)
+    assert not passes_b1r_gate(clean, thresholds)[0]  # unmeasured
+    ok = AgreementReport(workloads=clean.workloads, min_logits_cosine=0.99987)
+    assert passes_b1r_gate(ok, thresholds)[0]
+    bad = AgreementReport(workloads=clean.workloads, min_logits_cosine=0.9955)
+    passed, reasons = passes_b1r_gate(bad, thresholds)
+    assert not passed
+    assert any("min_logits_cosine" in r for r in reasons)
+
+
+def test_report_round_trips_the_extra_legs(tmp_path) -> None:
+    report = AgreementReport(
+        workloads=(_clean_workload("w0", n=4),),
+        nll_relative_excess=0.0123,
+        min_logits_cosine=0.9987,
+    )
+    path = tmp_path / "agreement.json"
+    report.save(path)
+    loaded = AgreementReport.load(path)
+    assert loaded.nll_relative_excess == pytest.approx(0.0123)
+    assert loaded.min_logits_cosine == pytest.approx(0.9987)
 
 
 def test_thresholds_round_trip() -> None:

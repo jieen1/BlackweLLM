@@ -199,24 +199,50 @@ def measure_workload(
 
 
 def layer_scan(model, name: str, entry: dict) -> dict:
-    """Per-layer prefill cosine scan against HF's captured activations."""
+    """Per-layer prefill cosine scan against HF's captured activations.
+
+    Reports the hidden-state cosine curve and the logits entry
+    *separately*, and records which bar of the composite threshold
+    actually fired. A single "worst cosine over everything" number mixes
+    two different kinds of tensor and cannot tell a real divergence from a
+    mis-specified threshold -- which is exactly what the first run of this
+    script found (see docs/b1-correctness-criterion.md §5.4).
+    """
     mine_trace = Qwen36EngineCaptureSource(model=model).capture(list(entry["prompt_ids"]))
     mine_cpu = {
         layer: {k: v.detach().cpu().clone() for k, v in sub.items()}
         for layer, sub in mine_trace.items()
     }
     report = scan_layers(entry["hidden"], mine_cpu)
-    worst = min(
-        (s for layer in report.layers for s in layer.submodules),
-        key=lambda s: s.cosine_similarity,
-        default=None,
-    )
+
+    hidden = [
+        (layer.layer_idx, s)
+        for layer in report.layers
+        for s in layer.submodules
+        if s.submodule == "hidden_state"
+    ]
+    logits = [
+        s for layer in report.layers for s in layer.submodules if s.submodule == "logits"
+    ]
+    min_layer, min_verdict = min(hidden, key=lambda pair: pair[1].cosine_similarity)
+    first_reasons = []
+    if report.first_divergent_layer is not None:
+        layer = next(
+            item for item in report.layers if item.layer_idx == report.first_divergent_layer
+        )
+        first_reasons = [f"{s.submodule}: {s.reason()}" for s in layer.worst_submodules]
+
     return {
         "workload": name,
         "first_divergent_layer": report.first_divergent_layer,
-        "first_divergent_submodules": list(report.first_divergent_submodules),
-        "worst_cosine": None if worst is None else worst.cosine_similarity,
-        "worst_submodule": None if worst is None else worst.submodule,
+        "first_divergent_reasons": first_reasons,
+        "min_hidden_cosine": min_verdict.cosine_similarity,
+        "min_hidden_cosine_layer": min_layer,
+        "last_hidden_cosine": hidden[-1][1].cosine_similarity,
+        "max_hidden_rel_abs_error": max(s.rel_max_abs_error for _idx, s in hidden),
+        "logits_cosine": logits[0].cosine_similarity if logits else None,
+        "logits_top1_agreement": logits[0].top1_agreement if logits else None,
+        "logits_top5_agreement": logits[0].top5_agreement if logits else None,
     }
 
 
@@ -284,7 +310,8 @@ def run_config(
         "nll_relative_excess": report.metadata["nll_relative_excess"],
         "ppl_ours": report.metadata["ppl_ours"],
         "first_divergent_layer": [s["first_divergent_layer"] for s in scans],
-        "worst_cosine": min((s["worst_cosine"] for s in scans if s["worst_cosine"]), default=None),
+        "min_hidden_cosine": min(s["min_hidden_cosine"] for s in scans),
+        "logits_cosine": min(s["logits_cosine"] for s in scans),
         "tokens_outside_capture": len(capture_gaps),
         "elapsed_s": report.metadata["elapsed_s"],
     }
@@ -360,7 +387,7 @@ def main() -> None:
             f"drift={row['max_drift_ratio']:.3g} "
             f"nll_excess={row['nll_relative_excess']:+.4f} "
             f"ppl={row['ppl_ours']:.4g} "
-            f"layer={row['first_divergent_layer']} "
+            f"hcos={row['min_hidden_cosine']:.7f} lcos={row['logits_cosine']:.7f} "
             f"({row['elapsed_s']:.0f}s)"
         )
 

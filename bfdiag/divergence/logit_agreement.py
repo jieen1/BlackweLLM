@@ -356,6 +356,16 @@ class WorkloadAgreement:
         return _quantile(sorted(s.gap_error for s in self.steps), 0.99)
 
     @property
+    def p90_gap_error(self) -> float:
+        """The discriminative reduction. Measured 2026-08-02: a correct run
+        sits at 0.25 while every detectable injected bug lands at 0.8 or
+        above, whereas ``max_gap_error`` is dominated by a handful of
+        high-entropy steps and separates nothing (control 10.56, a
+        near-no-op injection 10.28 -- *lower* than the control). See
+        docs/b1-correctness-criterion.md §5."""
+        return _quantile(sorted(s.gap_error for s in self.steps), 0.90)
+
+    @property
     def median_gap_error(self) -> float:
         return _quantile(sorted(s.gap_error for s in self.steps), 0.5)
 
@@ -395,6 +405,17 @@ class WorkloadAgreement:
             return float("nan")
         return max(values)
 
+    @property
+    def p90_logprob_error(self) -> float:
+        """The reduction to compare against SGLang's published bar; ``max``
+        is dominated by a few high-entropy steps and separates nothing."""
+        values = [s.logprob_error for s in self.steps]
+        if not values:
+            return 0.0
+        if any(math.isnan(v) for v in values):
+            return float("nan")
+        return _quantile(sorted(values), 0.90)
+
     def drift_ratio(self, *, window: int = 128) -> float:
         """``median(gap_error)`` over the last ``window`` steps divided by
         the same over the first ``window`` steps.
@@ -426,6 +447,7 @@ class WorkloadAgreement:
                 "num_steps": self.num_steps,
                 "max_gap_error": self.max_gap_error,
                 "p99_gap_error": self.p99_gap_error,
+                "p90_gap_error": self.p90_gap_error,
                 "median_gap_error": self.median_gap_error,
                 "max_tie_slack_ulps": self.max_tie_slack_ulps,
                 "num_disagreements": self.num_disagreements,
@@ -457,29 +479,56 @@ class AgreementThresholds:
     as provisional.
     """
 
+    #: Gross-breakage guard only. Measured to have almost no discriminative
+    #: power (see WorkloadAgreement.p90_gap_error) -- kept because a value
+    #: in the tens still means something went badly wrong.
     max_gap_error: float
     p99_gap_error: float
+    #: The primary bar.
+    p90_gap_error: float
+    median_gap_error: float
     max_tie_slack_ulps: float
     max_disagreement_rate: float
     max_mean_kl_topk: float
     max_drift_ratio: float
+    #: R4: teacher-forced NLL excess over the HF reference, relative,
+    #: one-sided -- the shape vLLM uses (PPL_TOL = 0.01 in
+    #: tests/models/language/generation_ppl_test/ppl_utils.py). ``None``
+    #: leaves it ungated.
+    max_nll_relative_excess: float | None = None
+    #: R3: cosine of the prefill logits vector against HF's. ``None``
+    #: leaves it ungated.
+    min_logits_cosine: float | None = None
     #: ``None`` leaves the SGLang-comparable bar ungated (for reports whose
     #: caller did not supply logsumexp values). A float gates it, and an
     #: unmeasured (``nan``) value then fails rather than silently passing.
     max_logprob_error: float | None = None
-    min_steps_per_workload: int = 512
+    p90_logprob_error: float | None = None
+    #: Per-workload floor. NOT 512: HF's own greedy continuation hits EOS
+    #: at 140 tokens on one of the three B1 workloads (measured
+    #: 2026-08-02), so a 512-per-workload bar is unreachable for reasons
+    #: that have nothing to do with correctness. The real sample-size
+    #: requirement is expressed as ``min_total_steps``.
+    min_steps_per_workload: int = 128
+    min_total_steps: int = 600
     min_workloads: int = 3
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "max_gap_error": self.max_gap_error,
             "p99_gap_error": self.p99_gap_error,
+            "p90_gap_error": self.p90_gap_error,
+            "median_gap_error": self.median_gap_error,
             "max_tie_slack_ulps": self.max_tie_slack_ulps,
             "max_disagreement_rate": self.max_disagreement_rate,
             "max_mean_kl_topk": self.max_mean_kl_topk,
             "max_drift_ratio": self.max_drift_ratio,
             "max_logprob_error": self.max_logprob_error,
+            "p90_logprob_error": self.p90_logprob_error,
+            "max_nll_relative_excess": self.max_nll_relative_excess,
+            "min_logits_cosine": self.min_logits_cosine,
             "min_steps_per_workload": self.min_steps_per_workload,
+            "min_total_steps": self.min_total_steps,
             "min_workloads": self.min_workloads,
         }
 
@@ -495,10 +544,51 @@ class AgreementThresholds:
 UNCALIBRATED_THRESHOLDS = AgreementThresholds(
     max_gap_error=1.0,
     p99_gap_error=0.5,
+    p90_gap_error=0.4,
+    median_gap_error=0.3,
     max_tie_slack_ulps=8.0,
     max_disagreement_rate=0.05,
     max_mean_kl_topk=0.01,
     max_drift_ratio=4.0,
+)
+
+#: Calibrated on real hardware, 2026-08-02, from a 652-step control run
+#: (3 workloads x 256 steps, one of them EOS-truncated at 140) against the
+#: HF reference, plus a 16-configuration injected-bug sweep. Every number
+#: below is `control x safety factor`, chosen to sit strictly between the
+#: control and the *weakest injected bug that is above the noise floor*;
+#: the measured separations are in docs/b1-correctness-criterion.md §5.
+#:
+#: Control            | weakest detected bug     | bar here
+#: p90 0.250          | 0.812 (stale-every:64)   | 0.5
+#: p99 3.375          | 9.03                     | 6.0
+#: median 0.125       | 0.250                    | 0.25
+#: max 10.56          | 14.53                    | 20.0   (gross guard only)
+#: tie slack 8 ULP    | 106 ULP                  | 32
+#: mean KL 1.58e-3    | 1.80e-2                  | 5e-3
+#: p90 logprob 0.250  | 0.79                     | 0.5
+#: drift 1.50         | 3.42 (decay:0.05)        | 3.0    (specialised)
+#: rate 0.0077        | 0.0169                   | 0.03   (weak, see below)
+#: NLL excess -0.003% | +3.32% (drop-q-norm)     | 1%     (= vLLM PPL_TOL)
+#: logits cos .999873 | 0.9955 (drop-q-norm)     | 0.9995
+#:
+#: `max_disagreement_rate` is kept deliberately loose and must NOT be read
+#: as a real bar: at this sample size the control produced 5 flips and the
+#: weakest detected bug 11, so the two distributions overlap. It is
+#: reported because a systematically biased implementation would inflate
+#: it, and gated only loosely enough to catch gross cases.
+CALIBRATED_THRESHOLDS = AgreementThresholds(
+    max_gap_error=20.0,
+    p99_gap_error=6.0,
+    p90_gap_error=0.5,
+    median_gap_error=0.25,
+    max_tie_slack_ulps=32.0,
+    max_disagreement_rate=0.03,
+    max_mean_kl_topk=5e-3,
+    max_drift_ratio=3.0,
+    p90_logprob_error=0.5,
+    max_nll_relative_excess=0.01,
+    min_logits_cosine=0.9995,
 )
 
 
@@ -506,6 +596,14 @@ UNCALIBRATED_THRESHOLDS = AgreementThresholds(
 class AgreementReport:
     workloads: tuple[WorkloadAgreement, ...] = field(default_factory=tuple)
     metadata: dict[str, Any] = field(default_factory=dict)
+    #: R4 and R3 scalars, carried here so ``passes_b1r_gate`` is the single
+    #: entry point for the whole criterion rather than one of four.
+    nll_relative_excess: float | None = None
+    min_logits_cosine: float | None = None
+
+    @property
+    def total_steps(self) -> int:
+        return sum(w.num_steps for w in self.workloads)
 
     @property
     def max_gap_error(self) -> float:
@@ -515,6 +613,16 @@ class AgreementReport:
     def p99_gap_error(self) -> float:
         combined = sorted(s.gap_error for w in self.workloads for s in w.steps)
         return _quantile(combined, 0.99)
+
+    @property
+    def p90_gap_error(self) -> float:
+        combined = sorted(s.gap_error for w in self.workloads for s in w.steps)
+        return _quantile(combined, 0.90)
+
+    @property
+    def median_gap_error(self) -> float:
+        combined = sorted(s.gap_error for w in self.workloads for s in w.steps)
+        return _quantile(combined, 0.50)
 
     @property
     def max_tie_slack_ulps(self) -> float:
@@ -547,19 +655,64 @@ class AgreementReport:
             return float("nan")
         return max(values)
 
+    @property
+    def p90_logprob_error(self) -> float:
+        values = [s.logprob_error for w in self.workloads for s in w.steps]
+        if not values:
+            return 0.0
+        if any(math.isnan(v) for v in values):
+            return float("nan")
+        return _quantile(sorted(values), 0.90)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "metadata": dict(self.metadata),
+            "nll_relative_excess": self.nll_relative_excess,
+            "min_logits_cosine": self.min_logits_cosine,
             "workloads": [w.to_dict() for w in self.workloads],
             "summary": {
+                "total_steps": self.total_steps,
                 "max_gap_error": self.max_gap_error,
                 "p99_gap_error": self.p99_gap_error,
+                "p90_gap_error": self.p90_gap_error,
+                "median_gap_error": self.median_gap_error,
                 "max_tie_slack_ulps": self.max_tie_slack_ulps,
                 "disagreement_rate": self.disagreement_rate,
                 "mean_kl_topk": self.mean_kl_topk,
                 "max_logprob_error": self.max_logprob_error,
                 "max_drift_ratio": self.max_drift_ratio,
             },
+        }
+
+    def summary_metrics(self) -> dict[str, float]:
+        """Every scalar the gate reads, in one flat mapping.
+
+        Splitting this out is what lets a recorded run be re-judged later
+        without keeping (or re-running) the full per-step trace: the
+        injected-bug sweep is checked into
+        ``tests/fixtures/b1_injection_sweep_2026-08-02.json`` as exactly
+        these mappings and replayed through :func:`evaluate_summary`, the
+        same code path a live run uses. A calibration that stops
+        separating -- because someone widened a bar -- then fails in CI on
+        a CPU, without a GPU or a 27B checkpoint.
+        """
+        return {
+            "max_gap_error": self.max_gap_error,
+            "p99_gap_error": self.p99_gap_error,
+            "p90_gap_error": self.p90_gap_error,
+            "median_gap_error": self.median_gap_error,
+            "max_tie_slack_ulps": self.max_tie_slack_ulps,
+            "disagreement_rate": self.disagreement_rate,
+            "mean_kl_topk": self.mean_kl_topk,
+            "max_drift_ratio": self.max_drift_ratio,
+            "max_logprob_error": self.max_logprob_error,
+            "p90_logprob_error": self.p90_logprob_error,
+            "nll_relative_excess": (
+                float("nan") if self.nll_relative_excess is None else self.nll_relative_excess
+            ),
+            "min_logits_cosine": (
+                float("nan") if self.min_logits_cosine is None else self.min_logits_cosine
+            ),
         }
 
     def save(self, path: str | Path) -> None:
@@ -572,19 +725,66 @@ class AgreementReport:
         return cls(
             workloads=tuple(WorkloadAgreement.from_dict(w) for w in data["workloads"]),
             metadata=dict(data.get("metadata", {})),
+            nll_relative_excess=data.get("nll_relative_excess"),
+            min_logits_cosine=data.get("min_logits_cosine"),
         )
+
+
+#: ``(metric name, threshold attribute, comparison)`` for every numeric
+#: bar. ``"max"`` means "measured must not exceed the bar", ``"min"`` means
+#: "measured must not fall below it".
+_NUMERIC_BARS: tuple[tuple[str, str, str], ...] = (
+    ("max_gap_error", "max_gap_error", "max"),
+    ("p99_gap_error", "p99_gap_error", "max"),
+    ("p90_gap_error", "p90_gap_error", "max"),
+    ("median_gap_error", "median_gap_error", "max"),
+    ("max_tie_slack_ulps", "max_tie_slack_ulps", "max"),
+    ("disagreement_rate", "max_disagreement_rate", "max"),
+    ("mean_kl_topk", "max_mean_kl_topk", "max"),
+    ("max_logprob_error", "max_logprob_error", "max"),
+    ("p90_logprob_error", "p90_logprob_error", "max"),
+    ("max_drift_ratio", "max_drift_ratio", "max"),
+    ("nll_relative_excess", "max_nll_relative_excess", "max"),
+    ("min_logits_cosine", "min_logits_cosine", "min"),
+)
+
+
+def evaluate_summary(
+    metrics: Mapping[str, float], thresholds: AgreementThresholds
+) -> tuple[bool, tuple[str, ...]]:
+    """Judge one run's summary metrics. Returns ``(passed, reasons)``.
+
+    Every bar is checked (no short-circuit) so one run tells the reader
+    *everything* that is out of band, not just the first thing -- the
+    injected-bug experiment reads the whole list to show which legs of the
+    criterion each bug trips.
+
+    A bar whose threshold is ``None`` is not gated. A bar that IS gated but
+    whose measurement is missing or ``nan`` fails: a check that silently
+    passes because nobody measured it is the exact shape of dead gate that
+    ``docs/e2e-and-quality-plan.md`` §3.2 (C8) exists to hunt down.
+    """
+    reasons: list[str] = []
+    for metric, attribute, direction in _NUMERIC_BARS:
+        bar = getattr(thresholds, attribute)
+        if bar is None:
+            continue
+        measured = metrics.get(metric)
+        if measured is None or math.isnan(measured):
+            reasons.append(f"{metric} is gated but was not measured")
+            continue
+        if direction == "max" and measured > bar:
+            reasons.append(f"{metric}={measured:.6g} > {bar:.6g}")
+        elif direction == "min" and measured < bar:
+            reasons.append(f"{metric}={measured:.8g} < {bar:.8g}")
+    return (not reasons), tuple(reasons)
 
 
 def passes_b1r_gate(
     report: AgreementReport, thresholds: AgreementThresholds
 ) -> tuple[bool, tuple[str, ...]]:
-    """Evaluate the B1-R gate. Returns ``(passed, failure_reasons)``.
-
-    Every bar is checked (no short-circuit) so one run tells the reader
-    *everything* that is out of band, not just the first thing -- the
-    injected-bug experiment in ``docs/b1-correctness-criterion.md`` reads
-    the whole list to show which legs of the criterion each bug trips.
-    """
+    """Evaluate the B1-R gate on a live report: shape checks (enough
+    workloads, enough steps) followed by :func:`evaluate_summary`."""
     reasons: list[str] = []
 
     if len(report.workloads) < thresholds.min_workloads:
@@ -604,43 +804,14 @@ def passes_b1r_gate(
                 f"{thresholds.min_steps_per_workload} steps: {names}"
             ]
         )
-
-    if report.max_gap_error > thresholds.max_gap_error:
-        reasons.append(
-            f"max_gap_error={report.max_gap_error:.6g} > {thresholds.max_gap_error:.6g}"
-        )
-    if report.p99_gap_error > thresholds.p99_gap_error:
-        reasons.append(
-            f"p99_gap_error={report.p99_gap_error:.6g} > {thresholds.p99_gap_error:.6g}"
-        )
-    if report.max_tie_slack_ulps > thresholds.max_tie_slack_ulps:
-        reasons.append(
-            f"max_tie_slack_ulps={report.max_tie_slack_ulps:.4g} > "
-            f"{thresholds.max_tie_slack_ulps:.4g}"
-        )
-    if report.disagreement_rate > thresholds.max_disagreement_rate:
-        reasons.append(
-            f"disagreement_rate={report.disagreement_rate:.4g} > "
-            f"{thresholds.max_disagreement_rate:.4g}"
-        )
-    if report.mean_kl_topk > thresholds.max_mean_kl_topk:
-        reasons.append(
-            f"mean_kl_topk={report.mean_kl_topk:.6g} > {thresholds.max_mean_kl_topk:.6g}"
-        )
-    if thresholds.max_logprob_error is not None:
-        measured = report.max_logprob_error
-        if math.isnan(measured):
-            reasons.append(
-                "max_logprob_error is gated but was not measured (no logsumexp supplied)"
-            )
-        elif measured > thresholds.max_logprob_error:
-            reasons.append(
-                f"max_logprob_error={measured:.6g} > {thresholds.max_logprob_error:.6g}"
-            )
-    if report.max_drift_ratio > thresholds.max_drift_ratio:
-        reasons.append(
-            f"max_drift_ratio={report.max_drift_ratio:.4g} > "
-            f"{thresholds.max_drift_ratio:.4g}"
+    if report.total_steps < thresholds.min_total_steps:
+        return False, tuple(
+            reasons
+            + [
+                f"only {report.total_steps} compared steps in total, gate requires "
+                f">= {thresholds.min_total_steps}"
+            ]
         )
 
-    return (not reasons), tuple(reasons)
+    passed, bar_reasons = evaluate_summary(report.summary_metrics(), thresholds)
+    return (not reasons and passed), tuple(reasons) + bar_reasons
