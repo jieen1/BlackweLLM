@@ -1,5 +1,16 @@
 # Prefix Cache — Architecture & Phased Implementation Plan
 
+> ⚠️ **数字更正（2026-08-02）：本文档中的 ~151 MB 是按 FP32 递归状态估的，实际是 BF16，
+> 真值约 76 MiB，恰好一半。** B0-4 已确认 Qwen3.6 的 GDN state dtype 为 BF16
+> （机制："单步 FP32 计算 + 跨步 BF16 舍入"）；B0-7 的容量表里 FP32 行正是
+> 144.0 + 7.5 = **151.5 MiB**，BF16 行是 72.0 + 3.75 = **75.75 MiB**。
+> B2 从真实 config 独立重算得到 ~77 MiB，与 BF16 行一致。
+>
+> 因此本文档所有由 151 MB 派生的数字都应对折：R8 的"256K 全 checkpoint ≈ 4.8 GB/前缀"
+> 实际约 **2.4 GB**。风险方向不变，量级减半。
+> 见 `notes/2026-08-02-trackB-b0-facts.md` §B0-7 与 `docs/implementation-plan.md` §7.1。
+
+
 Status: **DESIGN, not yet built.** This is the durable reference the
 implementation phases follow. It supersedes the "do not build it now"
 recommendation in `notes/2026-07-18-session-review-and-next-steps.md`
