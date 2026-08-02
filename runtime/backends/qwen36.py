@@ -179,7 +179,16 @@ class Qwen36Backend:
                 "block-aligned and must not straddle a page"
             )
         self.max_seq_len = self.pool.max_seq_len
-        self.pool.ensure_decode_workspaces(max_batch=num_slots)
+        if self.device.type == "cuda":
+            self.pool.ensure_decode_workspaces(max_batch=num_slots)
+        # else: sparkinfer's paged workspaces are CUDA-only, so there is
+        # nothing to build. A CPU-device backend is not a fallback execution
+        # path -- any forward will fail inside the kernel, loudly. It exists
+        # so the slot/prefix/checkpoint bookkeeping below, which is pure
+        # Python and is where the silent-corruption failure modes live
+        # (INV-A3-1/2/3), can be tested deterministically against a stub
+        # model instead of only against a 50 GiB checkpoint on a contended
+        # GPU. See tests/test_qwen36_backend.py.
 
         # -- prefix cache bookkeeping (same shape as LagunaBackend's) ------
         self._prefix_cache_tokens: list[list[int] | None] = [None] * num_slots
@@ -659,6 +668,14 @@ class Qwen36Backend:
         if len(tokens) < kv_len:
             return
         self._evict_checkpoint(slot)
+        # Nothing is ever ``pin``ned. INV-A3-4 protects resources with a live
+        # reference, and a checkpoint is not one: the live recurrent state is
+        # the slot's own pool row, which is not a cache and is not reachable
+        # by any eviction path at all. A checkpoint is a *copy* taken at an
+        # older boundary, so evicting one while its slot generates costs a
+        # future would-be hit and nothing else. Pinning every busy slot's
+        # checkpoint would instead make the budget unenforceable exactly when
+        # it matters (all slots busy), which is the opposite of a budget.
         self.checkpoint_pool.evict_for_budget(self._checkpoint_bytes)
         key = (slot, kv_len)
         self.checkpoint_pool.register(
