@@ -65,8 +65,26 @@ class TestFormatIsPartOfTheGate:
         )
 
     def test_supported_format_still_resolves(self):
-        resolution = resolve_config(_config("compressed-tensors", "mixed-precision"))
+        resolution = resolve_config(_config("compressed-tensors", "nvfp4-pack-quantized"))
         assert resolution.loader == "compressed_tensors"
+
+    def test_mixed_precision_is_refused_for_a_different_reason(self):
+        """Two refusals, two causes -- the message must not conflate them.
+
+        ``pack-quantized`` is refused because loading it would be silently
+        wrong. ``mixed-precision`` is refused because no adapter exists, which
+        is a scoped piece of work rather than a correctness risk. Someone
+        deciding whether to add support needs to know which they are looking
+        at.
+        """
+        with pytest.raises(UnsupportedArchitectureError) as excinfo:
+            resolve_config(_config("compressed-tensors", "mixed-precision"))
+        message = str(excinfo.value)
+        assert "no adapter exists yet" in message
+        assert "zero point" not in message, (
+            "the mixed-precision refusal borrowed pack-quantized's reason; they "
+            "fail for opposite causes"
+        )
 
     def test_method_without_subformat_still_resolves(self):
         resolution = resolve_config(_config("modelopt", None))

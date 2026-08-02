@@ -69,8 +69,45 @@ LOADER_FOR_QUANT_METHOD = {
 #: So the gate is the (method, format) pair, and an unlisted format is refused
 #: rather than assumed compatible. ``None`` means the method carries no
 #: sub-format (modelopt).
+#: ⚠️ ``mixed-precision`` was listed here on 2026-08-02 and removed the same
+#: day. The registry accepted it, and then ``load_weights`` failed with
+#: "168 parameter(s) never received a checkpoint tensor" -- because
+#: ``runtime/loading/compressed_tensors.py`` only handles Laguna's
+#: ``nvfp4-pack-quantized`` and says so in its own docstring ("Not yet
+#: exercised by a second real quantization format"). unsloth's layout names
+#: its NVFP4 weights ``weight_packed``/``weight_global_scale``/
+#: ``input_global_scale`` where the loader looks for ``.weight``, and 168 is
+#: exactly the count of ``weight_packed`` tensors in that checkpoint.
+#:
+#: Listing a format the loader cannot load turns a question answerable at
+#: resolve time into a confusing failure much later. Restore it in the same
+#: change that adds the adapter, not before.
+#: Why a specific known-but-unsupported format is refused. Generic text would
+#: be worse than useless here: the two refusals below fail for opposite
+#: reasons, and telling them apart is what decides whether adding the format
+#: is a loader task or a correctness problem.
+_WHY_REFUSED: dict[str | None, str] = {
+    "pack-quantized": (
+        "Refusing rather than loading: this is group-wise INT4 with an "
+        "asymmetric zero point (weight_zero_point), which nothing here "
+        "models. Every tensor "
+        "the loader looks for is present, so it would pass the "
+        "all-params-loaded assertion and still dequantize every weight as if "
+        "it were symmetric -- wrong output, no error."
+    ),
+    "mixed-precision": (
+        "Refusing rather than loading: no adapter exists yet. This layout names "
+        "its NVFP4 weights weight_packed/weight_global_scale/input_global_scale "
+        "where runtime/loading/compressed_tensors.py looks for .weight, so the "
+        "load fails partway with 'N parameter(s) never received a checkpoint "
+        "tensor'. Answering here rather than there is the only difference; "
+        "adding the adapter is a scoped piece of work, not a correctness risk."
+    ),
+}
+
+
 SUPPORTED_QUANT_FORMATS: dict[str, frozenset[str | None]] = {
-    "compressed-tensors": frozenset({"nvfp4-pack-quantized", "mixed-precision", None}),
+    "compressed-tensors": frozenset({"nvfp4-pack-quantized", None}),
     "modelopt": frozenset({None}),
 }
 
@@ -152,11 +189,12 @@ def _loader_for(spec: ArchitectureSpec) -> str:
             f"quantization method {spec.quant.method!r} format "
             f"{spec.quant.format!r} has no loader adapter; supported formats for "
             f"this method are {sorted(f for f in allowed if f is not None) or ['(none)']}. "
-            "Refusing rather than loading: the formats inside this method carry "
-            "different per-layer tensors, and one of them (pack-quantized) is "
-            "asymmetric INT4 whose zero point this runtime does not model -- "
-            "loading it would pass the all-params-loaded assertion and still "
-            "produce wrong weights."
+            + _WHY_REFUSED.get(
+                spec.quant.format,
+                "Refusing rather than loading: the formats inside a quantization "
+                "method carry different per-layer tensors and are not "
+                "interchangeable.",
+            )
         )
     return loader
 

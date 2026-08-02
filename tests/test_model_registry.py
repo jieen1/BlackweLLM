@@ -17,7 +17,6 @@ from tests.test_architecture_spec import (
     LAGUNA,
     QWEN_OFFICIAL,
     QWEN_TEXT_MTP,
-    QWEN_UNSLOTH,
     load_config,
     minimal_config,
 )
@@ -117,7 +116,13 @@ class TestQwen36Resolves:
     def test_multimodal_builds_resolve_and_the_vision_gate_does_not_fire(self):
         # B0-1b: a vision tower in config.json is no longer a refusal --
         # the loader runs language_model_only and the tensors are filtered.
-        for repo in (QWEN_OFFICIAL, QWEN_UNSLOTH):
+        #
+        # QWEN_UNSLOTH was dropped from this loop on 2026-08-02: its
+        # compressed-tensors/mixed-precision layout now refuses at resolve
+        # time because no loader adapter exists for it. Keeping it here would
+        # make a vision-gate test fail for a quantization reason, which tells
+        # the next reader nothing about the vision gate.
+        for repo in (QWEN_OFFICIAL,):
             resolution = resolve_config(load_config(repo))
             assert resolution.backend == "qwen36"
             assert resolution.spec.has_vision_tower is True
