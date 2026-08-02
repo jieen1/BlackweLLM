@@ -126,18 +126,21 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
 - [ ] 并发/批量下的 CG 收益未测（本轮只测了单并发单请求解码）。
 - [ ] MTP：默认 K 已从 8 改到 4（`f616029`，K 曲线实测 prose 1.11× / code 1.38×）；
       重同步 A/B 数据待回（代码在 `work/mtp-resync-20260802` 的 `aed0e2d`，无数据）
-- [ ] ⚠️ **全部 MTP 接受率数字都是在非标准 checkpoint（`nvidia/`）上测的，需要在标准
-      模型上重测。** 两个发布方的 NVFP4 **不是同一份权重的两次量化**：`nvidia/` 是
-      全模型统一 NVFP4，`unsloth/` 是混合布局（多数投影走 int8/float8-dynamic，
-      NVFP4 只覆盖 56–63 层的 `mlp.(gate|up|down)_proj`）。
-      **这个对照此前做不了**——`scripts/mtpfix_unsloth_checkpoint_probe.py` 在加载就死
-      （`168 parameter(s) never received a checkpoint tensor`），因为当时没有
-      mixed-precision adapter。**该 adapter 本日已合入（`ca50017`），阻塞已解除，
-      这个实验现在第一次可做。**
-      ⚠️ 注意别把历史的 "~4.0/4 (K=3)" 当靶子：那个数字出自历史仓库 47 个
-      unsloth benchmark 脚本，与今天的测法**不可比**（128K 前缀 / c=4 vs 512 token
-      单槽），该对照已于 2026-08-02 明确撤回。**重测是为了拿到标准模型自己的数，
-      不是为了追那个数。**
+- [x] ~~全部 MTP 接受率数字都测自非标准 checkpoint，需在标准模型上重测~~
+      —— **已重测，checkpoint 发布方假说被证伪。**
+      标准模型 K=4：prose 接受率 30.0%、每轮平均接受 **1.20**；code 41.7%、**1.67**。
+      与 `nvidia/` K=8 的记录对齐着看跨 K 可比的"每轮平均接受"：
+      **prose 1.21 vs 1.20，几乎完全相同。** 草稿头在哪个 checkpoint 上都只蒙对 ~1.2 个
+      token。历史 "~4.0/4" 换 checkpoint 也追不回，**别再当靶子**。
+      正确性通过（投机与非投机 committed 序列逐 token 相同）。
+      详见 [`../notes/2026-08-03-mtp-acceptance-on-standard-checkpoint.md`](../notes/2026-08-03-mtp-acceptance-on-standard-checkpoint.md)。
+      ⚠️ code 那一行 K 不同（8 vs 4）**不构成结论**，需同 K 重测。
+- [ ] ⚠️ **MTP 的 e2e 收益仍然未知：现有全部 MTP 数字的基线也是 eager 的。**
+      本次非投机基线 5.97–6.02 tok/s，正是 eager；服务路径开 CG 是 28.85 tok/s。
+      这对投机**不是无关缩放**——MTP 赚不赚取决于"一次 verify 是否比 K 次顺序 decode 便宜"，
+      而 CG 恰好把 decode 那侧改了 4.71×。**分母变了，0.83×/1.07× 不能外推到生产。**
+      （接受率结论不受影响：那是权重性质，与 CG 无关。）
+      **这是本 session 第二次踩到同一形状的问题——基线跑 eager，结论当成运行时性质。**
 
 ### 阶段 4 · Kernel 深度适配，压榨 SM120
 - [x] **目标已达成，但走的不是原处方的路。** 原文要求稠密 NVFP4 层改用
