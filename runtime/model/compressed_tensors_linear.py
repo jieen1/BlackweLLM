@@ -171,6 +171,32 @@ class CompressedTensorsNVFP4Linear(nn.Module):
         self.weight_global_scale = nn.Parameter(
             torch.empty((), dtype=torch.float32), requires_grad=False
         )
+        # Activation-side static global scale for this checkpoint's genuine
+        # W4A4 scheme (`config_groups.group_1.input_activations`: num_bits=4,
+        # strategy=tensor_group, group_size=16, dynamic="local" -- a
+        # calibrated per-tensor scale with the per-block e4m3 scale computed
+        # at runtime, exactly `quantize_grouped_nvfp4_torch`'s two-level
+        # design). Loaded but not read by this class's own `forward()` --
+        # same "checkpoint data present, not this class's job" split as
+        # `weight_global_scale` before this Parameter existed (see class
+        # docstring). Consumer is `nvfp4_w4a4_components_for_fuse` below,
+        # used only by the diagnostic scripts
+        # `scripts/verify_nvfp4_w4a4_gemm_single_layer.py` /
+        # `scripts/verify_nvfp4_w4a4_gemm_full_model_gap.py`
+        # (2026-08-03, ``work/w4a4-20260803``): routing this checkpoint's
+        # MLP through a genuine W4A4 ``sparkinfer.gemm.blockscaled.mm`` GEMM
+        # measured cosine ~0.988 at the single-layer level (vs ~0.99999 for
+        # the production W4A16 path) and **failed B1-R's calibrated
+        # gap-error bars** at the full-model level (median/p90/p90-logprob
+        # all over their bars; one of three workloads diverged badly enough
+        # to overflow the diagnostic's top-1024 capture window). Not wired
+        # into `Qwen36MLP.forward` for that reason -- this Parameter and the
+        # method below are kept because they are correct, real checkpoint
+        # data, and load-bearing evidence for that negative result, not
+        # because anything reads them in production.
+        self.input_global_scale = nn.Parameter(
+            torch.empty((), dtype=torch.float32), requires_grad=False
+        )
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size, dtype=torch.bfloat16))
         else:
@@ -179,6 +205,7 @@ class CompressedTensorsNVFP4Linear(nn.Module):
         self.weight_packed.weight_loader = default_weight_loader
         self.weight_scale.weight_loader = default_weight_loader
         self.weight_global_scale.weight_loader = default_weight_loader
+        self.input_global_scale.weight_loader = default_weight_loader
         if self.bias is not None:
             self.bias.weight_loader = default_weight_loader
 
@@ -229,18 +256,79 @@ class CompressedTensorsNVFP4Linear(nn.Module):
         )
         return self.weight_packed.data, self.weight_scale.data, reciprocal_global_scale
 
+    def nvfp4_w4a4_components_for_fuse(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(packed_weight, block_scale, weight_global_scale,
+        input_global_scale)`` **verbatim, unreciprocated**, for a genuine
+        W4A4 ``sparkinfer.gemm.blockscaled.mm`` GEMM (both operands
+        pre-quantized) -- a different convention from
+        :meth:`nvfp4_components_for_fuse` above, which reciprocates
+        ``weight_global_scale`` to match ``dequantize_nvfp4``'s
+        direct-multiplier convention for the W4A16 dequant-inside-kernel
+        path.
+
+        **Not called from ``Qwen36MLP.forward`` or any other production
+        path** -- only from the two diagnostic scripts named in this
+        Parameter's own declaration comment above. The W4A4 investigation
+        this method was built for (2026-08-03, ``work/w4a4-20260803``)
+        concluded negatively: correct as far as it goes (this convention IS
+        the one that produces sane output, see below), but genuinely
+        quantizing the activation to 4-bit NVFP4 costs enough precision,
+        compounded over 56 MLP layers x 3 GEMMs each, to fail B1-R's
+        calibrated gap-error bars at the full-model level. Kept for the
+        record and in case a future, more precise activation-quantization
+        recipe revisits this -- not because production reads it.
+
+        ``blockscaled.mm``'s own operand-building convention (matching
+        ``sparkinfer._lib.intrinsics.quantize_grouped_nvfp4_torch`` and its
+        oracle test, ``tests/gemm/test_blockscaled.py::_make_quantized_operand``)
+        is: ``global_scale`` is the value that maps a block's real amax onto
+        the e4m3 grid (``scale = global_scale * block_max / 6``, clipped),
+        and the GEMM's ``alpha = 1 / (weight_gs * activation_gs)`` undoes
+        *both* operands' global scales in one shot after the block-scaled
+        MMA has already applied each operand's per-block e4m3 scale
+        in-kernel. That is ``weight_global_scale`` used directly, not its
+        reciprocal -- confirmed by working the checkpoint's own arithmetic
+        backward from :meth:`nvfp4_components_for_fuse` (whose reciprocal is
+        independently verified correct for the BF16-dequant path): if
+        ``dequantize_nvfp4``'s ``per_block = weight_scale * (1 /
+        weight_global_scale)`` is the right per-element multiplier, and
+        ``quantize_grouped_nvfp4_torch`` defines that same multiplier as
+        ``scale / global_scale``, then ``weight_global_scale ==
+        global_scale`` (the un-reciprocated quantizer-side value) --
+        checked against a real layer's numbers in
+        ``scripts/verify_nvfp4_w4a4_gemm_single_layer.py`` (GPU, real
+        checkpoint weights), not just derived on paper.
+
+        ``input_global_scale`` (this checkpoint's genuine W4A4 activation
+        scale, ``config_groups.group_1.input_activations``) is assumed to
+        follow the **same** un-reciprocated convention as
+        ``weight_global_scale`` (both are this checkpoint's own calibration
+        output, produced by the same quantization tool) -- also verified
+        numerically by the same script rather than only by analogy, per
+        this class's own docstring note that guessing this backward
+        produces plausible-looking garbage (the ``"!!!!!!!!!!!!"`` bug).
+        """
+        global_scale = self.weight_global_scale.data.reshape(()).to(torch.float32)
+        input_global_scale = self.input_global_scale.data.reshape(()).to(torch.float32)
+        return self.weight_packed.data, self.weight_scale.data, global_scale, input_global_scale
+
     def free_nvfp4_raw_params(self) -> None:
         """Zero out this Linear's raw NVFP4 Parameter storage
-        (``.weight_packed``/``.weight_scale``/``.weight_global_scale``) in
-        place -- called by ``Qwen36MLP._free_raw_nvfp4_weights`` once the
-        fused w13/w2 representation built from
-        :meth:`nvfp4_components_for_fuse` no longer needs them. Same
-        discipline as :meth:`~runtime.model.modelopt_linear.
+        (``.weight_packed``/``.weight_scale``/``.weight_global_scale``/
+        ``.input_global_scale``) in place -- called by
+        ``Qwen36MLP._free_raw_nvfp4_weights`` once the fused w13/w2
+        representation built from :meth:`nvfp4_components_for_fuse` (or, for
+        the W4A4 path, :meth:`nvfp4_w4a4_components_for_fuse`) no longer
+        needs them. Same discipline as :meth:`~runtime.model.modelopt_linear.
         ModelOptNVFP4Linear.free_nvfp4_raw_params` -- see that method's
         docstring; the only difference is this format's own Parameter
         names (``weight_packed``/``weight_global_scale`` rather than
-        ``weight``/``weight_scale_2``).
+        ``weight``/``weight_scale_2``, plus this format's extra
+        ``input_global_scale``, which modelopt's weight-only checkpoint
+        does not have).
         """
-        for name in ("weight_packed", "weight_scale", "weight_global_scale"):
+        for name in ("weight_packed", "weight_scale", "weight_global_scale", "input_global_scale"):
             param = getattr(self, name)
             param.data = param.data.new_empty(0)
