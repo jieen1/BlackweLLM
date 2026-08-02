@@ -48,6 +48,34 @@ independently confirmed against this specific model class in this pass**
 behavior here was not checked against a live run before this was
 written) -- the first thing to verify on GPU, before trusting any
 reported divergence layer number.
+
+⚠️ **Measured on GPU 2026-08-02. The answer: right for layers 0..62,
+wrong for the last one.** Real capture against
+``nvidia/Qwen3.6-27B-NVFP4`` (evidence in
+``docs/b1-correctness-criterion.md`` §5.4) gives ``cos >= 0.99994`` at
+every layer 0..62 -- the ``i + 1`` offset above is correct -- but
+``cos ~= 0.975`` at layer 63, on a run whose final logits agree at
+``cos = 0.99993`` and whose NLL matches HF's to 2.5e-5 relative.
+Qwen3_5TextModel IS one of the families that applies the final norm to the
+last ``output_hidden_states`` entry: HF's per-token RMS runs 3.07 / 3.33 /
+4.23 / 3.47 / 4.01 / 4.32 / 5.03 across layers 56..62 and then drops to
+1.97 at 63, which is the signature of the normalisation, not of a
+divergence. So this module currently compares our PRE-final-norm layer-63
+output against HF's POST-final-norm one. **Do not read the layer-63
+hidden-state verdict as a correctness signal until this is fixed**; layers
+0..62 and the ``logits`` entry are trustworthy, and the B1-R gate
+therefore gates on the ``logits`` entry only.
+
+A second, independent defect found in the same run, in
+``bfdiag/divergence/thresholds.py`` rather than here:
+``_BASE_THRESHOLDS[HIDDEN_STATE].max_rel_abs_error = 0.02`` is unreachable
+for a real bf16 residual stream. A *correct* run measures 0.33 at layer 0
+while its cosine is 0.9999957, so ``scan_layers`` reports
+``first_divergent_layer=0`` on a clean model -- and reports it identically
+on an injected-bug model, i.e. zero discriminative power. Both defects are
+left unfixed deliberately: neither fix can be re-verified without a GPU
+window, and shipping an unverified change to a diagnostic is how a gate
+becomes decorative in the first place.
 """
 
 from __future__ import annotations
