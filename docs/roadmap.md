@@ -69,45 +69,74 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
 
 **四个阶段，顺序不能颠倒**：
 
-### 阶段 1 · 完整支持（进行中）
-- [ ] `resolve_checkpoint(unsloth)` 放行 —— ⚠️ 目前被拒。`mixed-precision` 于本日被我
-      从 `SUPPORTED_QUANT_FORMATS` 移除（理由是"门禁不该承诺 loader 做不到的事"，理由本身
-      成立，但**正确解法是补 loader 而不是缩门禁**，我选了省事的那个）
-- [ ] `load_weights` 零缺失零多余（现缺 168 个 `weight_packed`）
-      —— 🔧 adapter 已写(`work/mixedprec-loader-20260802` 的 `ca50017`)，**未验证**
-- [ ] 能出连贯输出 + C-LIVE 通过
-      —— 🔴 **首次实跑输出是退化的:两个 prompt 都产出 `"!!!!!!!!!!!!"`**。
-      写它的 agent 明确说"这不能证明正确性"，并正准备用已知可用的 `nvidia/` checkpoint
-      跑同一脚本做对照，以隔离"adapter 的真 bug"还是"无关伪影(例如对指令模型做裸补全)"
-      —— 隔离没做完就被中断。**恢复这条时第一件事就是把那个对照跑完**，
-      不要拿"能加载"当"支持"。
-- **判据**：这四条全通才算"支持"，不是"能加载"
+> **2026-08-03 复核**：本节多数条目在写下后已被完成，但勾一直没打。以下每条都
+> 重新对代码核实过（不是凭记忆），证据写在条目里。**阶段 4 的原处方被实测推翻**，
+> 见该节。
 
-### 阶段 2 · 系统质量与结构
-- [ ] 把 unsloth 纳入 registry/loader 的常规测试面，而不是特例
-- [ ] 现有 B1/B2/B3 的脚本与 fixture 统一切到标准模型
-- [ ] `IMPLEMENTED_BACKENDS` 与实际可服务范围一致
+### 阶段 1 · 完整支持 —— ✅ 三条全通
+- [x] `resolve_checkpoint(unsloth)` 放行 —— `mixed-precision` 已回到
+      `SUPPORTED_QUANT_FORMATS`（`runtime/model_registry.py:108`）。当日移除它的理由
+      （"门禁不该承诺 loader 做不到的事"）成立，但**解法选错了**：应该补 loader 而不是
+      缩门禁；缩门禁把标准模型锁在了门外。门禁改为按 `(quant_method, format)` 二元组
+      判定（`11b0e70`），`tests/test_registry_quant_format_gate.py` 钉住。
+- [x] `load_weights` 零缺失零多余 —— adapter 已合入并验证（`ca50017`）：
+      `runtime/loading/compressed_tensors.py` 的 `MixedPrecisionQuantMap` +
+      `runtime/model/compressed_tensors_linear.py`。原先缺的 168 个 `weight_packed` 归零。
+- [x] 能出连贯输出 + C-LIVE 通过 —— `"!!!!!!!!!!!!"` 已定位并修复:**根因是
+      `weight_global_scale` 是 `weight_scale_2` 的倒数**（不是改名），按改名处理就会把
+      每个权重缩放到爆。C-LIVE **64/67**，3 个失败逐个查实为模型自身行为而非服务缺陷
+      （见 `../notes/2026-08-03-std-model-serving-acceptance.md`）。
+      ⚠️ 顺带纠正一条工具链默认值：默认 `QSR_TOOL_CALL_PARSER=poolside_v1` 是给 Laguna 调的，
+      标准模型要用 `qwen3_coder`——这一项当时吃掉了 10 个失败里的 7 个。
+- **判据**：这三条全通才算"支持"，不是"能加载" —— **已达成**
+
+### 阶段 2 · 系统质量与结构（进行中）
+- [x] 把 unsloth 纳入 registry/loader 的常规测试面，而不是特例 ——
+      `tests/test_qwen36_mixed_precision_checkpoint.py` +
+      `tests/test_registry_quant_format_gate.py`（后者用合成 config，空 HF 缓存下也成立）
+- [ ] 现有 B1/B2/B3 的脚本与 fixture 统一切到标准模型 —— 🔧 **进行中**。
+      实测 22 个脚本硬编码 `models--nvidia--`（modelopt 格式），只有 1 个指向标准模型，
+      且每个脚本自带一份带 snapshot 哈希的 `MODEL_PATH`，无统一解析点。
+      ⚠️ **不能无脑替换**：两个 checkpoint 是不同量化格式，专门验 modelopt adapter 的脚本
+      必须留在 `nvidia/` 并注明原因。
+- [x] `IMPLEMENTED_BACKENDS` 与实际可服务范围一致 ——
+      `frozenset({"laguna", "qwen36"})`（`runtime/model_registry.py:152`），两者都可服务。
+      注：qwen36 不支持 DFlash（`ServerEngine._load_qwen36_model` 会显式抛错），
+      这是 backend 内的子能力差异，不是 backend 清单不一致。
 
 ### 阶段 3 · 输出速度
-- [ ] ⚠️ **首要项：消除反量化缓存**。实测时间线（`../notes/2026-08-02-gpu-memory-audit.md`）：
-      CG 捕获的 warmup 前向摸遍 64 层，**5 秒内 27,259 → 76,052 MiB**，
-      其中 **49.72 GiB 是永久缓存的 BF16 反量化权重**。
-      **模型本体只有 18.77 GiB —— 76 GiB 是我们自己造的。**
-      而且这意味着 **NVFP4 量化完全白做**：显存没省（两份都在）、速度没快（用 BF16 GEMM 算）。
-      B2 已把"绝对吞吐 ~4 tok/s"归因到这里。
+- [x] ~~**首要项：消除反量化缓存**~~ —— **已消除**。原文记录的是
+      "CG warmup 5 秒内 27,259 → 76,052 MiB，其中 49.72 GiB 是永久缓存的 BF16 反量化权重，
+      模型本体只有 18.77 GiB"。现在稠密 NVFP4 层直接吃打包 FP4（见阶段 4），
+      并在融合权重备好后释放原始 NVFP4 参数（`free_nvfp4_raw_params()`，
+      `runtime/model/qwen36_model.py:2011`，`5fce64e`）。**76.34 → 53.08 GiB。**
+      ⚠️ 原文"NVFP4 量化完全白做"的判断在当时成立，现在不再成立。
+- [ ] ⚠️ **本阶段真正的空白：CUDA Graph 捕获下的 decode 吞吐从来没测过。**
+      现有全部吞吐数字（5.819 / 6.442 / 6.547 tok/s）**都是 eager 的**，
+      且都是脚本里的裸 forward 循环，不是服务路径。而 w4a16 融合路径的 CG 捕获
+      **2026-08-03 才刚修好**（此前捕获失败会静默退回 eager，见
+      `tests/test_w4a16_scratch_contract.py`）——也就是说这些 eager 数字很可能
+      就是当时的实际服务速度，而 CG 打开后的真实速度是未知数。
+      **下一步就是补这个测量**，在此之前不要基于现有数字做优化决策。
 - [ ] MTP：默认 K 已从 8 改到 4（`f616029`，K 曲线实测 prose 1.11× / code 1.38×）；
-      重同步 A/B 数据待回
+      重同步 A/B 数据待回（代码在 `work/mtp-resync-20260802` 的 `aed0e2d`，无数据）
 
 ### 阶段 4 · Kernel 深度适配，压榨 SM120
-- [ ] **`sparkinfer.gemm.blockscaled`**（导出 `mm` / `mm_fused_quant_a` /
-      `mm_fused_quant_a_grouped`，`is_supported()` 自称 SM120/SM121）——
-      **BlackweLLM 目前一处都没用**（`grep -rn blockscaled runtime/` 为空）。
-      稠密 NVFP4 层应当走它，而不是反量化成 BF16 再 `F.linear`。
-      ⚠️ 参照实现就在仓库里：`runtime/backends/laguna_sparkinfer_moe.py` 的 MoE 专家权重
-      **直接在打包 FP4 上**调 sparkinfer kernel，从不反量化。**Laguna 做对了，Qwen3.6 没有。**
-- [ ] sparkinfer 现在**可以直接改**（2026-08-02 起解除，只动 `origin`）。
-      已合入的先例：`fused_recurrent_gated_delta_rule_multistep`（`1fd76d1`，17 单测 bit-exact）
+- [x] **目标已达成，但走的不是原处方的路。** 原文要求稠密 NVFP4 层改用
+      `sparkinfer.gemm.blockscaled.mm`。**该处方经实测被推翻**：`blockscaled.mm` 要求
+      **两个操作数都已量化（W4A4）**，而标准 checkpoint 的
+      `input_activations: None` 声明的是 **weight-only（W4A16）**——硬套上去正确性
+      垮得很厉害。原因写在 `runtime/model/modelopt_linear.py:76-80`，别再走一遍。
+      实际落地的是 `sparkinfer.moe._shared.kernels.w4a16` 的 `run_w4a16_moe`：
+      `Qwen36MLP` 把 gate/up/down 融成一次退化的 1-expert/top-1 MoE 调用，
+      **直接在打包 FP4 上算，从不反量化**——即原文"Laguna 做对了"的那个性质，
+      只是换了个 kernel 达成。
+- [x] sparkinfer 现在**可以直接改**（2026-08-02 起解除，只动 `origin`）。
+      已合入先例：`fused_recurrent_gated_delta_rule_multistep`（`1fd76d1`，17 单测 bit-exact）；
+      w4a16 scratch 欠额修复（`8242340`，104 条容量断言）。
 - [ ] GDN 侧的剩余项见 §7.1 B3；⚠️ 但**硬上限已排除 GDN 是 MTP 的决定项**
+- [ ] FP8 W8A8 kernel 接入 —— 有意推迟。单层 cosine 0.9996，比 NVFP4 路径差 30–40×，
+      需要一轮专门的全模型验证才能判断可不可用，不在本阶段顺手做。
 
 **阶段 3/4 曾被短暂叫停**（用户："不要去反量化啥的 就正常跑"），现按新指示恢复，
 **但严格排在阶段 1/2 之后**——先完整支持，再谈速度。
