@@ -24,14 +24,29 @@ in sync with it forever) to decide how to answer ``reconcile_prefix_hit``/
   step rests entirely on this branch being a literal passthrough -- see
   ``tests/test_slot_resource_manager.py``'s shadow-consistency tests for the
   claim made concrete (byte-for-byte equal to calling the backend directly).
-* ``needs_two_cache_families`` is ``True``: NOT implemented here, on
-  purpose. Track B lands the real ``(kv_hit, state_hit)`` merge logic and
-  the point at which a ``runtime.recurrent_state_pool.RecurrentStatePool``
-  actually gets instantiated (§7 row 7-h, §5 point 2: "是否要改变现有方法的
-  返回类型...是本设计里我判断不出唯一正确答案的一个具体分叉"). Raising
-  :class:`NotImplementedError` with a pointer to where the real logic lands
-  is the honest thing to do here -- pretending to support a merge whose
-  shape nothing has decided yet would be worse than refusing outright.
+* ``needs_two_cache_families`` is ``True``: §7 row 7-h, landed by Track B /
+  B2. This used to raise ``NotImplementedError`` pointing here; what
+  replaced it is deliberately **small**, because most of the two-resource
+  work belongs to the backend that owns both allocators
+  (``runtime/backends/qwen36.py``). Two things do belong here, and only
+  here:
+
+  1. **The min rule, applied once.** §3's decision -- "取 ``state_hit``
+     （恒 ``<= kv_hit``，即取 min），且必须 block-aligned" -- is stated in
+     one place and enforced in one place, instead of being a rule every
+     future backend is trusted to have reimplemented correctly. A backend
+     that answers with a ``state_hit`` above its own ``kv_hit`` cannot even
+     construct the ``PrefixHit``; a backend that answers with an
+     unaligned one is clamped here.
+  2. **Ranking free slots by ``.effective``, not by KV depth.** A backend's
+     ``find_best_slot_for_prompt`` returns one number, and for a
+     single-family backend that number is unambiguous. With two families it
+     is not: a slot whose KV matches 900 tokens but whose recurrent
+     checkpoint reaches 0 is worth exactly as much as a cold slot. Picking
+     by KV depth there does not produce a wrong answer -- it produces a
+     *slower* one, silently, which is the failure mode §2's INV-A3-6 row
+     describes ("纯性能回归，没有正确性信号"). This is the only place with
+     both the per-slot numbers and the authority to choose.
 
 Wired into ``server/engine.py`` as of step 7-g
 (docs/a3-cache-coordinator-design.md §7 row 7-g): ``ServerEngine.
@@ -57,11 +72,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, keeps this module torch-fre
     from runtime.architecture import ArchitectureSpec
     from runtime.backends.protocol import ModelBackend
 
-_NOT_IMPLEMENTED = (
-    "SlotResourceManager does not yet merge a second (recurrent-state) resource -- "
-    "Track B lands this (docs/a3-cache-coordinator-design.md §7 row 7-h). "
-    "needs_two_cache_families is True for this checkpoint, which no backend "
-    "this runtime ships today declares."
+_MISSING_PER_SLOT = (
+    "backend {cls} declares capabilities.prefix_cache with a checkpoint whose "
+    "ArchitectureSpec.needs_two_cache_families is True, but does not implement "
+    "prefix_hit_for_slot(token_ids, slot) -> PrefixHit. The coordinator needs "
+    "per-slot (kv_hit, state_hit) to rank free slots by the recurrent-bounded "
+    "depth (docs/a3-cache-coordinator-design.md §3); ranking by whatever a "
+    "backend's own find_best_slot_for_prompt returns would silently reuse "
+    "slots whose recurrent state cannot actually be resumed."
 )
 
 
@@ -79,9 +97,20 @@ class SlotResourceManager:
     reconcile", not "is this backend allowed to be asked at all".
     """
 
-    def __init__(self, backend: ModelBackend, architecture_spec: ArchitectureSpec) -> None:
+    def __init__(
+        self,
+        backend: ModelBackend,
+        architecture_spec: ArchitectureSpec,
+        *,
+        block_size: int = 1,
+    ) -> None:
         self._backend = backend
         self._spec = architecture_spec
+        #: Only consulted on the two-family branch, where §3 requires the
+        #: chosen boundary to be block-aligned. Defaults to 1 (no-op) so the
+        #: single-family branch stays a literal passthrough even in the
+        #: shadow-consistency tests that construct this without a block size.
+        self._block_size = max(1, int(block_size))
 
     @property
     def needs_two_cache_families(self) -> bool:
@@ -91,14 +120,51 @@ class SlotResourceManager:
         """INV-A3-2 (``state_hit <= kv_hit``) is enforced by
         :class:`PrefixHit` itself (``runtime/backends/protocol.py``'s
         ``__post_init__``) regardless of which branch below answers -- this
-        method does not re-derive it, only forwards or refuses."""
+        method does not re-derive it, only forwards or clamps.
+
+        The two-family branch applies §3's rule on top: ``state_hit`` is
+        floored to a ``block_size`` boundary. A backend cannot hand back
+        something above ``kv_hit`` (``PrefixHit`` refuses to exist), but it
+        *can* hand back an unaligned boundary, and an unaligned resume
+        point is not a crash -- it is a wrong answer several hundred tokens
+        later. Flooring is always safe: a shorter reusable prefix is a
+        performance loss, never a correctness one.
+        """
+        hit = self._backend.reconcile_prefix_hit(token_ids)
         if not self._spec.needs_two_cache_families:
-            return self._backend.reconcile_prefix_hit(token_ids)
-        raise NotImplementedError(_NOT_IMPLEMENTED)
+            return hit
+        return self._aligned(hit)
 
     def find_best_slot_for_prompt(
         self, token_ids: list[int], free_slots: list[int]
     ) -> tuple[int, int]:
         if not self._spec.needs_two_cache_families:
             return self._backend.find_best_slot_for_prompt(token_ids, free_slots)
-        raise NotImplementedError(_NOT_IMPLEMENTED)
+        per_slot = getattr(self._backend, "prefix_hit_for_slot", None)
+        if per_slot is None:
+            raise NotImplementedError(
+                _MISSING_PER_SLOT.format(cls=type(self._backend).__name__)
+            )
+        if not free_slots:
+            raise ValueError("find_best_slot_for_prompt requires at least one free slot")
+        best_slot = free_slots[0]
+        best = PrefixHit(kv_hit=0, state_hit=0)
+        for slot in free_slots:
+            hit = self._aligned(per_slot(token_ids, slot))
+            # Ordered by effective depth first, KV depth only as a
+            # tie-break: among slots that can be resumed equally deep, the
+            # one holding more matching KV is the better bet for the *next*
+            # checkpoint, and preferring it costs nothing.
+            if (hit.effective, hit.kv_hit) > (best.effective, best.kv_hit):
+                best = hit
+                best_slot = slot
+        return best_slot, best.effective
+
+    def _aligned(self, hit: PrefixHit) -> PrefixHit:
+        block = self._block_size
+        if block <= 1:
+            return hit
+        state = (hit.state_hit // block) * block
+        if state == hit.state_hit:
+            return hit
+        return PrefixHit(kv_hit=hit.kv_hit, state_hit=state)

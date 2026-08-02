@@ -119,14 +119,18 @@ class TestServerEngineBackendSelection:
     def test_backend_is_validated_against_the_registry_not_a_hardcoded_string(self):
         from runtime.model_registry import IMPLEMENTED_BACKENDS
 
-        # Today's implemented set happens to still be a singleton -- the
-        # point of this test is that ServerEngine consults this frozenset
-        # (registry's own notion of what exists) rather than comparing
-        # against one hardcoded string, so this passing is what's asserted,
-        # not the singleton-ness of the set.
-        assert IMPLEMENTED_BACKENDS == frozenset({"laguna"})
+        # The point is that ServerEngine consults this frozenset (registry's
+        # own notion of what exists) rather than comparing against one
+        # hardcoded string. Until Track B / B2 the set was a singleton and a
+        # rejected name was easy to come by; now that qwen36 is in it, the
+        # rejection has to be tested with a name that really is absent --
+        # which is also the stronger version of the claim, since a
+        # hardcoded ``!= "laguna"`` would now wrongly reject qwen36 too.
+        assert "laguna" in IMPLEMENTED_BACKENDS
+        assert "qwen36" in IMPLEMENTED_BACKENDS
+        assert "no-such-backend" not in IMPLEMENTED_BACKENDS
         with pytest.raises(ValueError, match="implemented backends"):
-            ServerEngine(backend="qwen36", capacity=1, num_slots=1)
+            ServerEngine(backend="no-such-backend", capacity=1, num_slots=1)
 
     def test_laguna_backend_overrides_model_and_k(self):
         engine = ServerEngine(

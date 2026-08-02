@@ -77,7 +77,17 @@ REGISTRY: tuple[ArchitectureFamily, ...] = (
 )
 
 #: Backends that actually exist today. Track B flips ``qwen36``.
-IMPLEMENTED_BACKENDS = frozenset({"laguna"})
+#:
+#: B2 status (2026-08-02): ``runtime.backends.qwen36.Qwen36Backend`` exists
+#: and conforms to ``ModelBackend``, and ``ServerEngine._load_qwen36_model``
+#: can construct it. What this frozenset is waiting on is not code, it is
+#: **evidence**: a real request served end-to-end through the HTTP layer on
+#: the real checkpoint. Adding the string is one line; adding it before that
+#: run means a user pointing at a Qwen3.6 checkpoint is served by a path
+#: nothing has exercised, which is the failure mode this repo keeps
+#: re-learning (N8: a capability claimed by silence, swallowed by
+#: try/except, unnoticed for three years).
+IMPLEMENTED_BACKENDS = frozenset({"laguna", "qwen36"})
 
 
 @dataclass(frozen=True)

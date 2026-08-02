@@ -138,30 +138,85 @@ class TestForwardingWhenNoSecondCacheFamily:
         assert via_coordinator == direct
 
 
-class TestSecondCacheFamilyNotImplemented:
-    """Deliberately constructed violation, not just the positive path:
-    needs_two_cache_families=True must actually raise, since Track B has
-    not landed the merge logic (§7 row 7-h)."""
+class _FakeTwoFamilyBackend(_FakeBackend):
+    """A backend with a real second resource: per-slot ``(kv_hit,
+    state_hit)`` supplied by the test, so the coordinator's ranking rule
+    can be checked against a case where KV depth and effective depth
+    disagree -- the case §3 exists for."""
 
-    def test_reconcile_prefix_hit_raises(self) -> None:
-        mgr = SlotResourceManager(_FakeBackend("x"), _spec(needs_two_cache_families=True))
-        with pytest.raises(NotImplementedError, match="Track B"):
-            mgr.reconcile_prefix_hit([1, 2, 3])
+    def __init__(self, marker: str, per_slot: dict[int, tuple[int, int]]):
+        super().__init__(marker)
+        self._per_slot = per_slot
+        self.per_slot_calls: list[tuple[list[int], int]] = []
 
-    def test_find_best_slot_for_prompt_raises(self) -> None:
-        mgr = SlotResourceManager(_FakeBackend("x"), _spec(needs_two_cache_families=True))
-        with pytest.raises(NotImplementedError, match="Track B"):
-            mgr.find_best_slot_for_prompt([1, 2, 3], [0, 1])
+    def prefix_hit_for_slot(self, token_ids: list[int], slot: int) -> PrefixHit:
+        self.per_slot_calls.append((list(token_ids), slot))
+        kv, state = self._per_slot.get(slot, (0, 0))
+        return PrefixHit(kv_hit=kv, state_hit=state)
 
-    def test_backend_is_never_called_on_the_not_implemented_path(self) -> None:
-        # The refusal must happen BEFORE touching the backend at all -- a
-        # backend that does not implement the True-branch shape yet (none
-        # does) must not be invoked speculatively.
+    def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
+        self.reconcile_calls.append(list(token_ids))
+        best = PrefixHit(kv_hit=0, state_hit=0)
+        for slot in self._per_slot:
+            hit = self.prefix_hit_for_slot(token_ids, slot)
+            if (hit.effective, hit.kv_hit) > (best.effective, best.kv_hit):
+                best = hit
+        return best
+
+
+class TestSecondCacheFamily:
+    """§7 row 7-h, landed by Track B / B2: the branch that used to raise.
+
+    The two behaviours the coordinator owns (and a backend does not) are the
+    ones checked here -- flooring ``state_hit`` to a block boundary, and
+    ranking free slots by ``.effective`` rather than by KV depth."""
+
+    def test_reconcile_forwards_and_floors_state_hit_to_block_size(self) -> None:
+        backend = _FakeTwoFamilyBackend("q", {0: (960, 900)})
+        mgr = SlotResourceManager(backend, _spec(needs_two_cache_families=True), block_size=64)
+        hit = mgr.reconcile_prefix_hit([1, 2, 3])
+        # 900 is not a multiple of 64. Flooring is always safe (a shorter
+        # reusable prefix is a performance loss); an unaligned resume point
+        # is a wrong answer several hundred tokens later, not a crash.
+        assert hit.state_hit == 896
+        assert hit.kv_hit == 960
+        assert hit.effective == 896
+
+    def test_reconcile_leaves_an_already_aligned_hit_untouched(self) -> None:
+        backend = _FakeTwoFamilyBackend("q", {0: (960, 896)})
+        mgr = SlotResourceManager(backend, _spec(needs_two_cache_families=True), block_size=64)
+        assert mgr.reconcile_prefix_hit([1, 2, 3]) == PrefixHit(kv_hit=960, state_hit=896)
+
+    def test_find_best_slot_ranks_by_effective_not_kv_depth(self) -> None:
+        # Slot 1 has by far the deeper KV match but no resumable recurrent
+        # state; slot 2 has a shallower KV match that is fully resumable.
+        # Choosing slot 1 is not a wrong answer, it is a silently slower
+        # one -- the INV-A3-6 failure mode ("纯性能回归，没有正确性信号").
+        backend = _FakeTwoFamilyBackend("q", {0: (0, 0), 1: (960, 0), 2: (128, 128)})
+        mgr = SlotResourceManager(backend, _spec(needs_two_cache_families=True), block_size=64)
+        assert mgr.find_best_slot_for_prompt([1, 2, 3], [0, 1, 2]) == (2, 128)
+
+    def test_find_best_slot_does_not_call_the_backend_ranking_method(self) -> None:
+        backend = _FakeTwoFamilyBackend("q", {0: (0, 0), 1: (128, 128)})
+        mgr = SlotResourceManager(backend, _spec(needs_two_cache_families=True), block_size=64)
+        mgr.find_best_slot_for_prompt([1, 2, 3], [0, 1])
+        assert backend.find_best_slot_calls == []
+
+    def test_backend_without_per_slot_query_is_refused_loudly(self) -> None:
+        # A backend declaring a two-family checkpoint but missing the
+        # per-slot query must fail with a message naming what to implement,
+        # not silently fall back to KV-depth ranking.
         backend = _FakeBackend("x")
-        mgr = SlotResourceManager(backend, _spec(needs_two_cache_families=True))
-        with pytest.raises(NotImplementedError):
-            mgr.reconcile_prefix_hit([1, 2, 3])
-        assert backend.reconcile_calls == []
+        mgr = SlotResourceManager(backend, _spec(needs_two_cache_families=True), block_size=64)
+        with pytest.raises(NotImplementedError, match="prefix_hit_for_slot"):
+            mgr.find_best_slot_for_prompt([1, 2, 3], [0, 1])
+        assert backend.find_best_slot_calls == []
+
+    def test_no_free_slots_is_a_value_error_not_an_index_error(self) -> None:
+        backend = _FakeTwoFamilyBackend("q", {0: (0, 0)})
+        mgr = SlotResourceManager(backend, _spec(needs_two_cache_families=True), block_size=64)
+        with pytest.raises(ValueError):
+            mgr.find_best_slot_for_prompt([1, 2, 3], [])
 
 
 class TestRealLagunaShadowConsistency:

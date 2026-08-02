@@ -504,12 +504,110 @@ class ServerEngine:
         "constructed after ``self.runner`` exists" for whatever caller reads
         it, real load or fake.
         """
-        return SlotResourceManager(self.runner, self.architecture_spec)
+        return SlotResourceManager(
+            self.runner, self.architecture_spec, block_size=self.block_size
+        )
 
     # -- model loading (engine thread only) --------------------------------
     def _load_model(self) -> None:
-        """Load model + create the Laguna runner. MUST run on engine thread."""
-        self._load_laguna_model()
+        """Load model + create the runner. MUST run on engine thread.
+
+        Dispatches on ``self.backend_name``, which ``server/app.py``'s
+        ``lifespan()`` resolved from the checkpoint's own ``config.json``
+        (``runtime.model_registry.resolve_checkpoint``) -- the engine does
+        not re-derive it. Track B / B2 added the second branch; before it
+        there was one backend and the dispatch was the absence of one.
+        """
+        if self.backend_name == "qwen36":
+            self._load_qwen36_model()
+        else:
+            self._load_laguna_model()
+
+    def _load_qwen36_model(self) -> None:
+        """Load ``Qwen36Backend`` (Track B / B2). MUST run on engine thread.
+
+        **Not reachable yet, on purpose.** ``__init__`` refuses any backend
+        outside ``runtime.model_registry.IMPLEMENTED_BACKENDS``, and that
+        frozenset still excludes ``"qwen36"``. Flipping it is a one-line
+        change that belongs in the commit that carries the end-to-end
+        evidence -- a served, verified Qwen3.6 request -- not in the one
+        that merely makes the construction possible. Landing this branch
+        first keeps that flip honest and small; landing the flip first
+        would mean any user pointing at a Qwen3.6 checkpoint gets served by
+        a path nothing has run.
+
+        Deliberately narrower than ``_load_laguna_model``: no DFlash (this
+        checkpoint's speculative story is B3's, and
+        ``Qwen36Backend.capabilities.speculative_decode`` says ``False``),
+        and prefix caching is passed through rather than forced, same as
+        Laguna's.
+
+        ``enable_cudagraph`` captures here, before ``start()``'s admission
+        loop can hand out a slot, for the same reason Laguna does -- plus
+        one Laguna does not have: capture runs real forwards, which write
+        real recurrent state, and a recurrent state left behind is read by
+        the next sequence rather than ignored (B0-5).
+        ``capture_decode_cuda_graph`` zeroes every slot on the way out for
+        exactly that reason.
+        """
+        import torch  # local: this module stays importable without torch
+
+        from runtime.backends.qwen36 import Qwen36Backend
+        from runtime.laguna_config import _resolve_laguna_model_dir
+        from runtime.model_loading import load_qwen36_model
+
+        if self.enable_dflash:
+            # capabilities.speculative_decode is False for this backend, and
+            # the scheduler reads self.enable_dflash directly (it decides
+            # whether classify_decode_slots routes a request to
+            # mtp_verify_and_commit_batch, which this backend does not
+            # implement). Refusing here rather than silently downgrading:
+            # a deployment that asked for speculative decoding and got
+            # ordinary decoding without being told is how an acceptance-rate
+            # counter sits at zero unnoticed (N8).
+            raise ValueError(
+                "enable_dflash is not supported by the qwen36 backend "
+                "(capabilities.speculative_decode is False; MTP is Track B / B3). "
+                "Start the server with QSR_SERVER_ENABLE_DFLASH=0."
+            )
+
+        max_model_len = self.blocks_per_slot * self.block_size
+        model = load_qwen36_model(
+            _resolve_laguna_model_dir(self.MODEL),
+            device="cuda",
+            dtype=torch.bfloat16,
+            max_seq_len=max_model_len,
+        )
+        self._prefill_chunk_size = 512  # unused: Qwen36Backend prefill is one-shot
+        self.runner = Qwen36Backend(
+            model,
+            num_slots=self.num_slots,
+            max_seq_len=max_model_len,
+            block_size=self.block_size,
+            device="cuda",
+            dtype=torch.bfloat16,
+            enable_prefix_cache=self.enable_prefix_cache,
+        )
+        if self._enable_cudagraph:
+            graph_batch_size = self.runner.capture_decode_cuda_graph()
+            if graph_batch_size is not None:
+                logger.info(
+                    "Qwen3.6 decode CUDA Graph captured at load (max batch_size=%d)",
+                    graph_batch_size,
+                )
+            else:
+                logger.warning(
+                    "Qwen3.6 decode CUDA Graph capture failed or unavailable; "
+                    "falling back to eager batched decode"
+                )
+        logger.info(
+            "Qwen3.6 model loaded on engine thread: num_slots=%d max_context=%d tokens/slot, "
+            "recurrent state %.1f MiB/slot, KV %.1f MiB/slot",
+            self.num_slots,
+            self.runner.max_seq_len,
+            self.runner.pool.geometry.recurrent_bytes_per_slot / 2**20,
+            self.runner.pool.geometry.kv_bytes_per_slot / 2**20,
+        )
 
     def _load_laguna_model(self) -> None:
         """Load LagunaBackend. MUST run on engine thread.
