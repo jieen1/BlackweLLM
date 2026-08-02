@@ -19,9 +19,17 @@ Static analysis, deliberately. Importing the test modules to introspect them
 would drag torch into the torch-free CI job, and the question -- "does this
 `def` accept that keyword" -- is answerable from the syntax tree alone.
 
-Known limits, stated rather than hidden: only ``self.runner.<method>(...)`` call
-sites are scanned, so a call through a local alias is missed, and a fake using
-``**kwargs`` is accepted without inspecting what it does with them.
+Coverage follows the *protocol*, not a list of attribute names. An earlier
+version scanned only ``self.runner.<method>(...)``, and step 7-g promptly moved
+two call sites to ``self.slot_resources.<method>(...)`` -- silently removing
+them from exactly the protection this file exists to give. Hardcoding a second
+holder name would only postpone that. Instead the method names come from
+``ModelBackend`` in ``runtime/backends/protocol.py``, and any ``self.<attr>.``
+receiver is scanned: a new delegating wrapper is covered the day it appears.
+
+Known limits, stated rather than hidden: a call through a local alias
+(``runner = self.runner``) is missed, and a fake using ``**kwargs`` is accepted
+without inspecting what it does with them.
 """
 
 from __future__ import annotations
@@ -31,21 +39,40 @@ import pathlib
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 _ENGINE = _REPO_ROOT / "server" / "engine.py"
+_PROTOCOL = _REPO_ROOT / "runtime" / "backends" / "protocol.py"
+
+
+def _backend_protocol_methods() -> set[str]:
+    """Every method ``ModelBackend`` declares -- the authoritative surface."""
+    tree = ast.parse(_PROTOCOL.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "ModelBackend":
+            return {
+                f.name
+                for f in node.body
+                if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and not f.name.startswith("__")
+            }
+    raise AssertionError("ModelBackend not found in runtime/backends/protocol.py")
 
 
 def _runner_call_keywords() -> dict[str, set[str]]:
-    """method name -> every keyword ``ServerEngine`` passes to it."""
+    """method name -> every keyword ``ServerEngine`` passes to it.
+
+    Any ``self.<attr>.<protocol_method>(...)`` receiver counts, so a delegating
+    wrapper like ``self.slot_resources`` is covered without being named here.
+    """
+    protocol_methods = _backend_protocol_methods()
     tree = ast.parse(_ENGINE.read_text(encoding="utf-8"))
     found: dict[str, set[str]] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        # self.runner.<method>(...)
         if (
             isinstance(func, ast.Attribute)
+            and func.attr in protocol_methods
             and isinstance(func.value, ast.Attribute)
-            and func.value.attr == "runner"
             and isinstance(func.value.value, ast.Name)
             and func.value.value.id == "self"
         ):
@@ -79,8 +106,9 @@ def _accepted_keywords(fn: ast.FunctionDef) -> set[str] | None:
 def test_test_fakes_accept_every_keyword_the_engine_passes():
     call_keywords = _runner_call_keywords()
     assert call_keywords, (
-        "no self.runner.<method>(keyword=...) call sites found in server/engine.py -- "
-        "the scanner stopped matching rather than the engine losing its keywords"
+        "no self.<attr>.<protocol method>(keyword=...) call sites found in "
+        "server/engine.py -- the scanner stopped matching rather than the engine "
+        "losing its keywords"
     )
 
     problems: list[str] = []
