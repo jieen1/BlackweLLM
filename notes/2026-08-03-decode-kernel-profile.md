@@ -77,11 +77,50 @@ gap。**那是错的**：`key_averages()` 把算子层与它派发的 kernel 层
 同一份工作计了两次。本文改从导出的 chrome trace 里只累加 `cat=="kernel"` 的事件，
 每微秒 GPU 时间只归属一次；CPU 标注单列、不进 kernel 总和。
 
+## 归属：按调用次数精确对上了
+
+用同一份 trace 数每步的 kernel 调用次数，与 checkpoint 声明的层构成对照：
+
+| kernel 组 | 次/step | ms/step | 对应什么 |
+|---|---:|---:|---|
+| `W4A16FusedMoeKernel` | **56.0** | 10.752 | **0–55 层的 MLP**（NVFP4，每层一次融合调用） |
+| `cutlass_80_wmma` ×3 | 129.0 | 7.603 | ┐ |
+| cuBLAS `gemvx` ×2 | 104.0 | 6.227 | ┘ 合计 **233**，全部是 FP8 层反量化后的 `F.linear` |
+
+FP8 线性层的预期数量（读自 `config_groups.group_0` 的 targets 与 `layer_types`）：
+
+```
+full_attention q/k/v/o : 16 × 4 = 64
+GDN 三个投影            : 48 × 3 = 144
+lm_head                :          1
+56–63 层 MLP           :  8 × 3 = 24
+                         合计     233
+```
+
+**233 预期 = 233 实测，一个不差。** NVFP4 侧 56 预期 = 56 实测。
+归属没有猜测成分：**每一次 BF16 通用 GEMM/GEMV 调用，都对应一个被反量化成 BF16 的
+FP8 层**；cuBLAS 按形状把它们分给 `gemvx`（104 次）和 SM80 WMMA cutlass（129 次）。
+
+## 阶段四的两根杠杆（合计 80% 的 kernel 时间）
+
+**① FP8 层 45%（13.83 ms/step，233 次调用）—— 现在是反量化成 BF16 再算。**
+接上 FP8 W8A8 kernel 可以让它们全程保持量化。此前有意推迟（单层 cosine 0.9996，
+比 NVFP4 路径差 30–40×，需要专门一轮全模型验证），见
+[`2026-08-03-nvfp4-raw-param-free-and-fp8-w8a8-probe.md`](2026-08-03-nvfp4-raw-param-free-and-fp8-w8a8-probe.md)。
+
+**② NVFP4 层 35%（10.75 ms/step，56 次调用）—— 现在走 W4A16。**
+标准 checkpoint 的 `group_1` 声明的是 **W4A4** 且 `input_global_scale` 实际发货，
+所以 `sparkinfer.gemm.blockscaled` 路径是开着的。⚠️ 此前那次 `blockscaled.mm` 失败
+是在 `nvidia/` checkpoint 上（那里 `input_activations: None`，动态量化激活没有
+对应物）——**那个否决不适用于标准模型**，详见 `docs/roadmap.md` 阶段 4。
+
+**GDN 不在名单上**：0.187 ms/step、0.6%。
+
 ## 未决
 
 - 上面的 kernel 归属是在 **eager** 下采的（kernel 时长与是否被图重放无关，
   但 kernel **序列**在 CG 下可能不同）。若要精确到生产，需在捕获图上用 nsys 采。
-- 7.6ms 的 SM80 kernel 具体来自哪些层、能否换成 Blackwell 原生路径，未查。
+- 两根杠杆动手前都必须先过 B1-R 的 gap-error 判据——上次 `blockscaled.mm` 就是栽在那里。
 - 带宽 roofline：28.85 tok/s ≈ 582 GB/s 有效带宽，卡的峰值在 1.8 TB/s 量级。
   但既然已 kernel-bound，下一步应是看这些具体 kernel 各自离自己的 roofline 多远，
   而不是看整体比值。

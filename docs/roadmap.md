@@ -124,11 +124,26 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       eager 下只有 21% 忙（CPU 侧 paged 元数据规划约 34.2ms/step，`plan_metadata_to_device`
       一项就 24.3ms）——这就是 4.71× 的机制。
       **GDN 递归 kernel 只占 0.6%**，独立证实"GDN 不是决定项"，别再往那投。
-- [ ] ⚠️ **阶段四第一个具体靶子：24.8% 的 kernel 时间跑在 `cutlass_80_wmma_tensorop` 上
-      ——为 SM80 编译的 Ampere 代 kernel，在 cc 12.0 的卡上**（7.602 ms/step，三个变体）。
-      加上两个 cuBLAS `gemvx`（6.23ms），**BF16 通用路径合计 13.8 ms/step = 45%**，
-      比 NVFP4 专用 kernel 的 35% 还多。这些是非 NVFP4 层反量化后走的 `F.linear`。
-      查清它们来自哪些层、能否换 Blackwell 原生路径。
+- [x] ~~查清那些 BF16 kernel 来自哪些层~~ —— **已按调用次数精确归属，无猜测成分**：
+
+      | kernel 组 | 次/step | ms/step | 是什么 |
+      |---|---:|---:|---|
+      | `W4A16FusedMoeKernel` | **56** | 10.752 (35.0%) | 0–55 层 MLP（NVFP4，每层一次） |
+      | `cutlass_80_wmma` ×3 + `gemvx` ×2 | **233** | 13.830 (45.0%) | **全部 FP8 层反量化后的 `F.linear`** |
+      | GDN 递归 | — | 0.187 (0.6%) | 不是量级项 |
+
+      FP8 层预期数 = full_attn 16×4 + GDN 48×3 + lm_head 1 + 56–63 层 MLP 8×3 = **233**，
+      与实测调用数**一个不差**；NVFP4 侧 56 预期 = 56 实测。
+      ⚠️ 其中 24.8% 跑在 `cutlass_80_wmma_tensorop` 上——**为 SM80 编译的 Ampere 代
+      kernel，在 cc 12.0 的卡上**。cuBLAS 按形状在 `gemvx`/SM80 WMMA 之间分派。
+- [ ] 🎯 **阶段四两根杠杆，合计 80% 的解码 kernel 时间**：
+      **① FP8 层 45%（13.83 ms/step，233 次）** —— 现在反量化成 BF16 再算；
+      接 FP8 W8A8 kernel 可全程保持量化。此前有意推迟（单层 cosine 0.9996，
+      比 NVFP4 路径差 30–40×，需专门一轮全模型验证）。
+      **② NVFP4 层 35%（10.75 ms/step，56 次）** —— 现在走 W4A16；
+      标准 checkpoint 声明 W4A4 且 `input_global_scale` 实际发货，
+      `gemm.blockscaled` 路径开着（见上一条对我自己那次误判的纠正）。
+      ⚠️ **两者动手前都必须先过 B1-R 的 gap-error 判据**——上次 `blockscaled.mm` 就栽在那。
 - [ ] 持久化 kernel 编译缓存：每进程首请求 TTFT 4.67s（之后稳定 0.25s），
       cutlass DSL 按 shape JIT，`cute.compile` 的 `cache_key` **只是进程内记忆化**。
 - [ ] 并发/批量下的 CG 收益未测（本轮只测了单并发单请求解码）。
