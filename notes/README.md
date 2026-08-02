@@ -39,7 +39,7 @@
 ## 2. 已定案的根因分析 🟢
 
 - [2026-08-02 Qwen3.6 显存底线由反量化缓存决定](2026-08-02-qwen36-dequant-cache-memory-floor.md) —— 一次完整前向后常驻 19GB→54GB+，`GPU_MEM_UTIL`/`num_slots` 全部管不到
-- [2026-08-02 B1 逐 token 对齐门禁不通过](2026-08-02-b1-greedy-alignment-fails.md) —— 首次分歧 32/120/218 步；权重两侧相同故非反量化问题；疑似 attention 层 0.0156 误差累积
+- [2026-08-02 B1 对齐门禁的证据链（原门禁已作废）](2026-08-02-b1-greedy-alignment-fails.md) —— 分歧只差 1–2 个 bf16 ULP，证明原门禁要求的东西不存在；含一条被自我推翻的误报
 - [2026-08-02 第 7 步 GPU 验收结果](2026-08-02-a3-step7g-gpu-acceptance-results.md) —— bit-exact/前缀缓存/C-LIVE 三条通过；接受率那条对照组错了需重做，另发现 4 条与 7-g 无关的下降
 - [2026-08-02 Qwen3.6 历史性能记录](2026-08-02-qwen36-historical-performance-record.md) —— 稳态 decode 曾快于 vLLM 1.33×，输在 TTFT；并厘清哪些"超越 vLLM"其实是 Laguna 的数字
 - [2026-08-02 接受率没有可用的观测路径](2026-08-02-acceptance-rate-has-no-working-observability.md) —— 正式验收判据，但两个记录函数生产零调用 + 直方图 5 桶装不下 K=15
