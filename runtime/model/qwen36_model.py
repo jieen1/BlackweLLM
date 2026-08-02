@@ -1707,8 +1707,8 @@ class Qwen36MLP(nn.Module):
     the checkpoint declares ``gate_proj``/``up_proj``/``down_proj`` all
     ``W4A16_NVFP4`` (true for every real MLP layer per B0-2 -- the
     checkpoint quantizes ``mlp.{gate,up,down}_proj`` uniformly, never a
-    mix), ``forward()`` does NOT call the three ``ModelOptNVFP4Linear``
-    submodules individually. Instead it fuses them into one call to
+    mix), ``forward()`` does NOT call the three NVFP4 Linear submodules
+    individually. Instead it fuses them into one call to
     ``sparkinfer.moe._shared.kernels.w4a16.kernel.run_w4a16_moe`` -- the
     weight-only kernel that dequantizes NVFP4 *inside* the kernel against
     the real BF16 activation (``packed_dequant_e2m1x4_to_bfloat2x2`` +
@@ -1719,44 +1719,88 @@ class Qwen36MLP(nn.Module):
     a quantized activation operand, and failed B1-R's calibrated gap-error
     bars).
 
+    **Two checkpoint formats, one fused path (2026-08-03 follow-up)**: this
+    fast path was originally gated on ``isinstance(..., ModelOptNVFP4Linear)``
+    only, so unsloth's ``unsloth/Qwen3.6-27B-NVFP4`` checkpoint (compressed-
+    tensors mixed-precision format, :class:`~runtime.model.
+    compressed_tensors_linear.CompressedTensorsNVFP4Linear`) silently fell
+    through to the plain per-Linear BF16-dequant-and-cache path below and
+    never got the memory/throughput win nvidia's modelopt checkpoint did
+    (measured: 80.65 GiB resident vs nvidia's 55-57 GiB). The gate now
+    accepts either NVFP4 Linear class, and every place this method used to
+    read a submodule's raw Parameters by name (``.weight``/``.weight_scale``/
+    ``.weight_scale_2``) instead calls that submodule's own
+    ``nvfp4_components_for_fuse()``/``free_nvfp4_raw_params()`` (defined on
+    both classes -- see ``runtime/model/modelopt_linear.py``,
+    ``runtime/model/compressed_tensors_linear.py``), so this class no longer
+    needs to know which checkpoint format it holds beyond the isinstance
+    check itself. The two formats' Parameter names genuinely differ
+    (``weight``/``weight_scale_2`` vs ``weight_packed``/``weight_global_scale``)
+    -- more importantly, **their global scales are RECIPROCALS of each
+    other**, not the same value under a different name (unsloth's real
+    ``layers.0.mlp.gate_proj``: ``weight_global_scale=6624.0``; nvidia's:
+    ``weight_scale_2=0.0002``; ``1/6624 ≈ 0.000151``, same order of
+    magnitude -- see ``CompressedTensorsNVFP4Linear``'s own docstring for
+    the GPU-measured evidence this exact mismatch produced degenerate
+    ``"!!!!!!!!!!!!"`` output the first time it was missed). Each format's
+    ``nvfp4_components_for_fuse()`` normalizes to modelopt's convention (a
+    direct multiplier, matching ``sparkinfer.moe._shared.kernels.w4a16.
+    prepare.prepare_w4a16_modelopt_nvfp4_weights``'s own documented
+    expectation of "raw ModelOpt weight global scales") before returning,
+    so everything in ``_ensure_w4a16_fused_ready`` below is format-agnostic.
+
+    Also correctly inert for unsloth's own FP8-channel MLP layers: that
+    checkpoint's ``config_groups`` quantizes ``layers.{56..63}.mlp.
+    {gate,up,down}_proj`` as per-channel FP8, not NVFP4 (verified against
+    the real safetensors index/config, 2026-08-03) -- those three
+    submodules are :class:`~runtime.model.compressed_tensors_linear.
+    CompressedTensorsFP8ChannelLinear`, so ``_nvfp4_fused`` is False for
+    them and they fall through to the plain per-Linear forward below,
+    unaffected by any of this.
+
     Why fusion is required, not optional: ``run_w4a16_moe`` is shaped like
     one full MoE expert's gated MLP block (FC1 = ``w13`` fused gate+up ->
     activation -> FC2 = ``w2`` down-proj) in a single launch -- there is no
-    way to call it for "just gate_proj alone" or "just down_proj alone"
-    the way the individual ``ModelOptNVFP4Linear.forward()`` used to. This
-    class degenerates the call into a 1-expert/top-1 MoE (``topk_ids`` is
-    always ``[[0]]``, ``topk_weights`` is always ``[[1.0]]``) -- exactly
-    the untested-on-GPU path B0 already flagged
+    way to call it for "just gate_proj alone" or "just down_proj alone" the
+    way the individual NVFP4 Linear's own ``forward()`` used to. This class
+    degenerates the call into a 1-expert/top-1 MoE (``topk_ids`` is always
+    ``[[0]]``, ``topk_weights`` is always ``[[1.0]]``) -- exactly the
+    untested-on-GPU path B0 already flagged
     (``notes/2026-08-02-trackB-b0-facts.md`` references
     ``prepare_w4a16_modelopt_nvfp4_weights`` + ``num_experts=1``).
 
-    ``gate_proj``/``up_proj``/``down_proj`` stay real ``ModelOptNVFP4Linear``
+    ``gate_proj``/``up_proj``/``down_proj`` stay real NVFP4 Linear
     submodules (unchanged Parameter shapes, unchanged ``weight_loader``
     wiring) purely so the existing checkpoint-loading machinery keeps
-    working unmodified -- ``forward()`` below reads their ``.weight``/
-    ``.weight_scale``/``.weight_scale_2`` tensors directly to build the
-    fused ``w13``/``w2`` representation once, lazily, and never calls
-    their own ``.forward()``. Their ``_ensure_ready()``/``_weight_bf16``
-    legacy dequant path is left completely alone (still there for whatever
-    standalone diagnostics construct a bare ``ModelOptNVFP4Linear``, e.g.
-    ``scripts/verify_nvfp4_gemm_single_layer.py``) -- this class just
-    never triggers it.
+    working unmodified -- ``_ensure_w4a16_fused_ready`` below reads their
+    scale/weight tensors (via ``nvfp4_components_for_fuse()``) to build the
+    fused ``w13``/``w2`` representation once, lazily, and never calls their
+    own ``.forward()``. Their ``_ensure_ready()``/``_weight_bf16`` legacy
+    dequant path is left completely alone (still there for whatever
+    standalone diagnostics construct a bare NVFP4 Linear, e.g.
+    ``scripts/verify_nvfp4_gemm_single_layer.py``) -- this class just never
+    triggers it.
 
-    ``gate_proj.weight_scale_2`` and ``up_proj.weight_scale_2`` must be
-    exactly equal for the fused ``w13`` global scale to be valid (the
-    kernel's packed W4A16 format has ONE global scale per w13 tensor,
-    shared by both halves). Empirically true for every one of the real
-    checkpoint's 64 MLP layers (verified directly off safetensors headers,
-    not assumed) -- ``_ensure_w4a16_fused_ready`` asserts it rather than
-    silently averaging/picking one if a future checkpoint variant differs.
+    ``gate_proj``'s and ``up_proj``'s fused-global-scale must be exactly
+    equal for the fused ``w13`` global scale to be valid (the kernel's
+    packed W4A16 format has ONE global scale per w13 tensor, shared by both
+    halves). Empirically true for every real NVFP4 MLP layer in BOTH
+    checkpoints this runtime loads (verified directly off safetensors
+    headers, not assumed -- nvidia's modelopt checkpoint: all 64 layers;
+    unsloth's compressed-tensors checkpoint: all 56 NVFP4 layers, i.e.
+    every layer except the 8 FP8-channel ones above) --
+    ``_ensure_w4a16_fused_ready`` asserts it rather than silently
+    averaging/picking one if a future checkpoint variant differs.
 
     **Raw-Parameter freeing (2026-08-03 follow-up)**: once
     ``_w4a16_prepared`` is built, ``gate_proj``/``up_proj``/``down_proj``'s
-    raw ``.weight``/``.weight_scale``/``.weight_scale_2`` (~9.15 GiB across
-    64 real layers) are no longer read by this class -- by default
+    raw weight/scale Parameters (~9.15 GiB across 64 real layers on
+    nvidia's checkpoint) are no longer read by this class -- by default
     ``_ensure_w4a16_fused_ready`` frees them (see
-    ``_free_raw_nvfp4_weights``), so the two copies (raw + repacked) don't
-    stay resident together the way ``notes/2026-08-03-nvfp4-gemm-memory-
+    ``_free_raw_nvfp4_weights``, which now calls each submodule's own
+    ``free_nvfp4_raw_params()`` rather than looping over one format's fixed
+    attribute names), so the two copies (raw + repacked) don't stay
+    resident together the way ``notes/2026-08-03-nvfp4-gemm-memory-
     audit.md`` measured. Set ``self._keep_raw_nvfp4_weights = True`` before
     the first fused forward to opt out -- see ``__init__``'s docstring on
     that attribute for exactly which diagnostic/verification scripts need
@@ -1792,14 +1836,27 @@ class Qwen36MLP(nn.Module):
         assert config["hidden_act"] == "silu"
 
         # All-or-nothing: only fuse when every one of the three is a real
-        # NVFP4 Linear (never true for the mixed/unquantized configs some
-        # unit tests build, e.g. tests/test_qwen36_mtp_head.py's
-        # TestWeightPrefixOverride, which only quantizes gate_proj -- those
-        # fall through to the plain per-Linear forward below, unaffected).
+        # NVFP4 Linear -- either checkpoint format (modelopt's
+        # ModelOptNVFP4Linear or compressed-tensors mixed-precision's
+        # CompressedTensorsNVFP4Linear; 2026-08-03 follow-up, see both
+        # classes' `nvfp4_components_for_fuse`/`free_nvfp4_raw_params`
+        # methods -- this class no longer touches either one's raw
+        # Parameters by name, so it does not need to know which format it
+        # holds beyond this isinstance check). Never true for the
+        # mixed/unquantized configs some unit tests build, e.g.
+        # tests/test_qwen36_mtp_head.py's TestWeightPrefixOverride, which
+        # only quantizes gate_proj -- those fall through to the plain
+        # per-Linear forward below, unaffected. Also correctly False for
+        # unsloth's own FP8-channel MLP layers (that checkpoint's
+        # config_groups quantizes layers 56-63's mlp.{gate,up,down}_proj as
+        # FP8, not NVFP4 -- verified against the real safetensors index,
+        # 2026-08-03): those three submodules are CompressedTensorsFP8ChannelLinear
+        # instances, so this check is False for them and they fall through
+        # to the same plain per-Linear forward, same as ever.
         self._nvfp4_fused = (
-            isinstance(self.gate_proj, ModelOptNVFP4Linear)
-            and isinstance(self.up_proj, ModelOptNVFP4Linear)
-            and isinstance(self.down_proj, ModelOptNVFP4Linear)
+            isinstance(self.gate_proj, (ModelOptNVFP4Linear, CompressedTensorsNVFP4Linear))
+            and isinstance(self.up_proj, (ModelOptNVFP4Linear, CompressedTensorsNVFP4Linear))
+            and isinstance(self.down_proj, (ModelOptNVFP4Linear, CompressedTensorsNVFP4Linear))
         )
         self._w4a16_prepared = None  # built lazily, once, on first fused forward
 
@@ -1845,32 +1902,37 @@ class Qwen36MLP(nn.Module):
         )
 
         gate, up, down = self.gate_proj, self.up_proj, self.down_proj
-        gate_gs = gate.weight_scale_2.data.reshape(()).to(torch.float32)
-        up_gs = up.weight_scale_2.data.reshape(()).to(torch.float32)
+        # `nvfp4_components_for_fuse()` normalizes both checkpoint formats
+        # to the SAME (modelopt-style, direct-multiplier) global-scale
+        # convention -- see that method's docstring on each class
+        # (runtime/model/modelopt_linear.py,
+        # runtime/model/compressed_tensors_linear.py) for why unsloth's
+        # compressed-tensors format needs a reciprocal here and modelopt's
+        # doesn't. Everything below this line is format-agnostic.
+        gate_w, gate_scale, gate_gs = gate.nvfp4_components_for_fuse()
+        up_w, up_scale, up_gs = up.nvfp4_components_for_fuse()
+        down_w, down_scale, down_gs = down.nvfp4_components_for_fuse()
         if gate_gs.item() != up_gs.item():
             raise ValueError(
-                "Qwen36MLP: gate_proj.weight_scale_2 "
-                f"({gate_gs.item()!r}) != up_proj.weight_scale_2 "
-                f"({up_gs.item()!r}) -- the fused w13 kernel needs one "
-                "shared global scale for both halves; this checkpoint "
-                "layer breaks the assumption every real layer was "
-                "verified to satisfy."
+                "Qwen36MLP: gate_proj's fused-global-scale "
+                f"({gate_gs.item()!r}) != up_proj's ({up_gs.item()!r}) -- "
+                "the fused w13 kernel needs one shared global scale for "
+                "both halves; this checkpoint layer breaks the assumption "
+                "every real layer was verified to satisfy."
             )
 
         # w13 physical row order: [gate rows; up rows] -- pass
         # w13_layout="gate_up" so the kernel knows this is already its own
         # native (no-row-rotation) order. See class docstring.
-        w13_fp4 = torch.cat([gate.weight.data, up.weight.data], dim=0).unsqueeze(0).contiguous()
+        w13_fp4 = torch.cat([gate_w, up_w], dim=0).unsqueeze(0).contiguous()
         w13_blockscale = swizzle_block_scale(
-            torch.cat([gate.weight_scale.data, up.weight_scale.data], dim=0)
-            .unsqueeze(0)
-            .contiguous()
+            torch.cat([gate_scale, up_scale], dim=0).unsqueeze(0).contiguous()
         )
         w13_global_scale = gate_gs.reshape(1).contiguous()
 
-        w2_fp4 = down.weight.data.unsqueeze(0).contiguous()
-        w2_blockscale = swizzle_block_scale(down.weight_scale.data.unsqueeze(0).contiguous())
-        w2_global_scale = down.weight_scale_2.data.reshape(1).to(torch.float32).contiguous()
+        w2_fp4 = down_w.unsqueeze(0).contiguous()
+        w2_blockscale = swizzle_block_scale(down_scale.unsqueeze(0).contiguous())
+        w2_global_scale = down_gs.reshape(1).contiguous()
 
         self._w4a16_prepared = prepare_w4a16_modelopt_nvfp4_weights(
             w13_fp4,
@@ -1895,6 +1957,18 @@ class Qwen36MLP(nn.Module):
         # storage -- never a view of their inputs -- so nothing above holds
         # onto these once this function returns.
         del w13_fp4, w13_blockscale, w2_fp4, w2_blockscale
+        # `gate_w`/`up_w`/`down_w`/`gate_scale`/`up_scale`/`down_scale`
+        # (unpacked from `nvfp4_components_for_fuse()` above) are themselves
+        # direct references to the raw Parameter `.data` tensors -- no
+        # copy. Unlike the pre-refactor code, which accessed
+        # `<submodule>.weight.data` inline inside `torch.cat(...)` and so
+        # never bound a persistent local name to it, these six ARE
+        # persistent local names in this frame and must be dropped for the
+        # same reason `w2_fp4`/`w2_blockscale` are above: a live local
+        # reference to the OLD tensor object keeps its storage resident
+        # even after `_free_raw_nvfp4_weights` reassigns the owning
+        # Parameter's `.data` to a fresh empty tensor.
+        del gate_w, up_w, down_w, gate_scale, up_scale, down_scale
         if not self._keep_raw_nvfp4_weights:
             self._free_raw_nvfp4_weights()
 
@@ -1926,11 +2000,16 @@ class Qwen36MLP(nn.Module):
         runs once per instance), so the cost is a bounded ~64 calls over
         the model's lifetime, not a per-token or per-forward recurring
         one."""
+        # `weight_scale` is the one Parameter name both NVFP4 Linear
+        # formats share verbatim (modelopt's `weight`/`weight_scale_2` vs
+        # compressed-tensors' `weight_packed`/`weight_global_scale` differ,
+        # `weight_scale` doesn't -- see both classes' `__init__`), so it is
+        # read here for the device check before `free_nvfp4_raw_params()`
+        # (below) reassigns it to a 0-element tensor on the SAME device.
+        device_type = self.gate_proj.weight_scale.data.device.type
         for lin in (self.gate_proj, self.up_proj, self.down_proj):
-            for name in ("weight", "weight_scale", "weight_scale_2"):
-                param = getattr(lin, name)
-                param.data = param.data.new_empty(0)
-        if self.gate_proj.weight.device.type == "cuda":
+            lin.free_nvfp4_raw_params()
+        if device_type == "cuda":
             torch.cuda.empty_cache()
 
     def _forward_w4a16_fused(self, x: torch.Tensor) -> torch.Tensor:
