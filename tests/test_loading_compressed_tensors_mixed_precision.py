@@ -107,20 +107,31 @@ class TestCompressedTensorsFP8ChannelLinear:
 
 class TestCompressedTensorsNVFP4Linear:
     def test_parameter_names_match_the_real_checkpoint_suffixes(self):
-        # Must be exactly these three -- .input_global_scale (the fourth
-        # real checkpoint tensor per module) is deliberately never given a
-        # Parameter here (see class docstring); Qwen36ForCausalLMSelfBuilt's
-        # _IGNORED_WEIGHT_SUFFIXES lets it fall on the floor without being
-        # mistaken for a missing-parameter bug.
+        # Must be exactly these four -- .input_global_scale (the checkpoint's
+        # activation-side static scale for this format's genuine W4A4
+        # scheme, `config_groups.group_1.input_activations`) now has a
+        # matching Parameter too (2026-08-03 W4A4 follow-up: it used to fall
+        # on the floor via Qwen36ForCausalLMSelfBuilt's default "no matching
+        # Parameter -> skip" behavior, deliberately, back when only the
+        # W4A16 dequant-to-BF16 path existed and never read it -- see
+        # nvfp4_w4a4_components_for_fuse's docstring for the consumer that
+        # now needs it loaded).
         lin = CompressedTensorsNVFP4Linear(32, 4, bias=False)
         names = {name for name, _ in lin.named_parameters()}
-        assert names == {"weight_packed", "weight_scale", "weight_global_scale"}
+        assert names == {
+            "weight_packed",
+            "weight_scale",
+            "weight_global_scale",
+            "input_global_scale",
+        }
         assert lin.weight_packed.shape == (4, 16)
         assert lin.weight_packed.dtype == torch.uint8
         assert lin.weight_scale.shape == (4, 2)  # 32 // group_size(16)
         assert lin.weight_scale.dtype == torch.float8_e4m3fn
         assert lin.weight_global_scale.shape == ()
         assert lin.weight_global_scale.dtype == torch.float32
+        assert lin.input_global_scale.shape == ()
+        assert lin.input_global_scale.dtype == torch.float32
 
     def test_forward_matches_hand_computed_value(self):
         # Same worked example as tests/test_loading_modelopt.py's
@@ -183,3 +194,68 @@ class TestCompressedTensorsNVFP4Linear:
         assert cached is not None
         lin(torch.ones(1, 32, dtype=torch.bfloat16))
         assert lin._weight_bf16 is cached
+
+
+class TestNvfp4W4A4ComponentsForFuse:
+    """``nvfp4_w4a4_components_for_fuse`` (2026-08-03, W4A4-GEMM
+    investigation, ``work/w4a4-20260803``) uses the OPPOSITE global-scale
+    convention from ``nvfp4_components_for_fuse`` right above it: both
+    ``weight_global_scale`` and ``input_global_scale`` come back verbatim,
+    NOT reciprocated -- because they feed ``sparkinfer.gemm.blockscaled.mm``'s
+    own ``alpha = 1 / (weight_gs * activation_gs)`` convention, not
+    ``dequantize_nvfp4``'s direct-multiplier one.
+
+    This is exactly the kind of convention that produces a plausible-looking
+    but wrong model when it flips silently (the same class's own
+    ``test_weight_global_scale_is_reciprocated_not_used_directly`` pins the
+    OTHER method's convention for the same reason) -- measured on a real GPU
+    with real checkpoint weights, not assumed: reciprocating either scale
+    here collapses the output to a flat 0 (activation reciprocated -- the
+    per-block scale saturates below the smallest representable e4m3 value)
+    or blows it up past 1e10 (weight reciprocated -- see
+    ``scripts/verify_nvfp4_w4a4_gemm_single_layer.py``'s 4-way convention
+    sweep, run 2026-08-03). Only the "both direct" combination this test
+    pins landed within 1% of the BF16 reference's magnitude.
+    """
+
+    def test_both_global_scales_come_back_unreciprocated(self):
+        lin = CompressedTensorsNVFP4Linear(32, 4, bias=False)
+        lin.weight_packed.data.copy_(torch.zeros(4, 16, dtype=torch.uint8))
+        lin.weight_scale.data.copy_(torch.ones(4, 2, dtype=torch.float8_e4m3fn))
+        lin.weight_global_scale.data.copy_(torch.tensor(18432.0))
+        lin.input_global_scale.data.copy_(torch.tensor(376.0))
+
+        packed, scale, weight_gs, input_gs = lin.nvfp4_w4a4_components_for_fuse()
+
+        assert packed.data_ptr() == lin.weight_packed.data.data_ptr()
+        assert scale.data_ptr() == lin.weight_scale.data.data_ptr()
+        assert weight_gs.item() == 18432.0, (
+            "weight_global_scale must pass through verbatim for the "
+            "blockscaled.mm convention -- if this is 1/18432 instead, "
+            "nvfp4_w4a4_components_for_fuse started reusing "
+            "nvfp4_components_for_fuse's reciprocal by mistake"
+        )
+        assert input_gs.item() == 376.0, (
+            "input_global_scale must pass through verbatim too -- reciprocating "
+            "it (the bug this test guards) collapses every block scale below "
+            "the smallest representable e4m3 value, silently zeroing the "
+            "quantized activation instead of raising"
+        )
+
+    def test_differs_from_the_w4a16_reciprocating_convention(self):
+        """The two methods must disagree on the same checkpoint tensor --
+        if a future refactor makes them share one code path, this fails
+        instead of silently applying the W4A16 kernel's convention to the
+        W4A4 blockscaled kernel (or vice versa)."""
+        lin = CompressedTensorsNVFP4Linear(32, 4, bias=False)
+        lin.weight_packed.data.copy_(torch.zeros(4, 16, dtype=torch.uint8))
+        lin.weight_scale.data.copy_(torch.ones(4, 2, dtype=torch.float8_e4m3fn))
+        lin.weight_global_scale.data.copy_(torch.tensor(6624.0))
+        lin.input_global_scale.data.copy_(torch.tensor(776.0))
+
+        _, _, w4a16_gs = lin.nvfp4_components_for_fuse()
+        _, _, w4a4_weight_gs, _ = lin.nvfp4_w4a4_components_for_fuse()
+
+        assert abs(w4a16_gs.item() - 1.0 / 6624.0) < 1e-9
+        assert w4a4_weight_gs.item() == 6624.0
+        assert w4a16_gs.item() != w4a4_weight_gs.item()
