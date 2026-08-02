@@ -151,7 +151,9 @@ def main() -> None:
     layer(x_prefill, anchor_state)
     record("anchor has_previous_state after prefill", anchor_state.has_previous_state is True)
 
-    K = 16
+    K = int(sys.argv[1]) if len(sys.argv) > 1 else 16  # repo default (NUM_SPECULATIVE_TOKENS);
+    # scripts/b3_mtp_e2e_acceptance_throughput.py's own e2e run used K=8 --
+    # pass 8 here to align with that report's numbers for extrapolation.
     x_candidates = torch.randn(1, K, hidden_size, device=DEVICE, dtype=torch.bfloat16) * 0.1
 
     # -- Correctness: OLD and NEW spec_forward must agree bit-exactly ----
