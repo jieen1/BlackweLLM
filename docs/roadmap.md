@@ -136,14 +136,22 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       与实测调用数**一个不差**；NVFP4 侧 56 预期 = 56 实测。
       ⚠️ 其中 24.8% 跑在 `cutlass_80_wmma_tensorop` 上——**为 SM80 编译的 Ampere 代
       kernel，在 cc 12.0 的卡上**。cuBLAS 按形状在 `gemvx`/SM80 WMMA 之间分派。
-- [ ] 🎯 **阶段四两根杠杆，合计 80% 的解码 kernel 时间**：
-      **① FP8 层 45%（13.83 ms/step，233 次）** —— 现在反量化成 BF16 再算；
-      接 FP8 W8A8 kernel 可全程保持量化。此前有意推迟（单层 cosine 0.9996，
-      比 NVFP4 路径差 30–40×，需专门一轮全模型验证）。
-      **② NVFP4 层 35%（10.75 ms/step，56 次）** —— 现在走 W4A16；
-      标准 checkpoint 声明 W4A4 且 `input_global_scale` 实际发货，
-      `gemm.blockscaled` 路径开着（见上一条对我自己那次误判的纠正）。
-      ⚠️ **两者动手前都必须先过 B1-R 的 gap-error 判据**——上次 `blockscaled.mm` 就栽在那。
+- [x] ~~**杠杆②：NVFP4 层改走 W4A4**（35%，10.75 ms/step）~~ —— 🔴 **试过了，不可用。**
+      前提确实是对的（kernel 契约完全匹配、checkpoint 真的声明 W4A4 且发货
+      `input_global_scale`），**但数值上就是差**：单层 cosine 0.988–0.989 对现有 W4A16 的
+      0.999984–0.999990，**差约 30×**；B1-R **全线不过**（median gap 0.5 / 判据 0.25，
+      p90 0.875 / 0.5，最差负载 `mean_kl_topk` 7–8e-3 / 5e-3），且 `instruction` 负载
+      25–65 步内就**发散到溢出 top-1024 捕获窗口——比 B1-R 校准集里任何注入 bug 都差**。
+      未测速度（正确性已不过，测速只会诱使放宽判据）。生产路径未动。
+      详见 [`../notes/2026-08-03-w4a4-blockscaled-negative-result.md`](../notes/2026-08-03-w4a4-blockscaled-negative-result.md)。
+- [ ] 🎯 **杠杆①（现在是唯一一根）：FP8 层 45%（13.83 ms/step，233 次调用）**
+      —— 现在反量化成 BF16 再走 `F.linear`；接 FP8 W8A8 kernel 可全程保持量化。
+      ⚠️ **先做判据预演再投实现**：FP8 W8A8 单层 cosine 0.9996，比 NVFP4 路径差 30–40×
+      ——**与刚被否掉的 W4A4（0.988 vs 0.99999）是同一量级的劣化**，
+      而 W4A4 已经证明这个量级足以打穿 B1-R。**不要重复一遍完整实现再发现过不了。**
+- [ ] ⚠️ **`assert_all_params_loaded` 是单向的**：保证"每个模型参数都拿到 checkpoint 张量"，
+      **不保证"每个 checkpoint 张量都被消费"**。`input_global_scale` 因此被静默丢弃了很久
+      （W4A4 调查时才发现，本次无害但盲区是真的）。补一个反向检查。
 - [x] ~~持久化 kernel 编译缓存~~ —— **本来就有，而且默认开着；我先前说"`cache_key`
       只是进程内记忆化"是错的，现予纠正。**
       `sparkinfer/_lib/compiler.py` 有三层：spec memo、内存 LRU、**磁盘缓存**。
