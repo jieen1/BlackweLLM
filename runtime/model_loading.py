@@ -74,6 +74,8 @@ from runtime.loading.common import (
     assert_all_params_loaded,
     default_torch_dtype,
     iterate_safetensors_checkpoint,
+    record_checkpoint_tensor_names,
+    warn_on_unconsumed_tensor_families,
 )
 from runtime.loading.language_model_only import (
     LanguageModelOnlyStats,
@@ -285,8 +287,15 @@ def load_qwen36_model(
             language_model_only=language_model_only,
             stats=vision_filter_stats,
         )
+        # Recorded AFTER the vision filter: tensors it drops were dropped on
+        # purpose and must not be reported as unconsumed.
+        seen_checkpoint_names: set[str] = set()
+        weights = record_checkpoint_tensor_names(weights, seen_checkpoint_names)
         loaded_param_names = model.load_weights(weights)
         assert_all_params_loaded(model, loaded_param_names, context="load_qwen36_model")
+        warn_on_unconsumed_tensor_families(
+            model, seen_checkpoint_names, context="load_qwen36_model"
+        )
 
     model._vision_filter_stats = vision_filter_stats
     model.eval()

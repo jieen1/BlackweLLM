@@ -34,13 +34,16 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Generator
+import logging
+from collections.abc import Generator, Iterable
 from pathlib import Path
 
 import torch
 from safetensors import safe_open
 
 from runtime.model.plain_attention import SelfBuiltAttentionPlaceholder
+
+logger = logging.getLogger(__name__)
 
 
 @contextlib.contextmanager
@@ -211,3 +214,91 @@ def assert_all_params_loaded(
             "or load_weights's name-mapping logic has a bug -- do not "
             "silently proceed with randomly-initialized weights."
         )
+
+
+def record_checkpoint_tensor_names(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    sink: set[str],
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Pass ``weights`` through unchanged, recording every name into ``sink``.
+
+    A generator rather than a list because the whole point of
+    :func:`iterate_safetensors_checkpoint` is never holding the checkpoint in
+    memory at once (see its own memory-safety note). Only names accumulate.
+
+    Wrap this *after* any filtering, not before -- filtered-out tensors were
+    dropped on purpose and must not be reported as unconsumed.
+    """
+    for name, tensor in weights:
+        sink.add(name)
+        yield name, tensor
+
+
+def _tensor_family(name: str) -> str:
+    """The trailing component that identifies what KIND of tensor this is.
+
+    ``model.layers.0.mlp.gate_proj.input_global_scale`` -> ``input_global_scale``
+    """
+    return name.rsplit(".", 1)[-1]
+
+
+def warn_on_unconsumed_tensor_families(
+    model: torch.nn.Module,
+    seen_checkpoint_names: set[str],
+    *,
+    context: str,
+    expected_unconsumed: frozenset[str] = frozenset(),
+) -> frozenset[str]:
+    """Report checkpoint tensor *families* that reached no model parameter.
+
+    :func:`assert_all_params_loaded` checks one direction only: every model
+    Parameter received a checkpoint tensor. The reverse -- a checkpoint tensor
+    that no Parameter consumed -- is completely silent, because an unused
+    tensor simply never gets read.
+
+    That blind spot is not hypothetical. ``CompressedTensorsNVFP4Linear``
+    never created an ``input_global_scale`` Parameter, so the standard
+    checkpoint's 56 activation-scale tensors were dropped without a word for
+    as long as that class existed. It happened to be harmless -- the W4A16
+    path does not need an activation scale -- but nothing said so at the time,
+    and the next dropped scale need not be harmless. A missing scale does not
+    crash; it quietly changes the arithmetic.
+
+    Compares *families* (trailing name component) rather than full names on
+    purpose: loaders remap names, so ``checkpoint_names - loaded_param_names``
+    would be meaningless set arithmetic between two different naming schemes.
+    A family is scheme-independent -- if a checkpoint ships any
+    ``.input_global_scale`` and the model has no parameter whose name ends
+    that way, nothing could have consumed it, whatever the remapping.
+
+    **Warns rather than raises**, unlike its sibling. A parameter with no
+    tensor is unambiguously a defect -- the weight is random. An unconsumed
+    tensor is often legitimate: checkpoints ship tensors for features this
+    runtime does not enable (MTP heads with ``enable_mtp=False``, alternate
+    quantization schemes). Raising would turn "the checkpoint offers more than
+    we use" into a load failure. Being able to *see* it is the whole fix.
+
+    Returns the unconsumed families so callers/tests can assert on them.
+    """
+    checkpoint_families = {_tensor_family(n) for n in seen_checkpoint_names}
+    param_families = {_tensor_family(n) for n, _ in model.named_parameters()}
+    buffer_families = {_tensor_family(n) for n, _ in model.named_buffers()}
+
+    unconsumed = checkpoint_families - param_families - buffer_families - expected_unconsumed
+    if unconsumed:
+        counts = {
+            family: sum(1 for n in seen_checkpoint_names if _tensor_family(n) == family)
+            for family in unconsumed
+        }
+        detail = ", ".join(f"{f} x{counts[f]}" for f in sorted(unconsumed))
+        logger.warning(
+            "%s: %d checkpoint tensor family/families reached no model parameter "
+            "or buffer: %s. Nothing consumed them, so whatever they encode is not "
+            "affecting this model. That is expected for features this build does "
+            "not enable, and a real defect if one of them is a scale the active "
+            "quantization scheme should be using.",
+            context,
+            len(unconsumed),
+            detail,
+        )
+    return frozenset(unconsumed)
