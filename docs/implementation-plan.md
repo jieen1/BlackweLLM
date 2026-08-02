@@ -463,10 +463,38 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 
 
 **B2 服务化**（M3，1 月）
-- [ ] 固定槽位 + 连续批处理 · 递归状态纳入槽位生命周期 · CUDA Graph（**B0-5 已确认 capture-safe，2026-08-02**，
+- [x] 固定槽位 + 连续批处理 · 递归状态纳入槽位生命周期 · CUDA Graph（**B0-5 已确认 capture-safe，2026-08-02**，
   落地时复刻 `mark_static_address`+`.copy_()` 模式，新槶位分配时需显式 `.zero_()` 一次） ·
   前缀缓存联动驱逐（A3 的第一个真实用户）· 并发 ≥ 2
 - **门禁**：双协议回归全绿 + **C-LIVE 通过** + 与 B1 eager 贪心 bit-exact
+
+  ✅ **已落地（2026-08-02，`work/b2-serving-20260802`）**：`runtime/model/qwen36_slots.py`
+  （`Qwen36SlotPool`）+ `runtime/backends/qwen36.py`（`Qwen36Backend`，符合 `ModelBackend`）+
+  `server/engine.py::_load_qwen36_model`。**`IMPLEMENTED_BACKENDS` 已翻**——翻的依据是一次真实的
+  端到端服务运行（`backend=qwen36`，OpenAI/Anthropic 双协议、流式与非流式、thinking 剥离、`/metrics` 200），
+  不是"代码写好了"。
+
+  **三条门禁的实测结果**（`scripts/b2_verify_serving.py`，真实 `nvidia/Qwen3.6-27B-NVFP4`）：
+  - **与 B1 eager 贪心 bit-exact** ✅ —— 服务路径（串行）与 B1 eager 逐 token 相同；批处理 B=1 与串行相同；
+    **从递归 checkpoint 热恢复的续写与冷启动 B1 eager 逐 token 相同**（这条最强：它同时坐实了
+    checkpoint 还原和 KV 复用两侧）。13/13 通过。
+  - **C-LIVE 通过** ✅ 67/67（在本 worktree 起的 Laguna 服务上跑，双协议回归全绿）。
+  - **并发 ≥ 2** ✅ 两槽同轮解码，每槽输出与其单独运行逐 token 相同（INV-A3-1 信号探针）；
+    batch=2 每轮 247.5ms vs batch=1 220.7ms ⇒ 聚合 1.78x（另一次测到 2.10x，batch=1 基线是抖动的那一半）。
+  - **CUDA Graph** ✅ `head_dim=256` 下 `use_cuda_graph=True` 首次实测跑通（B0-3 留给 B2 的那条），
+    捕获后重放与 eager 批处理逐 token 相同，且捕获后每槽递归状态 `max|state|=0`（B0-5 的操作要求）。
+
+  **关键实现决定**：递归 checkpoint 为**每槽一份滚动的、block 对齐的**副本（本 checkpoint 几何下
+  ~77 MiB/份，按真实 config 重算，不沿用 `notes/prefix-cache-design.md` 的 "~151MB"），由
+  `RecurrentStatePool` 的字节预算 LRU 管辖，INV-A3-3 双向都接上了。`SlotResourceManager` 的
+  `NotImplementedError` 分支已实现，只拿两件后端做不了的事：把 §3 的 block 对齐规则统一执行一次，
+  以及**按 `.effective` 而不是 KV 深度给空闲槽排序**。
+
+  **未验证 / 交还的待办**：① 服务进程内 CUDA Graph 是否真的生效未能从日志确认（`server.engine`
+  的 logger 在当前日志配置下不落盘，Laguna 侧同样如此）；② 服务级并发 ≥ 2（本轮按显存预算用了
+  capacity=1，并发证据在 backend 级）；③ 绝对速度 ~4 tok/s 是 B1 "每次 forward 反量化到 BF16"
+  的代价，不是 B2 的回归，属 B3；④ MTP/投机、warm continue 明确不在 B2（`capabilities` 里写着 `False`）；
+  ⑤ 长上下文（本轮最长 32K 服务、512 验证）与多轮 soak 未做。
 
 **B3 性能与投机**（M4，1 月）—— **B0-8 已答（✅ MTP 不含 GDN），体量按下文收窄，不是两个分支待选**：
 - 草稿侧（MTP 头）**已确认简化**：MTP 不需要自己的 conv/ssm 递归状态，不需要 eagle-shift
