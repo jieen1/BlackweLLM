@@ -72,14 +72,20 @@ import torch  # noqa: E402
 from safetensors import safe_open  # noqa: E402
 
 from runtime.backends._sparkinfer_import import ensure_sparkinfer_path  # noqa: E402
+from runtime.checkpoints import modelopt_checkpoint_path  # noqa: E402
 from runtime.model.modelopt_linear import ModelOptFP8Linear  # noqa: E402
 
 ensure_sparkinfer_path()
 from sparkinfer.gemm import tensor_fp8_linear  # noqa: E402
 
-CKPT = Path(
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/snapshots"
-)
+# Deliberately modelopt (nvidia), not the standard checkpoint: this script
+# imports ``ModelOptFP8Linear`` directly and reads the checkpoint's own
+# ``config_groups`` scheme to confirm this format's static per-tensor FP8
+# scales (see the module docstring above) -- both are modelopt-specific;
+# the standard checkpoint's FP8 layers use a different, per-channel scale
+# layout (see ``runtime/model/compressed_tensors_linear.py``'s module
+# docstring) that ``ModelOptFP8Linear`` does not know how to read.
+CKPT = Path(modelopt_checkpoint_path())
 DEVICE = "cuda"
 
 #: (checkpoint dotted prefix, layer index used only for the printed label)
@@ -90,9 +96,9 @@ TARGETS = (
 
 
 def _find_ckpt() -> Path:
-    snaps = sorted(CKPT.iterdir())
-    assert snaps, f"no snapshot under {CKPT}"
-    return snaps[0]
+    """``modelopt_checkpoint_path()`` already resolved the one real snapshot
+    directory (or raised a clear error) -- nothing left to glob for here."""
+    return CKPT
 
 
 def load_linear(ckpt: Path, prefix: str) -> ModelOptFP8Linear:

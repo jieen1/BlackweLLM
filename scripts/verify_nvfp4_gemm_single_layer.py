@@ -57,6 +57,7 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from safetensors import safe_open  # noqa: E402
 
+from runtime.checkpoints import standard_checkpoint_path  # noqa: E402
 from runtime.loading.compressed_tensors import QUANT_ALGO_MP_NVFP4  # noqa: E402
 from runtime.loading.modelopt import QUANT_ALGO_NVFP4  # noqa: E402
 from runtime.model._weight_loading import default_weight_loader  # noqa: E402
@@ -68,9 +69,14 @@ from runtime.model.qwen36_model import (  # noqa: E402
 )
 from runtime.model_loading import _build_qwen36_model_config  # noqa: E402
 
-DEFAULT_CKPT_GLOB = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/snapshots"
-)
+# Genuinely format-agnostic (see ``_detect_algo``/``_SUFFIXES_FOR_ALGO``
+# above): auto-detects the checkpoint's quant format rather than assuming
+# one, so this defaults to the standard checkpoint like every other
+# non-format-pinned script this round, but ``--model-path`` (below) can
+# still point it at nvidia's modelopt checkpoint -- e.g. to reproduce
+# modelopt-specific numbers, or via ``modelopt_checkpoint_path()`` from
+# ``runtime.checkpoints``.
+DEFAULT_CKPT_GLOB = standard_checkpoint_path()
 LAYER = 5
 DEVICE = "cuda"
 HIDDEN_ACT = "silu"

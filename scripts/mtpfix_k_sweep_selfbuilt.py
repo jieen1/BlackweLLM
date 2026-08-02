@@ -51,14 +51,21 @@ assert runtime.__file__.startswith(_ROOT), (
 import torch  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
+from runtime.checkpoints import modelopt_checkpoint_path  # noqa: E402
 from runtime.model.qwen36_model import Qwen36GenerationState  # noqa: E402
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 from runtime.mtp_accept import determine_accept_reject_from_predictions  # noqa: E402
 
-MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
-    "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
-)
+# Deliberately modelopt (nvidia), not the standard checkpoint -- and unlike
+# most of this round's migrations, not because of format-specific code.
+# This script's entire point (see module docstring) is being the
+# nvidia-checkpoint half of a deliberate two-script comparison against its
+# sibling ``mtpfix_unsloth_checkpoint_probe.py`` (hardcoded to the standard
+# checkpoint), isolating the checkpoint-*publisher* confound in the
+# historical MTP acceptance-rate discrepancy. Pointing this script at the
+# standard checkpoint too would collapse the comparison the pair exists to
+# make.
+MODEL_PATH = modelopt_checkpoint_path()
 DEVICE = torch.device("cuda")
 MAX_SEQ_LEN = 256
 N_TOKENS = 32  # tokens to generate per prompt (both paths)

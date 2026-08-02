@@ -70,6 +70,7 @@ import torch  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
 from bfdiag.divergence.qwen36_capture import Qwen36HFOracleCaptureSource  # noqa: E402
+from runtime.checkpoints import standard_checkpoint_path  # noqa: E402
 from runtime.model_loading import _build_qwen36_model_config, load_qwen36_model  # noqa: E402
 
 
@@ -90,10 +91,17 @@ def _load_sibling_script(name: str):
     spec.loader.exec_module(module)
     return module
 
-MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
-    "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
-)
+# checkpoint-unify-20260803 KNOWN GAP: this script's ``stage_dequantized_
+# weights_to_disk``/``load_staged_weights_into_hf`` calls are reused
+# verbatim from ``b1_verify_greedy_alignment.py`` (via ``_load_sibling_
+# script`` above) and inherit that script's modelopt-only staging-suffix
+# gap -- see the "checkpoint-unify-20260803 KNOWN GAP" comment on that
+# file's own ``MODEL_PATH`` for the full explanation. Against the standard
+# checkpoint, every NVFP4 MLP weight is currently dropped from staging
+# silently rather than erroring, so HF's captured reference trajectory
+# below is not yet trustworthy for this checkpoint. Flagged, not fixed
+# here: out of scope for a checkpoint-path migration.
+MODEL_PATH = standard_checkpoint_path()
 DEVICE = torch.device("cuda")
 MAX_NEW_TOKENS = 512
 MAX_SEQ_LEN = 2048

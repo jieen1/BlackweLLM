@@ -39,12 +39,18 @@ assert runtime.__file__.startswith(_ROOT), (
 import torch  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
+from runtime.checkpoints import modelopt_checkpoint_path  # noqa: E402
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 
-DEFAULT_MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
-    "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
-)
+# Default deliberately stays nvidia's modelopt checkpoint -- NOT because
+# this measurement code is format-specific (it isn't; ``--model-path``
+# below already runs the standard checkpoint through the identical code
+# path), but because the default exists specifically to reproduce nvidia's
+# own historical 6.547 tok/s figure on demand (see the module docstring
+# above). Changing the default would silently break that reproducibility
+# for anyone who omits ``--model-path``. Pass ``--model-path`` explicitly
+# to grade the standard checkpoint instead.
+DEFAULT_MODEL_PATH = modelopt_checkpoint_path()
 DEVICE = torch.device("cuda")
 torch.set_grad_enabled(False)
 

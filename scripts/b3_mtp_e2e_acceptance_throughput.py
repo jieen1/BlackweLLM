@@ -65,14 +65,19 @@ assert runtime.__file__.startswith(_ROOT), (
 import torch  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
+from runtime.checkpoints import standard_checkpoint_path  # noqa: E402
 from runtime.model.qwen36_model import Qwen36GenerationState  # noqa: E402
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 from runtime.mtp_accept import determine_accept_reject_from_predictions  # noqa: E402
 
-MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
-    "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
-)
+# Checkpoint choice matters here, not just as a formality: MTP acceptance
+# behavior has been measured to differ by checkpoint *publisher*, not only
+# by quantization format -- see scripts/mtpfix_unsloth_checkpoint_probe.py's
+# module docstring. This is the script the "K=8, chosen when the head was
+# wired up" / "e2e to prose 1.09x / code 0.905x" figures in the roadmap and
+# notes/ came from, measured on the nvidia checkpoint; re-running on the
+# standard checkpoint may change them enough to change those conclusions.
+MODEL_PATH = standard_checkpoint_path()
 DEVICE = torch.device("cuda")
 MAX_SEQ_LEN = 256
 # Draft tokens per speculative round. 4, not 8.

@@ -75,6 +75,7 @@ if _mem_fraction:
 from transformers import AutoTokenizer  # noqa: E402
 
 from runtime.backends.qwen36 import Qwen36Backend  # noqa: E402
+from runtime.checkpoints import standard_checkpoint_path  # noqa: E402
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 from runtime.sampling import SamplingParams  # noqa: E402
 
@@ -82,12 +83,15 @@ from runtime.sampling import SamplingParams  # noqa: E402
 # parameterized by --model-path (same convention as
 # verify_nvfp4_gemm_full_model_gap.py / measure_nvfp4_gemm_memory_and_
 # throughput.py, commit 9e67e4a) so this same B2 gate script can also
-# grade unsloth/Qwen3.6-27B-NVFP4 (the standard/served checkpoint) --
-# default unchanged, still nvidia's checkpoint.
-DEFAULT_MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
-    "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
-)
+# grade unsloth/Qwen3.6-27B-NVFP4 (the standard/served checkpoint).
+#
+# checkpoint-unify-20260803: default flipped to the standard checkpoint --
+# this is the B2 *serving* gate ("does the serving path compute what B1's
+# eager path computes"), which should default to grading the model actually
+# served, same as every other B1/B2/B3 script this round migrated. Still
+# overridable via --model-path (e.g. to re-check against nvidia's modelopt
+# checkpoint specifically).
+DEFAULT_MODEL_PATH = standard_checkpoint_path()
 
 PROMPTS = [
     "The capital of France is",

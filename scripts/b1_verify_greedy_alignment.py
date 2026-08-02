@@ -108,12 +108,34 @@ from bfdiag.divergence.qwen36_greedy_alignment import (  # noqa: E402
 )
 from bfdiag.divergence.report import format_text_report  # noqa: E402
 from bfdiag.divergence.scan import scan_layers  # noqa: E402
+from runtime.checkpoints import standard_checkpoint_path  # noqa: E402
 from runtime.model_loading import _build_qwen36_model_config, load_qwen36_model  # noqa: E402
 
-MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
-    "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
-)
+# checkpoint-unify-20260803 KNOWN GAP -- read before trusting a run against
+# this default: this script's disk-staging path (``_NEVER_STAGED_SUFFIXES``/
+# ``stage_dequantized_weights_to_disk`` below) hardcodes modelopt's suffix
+# set (``.weight``/``.weight_scale``/``.weight_scale_2``/``.input_scale``).
+# The standard checkpoint's NVFP4 MLP parameters use compressed-tensors'
+# different suffixes instead (``.weight_packed``/``.weight_scale``/
+# ``.weight_global_scale``) -- ``.weight_packed`` does not end with
+# ``".weight"`` so it skips the dequant-cache branch, and neither it nor
+# ``.weight_global_scale`` is in ``_NEVER_STAGED_SUFFIXES``, so both get
+# staged as raw (non-dequantized) tensors under names HF's plain
+# ``nn.Linear`` does not have. ``load_staged_weights_into_hf`` then reports
+# them ``missing`` and leaves every NVFP4-quantized HF Linear (i.e. every
+# MLP gate/up/down_proj) at random init -- NOT a crash, a silently
+# meaningless comparison.
+#
+# ``stage_dequantized_weights_to_disk`` now REFUSES this case outright
+# (raises ``NotImplementedError`` on any ``.weight_packed`` parameter)
+# rather than relying on whoever runs it next having read this comment.
+# So the gap is contained, not merely documented: the script cannot
+# silently produce a meaningless PASS/FAIL. It still needs the real fix --
+# extending the staging suffix set for compressed-tensors NVFP4 -- before
+# B1 can grade the standard checkpoint at all; that is a staging-logic
+# change, out of scope for a checkpoint-*path* migration. Until then, run
+# against ``runtime.checkpoints.modelopt_checkpoint_path()``.
+MODEL_PATH = standard_checkpoint_path()
 MAX_NEW_TOKENS = 512
 DEVICE = torch.device("cuda")
 
@@ -127,8 +149,7 @@ WORKLOADS: tuple[tuple[str, str], ...] = (
     ("math-short", "2 + 2 ="),
     (
         "instruction-longer",
-        "Write a short paragraph explaining, in simple terms, how a "
-        "refrigerator keeps food cold.",
+        "Write a short paragraph explaining, in simple terms, how a refrigerator keeps food cold.",
     ),
 )
 
@@ -138,6 +159,12 @@ WORKLOADS: tuple[tuple[str, str], ...] = (
 #: a real ``input_scale`` Parameter (see its docstring) that this runtime's
 #: own FP8 kernel path reads directly, but HF's plain ``nn.Linear`` has no
 #: activation-scale equivalent to load it into, same as the other two.
+#:
+#: MODELOPT-ONLY -- see the "checkpoint-unify-20260803 KNOWN GAP" comment
+#: above ``MODEL_PATH``: this suffix set does not cover compressed-tensors'
+#: ``.weight_packed``/``.weight_global_scale``, so staging against the
+#: standard checkpoint currently drops every NVFP4 MLP weight silently
+#: rather than erroring.
 _NEVER_STAGED_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 
 
@@ -169,6 +196,34 @@ def stage_dequantized_weights_to_disk(mine: torch.nn.Module, scratch_dir: Path) 
     to load them into).
     """
     modules_by_path = dict(mine.named_modules())
+
+    # Refuse rather than stage a comparison we know is meaningless. See the
+    # KNOWN GAP note above MODEL_PATH: this function's suffix set is
+    # modelopt's, so a compressed-tensors checkpoint's `.weight_packed`
+    # would be staged raw under a name HF's plain nn.Linear does not have,
+    # `load_staged_weights_into_hf` would report it missing, and every
+    # NVFP4 MLP Linear in the reference model would stay at random init --
+    # producing a PASS/FAIL that means nothing, without crashing.
+    #
+    # A comment alone does not stop that; whoever runs this next will not
+    # have read it. This repo's own precedent for "the runtime cannot
+    # honor this request" is to fail loudly rather than proceed silently
+    # (see N1: json_schema is rejected with a 400 instead of being accepted
+    # and left unconstrained). Same choice here.
+    packed = sorted(n for n, _ in mine.named_parameters() if n.endswith(".weight_packed"))
+    if packed:
+        raise NotImplementedError(
+            f"{len(packed)} compressed-tensors parameter(s) end with '.weight_packed' "
+            f"(e.g. {packed[0]}), which this script's disk-staging path cannot handle: "
+            f"_NEVER_STAGED_SUFFIXES and the dequant-cache branch below both encode "
+            f"modelopt's naming ('.weight'/'.weight_scale'/'.weight_scale_2'/"
+            f"'.input_scale'). Staging anyway would leave every NVFP4 MLP Linear in "
+            f"the HF reference model at random init and yield a silently meaningless "
+            f"result. Extend the staging suffix set for compressed-tensors NVFP4 "
+            f"first, or run this script against the modelopt checkpoint "
+            f"(runtime.checkpoints.modelopt_checkpoint_path) while that is pending."
+        )
+
     staged: list[str] = []
     for name, param in mine.named_parameters():
         if name.endswith(_NEVER_STAGED_SUFFIXES):
@@ -321,9 +376,7 @@ def main() -> None:
     try:
         # -- Step 1: load our own model --
         t0 = time.time()
-        mine = load_qwen36_model(
-            MODEL_PATH, device="cuda", dtype=torch.bfloat16, max_seq_len=1024
-        )
+        mine = load_qwen36_model(MODEL_PATH, device="cuda", dtype=torch.bfloat16, max_seq_len=1024)
         print(f"load_qwen36_model: {time.time() - t0:.1f}s")
 
         # -- Step 2: stage every real parameter to disk, dequantized --
@@ -348,8 +401,7 @@ def main() -> None:
             mine_traces[name] = _clone_trace_to_cpu(trace)
             mine_tokens[name] = greedy_generate_mine(mine, input_ids, MAX_NEW_TOKENS, eos_id)
             print(
-                f"[mine] {name}: {time.time() - t0:.1f}s, "
-                f"generated {len(mine_tokens[name])} tokens"
+                f"[mine] {name}: {time.time() - t0:.1f}s, generated {len(mine_tokens[name])} tokens"
             )
 
         mem_after_mine = torch.cuda.memory_allocated() / (1024**3)
