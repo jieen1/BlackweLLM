@@ -63,6 +63,8 @@ not prove.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -79,6 +81,7 @@ from runtime.loading.language_model_only import (
 )
 from runtime.model.laguna_dflash_model import LagunaDraftForCausalLMSelfBuilt
 from runtime.model.laguna_model import LagunaForCausalLMSelfBuilt
+from runtime.model.qwen36_model import Qwen36ForCausalLMSelfBuilt
 
 
 def load_laguna_model(
@@ -189,4 +192,66 @@ def load_laguna_dflash_draft_model(
     # those aren't read by this step) -- see laguna_dflash_model.py.
     model.model._build_fused_kv_buffers()
 
+    return model.eval()
+
+
+def _build_qwen36_model_config(model_path: str) -> dict[str, Any]:
+    """Merge ``config.json``'s ``text_config`` (Qwen3.6 nests the language
+    model's own fields there -- ``runtime.architecture._text_section``
+    already establishes this convention) with the top-level
+    ``quantization_config`` (which is NOT nested under ``text_config`` --
+    verified directly against the real checkpoint) into one flat dict,
+    since :class:`runtime.model.qwen36_model.Qwen36ForCausalLMSelfBuilt`
+    reads both from a single ``config`` argument.
+    """
+    raw = json.loads((Path(model_path) / "config.json").read_text())
+    text_config = raw.get("text_config")
+    merged = dict(text_config) if isinstance(text_config, dict) else dict(raw)
+    merged["quantization_config"] = raw.get("quantization_config")
+    return merged
+
+
+def load_qwen36_model(
+    model_path: str,
+    *,
+    device: torch.device | str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+    max_seq_len: int = 4096,
+    language_model_only: bool = True,
+) -> Qwen36ForCausalLMSelfBuilt:
+    """Construct + load a Qwen3.6-27B (``Qwen3_5ForConditionalGeneration``,
+    text-only) model instance. Track B / B1 -- see ``runtime/model/
+    qwen36_model.py``'s module docstring for the exact scope this covers
+    (eager, batch=1, BF16-dequantized quantized Linears, BF16 KV cache).
+
+    Unlike :func:`load_laguna_model`, ``language_model_only`` defaults to
+    **True** here, not False: this runtime's only real Qwen3.6 checkpoint
+    (``nvidia/Qwen3.6-27B-NVFP4``, D6) ships a real vision tower this
+    runtime never builds (B0-1a/b) -- there is no analogue of Laguna's
+    "no vision tensors exist at all" case for this family, so silently
+    defaulting to False here would mean the common call forgets to filter.
+    Passing False is only for a hypothetical vision-tower-free Qwen3.6
+    variant and should be a deliberate caller choice, not a silent default.
+
+    ``max_seq_len`` sizes every full-attention layer's single-page KV
+    cache (``Qwen36PagedAttentionCache``) upfront -- see that class's
+    docstring for why this is a hard cap, not a growable buffer, at B1's
+    batch=1/no-CUDA-graph scope.
+    """
+    model_config = _build_qwen36_model_config(model_path)
+    target_device = torch.device(device)
+
+    with default_torch_dtype(dtype), target_device:
+        model = Qwen36ForCausalLMSelfBuilt(model_config, max_seq_len=max_seq_len)
+
+        vision_filter_stats = LanguageModelOnlyStats()
+        weights = filter_language_model_only(
+            iterate_safetensors_checkpoint(model_path),
+            language_model_only=language_model_only,
+            stats=vision_filter_stats,
+        )
+        loaded_param_names = model.load_weights(weights)
+        assert_all_params_loaded(model, loaded_param_names, context="load_qwen36_model")
+
+    model._vision_filter_stats = vision_filter_stats
     return model.eval()
