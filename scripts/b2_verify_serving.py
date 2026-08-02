@@ -342,9 +342,15 @@ def check_cuda_graph(model, prompts, steps, args) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--slots", type=int, default=2)
+    # Defaults are the SMALLEST configuration that still exercises every
+    # claim, not a comfortable one: this card is shared with a user's own
+    # workload and with two other agent workstreams, and a 27B checkpoint
+    # dequantized to BF16 is ~54 GiB before a single cache byte. One slot
+    # and a 512-token context is what the coordinator's budget allows by
+    # default; --slots 2 is opt-in and only for the concurrency check.
+    ap.add_argument("--slots", type=int, default=1)
     ap.add_argument("--steps", type=int, default=16)
-    ap.add_argument("--max-seq-len", type=int, default=1024)
+    ap.add_argument("--max-seq-len", type=int, default=512)
     ap.add_argument("--block-size", type=int, default=64)
     ap.add_argument(
         "--only",
@@ -365,6 +371,8 @@ def main() -> None:
     )
     print(f"load_qwen36_model: {time.time()-t0:.1f}s")
     print(f"weights resident: {torch.cuda.memory_allocated()/2**30:.1f} GiB")
+    free_b, total_b = torch.cuda.mem_get_info()
+    print(f"device free after load: {free_b/2**30:.1f} / {total_b/2**30:.1f} GiB")
 
     def want(name: str) -> bool:
         return not only or name in only
