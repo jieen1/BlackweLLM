@@ -218,6 +218,7 @@ def load_qwen36_model(
     dtype: torch.dtype = torch.bfloat16,
     max_seq_len: int = 4096,
     language_model_only: bool = True,
+    warmup_attention: bool = True,
 ) -> Qwen36ForCausalLMSelfBuilt:
     """Construct + load a Qwen3.6-27B (``Qwen3_5ForConditionalGeneration``,
     text-only) model instance. Track B / B1 -- see ``runtime/model/
@@ -237,6 +238,16 @@ def load_qwen36_model(
     cache (``Qwen36PagedAttentionCache``) upfront -- see that class's
     docstring for why this is a hard cap, not a growable buffer, at B1's
     batch=1/no-CUDA-graph scope.
+
+    ``warmup_attention`` (default True, CUDA only) runs
+    :meth:`Qwen36ForCausalLMSelfBuilt.warmup_attention_shapes` before
+    returning, so sparkinfer's one-time CuTe compile for this geometry is
+    paid here rather than inside whichever request arrives first. It adds
+    nothing to steady-state cost and, once ``~/.cache/sparkinfer`` is warm,
+    little to load time either; pass False only when a caller genuinely
+    wants to measure that first compile itself (as
+    ``scripts/b1_probe_extend_jit_buckets.py`` and
+    ``scripts/b1_verify_prefill_jit_and_greedy.py`` do).
 
     Disables autograd globally (``torch.set_grad_enabled(False)``), same
     as ``LagunaBackend.__init__`` (``runtime/backends/laguna.py:266``) --
@@ -268,4 +279,7 @@ def load_qwen36_model(
         assert_all_params_loaded(model, loaded_param_names, context="load_qwen36_model")
 
     model._vision_filter_stats = vision_filter_stats
-    return model.eval()
+    model.eval()
+    if warmup_attention and target_device.type == "cuda":
+        model.warmup_attention_shapes(device=target_device, dtype=dtype)
+    return model
