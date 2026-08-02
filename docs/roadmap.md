@@ -144,8 +144,17 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       标准 checkpoint 声明 W4A4 且 `input_global_scale` 实际发货，
       `gemm.blockscaled` 路径开着（见上一条对我自己那次误判的纠正）。
       ⚠️ **两者动手前都必须先过 B1-R 的 gap-error 判据**——上次 `blockscaled.mm` 就栽在那。
-- [ ] 持久化 kernel 编译缓存：每进程首请求 TTFT 4.67s（之后稳定 0.25s），
-      cutlass DSL 按 shape JIT，`cute.compile` 的 `cache_key` **只是进程内记忆化**。
+- [x] ~~持久化 kernel 编译缓存~~ —— **本来就有，而且默认开着；我先前说"`cache_key`
+      只是进程内记忆化"是错的，现予纠正。**
+      `sparkinfer/_lib/compiler.py` 有三层：spec memo、内存 LRU、**磁盘缓存**。
+      `cache_key` 喂给 `KernelCompileSpec.from_key(...)`，就是磁盘缓存键的一部分。
+      开关 `SPARKINFER_COMPILE_DISK_CACHE`（**默认 `"1"`**）、目录
+      `SPARKINFER_COMPILE_CACHE_DIR` 或 `$XDG_CACHE_HOME/sparkinfer`。
+      佐证：`~/.cache/sparkinfer` 有 297 MB，而今天多次起服务**零文件写入**——
+      是命中，不是没用。`compile_cache_info()` 可读 hits/misses 逐项核实。
+- [ ] 那么首请求 TTFT 4.67s（之后稳定 0.25s）**不是编译**，是别的
+      （`sparkinfer/gemm/bf16_gemv/_kernel.py:207` 提到 "first-launch lazy module load"）。
+      **重新定位这 4.4 秒**再谈优化，别按"编译慢"去治。
 - [ ] 并发/批量下的 CG 收益未测（本轮只测了单并发单请求解码）。
 - [ ] MTP：默认 K 已从 8 改到 4（`f616029`，K 曲线实测 prose 1.11× / code 1.38×）；
       重同步 A/B 数据待回（代码在 `work/mtp-resync-20260802` 的 `aed0e2d`，无数据）

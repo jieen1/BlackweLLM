@@ -63,9 +63,13 @@ forward 循环）。**4.71× 这个比值只在本表内部成立**，因为只�
 
 未决：
 
-- 首 token 4.67s（每进程第一次请求，之后稳定 0.25s）——cutlass DSL 按 shape JIT，
-  `cute.compile` 有 `cache_key` 但**只是进程内记忆化，跨重启不复用**。
-  持久化编译缓存能同时改善冷启动和首请求延迟。
+- 首 token 4.67s（每进程第一次请求，之后稳定 0.25s）。
+  ⚠️ **本文最初把它归给"没有持久化编译缓存"，那是错的**：`sparkinfer/_lib/compiler.py`
+  有 spec memo / 内存 LRU / **磁盘缓存**三层，`SPARKINFER_COMPILE_DISK_CACHE` 默认开，
+  `cache_key` 正是磁盘缓存键的一部分（`KernelCompileSpec.from_key`）。
+  `~/.cache/sparkinfer` 297 MB 且今天多次起服务零写入——**是命中**。
+  所以这 4.4 秒**不是编译**，需另行定位（`gemm/bf16_gemv/_kernel.py:207` 提到
+  first-launch lazy module load）。`compile_cache_info()` 可逐项核实 hits/misses。
 - `KV 8192 MiB/slot × 2 槽 = 16 GiB`，因为默认 `max_context=131072`。
   常驻 72 GiB 里这是一大块，且是配置选择而非缺陷——但值得给出按需配置的指引。
 - 本次只测了单并发单请求解码。并发/批量下的 CG 收益未测。
