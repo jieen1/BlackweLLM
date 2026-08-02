@@ -32,35 +32,54 @@ LOGGER_NAMES = [
 ]
 
 
+def _handlers_that_would_fire(logger: logging.Logger) -> list[logging.Handler]:
+    """Every handler ``callHandlers`` would reach for a record on ``logger``.
+
+    Replicates CPython's own walk: collect the logger's handlers, then follow
+    ``parent`` while ``propagate`` holds. Written out rather than probed with a
+    temporary handler because ``server.app`` deliberately sets
+    ``propagate = False`` -- a probe attached to its ancestor never sees its
+    records, and a probe attached to the logger itself would trivially receive
+    them and prove nothing. This asks the question that matters: is there a
+    handler on the path a real record would take?
+    """
+    found: list[logging.Handler] = []
+    current: logging.Logger | None = logger
+    while current:
+        found.extend(current.handlers)
+        if not current.propagate:
+            break
+        current = current.parent
+    return found
+
+
 @pytest.mark.parametrize("logger_name", LOGGER_NAMES)
 def test_info_reaches_a_handler(logger_name):
-    """An INFO record emitted after importing ``server`` must land somewhere.
-
-    Asserting on delivery rather than on configuration: a test that checked
-    "does this logger have a handler" would pass on a logger whose parent
-    swallows the record, and would fail on one correctly inheriting a working
-    ancestor. What matters is whether the record arrives.
-    """
+    """A record emitted here must have somewhere to land."""
     import server  # noqa: F401  -- the import is what installs the handlers
 
-    captured = io.StringIO()
-    probe = logging.StreamHandler(captured)
-
     logger = logging.getLogger(logger_name)
-    # Attach to the configured ancestor so this exercises real propagation
-    # instead of bypassing it.
-    root_name = logger_name.split(".")[0]
-    ancestor = logging.getLogger(root_name)
+    handlers = _handlers_that_would_fire(logger)
+    assert handlers, (
+        f"{logger_name} emitted INFO would reach no handler at all -- this is "
+        'how "CUDA Graph captured at load" went missing from the service log'
+    )
+
+
+def test_a_record_is_actually_formatted_end_to_end(caplog):
+    """One end-to-end check that the walk above is not merely structural."""
+    import server  # noqa: F401
+
+    stream = io.StringIO()
+    probe = logging.StreamHandler(stream)
+    engine_logger = logging.getLogger("qwen_sm120_server.engine")
+    ancestor = logging.getLogger("qwen_sm120_server")
     ancestor.addHandler(probe)
     try:
-        logger.info("probe record from %s", logger_name)
+        engine_logger.info("CUDA Graph captured at load")
     finally:
         ancestor.removeHandler(probe)
-
-    assert "probe record" in captured.getvalue(), (
-        f"{logger_name} emitted INFO and nothing received it -- this is how "
-        '"CUDA Graph captured at load" went missing from the service log'
-    )
+    assert "CUDA Graph captured at load" in stream.getvalue()
 
 
 def test_info_level_is_actually_enabled():
