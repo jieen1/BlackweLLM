@@ -38,7 +38,8 @@
 
 ## 2. 已定案的根因分析 🟢
 
-- [2026-08-02 GDN spec_forward 批处理](2026-08-02-gdn-spec-forward-batching.md) —— 19.9→12.0ms 且 bit-exact；含 torch.bmm 只在输出维 ≤512 保逐位精确的硬发现
+- [2026-08-02 GDN spec_forward 批处理](2026-08-02-gdn-spec-forward-batching.md) —— 🟡 19.9→12.0ms 的计时仍有效；但"大投影不能批处理"的否决与"torch.bmm 512 上限"这条推广**已被下一条推翻**
+- [2026-08-02 批处理大投影：bit-exact 不是这里的判据](2026-08-02-spec-verify-batching-bar.md) —— `verify_forward` 里的 bit-exact 早已不存在（layer 1 状态差 0.0117 / 73% 元素）；全模型 672 步的 B1-R gap error 与 shipped 路径**完全相同**（p90=0.250，bar 0.5）；单层 K=16 再快 3.15×、全模型 verify 1.40–1.57×；e2e【推算】0.79–0.91×，仍 <1.0×
 - [GDN 多步融合 kernel 规格](2026-08-02-handoff-sparkinfer-gdn-multistep-kernel.md) —— ⚠️ 其 ~6.8ms 归因已被实测推翻（真值 ~0.8–1.0ms）；kernel 已实现并 bit-exact，但不是决定性项
 - [2026-08-02 Qwen3.6 显存底线由反量化缓存决定](2026-08-02-qwen36-dequant-cache-memory-floor.md) —— 一次完整前向后常驻 19GB→54GB+，`GPU_MEM_UTIL`/`num_slots` 全部管不到
 - [2026-08-02 B1 对齐门禁的证据链（原门禁已作废）](2026-08-02-b1-greedy-alignment-fails.md) —— 分歧只差 1–2 个 bf16 ULP，证明原门禁要求的东西不存在；含一条被自我推翻的误报

@@ -88,8 +88,6 @@ MODEL_PATH = (
 )
 DEVICE = torch.device("cuda")
 torch.set_grad_enabled(False)
-# This probe's real footprint is a handful of layers (hundreds of MiB).
-torch.cuda.set_per_process_memory_fraction(0.15, device=0)
 
 RESULTS: dict[str, object] = {}
 
@@ -659,6 +657,11 @@ def main() -> None:
     args = ap.parse_args()
 
     print("torch:", torch.__version__, "device:", torch.cuda.get_device_name(0))
+    # Applied here, not at import: this module is also imported by
+    # scripts/b3_verify_batching_logit_agreement.py purely for
+    # `spec_forward_batched`, and that script DOES load the full model.
+    # A module-level cap would silently strangle it.
+    torch.cuda.set_per_process_memory_fraction(0.15, device=0)
     torch.manual_seed(1234)
     config = _build_qwen36_model_config(MODEL_PATH)
     quantized = quantized_layers_map(config)

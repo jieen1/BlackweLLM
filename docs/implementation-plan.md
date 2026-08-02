@@ -504,9 +504,15 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
   `investigation-queue.md` D-3（ReplaySSM，投机 scratch 显存 11.5GB→1.8GB）合并排期**，
   ReplaySSM 把"状态回滚"问题转化成"缓存最近输入、O(1) ring-buffer 指针移动"，是候选机制而非
   从零设计。
-- [x] **主模型侧 GDN 递归状态回滚** —— ✅ **已实现并 GPU 证明逐位精确**：
+- [x] **主模型侧 GDN 递归状态回滚** —— ✅ **已实现并 GPU 验证**：
   `spec_forward()`/`commit_spec_snapshot()`，K=16 下每个接受数 m ∈ {0,1,5,8,15,16}
   回滚后状态与顺序非投机解码 `max_abs_diff=0.0`。
+  ⚠️ **这个 0.0 只在"单独一层、两边喂完全相同输入"的探针条件下成立**；在真正的
+  `verify_forward` 里，前一层的批处理 MLP/layernorm 已经让第 2 个及以后的 GDN 层
+  输入不同，实测 layer 1 的递归状态与顺序解码差 **0.0117**（73% 元素）。
+  这不是 bug（B3 判据本就不要求 bit-exact，见 `b1-correctness-criterion.md` §7），
+  但**不能拿它当"投影必须逐位置循环"的理由**，见
+  [`../notes/2026-08-02-spec-verify-batching-bar.md`](../notes/2026-08-02-spec-verify-batching-bar.md)。
 - [x] **MTP 草稿头 + 端到端接受率/吞吐** —— ✅ **已测，结果是负面的，见下**
 - [ ] GDN kernel 调优 · 128K/256K 容量与吞吐
 
@@ -548,9 +554,37 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 >
 > ⚠️ **真正的主导项已定位：被重复 K 次的大投影**（`in_proj_qkv`/`in_proj_z`/`out_proj`，
 > 输出 5120–10240）。它们**无法保 bit-exact 地批处理**——落在 `torch.bmm` 逐位精确的
-> 512 上限之外。**这才是 MTP 翻正的真正门槛，且目前没有已知的 bit-exact 解法。**
+> 512 上限之外。~~**这才是 MTP 翻正的真正门槛，且目前没有已知的 bit-exact 解法。**~~
 >
-> 📌 **一条可推广的硬发现**：批处理只做到 1.5–1.75× 而不是更多，是因为
+> 🟢 **"不能批处理"这个否决已被实测推翻（同日，
+> [`../notes/2026-08-02-spec-verify-batching-bar.md`](../notes/2026-08-02-spec-verify-batching-bar.md)）。**
+> bit-exact 在这里是**过严的判据**，与 §7.1 B1 原门禁被 B1-R 取代是同一件事：
+> - **它要保的性质在 `verify_forward` 里早就不存在**：同一个函数对全部 64 层调用
+>   `layer.mlp(...)`/`layer.input_layernorm(...)`/`layer.self_attn(...)`，输入是整块
+>   `[1,K,hidden]`，实测**全部不 bit-exact**（layer-0 MLP `max_abs_diff=0.0078`，57% 元素）。
+>   两层实盘堆叠（**shipped `spec_forward` 未改**）后 layer 1 的递归状态与顺序解码差
+>   **0.0117**、73% 元素不同；批处理三个投影只让 `spec_forward` 输出动 **≤0.00049**。
+> - **全模型 672 步、B1-R 的 R1 指标、参照系是我们自己的非投机路径**：
+>   `p90_gap_error` 在 "shipped vs 顺序" 与 "batched vs 顺序" 两组里**完全相同 = 0.250**
+>   （bar 0.5），`max_tie_slack_ulps` 都是 **1.0 ULP**，`mean_kl_topk` 2.6e-4 / 2.9e-4
+>   （bar 5e-3；SGLang 对 Qwen3-Next+MTP 的门禁是 3.5e-3）。**8 条 gap-error bar 全绿。**
+> - **上游两家都这么做**：vLLM/SGLang 的 verify 就是一次 M=Σ(k_i+1) 的批处理前向，
+>   且对 Mamba/GDN 状态"算出 K+1 份、按 index 取"，没有任何 bit-exact 检查；
+>   vLLM 文档明写 "lossless" 只到算法层，batch size 变化会改 logprob。
+> - **递归状态单独审过**：一次满 1 ULP 状态扰动跑 96 步只到 **0.00098**，而 runtime
+>   自己每步的 fp32→bf16 回舍 96 步累积到 **0.00162**（0.60×）。
+>
+> **收益（实测）**：单层 `spec_forward` K=8 **3.41→1.69ms**、K=16 **5.76→1.83ms**；
+> 全模型一轮 K=16 verify（含 64 层与 `lm_head`）**1.40–1.57×**。
+> **【推算】e2e：prose 0.784×→≈0.91×，code 0.704×→≈0.79×——仍然 <1.0×。**
+> **GDN verify 成本归零的硬上限是 prose 1.09× / code 0.905×**，所以大投影
+> **不是** MTP 能否翻正的开关；剩下的决定项是每轮的非 GDN 成本（起草 ~73ms、
+> 额外一次完整前向推进 anchor ~194–240ms）与接受率（15%/35%）。
+>
+> 📌 **原"可推广的硬发现"部分不成立**：`torch.bmm` 的 512 上限不是可依赖的规律——
+> 同一次测量里 `self_attn.q_proj`（输出 **12288**）批处理**是** bit-exact 的，
+> 而 `input_layernorm`（不是 GEMM）**不是**。分界取决于 cuBLAS 为具体 (M,N,K) 选到
+> 哪个 kernel，不是一个可以写进设计约束的常量。原文如下，保留以便对照：
 > **`torch.bmm` 只在输出维 ≤512 时保逐位精确**——
 > `out=16/128/512` 为 `True`（`max_abs_diff=0`），`out=2048` 起为 `False`。
 > 朴素的批量 `F.linear` 更糟：BF16 GEMM 的归约顺序随行数变化，**用合成未量化权重同样复现，

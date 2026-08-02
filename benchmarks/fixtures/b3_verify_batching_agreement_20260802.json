@@ -1,0 +1,209 @@
+{
+  "k": 16,
+  "steps_requested": 224,
+  "workloads": {
+    "prose": {
+      "positions": 224,
+      "verify_shipped_vs_sequential": {
+        "num_steps": 224,
+        "max_gap_error": 0.375,
+        "p99_gap_error": 0.25,
+        "p90_gap_error": 0.125,
+        "median_gap_error": 0.125,
+        "max_tie_slack_ulps": 1.0,
+        "num_disagreements": 1,
+        "disagreement_rate": 0.004464285714285714,
+        "mean_kl_topk": 0.00040491555721707017,
+        "max_kl_topk": 0.005402629969415625,
+        "max_logprob_error": 0.3749961853027344,
+        "drift_ratio": 1.0
+      },
+      "verify_batched_vs_sequential": {
+        "num_steps": 224,
+        "max_gap_error": 0.625,
+        "p99_gap_error": 0.25,
+        "p90_gap_error": 0.1875,
+        "median_gap_error": 0.125,
+        "max_tie_slack_ulps": 0.0,
+        "num_disagreements": 0,
+        "disagreement_rate": 0.0,
+        "mean_kl_topk": 0.00039836126080477374,
+        "max_kl_topk": 0.005401815847681777,
+        "max_logprob_error": 0.6249961853027344,
+        "drift_ratio": 1.0
+      },
+      "verify_batched_vs_verify_shipped": {
+        "num_steps": 224,
+        "max_gap_error": 0.25,
+        "p99_gap_error": 0.25,
+        "p90_gap_error": 0.1875,
+        "median_gap_error": 0.125,
+        "max_tie_slack_ulps": 1.0,
+        "num_disagreements": 1,
+        "disagreement_rate": 0.004464285714285714,
+        "mean_kl_topk": 0.00037815714456521365,
+        "max_kl_topk": 0.003953760217382966,
+        "max_logprob_error": 0.25,
+        "drift_ratio": 1.0
+      }
+    },
+    "code": {
+      "positions": 224,
+      "verify_shipped_vs_sequential": {
+        "num_steps": 224,
+        "max_gap_error": 0.4375,
+        "p99_gap_error": 0.25,
+        "p90_gap_error": 0.1875,
+        "median_gap_error": 0.125,
+        "max_tie_slack_ulps": 1.0,
+        "num_disagreements": 3,
+        "disagreement_rate": 0.013392857142857142,
+        "mean_kl_topk": 0.00010807353528358695,
+        "max_kl_topk": 0.0019548250330352,
+        "max_logprob_error": 0.4375038146972656,
+        "drift_ratio": 1.0
+      },
+      "verify_batched_vs_sequential": {
+        "num_steps": 224,
+        "max_gap_error": 0.5,
+        "p99_gap_error": 0.25,
+        "p90_gap_error": 0.125,
+        "median_gap_error": 0.125,
+        "max_tie_slack_ulps": 1.0,
+        "num_disagreements": 4,
+        "disagreement_rate": 0.017857142857142856,
+        "mean_kl_topk": 0.00010734746983318749,
+        "max_kl_topk": 0.0019820596275640753,
+        "max_logprob_error": 0.4999523162841797,
+        "drift_ratio": 1.0
+      },
+      "verify_batched_vs_verify_shipped": {
+        "num_steps": 224,
+        "max_gap_error": 0.375,
+        "p99_gap_error": 0.25,
+        "p90_gap_error": 0.125,
+        "median_gap_error": 0.125,
+        "max_tie_slack_ulps": 1.0,
+        "num_disagreements": 1,
+        "disagreement_rate": 0.004464285714285714,
+        "mean_kl_topk": 0.00012041618718918986,
+        "max_kl_topk": 0.0019674667237575103,
+        "max_logprob_error": 0.3749961853027344,
+        "drift_ratio": 1.0
+      }
+    },
+    "instruction": {
+      "positions": 224,
+      "verify_shipped_vs_sequential": {
+        "num_steps": 224,
+        "max_gap_error": 0.75,
+        "p99_gap_error": 0.5,
+        "p90_gap_error": 0.25,
+        "median_gap_error": 0.125,
+        "max_tie_slack_ulps": 1.0,
+        "num_disagreements": 1,
+        "disagreement_rate": 0.004464285714285714,
+        "mean_kl_topk": 0.0002646026968304477,
+        "max_kl_topk": 0.004562656288349518,
+        "max_logprob_error": 0.7500381469726562,
+        "drift_ratio": 1.0
+      },
+      "verify_batched_vs_sequential": {
+        "num_steps": 224,
+        "max_gap_error": 0.5,
+        "p99_gap_error": 0.4375,
+        "p90_gap_error": 0.25,
+        "median_gap_error": 0.125,
+        "max_tie_slack_ulps": 1.0,
+        "num_disagreements": 2,
+        "disagreement_rate": 0.008928571428571428,
+        "mean_kl_topk": 0.0003552306090015447,
+        "max_kl_topk": 0.0061191734916171475,
+        "max_logprob_error": 0.500030517578125,
+        "drift_ratio": 1.0
+      },
+      "verify_batched_vs_verify_shipped": {
+        "num_steps": 224,
+        "max_gap_error": 0.875,
+        "p99_gap_error": 0.5625,
+        "p90_gap_error": 0.25,
+        "median_gap_error": 0.125,
+        "max_tie_slack_ulps": 1.0,
+        "num_disagreements": 1,
+        "disagreement_rate": 0.004464285714285714,
+        "mean_kl_topk": 0.0003561569795074575,
+        "max_kl_topk": 0.007732512005552144,
+        "max_logprob_error": 0.87506103515625,
+        "drift_ratio": 1.0
+      }
+    }
+  },
+  "summary": {
+    "verify_shipped_vs_sequential": {
+      "metrics": {
+        "max_gap_error": 0.75,
+        "p99_gap_error": 0.375,
+        "p90_gap_error": 0.25,
+        "median_gap_error": 0.125,
+        "max_tie_slack_ulps": 1.0,
+        "disagreement_rate": 0.00744047619047619,
+        "mean_kl_topk": 0.00025919726311036826,
+        "max_drift_ratio": 1.0,
+        "max_logprob_error": 0.7500381469726562,
+        "p90_logprob_error": 0.18750381469726562,
+        "nll_relative_excess": NaN,
+        "min_logits_cosine": NaN
+      },
+      "passes_calibrated_bars": false,
+      "reasons": [
+        "nll_relative_excess is gated but was not measured",
+        "min_logits_cosine is gated but was not measured"
+      ],
+      "total_steps": 672
+    },
+    "verify_batched_vs_sequential": {
+      "metrics": {
+        "max_gap_error": 0.625,
+        "p99_gap_error": 0.375,
+        "p90_gap_error": 0.25,
+        "median_gap_error": 0.125,
+        "max_tie_slack_ulps": 1.0,
+        "disagreement_rate": 0.008928571428571428,
+        "mean_kl_topk": 0.00028697977987983533,
+        "max_drift_ratio": 1.0,
+        "max_logprob_error": 0.6249961853027344,
+        "p90_logprob_error": 0.21122360229492188,
+        "nll_relative_excess": NaN,
+        "min_logits_cosine": NaN
+      },
+      "passes_calibrated_bars": false,
+      "reasons": [
+        "nll_relative_excess is gated but was not measured",
+        "min_logits_cosine is gated but was not measured"
+      ],
+      "total_steps": 672
+    },
+    "verify_batched_vs_verify_shipped": {
+      "metrics": {
+        "max_gap_error": 0.875,
+        "p99_gap_error": 0.375,
+        "p90_gap_error": 0.25,
+        "median_gap_error": 0.125,
+        "max_tie_slack_ulps": 1.0,
+        "disagreement_rate": 0.004464285714285714,
+        "mean_kl_topk": 0.00028491010375395365,
+        "max_drift_ratio": 1.0,
+        "max_logprob_error": 0.87506103515625,
+        "p90_logprob_error": 0.194244384765625,
+        "nll_relative_excess": NaN,
+        "min_logits_cosine": NaN
+      },
+      "passes_calibrated_bars": false,
+      "reasons": [
+        "nll_relative_excess is gated but was not measured",
+        "min_logits_cosine is gated but was not measured"
+      ],
+      "total_steps": 672
+    }
+  }
+}

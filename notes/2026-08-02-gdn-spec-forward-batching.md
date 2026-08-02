@@ -1,6 +1,18 @@
 # GDN spec_forward 批处理优化——真实数字 + 一个硬性约束的发现
 
-日期：2026-08-02 · 状态：🟢 已在真实 GPU 上验证（单层，真实权重）· 分支：`work/gdn-batch-20260802`
+日期：2026-08-02 · 状态：🟡 **计时数据有效，但本文的核心否决已被推翻** · 分支：`work/gdn-batch-20260802`
+
+> 🔴 **本文"`in_proj_qkv`/`in_proj_z`/`out_proj` 不能批处理"这个否决，以及
+> "`torch.bmm` 只在输出维 ≤512 保逐位精确"这条推广，都已被同日的实测推翻**，见
+> [`2026-08-02-spec-verify-batching-bar.md`](2026-08-02-spec-verify-batching-bar.md)：
+> ① 这三个投影要保的 bit-exact，在 `verify_forward` 里被同一个函数的批量
+> MLP/layernorm 早就花掉了（layer 1 递归状态与顺序解码差 0.0117，73% 元素不同）；
+> ② 全模型 672 步的 B1-R gap error，批处理版与 shipped 版**逐个分位数完全相同**
+> （p90 都是 0.250，bar 0.5）；
+> ③ 上游 vLLM/SGLang 的 verify 本来就是一次批处理前向，两家都不要求 bit-exact；
+> ④ `self_attn.q_proj`（输出 **12288**）在同一次测量里批处理**是** bit-exact 的，
+> 所以 512 不是分界线。
+> **本文以下的计时数字仍然有效；"没能批掉"的那一节不要再当作约束引用。**
 
 ## 结论先行
 
