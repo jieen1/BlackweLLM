@@ -94,7 +94,7 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
 - [x] 把 unsloth 纳入 registry/loader 的常规测试面，而不是特例 ——
       `tests/test_qwen36_mixed_precision_checkpoint.py` +
       `tests/test_registry_quant_format_gate.py`（后者用合成 config，空 HF 缓存下也成立）
-- [ ] 现有 B1/B2/B3 的脚本与 fixture 统一切到标准模型 —— 🔧 **进行中**。
+- [x] ~~现有 B1/B2/B3 的脚本与 fixture 统一切到标准模型~~ —— **已完成**（`cbd6c03`）。原记录：
       实测 22 个脚本硬编码 `models--nvidia--`（modelopt 格式），只有 1 个指向标准模型，
       且每个脚本自带一份带 snapshot 哈希的 `MODEL_PATH`，无统一解析点。
       ⚠️ **不能无脑替换**：两个 checkpoint 是不同量化格式，专门验 modelopt adapter 的脚本
@@ -149,7 +149,7 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       ⚠️ **先做判据预演再投实现**：FP8 W8A8 单层 cosine 0.9996，比 NVFP4 路径差 30–40×
       ——**与刚被否掉的 W4A4（0.988 vs 0.99999）是同一量级的劣化**，
       而 W4A4 已经证明这个量级足以打穿 B1-R。**不要重复一遍完整实现再发现过不了。**
-- [ ] ⚠️ **`assert_all_params_loaded` 是单向的**：保证"每个模型参数都拿到 checkpoint 张量"，
+- [x] ~~**`assert_all_params_loaded` 是单向的**~~ —— **已补反向检查**（`0ddab29`：`warn_on_unconsumed_tensor_families`，按名字尾部分族，警告而非抛错）。原记录：：保证"每个模型参数都拿到 checkpoint 张量"，
       **不保证"每个 checkpoint 张量都被消费"**。`input_global_scale` 因此被静默丢弃了很久
       （W4A4 调查时才发现，本次无害但盲区是真的）。补一个反向检查。
 - [x] ~~持久化 kernel 编译缓存~~ —— **本来就有，而且默认开着；我先前说"`cache_key`
@@ -192,7 +192,7 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
 - [x] **已达成"不反量化"这个目标**：`Qwen36MLP` 把 gate/up/down 融成一次退化的
       1-expert/top-1 MoE 调用，走 `sparkinfer.moe._shared.kernels.w4a16` 的
       `run_w4a16_moe`，**直接在打包 FP4 上算**——即原文"Laguna 做对了"的那个性质。
-- [ ] 🔴 **但原处方（`gemm.blockscaled.mm`）并没有被推翻——我 2026-08-03 早些时候
+- 🔴 **（事实记录，非待办）原处方（`gemm.blockscaled.mm`）并没有被推翻——我 2026-08-03 早些时候
       在本文写的"处方是错的"本身才是错的，现予纠正。**
       当时的依据是 `runtime/model/modelopt_linear.py:76-84` 记录的失败实验：
       `blockscaled.mm` 要求两个操作数都量化，而"checkpoint 声明 weight-only"。
@@ -211,7 +211,7 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       那 56 层 MLP 现在走 W4A16（kernel 内把权重反量化去乘 BF16 激活），
       实测 **10.75 ms/step、占 kernel 时间 35%**。
       ⚠️ 动手前必须先过 B1-R 的 gap-error 判据——上次就是栽在那里。
-- [ ] 📌 层构成实测（2026-08-03，读自标准 checkpoint 的 `config_groups`）：
+- 📌 **（事实记录，非待办）**层构成实测（2026-08-03，读自标准 checkpoint 的 `config_groups`）：
       **group_1 (NVFP4/W4A4)** = `.*mlp\.(gate|up|down)_proj$` 全量，
       但 **group_0 把 56–63 层的 MLP 覆盖回 FP8**，故 NVFP4 实际覆盖 **0–55 层的 MLP**；
       **group_0 (FP8 W8A8, 权重 channel / 激活 per-token)** = attention 的 q/k/v/o、
@@ -222,8 +222,9 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       已合入先例：`fused_recurrent_gated_delta_rule_multistep`（`1fd76d1`，17 单测 bit-exact）；
       w4a16 scratch 欠额修复（`8242340`，104 条容量断言）。
 - [ ] GDN 侧的剩余项见 §7.1 B3；⚠️ 但**硬上限已排除 GDN 是 MTP 的决定项**
-- [ ] FP8 W8A8 kernel 接入 —— 有意推迟。单层 cosine 0.9996，比 NVFP4 路径差 30–40×，
-      需要一轮专门的全模型验证才能判断可不可用，不在本阶段顺手做。
+- （FP8 W8A8 接入**不在此处重复列**——它就是上面阶段 3 那条"杠杆①"。
+  原记录：单层 cosine 0.9996，比 NVFP4 路径差 30–40×，需要一轮专门的全模型验证。
+  **2026-08-03 起改为先做判据预演再谈实现**，理由见杠杆①那条。）
 
 **阶段 3/4 曾被短暂叫停**（用户："不要去反量化啥的 就正常跑"），现按新指示恢复，
 **但严格排在阶段 1/2 之后**——先完整支持，再谈速度。
