@@ -203,3 +203,44 @@ class CompressedTensorsNVFP4Linear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         self._ensure_ready()
         return F.linear(x, self._weight_bf16, self.bias)
+
+    def nvfp4_components_for_fuse(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(packed_weight, block_scale, global_scale)`` for
+        ``Qwen36MLP``'s fused w13/w2 W4A16 path (``runtime/model/
+        qwen36_model.py``) -- packed weight ``[out, in // 2]`` uint8, block
+        scale ``[out, in // group_size]`` float8_e4m3fn, global scale a
+        scalar float32 in :class:`~runtime.model.modelopt_linear.
+        ModelOptNVFP4Linear`'s convention (a direct multiplier -- see
+        :meth:`~runtime.model.modelopt_linear.ModelOptNVFP4Linear.
+        nvfp4_components_for_fuse`'s docstring), NOT this checkpoint's own
+        ``weight_global_scale`` convention. The reciprocal happens here,
+        once, so every caller downstream of this method (in particular
+        ``sparkinfer.moe._shared.kernels.w4a16.prepare.
+        prepare_w4a16_modelopt_nvfp4_weights``, whose docstring literally
+        says "raw ModelOpt weight global scales") can stay written in the
+        single convention it already expects, exactly like this class's own
+        :meth:`_ensure_ready` already does for its dequant-to-BF16 path --
+        see this class's docstring for the measured evidence that skipping
+        this reciprocal produces degenerate output (``"!!!!!!!!!!!!"``,
+        2026-08-03).
+        """
+        reciprocal_global_scale = 1.0 / self.weight_global_scale.data.reshape(()).to(
+            torch.float32
+        )
+        return self.weight_packed.data, self.weight_scale.data, reciprocal_global_scale
+
+    def free_nvfp4_raw_params(self) -> None:
+        """Zero out this Linear's raw NVFP4 Parameter storage
+        (``.weight_packed``/``.weight_scale``/``.weight_global_scale``) in
+        place -- called by ``Qwen36MLP._free_raw_nvfp4_weights`` once the
+        fused w13/w2 representation built from
+        :meth:`nvfp4_components_for_fuse` no longer needs them. Same
+        discipline as :meth:`~runtime.model.modelopt_linear.
+        ModelOptNVFP4Linear.free_nvfp4_raw_params` -- see that method's
+        docstring; the only difference is this format's own Parameter
+        names (``weight_packed``/``weight_global_scale`` rather than
+        ``weight``/``weight_scale_2``).
+        """
+        for name in ("weight_packed", "weight_scale", "weight_global_scale"):
+            param = getattr(self, name)
+            param.data = param.data.new_empty(0)

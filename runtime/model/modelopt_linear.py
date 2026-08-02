@@ -253,3 +253,41 @@ class ModelOptNVFP4Linear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         self._ensure_ready()
         return F.linear(x, self._weight_bf16, self.bias)
+
+    def nvfp4_components_for_fuse(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(packed_weight, block_scale, global_scale)`` for
+        ``Qwen36MLP``'s fused w13/w2 W4A16 path (``runtime/model/
+        qwen36_model.py``) -- packed weight ``[out, in // 2]`` uint8, block
+        scale ``[out, in // group_size]`` float8_e4m3fn, global scale a
+        scalar float32 already in ``prepare_w4a16_modelopt_nvfp4_weights``'s
+        expected convention (that function's own docstring: "raw ModelOpt
+        weight global scales" -- this class's own ``weight_scale_2`` IS that
+        convention, used as-is by :func:`~runtime.loading.modelopt.
+        dequantize_nvfp4`'s direct multiply, ``per_block = weight_scale *
+        global_scale``). See :meth:`~runtime.model.compressed_tensors_linear.
+        CompressedTensorsNVFP4Linear.nvfp4_components_for_fuse` for the
+        sibling checkpoint format's, which is the RECIPROCAL of this
+        convention and must invert before returning -- so ``Qwen36MLP``
+        never needs an isinstance branch to know which format it holds.
+        """
+        return (
+            self.weight.data,
+            self.weight_scale.data,
+            self.weight_scale_2.data.reshape(()).to(torch.float32),
+        )
+
+    def free_nvfp4_raw_params(self) -> None:
+        """Zero out this Linear's raw NVFP4 Parameter storage (``.weight``/
+        ``.weight_scale``/``.weight_scale_2``) in place -- called by
+        ``Qwen36MLP._free_raw_nvfp4_weights`` once the fused w13/w2
+        representation built from :meth:`nvfp4_components_for_fuse` no
+        longer needs them. Reassigns each Parameter's ``.data`` to a
+        0-element tensor (same discipline as the pre-existing per-format
+        loop this replaces) rather than deleting/``None``-ing the
+        ``nn.Parameter``, so ``named_parameters()``/direct attribute access
+        still finds a real tensor of the right dtype/device at the expected
+        name.
+        """
+        for name in ("weight", "weight_scale", "weight_scale_2"):
+            param = getattr(self, name)
+            param.data = param.data.new_empty(0)
