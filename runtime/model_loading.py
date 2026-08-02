@@ -301,4 +301,11 @@ def load_qwen36_model(
     model.eval()
     if warmup_attention and target_device.type == "cuda":
         model.warmup_attention_shapes(device=target_device, dtype=dtype)
+        # Only on CUDA, and only alongside warmup: this materializes every FP8
+        # Linear's BF16 cache to free the originals, which is a real cost to
+        # pay eagerly and pointless on a CPU-side construction (a test fixture,
+        # a shape probe) that may never run a forward at all.
+        freed = model.free_fp8_raw_weights()
+        if freed:
+            print(f"freed raw FP8 weights on {freed} Linear(s) (BF16 cache retained)")
     return model

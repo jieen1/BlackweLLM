@@ -70,20 +70,53 @@ def forward(self, x):
 
 于是这 237 个张量**两份同时常驻 29.98 GiB**，而 `forward` 只读其中的 BF16 那份。
 
-**可回收约 9.99 GiB，且不需要任何 kernel 工作**——照搬 NVFP4 的做法，在
-`_ensure_ready()` 之后释放 FP8 原件即可。
+**已实施**（FP8 W8A8 预演给出否定结论后，保留 FP8 原件已无意义）：
+`CompressedTensorsFP8ChannelLinear.free_fp8_raw_weight()` +
+`Qwen36ForCausalLMSelfBuilt.free_fp8_raw_weights()`，在 `load_qwen36_model`
+的 warmup 之后调用。
 
-⚠️ **但先别急着做**：FP8 W8A8 的判据预演正在进行（阶段四杠杆①）。
-若 W8A8 可用，就需要**保留 FP8 原件**并干脆不建 BF16 缓存——那是更大的一笔
-（省掉整整 19.99 GiB，还顺带消掉 45% 的 BF16 GEMM kernel 时间）。
-**等预演结论出来再定做哪一种**，否则可能刚释放完又要加回来。
+**真机实测：释放 233 个 Linear，常驻 44,626 → 38,698 MiB，实收 5.79 GiB**，
+forward 输出不变。
+
+⚠️ **实收 5.79 GiB 而非预估的 9.99 GiB** —— 分配器把释放出来的块留作复用，
+`nvidia-smi` 看到的降幅小于实际丢弃的存储量。NVFP4 那轮是同一现象
+（丢了 ~9.15 GiB 存储，常驻只从 67.10 降到 64.58）。**这是预期行为，不是没生效**：
+`weight.data.numel()` 确实为 0，节省会体现在后续分配的头寸上。
+
+📌 **顺带解开前面那个存疑**：`free_fp8_raw_weights()` 报告 **233** 个 Linear，
+与解码 profiling 数到的 **233 次/步 kernel 调用完全一致**。所以 233 是**模型里
+FP8 Linear 模块的数量**，而 237 是我的正则在 checkpoint 里匹配到的张量数——
+多出的 4 个没有对应模块。**以 233 为准。**
+
+## 🔴 更大的一笔：标准 checkpoint 其实发了 FP8 KV scale，而我们没用
+
+释放 FP8 原件那次真机运行里，**新加的反向检查在第一次真实运行就报了警**：
+
+```
+load_qwen36_model: 2 checkpoint tensor family/families reached no model
+parameter or buffer: k_scale x16, v_scale x16
+```
+
+`runtime/model/qwen36_model.py` 的模块 docstring 写着"本 checkpoint 声明
+`kv_cache_quant_algo: FP8` 但**发货零个 `k_scale`/`v_scale`**（B0-2）"，
+并据此决定用 BF16 KV 绕开"该用什么 scale"。**实测这个前提对标准模型不成立**：
+
+| checkpoint | k_scale | v_scale |
+|---|---:|---:|
+| `nvidia/`（B0-2 当时测的） | 0 | 0 |
+| `unsloth/`（**标准模型**） | **16** | **16** |
+
+标准 checkpoint 发的是完整的静态 per-tensor 对称 FP8 KV 方案
+（`num_bits=8`、`strategy=tensor`、`symmetric=True`、`observer=static_minmax`），
+每个 full_attention 层一份 `k_scale`/`v_scale`。**那个被推迟的问题，checkpoint 自己
+给了答案，而我们没有接**——`load_qwen36_model` 不像 Laguna 路径那样调用
+`apply_kv_cache_scale_post_load`，所以这 32 个张量一直无人认领。
+
+**这笔比释放 FP8 原件大得多**：KV 是 **8192 MiB/槽**，是本审计里最大的单项，
+FP8 KV 直接把它减半。num_slots=2 省约 8 GiB；capacity=4（num_slots=5）省约 20 GiB。
+⚠️ BF16 KV 目前是正确的、在跑的；这是**未兑现的机会而不是 bug**，动手前必须过 B1-R。
 
 ## 顺带
 
-- 237 是匹配 group_0 命名的 `.weight` 张量数；解码 profiling 里数到的是
-  **233 次/步 kernel 调用**（[`2026-08-03-decode-kernel-profile.md`](2026-08-03-decode-kernel-profile.md)）。
-  两者不必相等——每步都调用的层数与 checkpoint 里的张量数不是同一件事
-  （例如 `lm_head` 的调用节奏与 decoder 层不同）。**没有把这 4 个的差异查清楚**，
-  在此存疑而不是编一个解释。
 - `max_context=131072` 是默认值，KV 因此占 8 GiB/槽。这是**配置选择而非缺陷**，
   但它是 72 GiB 里最大的单项之一，缩短上下文能直接换显存。

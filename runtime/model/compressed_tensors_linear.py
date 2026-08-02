@@ -161,6 +161,38 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
         if self._weight_bf16 is None:
             self._weight_bf16 = dequantize_fp8_channel(self.weight.data, self.weight_scale.data)
 
+    def free_fp8_raw_weight(self) -> None:
+        """Drop the FP8 ``.weight`` storage once ``_weight_bf16`` exists.
+
+        The FP8 original and its BF16 dequantization are both resident
+        otherwise, and :meth:`forward` reads only the BF16 one. Measured on
+        the standard checkpoint (``notes/2026-08-03-production-memory-audit.md``):
+        237 FP8 weight tensors, 10.73B parameters, so the originals are
+        9.99 GiB held for nothing once the cache is built.
+
+        This is the FP8 half of a fix that was only ever applied to the NVFP4
+        half. ``free_nvfp4_raw_params`` took the resident set from 76.34 to
+        53.08 GiB by doing exactly this for the 56 NVFP4 MLP layers, and
+        stopped there -- the other 237 layers kept both copies, unremarked,
+        because nothing measured the split until that audit.
+
+        Deliberately NOT called from :meth:`_ensure_ready`. The dequantization
+        happens lazily on first forward, and several diagnostic scripts build
+        one of these layers precisely to compare the FP8 original against a
+        dequantized or emulated path (``scripts/verify_fp8_*``); freeing
+        automatically would break them at a distance for a memory win they do
+        not need. Model-level code calls this once, after warmup -- same
+        division of labour as ``Qwen36MLP._free_raw_nvfp4_weights``.
+
+        Safe to call before the cache exists (materializes it first) and safe
+        to call more than once. Reassigns ``.data`` to a 0-element tensor on
+        the same device rather than deleting the Parameter, so
+        ``named_parameters()`` keeps its shape and nothing that walks the
+        module tree trips over a missing entry.
+        """
+        self._ensure_ready()
+        self.weight.data = self.weight.data.new_empty(0)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         self._ensure_ready()
         if _fp8_activation_emulation_enabled():

@@ -969,9 +969,17 @@ drafter + 投机专用 `kv_cache_dtype`）读代码后发现**不完全对**—�
   56 层 MLP；**FP8 那 237 个张量的 BF16 缓存是永久的，且 FP8 原件同时常驻**——
   按 checkpoint 真实尺寸算：原件 9.99 GiB + BF16 缓存 19.99 GiB = **两份 29.98 GiB**，
   而 `forward` 只读 BF16 那份。**照搬 NVFP4 做法可立刻回收 ~9.99 GiB，无需任何 kernel 工作。**
-  ⚠️ 但**先等 FP8 W8A8 判据预演的结论**：若 W8A8 可用，正确做法是保留 FP8 原件、
-  根本不建 BF16 缓存（省 19.99 GiB，还顺带消掉 45% 的 BF16 GEMM 时间），
-  否则可能刚释放完又要加回来。
+  ✅ **已实施**（W8A8 预演否定后不再需要保留 FP8 原件）：`free_fp8_raw_weights()`，
+  真机实测**释放 233 个 Linear、常驻 44,626 → 38,698 MiB、实收 5.79 GiB**，输出不变。
+  （实收小于预估 9.99 GiB 是分配器复用所致，与 NVFP4 那轮同一现象，不是没生效。）
+- [ ] 🔴 **比上一条大得多的一笔：标准 checkpoint 发了 FP8 KV scale，我们没用。**
+  新加的反向检查在第一次真实运行就报出 `k_scale x16, v_scale x16` 无人消费。
+  `qwen36_model.py` 里"本 checkpoint 发货零个 k_scale/v_scale（B0-2）"**对 `nvidia/`
+  成立、对标准模型是错的**（实测 nvidia 0/0，unsloth 16/16），而"用 BF16 KV 绕开
+  scale 问题"这个设计正建立在那个前提上。标准 checkpoint 发的是完整静态 per-tensor
+  对称 FP8 KV 方案。**KV 是 8192 MiB/槽、审计里最大的单项，FP8 KV 直接减半**
+  （num_slots=2 省约 8 GiB，capacity=4 省约 20 GiB）。
+  ⚠️ BF16 KV 现在是正确且在跑的，这是未兑现的机会而非 bug；动手前必须过 B1-R。
 - [x] ~~DFlash 的 eager verify 回退路径是否真的会在生产流量下被打到~~ —— ✅ **已答：不会**。
   今天它只有一条触发路径（verify CG 启动期捕获失败），是潜伏风险不是活跃故障；且
   `QSR_DFLASH_REQUIRE_CG=1` 已让它在生产中不可达。沿途挖出的 eager-vs-CG 数值分歧**也已结案**：

@@ -18,11 +18,37 @@ prefix cache -- only ship it correct"):
 - Full-attention layers use sparkinfer's paged-attention kernel
   (B0-3-verified correct for this exact shape:
   ``head_dim=256``/``gqa_group=6``/SM120) with a **BF16** KV cache, not
-  FP8 -- this checkpoint declares ``kv_cache_quant_algo: FP8`` but ships
-  zero ``k_scale``/``v_scale`` tensors (B0-2), and resolving "what scale
-  to use" is explicitly deferred to B3 (``docs/qwen36-rebuild-spec.md``
-  §7). BF16 KV sidesteps that open question entirely for B1's
-  correctness gate rather than guessing a default. Uses a per-layer
+  FP8. The original reason (B0-2) was that "this checkpoint declares
+  ``kv_cache_quant_algo: FP8`` but ships zero ``k_scale``/``v_scale``
+  tensors", so there was no scale to use and BF16 KV sidestepped the
+  question rather than guessing a default.
+
+  🔴 **That premise is false for the standard model** (measured
+  2026-08-03; the B0-2 observation was made against ``nvidia/``, which
+  every script pointed at then):
+
+  ====================  ========  ========
+  checkpoint            k_scale   v_scale
+  ====================  ========  ========
+  ``nvidia/`` (B0-2)           0         0
+  ``unsloth/`` standard      16        16
+  ====================  ========  ========
+
+  The standard checkpoint ships a complete static per-tensor symmetric
+  FP8 KV scheme (``kv_cache_scheme``: ``num_bits=8``, ``strategy=tensor``,
+  ``symmetric=True``, ``observer=static_minmax``) plus one
+  ``k_scale``/``v_scale`` per full-attention layer. So the deferred
+  question has a checkpoint-provided answer here, and nothing consumes
+  it -- ``load_qwen36_model`` does not call
+  ``apply_kv_cache_scale_post_load`` the way the Laguna path does, which
+  is how ``warn_on_unconsumed_tensor_families`` surfaced these 32 tensors
+  on its first real run.
+
+  BF16 KV is still what ships and is still correct; this is an unclaimed
+  opportunity, not a bug. It is a large one: KV is 8192 MiB/slot, the
+  single biggest line in the 72.39 GiB resident audit
+  (``notes/2026-08-03-production-memory-audit.md``), and FP8 KV would
+  halve it. Any attempt must clear B1-R first. Uses a per-layer
   fixed-capacity workspace (:class:`Qwen36AttentionWorkspace`), not the
   higher-level ``sparkinfer.attention.paged.{plan,bind,run}`` convenience
   API directly -- the convenience API JIT-recompiles per distinct
@@ -2660,6 +2686,39 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         self, *, device: torch.device, dtype: torch.dtype
     ) -> Qwen36GenerationState:
         return self.model.new_generation_state(device=device, dtype=dtype)
+
+    def free_fp8_raw_weights(self) -> int:
+        """Drop every FP8 Linear's raw ``.weight`` once its BF16 cache exists.
+
+        The FP8 counterpart to :meth:`Qwen36MLP._free_raw_nvfp4_weights`,
+        which freed the NVFP4 MLP layers' raw parameters and took the resident
+        set from 76.34 to 53.08 GiB. That fix covered the 56 NVFP4 MLP layers
+        and nothing else; the other 237 FP8 tensors -- attention q/k/v/o, the
+        GDN projections, ``lm_head``, and layers 56-63's MLP -- went on
+        holding both the FP8 original and its BF16 dequantization, which
+        ``forward`` never reads. Measured at 9.99 GiB of originals against
+        19.99 GiB of cache (``notes/2026-08-03-production-memory-audit.md``).
+
+        Each call materializes the BF16 cache if it does not exist yet, so
+        this can run before any forward -- it pulls the lazy dequantization
+        forward to load time rather than first token, which is where it was
+        going to happen regardless. Peak stays bounded: one extra tensor at a
+        time, not a second full copy of the model.
+
+        Returns the number of Linears freed, so callers can log it and a test
+        can assert the sweep actually reached something rather than silently
+        matching nothing.
+        """
+        from runtime.model.compressed_tensors_linear import CompressedTensorsFP8ChannelLinear
+
+        freed = 0
+        for module in self.modules():
+            if isinstance(module, CompressedTensorsFP8ChannelLinear):
+                module.free_fp8_raw_weight()
+                freed += 1
+        if freed and next(self.parameters()).device.type == "cuda":
+            torch.cuda.empty_cache()
+        return freed
 
     def warmup_attention_shapes(
         self, *, device: torch.device | str, dtype: torch.dtype
