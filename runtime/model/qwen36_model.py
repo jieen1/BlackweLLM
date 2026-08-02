@@ -1176,12 +1176,31 @@ class Qwen36AttentionWorkspace:
         kv_dtype: torch.dtype,
         device: torch.device,
         max_batch: int = 1,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
     ) -> None:
         if mode not in ("extend", "decode"):
             raise ValueError(f"Qwen36AttentionWorkspace: unsupported mode {mode!r}")
         self.mode = mode
         self.max_batch = max_batch
-        self._descale = torch.ones(1, dtype=torch.float32, device=device)
+        # k_descale/v_descale (2026-08-03, FP8 KV): the real per-layer
+        # k_scale/v_scale Parameters (Qwen36Attention.k_scale/.v_scale) when
+        # this layer's KV cache is FP8, or the harmless 1.0 no-op descale
+        # (unchanged from before FP8 KV existed) when it is BF16. K and V
+        # are NEVER equal on the real checkpoint (e.g. layer 3 measures
+        # k_scale=0.0262, v_scale=0.0344) -- one shared descale for both
+        # would silently apply K's scale to V or vice versa, so these are
+        # kept as two independent tensors rather than one `_descale`.
+        self._k_descale = (
+            k_descale
+            if k_descale is not None
+            else torch.ones(1, dtype=torch.float32, device=device)
+        )
+        self._v_descale = (
+            v_descale
+            if v_descale is not None
+            else torch.ones(1, dtype=torch.float32, device=device)
+        )
         # eager_extend_work_items_capacity is sparkinfer's own estimator
         # for exactly this pair of modes (its name and design track
         # max_total_q, which is what extend/decode's real work-item count
@@ -1249,7 +1268,7 @@ class Qwen36AttentionWorkspace:
         ws._plan = plan
         binding = build_paged_attention_binding(
             scratch=ws, q=q, k_cache=k_cache, v_cache=v_cache, output=output,
-            k_descale=self._descale, v_descale=self._descale,
+            k_descale=self._k_descale, v_descale=self._v_descale,
         )
         paged_attention_forward(binding=binding)
 
@@ -1292,7 +1311,15 @@ class Qwen36BatchedDecodeAttention:
     ) -> None:
         self.batch = batch
         self.device = device
-        self._descale = torch.ones(1, dtype=torch.float32, device=device)
+        # Fallback descale used when a caller's forward() doesn't pass its
+        # own -- BF16 KV's harmless no-op (1.0). This driver is SHARED
+        # across every full-attention layer for a given batch size (class
+        # docstring), but real per-layer k_scale/v_scale differ across
+        # layers (see Qwen36AttentionWorkspace's own comment on the same
+        # point), so the real per-layer descale is a forward()-time
+        # argument here, not something this driver can hold fixed at
+        # construction like the old single `self._descale` used to.
+        self._default_descale = torch.ones(1, dtype=torch.float32, device=device)
         self.page_table = torch.zeros(
             batch, pages_per_slot, dtype=torch.int32, device=device
         )
@@ -1364,7 +1391,14 @@ class Qwen36BatchedDecodeAttention:
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         output: torch.Tensor,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
     ) -> None:
+        """``k_descale``/``v_descale`` default to the harmless 1.0 no-op
+        (BF16 KV); a caller with an FP8 KV pool passes its own layer's
+        real ``k_scale``/``v_scale`` Parameters here instead (see class
+        docstring -- this driver is shared across layers, so the real
+        descale cannot live on ``self``)."""
         plan = create_paged_plan(
             q, k_cache, v_cache, self.page_table, self.cache_seqlens, self.cu_seqlens_q,
             mode="decode", enable_cuda_graph=False, window_left=-1,
@@ -1377,7 +1411,8 @@ class Qwen36BatchedDecodeAttention:
         ws._plan = plan
         binding = build_paged_attention_binding(
             scratch=ws, q=q, k_cache=k_cache, v_cache=v_cache, output=output,
-            k_descale=self._descale, v_descale=self._descale,
+            k_descale=k_descale if k_descale is not None else self._default_descale,
+            v_descale=v_descale if v_descale is not None else self._default_descale,
         )
         paged_attention_forward(binding=binding)
 
@@ -1419,7 +1454,10 @@ class Qwen36DecodeGraphAttention:
     ) -> None:
         self.batch = batch
         self.device = device
-        self._descale = torch.ones(1, dtype=torch.float32, device=device)
+        # See Qwen36BatchedDecodeAttention's matching comment: this driver
+        # is also shared across every full-attention layer, so the real
+        # per-layer descale is a forward()-time argument, not fixed here.
+        self._default_descale = torch.ones(1, dtype=torch.float32, device=device)
         self._workspace = PagedAttentionWorkspace.for_contract(
             mode="decode",
             device=device,
@@ -1474,18 +1512,88 @@ class Qwen36DecodeGraphAttention:
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         output: torch.Tensor,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
     ) -> None:
+        """See :meth:`Qwen36BatchedDecodeAttention.forward`'s matching
+        docstring -- same default-to-1.0, caller-supplies-the-real-scale
+        contract. Safe under CUDA Graph capture/replay: whichever tensor
+        object is passed becomes part of ``binding`` and the kernel reads
+        its address directly (``sparkinfer.attention.paged._scratch.
+        build_paged_attention_binding`` stores it, no intermediate copy
+        into shared scratch) -- since a real caller always passes the SAME
+        Parameter object (never reallocated after load), capture bakes in
+        the correct per-layer address and replay keeps reading it."""
         binding = build_paged_attention_binding(
             scratch=self._workspace, q=q, k_cache=k_cache, v_cache=v_cache,
-            output=output, k_descale=self._descale, v_descale=self._descale,
+            output=output,
+            k_descale=k_descale if k_descale is not None else self._default_descale,
+            v_descale=v_descale if v_descale is not None else self._default_descale,
         )
         paged_attention_forward(binding=binding)
 
 
+#: sparkinfer's one FP8 KV-cache storage dtype (its own module docstring:
+#: "BF16/FP16 queries, BF16/FP16/FP8-e4m3 KV cache"). Named here so every
+#: FP8-KV-aware branch below spells the same torch dtype object, not a
+#: string literal repeated at each call site.
+_FP8_KV_DTYPE = torch.float8_e4m3fn
+
+
+def _kv_to_cache_dtype(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    cache_dtype: torch.dtype,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cast ``(key, value)`` to ``cache_dtype`` for KV-cache storage.
+
+    BF16 cache (``cache_dtype != _FP8_KV_DTYPE``): a plain dtype cast --
+    exactly what every call site did before FP8 KV existed, so the default
+    (``enable_fp8_kv=False``) path is byte-for-byte unchanged.
+
+    FP8 cache: scale-DIVIDE before casting -- ``fp8_stored = real_value /
+    scale`` -- the same convention ``runtime/kernels/fused_kv_scatter.py``
+    (``k_fp8 = (k_val / k_scale).to(tl.float8e4nv)``) and Laguna's own FP8
+    KV write path use (``runtime/backends/laguna_cuda_graph.py``:
+    ``k_cache[...] = (key / layer._k_scale).to(torch.float8_e4m3fn)``).
+    This is the exact inverse of what sparkinfer's kernel does on READ via
+    ``k_descale``/``v_descale`` (a multiply: ``real ~= fp8_stored *
+    scale`` -- confirmed by Laguna's matching read-side convention,
+    ``ws._k_descale = layer._k_scale.detach()``, no reciprocal), so
+    ``k_descale``/``v_descale`` must always be handed these same
+    ``k_scale``/``v_scale`` tensors DIRECTLY, never their reciprocal.
+    Getting this inverted is exactly the class of bug this codebase has
+    hit before with a different scale pair (``CompressedTensorsNVFP4Linear``'s
+    ``weight_global_scale`` vs. modelopt's ``weight_scale_2`` -- see that
+    class's docstring for what a missed reciprocal there looked like on a
+    real GPU run: degenerate ``"!!!!!!!!!!!!"`` output) -- this codebase's
+    scale conventions are genuinely inconsistent across formats, so this
+    function's docstring states its own convention explicitly rather than
+    assuming a reader infers it from a sibling.
+    """
+    if cache_dtype == _FP8_KV_DTYPE:
+        assert k_scale is not None and v_scale is not None, (
+            "FP8 KV cache requires real k_scale/v_scale tensors -- a cache built "
+            "with cache_dtype=float8_e4m3fn but k_scale/v_scale=None is a "
+            "construction bug (Qwen36Attention.__init__ always creates both "
+            "together), not a runtime condition to silently degrade for"
+        )
+        return (key / k_scale).to(cache_dtype), (value / v_scale).to(cache_dtype)
+    return key.to(cache_dtype), value.to(cache_dtype)
+
+
 class Qwen36Attention(nn.Module):
     """Transcribed from ``Qwen3_5Attention``. Uses sparkinfer's paged
-    attention kernel (B0-3-verified for this exact shape) with a BF16 KV
-    cache -- see module docstring for why BF16, not FP8.
+    attention kernel (B0-3-verified for this exact shape). KV cache dtype
+    is BF16 by default; ``enable_fp8_kv=True`` (module docstring's
+    2026-08-03 update -- gated by ``QSR_QWEN36_FP8_KV``, resolved once by
+    ``runtime.model_loading.load_qwen36_model`` and threaded down
+    explicitly rather than re-read from the environment per layer) makes
+    it FP8-e4m3, consuming the standard checkpoint's real per-layer
+    ``k_scale``/``v_scale`` tensors.
     """
 
     def __init__(
@@ -1496,6 +1604,7 @@ class Qwen36Attention(nn.Module):
         *,
         max_seq_len: int,
         weight_prefix: str | None = None,
+        enable_fp8_kv: bool = False,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -1512,6 +1621,30 @@ class Qwen36Attention(nn.Module):
             "q_proj's doubled output width; a checkpoint with attn_output_gate=False "
             "would need a different q_proj shape and forward path, not handled here"
         )
+
+        # FP8 KV (2026-08-03 follow-up, default OFF -- see module
+        # docstring): `kv_cache_dtype` is this layer's own KV storage
+        # dtype, consulted by `new_cache`/`Qwen36SlotPool` instead of the
+        # ambient compute dtype the two used to share unconditionally.
+        # `k_scale`/`v_scale` are real Parameters ONLY when enabled --
+        # named exactly like the checkpoint's own
+        # `self_attn.{k,v}_scale` tensors (no remapping needed:
+        # `load_weights`'s `model.language_model.` -> `model.` prefix
+        # strip already lines this module's dotted name up with the
+        # checkpoint's), so a checkpoint that declares
+        # QSR_QWEN36_FP8_KV=1 but ships neither tensor (e.g. the modelopt
+        # checkpoint -- its quantization_config.kv_cache_scheme exists but
+        # it ships ZERO k_scale/v_scale tensors, verified directly, see
+        # module docstring) fails loudly at `assert_all_params_loaded`
+        # rather than silently running FP8 KV with an unset 1.0 scale.
+        self.enable_fp8_kv = enable_fp8_kv
+        self.kv_cache_dtype = _FP8_KV_DTYPE if enable_fp8_kv else torch.bfloat16
+        if enable_fp8_kv:
+            self.k_scale = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+            self.v_scale = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+        else:
+            self.k_scale = None
+            self.v_scale = None
 
         # ``weight_prefix`` (B3): overrides the derived
         # ``model.language_model.layers.{layer_idx}`` checkpoint prefix used
@@ -1574,16 +1707,28 @@ class Qwen36Attention(nn.Module):
             dtype=dtype,
             kv_dtype=cache.k_cache.dtype,
             device=device,
+            # None when FP8 KV is disabled -- Qwen36AttentionWorkspace
+            # treats None as "use the harmless 1.0 no-op descale", same
+            # as before this parameter existed.
+            k_descale=self.k_scale,
+            v_descale=self.v_scale,
         )
         setattr(self, attr, workspace)
         return workspace
 
     def new_cache(self, *, device: torch.device, dtype: torch.dtype) -> Qwen36PagedAttentionCache:
+        """KV storage dtype is this layer's own ``kv_cache_dtype`` (BF16
+        unless FP8 KV was enabled for this layer -- see ``__init__``), not
+        the compute ``dtype`` this method used to be handed by every call
+        site (they still pass one, always the model's BF16 compute dtype,
+        for backward call-site compatibility, but it is unused now that
+        the two dtypes can diverge)."""
+        del dtype
         return Qwen36PagedAttentionCache(
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             max_seq_len=self.max_seq_len,
-            dtype=dtype,
+            dtype=self.kv_cache_dtype,
             device=device,
         )
 
@@ -1620,7 +1765,10 @@ class Qwen36Attention(nn.Module):
         query = query_flat.view(seq_len, self.num_heads, self.head_dim)
         key = key_flat.view(seq_len, self.num_kv_heads, self.head_dim)
 
-        _past_len, total_len = cache.append(key.to(cache.dtype), value.to(cache.dtype))
+        k_to_store, v_to_store = _kv_to_cache_dtype(
+            key, value, cache_dtype=cache.dtype, k_scale=self.k_scale, v_scale=self.v_scale
+        )
+        _past_len, total_len = cache.append(k_to_store, v_to_store)
         mode = "decode" if seq_len == 1 else "extend"
 
         workspace = self._workspace_for(mode, cache, query.dtype, query.device)
@@ -1629,10 +1777,21 @@ class Qwen36Attention(nn.Module):
         )
         cache_seqlens = torch.tensor([total_len], dtype=torch.int32, device=query.device)
         cu_seqlens_q = torch.tensor([0, seq_len], dtype=torch.int32, device=query.device)
-        needs_cast = query.dtype != cache.k_cache.dtype
-        q_for_kernel = query.to(cache.k_cache.dtype) if needs_cast else query
+        # Query stays in its own compute dtype (BF16) regardless of the KV
+        # cache's dtype -- sparkinfer's paged-attention kernel wants
+        # "BF16/FP16 queries, BF16/FP16/FP8-e4m3 KV cache (FP8 KV needs
+        # BF16 queries + k/v descales)" (sparkinfer/attention/paged/
+        # __init__.py's own module docstring), never a query cast to match
+        # the cache. Casting query to cache.dtype here (the old
+        # `needs_cast`/`q_for_kernel`) was latently harmless only because
+        # cache.dtype always equaled query.dtype before FP8 KV existed --
+        # it would have been actively wrong with FP8 KV (casting a BF16
+        # query down to FP8), and the workspace's own scratch independently
+        # enforces `q.dtype == self.dtype`, constructed as the BF16 compute
+        # dtype, never kv_dtype (`Qwen36AttentionWorkspace.forward`'s
+        # `_workspace._validate_static_shapes`).
         workspace.forward(
-            q=q_for_kernel,
+            q=query,
             k_cache=cache.k_cache,
             v_cache=cache.v_cache,
             output=output,
@@ -1704,16 +1863,34 @@ class Qwen36Attention(nn.Module):
 
         k_flat = k_pool.view(-1, self.num_kv_heads, self.head_dim)
         v_flat = v_pool.view(-1, self.num_kv_heads, self.head_dim)
-        k_flat.index_copy_(0, write_index, key.to(k_pool.dtype))
-        v_flat.index_copy_(0, write_index, value.to(v_pool.dtype))
+        k_to_store, v_to_store = _kv_to_cache_dtype(
+            key, value, cache_dtype=k_pool.dtype, k_scale=self.k_scale, v_scale=self.v_scale
+        )
+        # Plain advanced-indexing assignment, NOT index_copy_: measured
+        # directly (2026-08-03, a real FP8 KV server load) that
+        # `index_copy_cuda` raises `NotImplementedError` for
+        # `Float8_e4m3fn` on this torch build, while `tensor[idx] = value`
+        # (dispatches to `aten::index_put_`) does not -- this is exactly
+        # the op :class:`Qwen36PagedAttentionCache`'s own `append` already
+        # uses successfully for FP8 (`self.k_cache[page_ids, offsets] =
+        # new_k.to(self.dtype)`, proven correct by the B1-R gap-error gate
+        # on GPU). Semantically identical here: `write_index` has one
+        # distinct row per batch entry, never a repeat, so index_copy_'s
+        # only behavioral edge over index_put_ (last-write-wins on
+        # duplicate indices) never applies.
+        k_flat[write_index] = k_to_store
+        v_flat[write_index] = v_to_store
 
-        needs_cast = query.dtype != k_pool.dtype
-        q_for_kernel = query.to(k_pool.dtype) if needs_cast else query
+        # Query stays BF16 regardless of k_pool's dtype -- see forward()'s
+        # matching comment for why casting it to the pool's dtype (the old
+        # `needs_cast`/`q_for_kernel`) would be wrong for FP8 KV.
         attn.forward(
-            q=q_for_kernel,
+            q=query,
             k_cache=k_pool,
             v_cache=v_pool,
             output=output,
+            k_descale=self.k_scale,
+            v_descale=self.v_scale,
         )
 
         attn_out = output.reshape(batch_size, 1, -1)
@@ -2132,6 +2309,7 @@ class Qwen36DecoderLayer(nn.Module):
         quantized: dict[str, str],
         *,
         max_seq_len: int,
+        enable_fp8_kv: bool = False,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -2143,7 +2321,13 @@ class Qwen36DecoderLayer(nn.Module):
             self.linear_attn = Qwen36GatedDeltaNet(config, layer_idx, quantized)
             self.self_attn = None
         else:
-            self.self_attn = Qwen36Attention(config, layer_idx, quantized, max_seq_len=max_seq_len)
+            self.self_attn = Qwen36Attention(
+                config,
+                layer_idx,
+                quantized,
+                max_seq_len=max_seq_len,
+                enable_fp8_kv=enable_fp8_kv,
+            )
             self.linear_attn = None
 
         self.mlp = Qwen36MLP(config, layer_idx, quantized)
@@ -2401,7 +2585,12 @@ class Qwen36TextModelSelfBuilt(nn.Module):
     """Embedding -> N decoder layers -> final norm. Batch=1, no vision."""
 
     def __init__(
-        self, config: dict[str, Any], quantized: dict[str, str], *, max_seq_len: int
+        self,
+        config: dict[str, Any],
+        quantized: dict[str, str],
+        *,
+        max_seq_len: int,
+        enable_fp8_kv: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -2414,7 +2603,13 @@ class Qwen36TextModelSelfBuilt(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                Qwen36DecoderLayer(config, i, quantized, max_seq_len=max_seq_len)
+                Qwen36DecoderLayer(
+                    config,
+                    i,
+                    quantized,
+                    max_seq_len=max_seq_len,
+                    enable_fp8_kv=enable_fp8_kv,
+                )
                 for i in range(self.num_hidden_layers)
             ]
         )
@@ -2658,7 +2853,12 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
     declares ``tie_word_embeddings: false``, verified)."""
 
     def __init__(
-        self, config: dict[str, Any], *, max_seq_len: int, enable_mtp: bool = False
+        self,
+        config: dict[str, Any],
+        *,
+        max_seq_len: int,
+        enable_mtp: bool = False,
+        enable_fp8_kv: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -2667,7 +2867,16 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         # injected under the same key) -- see that function's docstring.
         quantized = _quantized_layers_map_for_checkpoint(config)
         self.quantized = quantized
-        self.model = Qwen36TextModelSelfBuilt(config, quantized, max_seq_len=max_seq_len)
+        # enable_fp8_kv (module docstring's 2026-08-03 update, default
+        # OFF): threaded to the backbone's own full-attention layers only
+        # -- NOT to Qwen36MTPHead below, whose checkpoint tensors
+        # (`mtp.layers.0.self_attn.*`) never include a k_scale/v_scale
+        # (verified directly against the real checkpoint's tensor list,
+        # see the block comment above Qwen36MTPHead), so its attention
+        # stays hardcoded BF16 KV regardless of this flag.
+        self.model = Qwen36TextModelSelfBuilt(
+            config, quantized, max_seq_len=max_seq_len, enable_fp8_kv=enable_fp8_kv
+        )
         assert not config.get("tie_word_embeddings", False)
         self.lm_head = _make_linear(
             quantized, "lm_head", config["hidden_size"], config["vocab_size"]
@@ -2750,8 +2959,18 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
             cache = attn.new_cache(device=device, dtype=dtype)
             for mode, seq_len in (("extend", 2), ("decode", 1)):
                 workspace = attn._workspace_for(mode, cache, dtype, device)
+                # `dtype` (the model's BF16 compute dtype), NOT
+                # `cache.dtype` -- query always stays in its own compute
+                # dtype regardless of the KV cache's dtype (FP8 KV: see
+                # Qwen36Attention.forward's matching comment). Using
+                # `cache.dtype` here was a second, independent instance of
+                # the same "cast Q to the cache's dtype" bug forward()/
+                # decode_batch() had, only reachable through this warmup
+                # path -- caught by an actual FP8 KV load attempt raising
+                # "unsupported q dtype torch.float8_e4m3fn" from
+                # sparkinfer's planner (real error, not hypothetical).
                 q = torch.zeros(
-                    seq_len, attn.num_heads, attn.head_dim, dtype=cache.dtype, device=device
+                    seq_len, attn.num_heads, attn.head_dim, dtype=dtype, device=device
                 )
                 workspace.forward(
                     q=q,
