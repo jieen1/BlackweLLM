@@ -167,6 +167,21 @@ CPU-only interpreter, not just the full one:
 ~/.venvs/vllm/bin/python -m pytest -q   # full, mirrors CI job 2
 ```
 
+### Qwen3.6 on a shared card
+
+`ModelOptFP8Linear`/`ModelOptNVFP4Linear` dequantize weights to BF16 lazily and
+cache them for the process's lifetime, so resident memory goes from ~19 GB to
+~54 GB+ the first time a forward pass touches every layer. **No memory knob
+controls this** -- `GPU_MEM_UTIL`, `num_slots` and `blocks_per_slot` all size
+the KV cache, not the weight cache. Lowering them and expecting a smaller
+footprint is the natural guess and it is wrong; it was tried twice on
+2026-08-02 and the card still filled.
+
+To verify something on a shared card, drive a **single layer** rather than the
+whole model. `scripts/b3_probe_gdn_spec_rollback.py` is the worked example: one
+real GDN layer with real FP8 weights, no full-model load. See
+[`notes/2026-08-02-qwen36-dequant-cache-memory-floor.md`](notes/2026-08-02-qwen36-dequant-cache-memory-floor.md).
+
 ### Verifying from a git worktree
 
 `~/.venvs/vllm` has `blackwellm` installed **editable**, and that install's
