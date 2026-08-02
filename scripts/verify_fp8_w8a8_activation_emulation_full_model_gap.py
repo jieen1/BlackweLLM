@@ -181,6 +181,28 @@ def main() -> None:
     report = AgreementReport(workloads=tuple(workloads))
     metrics = report.summary_metrics()
     passed, reasons = evaluate_summary(metrics, CALIBRATED_THRESHOLDS)
+
+    # A workload that overflowed the capture window contributed NOTHING to the
+    # metrics above -- it was skipped before `workloads.append`. So every bar
+    # here was judged on the survivors, with the worst case excluded by
+    # construction. Without this, a run where one workload diverges beyond
+    # measurement and the rest stay inside their bars would record
+    # `passes_calibrated_bars: true`: a false green produced by the very
+    # divergence the gate exists to catch.
+    overflowed = sorted(
+        label for label, w in results["workloads"].items() if "capture_overflow" in w
+    )
+    if overflowed:
+        passed = False
+        reasons = (
+            *reasons,
+            f"{len(overflowed)} workload(s) overflowed the top-1024 capture window "
+            f"({', '.join(overflowed)}) and are NOT represented in any metric above -- "
+            "the bars shown were computed on the survivors only. Diverging past "
+            "measurability is a harder failure than exceeding a bar: B1-R's own "
+            "calibration sweep never produced it from any injected bug "
+            "(docs/b1-correctness-criterion.md §5.3, all stayed inside top-64).",
+        )
     for key in (
         "median_gap_error",
         "p90_gap_error",
