@@ -385,6 +385,15 @@ async def lifespan(app: FastAPI):
     engine = ServerEngine(
         model=SERVER_MODEL_PATH,
         backend=resolution.backend,
+        # A3 step 7-g (docs/a3-cache-coordinator-design.md §7 row 7-g):
+        # `resolution.spec` used to be read only for `.backend` above and
+        # discarded -- it also carries `needs_two_cache_families`, which
+        # `ServerEngine.slot_resources` (a `SlotResourceManager`) needs to
+        # decide whether a second cache-family allocator is required. For
+        # every checkpoint this runtime serves today that is `False`, so
+        # this plumbs the already-computed fact through rather than
+        # re-deriving a fallback inside ServerEngine.
+        architecture_spec=resolution.spec,
         capacity=SERVER_CAPACITY,
         num_slots=SERVER_NUM_SLOTS,
         block_size=SERVER_BLOCK_SIZE,

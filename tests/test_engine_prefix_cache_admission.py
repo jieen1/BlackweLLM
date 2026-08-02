@@ -21,18 +21,33 @@ test).
 other half of the shadow-consistency claim: for the one real shipping
 backend (``LagunaBackend``), the new capability bit and the old ``hasattr``
 probe agree.
+
+``TestCoordinatorWiring`` (A3 step 7-g, docs/a3-cache-coordinator-design.md
+§7 row 7-g) covers the piece this docstring's own claims above do NOT: that
+admission actually calls through ``ServerEngine.slot_resources`` (a
+``SlotResourceManager``) rather than ``self.runner`` directly. Every test
+above this point in the file was written for 7-b, when the call site really
+was ``self.runner.find_best_slot_for_prompt``/``.reconcile_prefix_hit``, and
+still passes unmodified after 7-g's wiring -- strong evidence the observable
+outcome did not change, but not, on its own, proof that the coordinator is
+actually in the call path (a `self.slot_resources` property that silently
+fell back to `self.runner` under the hood would pass those same assertions).
+``TestCoordinatorWiring`` spies on ``SlotResourceManager`` itself to close
+that gap.
 """
 
 from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 pytest.importorskip("torch")
 
 from runtime.backends.protocol import BackendCapabilities, PrefixHit
+from runtime.slot_resource_manager import SlotResourceManager
 from server.engine import GenerationRequest, ServerEngine
 
 
@@ -201,3 +216,62 @@ class TestCapabilityGatedSlotAssignment:
         # hasattr(runner, "find_best_slot_for_prompt") == False did before.
         assert engine.active[0]["anchor"] == 700
         assert 1 in engine.free_slots
+
+
+class TestCoordinatorWiring:
+    """A3 step 7-g: prove the coordinator is actually in the call path, not
+    just that the observable outcome is unchanged (the other tests in this
+    file, all inherited from 7-b, already prove that half)."""
+
+    def test_slot_resources_is_a_slot_resource_manager_bound_to_runner(self) -> None:
+        runner = _FakeNoCacheRunner()
+        engine = _bare_admission_engine(runner)
+
+        resources = engine.slot_resources
+
+        assert isinstance(resources, SlotResourceManager)
+        assert resources._backend is runner
+        # Default architecture_spec (no real checkpoint passed to this bare
+        # test engine) still forces the pure-forward branch -- see
+        # server/engine.py's _DEFAULT_ARCHITECTURE_SPEC comment.
+        assert resources.needs_two_cache_families is False
+
+    def test_admission_calls_through_slot_resource_manager_not_runner_directly(
+        self,
+    ) -> None:
+        """Spies on SlotResourceManager's own methods (not the fake runner's)
+        -- a property that quietly bypassed the coordinator and called
+        ``self.runner`` directly would still pass every test above this
+        class, but would leave these spies uncalled."""
+        prompt_a, prompt_b = (11, 12, 13), (21, 22, 23)
+        runner = _FakeCacheAwareRunner(best_slot_by_prompt={prompt_a: 1, prompt_b: 0})
+        engine = _bare_admission_engine(runner)
+        engine.waiting = [
+            _req(engine, list(prompt_a), "req-a"),
+            _req(engine, list(prompt_b), "req-b"),
+        ]
+
+        with (
+            patch.object(
+                SlotResourceManager,
+                "find_best_slot_for_prompt",
+                autospec=True,
+                side_effect=SlotResourceManager.find_best_slot_for_prompt,
+            ) as spy_find_slot,
+            patch.object(
+                SlotResourceManager,
+                "reconcile_prefix_hit",
+                autospec=True,
+                side_effect=SlotResourceManager.reconcile_prefix_hit,
+            ) as spy_reconcile,
+        ):
+            engine._step_sync()
+
+        assert spy_find_slot.call_count == 2
+        assert spy_reconcile.call_count == 2
+        # The underlying fake runner's own calls (already asserted by the
+        # 7-b tests above) must still have happened -- the coordinator forwarded,
+        # it did not intercept and answer on its own.
+        assert len(runner.find_best_slot_calls) == 2
+        assert engine.active[1]["anchor"] == 901
+        assert engine.active[0]["anchor"] == 900
