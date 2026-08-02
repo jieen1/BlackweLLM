@@ -349,17 +349,26 @@ class Qwen36DecodeBatch:
 
     input_ids: torch.Tensor  # [B, 1] int64
     positions: torch.Tensor  # [B] int64
-    cache_seqlens: torch.Tensor  # [B] int32, INCLUDING this step's token
-    cu_seqlens_q: torch.Tensor  # [B+1] int32 == arange(B+1)
-    page_table: torch.Tensor  # [B, pages_per_slot] int32, global page ids
     write_index: torch.Tensor  # [B] int64, flat row into k_pool.view(-1, H, D)
     slot_index: torch.Tensor  # [B] int64, which pool row each batch entry is
+    #: Shared across every full-attention layer; owns ``page_table`` (global
+    #: page ids) and ``cache_seqlens`` (lengths INCLUDING this step's token).
+    #: Which concrete driver this is -- eager or graph-replay -- is the whole
+    #: of the difference between an eager step and a captured one.
+    attn: Any
     k_pools: list[torch.Tensor | None]
     v_pools: list[torch.Tensor | None]
     conv_pools: list[torch.Tensor | None]
     recurrent_pools: list[torch.Tensor | None]
-    workspaces: list[Any]
     attn_outputs: list[torch.Tensor | None]
+
+    @property
+    def page_table(self) -> torch.Tensor:
+        return self.attn.page_table
+
+    @property
+    def cache_seqlens(self) -> torch.Tensor:
+        return self.attn.cache_seqlens
 
 
 @dataclass
@@ -859,6 +868,193 @@ class Qwen36AttentionWorkspace:
         paged_attention_forward(binding=binding)
 
 
+class Qwen36BatchedDecodeAttention:
+    """One shared paged-attention driver for a whole batched decode step (B2).
+
+    Owns the three metadata tensors (``page_table``, ``cache_seqlens``,
+    ``cu_seqlens_q``) rather than taking them per call, which is what makes
+    it interchangeable with :class:`Qwen36DecodeGraphAttention`: in graph
+    mode those tensors have to be sparkinfer's own persistent buffers, not
+    the caller's, and a driver object is the only place that difference can
+    live without leaking into every layer's forward.
+
+    **Shared across every full-attention layer**, unlike B1's per-layer
+    :class:`Qwen36AttentionWorkspace`. That class's own docstring already
+    flagged the per-layer construction as "a real, concrete follow-up --
+    not attempted here because it was not needed to fix the actual bug
+    within this pass's time budget"; batched decode forces the issue, since
+    graph mode needs one set of metadata buffers for the whole step rather
+    than sixteen that must all be written identically. All 16 full-attention
+    layers in this checkpoint share
+    ``num_q_heads``/``num_kv_heads``/``head_dim``/``page_size``, so one
+    instance is correct as well as cheaper.
+    """
+
+    def __init__(
+        self,
+        *,
+        batch: int,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        pages_per_slot: int,
+        num_cache_pages: int,
+        dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self.batch = batch
+        self.device = device
+        self._descale = torch.ones(1, dtype=torch.float32, device=device)
+        self.page_table = torch.zeros(
+            batch, pages_per_slot, dtype=torch.int32, device=device
+        )
+        self.cache_seqlens = torch.ones(batch, dtype=torch.int32, device=device)
+        self.cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=device)
+        max_work_items = PagedAttentionWorkspace.eager_extend_work_items_capacity(
+            max_total_q=batch, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
+        )
+        self._workspace = PagedAttentionWorkspace.for_fixed_capacity(
+            mode="decode",
+            device=device,
+            dtype=dtype,
+            kv_dtype=kv_dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            page_size=page_size,
+            max_total_q=batch,
+            max_batch=batch,
+            max_page_table_width=pages_per_slot,
+            max_work_items=max_work_items,
+            max_partial_rows=0,
+            num_cache_pages=num_cache_pages,
+            use_cuda_graph=False,
+        )
+        self._plan_budget = PagedPlanBudget(
+            max_total_q=batch,
+            max_batch=batch,
+            max_page_table_width=pages_per_slot,
+        )
+
+    def forward(
+        self,
+        *,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        plan = create_paged_plan(
+            q, k_cache, v_cache, self.page_table, self.cache_seqlens, self.cu_seqlens_q,
+            mode="decode", enable_cuda_graph=False, window_left=-1,
+            plan_budget=self._plan_budget,
+        )
+        ws = self._workspace
+        ws._ensure_capacity(plan)
+        ws._copy_runtime_metadata(self.page_table, self.cache_seqlens, self.cu_seqlens_q)
+        ws._copy_plan_metadata(plan)
+        ws._plan = plan
+        binding = build_paged_attention_binding(
+            scratch=ws, q=q, k_cache=k_cache, v_cache=v_cache, output=output,
+            k_descale=self._descale, v_descale=self._descale,
+        )
+        paged_attention_forward(binding=binding)
+
+
+class Qwen36DecodeGraphAttention:
+    """The same driver, in sparkinfer's CUDA-Graph replay mode (B2).
+
+    Why a second class instead of a flag on the first: the eager driver
+    calls ``create_paged_plan`` on every forward, and that planner reads
+    tensor *contents* on the host. Inside a capture that is not merely
+    slow, it raises -- which is the good outcome; the bad one would be a
+    planner that silently baked one step's schedule into a graph replayed
+    forever. sparkinfer already provides the alternative
+    (``prepare_decode_graph_replay_state`` + metadata updated by a device
+    kernel from ``cache_seqlens``), and ``SparkinferDecodeWorkspace`` in
+    ``runtime/backends/laguna_sparkinfer_attn.py`` is the same shape for
+    Laguna's geometry -- this is that pattern at head_dim=256 / BF16 KV /
+    batch>1, which B0-3 explicitly left untested and handed to B2
+    ("未实测 ``use_cuda_graph=True``，留给 B2").
+
+    Per-step cost is what it is for Laguna: int32 writes into
+    :attr:`cache_seqlens` / :attr:`page_table`, then ``graph.replay()``.
+    """
+
+    def __init__(
+        self,
+        *,
+        batch: int,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        pages_per_slot: int,
+        num_cache_pages: int,
+        max_seq_len: int,
+        dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self.batch = batch
+        self.device = device
+        self._descale = torch.ones(1, dtype=torch.float32, device=device)
+        self._workspace = PagedAttentionWorkspace.for_contract(
+            mode="decode",
+            device=device,
+            dtype=dtype,
+            kv_dtype=kv_dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            page_size=page_size,
+            max_total_q=batch,
+            num_cache_pages=num_cache_pages,
+            use_cuda_graph=True,
+        )
+        self._workspace.prepare_decode_graph_replay_state(
+            batch=batch,
+            max_page_table_width=pages_per_slot,
+            total_q_capacity=batch,
+            max_cache_page_count=num_cache_pages,
+            window_left=-1,
+        )
+        # Bind the WORST case before capture, not a representative one: the
+        # graph's schedule is fixed at capture time, so a shorter context
+        # captured here would silently under-serve every longer one later.
+        capture_page_table = torch.arange(
+            pages_per_slot, dtype=torch.int32, device=device
+        ).unsqueeze(0).repeat(batch, 1)
+        capture_cache_seqlens = torch.full(
+            (batch,), max_seq_len, dtype=torch.int32, device=device
+        )
+        self.cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=device)
+        self._workspace._copy_runtime_metadata(
+            capture_page_table, capture_cache_seqlens, self.cu_seqlens_q
+        )
+        # From here on these ARE the buffers the caller writes each step.
+        self.page_table = self._workspace.page_table
+        self.cache_seqlens = self._workspace.cache_seqlens
+
+    def forward(
+        self,
+        *,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        binding = build_paged_attention_binding(
+            scratch=self._workspace, q=q, k_cache=k_cache, v_cache=v_cache,
+            output=output, k_descale=self._descale, v_descale=self._descale,
+        )
+        paged_attention_forward(binding=binding)
+
+
 class Qwen36Attention(nn.Module):
     """Transcribed from ``Qwen3_5Attention``. Uses sparkinfer's paged
     attention kernel (B0-3-verified for this exact shape) with a BF16 KV
@@ -1014,11 +1210,8 @@ class Qwen36Attention(nn.Module):
         *,
         k_pool: torch.Tensor,
         v_pool: torch.Tensor,
-        page_table: torch.Tensor,
-        cache_seqlens: torch.Tensor,
         write_index: torch.Tensor,
-        cu_seqlens_q: torch.Tensor,
-        workspace: Qwen36AttentionWorkspace,
+        attn: Qwen36BatchedDecodeAttention | Qwen36DecodeGraphAttention,
         output: torch.Tensor,
     ) -> torch.Tensor:
         """One decode step for ``B`` sequences sharing this layer's KV pool.
@@ -1030,20 +1223,20 @@ class Qwen36Attention(nn.Module):
         * ``k_pool``/``v_pool``: ``[num_pages_total, page_size,
           num_kv_heads, head_dim]`` -- every slot's pages in one
           allocation.
-        * ``page_table``: ``[B, pages_per_slot]`` int32, **global** page
-          ids (slot ``s``'s local page ``p`` is ``s * pages_per_slot + p``).
         * ``write_index``: ``[B]`` int64, flat row index into
           ``k_pool.view(-1, num_kv_heads, head_dim)`` for this step's new
           token -- i.e. ``global_page * page_size + offset``. Computed by
           the caller because it depends only on each slot's ``kv_len``,
           which the slot bookkeeping already owns; doing it here would
           mean handing this layer slot identities it otherwise never sees.
-        * ``cache_seqlens``: ``[B]`` int32, each sequence's length
-          **including** the token written this step.
+        * ``attn``: the step's shared attention driver, which owns
+          ``page_table`` (``[B, pages_per_slot]`` int32, **global** page
+          ids) and ``cache_seqlens`` (``[B]`` int32, each sequence's length
+          **including** the token written this step).
 
-        ``output`` and ``workspace`` are caller-owned so a CUDA Graph
-        capture can pin them; every tensor this method touches is either
-        an argument or derived by a shape-stable op, so nothing here
+        ``output`` and ``attn`` are caller-owned so a CUDA Graph capture
+        can pin them; every tensor this method touches is either an
+        argument or derived by a shape-stable op, so nothing here
         allocates a buffer whose address a replay could invalidate.
         """
         batch_size, seq_len, _ = hidden_states.shape
@@ -1073,14 +1266,11 @@ class Qwen36Attention(nn.Module):
 
         needs_cast = query.dtype != k_pool.dtype
         q_for_kernel = query.to(k_pool.dtype) if needs_cast else query
-        workspace.forward(
+        attn.forward(
             q=q_for_kernel,
             k_cache=k_pool,
             v_cache=v_pool,
             output=output,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            cu_seqlens_q=cu_seqlens_q,
         )
 
         attn_out = output.reshape(batch_size, 1, -1)
@@ -1201,11 +1391,8 @@ class Qwen36DecoderLayer(nn.Module):
                 cos_sin_cache,
                 k_pool=batch.k_pools[i],
                 v_pool=batch.v_pools[i],
-                page_table=batch.page_table,
-                cache_seqlens=batch.cache_seqlens,
                 write_index=batch.write_index,
-                cu_seqlens_q=batch.cu_seqlens_q,
-                workspace=batch.workspaces[i],
+                attn=batch.attn,
                 output=batch.attn_outputs[i],
             )
 

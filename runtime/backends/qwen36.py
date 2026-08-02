@@ -180,15 +180,16 @@ class Qwen36Backend:
             )
         self.max_seq_len = self.pool.max_seq_len
         if self.device.type == "cuda":
+            # Pre-build every batch size's eager driver so no request pays
+            # a first-call allocation. On CPU they are built lazily instead:
+            # a CPU-device backend is not a fallback execution path (the
+            # kernels are CUDA-only and a forward there fails loudly), it
+            # exists so the slot/prefix/checkpoint bookkeeping below -- pure
+            # Python, and where the silent-corruption failure modes live
+            # (INV-A3-1/2/3) -- can be tested deterministically against a
+            # stub model instead of only against a 50 GiB checkpoint on a
+            # contended GPU. See tests/test_qwen36_backend.py.
             self.pool.ensure_decode_workspaces(max_batch=num_slots)
-        # else: sparkinfer's paged workspaces are CUDA-only, so there is
-        # nothing to build. A CPU-device backend is not a fallback execution
-        # path -- any forward will fail inside the kernel, loudly. It exists
-        # so the slot/prefix/checkpoint bookkeeping below, which is pure
-        # Python and is where the silent-corruption failure modes live
-        # (INV-A3-1/2/3), can be tested deterministically against a stub
-        # model instead of only against a 50 GiB checkpoint on a contended
-        # GPU. See tests/test_qwen36_backend.py.
 
         # -- prefix cache bookkeeping (same shape as LagunaBackend's) ------
         self._prefix_cache_tokens: list[list[int] | None] = [None] * num_slots
@@ -743,6 +744,11 @@ class Qwen36Backend:
             logger.exception("Qwen3.6 decode CUDA Graph capture failed; falling back to eager")
             self._decode_graphs.clear()
             self._decode_graph_logits.clear()
+            # Uninstall every graph driver too. Leaving one installed would
+            # make the eager path write metadata into a replay-mode
+            # workspace whose plan was never captured -- a state that reads
+            # as "fell back safely" and computes garbage.
+            self.pool.graph_attn.clear()
             return None
         finally:
             self.pool.reset_all()
@@ -758,14 +764,31 @@ class Qwen36Backend:
             tokens = [0] * b
             for slot in slots:
                 self.pool.reset_slot(slot)
-            # Warm the shapes eagerly first: a kernel's first-ever launch
-            # may JIT, and JIT inside a capture is not capturable.
+            # Warm eagerly first, at this exact batch size: a kernel's
+            # first-ever launch may JIT, and a JIT compile inside a capture
+            # is not capturable. This is also what pays the FLA/Triton
+            # first-call compile once instead of inside the graph.
             warm_batch, _ = self.pool.build_decode_batch(slots, tokens)
             self.model.decode_batch(warm_batch)
+            torch.cuda.synchronize(self.device)
+
+            # Install the graph-replay driver BEFORE building the batch the
+            # graph is captured against: it owns the metadata buffers the
+            # capture bakes in, and those must be the same buffers every
+            # later step writes.
+            self.pool.graph_attn[b] = self.pool.build_graph_attention_driver(b)
+            for slot in slots:
+                self.pool.reset_slot(slot)
+            batch, _ = self.pool.build_decode_batch(slots, tokens)
+            # One eager run through the graph driver too: sparkinfer's
+            # replay-mode kernel has its own first-launch compile, distinct
+            # from the eager planner's.
+            self.model.decode_batch(batch)
             for slot in slots:
                 self.pool.reset_slot(slot)
             batch, _ = self.pool.build_decode_batch(slots, tokens)
             torch.cuda.synchronize(self.device)
+
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, pool=self._graph_pool):
                 logits = self.model.decode_batch(batch)

@@ -60,8 +60,9 @@ import torch
 from runtime.model.qwen36_model import (
     _PAGED_ATTENTION_PAGE_SIZE,
     GdnLayerState,
-    Qwen36AttentionWorkspace,
+    Qwen36BatchedDecodeAttention,
     Qwen36DecodeBatch,
+    Qwen36DecodeGraphAttention,
     Qwen36ForCausalLMSelfBuilt,
     Qwen36GenerationState,
     Qwen36PagedAttentionCache,
@@ -147,8 +148,13 @@ class Qwen36SlotPool:
         self.v_pools: list[torch.Tensor | None] = [None] * self.num_layers
         self.conv_pools: list[torch.Tensor | None] = [None] * self.num_layers
         self.recurrent_pools: list[torch.Tensor | None] = [None] * self.num_layers
-        self.decode_workspaces: list[Qwen36AttentionWorkspace | None] = [None] * self.num_layers
         self.attn_outputs: list[torch.Tensor | None] = [None] * self.num_layers
+        #: batch size -> shared attention driver for a decode step of that
+        #: size. Eager drivers are built on demand; a graph driver replaces
+        #: the eager one for a batch size only once its graph is captured.
+        self.decode_attn: dict[int, Qwen36BatchedDecodeAttention] = {}
+        self.graph_attn: dict[int, Qwen36DecodeGraphAttention] = {}
+        self._attn_geometry: dict[str, int] | None = None
 
         recurrent_bytes = 0
         kv_bytes = 0
@@ -199,6 +205,24 @@ class Qwen36SlotPool:
                         device=self.device, dtype=dtype,
                     )
                 )
+                geometry = {
+                    "num_q_heads": attn.num_heads,
+                    "num_kv_heads": attn.num_kv_heads,
+                    "head_dim": attn.head_dim,
+                }
+                if self._attn_geometry is None:
+                    self._attn_geometry = geometry
+                elif self._attn_geometry != geometry:
+                    # One shared driver per step is only correct while every
+                    # full-attention layer has the same shape. This
+                    # checkpoint's 16 do; a future one that does not must
+                    # fail here rather than silently run 15 layers through a
+                    # workspace built for the 16th.
+                    raise ValueError(
+                        "Qwen36SlotPool assumes every full-attention layer shares one "
+                        f"geometry; layer {i} has {geometry}, earlier layers have "
+                        f"{self._attn_geometry}"
+                    )
 
         self.geometry = SlotPoolGeometry(
             num_slots=num_slots,
@@ -223,15 +247,6 @@ class Qwen36SlotPool:
         )
         self._batch_positions = _mark_static(
             torch.zeros(b, dtype=torch.long, device=self.device)
-        )
-        self._batch_cache_seqlens = _mark_static(
-            torch.ones(b, dtype=torch.int32, device=self.device)
-        )
-        self._batch_cu_seqlens_q = _mark_static(
-            torch.arange(b + 1, dtype=torch.int32, device=self.device)
-        )
-        self._batch_page_table = _mark_static(
-            torch.zeros(b, self.pages_per_slot, dtype=torch.int32, device=self.device)
         )
         self._batch_write_index = _mark_static(
             torch.zeros(b, dtype=torch.long, device=self.device)
@@ -433,7 +448,7 @@ class Qwen36SlotPool:
                 if cache is not None:
                     cache.seq_len = past + 1
 
-        dev = self.device
+        attn = self.attention_driver(b)
         self._batch_input_ids[:b, 0].copy_(
             torch.tensor(token_ids, dtype=torch.long, device="cpu"), non_blocking=True
         )
@@ -441,7 +456,7 @@ class Qwen36SlotPool:
             torch.tensor([s - 1 for s in seqlens], dtype=torch.long, device="cpu"),
             non_blocking=True,
         )
-        self._batch_cache_seqlens[:b].copy_(
+        attn.cache_seqlens.copy_(
             torch.tensor(seqlens, dtype=torch.int32, device="cpu"), non_blocking=True
         )
         self._batch_write_index[:b].copy_(
@@ -450,58 +465,74 @@ class Qwen36SlotPool:
         self._batch_slot_index[:b].copy_(
             torch.tensor(slots, dtype=torch.long, device="cpu"), non_blocking=True
         )
-        self._batch_page_table[:b].copy_(
+        attn.page_table.copy_(
             self._global_page_table.index_select(
-                0, torch.tensor(slots, dtype=torch.long, device=dev)
+                0, torch.tensor(slots, dtype=torch.long, device=self.device)
             )
         )
 
         batch = Qwen36DecodeBatch(
             input_ids=self._batch_input_ids[:b],
             positions=self._batch_positions[:b],
-            cache_seqlens=self._batch_cache_seqlens[:b],
-            cu_seqlens_q=self._batch_cu_seqlens_q[: b + 1],
-            page_table=self._batch_page_table[:b],
             write_index=self._batch_write_index[:b],
             slot_index=self._batch_slot_index[:b],
+            attn=attn,
             k_pools=self.k_pools,
             v_pools=self.v_pools,
             conv_pools=self.conv_pools,
             recurrent_pools=self.recurrent_pools,
-            workspaces=self.decode_workspaces,
             attn_outputs=[
                 None if out is None else out[:b] for out in self.attn_outputs
             ],
         )
         return batch, b
 
-    def ensure_decode_workspaces(self, max_batch: int) -> None:
-        """Build one fixed-capacity decode workspace per attention layer.
+    def attention_driver(self, batch: int):
+        """The shared attention driver for a decode step of size ``batch``.
 
-        Sized for ``max_batch`` sequences and the *whole* page pool, not
-        one slot's worth: batched decode addresses pages globally, so the
-        workspace's ``num_cache_pages`` must cover every slot's range or
-        sparkinfer's own capacity check rejects the page table.
+        A captured graph's driver wins once it exists: the graph was
+        captured against *its* metadata buffers, so replaying it while the
+        eager driver's buffers are the ones being written would replay last
+        capture's schedule forever -- correct-looking output computed from
+        the wrong context lengths.
         """
-        total_pages = self._num_rows * self.pages_per_slot
-        for layer in self.model.model.layers:
-            i = layer.layer_idx
-            if layer.layer_type == "linear_attention":
-                continue
-            if self.decode_workspaces[i] is not None:
-                continue
-            attn = layer.self_attn
-            self.decode_workspaces[i] = Qwen36AttentionWorkspace(
-                mode="decode",
-                num_q_heads=attn.num_heads,
-                num_kv_heads=attn.num_kv_heads,
-                head_dim=attn.head_dim,
-                page_size=self.page_size,
-                max_total_q=max_batch,
-                max_page_table_width=self.pages_per_slot,
-                num_cache_pages=total_pages,
-                dtype=self.dtype,
-                kv_dtype=self.dtype,
-                device=self.device,
-                max_batch=max_batch,
+        graph = self.graph_attn.get(batch)
+        if graph is not None:
+            return graph
+        existing = self.decode_attn.get(batch)
+        if existing is None:
+            existing = Qwen36BatchedDecodeAttention(
+                batch=batch, **self._driver_kwargs()
             )
+            self.decode_attn[batch] = existing
+        return existing
+
+    def build_graph_attention_driver(self, batch: int) -> Qwen36DecodeGraphAttention:
+        """Build (but do not install) a graph-replay driver for ``batch``."""
+        return Qwen36DecodeGraphAttention(
+            batch=batch, max_seq_len=self.max_seq_len, **self._driver_kwargs()
+        )
+
+    def _driver_kwargs(self) -> dict:
+        if self._attn_geometry is None:
+            raise RuntimeError("this model has no full-attention layers to drive")
+        return {
+            **self._attn_geometry,
+            "page_size": self.page_size,
+            "pages_per_slot": self.pages_per_slot,
+            "num_cache_pages": self._num_rows * self.pages_per_slot,
+            "dtype": self.dtype,
+            "kv_dtype": self.dtype,
+            "device": self.device,
+        }
+
+    def ensure_decode_workspaces(self, max_batch: int) -> None:
+        """Pre-build the eager decode driver for every batch size in use.
+
+        Sized for the *whole* page pool, not one slot's worth: batched
+        decode addresses pages globally, so ``num_cache_pages`` must cover
+        every slot's range or sparkinfer's own capacity check rejects the
+        page table.
+        """
+        for batch in range(1, max_batch + 1):
+            self.attention_driver(batch)
