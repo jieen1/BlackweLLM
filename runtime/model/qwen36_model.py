@@ -187,15 +187,31 @@ class GdnLayerState:
     has_previous_state: bool = False
 
 
+#: sparkinfer's paged-attention planner rejects any other page_size
+#: (confirmed directly, 2026-08-02: ``page_size=512`` raised
+#: "primary paged backend expects page_size=64 or page_size=128, got
+#: 512" from ``sparkinfer/attention/paged/planner.py``) -- matches B0-3's
+#: own probe, which only ever exercised these two values. 128 chosen
+#: arbitrarily between the two (B0-3 measured both as correct and of
+#: comparable throughput for this shape; B1 does not need to pick a
+#: winner).
+_PAGED_ATTENTION_PAGE_SIZE = 128
+
+
 class Qwen36PagedAttentionCache:
-    """Single-page (batch=1), BF16 KV cache for one full-attention layer,
+    """Batch=1 BF16 KV cache for one full-attention layer, paged (fixed
+    ``page_size=128``, see :data:`_PAGED_ATTENTION_PAGE_SIZE`) and
     read/written through sparkinfer's paged-attention kernel.
 
-    One page sized to hold the entire sequence -- deliberately avoids
-    page-table bookkeeping complexity that has no payoff at batch=1 (that
-    complexity belongs to B2's real slot manager, not this correctness
-    check). ``max_seq_len`` must be decided upfront (caller's
-    responsibility); this is a hard cap, not a growable buffer.
+    Real multi-page addressing (not one giant page) is required, not a
+    simplification choice -- sparkinfer's planner hard-rejects any
+    ``page_size`` other than 64/128 (confirmed directly; see the constant
+    above), so a single page sized to the whole sequence only works by
+    accident when ``max_seq_len`` happens to equal 64 or 128. The page
+    *table* itself is still trivial at batch=1 (one sequence, physical
+    pages 0..num_pages-1 in order) -- the complexity this class still
+    avoids is B2's real slot manager (sharing/evicting physical pages
+    across concurrent sequences), not paging itself.
     """
 
     def __init__(
@@ -207,20 +223,26 @@ class Qwen36PagedAttentionCache:
         dtype: torch.dtype,
         device: torch.device,
     ) -> None:
-        self.max_seq_len = max_seq_len
+        self.page_size = _PAGED_ATTENTION_PAGE_SIZE
+        self.num_pages = (max_seq_len + self.page_size - 1) // self.page_size
+        self.max_seq_len = self.num_pages * self.page_size
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.dtype = dtype
         self.device = device
-        kv_shape = (1, max_seq_len, num_kv_heads, head_dim)
+        kv_shape = (self.num_pages, self.page_size, num_kv_heads, head_dim)
         self.k_cache = torch.zeros(kv_shape, dtype=dtype, device=device)
         self.v_cache = torch.zeros(kv_shape, dtype=dtype, device=device)
-        self.page_table = torch.zeros(1, 1, dtype=torch.int32, device=device)
+        # Batch=1, one sequence: physical pages are just 0..num_pages-1,
+        # in order -- no sharing/eviction to address (see class docstring).
+        self.page_table = torch.arange(self.num_pages, dtype=torch.int32, device=device)
+        self.page_table = self.page_table.unsqueeze(0)  # [1, num_pages]
         self.seq_len = 0  # tokens currently resident
 
     def append(self, new_k: torch.Tensor, new_v: torch.Tensor) -> tuple[int, int]:
         """Write ``new_k``/``new_v`` (``[seq_len, num_kv_heads, head_dim]``)
-        at the tail. Returns ``(past_len, new_total_len)``."""
+        at the tail, scattering across page boundaries as needed. Returns
+        ``(past_len, new_total_len)``."""
         seq_len = new_k.shape[0]
         past_len = self.seq_len
         new_total = past_len + seq_len
@@ -229,8 +251,11 @@ class Qwen36PagedAttentionCache:
                 f"Qwen36PagedAttentionCache overflow: max_seq_len={self.max_seq_len}, "
                 f"attempted to reach {new_total}"
             )
-        self.k_cache[0, past_len:new_total] = new_k
-        self.v_cache[0, past_len:new_total] = new_v
+        positions = torch.arange(past_len, new_total, device=self.device)
+        page_ids = positions // self.page_size
+        offsets = positions % self.page_size
+        self.k_cache[page_ids, offsets] = new_k.to(self.dtype)
+        self.v_cache[page_ids, offsets] = new_v.to(self.dtype)
         self.seq_len = new_total
         return past_len, new_total
 
@@ -538,13 +563,13 @@ class Qwen36Attention(nn.Module):
                 num_kv_heads=self.num_kv_heads,
                 head_dim_qk=self.head_dim,
                 head_dim_vo=self.head_dim,
-                page_size=cache.max_seq_len,
+                page_size=cache.page_size,
                 max_total_q=seq_len,
                 max_batch=1,
-                max_page_table_width=1,
+                max_page_table_width=cache.num_pages,
                 max_work_items=4096,
                 max_partial_rows=65536,
-                num_cache_pages=1,
+                num_cache_pages=cache.num_pages,
                 use_cuda_graph=False,
             )
         )

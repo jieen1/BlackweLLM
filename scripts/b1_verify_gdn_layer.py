@@ -47,6 +47,11 @@ MODEL_PATH = (
 )
 LAYER_IDX = 0  # a linear_attention layer per layer_types
 DEVICE = torch.device("cuda")
+# No training anywhere in this runtime; matches LagunaBackend.__init__'s
+# same call (runtime/backends/laguna.py:266). Not strictly required for
+# GDN (FLA's own ops don't dlpack-export), but kept consistent with the
+# attention-layer script this one is paired with.
+torch.set_grad_enabled(False)
 
 
 def load_layer_tensors(model_path: str, layer_idx: int) -> dict[str, torch.Tensor]:

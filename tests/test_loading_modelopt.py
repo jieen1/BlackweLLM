@@ -6,10 +6,13 @@ cleanly under the CPU-only ci-sim job rather than erroring at collection,
 matching this repo's existing convention (see ``pyproject.toml``'s note on
 ``pytest.importorskip("torch")``-guarded modules).
 
-Cross-checked against ``torch``'s own native ``float4_e2m1fn_x2`` cast on
-GPU separately (``scripts/b1_verify_nvfp4_dequant.py`` -- needs CUDA, not
-run here); the LUT/packing-order values asserted below are transcribed
-from that GPU-verified result, not independently re-derived here.
+``scripts/b1_verify_nvfp4_dequant.py`` tried to cross-check the E2M1 LUT
+against torch's own native ``float4_e2m1fn_x2`` cast on GPU -- that cast
+turned out to be non-functional on this torch build in both directions
+(2026-08-02 finding, see that script and ``runtime/loading/modelopt.py``'s
+module docstring). The LUT values asserted below are instead the E2M1
+format's mathematically-determined table (see that docstring); the
+packing order is this module's one genuinely unverified assumption.
 """
 
 from __future__ import annotations

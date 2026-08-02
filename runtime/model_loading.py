@@ -237,7 +237,21 @@ def load_qwen36_model(
     cache (``Qwen36PagedAttentionCache``) upfront -- see that class's
     docstring for why this is a hard cap, not a growable buffer, at B1's
     batch=1/no-CUDA-graph scope.
+
+    Disables autograd globally (``torch.set_grad_enabled(False)``), same
+    as ``LagunaBackend.__init__`` (``runtime/backends/laguna.py:266``) --
+    this is not optional cleanup: sparkinfer's paged-attention kernel
+    exports its input tensors via ``__dlpack__``, which torch refuses for
+    any tensor requiring grad (confirmed directly: omitting this raises
+    ``BufferError: Can't export tensors that require gradient`` from
+    inside ``sparkinfer/attention/paged/_forward.py``, not a hypothetical
+    concern). Every ``nn.Parameter`` in this model graph defaults to
+    ``requires_grad=True`` unless a class explicitly overrides it (only
+    the quantized Linears in ``modelopt_linear.py`` do), so this is
+    process-global, not per-parameter, on purpose -- matching Laguna's
+    same choice, for the same reason (this runtime never trains).
     """
+    torch.set_grad_enabled(False)
     model_config = _build_qwen36_model_config(model_path)
     target_device = torch.device(device)
 

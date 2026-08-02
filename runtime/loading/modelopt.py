@@ -54,19 +54,52 @@ this worktree, not inherited):
   step for this module to reproduce at all, checkpoint-declared, not
   assumed.
 - Packing order (which nibble is which element) and the E2M1 code table
-  (:data:`_FP4_E2M1_LUT`) are **not independently re-verifiable against an
-  HF-native reference in this environment**: this ``transformers`` install
-  has no ``modelopt`` entry in ``AUTO_QUANTIZER_MAPPING`` (checked directly,
-  2026-08-02) and no ``nvidia-modelopt`` package is installed, so there is
-  no second, independently-implemented NVFP4 dequantizer on this machine to
-  diff against. What *is* checked: :data:`_FP4_E2M1_LUT` and the packing
-  order below are cross-validated on GPU against ``torch``'s own native
-  ``float4_e2m1fn_x2`` view+cast (an independent implementation of the same
-  OCP E2M1 decode, built into PyTorch/CUDA, not derived by this module) --
-  see ``scripts/b1_verify_nvfp4_dequant.py``. This is real evidence for "is
-  the bit-level decode right", but is NOT the same claim as "does this
-  match what modelopt's own export intended" -- see that script's output
-  and the B1 handoff notes for exactly what was and was not established.
+  (:data:`_FP4_E2M1_LUT`) are **not independently re-verifiable against a
+  live kernel in this environment** -- checked directly, not assumed:
+  - This ``transformers`` install has no ``modelopt`` entry in
+    ``AUTO_QUANTIZER_MAPPING`` and no ``nvidia-modelopt`` package is
+    installed, so there is no independently-implemented NVFP4 dequantizer
+    on this machine to diff against.
+  - ``torch``'s own native ``float4_e2m1fn_x2`` dtype **exists but its
+    elementwise cast is not functional on this build**
+    (``torch==2.13.0a0+gitcf30153``): casting *to* float32 raises a
+    device-side assert (``DynamicCast.h:79 fetch_and_cast``, confirmed on
+    GPU) and casting *from* float32 raises ``RuntimeError: copy_() does
+    not support casting Float4_e2m1fn_x2 to different types`` (confirmed
+    on GPU, 2026-08-02) -- both directions checked directly, both
+    non-functional. See ``scripts/b1_verify_nvfp4_dequant.py`` for the
+    exact commands and errors; do not assume this dtype is a usable
+    cross-check without re-verifying against whatever torch build is in
+    use.
+  - ``sparkinfer``'s own NVFP4 code (``sparkinfer/quantization/nvfp4/
+    _kernel.py``) only implements the *quantize* direction (float32 ->
+    packed E2M1, via inline PTX ``cvt.rn.satfinite.e2m1x2.f32``, wrapped
+    in CUTLASS-DSL, not plain Triton) -- there is no dequantize kernel to
+    borrow, and reverse-engineering the packed-operand-to-nibble order of
+    that PTX instruction from scratch was judged disproportionate effort
+    for this one question given the time available in this pass.
+
+  **What this module's correctness rests on instead, stated explicitly
+  rather than left implicit**:
+  1. :data:`_FP4_E2M1_LUT`'s *values* are not an empirical guess -- they
+     are mathematically determined by the E2M1 bit format itself (1 sign
+     + 2 exponent bits, bias 1, 1 mantissa bit: subnormal 0/0.5, normals
+     1.0-1.5 (exp=1), 2.0-3.0 (exp=2), 4.0-6.0 (exp=3)) and match the
+     table published in the OCP Microscaling Formats spec and used
+     identically by every NVFP4/MXFP4 implementation surveyed while
+     writing this module -- there is essentially only one table E2M1 can
+     represent, given the format definition.
+  2. The *packing order* (low nibble = even index) is a data-layout
+     convention, not a math question, and genuinely could not be
+     independently confirmed on this machine in this pass -- it matches
+     the near-universal "first element in low bits" convention used by
+     CUTLASS/TensorRT-LLM sub-byte packing (and by this project's own
+     git-recovered ``nvfp4_linear.py``'s general handling), but this is
+     the single largest unverified assumption in this module. **If the
+     full-model smoke test (``scripts/b1_verify_full_model_smoke.py``)
+     ever produces incoherent/degenerate output despite every other layer
+     checking out, swap the nibble order here first** -- it is the most
+     likely single point of failure this module has.
 """
 
 from __future__ import annotations
@@ -159,10 +192,11 @@ def unpack_nvfp4_to_fp32(weight_u8: torch.Tensor) -> torch.Tensor:
     Packing order: low nibble (``byte & 0xF``) is the even-index element
     (``2*k``), high nibble (``byte >> 4``) is the odd-index element
     (``2*k+1``) -- the standard little-endian-nibble convention shared by
-    CUTLASS/TensorRT-LLM NVFP4 layouts. Cross-validated on GPU against
-    torch's native ``float4_e2m1fn_x2`` cast (module docstring); not
-    independently re-verified against modelopt's own reference exporter
-    (none installed in this environment).
+    CUTLASS/TensorRT-LLM NVFP4 layouts. **Not independently re-verified
+    against a live kernel** -- torch's native ``float4_e2m1fn_x2`` cast
+    turned out to be non-functional on this build in both directions, see
+    module docstring for the exact errors and what this module's
+    correctness rests on instead.
     """
     if weight_u8.dtype != torch.uint8:
         raise ValueError(f"expected uint8 packed NVFP4 weight, got {weight_u8.dtype}")

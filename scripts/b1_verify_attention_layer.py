@@ -41,6 +41,11 @@ MODEL_PATH = (
 LAYER_IDX = 3  # first full_attention layer per layer_types
 DEVICE = torch.device("cuda")
 MAX_SEQ_LEN = 64
+# Required: sparkinfer's paged-attention kernel exports its inputs via
+# __dlpack__, which torch refuses for any tensor requiring grad. No
+# training anywhere in this runtime -- matches LagunaBackend.__init__
+# (runtime/backends/laguna.py:266).
+torch.set_grad_enabled(False)
 
 
 def load_layer_tensors(model_path: str, layer_idx: int) -> dict[str, torch.Tensor]:
