@@ -175,12 +175,18 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       正确性通过（投机与非投机 committed 序列逐 token 相同）。
       详见 [`../notes/2026-08-03-mtp-acceptance-on-standard-checkpoint.md`](../notes/2026-08-03-mtp-acceptance-on-standard-checkpoint.md)。
       ⚠️ code 那一行 K 不同（8 vs 4）**不构成结论**，需同 K 重测。
-- [ ] ⚠️ **MTP 的 e2e 收益仍然未知：现有全部 MTP 数字的基线也是 eager 的。**
-      本次非投机基线 5.97–6.02 tok/s，正是 eager；服务路径开 CG 是 28.85 tok/s。
-      这对投机**不是无关缩放**——MTP 赚不赚取决于"一次 verify 是否比 K 次顺序 decode 便宜"，
-      而 CG 恰好把 decode 那侧改了 4.71×。**分母变了，0.83×/1.07× 不能外推到生产。**
+- [ ] ⚠️ **MTP 根本没接进服务路径——所以"MTP 在 CG 下的 e2e"不是一次待做的测量，
+      而是一项待做的实现。**（2026-08-03 核实：`Qwen36Backend.capabilities.
+      speculative_decode = False`，`server/engine.py::_load_qwen36_model` 的 docstring
+      也明说了。MTP 只存在于 `scripts/b3*`，从未进过 `server/app.py`。）
+      现有全部 MTP 数字的基线因此都是 eager 的（本次非投机基线 5.97–6.02 tok/s），
+      而服务路径开 CG 是 28.85 tok/s。这对投机**不是无关缩放**：MTP 赚不赚取决于
+      "一次 verify 是否比 K 次顺序 decode 便宜"，CG 恰好把 decode 那一侧变便宜了 4.71×
+      ——**门槛是被抬高而不是降低了**。
+      加上已实测的接受率只有 1.20–1.67 / K=4，**先别投实现**；
+      要评估就先只做一次"verify 成本 vs K 次 CG decode 成本"的对照，再决定。
       （接受率结论不受影响：那是权重性质，与 CG 无关。）
-      **这是本 session 第二次踩到同一形状的问题——基线跑 eager，结论当成运行时性质。**
+      **本 session 第二次踩到同一形状——基线跑 eager，结论当成运行时性质。**
 
 ### 阶段 4 · Kernel 深度适配，压榨 SM120
 - [x] **已达成"不反量化"这个目标**：`Qwen36MLP` 把 gate/up/down 融成一次退化的
