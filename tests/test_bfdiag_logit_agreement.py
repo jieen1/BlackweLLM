@@ -203,6 +203,7 @@ def _step(
     slack: float = 0.0,
     kl: float = 0.0,
     scale: float = 8.0,
+    logprob_error: float = 0.0,
 ) -> StepAgreement:
     return StepAgreement(
         step_index=index,
@@ -215,6 +216,7 @@ def _step(
         tie_slack=slack,
         logit_scale=scale,
         kl_topk=kl,
+        logprob_error=logprob_error,
     )
 
 
@@ -362,6 +364,66 @@ def test_report_round_trips_through_json(tmp_path) -> None:
     assert loaded.workloads[0].workload_name == "w0"
     assert loaded.workloads[0].num_steps == 4
     assert loaded.max_gap_error == pytest.approx(report.max_gap_error)
+
+
+def test_logprob_error_needs_both_logsumexps() -> None:
+    logits = {5: 12.0, 7: 11.5}
+    assert math.isnan(compare_step(0, 5, logits, dict(logits)).logprob_error)
+    assert math.isnan(
+        compare_step(0, 5, logits, dict(logits), mine_logsumexp=12.5).logprob_error
+    )
+
+
+def test_logprob_error_is_shift_invariant_like_log_softmax() -> None:
+    """log_softmax subtracts each side's own logsumexp, so a constant
+    offset on one side must cancel exactly."""
+    oracle = {1: 10.0, 2: 9.0}
+    mine = {t: v + 3.0 for t, v in oracle.items()}
+    step = compare_step(
+        0, 1, mine, oracle, mine_logsumexp=13.0, oracle_logsumexp=10.0
+    )
+    assert step.logprob_error == pytest.approx(0.0)
+
+
+def test_logprob_error_measures_relative_movement() -> None:
+    oracle = {1: 10.0, 2: 9.0}
+    mine = {1: 10.0, 2: 9.05}
+    step = compare_step(0, 1, mine, oracle, mine_logsumexp=0.0, oracle_logsumexp=0.0)
+    assert step.logprob_error == pytest.approx(0.05)
+
+
+def test_gate_ignores_logprob_error_when_ungated() -> None:
+    steps = [_step(i, gap=0.05, logprob_error=float("nan")) for i in range(512)]
+    report = _report(*(_workload(f"w{i}", steps) for i in range(3)))
+    passed, reasons = passes_b1r_gate(report, UNCALIBRATED_THRESHOLDS)
+    assert passed, reasons
+
+
+def test_gate_fails_when_logprob_error_is_gated_but_unmeasured() -> None:
+    """A bar that silently passes because nobody measured it is exactly the
+    kind of dead gate e2e-and-quality-plan.md's C8 audit exists to find."""
+    thresholds = AgreementThresholds.from_dict(
+        {**UNCALIBRATED_THRESHOLDS.to_dict(), "max_logprob_error": 0.06}
+    )
+    steps = [_step(i, gap=0.05, logprob_error=float("nan")) for i in range(512)]
+    report = _report(*(_workload(f"w{i}", steps) for i in range(3)))
+    passed, reasons = passes_b1r_gate(report, thresholds)
+    assert not passed
+    assert any("not measured" in r for r in reasons)
+
+
+def test_gate_checks_logprob_error_against_the_sglang_comparable_bar() -> None:
+    thresholds = AgreementThresholds.from_dict(
+        {**UNCALIBRATED_THRESHOLDS.to_dict(), "max_logprob_error": 0.06}
+    )
+    ok = [_step(i, gap=0.05, logprob_error=0.02) for i in range(512)]
+    bad = ok[:-1] + [_step(511, gap=0.05, logprob_error=0.5)]
+    assert passes_b1r_gate(_report(*(_workload(f"w{i}", ok) for i in range(3))), thresholds)[0]
+    passed, reasons = passes_b1r_gate(
+        _report(_workload("w0", bad), _workload("w1", ok), _workload("w2", ok)), thresholds
+    )
+    assert not passed
+    assert any("max_logprob_error" in r for r in reasons)
 
 
 def test_thresholds_round_trip() -> None:

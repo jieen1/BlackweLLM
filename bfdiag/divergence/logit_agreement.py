@@ -59,6 +59,19 @@ ULP at that magnitude. A flip at ``tie_slack`` of 1-2 ULP is what the
 measurements above found and is, by construction, the smallest
 disagreement the format admits.
 
+A second, deliberately redundant statistic rides along: ``logprob_error``,
+the max ``|delta log_softmax|`` over the same comparison set. It carries
+no information the gap error does not (the two differ only by which
+per-side constant is subtracted -- each side's own ``logsumexp`` instead
+of its logit at the anchor token), and it exists purely so this
+repository's number is directly comparable to an **upstream, independently
+calibrated** one: SGLang gates exactly this quantity, across its entire
+model zoo, at ``prefill_tolerance=5e-2`` / ``decode_tolerance=6e-2``
+(``sglang/test/registered/models/test_generation_models.py``'s
+``ModelCase`` defaults, with the decode bar carrying the comment
+"Increased to fix numerical error in issue #8614"). A threshold argued
+only from our own measurements is a threshold argued from one sample.
+
 Everything here is torch-free and operates on plain mappings, following
 the same split as ``bfdiag/divergence/scan.py`` vs ``capture.py``: the
 GPU-side script does the top-K extraction with torch and this module does
@@ -128,6 +141,11 @@ class StepAgreement:
     tie_slack: float
     logit_scale: float
     kl_topk: float
+    #: max |delta log_softmax| over the comparison set, or ``nan`` when the
+    #: caller did not supply both sides' full-vocabulary logsumexp. Exists
+    #: to be comparable with SGLang's published 5e-2/6e-2 bars; see the
+    #: module docstring.
+    logprob_error: float = float("nan")
 
     @property
     def agrees(self) -> bool:
@@ -153,6 +171,7 @@ class StepAgreement:
             "tie_slack": self.tie_slack,
             "logit_scale": self.logit_scale,
             "kl_topk": self.kl_topk,
+            "logprob_error": self.logprob_error,
             "agrees": self.agrees,
             "tie_slack_ulps": self.tie_slack_ulps,
             "gap_error_ulps": self.gap_error_ulps,
@@ -171,6 +190,7 @@ class StepAgreement:
             tie_slack=float(data["tie_slack"]),
             logit_scale=float(data["logit_scale"]),
             kl_topk=float(data["kl_topk"]),
+            logprob_error=float(data.get("logprob_error", float("nan"))),
         )
 
 
@@ -214,6 +234,8 @@ def compare_step(
     oracle_logits: Mapping[int, float],
     *,
     gap_top_k: int = DEFAULT_GAP_TOP_K,
+    mine_logsumexp: float | None = None,
+    oracle_logsumexp: float | None = None,
 ) -> StepAgreement:
     """Compare one step's two top-K logit slices.
 
@@ -269,6 +291,14 @@ def compare_step(
 
     logit_scale = max(abs(oracle_logits[t]) for t in comparison_set)
 
+    if mine_logsumexp is None or oracle_logsumexp is None:
+        logprob_error = float("nan")
+    else:
+        logprob_error = max(
+            abs((mine_logits[t] - mine_logsumexp) - (oracle_logits[t] - oracle_logsumexp))
+            for t in comparison_set
+        )
+
     return StepAgreement(
         step_index=step_index,
         forced_token_id=forced_token_id,
@@ -280,6 +310,7 @@ def compare_step(
         tie_slack=tie_slack,
         logit_scale=logit_scale,
         kl_topk=kl,
+        logprob_error=logprob_error,
     )
 
 
@@ -353,6 +384,17 @@ class WorkloadAgreement:
     def max_kl_topk(self) -> float:
         return max((s.kl_topk for s in self.steps), default=0.0)
 
+    @property
+    def max_logprob_error(self) -> float:
+        """``nan`` propagates deliberately: a caller that did not supply
+        logsumexp values must not read a small number here."""
+        values = [s.logprob_error for s in self.steps]
+        if not values:
+            return 0.0
+        if any(math.isnan(v) for v in values):
+            return float("nan")
+        return max(values)
+
     def drift_ratio(self, *, window: int = 128) -> float:
         """``median(gap_error)`` over the last ``window`` steps divided by
         the same over the first ``window`` steps.
@@ -390,6 +432,7 @@ class WorkloadAgreement:
                 "disagreement_rate": self.disagreement_rate,
                 "mean_kl_topk": self.mean_kl_topk,
                 "max_kl_topk": self.max_kl_topk,
+                "max_logprob_error": self.max_logprob_error,
                 "drift_ratio": self.drift_ratio(),
             },
         }
@@ -420,6 +463,10 @@ class AgreementThresholds:
     max_disagreement_rate: float
     max_mean_kl_topk: float
     max_drift_ratio: float
+    #: ``None`` leaves the SGLang-comparable bar ungated (for reports whose
+    #: caller did not supply logsumexp values). A float gates it, and an
+    #: unmeasured (``nan``) value then fails rather than silently passing.
+    max_logprob_error: float | None = None
     min_steps_per_workload: int = 512
     min_workloads: int = 3
 
@@ -431,6 +478,7 @@ class AgreementThresholds:
             "max_disagreement_rate": self.max_disagreement_rate,
             "max_mean_kl_topk": self.max_mean_kl_topk,
             "max_drift_ratio": self.max_drift_ratio,
+            "max_logprob_error": self.max_logprob_error,
             "min_steps_per_workload": self.min_steps_per_workload,
             "min_workloads": self.min_workloads,
         }
@@ -490,6 +538,15 @@ class AgreementReport:
     def max_drift_ratio(self) -> float:
         return max((w.drift_ratio() for w in self.workloads), default=1.0)
 
+    @property
+    def max_logprob_error(self) -> float:
+        values = [w.max_logprob_error for w in self.workloads]
+        if not values:
+            return 0.0
+        if any(math.isnan(v) for v in values):
+            return float("nan")
+        return max(values)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "metadata": dict(self.metadata),
@@ -500,6 +557,7 @@ class AgreementReport:
                 "max_tie_slack_ulps": self.max_tie_slack_ulps,
                 "disagreement_rate": self.disagreement_rate,
                 "mean_kl_topk": self.mean_kl_topk,
+                "max_logprob_error": self.max_logprob_error,
                 "max_drift_ratio": self.max_drift_ratio,
             },
         }
@@ -569,6 +627,16 @@ def passes_b1r_gate(
         reasons.append(
             f"mean_kl_topk={report.mean_kl_topk:.6g} > {thresholds.max_mean_kl_topk:.6g}"
         )
+    if thresholds.max_logprob_error is not None:
+        measured = report.max_logprob_error
+        if math.isnan(measured):
+            reasons.append(
+                "max_logprob_error is gated but was not measured (no logsumexp supplied)"
+            )
+        elif measured > thresholds.max_logprob_error:
+            reasons.append(
+                f"max_logprob_error={measured:.6g} > {thresholds.max_logprob_error:.6g}"
+            )
     if report.max_drift_ratio > thresholds.max_drift_ratio:
         reasons.append(
             f"max_drift_ratio={report.max_drift_ratio:.4g} > "
