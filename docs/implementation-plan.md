@@ -414,6 +414,13 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 **B1 正确性优先**（M2→M3，1 月）：eager、batch=1、无图、无投机、无前缀缓存
 - [ ] GDN 层（conv1d state + gated delta rule + 输出门）· Full attention（sparkinfer paged）· 稠密 SwiGLU（NVFP4）· RoPE partial 0.25 + mrope · modelopt 加载 · 注意力输出门控
 - **门禁**：与 HF transformers 贪心**逐 token 对齐**（≥ 3 工作负载 × 512 token）；逐层 logits 余弦相似度进 bfdiag
+  —— 🔴 **2026-08-02 首次实跑：不通过**（`overall_match_rate=0.3287`，首次分歧在第 32 / 120 / 218 步）。
+  权重两侧逐位相同（HF 侧是从我们反量化的张量拷过去的），**故不是反量化问题，是前向数学**。
+  分歧后我们退化成吐 `<think>`/`<|im_start|>` 控制 token 并重启回答。疑似 attention 层
+  `max_abs_err=0.0156` 在自回归数百步后累积翻转 argmax——**待坐实，见**
+  [`../notes/2026-08-02-b1-greedy-alignment-fails.md`](../notes/2026-08-02-b1-greedy-alignment-fails.md)。
+  ⚠️ 该笔记同时指出**门禁写法本身需复审**：要求两个独立实现在 bf16 下 512 步零 argmax 翻转，
+  与本仓库 eager-vs-CG 那次"两边都对也会在近似平局处翻转"的结论相冲突。
 
 **B2 服务化**（M3，1 月）
 - [ ] 固定槽位 + 连续批处理 · 递归状态纳入槽位生命周期 · CUDA Graph（**B0-5 已确认 capture-safe，2026-08-02**，
