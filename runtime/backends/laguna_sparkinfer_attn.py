@@ -154,6 +154,54 @@ class SparkinferPrefillWorkspace:
     the real ``qo_len``/``kv_len`` differs from the previous call, vs ~32s
     for the very first call against any new workspace.
 
+    **That is necessary but was not sufficient, and the gap was found on
+    Qwen3.6 first (2026-08-02).** Pinning every *buffer* shape does not pin
+    everything in sparkinfer's compile key: the key also contains
+    ``_traits_compile_key(traits)``, and ``traits`` comes from
+    ``select_paged_forward_traits_from_plan(plan)`` -- so ``plan.cta_tile_q``
+    is itself part of the key. For an eager plan the planner derives it from
+    the LIVE query length (``planner.py``, ``create_paged_plan``'s
+    ``enable_cuda_graph=False`` branch), via
+    ``_paged_determine_cta_tile_q(packed_qo_len=qo_len * gqa_group_size, ...)``.
+    At Laguna's own geometry (``gqa_group_size=6``, ``head_dim=128``) that
+    yields THREE tile buckets across query length -- measured on GPU, and
+    identical for both layer groups (``window_left=-1`` and the SWA group's
+    ``window_left=511``): ``cta_tile_q=16`` for ``qo_len <= 5``, 64 for
+    6..10, 128 for ``qo_len >= 11``. So prefill had three distinct compiles,
+    not one (25-37s each on this machine with a cold compile cache). Worse,
+    ``LagunaBackend.warmup_paged_attention_shapes`` warms with
+    ``dummy_qo=8``, which lands in the MIDDLE bucket -- the 128 bucket every
+    ordinary-length prompt actually uses was never warmed, so it compiled
+    inside the first real request on any machine with a cold
+    ``~/.cache/sparkinfer``.
+
+    Fix: pass sparkinfer's own ``PagedPlanBudget`` for ``mode="extend"``, so
+    ``cta_tile_q`` is derived from this workspace's declared capacity instead
+    of the live shape and all three buckets collapse into one. The planner
+    has a branch specifically for this (``if mode in ("extend", "verify") and
+    plan_budget.max_total_q is not None: avg_packed_qo_len = max(...)``); no
+    sparkinfer source is modified. See
+    ``scripts/laguna_probe_extend_jit_buckets.py`` for the measured before/
+    after and for the bitwise-equality check that this changes no arithmetic
+    (extend can never split KV -- ``create_paged_plan`` hard-sets
+    ``split_kv=False, disable_split_kv=True`` for ``mode == "extend"``
+    unconditionally -- so ``cta_tile_q`` only regroups query rows into CTAs
+    and each row's softmax still runs over the whole KV span in one CTA).
+
+    ``mode="verify"`` is deliberately EXCLUDED from that budget, and this is
+    load-bearing rather than conservatism: ``_paged_determine_cta_tile_q``
+    selects Laguna's M64 verifier by an exact match on
+    ``packed_qo_len == 48`` (its q=8/GQA6 window), and several downstream
+    kernel-policy flags (``use_laguna_verify_kernel``,
+    ``laguna_verify_two_wave_b1``, the FP8 PV MMA path) are gated on
+    ``plan.cta_tile_q == 64``. A capacity-derived ``packed_qo_len`` would
+    miss that exact match and silently drop verify onto ``cta_tile_q=16``.
+    Verify does not have extend's problem anyway: its query length is a
+    fixed ``NUM_QUERY_PER_REQ`` window, so it is single-bucket already.
+    ``mode="decode"`` never consults the budget branch at all
+    (``_paged_determine_cta_tile_q`` returns a hard-coded 16 for decode
+    before it looks at ``packed_qo_len``).
+
     A second, distinct bug lived in how ``forward()`` sized that fixed
     capacity (see notes/2026-08-01-c1-c2-gpu-investigation.md §C-1): it
     always called ``PagedAttentionWorkspace.eager_extend_work_items_capacity``
@@ -202,6 +250,11 @@ class SparkinferPrefillWorkspace:
     """
 
     def __init__(self, device: torch.device, *, max_total_q: int, max_page_table_width: int):
+        # Lazy, like every other sparkinfer import in this module: importing
+        # sparkinfer at module scope would make this file unimportable in the
+        # sparkinfer-free environments some tests run in.
+        from sparkinfer.attention.paged.planner import PagedPlanBudget
+
         self.device = device
         self._descale = torch.ones(1, dtype=torch.float32, device=device)
         self._workspace: Any | None = None
@@ -218,6 +271,16 @@ class SparkinferPrefillWorkspace:
         # (prefill is always single-slot; DFlash verify is always
         # single-slot -- see laguna.py and laguna_dflash.py call sites).
         self._max_batch = 1
+        # Declares this capacity to the planner so plan policy that is part
+        # of sparkinfer's compile key -- above all ``cta_tile_q`` -- is
+        # derived from capacity rather than from the live request's query
+        # length. mode="extend" ONLY; see the class docstring for why
+        # mode="verify" must not get this and why mode="decode" ignores it.
+        self._extend_plan_budget = PagedPlanBudget(
+            max_total_q=max_total_q,
+            max_batch=self._max_batch,
+            max_page_table_width=max_page_table_width,
+        )
         # Upper bound on the query length any mode="verify" call will ever
         # use against this instance. Zero (unset) means "no caller has
         # declared verify traffic for this (window_left, heads, head_size)
@@ -506,6 +569,7 @@ class SparkinferPrefillWorkspace:
                 mode=mode,
                 enable_cuda_graph=False,
                 window_left=window_left,
+                plan_budget=self._extend_plan_budget if mode == "extend" else None,
             )
             ws._ensure_capacity(plan)
             ws._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)

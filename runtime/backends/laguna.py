@@ -684,6 +684,30 @@ class LagunaBackend:
         reuses it for free, with no further compiles. Compiles are cached
         to ``~/.cache/sparkinfer`` across process restarts too.
 
+        **That last claim was false until 2026-08-02, and it is recorded
+        here because this method's entire reason to exist depended on it.**
+        Pinning buffer shapes does not pin ``plan.cta_tile_q``, which is
+        also part of sparkinfer's compile key and which the eager planner
+        derives from the live ``qo_len``. At this model's geometry that
+        gave ``mode="extend"`` THREE compile buckets across query length
+        (measured, both layer groups: ``cta_tile_q`` 16 for ``qo_len<=5``,
+        64 for 6..10, 128 for ``qo_len>=11``), and ``dummy_qo=8`` below
+        lands in the MIDDLE one -- so the 128 bucket that every
+        ordinary-length prompt uses was never warmed, and on a machine
+        with a cold ``~/.cache/sparkinfer`` it paid a ~26-37s compile
+        inside the first real request, which is precisely the stall this
+        method claims to have eliminated. Routine
+        serving never showed it only because the on-disk compile cache is
+        on by default and survives restarts, making it once-per-machine
+        rather than recurring. ``SparkinferPrefillWorkspace`` now passes
+        sparkinfer's ``PagedPlanBudget`` for ``mode="extend"`` so
+        ``cta_tile_q`` is derived from declared capacity instead,
+        collapsing those three buckets into one; with that in place the
+        claim above holds as written and the two passes below really do
+        cover every extend/decode contract this backend can reach. See
+        ``SparkinferPrefillWorkspace``'s docstring and
+        ``scripts/laguna_probe_extend_jit_buckets.py``.
+
         Called once at server startup, before any request is admitted
         (see ``ServerEngine._load_laguna_model``), so that small, fixed
         number of compiles (one per layer group -- full-attention plus
