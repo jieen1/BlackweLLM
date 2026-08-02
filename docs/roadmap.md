@@ -118,9 +118,17 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       （72.39 vs 77.69）。捕获本身不贵（启动 24.9s vs 21.0s）。
       详见 [`../notes/2026-08-03-cudagraph-vs-eager-decode-throughput.md`](../notes/2026-08-03-cudagraph-vs-eager-decode-throughput.md)。
       ⚠️ **所有基于 ~6 tok/s 做出的优化判断都需要重估**，起点是 28.85 不是 6.1。
-- [ ] **新的首要项**：28.85 tok/s 对应有效带宽约 582 GB/s，而卡的峰值在 1.8 TB/s 量级
-      ——**约在 roofline 三成，headroom 是真的**。下一步应当先做 profiling 定位瓶颈层，
-      而不是继续猜。
+- [x] ~~先做 profiling 定位瓶颈，而不是继续猜~~ —— **已做**，见
+      [`../notes/2026-08-03-decode-kernel-profile.md`](../notes/2026-08-03-decode-kernel-profile.md)。
+      **CG 下 GPU busy 31.01ms / 墙钟 34.67ms = 89%，已经 kernel-bound**；
+      eager 下只有 21% 忙（CPU 侧 paged 元数据规划约 34.2ms/step，`plan_metadata_to_device`
+      一项就 24.3ms）——这就是 4.71× 的机制。
+      **GDN 递归 kernel 只占 0.6%**，独立证实"GDN 不是决定项"，别再往那投。
+- [ ] ⚠️ **阶段四第一个具体靶子：24.8% 的 kernel 时间跑在 `cutlass_80_wmma_tensorop` 上
+      ——为 SM80 编译的 Ampere 代 kernel，在 cc 12.0 的卡上**（7.602 ms/step，三个变体）。
+      加上两个 cuBLAS `gemvx`（6.23ms），**BF16 通用路径合计 13.8 ms/step = 45%**，
+      比 NVFP4 专用 kernel 的 35% 还多。这些是非 NVFP4 层反量化后走的 `F.linear`。
+      查清它们来自哪些层、能否换 Blackwell 原生路径。
 - [ ] 持久化 kernel 编译缓存：每进程首请求 TTFT 4.67s（之后稳定 0.25s），
       cutlass DSL 按 shape JIT，`cute.compile` 的 `cache_key` **只是进程内记忆化**。
 - [ ] 并发/批量下的 CG 收益未测（本轮只测了单并发单请求解码）。
