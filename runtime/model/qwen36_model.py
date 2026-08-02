@@ -1859,11 +1859,6 @@ class Qwen36MLP(nn.Module):
             and isinstance(self.down_proj, (ModelOptNVFP4Linear, CompressedTensorsNVFP4Linear))
         )
         self._w4a16_prepared = None  # built lazily, once, on first fused forward
-        #: Persistent ``fc1``/``fc2`` ``c_tmp`` GEMM scratch for the fused
-        #: W4A16 kernel -- see ``_w4a16_c_tmp_scratch``'s docstring for why
-        #: this exists (CUDA Graph capture of decode, discovered 2026-08-03).
-        self._w4a16_c_tmp_fc1: torch.Tensor | None = None
-        self._w4a16_c_tmp_fc2: torch.Tensor | None = None
 
         # Memory-audit follow-up (2026-08-03, notes/2026-08-03-nvfp4-gemm-
         # memory-audit.md "What was not verified"): once `_w4a16_prepared`
@@ -2017,92 +2012,6 @@ class Qwen36MLP(nn.Module):
         if device_type == "cuda":
             torch.cuda.empty_cache()
 
-    def _w4a16_c_tmp_scratch(
-        self, m: int, device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Persistent ``fc1``/``fc2`` GEMM scratch (``c_tmp``) for the fused
-        W4A16 kernel, sized conservatively enough to survive a
-        ``torch.cuda.graph`` capture of decode.
-
-        Found 2026-08-03 (worktree ``work/std-serve-20260803``,
-        ``notes/2026-08-03-std-model-cuda-graph-w4a16-scratch.md``): decode
-        CUDA Graph capture failed with ``RuntimeError("W4A16 GEMM scratch is
-        not initialized for CUDA graph capture ...")`` raised by
-        sparkinfer's own ``kernel.py::_get_c_tmp``. Root cause is a real
-        sizing mismatch inside sparkinfer between two of its own formulas,
-        not anything wrong with our call shape:
-
-        - ``make_w4a16_packed_buffers`` (what ``_forward_w4a16_fused`` used
-          to pass straight through as ``fc1_c_tmp``/``fc2_c_tmp``) sizes
-          scratch via ``plan_w4a16_buffers``'s ``max_packed_route_slots``,
-          e.g. for this deployment's decode batch=2 (topk=1, num_experts=1,
-          block_size_m=8): ``route_slots=9``.
-        - ``run_w4a16_moe``'s own decode-time fast path (``use_direct_topk_
-          routes``/TC-decode -- exactly what small-M bf16 gated decode with
-          int32 ``topk_ids`` and no ``expert_map`` always takes) computes its
-          scratch requirement internally as ``route_slots_for_scratch = m *
-          topk * block_size_m`` = ``2 * 1 * 8 = 16`` for the same call --
-          almost double what ``make_w4a16_packed_buffers`` allocated.
-
-        In eager mode this silently self-heals: ``_get_c_tmp`` falls back to
-        a fresh ``torch.empty(...)`` whenever the caller-provided scratch is
-        too small, so every eager gap-error/cosine check this branch has run
-        (B1-R, ``verify_nvfp4_gemm_full_model_gap.py``, etc.) never observed
-        it. ``torch.cuda.graph`` capture refuses that fallback outright,
-        which is how this surfaced.
-
-        Not fixed in sparkinfer (this repo only reads sparkinfer's source,
-        see AGENTS.md) -- worked around here instead, using sparkinfer's own
-        public ``packed_gemm_scratch_elements`` sizing function directly
-        rather than the ``make_w4a16_packed_buffers`` convenience wrapper
-        that mis-sizes it. Deliberately over-provisions to stay correct
-        without having to replicate ``run_w4a16_moe``'s internal fast-path
-        selection: ``route_slots=m*64`` and ``moe_block_size=64`` (64 is the
-        max of sparkinfer's own ``_W4A16_ALLOWED_ROUTED_SIZES=(8,16,32,48,
-        64)``) upper-bounds ``route_slots_for_scratch=m*topk*block_size_m``
-        for every real ``(topk=1, block_size_m)`` pair
-        ``select_route_block_size_m`` can choose -- both terms of
-        ``packed_gemm_scratch_elements``'s ``min(size_n*route_slots,
-        sms*4*moe_block_size*256)`` scale linearly with ``moe_block_size``,
-        and 64 already covers block_size_m=8's extra doubling with 4x to
-        spare. Cached and grown monotonically, and ONLY outside capture
-        (growing mid-capture is neither safe nor needed: decode always warms
-        up eagerly at the exact batch size immediately before capturing it
-        -- see ``Qwen36Backend._capture_decode_graphs`` -- so the scratch is
-        already the right size once real capture starts).
-        """
-        from sparkinfer.moe._shared.kernels.w4a16.host import packed_gemm_scratch_elements
-
-        prepared = self._w4a16_prepared
-        fc1_cols = (2 if prepared.is_gated else 1) * int(prepared.intermediate_size)
-        sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
-        needed_fc1 = packed_gemm_scratch_elements(
-            size_n=fc1_cols, route_slots=m * 64, moe_block_size=64, sms=sms
-        )
-        needed_fc2 = packed_gemm_scratch_elements(
-            size_n=int(prepared.hidden_size), route_slots=m * 64, moe_block_size=64, sms=sms
-        )
-        have_enough = (
-            self._w4a16_c_tmp_fc1 is not None
-            and self._w4a16_c_tmp_fc1.numel() >= needed_fc1
-            and self._w4a16_c_tmp_fc2 is not None
-            and self._w4a16_c_tmp_fc2.numel() >= needed_fc2
-        )
-        if not have_enough:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    f"W4A16 fused MLP c_tmp scratch (fc1={needed_fc1}, fc2={needed_fc2} "
-                    f"elements needed for m={m}) cannot grow during CUDA graph capture. "
-                    "This should not happen -- decode CUDA Graph capture always warms up "
-                    "eagerly at the exact same batch size right before capturing it "
-                    "(Qwen36Backend._capture_decode_graphs), which should have already "
-                    "grown this scratch. If you see this, something changed the decode "
-                    "batch size between warm-up and capture."
-                )
-            self._w4a16_c_tmp_fc1 = torch.empty((needed_fc1,), dtype=torch.float32, device=device)
-            self._w4a16_c_tmp_fc2 = torch.empty((needed_fc2,), dtype=torch.float32, device=device)
-        return self._w4a16_c_tmp_fc1, self._w4a16_c_tmp_fc2
-
     def _forward_w4a16_fused(self, x: torch.Tensor) -> torch.Tensor:
         self._ensure_w4a16_fused_ready()
         from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
@@ -2123,6 +2032,35 @@ class Qwen36MLP(nn.Module):
         topk_ids = torch.zeros((m, 1), dtype=torch.int32, device=device)
         topk_weights = torch.ones((m, 1), dtype=torch.float32, device=device)
 
+        # NVFP4-standard-model follow-up (2026-08-03, notes/2026-08-03-std-
+        # model-serving-acceptance.md section 3): decode CUDA Graph capture
+        # of this fused path used to fail here with RuntimeError("W4A16 GEMM
+        # scratch is not initialized for CUDA graph capture ...") because
+        # sparkinfer's make_w4a16_packed_buffers()/plan_w4a16_buffers()
+        # under-sized fc1_c_tmp/fc2_c_tmp for run_w4a16_moe's small-M direct
+        # top-k routes / TC-decode fast path (which this class's degenerate
+        # 1-expert/top-1 MoE always takes): it sized scratch via
+        # max_packed_route_slots (the *packed/grouped* route-kernel's bound)
+        # while the kernel's own fast path needs
+        # route_slots_for_scratch=m*topk*block_size_m instead -- a genuine
+        # sparkinfer bug (9 vs 16 route slots for this deployment's decode
+        # batch=2), invisible in eager mode (silently absorbed by a fresh
+        # torch.empty() fallback) but fatal under torch.cuda.graph capture
+        # (which correctly refuses that fallback). Worked around here with a
+        # separate, persistent, deliberately-oversized scratch buffer
+        # (``_w4a16_c_tmp_scratch``, since removed).
+        #
+        # Root-caused and fixed upstream instead (sparkinfer worktree
+        # work/w4a16-scratch-20260803, plan_w4a16_buffers now unions the
+        # packed-mode bound with the direct-topk-routes bound when sizing
+        # fc1_c_tmp_elements/fc2_c_tmp_elements) -- verified against a real
+        # checkpoint layer at this exact decode shape
+        # (scripts/verify_w4a16_cuda_graph_scratch_rootcause.py: CUDA Graph
+        # capture succeeds and replays bit-exact vs eager using
+        # make_w4a16_packed_buffers's own fc1_c_tmp/fc2_c_tmp directly, no
+        # workaround). The workaround is gone; buffers.fc1_c_tmp/fc2_c_tmp
+        # are passed straight through again, same as every other buffer
+        # here.
         buffers = make_w4a16_packed_buffers(
             self._w4a16_prepared,
             m=m,
@@ -2130,9 +2068,6 @@ class Qwen36MLP(nn.Module):
             dtype=torch.bfloat16,
             device=device,
         )
-        # NOT buffers.fc1_c_tmp/fc2_c_tmp -- see _w4a16_c_tmp_scratch's
-        # docstring for why those are undersized for CUDA graph capture.
-        fc1_c_tmp, fc2_c_tmp = self._w4a16_c_tmp_scratch(m, device)
         out = run_w4a16_moe(
             x2d,
             self._w4a16_prepared,
@@ -2142,8 +2077,8 @@ class Qwen36MLP(nn.Module):
             intermediate_cache13=buffers.intermediate_cache13,
             intermediate_cache2=buffers.intermediate_cache2,
             output=buffers.output,
-            fc1_c_tmp=fc1_c_tmp,
-            fc2_c_tmp=fc2_c_tmp,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
             packed_route_indices=buffers.packed_route_indices,
             block_expert_ids=buffers.block_expert_ids,
             packed_route_count=buffers.packed_route_count,
