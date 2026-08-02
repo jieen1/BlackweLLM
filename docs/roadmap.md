@@ -737,15 +737,15 @@ drafter + 投机专用 `kv_cache_dtype`）读代码后发现**不完全对**—�
 以下条目在本文档编制时**没有本机实测记录**，一律不作为决策依据。
 它们是 Track B0 的主要内容。
 
-- [ ] sparkinfer paged attention 在 `head_dim=256 / gqa_group=6 / fp8 KV` 下的正确性与吞吐
-- [ ] FLA `gated_delta_rule` 在 SM120 上能否跑通、速度如何（chunk 与 fused_recurrent 两条路径）
-- [ ] GDN 递归状态更新是否 CUDA Graph capture-safe
-- [ ] Qwen3.6 modelopt NVFP4 的 tensor 命名与 scale 语义逐项确认
-- [ ] Qwen3.6-27B 在 96 GB 上的 context × 并发可行域（含递归状态显存）
-- [ ] mrope-interleaved 在纯文本输入下能否退化为标准 1D RoPE
+- [x] ~~sparkinfer paged attention 在 `head_dim=256 / gqa_group=6 / fp8 KV` 下的正确性与吞吐~~ —— ✅ **B0-3 已答**：能跑且正确（对 fp32 参照 cosine ≥ 0.99999），page_size 64/128 都通。⚠️ 该组合在 sparkinfer 自己的测试套件里从未被测过，首次 JIT decode 62–64s / extend 27s
+- [x] ~~FLA `gated_delta_rule` 在 SM120 上能否跑通、速度如何（chunk 与 fused_recurrent 两条路~~ —— ✅ **B0-4 已答**：用 FLA v0.5.2，cosine ≥ 0.99998，48 层 decode 约 1.6–1.9ms。⚠️ 两条路数值不同：`seq_len==1 且有状态` 走 fused_recurrent、其余走 chunk，logits 可差约 30 ULP
+- [x] ~~GDN 递归状态更新是否 CUDA Graph capture-safe~~ —— ✅ **B0-5 已答：capture-safe**。捕获+重放 6 步与 eager 逐 bit 一致（max_abs_err=0）。唯一操作要求：新槽位分配时递归状态必须显式 `.zero_()` 一次
+- [x] ~~Qwen3.6 modelopt NVFP4 的 tensor 命名与 scale 语义逐项确认~~ —— ✅ **B0-2 已答**：checkpoint 是混合精度（GDN/self_attn 投影 FP8 W8A8；稠密 MLP 与 lm_head NVFP4 W4A16 block=16）。最大发现：`kv_cache_quant_algo=FP8` 有声明但**零个** k_scale/v_scale
+- [x] ~~Qwen3.6-27B 在 96 GB 上的 context × 并发可行域（含递归状态显存）~~ —— ✅ **B0-7 已答**（conv 状态数已于 B1 实测更正为完整 kernel size）。⚠️ **但真正的显存底线不是 KV**：反量化缓存让常驻从 19GB 涨到 54GB+，且不受任何显存旋钮控制，见 [`../notes/2026-08-02-qwen36-dequant-cache-memory-floor.md`](../notes/2026-08-02-qwen36-dequant-cache-memory-floor.md)
+- [x] ~~mrope-interleaved 在纯文本输入下能否退化为标准 1D RoPE~~ —— ✅ **B0-6 已答：精确退化**。纯文本下 T/H/W position_ids 是同一个 `.expand()` 视图，`apply_interleaved_mrope` 是空操作。可直接写成断言
 - [ ] `Qwen3.6-25B-A3B` 的 `config.json`（专家数 / top-k / 是否 hybrid / 是否带 MTP）
 - [ ] sparkinfer `moe.fused_moe` 在非 256/top-10 形状下的可用性与性能
-- [ ] 现有 4 个失败测试各自的"正确期望"是什么（尤其 thinking tag 那个）
+- [x] ~~现有 4 个失败测试各自的"正确期望"是什么（尤其 thinking tag 那个）~~ —— ✅ **已解决**：T0-1 已让 CI 恢复绿灯，三个模块都补了 `pytest.importorskip`
 - [x] ~~Qwen3.6 的 MTP 层是否带 GDN~~ —— ✅ **已答（B-6 + B0-8 两轮独立核实，两个 checkpoint
   的 `mtp.*` 张量全是 `self_attn.*`/`mlp.*`，零 `linear_attn.*`/`A_log`/`conv1d`）**。
   ⚠️ **但由此推不出"B3 最难的一项消失"**——原判断把草稿侧与验证侧混为一谈了：verify 是把候选
@@ -768,15 +768,10 @@ drafter + 投机专用 `kv_cache_dtype`）读代码后发现**不完全对**—�
   稠密 fp32 oracle 判定两条路径在 attention 算子层面都对（cos ≥ 0.999997，高于本仓库 ≥0.999991 的
   标准），分歧来自 MoE 离散路由放大微小数值差，**不是 split-KV merge 有 bug**。见
   `investigation-queue.md` C-1
-- [ ] **（2026-08-02 新增）接受率与槽位 KV 使用率的可观测性为 0** —— `record_mtp_acceptance` /
-  `record_slot_kv_usage` **生产零调用方**，两条 Prometheus 序列在空时**根本不出现**（不是显示 0，
-  仪表盘上像"还没数据"）；且 `engine.stats["mtp_acceptance_histogram"]` 只有 5 个桶而生产
-  `NUM_SPECULATIVE_TOKENS=15`，`na>=5` 被静默丢弃——**接受率越健康，被记录的比例越低**。
-  接受率是 A6 的正式验收判据，今天所有可信数字都来自离线 benchmark，不是服务器自己。
-  三条必须一起修（桶宽从 `NUM_SPECULATIVE_TOKENS` 推导，不是各写字面量：今天两处一个 5、
-  一个 9、真值 15）。见 [`../notes/2026-08-02-acceptance-rate-has-no-working-observability.md`](../notes/2026-08-02-acceptance-rate-has-no-working-observability.md)
-- [ ] CUDA Graph 捕获**成功**的可观测性缺口仍在（只有失败打 warning，成功打 info，默认日志下不可见）——
-  见 RK9 / `implementation-plan.md` §7.3/C7-2
+- [x] ~~**接受率与槽位 KV 使用率的可观测性为 0**~~ —— ✅ **已修（`b27915b`）**：桶宽改为从 `NUM_SPECULATIVE_TOKENS` 推导（此前引擎 5、metrics 9、真值 15 三个互不相同的字面量）；`na >= 5` 从静默丢弃改为钳进溢出桶；两个记录函数已接。测试钉的是关系而非数字，反向验证过（桶宽改回 9 则变红）
+
+- [~] **CUDA Graph 捕获成功的可观测性** —— 🟡 **代码已修（B3），但未活体复验**。`Qwen36Backend.snapshot()` 原本硬编码 `dflash_cg_status=()`，Laguna 的非 DFlash decode-CG 路径也未被跟踪；两者现在都记录捕获成功/失败并经 `snapshot()` 与 `/debug/stats` 暴露。⚠️ **活体复验需要一次完整前向，而那正是触发反量化缓存显存爆掉的动作**，在共享卡上未做
+
 - [ ] **（本批新增）** `NUM_SPECULATIVE_TOKENS` 从 15 静态调大是否能在不损失接受率的前提下提升吞吐
   （Track F/F1-1）
 
