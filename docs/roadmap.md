@@ -111,13 +111,19 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       并在融合权重备好后释放原始 NVFP4 参数（`free_nvfp4_raw_params()`，
       `runtime/model/qwen36_model.py:2011`，`5fce64e`）。**76.34 → 53.08 GiB。**
       ⚠️ 原文"NVFP4 量化完全白做"的判断在当时成立，现在不再成立。
-- [ ] ⚠️ **本阶段真正的空白：CUDA Graph 捕获下的 decode 吞吐从来没测过。**
-      现有全部吞吐数字（5.819 / 6.442 / 6.547 tok/s）**都是 eager 的**，
-      且都是脚本里的裸 forward 循环，不是服务路径。而 w4a16 融合路径的 CG 捕获
-      **2026-08-03 才刚修好**（此前捕获失败会静默退回 eager，见
-      `tests/test_w4a16_scratch_contract.py`）——也就是说这些 eager 数字很可能
-      就是当时的实际服务速度，而 CG 打开后的真实速度是未知数。
-      **下一步就是补这个测量**，在此之前不要基于现有数字做优化决策。
+- [x] ~~CUDA Graph 捕获下的 decode 吞吐从来没测过~~ —— **已测，结论是本阶段最大的一条：
+      在册的每个吞吐数字都比运行时的实际能力低约 5 倍。**
+      服务路径、标准模型、同 prompt 同参数同槽位、只切 `QSR_SERVER_ENABLE_CUDAGRAPH`：
+      **CG 28.848 tok/s vs eager 6.120 tok/s = 4.71×**，且 **CG 还少用 5.30 GiB**
+      （72.39 vs 77.69）。捕获本身不贵（启动 24.9s vs 21.0s）。
+      详见 [`../notes/2026-08-03-cudagraph-vs-eager-decode-throughput.md`](../notes/2026-08-03-cudagraph-vs-eager-decode-throughput.md)。
+      ⚠️ **所有基于 ~6 tok/s 做出的优化判断都需要重估**，起点是 28.85 不是 6.1。
+- [ ] **新的首要项**：28.85 tok/s 对应有效带宽约 582 GB/s，而卡的峰值在 1.8 TB/s 量级
+      ——**约在 roofline 三成，headroom 是真的**。下一步应当先做 profiling 定位瓶颈层，
+      而不是继续猜。
+- [ ] 持久化 kernel 编译缓存：每进程首请求 TTFT 4.67s（之后稳定 0.25s），
+      cutlass DSL 按 shape JIT，`cute.compile` 的 `cache_key` **只是进程内记忆化**。
+- [ ] 并发/批量下的 CG 收益未测（本轮只测了单并发单请求解码）。
 - [ ] MTP：默认 K 已从 8 改到 4（`f616029`，K 曲线实测 prose 1.11× / code 1.38×）；
       重同步 A/B 数据待回（代码在 `work/mtp-resync-20260802` 的 `aed0e2d`，无数据）
 

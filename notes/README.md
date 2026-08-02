@@ -38,6 +38,7 @@
 
 ## 2. 已定案的根因分析 🟢
 
+- [2026-08-03 CUDA Graph vs eager 解码吞吐 = 4.71×](2026-08-03-cudagraph-vs-eager-decode-throughput.md) —— 🟢 **在册每个吞吐数字都是 eager 的，比运行时实际能力低约 5 倍**。服务路径同 prompt 同参数只切一个开关：CG **28.848** vs eager **6.120 tok/s**，且 CG 还少用 5.30 GiB。捕获本身不贵（启动 +4s）。⚠️ **所有基于 ~6 tok/s 的优化判断都需重估**；另纠正一条我自己的误判（311s 冷启动是磁盘读 22 GiB，不是 JIT 前置）
 - [2026-08-02 GDN spec_forward 批处理](2026-08-02-gdn-spec-forward-batching.md) —— 🟡 19.9→12.0ms 的计时仍有效；但"大投影不能批处理"的否决与"torch.bmm 512 上限"这条推广**已被下一条推翻**
 - [2026-08-02 批处理大投影：bit-exact 不是这里的判据](2026-08-02-spec-verify-batching-bar.md) —— `verify_forward` 里的 bit-exact 早已不存在（layer 1 状态差 0.0117 / 73% 元素）；全模型 672 步的 B1-R gap error 与 shipped 路径**完全相同**（p90=0.250，bar 0.5）；单层 K=16 再快 3.15×、全模型 verify 1.40–1.57×；e2e【推算】0.79–0.91×，仍 <1.0×
 - [GDN 多步融合 kernel 规格](2026-08-02-handoff-sparkinfer-gdn-multistep-kernel.md) —— ⚠️ 其 ~6.8ms 归因已被实测推翻（真值 ~0.8–1.0ms）；kernel 已实现并 bit-exact，但不是决定性项
