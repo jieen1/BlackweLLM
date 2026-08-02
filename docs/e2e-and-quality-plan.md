@@ -343,6 +343,26 @@ soak 回答"服务还稳吗"，两者合在一起构成北极星指标第 3 条�
   缺陷，不是结构化输出的子问题。`prefill_sampled` 已有一份可抄的实现，但它唯一的调用方
   `generate()` 零生产调用方，**不要直接复活 `generate()`**（遗留路径，接的不是今天的准入
   流程）。修完 b0 之后，E-N1 才存在真正的二选一。
+
+  — ✅ **2026-08-02 已实现**（`work/en1-b0-20260802`，未合并 main）：抄
+  `prefill_sampled` 的采样调用（`sample_from_logits` + `make_generator(params.seed)`），
+  抽成 `runtime/backends/laguna.py` 的新辅助函数 `_select_anchor_token(logits, params)`，
+  接进两条生产 prefill 路径各自的 anchor 计算点——`LagunaBackend.prefill_with_aux`
+  （连同它委托的 `_prefill_with_prefix_hit`，DFlash 关）与
+  `DFlashEngine.dflash_prefill_bootstrap`（DFlash 开，今天生产实际走的路径，向
+  `backend.prefill_with_aux` 转发 `params`）。复用的正是 E2-b 已经打通到 backend 的
+  `params_per_slot` 管道（`prefill_chunked_begin` 的 keyword-only 参数），没有另开新通道。
+  贪心（`params is None` 或 `temperature<=0`）分支保留原来的
+  `int(logits[-1].argmax(dim=-1).item())` 计算式本身，只是换了个函数名装它，逐位不变；
+  非贪心分支走 `sample_from_logits`。新增 CPU-only 测试
+  `tests/test_anchor_token_sampling.py`（13 例）：直接测 `_select_anchor_token` 本身，
+  以及通过 `LagunaBackend.prefill_with_aux`/`_prefill_with_prefix_hit`/
+  `DFlashEngine.dflash_prefill_bootstrap` 的 stub-backend 门禁测两条生产路径的接线——
+  greedy 与 `params=None` 时跨多个 seed 结果恒等于独立算出的 argmax；`temperature=1.0`
+  时跨 40 个 seed 首 token 出现 ≥2 个不同值。三道门禁（`ruff check .`、CI-sim pytest
+  872 passed/165 skipped、`~/.venvs/vllm` pytest 1313 passed）全绿，新增计数正好是这 13
+  个测试（CI-sim 里因为没装 torch 全部 skip，vllm venv 里真正跑）。未验证：GPU 上端到端
+  的真实请求级多样性（这条改动本身不需要 GPU，验证也全部在 CPU 完成，没有申请 GPU 锁）。
 - [ ] **usage token 缺口 2**：`<usage>` 标签剥离统一到哪种语义（流式的"冻结"还是
   非流式的"删除后继续"）。见 §2.5。
 - [x] ~~**[待验证]** roadmap §0 "Laguna-S-2.1 MMLU-Pro 84.5%"的引用来源~~ —— ✅ **已坐实是误引，
