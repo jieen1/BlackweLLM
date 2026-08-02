@@ -73,6 +73,7 @@ import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
 from safetensors import safe_open  # noqa: E402
 
+from runtime.checkpoints import modelopt_checkpoint_path  # noqa: E402
 from runtime.loading.modelopt import quantized_layers_map  # noqa: E402
 from runtime.model.qwen36_model import (  # noqa: E402
     GdnLayerState,
@@ -82,10 +83,16 @@ from runtime.model.qwen36_model import (  # noqa: E402
 )
 from runtime.model_loading import _build_qwen36_model_config  # noqa: E402
 
-MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
-    "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
-)
+# Deliberately modelopt (nvidia), not the standard checkpoint: this script
+# imports ``runtime.loading.modelopt.quantized_layers_map`` directly, which
+# classifies against modelopt's own ``quantization_config.quantized_layers``
+# schema -- the standard (compressed-tensors) checkpoint does not have that
+# key at all, so this classifier does not even apply to it. Also builds
+# ``ModelOptFP8Linear`` further down (see ``runtime/model/qwen36_model.py``'s
+# ``_LINEAR_FACTORY_FOR_ALGO``), which is wrong for the standard checkpoint's
+# per-channel FP8 scale layout -- see ``b1_verify_gdn_layer.py``'s equivalent
+# comment for the full explanation.
+MODEL_PATH = modelopt_checkpoint_path()
 DEVICE = torch.device("cuda")
 torch.set_grad_enabled(False)
 

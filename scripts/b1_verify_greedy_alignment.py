@@ -108,12 +108,29 @@ from bfdiag.divergence.qwen36_greedy_alignment import (  # noqa: E402
 )
 from bfdiag.divergence.report import format_text_report  # noqa: E402
 from bfdiag.divergence.scan import scan_layers  # noqa: E402
+from runtime.checkpoints import standard_checkpoint_path  # noqa: E402
 from runtime.model_loading import _build_qwen36_model_config, load_qwen36_model  # noqa: E402
 
-MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
-    "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
-)
+# checkpoint-unify-20260803 KNOWN GAP -- read before trusting a run against
+# this default: this script's disk-staging path (``_NEVER_STAGED_SUFFIXES``/
+# ``stage_dequantized_weights_to_disk`` below) hardcodes modelopt's suffix
+# set (``.weight``/``.weight_scale``/``.weight_scale_2``/``.input_scale``).
+# The standard checkpoint's NVFP4 MLP parameters use compressed-tensors'
+# different suffixes instead (``.weight_packed``/``.weight_scale``/
+# ``.weight_global_scale``) -- ``.weight_packed`` does not end with
+# ``".weight"`` so it skips the dequant-cache branch, and neither it nor
+# ``.weight_global_scale`` is in ``_NEVER_STAGED_SUFFIXES``, so both get
+# staged as raw (non-dequantized) tensors under names HF's plain
+# ``nn.Linear`` does not have. ``load_staged_weights_into_hf`` then reports
+# them ``missing`` and leaves every NVFP4-quantized HF Linear (i.e. every
+# MLP gate/up/down_proj) at random init -- NOT a crash, a silently
+# meaningless comparison. Do not trust a PASS or FAIL from this script
+# against the standard checkpoint until the staging suffix set is extended
+# for compressed-tensors NVFP4; see the coordinator's checkpoint-unify
+# report (2026-08-03) for the full analysis. Flagged here rather than
+# fixed: fixing it is a staging-logic change, out of scope for a
+# checkpoint-*path* migration.
+MODEL_PATH = standard_checkpoint_path()
 MAX_NEW_TOKENS = 512
 DEVICE = torch.device("cuda")
 
@@ -138,6 +155,12 @@ WORKLOADS: tuple[tuple[str, str], ...] = (
 #: a real ``input_scale`` Parameter (see its docstring) that this runtime's
 #: own FP8 kernel path reads directly, but HF's plain ``nn.Linear`` has no
 #: activation-scale equivalent to load it into, same as the other two.
+#:
+#: MODELOPT-ONLY -- see the "checkpoint-unify-20260803 KNOWN GAP" comment
+#: above ``MODEL_PATH``: this suffix set does not cover compressed-tensors'
+#: ``.weight_packed``/``.weight_global_scale``, so staging against the
+#: standard checkpoint currently drops every NVFP4 MLP weight silently
+#: rather than erroring.
 _NEVER_STAGED_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 
 

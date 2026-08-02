@@ -44,12 +44,10 @@ assert runtime.__file__.startswith(_REPO), runtime.__file__
 import torch  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
+from runtime.checkpoints import standard_checkpoint_path  # noqa: E402
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 
-MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
-    "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
-)
+MODEL_PATH = standard_checkpoint_path()
 MAX_NEW_TOKENS = 16
 MAX_SEQ_LEN = 512
 

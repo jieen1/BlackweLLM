@@ -60,14 +60,18 @@ assert runtime.__file__.startswith(_ROOT), (
 import torch  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
+from runtime.checkpoints import standard_checkpoint_path  # noqa: E402
 from runtime.model.qwen36_model import Qwen36GenerationState  # noqa: E402
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 from runtime.mtp_accept import determine_accept_reject_from_predictions  # noqa: E402
 
-MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/"
-    "snapshots/ccdaab7e68af2409599b8949a8f2685703c9bae5"
-)
+# checkpoint-unify-20260803: not one of the original 22 (this script already
+# hardcoded the standard checkpoint deliberately, being the unsloth half of
+# a comparison pair with mtpfix_k_sweep_selfbuilt.py's nvidia default) --
+# migrated anyway so it resolves through the same single point everything
+# else does, and so the new tests/test_checkpoint_scripts_no_hardcoded_
+# path.py gate has nothing left to flag.
+MODEL_PATH = standard_checkpoint_path()
 DEVICE = torch.device("cuda")
 MAX_SEQ_LEN = 256
 N_TOKENS = 32  # tokens to generate per prompt (both paths)

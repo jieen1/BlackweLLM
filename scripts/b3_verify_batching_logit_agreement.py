@@ -71,16 +71,14 @@ from bfdiag.divergence.logit_agreement import (  # noqa: E402
     evaluate_summary,
     missing_from_intersection,
 )
+from runtime.checkpoints import standard_checkpoint_path  # noqa: E402
 from runtime.model.qwen36_model import Qwen36GatedDeltaNet  # noqa: E402
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 
 sys.path.insert(0, str(Path(_ROOT) / "scripts"))
 from b3_probe_batching_bar import spec_forward_batched  # noqa: E402
 
-MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
-    "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
-)
+MODEL_PATH = standard_checkpoint_path()
 DEVICE = torch.device("cuda")
 torch.set_grad_enabled(False)
 

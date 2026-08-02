@@ -25,12 +25,10 @@ assert runtime.__file__.startswith("/home/bot/project/qsr-w-b1"), runtime.__file
 
 import torch  # noqa: E402
 
+from runtime.checkpoints import standard_checkpoint_path  # noqa: E402
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 
-MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
-    "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
-)
+MODEL_PATH = standard_checkpoint_path()
 
 
 def main() -> None:

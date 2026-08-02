@@ -37,14 +37,22 @@ from transformers.cache_utils import DynamicCache  # noqa: E402
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig  # noqa: E402
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet  # noqa: E402
 
+from runtime.checkpoints import modelopt_checkpoint_path  # noqa: E402
 from runtime.loading.modelopt import dequantize_fp8  # noqa: E402
 from runtime.model.qwen36_model import Qwen36GatedDeltaNet  # noqa: E402
 from runtime.model_loading import _build_qwen36_model_config  # noqa: E402
 
-MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
-    "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
-)
+# Deliberately modelopt (nvidia), not the standard checkpoint: this script
+# calls ``runtime.loading.modelopt.dequantize_fp8`` directly and hardcodes
+# ``quantized = {...: "FP8"}`` below, which forces the raw tensors it reads
+# through ``ModelOptFP8Linear`` -- correct for modelopt's per-*tensor*
+# scalar ``weight_scale`` (float32), but silently WRONG for the standard
+# checkpoint's per-*channel* ``weight_scale`` ([out, 1], bfloat16) even
+# though both checkpoints happen to name the tensors identically (see
+# ``runtime/model/compressed_tensors_linear.py``'s module docstring). Do
+# not "fix" this to the standard checkpoint without also switching to
+# ``CompressedTensorsFP8ChannelLinear``/``dequantize_fp8_channel``.
+MODEL_PATH = modelopt_checkpoint_path()
 LAYER_IDX = 0  # a linear_attention layer per layer_types
 DEVICE = torch.device("cuda")
 # No training anywhere in this runtime; matches LagunaBackend.__init__'s

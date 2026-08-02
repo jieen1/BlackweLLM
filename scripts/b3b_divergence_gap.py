@@ -73,14 +73,18 @@ from bfdiag.divergence.logit_agreement import (  # noqa: E402
     evaluate_summary,
     missing_from_intersection,
 )
+from runtime.checkpoints import standard_checkpoint_path  # noqa: E402
 from runtime.model.qwen36_model import Qwen36GenerationState  # noqa: E402
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 from runtime.mtp_accept import determine_accept_reject_from_predictions  # noqa: E402
 
-MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
-    "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
-)
+# Checkpoint choice matters here, not just as a formality: MTP acceptance
+# behavior has been measured to differ by checkpoint *publisher*, not only
+# by quantization format -- see scripts/mtpfix_unsloth_checkpoint_probe.py's
+# module docstring. The gap-error numbers this script recorded pre-migration
+# were measured on the nvidia checkpoint; re-running on the standard
+# checkpoint may shift them.
+MODEL_PATH = standard_checkpoint_path()
 DEVICE = torch.device("cuda")
 torch.set_grad_enabled(False)
 MAX_SEQ_LEN = 256

@@ -43,13 +43,22 @@ assert runtime.__file__.startswith(_ROOT), (
 import torch  # noqa: E402
 from safetensors import safe_open  # noqa: E402
 
+from runtime.checkpoints import modelopt_checkpoint_path  # noqa: E402
 from runtime.model.qwen36_model import GdnLayerState, Qwen36GatedDeltaNet  # noqa: E402
 from runtime.model_loading import _build_qwen36_model_config  # noqa: E402
 
-MODEL_PATH = (
-    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
-    "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
-)
+# Deliberately modelopt (nvidia), not the standard checkpoint: this script
+# hardcodes ``quantized = {...: "FP8"}`` below when constructing the raw
+# GDN layer, which (per ``runtime/model/qwen36_model.py``'s
+# ``_LINEAR_FACTORY_FOR_ALGO``) always builds ``ModelOptFP8Linear`` --
+# correct for modelopt's per-*tensor* scalar ``weight_scale`` (float32),
+# but silently WRONG for the standard checkpoint's per-*channel*
+# ``weight_scale`` ([out, 1], bfloat16), even though both checkpoints
+# happen to name the raw tensors identically (``weight``/``weight_scale``)
+# -- see ``runtime/model/compressed_tensors_linear.py``'s module docstring.
+# Do not "fix" this to the standard checkpoint without also switching to
+# ``CompressedTensorsFP8ChannelLinear``.
+MODEL_PATH = modelopt_checkpoint_path()
 LAYER_IDX = 0
 DEVICE = torch.device("cuda")
 torch.set_grad_enabled(False)
