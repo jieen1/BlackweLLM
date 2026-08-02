@@ -47,6 +47,33 @@ LOADER_FOR_QUANT_METHOD = {
     "modelopt": "modelopt",
 }
 
+#: ``compressed-tensors`` is a container, not a payload format, and the formats
+#: inside it are not interchangeable. Measured 2026-08-02 across the local
+#: checkpoints, the per-layer tensor names differ outright:
+#:
+#:   nvfp4-pack-quantized  Laguna, production. Symmetric NVFP4, no zero point.
+#:   mixed-precision       unsloth's Qwen3.6. FP8 channel-wise + NVFP4.
+#:   pack-quantized        cyankiwi's Qwen3.6-AWQ-INT4. ``num_bits=4, type=int,
+#:                         group_size=32`` -- group-wise INT4 with an
+#:                         **asymmetric weight_zero_point**.
+#:
+#: Note the names: ``nvfp4-pack-quantized`` and ``pack-quantized`` differ by a
+#: prefix and by whether a zero point exists. Nothing in this runtime models a
+#: zero point.
+#:
+#: Selecting a loader on ``quant_method`` alone accepted the asymmetric one,
+#: and the danger is not a crash -- every tensor name the loader looks for is
+#: present, so ``assert_all_params_loaded`` would pass while each weight came
+#: back dequantized as if it were symmetric.
+#:
+#: So the gate is the (method, format) pair, and an unlisted format is refused
+#: rather than assumed compatible. ``None`` means the method carries no
+#: sub-format (modelopt).
+SUPPORTED_QUANT_FORMATS: dict[str, frozenset[str | None]] = {
+    "compressed-tensors": frozenset({"nvfp4-pack-quantized", "mixed-precision", None}),
+    "modelopt": frozenset({None}),
+}
+
 
 @dataclass(frozen=True)
 class ArchitectureFamily:
@@ -118,6 +145,18 @@ def _loader_for(spec: ArchitectureSpec) -> str:
         raise UnsupportedArchitectureError(
             f"quantization method {spec.quant.method!r} has no loader adapter; "
             f"supported methods are {sorted(LOADER_FOR_QUANT_METHOD)}"
+        )
+    allowed = SUPPORTED_QUANT_FORMATS.get(spec.quant.method, frozenset({None}))
+    if spec.quant.format not in allowed:
+        raise UnsupportedArchitectureError(
+            f"quantization method {spec.quant.method!r} format "
+            f"{spec.quant.format!r} has no loader adapter; supported formats for "
+            f"this method are {sorted(f for f in allowed if f is not None) or ['(none)']}. "
+            "Refusing rather than loading: the formats inside this method carry "
+            "different per-layer tensors, and one of them (pack-quantized) is "
+            "asymmetric INT4 whose zero point this runtime does not model -- "
+            "loading it would pass the all-params-loaded assertion and still "
+            "produce wrong weights."
         )
     return loader
 
