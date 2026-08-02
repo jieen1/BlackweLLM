@@ -18,10 +18,7 @@ this looked like a clean drop-in swap to directly test whether the
 CHECKPOINT (not the code) explains the acceptance-rate gap.
 
 **Result: blocked, not a clean swap.** ``unsloth/Qwen3.6-27B-NVFP4``'s
-``config.json`` declares a MIXED quantization layout (its
-``quantization_config.config_groups`` has a ``group_0`` int8/float8-dynamic
-scheme covering most projections, with NVFP4 (``group_1``) reserved for
-only ``mlp.(gate|up|down)_proj`` in layers 56-63) -- unlike
+``config.json`` declares a MIXED quantization layout -- unlike
 ``nvidia/Qwen3.6-27B-NVFP4``'s uniform NVFP4-everywhere layout this repo's
 ``runtime.loading``/``quantized_layers_map`` was built and tested against.
 Running this script raises ``RuntimeError: load_qwen36_model: 168
@@ -29,7 +26,32 @@ parameter(s) never received a checkpoint tensor`` (``runtime/loading/
 common.py::assert_all_params_loaded``) -- the loader's quantized/plain
 layer-type inference does not recognize unsloth's mixed layout, so most
 non-quantized (int8/float8 group_0) backbone MLP weights are left
-unmapped. This is a REAL, checkpoint-format finding in its own right (the
+unmapped.
+
+**Correction (2026-08-03) -- the layout summary above used to be backwards.**
+It said NVFP4 was "reserved for only ``mlp.(gate|up|down)_proj`` in layers
+56-63". Read off the checkpoint's own ``config_groups``, it is the opposite:
+
+- ``group_1`` (NVFP4, ``num_bits=4``, ``tensor_group``, ``group_size=16``)
+  targets ``re:.*mlp\\.(gate|up|down)_proj$`` -- **every** MLP;
+- ``group_0`` (FP8, channel-wise weights / per-token activations) targets the
+  attention ``q|k|v|o_proj``, ``linear_attn``'s ``in_proj_qkv``/``in_proj_z``/
+  ``out_proj``, ``lm_head``, **and** ``layers.(56|57|...|63).mlp.*`` -- which
+  overrides those eight layers back out of group_1.
+
+So NVFP4 covers MLP for layers **0-55**, and 56-63's MLP is FP8. Confirmed
+against the shipped tensors: layer 0/55 ``mlp.gate_proj`` carry
+``weight_packed``/``weight_scale``/``weight_global_scale``/
+``input_global_scale``; layer 56's carry ``weight``/``weight_scale``.
+
+That ``input_global_scale`` matters beyond bookkeeping: it means this
+checkpoint declares **W4A4**, not weight-only. ``nvidia/``'s group_1 declares
+``input_activations: None``. The blockscaled.mm attempt recorded in
+``runtime/model/modelopt_linear.py`` failed against ``nvidia/`` precisely
+because dynamic activation quantization had no checkpoint-side counterpart
+there -- it has one here. See ``docs/roadmap.md`` stage 4.
+
+This is a REAL, checkpoint-format finding in its own right (the
 two publishers' NVFP4 checkpoints are not just re-quantizations of the same
 layout -- they use genuinely different per-layer precision plans), and it
 means this investigation could NOT directly measure whether unsloth's MTP

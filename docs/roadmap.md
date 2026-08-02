@@ -151,15 +151,35 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       **这是本 session 第二次踩到同一形状的问题——基线跑 eager，结论当成运行时性质。**
 
 ### 阶段 4 · Kernel 深度适配，压榨 SM120
-- [x] **目标已达成，但走的不是原处方的路。** 原文要求稠密 NVFP4 层改用
-      `sparkinfer.gemm.blockscaled.mm`。**该处方经实测被推翻**：`blockscaled.mm` 要求
-      **两个操作数都已量化（W4A4）**，而标准 checkpoint 的
-      `input_activations: None` 声明的是 **weight-only（W4A16）**——硬套上去正确性
-      垮得很厉害。原因写在 `runtime/model/modelopt_linear.py:76-80`，别再走一遍。
-      实际落地的是 `sparkinfer.moe._shared.kernels.w4a16` 的 `run_w4a16_moe`：
-      `Qwen36MLP` 把 gate/up/down 融成一次退化的 1-expert/top-1 MoE 调用，
-      **直接在打包 FP4 上算，从不反量化**——即原文"Laguna 做对了"的那个性质，
-      只是换了个 kernel 达成。
+- [x] **已达成"不反量化"这个目标**：`Qwen36MLP` 把 gate/up/down 融成一次退化的
+      1-expert/top-1 MoE 调用，走 `sparkinfer.moe._shared.kernels.w4a16` 的
+      `run_w4a16_moe`，**直接在打包 FP4 上算**——即原文"Laguna 做对了"的那个性质。
+- [ ] 🔴 **但原处方（`gemm.blockscaled.mm`）并没有被推翻——我 2026-08-03 早些时候
+      在本文写的"处方是错的"本身才是错的，现予纠正。**
+      当时的依据是 `runtime/model/modelopt_linear.py:76-84` 记录的失败实验：
+      `blockscaled.mm` 要求两个操作数都量化，而"checkpoint 声明 weight-only"。
+      **那条记录说的是 `nvidia/` checkpoint，我把它当成了"所有 checkpoint"。**
+      实测两者的 `config_groups.group_1`：
+
+      | | 权重 | 激活 |
+      |---|---|---|
+      | `nvidia/`（那次实验用的） | W4 | **A=None** → weight-only，`blockscaled.mm` 确实不适用 |
+      | `unsloth/`（**标准模型**） | W4 | **A=4F → W4A4** |
+
+      而且标准 checkpoint 的 **`input_global_scale` 是实际发货的张量**（0–55 层
+      `mlp.(gate|up|down)_proj` 各有一份）。那次失败是因为在 `nvidia/` 上动态量化激活
+      "没有 checkpoint 侧对应物、纯属引入误差"——**在标准模型上有对应物。**
+      所以 **W4A4 路径对标准模型是开着的，且很可能是阶段四最大的一根杠杆**：
+      那 56 层 MLP 现在走 W4A16（kernel 内把权重反量化去乘 BF16 激活），
+      实测 **10.75 ms/step、占 kernel 时间 35%**。
+      ⚠️ 动手前必须先过 B1-R 的 gap-error 判据——上次就是栽在那里。
+- [ ] 📌 层构成实测（2026-08-03，读自标准 checkpoint 的 `config_groups`）：
+      **group_1 (NVFP4/W4A4)** = `.*mlp\.(gate|up|down)_proj$` 全量，
+      但 **group_0 把 56–63 层的 MLP 覆盖回 FP8**，故 NVFP4 实际覆盖 **0–55 层的 MLP**；
+      **group_0 (FP8 W8A8, 权重 channel / 激活 per-token)** = attention 的 q/k/v/o、
+      `linear_attn` 的 in_proj_qkv/in_proj_z/out_proj、`lm_head`、以及 56–63 层 MLP。
+      ⚠️ `scripts/mtpfix_unsloth_checkpoint_probe.py` 的 docstring 把这个**说反了**
+      （称 NVFP4 "只覆盖 56–63 层"），已在该文件更正。
 - [x] sparkinfer 现在**可以直接改**（2026-08-02 起解除，只动 `origin`）。
       已合入先例：`fused_recurrent_gated_delta_rule_multistep`（`1fd76d1`，17 单测 bit-exact）；
       w4a16 scratch 欠额修复（`8242340`，104 条容量断言）。
