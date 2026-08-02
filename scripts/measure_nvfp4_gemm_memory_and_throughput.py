@@ -1,12 +1,19 @@
-"""Memory + throughput measurement for the new direct-NVFP4-GEMM
-``ModelOptNVFP4Linear`` path (``work/nvfp4-gemm-20260802``): does removing
-the 49.7 GiB BF16 dequant cache actually shrink resident memory, and what
-does eager (no CUDA graph) greedy decode throughput look like relative to
-the ~4 tok/s baseline named in the task?
+"""Memory + throughput measurement for the direct-NVFP4-GEMM fused MLP path
+(``work/nvfp4-gemm-20260802``, extended to the compressed-tensors checkpoint
+format by ``work/std-model-fuse-20260803``): does removing the BF16 dequant
+cache actually shrink resident memory, and what does eager (no CUDA graph)
+greedy decode throughput look like?
 
 External ``nvidia-smi`` polling (not ``torch.cuda.*`` counters), matching
 ``notes/2026-08-02-gpu-memory-audit.md``'s methodology -- so the number is
 directly comparable to that note's 27.3 -> 76.1 GiB warmup jump.
+
+``--model-path`` (2026-08-03 follow-up): originally hardcoded to nvidia's
+modelopt checkpoint only. Parameterized, default UNCHANGED (still nvidia's
+checkpoint), so this stays the exact same measurement code either checkpoint
+runs through -- required for the unsloth (compressed-tensors) checkpoint's
+throughput number to be comparable to nvidia's 6.547 tok/s at all (a
+different script/methodology would not be).
 
 *** MUST be run with PYTHONPATH pointing at this worktree -- see
 ``scripts/verify_nvfp4_gemm_full_model_gap.py``'s docstring for why.
@@ -14,6 +21,7 @@ directly comparable to that note's 27.3 -> 76.1 GiB warmup jump.
 
 from __future__ import annotations
 
+import argparse
 import subprocess
 import sys
 import time
@@ -33,7 +41,7 @@ from transformers import AutoTokenizer  # noqa: E402
 
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 
-MODEL_PATH = (
+DEFAULT_MODEL_PATH = (
     "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
     "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
 )
@@ -52,13 +60,19 @@ def nvidia_smi_used_mib() -> int:
 
 
 def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
+    args = ap.parse_args()
+    model_path = args.model_path
+
     print("torch:", torch.__version__, "device:", torch.cuda.get_device_name(0))
+    print("model_path:", model_path)
     before_load = nvidia_smi_used_mib()
     print(f"nvidia-smi before load: {before_load} MiB")
 
-    tok = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
+    tok = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
     t0 = time.perf_counter()
-    model = load_qwen36_model(MODEL_PATH, device=DEVICE, max_seq_len=512, enable_mtp=False)
+    model = load_qwen36_model(model_path, device=DEVICE, max_seq_len=512, enable_mtp=False)
     print(f"model loaded in {time.perf_counter() - t0:.1f}s")
     after_load = nvidia_smi_used_mib()
     print(f"nvidia-smi after load: {after_load} MiB (+{after_load - before_load} MiB)")

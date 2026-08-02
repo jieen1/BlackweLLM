@@ -77,13 +77,16 @@ from bfdiag.divergence.logit_agreement import (  # noqa: E402
     AgreementReport,
     evaluate_summary,
 )
+from runtime.model.compressed_tensors_linear import CompressedTensorsNVFP4Linear  # noqa: E402
 from runtime.model.modelopt_linear import ModelOptNVFP4Linear  # noqa: E402
 from runtime.model.qwen36_model import Qwen36MLP  # noqa: E402
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 
 sys.path.insert(0, str(Path(_ROOT) / "scripts"))
 from b3_verify_batching_logit_agreement import (  # noqa: E402
-    MODEL_PATH,
+    MODEL_PATH as DEFAULT_MODEL_PATH,
+)
+from b3_verify_batching_logit_agreement import (  # noqa: E402
     PROMPTS,
     TopKRow,
     agreement,
@@ -103,9 +106,21 @@ def _legacy_per_linear_forward(self: Qwen36MLP, x: torch.Tensor) -> torch.Tensor
 
 
 def _drop_dequant_caches(model: torch.nn.Module) -> None:
+    # Either NVFP4 checkpoint format's Linear caches a BF16 dequant on
+    # first use of its own legacy `.forward()`/`_ensure_ready()` (see
+    # runtime/model/modelopt_linear.py, runtime/model/
+    # compressed_tensors_linear.py) -- this oracle path
+    # (`_legacy_per_linear_forward`) calls `gate_proj`/`up_proj`/
+    # `down_proj` directly, so both formats need their cache dropped here
+    # between workloads, not just modelopt's (2026-08-03 follow-up, when
+    # this script was extended to also run against unsloth's
+    # compressed-tensors checkpoint via `--model-path`).
     n = 0
     for m in model.modules():
-        if isinstance(m, ModelOptNVFP4Linear) and m._weight_bf16 is not None:
+        if (
+            isinstance(m, (ModelOptNVFP4Linear, CompressedTensorsNVFP4Linear))
+            and m._weight_bf16 is not None
+        ):
             m._weight_bf16 = None
             n += 1
     torch.cuda.empty_cache()
@@ -142,18 +157,21 @@ def main() -> None:
     ap.add_argument(
         "--out", type=str, default=".bfdiag/runs/nvfp4_gemm_full_model_gap.json"
     )
+    ap.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
     args = ap.parse_args()
+    model_path = args.model_path
 
     print("torch:", torch.__version__, "device:", torch.cuda.get_device_name(0))
+    print("model_path:", model_path)
     print(
         "Qwen36MLP.forward is the fused w4a16 kernel path:",
         Qwen36MLP.forward is _NEW_FORWARD,
     )
-    tok = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
+    tok = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
 
     t0 = time.perf_counter()
     model = load_qwen36_model(
-        MODEL_PATH, device=DEVICE, max_seq_len=args.max_seq_len, enable_mtp=False
+        model_path, device=DEVICE, max_seq_len=args.max_seq_len, enable_mtp=False
     )
     print(f"model loaded in {time.perf_counter() - t0:.1f}s")
     print(f"allocated after load: {torch.cuda.memory_allocated() / 1024**3:.2f} GiB")
