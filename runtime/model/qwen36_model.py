@@ -22,7 +22,17 @@ prefix cache -- only ship it correct"):
   zero ``k_scale``/``v_scale`` tensors (B0-2), and resolving "what scale
   to use" is explicitly deferred to B3 (``docs/qwen36-rebuild-spec.md``
   §7). BF16 KV sidesteps that open question entirely for B1's
-  correctness gate rather than guessing a default.
+  correctness gate rather than guessing a default. Uses a per-layer
+  fixed-capacity workspace (:class:`Qwen36AttentionWorkspace`), not the
+  higher-level ``sparkinfer.attention.paged.{plan,bind,run}`` convenience
+  API directly -- confirmed on real GPU (B1's own smoke test) that the
+  convenience API JIT-recompiles per distinct ``(seq_len, cache_seqlens)``
+  shape (an 8-token prompt paid a fresh ~24s extend compile a 5-token
+  prompt moments earlier had already separately paid for), which is a
+  real usability blocker for any traffic that does not repeat exact
+  shapes, not a performance nice-to-have -- see that class's docstring,
+  which ports the same fix Laguna already has for its own attention path
+  (``SparkinferPrefillWorkspace``, ``runtime/backends/laguna_sparkinfer_attn.py``).
 - GDN layers use ``fla.ops.gated_delta_rule`` directly (B0-4's decision
   ①: verified correct against HF's own torch fallback for these exact
   shapes, cosine >= 0.99998) -- not the torch fallback, and not a
@@ -62,7 +72,10 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-from sparkinfer.attention import paged
+from sparkinfer.attention.paged._forward import paged_attention_forward
+from sparkinfer.attention.paged._scratch import build_paged_attention_binding
+from sparkinfer.attention.paged.planner import create_paged_plan
+from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
 from torch import nn
 
 from runtime.kernels.rope import apply_rotary_embedding_inplace, compute_cos_sin_cache_default
@@ -465,6 +478,140 @@ class Qwen36GatedDeltaNet(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+class Qwen36AttentionWorkspace:
+    """Fixed-capacity sparkinfer paged-attention workspace for one
+    ``Qwen36Attention`` layer, covering both ``mode="extend"`` (prefill)
+    and ``mode="decode"`` (single-token continuation) -- no ``"verify"``
+    (B1 has no speculative decoding) and no ``window_left``/SWA (Qwen3.6's
+    ``layer_types`` has no ``"sliding_attention"`` entry, only
+    ``"full_attention"``/``"linear_attention"`` -- verified against the
+    real checkpoint's ``config.json``, B0-6/B1).
+
+    **Why this exists, not a nice-to-have**: the higher-level
+    ``sparkinfer.attention.paged.{plan,bind,run}`` convenience API this
+    module used before builds a *fresh* plan from the CALLER's actual
+    ``(seq_len, cache_seqlens)`` on every single call. sparkinfer's CuTe
+    launch wrapper JIT-compiles keyed on a snapshot of several tensors'
+    shapes (confirmed directly, 2026-08-02: an 8-token prompt during B1's
+    own smoke test re-triggered a fresh ~24s extend compile that a
+    5-token prompt moments earlier had already separately paid for) -- so
+    real serving traffic, which essentially never repeats a shape, would
+    pay a ~25-60s compile on every distinct prompt length forever. This is
+    not a hypothetical: it is the same root cause Laguna already found
+    and fixed for its own attention path
+    (``notes/2026-08-01-prefill-shape-buckets-root-cause.md``,
+    ``SparkinferPrefillWorkspace`` in
+    ``runtime/backends/laguna_sparkinfer_attn.py``) -- this class is that
+    same fix, ported to Qwen3.6's shape (BF16 KV rather than FP8, no SWA,
+    no verify), not a new design. Building ONE persistent
+    ``PagedAttentionWorkspace.for_fixed_capacity`` instead means every
+    call within the declared capacity reuses the SAME compiled kernel and
+    the SAME scratch buffers -- only their *contents* change per call.
+
+    **What is scoped out of this port, and why that's a real gap, not
+    laziness**: Laguna shares ONE ``SparkinferPrefillWorkspace`` across an
+    entire *group* of layers with matching shapes (all its full-attention
+    layers at once). This class is instead constructed **per layer**
+    (``Qwen36Attention.__init__`` builds its own) -- correct (each
+    instance's fixed capacity is still honored, and sparkinfer's own
+    compile cache is keyed by shape parameters below the level of this
+    Python object, so cross-layer compiles very likely still dedupe), but
+    it allocates ``Qwen36Attention.num_layers``-times the scratch memory a
+    single shared instance would. Given all 16 full-attention layers in
+    this checkpoint share identical
+    ``num_q_heads``/``num_kv_heads``/``head_dim``/``page_size``, sharing
+    one instance across all of them the way Laguna does is a real,
+    concrete follow-up -- not attempted here because it was not needed to
+    fix the actual bug (repeated compiles per *runtime shape*, not per
+    *layer*) within this pass's time budget. **Never independently
+    GPU-verified against sparkinfer** (this pass had no GPU time left
+    after the fix was written) -- see the B1 handoff notes for what
+    running ``scripts/b1_verify_full_model_smoke.py`` again should show if
+    this is right: the third prompt's prefill should no longer cost a
+    fresh ~24s, and every prompt after the first should hit the workspace
+    warm.
+    """
+
+    def __init__(
+        self,
+        *,
+        mode: str,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        max_total_q: int,
+        max_page_table_width: int,
+        num_cache_pages: int,
+        dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        if mode not in ("extend", "decode"):
+            raise ValueError(f"Qwen36AttentionWorkspace: unsupported mode {mode!r}")
+        self.mode = mode
+        self._descale = torch.ones(1, dtype=torch.float32, device=device)
+        # eager_extend_work_items_capacity is sparkinfer's own estimator
+        # for exactly this pair of modes (its name and design track
+        # max_total_q, which is what extend/decode's real work-item count
+        # scales with) -- see SparkinferPrefillWorkspace's docstring for
+        # why this estimator specifically does NOT generalize to
+        # mode="verify" (not a concern here: B1 has none).
+        max_work_items = PagedAttentionWorkspace.eager_extend_work_items_capacity(
+            max_total_q=max_total_q, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
+        )
+        self._workspace = PagedAttentionWorkspace.for_fixed_capacity(
+            mode=mode,
+            device=device,
+            dtype=dtype,
+            kv_dtype=kv_dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            page_size=page_size,
+            max_total_q=max_total_q,
+            max_batch=1,
+            max_page_table_width=max_page_table_width,
+            max_work_items=max_work_items,
+            max_partial_rows=0,  # matches PagedExtendGraphCapacity: no split-KV merge buffer
+            num_cache_pages=num_cache_pages,
+            use_cuda_graph=False,
+        )
+        self._prepared_metadata: object | None = None
+
+    def forward(
+        self,
+        *,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        output: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+    ) -> None:
+        """Run attention, writing into ``output`` in place. First call
+        against this instance pays sparkinfer's one-time CuTe compile
+        (or hits its on-disk cache from a prior process); every later
+        call at any shape within this instance's declared capacity reuses
+        it."""
+        plan = create_paged_plan(
+            q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
+            mode=self.mode, enable_cuda_graph=False, window_left=-1,
+        )
+        ws = self._workspace
+        ws._ensure_capacity(plan)
+        ws._copy_runtime_metadata(page_table, cache_seqlens, cu_seqlens_q)
+        ws._copy_plan_metadata(plan)
+        ws._plan = plan
+        binding = build_paged_attention_binding(
+            scratch=ws, q=q, k_cache=k_cache, v_cache=v_cache, output=output,
+            k_descale=self._descale, v_descale=self._descale,
+        )
+        paged_attention_forward(binding=binding)
+
+
 class Qwen36Attention(nn.Module):
     """Transcribed from ``Qwen3_5Attention``. Uses sparkinfer's paged
     attention kernel (B0-3-verified for this exact shape) with a BF16 KV
@@ -508,6 +655,43 @@ class Qwen36Attention(nn.Module):
         self.q_norm = Qwen36RMSNorm(self.head_dim, eps=self.eps)
         self.k_norm = Qwen36RMSNorm(self.head_dim, eps=self.eps)
 
+        # Built lazily on first forward() call, from the actual observed
+        # cache/dtype -- safe because every Qwen36GenerationState this
+        # layer instance will ever see comes from the SAME model instance
+        # (same max_seq_len, same cache.num_pages every time; a second
+        # model instance with a different max_seq_len gets its own
+        # Qwen36Attention layers, hence its own workspaces). See
+        # Qwen36AttentionWorkspace's docstring for why this exists.
+        self._extend_workspace: Qwen36AttentionWorkspace | None = None
+        self._decode_workspace: Qwen36AttentionWorkspace | None = None
+
+    def _workspace_for(
+        self,
+        mode: str,
+        cache: Qwen36PagedAttentionCache,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Qwen36AttentionWorkspace:
+        attr = "_extend_workspace" if mode == "extend" else "_decode_workspace"
+        existing = getattr(self, attr)
+        if existing is not None:
+            return existing
+        workspace = Qwen36AttentionWorkspace(
+            mode=mode,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            page_size=cache.page_size,
+            max_total_q=self.max_seq_len,
+            max_page_table_width=cache.num_pages,
+            num_cache_pages=cache.num_pages,
+            dtype=dtype,
+            kv_dtype=cache.k_cache.dtype,
+            device=device,
+        )
+        setattr(self, attr, workspace)
+        return workspace
+
     def new_cache(self, *, device: torch.device, dtype: torch.dtype) -> Qwen36PagedAttentionCache:
         return Qwen36PagedAttentionCache(
             num_kv_heads=self.num_kv_heads,
@@ -550,54 +734,28 @@ class Qwen36Attention(nn.Module):
         query = query_flat.view(seq_len, self.num_heads, self.head_dim)
         key = key_flat.view(seq_len, self.num_kv_heads, self.head_dim)
 
-        past_len, total_len = cache.append(key.to(cache.dtype), value.to(cache.dtype))
+        _past_len, total_len = cache.append(key.to(cache.dtype), value.to(cache.dtype))
         mode = "decode" if seq_len == 1 else "extend"
 
-        plan = paged.plan(
-            paged.Caps(
-                device=query.device,
-                mode=mode,
-                dtype=query.dtype,
-                kv_dtype=cache.k_cache.dtype,
-                num_q_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim_qk=self.head_dim,
-                head_dim_vo=self.head_dim,
-                page_size=cache.page_size,
-                max_total_q=seq_len,
-                max_batch=1,
-                max_page_table_width=cache.num_pages,
-                max_work_items=4096,
-                max_partial_rows=65536,
-                num_cache_pages=cache.num_pages,
-                use_cuda_graph=False,
-            )
-        )
-        scratch_spec = plan.scratch_specs()[0]
-        scratch = torch.empty(scratch_spec.shape, dtype=scratch_spec.dtype, device=query.device)
+        workspace = self._workspace_for(mode, cache, query.dtype, query.device)
         output = torch.empty(
             seq_len, self.num_heads, self.head_dim, dtype=query.dtype, device=query.device
         )
         cache_seqlens = torch.tensor([total_len], dtype=torch.int32, device=query.device)
         cu_seqlens_q = torch.tensor([0, seq_len], dtype=torch.int32, device=query.device)
-        binding = paged.bind(
-            plan,
-            scratch=scratch,
-            q=query.to(cache.k_cache.dtype) if query.dtype != cache.k_cache.dtype else query,
+        needs_cast = query.dtype != cache.k_cache.dtype
+        q_for_kernel = query.to(cache.k_cache.dtype) if needs_cast else query
+        workspace.forward(
+            q=q_for_kernel,
             k_cache=cache.k_cache,
             v_cache=cache.v_cache,
             output=output,
             page_table=cache.page_table,
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
-            active_total_q=seq_len,
-            k_descale=None,
-            v_descale=None,
         )
-        attn_out, _lse = paged.run(binding=binding)
-        del past_len
 
-        attn_out = attn_out.reshape(batch_size, seq_len, -1).contiguous()
+        attn_out = output.reshape(batch_size, seq_len, -1).contiguous()
         attn_out = attn_out * torch.sigmoid(gate)
         return self.o_proj(attn_out)
 
