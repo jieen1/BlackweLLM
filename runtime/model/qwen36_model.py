@@ -81,7 +81,11 @@ import torch.nn.functional as F
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 from sparkinfer.attention.paged._forward import paged_attention_forward
 from sparkinfer.attention.paged._scratch import build_paged_attention_binding
-from sparkinfer.attention.paged.planner import PagedPlanBudget, create_paged_plan
+from sparkinfer.attention.paged.planner import (
+    PagedPlanBudget,
+    create_paged_plan,
+    plan_decode_graph_capacity,
+)
 from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
 from torch import nn
 
@@ -912,9 +916,41 @@ class Qwen36BatchedDecodeAttention:
         )
         self.cache_seqlens = torch.ones(batch, dtype=torch.int32, device=device)
         self.cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=device)
-        max_work_items = PagedAttentionWorkspace.eager_extend_work_items_capacity(
-            max_total_q=batch, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
-        )
+        # ``eager_extend_work_items_capacity`` is the WRONG estimator here and
+        # says so in its name: it scales with ``max_total_q * gqa / 16``, which
+        # for a decode step is one work item per request and ignores the KV
+        # axis entirely. A batch-2 decode over a 512-token context blew
+        # straight through it ("fixed-capacity paged workspace exceeded",
+        # measured 2026-08-02). ``plan_decode_graph_capacity`` is sparkinfer's
+        # own worst-case policy for exactly this shape -- a decode bucket of a
+        # given batch over a given page count -- and returns ``max_work_items``
+        # and ``max_partial_rows`` as a consistent pair, which matters because
+        # a split-KV plan needs partial rows to merge into and a hand-picked
+        # ``max_partial_rows=0`` silently forbids the schedule the planner is
+        # about to ask for.
+        if device.type == "cuda":
+            capacity = plan_decode_graph_capacity(
+                device=device,
+                q_dtype=dtype,
+                kv_dtype=kv_dtype,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim,
+                head_dim_vo=head_dim,
+                page_size=page_size,
+                batch=batch,
+                max_cache_page_count=num_cache_pages,
+                window_left=-1,
+            )
+            max_work_items = capacity.max_work_items
+            max_partial_rows = capacity.max_partial_rows
+        else:
+            # CPU: this driver is never actually run (the kernels are
+            # CUDA-only); it exists so the pool's bookkeeping is testable.
+            # plan_decode_graph_capacity refuses a non-CUDA device outright,
+            # so fall back to a value that only has to be self-consistent.
+            max_work_items = max(batch, 1)
+            max_partial_rows = 0
         self._workspace = PagedAttentionWorkspace.for_fixed_capacity(
             mode="decode",
             device=device,
@@ -929,7 +965,7 @@ class Qwen36BatchedDecodeAttention:
             max_batch=batch,
             max_page_table_width=pages_per_slot,
             max_work_items=max_work_items,
-            max_partial_rows=0,
+            max_partial_rows=max_partial_rows,
             num_cache_pages=num_cache_pages,
             use_cuda_graph=False,
         )
