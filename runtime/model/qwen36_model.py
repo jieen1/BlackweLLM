@@ -31,12 +31,15 @@ prefix cache -- only ship it correct"):
   earlier had already separately paid for), a real usability blocker for
   any traffic that does not repeat exact shapes. Ports the same fix
   Laguna already has (``SparkinferPrefillWorkspace``,
-  ``runtime/backends/laguna_sparkinfer_attn.py``) -- **but a 2026-08-02
-  re-run found this fix only works for `mode="decode"`; `mode="extend"`
-  (prefill) still recompiles per novel shape, root cause not found within
-  this pass's time budget -- see that class's docstring for the full,
-  honest account, including what was read in sparkinfer's own compile-key
-  code that appears to contradict what was measured.**
+  ``runtime/backends/laguna_sparkinfer_attn.py``), plus a second piece
+  Laguna does not need at its own geometry: the plan's ``cta_tile_q`` is
+  part of sparkinfer's compile key and the eager planner derives it from
+  the live query length, so ``PagedPlanBudget`` is passed to derive it
+  from declared capacity instead. With both pieces there is exactly ONE
+  extend compile and ONE decode compile per process, at any prompt
+  length -- see :class:`Qwen36AttentionWorkspace`'s docstring for the
+  measured evidence and for why the earlier "extend recompiles per novel
+  shape" reading was one bucket boundary misread as an unbounded axis.
 - GDN layers use ``fla.ops.gated_delta_rule`` directly (B0-4's decision
   ①: verified correct against HF's own torch fallback for these exact
   shapes, cosine >= 0.99998) -- not the torch fallback, and not a
@@ -78,7 +81,7 @@ import torch.nn.functional as F
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 from sparkinfer.attention.paged._forward import paged_attention_forward
 from sparkinfer.attention.paged._scratch import build_paged_attention_binding
-from sparkinfer.attention.paged.planner import create_paged_plan
+from sparkinfer.attention.paged.planner import PagedPlanBudget, create_paged_plan
 from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
 from torch import nn
 
@@ -528,59 +531,73 @@ class Qwen36AttentionWorkspace:
     concrete follow-up -- not attempted here because it was not needed to
     fix the actual bug within this pass's time budget.
 
-    **2026-08-02 GPU re-run (`scripts/b1_verify_full_model_smoke.py`),
-    reported honestly, not smoothed over -- this fix is CONFIRMED PARTIAL,
-    not fully working**:
+    **The second, independent axis: ``cta_tile_q`` (2026-08-02)**. The
+    fixed-capacity workspace above pins every *buffer* shape, and that is
+    genuinely sufficient for ``mode="decode"``. It was NOT sufficient for
+    ``mode="extend"``, and the earlier version of this docstring recorded
+    that as an unexplained contradiction. It is explained now, and the
+    explanation is a second capacity-vs-live-shape leak in a place the
+    workspace object cannot reach on its own:
 
-    - ``mode="decode"`` is genuinely fixed: after the very first decode
-      call in a process, every later decode call is fast (~0.13-0.16s)
-      *regardless of prompt length* -- confirmed across three prompts of
-      different lengths (5, 5, 8 tokens), each producing a fast decode
-      after its own first step.
-    - ``mode="extend"`` (prefill) is **NOT fixed**: the third prompt
-      (8 tokens, the first extend call this process had NOT already seen
-      at that exact length) still paid a fresh ~25.7s compile, identical
-      in magnitude to a genuinely cold contract. Two prompts sharing the
-      same length (5 tokens each) DID reuse the compile between them
-      (0.14s), so the workspace is not simply broken -- it is invariant to
-      *repeated* shapes but not to *novel* ones, which is exactly the
-      behavior this fix was meant to eliminate and did not.
-    - Investigated, not just observed: read ``sparkinfer/attention/paged/
-      _forward.py``'s ``forward_cache_key`` construction directly.
-      ``_tensor_meta_key(q_cache_tensor, dynamic_dims=(0,))`` appears
-      designed to make the compile cache invariant to ``q.shape[0]``
-      regardless of whether ``workspace._plan_q`` (the padded persistent
-      buffer ``use_capacity_contract`` mode would substitute in) is
-      actually populated -- i.e. reading this cache-key code, the extend
-      recompile should NOT be happening at all, contradicting what was
-      measured. Ruled out as the cause: ``planner.py`` (the eager
-      scheduler Laguna's own docstring says legitimately reruns per call)
-      has no JIT/compile machinery of its own to trigger a fresh compile;
-      ``traits.py``'s ``select_paged_forward_traits`` never reads
-      ``total_q``/``max_total_q``, so trait selection cannot be silently
-      picking a different kernel variant by query length either. The
-      actual mechanism was NOT found within this pass's time budget.
-    - **This was not re-tested against sparkinfer's own FP8-KV path**
-      (B0-3's tested configuration) -- this runtime deliberately uses
-      BF16 KV (see this module's top docstring for why), so it is not
-      known whether this extend-mode non-fix is specific to BF16 KV, or
-      would reproduce on FP8 KV too (in which case it would also affect
-      Laguna, contradicting that class's own documented measurement, and
-      would be worth re-confirming against Laguna's real traffic rather
-      than assumed fixed there either).
+    sparkinfer's compile cache key includes ``_traits_compile_key(traits)``
+    (``attention/paged/_forward.py``), and ``traits`` comes from
+    ``select_paged_forward_traits_from_plan(plan)`` -- so ``plan.cta_tile_q``
+    is *part of the compile key*. For an eager plan the planner derives it
+    from the LIVE query length
+    (``planner.py``, ``create_paged_plan``'s ``enable_cuda_graph=False``
+    branch)::
 
-    **Net effect on the usability concern this was written to address**:
-    decode-side cost is real and solved. Prefill-side cost -- the larger
-    of the two per the historical-performance record
-    (``notes/2026-08-02-qwen36-historical-performance-record.md``: TTFT
-    was 60-70% of the historical gap to vLLM, decode step time only
-    10-15%) -- is UNRESOLVED. Whoever picks this up next should not
-    assume this class fixes prefill JIT cost; it should be re-profiled
-    first, and if the ``_tensor_meta_key`` reading above is right that
-    this "shouldn't" be happening, that contradiction itself is worth
-    handing to whoever owns the sparkinfer relationship (this runtime's
-    hard constraint is read-only/profiling against sparkinfer, never
-    patching it -- see ``AGENTS.md``).
+        avg_packed_qo_len = sum(packed_qo_len_arr) // max(batch, 1)
+        if mode in ("extend", "verify") and plan_budget is not None \\
+                and plan_budget.max_total_q is not None:
+            avg_packed_qo_len = max(
+                avg_packed_qo_len,
+                int(plan_budget.max_total_q) * gqa_group_size // max(batch, 1),
+            )
+        cta_tile_q = _paged_determine_cta_tile_q(packed_qo_len=avg_packed_qo_len, ...)
+
+    With ``gqa_group_size=6`` and ``head_dim=256``,
+    ``_paged_determine_cta_tile_q`` returns 16 while
+    ``packed_qo_len = 6 * seq_len <= 32`` and 64 above it -- i.e. it flips at
+    ``seq_len == 6``. That is exactly one boundary, and B1's smoke test
+    (prompts of 5, 5, 8 tokens) walked straight across it, which is why the
+    third prompt looked like "every novel length recompiles". Measured
+    directly (``scripts/b1_probe_extend_jit_buckets.py``, 14 mutually
+    distinct novel lengths from 5 to 2584): pre-fix, exactly TWO lengths pay
+    a compile (5 -> ``cta_tile_q=16``, 8 -> ``cta_tile_q=64``) and the other
+    twelve cost ~4 ms. So the earlier "recompiles forever" reading was too
+    pessimistic -- but the bug is real and is a usability blocker anyway,
+    because *which* bucket a request lands in is decided by its prompt
+    length, so any warmup that exercises one bucket leaves the other cold
+    and a short prompt still stalls ~26 s in production.
+
+    Fix: pass sparkinfer's own :class:`PagedPlanBudget` into
+    ``create_paged_plan``. That ``max(...)`` branch above exists precisely
+    so a fixed-capacity caller can have ``cta_tile_q`` derived from its
+    declared capacity instead of the live shape; with
+    ``max_total_q = max_seq_len`` every extend call lands in the same tile
+    bucket, so there is ONE extend compile per (geometry, capacity) for the
+    life of the process regardless of prompt length. The budget's other
+    fields (``max_batch``, ``max_page_table_width``) additionally make
+    ``create_paged_plan`` fail loudly and early if a caller ever exceeds the
+    capacity this workspace was built for, instead of failing deeper inside
+    ``_ensure_capacity``.
+
+    Two things deliberately NOT changed, having been read and ruled out:
+
+    - ``max_partial_rows=0`` stays correct. ``create_paged_plan`` hard-sets
+      ``split_kv = False; disable_split_kv = True`` for ``mode == "extend"``
+      unconditionally (``planner.py``), so an extend plan can never request
+      the split-KV merge buffer. Measured across all 14 probe lengths:
+      ``split_kv`` is ``False`` everywhere. This also means the split-KV
+      chunk-count divergence documented in
+      ``notes/2026-08-02-eager-verify-cg-verify-divergence.md`` is
+      structurally out of reach on this path.
+    - ``mode="decode"`` is unaffected by the budget:
+      ``_paged_determine_cta_tile_q`` returns a hard-coded 16 for decode
+      before it ever looks at ``packed_qo_len``, and the ``max(...)``
+      branch is gated on ``mode in ("extend", "verify")``. Passing the
+      budget for decode buys only the capacity assertions.
     """
 
     def __init__(
@@ -629,6 +646,15 @@ class Qwen36AttentionWorkspace:
             num_cache_pages=num_cache_pages,
             use_cuda_graph=False,
         )
+        # Declares this workspace's capacity to the planner so the plan's
+        # own policy knobs -- above all ``cta_tile_q``, which is part of
+        # sparkinfer's compile cache key -- are derived from capacity, not
+        # from the live request's query length. See the class docstring.
+        self._plan_budget = PagedPlanBudget(
+            max_total_q=max_total_q,
+            max_batch=1,
+            max_page_table_width=max_page_table_width,
+        )
         self._prepared_metadata: object | None = None
 
     def forward(
@@ -646,10 +672,12 @@ class Qwen36AttentionWorkspace:
         against this instance pays sparkinfer's one-time CuTe compile
         (or hits its on-disk cache from a prior process); every later
         call at any shape within this instance's declared capacity reuses
-        it."""
+        it -- including query lengths never seen before, which is what
+        ``plan_budget`` buys (class docstring)."""
         plan = create_paged_plan(
             q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
             mode=self.mode, enable_cuda_graph=False, window_left=-1,
+            plan_budget=self._plan_budget,
         )
         ws = self._workspace
         ws._ensure_capacity(plan)
@@ -1013,6 +1041,55 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         self, *, device: torch.device, dtype: torch.dtype
     ) -> Qwen36GenerationState:
         return self.model.new_generation_state(device=device, dtype=dtype)
+
+    def warmup_attention_shapes(
+        self, *, device: torch.device | str, dtype: torch.dtype
+    ) -> None:
+        """Pay sparkinfer's one-time CuTe compile for both attention modes
+        now, on throwaway buffers, instead of on whichever real request
+        happens to arrive first.
+
+        This is the Qwen3.6 analogue of ``LagunaBackend.
+        warmup_paged_attention_shapes`` (``runtime/backends/laguna.py``),
+        and it is only *one* forward per (layer, mode) because
+        :class:`Qwen36AttentionWorkspace` now makes the compile invariant
+        to prompt length -- without that, a warmup would have to guess
+        which query-length bucket the first real request lands in, and
+        guessing wrong would leave the stall exactly where it was. The two
+        changes are complementary, not redundant.
+
+        Runs only the attention kernels, not a whole model forward: GDN's
+        recurrent state is order-dependent (B0-5), so a real forward would
+        have to be careful not to leave a warmed-up state behind. Here each
+        layer gets a throwaway KV cache that is dropped on return, no GDN
+        state is allocated at all, and no caller-visible state is touched.
+        """
+        device = torch.device(device)
+        for layer in self.model.layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is None:
+                continue
+            cache = attn.new_cache(device=device, dtype=dtype)
+            for mode, seq_len in (("extend", 2), ("decode", 1)):
+                workspace = attn._workspace_for(mode, cache, dtype, device)
+                q = torch.zeros(
+                    seq_len, attn.num_heads, attn.head_dim, dtype=cache.dtype, device=device
+                )
+                workspace.forward(
+                    q=q,
+                    k_cache=cache.k_cache,
+                    v_cache=cache.v_cache,
+                    output=torch.empty_like(q),
+                    page_table=cache.page_table,
+                    cache_seqlens=torch.tensor(
+                        [seq_len], dtype=torch.int32, device=device
+                    ),
+                    cu_seqlens_q=torch.tensor(
+                        [0, seq_len], dtype=torch.int32, device=device
+                    ),
+                )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
 
     def forward(
         self,

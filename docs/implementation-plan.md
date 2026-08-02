@@ -359,7 +359,36 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
   两个同长度的 prompt **确实**复用了编译（0.14s），所以 workspace 对象本身不是没起作用——
   它只对**重复出现的**形状不变，对**新出现的**形状仍然重编译。**prefill 路径的可用性阻塞依然成立**，
   而 prefill 恰好是历史差距分解里最大的一块（60–70%，见
-  [`../notes/2026-08-02-qwen36-historical-performance-record.md`](../notes/2026-08-02-qwen36-historical-performance-record.md)）。CUDA-Graph 专属加速内核（`_is_laguna_fp8_gqa6_analytic_decode_graph`
+  [`../notes/2026-08-02-qwen36-historical-performance-record.md`](../notes/2026-08-02-qwen36-historical-performance-record.md)）。
+
+  ✅ **已修复 + 上面那句"对新出现的形状仍然重编译"是过度推广，一并更正（2026-08-02，`work/qwen36-jit-20260802`）**：
+
+  - **真实根因（读代码 + GPU 实测坐实，不是"容量没盖住"）**：`for_fixed_capacity` 把所有**缓冲区形状**
+    钉死了，这一半是对的、decode 因此真的修好了。漏掉的是**第二条轴**：sparkinfer 的编译 key 里含
+    `_traits_compile_key(traits)`，而 `traits` 来自 `select_paged_forward_traits_from_plan(plan)`——
+    **`plan.cta_tile_q` 本身就是编译 key 的一部分**。eager 路径下 `create_paged_plan` 用**活的 query
+    长度**算它（`planner.py`，`enable_cuda_graph=False` 分支）：`avg_packed_qo_len = seq_len * gqa_group_size`，
+    `_paged_determine_cta_tile_q` 在 `packed_qo_len <= 32` 返回 16、之上返回 64（`head_dim=256` 封死了
+    128 那档）。`gqa_group_size=6` ⇒ **翻转点恰好在 `seq_len == 6`**。
+  - **"每个新长度都重编译"是 n=3 的误读**：B1 冒烟用的 5/5/8 token 恰好横跨这唯一一个分桶边界。
+    实测 14 个互不相同、全新的长度（5…2584，`scripts/b1_probe_extend_jit_buckets.py`，
+    `SPARKINFER_COMPILE_DISK_CACHE=0`）：修前**只有 2 个长度**付编译（5→`cta_tile_q=16` 41.1s、
+    8→`cta_tile_q=64` 25.9s），其余 12 个都是 ~4ms。**但这仍然是可用性阻塞**——落哪个桶由 prompt
+    长度决定，任何只热身了一个桶的 warmup 都会让另一个桶的首个请求卡 ~26s。
+  - **修法**：把 sparkinfer 自己的 `PagedPlanBudget` 传进 `create_paged_plan`。planner 里那段
+    `if mode in ("extend","verify") and plan_budget.max_total_q is not None: avg_packed_qo_len = max(...)`
+    就是为固定容量调用方准备的——`max_total_q = max_seq_len` 后 `cta_tile_q` 由**容量**而非活形状决定，
+    全部落进同一个桶。修后同一组 14 个长度：**只有第 1 个付 26.8s，其余 13 个全是 ~4ms**。
+  - **正确性**：`cta_tile_q` 16→64 对本路径**数值完全无影响**——extend 的 `split_kv` 被 planner 硬置为
+    `False`，不存在跨 CTA 归并，逐 query 行的 softmax 顺序不随分块变化。kernel 级 A/B（S=2…257，
+    16 与 64 两种分块）**逐 bit 相同**，且都对 fp32 稠密参照 cos≥0.999998；全模型 10 个 prompt 的
+    贪心 token 与末步 logits 修前/修后**逐 bit 相同**（`scripts/b1_verify_prefill_jit_and_greedy.py --compare`）。
+  - **附带**：`Qwen36ForCausalLMSelfBuilt.warmup_attention_shapes()` + `load_qwen36_model(warmup_attention=True)`
+    把这唯一一次编译移到加载期（首个 prefill 37.8s → 5.5s）。**剩下的 5.5s 不是 sparkinfer**，是 FLA/Triton
+    在 GDN chunk 路径上的首调用编译（单独实测冷进程 12.0s，且**不随长度重编译**：S=3…1023 之后每次 ~1ms）——
+    是一次性冷启动项，不是每形状项，不在本条范围内。
+
+  CUDA-Graph 专属加速内核（`_is_laguna_fp8_gqa6_analytic_decode_graph`
   等）全部硬编码 `head_dim_qk==128`，摸不到，head_dim=256 decode 只能走通用
   `plan_decode_graph_capacity`（该函数本身对 head_dim 无上限，未实测 `use_cuda_graph=True`，留给 B2）。
   证据：`notes/2026-08-02-trackB-b0-gpu-facts.md` §B0-3、`scripts/b0_probe_paged_attention_head256.py`
