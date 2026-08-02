@@ -118,6 +118,15 @@ def build_mlp(ckpt: Path, layer: int) -> tuple[Qwen36MLP, int, int]:
         proj_module.weight_scale_2.data.copy_(t["weight_scale_2"].to(DEVICE))
 
     mlp = mlp.to(DEVICE)
+    # run_case (below) calls legacy_forward (each submodule's own
+    # ModelOptNVFP4Linear.forward()/_ensure_ready(), reading raw
+    # .weight/.weight_scale/.weight_scale_2 directly) BEFORE mlp(x) on every
+    # M in main()'s loop, all on this ONE mlp instance -- but the fused path
+    # frees those raw Parameters by default the first time it runs (see
+    # Qwen36MLP.__init__'s docstring on `_keep_raw_nvfp4_weights`), which
+    # would break every M after the first. Opt out: this script's whole
+    # point is comparing the two paths against each other repeatedly.
+    mlp._keep_raw_nvfp4_weights = True
     return mlp, hidden_size, intermediate_size
 
 

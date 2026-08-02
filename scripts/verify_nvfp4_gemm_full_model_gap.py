@@ -158,6 +158,21 @@ def main() -> None:
     print(f"model loaded in {time.perf_counter() - t0:.1f}s")
     print(f"allocated after load: {torch.cuda.memory_allocated() / 1024**3:.2f} GiB")
 
+    # This script's oracle path (_legacy_per_linear_forward, monkeypatched
+    # in per workload below) reads gate/up/down_proj's raw NVFP4 Parameters
+    # directly, on the SAME model instance, once per workload -- not just
+    # once overall. The fused candidate path frees those raw Parameters by
+    # default the first time it runs (see Qwen36MLP.__init__'s docstring on
+    # `_keep_raw_nvfp4_weights`), which would break every oracle run after
+    # the first workload's candidate run. Opt out on every real MLP in this
+    # model before the first forward pass.
+    n_kept = 0
+    for m in model.modules():
+        if isinstance(m, Qwen36MLP) and m._nvfp4_fused:
+            m._keep_raw_nvfp4_weights = True
+            n_kept += 1
+    print(f"kept raw NVFP4 weights resident on {n_kept} fused Qwen36MLP instances")
+
     workloads = []
     results: dict[str, object] = {"steps": args.steps, "workloads": {}}
 

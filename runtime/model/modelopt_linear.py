@@ -85,6 +85,20 @@ class ModelOptFP8Linear(nn.Module):
     Checkpoint shape (verified against real safetensors headers, B0-2):
     ``weight`` is ``[out, in]`` ``float8_e4m3fn`` (unpacked, one byte per
     element); ``weight_scale`` is a single ``float32`` scalar.
+
+    ``input_scale`` (also a single ``float32`` scalar, 2026-08-03 follow-up
+    to the NVFP4-GEMM round -- see ``runtime/model/qwen36_model.py``'s
+    ``Qwen36Attention``/``Qwen36GatedDeltaNet`` docstrings for the caller
+    that actually reads it) is loaded here purely as checkpoint data: this
+    class's own ``forward()``/``_ensure_ready()`` below are UNCHANGED and
+    never read it, exactly the same "leave the submodule's own legacy path
+    alone, fuse/route one level up" split NVFP4 used
+    (``runtime/model/qwen36_model.py::Qwen36MLP``) -- kept that way on
+    purpose so ``_bmm_project`` (real GDN spec-decode code, not just a
+    diagnostic) and ``scripts/b3_probe_batching_bar.py`` keep getting the
+    same BF16-dequant-and-cache ``_weight_bf16`` they always have, whether
+    or not the owning module's forward routes through a real FP8xFP8 kernel
+    instead.
     """
 
     def __init__(self, input_size: int, output_size: int, *, bias: bool = False) -> None:
@@ -97,6 +111,7 @@ class ModelOptFP8Linear(nn.Module):
             requires_grad=False,
         )
         self.weight_scale = nn.Parameter(torch.empty((), dtype=torch.float32), requires_grad=False)
+        self.input_scale = nn.Parameter(torch.empty((), dtype=torch.float32), requires_grad=False)
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size, dtype=torch.bfloat16))
         else:
@@ -104,6 +119,7 @@ class ModelOptFP8Linear(nn.Module):
 
         self.weight.weight_loader = default_weight_loader
         self.weight_scale.weight_loader = default_weight_loader
+        self.input_scale.weight_loader = default_weight_loader
         if self.bias is not None:
             self.bias.weight_loader = default_weight_loader
 
