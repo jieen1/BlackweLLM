@@ -25,14 +25,18 @@ prefix cache -- only ship it correct"):
   correctness gate rather than guessing a default. Uses a per-layer
   fixed-capacity workspace (:class:`Qwen36AttentionWorkspace`), not the
   higher-level ``sparkinfer.attention.paged.{plan,bind,run}`` convenience
-  API directly -- confirmed on real GPU (B1's own smoke test) that the
-  convenience API JIT-recompiles per distinct ``(seq_len, cache_seqlens)``
-  shape (an 8-token prompt paid a fresh ~24s extend compile a 5-token
-  prompt moments earlier had already separately paid for), which is a
-  real usability blocker for any traffic that does not repeat exact
-  shapes, not a performance nice-to-have -- see that class's docstring,
-  which ports the same fix Laguna already has for its own attention path
-  (``SparkinferPrefillWorkspace``, ``runtime/backends/laguna_sparkinfer_attn.py``).
+  API directly -- the convenience API JIT-recompiles per distinct
+  ``(seq_len, cache_seqlens)`` shape (confirmed on real GPU: an 8-token
+  prompt paid a fresh ~24s extend compile a 5-token prompt moments
+  earlier had already separately paid for), a real usability blocker for
+  any traffic that does not repeat exact shapes. Ports the same fix
+  Laguna already has (``SparkinferPrefillWorkspace``,
+  ``runtime/backends/laguna_sparkinfer_attn.py``) -- **but a 2026-08-02
+  re-run found this fix only works for `mode="decode"`; `mode="extend"`
+  (prefill) still recompiles per novel shape, root cause not found within
+  this pass's time budget -- see that class's docstring for the full,
+  honest account, including what was read in sparkinfer's own compile-key
+  code that appears to contradict what was measured.**
 - GDN layers use ``fla.ops.gated_delta_rule`` directly (B0-4's decision
   ①: verified correct against HF's own torch fallback for these exact
   shapes, cosine >= 0.99998) -- not the torch fallback, and not a
@@ -522,14 +526,61 @@ class Qwen36AttentionWorkspace:
     ``num_q_heads``/``num_kv_heads``/``head_dim``/``page_size``, sharing
     one instance across all of them the way Laguna does is a real,
     concrete follow-up -- not attempted here because it was not needed to
-    fix the actual bug (repeated compiles per *runtime shape*, not per
-    *layer*) within this pass's time budget. **Never independently
-    GPU-verified against sparkinfer** (this pass had no GPU time left
-    after the fix was written) -- see the B1 handoff notes for what
-    running ``scripts/b1_verify_full_model_smoke.py`` again should show if
-    this is right: the third prompt's prefill should no longer cost a
-    fresh ~24s, and every prompt after the first should hit the workspace
-    warm.
+    fix the actual bug within this pass's time budget.
+
+    **2026-08-02 GPU re-run (`scripts/b1_verify_full_model_smoke.py`),
+    reported honestly, not smoothed over -- this fix is CONFIRMED PARTIAL,
+    not fully working**:
+
+    - ``mode="decode"`` is genuinely fixed: after the very first decode
+      call in a process, every later decode call is fast (~0.13-0.16s)
+      *regardless of prompt length* -- confirmed across three prompts of
+      different lengths (5, 5, 8 tokens), each producing a fast decode
+      after its own first step.
+    - ``mode="extend"`` (prefill) is **NOT fixed**: the third prompt
+      (8 tokens, the first extend call this process had NOT already seen
+      at that exact length) still paid a fresh ~25.7s compile, identical
+      in magnitude to a genuinely cold contract. Two prompts sharing the
+      same length (5 tokens each) DID reuse the compile between them
+      (0.14s), so the workspace is not simply broken -- it is invariant to
+      *repeated* shapes but not to *novel* ones, which is exactly the
+      behavior this fix was meant to eliminate and did not.
+    - Investigated, not just observed: read ``sparkinfer/attention/paged/
+      _forward.py``'s ``forward_cache_key`` construction directly.
+      ``_tensor_meta_key(q_cache_tensor, dynamic_dims=(0,))`` appears
+      designed to make the compile cache invariant to ``q.shape[0]``
+      regardless of whether ``workspace._plan_q`` (the padded persistent
+      buffer ``use_capacity_contract`` mode would substitute in) is
+      actually populated -- i.e. reading this cache-key code, the extend
+      recompile should NOT be happening at all, contradicting what was
+      measured. Ruled out as the cause: ``planner.py`` (the eager
+      scheduler Laguna's own docstring says legitimately reruns per call)
+      has no JIT/compile machinery of its own to trigger a fresh compile;
+      ``traits.py``'s ``select_paged_forward_traits`` never reads
+      ``total_q``/``max_total_q``, so trait selection cannot be silently
+      picking a different kernel variant by query length either. The
+      actual mechanism was NOT found within this pass's time budget.
+    - **This was not re-tested against sparkinfer's own FP8-KV path**
+      (B0-3's tested configuration) -- this runtime deliberately uses
+      BF16 KV (see this module's top docstring for why), so it is not
+      known whether this extend-mode non-fix is specific to BF16 KV, or
+      would reproduce on FP8 KV too (in which case it would also affect
+      Laguna, contradicting that class's own documented measurement, and
+      would be worth re-confirming against Laguna's real traffic rather
+      than assumed fixed there either).
+
+    **Net effect on the usability concern this was written to address**:
+    decode-side cost is real and solved. Prefill-side cost -- the larger
+    of the two per the historical-performance record
+    (``notes/2026-08-02-qwen36-historical-performance-record.md``: TTFT
+    was 60-70% of the historical gap to vLLM, decode step time only
+    10-15%) -- is UNRESOLVED. Whoever picks this up next should not
+    assume this class fixes prefill JIT cost; it should be re-profiled
+    first, and if the ``_tensor_meta_key`` reading above is right that
+    this "shouldn't" be happening, that contradiction itself is worth
+    handing to whoever owns the sparkinfer relationship (this runtime's
+    hard constraint is read-only/profiling against sparkinfer, never
+    patching it -- see ``AGENTS.md``).
     """
 
     def __init__(
