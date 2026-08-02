@@ -1,8 +1,16 @@
-# 交接给 SparkInfer:GDN 多步融合 kernel
+# GDN 多步融合 kernel — 规格（原为交接单）
 
-日期：2026-08-02 · 状态：📤 待转交 · 提出方：BlackweLLM
+日期：2026-08-02 · 状态：🔧 **自己实现**（约束已解除）· 提出方：BlackweLLM
 
-> 本仓库的硬约束是**不直接改 sparkinfer 源码**，需要的改动写成交接单。这是一份。
+> ⚠️ **本文最初写成"交接给 SparkInfer"的转交件**，因为当时的规则是不直接改 sparkinfer
+> 源码。**该规则已于 2026-08-02 解除**——用户明确说 sparkinfer 可以直接改。
+>
+> 所以这份文档现在是**实现规格**，不是转交件。内容照旧有效：问题定义、实测数字、
+> 验收判据都不因谁来做而改变。
+>
+> 实现约束：`/home/bot/project/sparkinfer` 的 `origin`（`jieen1/sparkinfer`）是我们的
+> fork，改动进 `origin/master`；`upstream`（`local-inference-lab`）不碰。仍在独立
+> worktree 干活再合并。
 
 ## 一句话
 

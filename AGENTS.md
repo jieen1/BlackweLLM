@@ -127,12 +127,17 @@ valid for cold-prefill performance, OOM/memory-pressure limits, or any
 `max_model_len`, quantization backend) — those are fixed when the model loads and
 require a fresh process.
 
-## External dependencies you must not edit directly
+## External dependencies
 
-- **SparkInfer** (`/home/bot/project/sparkinfer`) — SM120 kernel library, owned by
-  a separate team. Read-only profiling is fine; **source changes must be written
-  up and handed over, not made in place.** Note that the current performance
-  numbers depend on local gating patches that are not upstream yet (roadmap T0-5).
+- **SparkInfer** (`/home/bot/project/sparkinfer`) — SM120 kernel library.
+  **Directly editable as of 2026-08-02**, superseding the earlier hand-it-over
+  rule. `origin` is `jieen1/sparkinfer`, this project's own fork, and is where
+  changes go; `upstream` is `local-inference-lab/sparkinfer` and is not ours.
+  Work in a worktree and merge, as with this repo — sparkinfer has its own
+  branch rhythm and has collided with in-flight branch switches before, so
+  check `git status` and `git log` before starting. Note that the current
+  performance numbers depend on local gating patches that are not upstream yet
+  (roadmap T0-5).
 
 ## Coding style
 
