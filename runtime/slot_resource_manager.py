@@ -33,13 +33,18 @@ in sync with it forever) to decide how to answer ``reconcile_prefix_hit``/
   is the honest thing to do here -- pretending to support a merge whose
   shape nothing has decided yet would be worse than refusing outright.
 
-Not wired into ``server/engine.py``. That is step 7-g, which this task
-explicitly stops short of (docs/a3-cache-coordinator-design.md §7's own
-note: 7-g is the one step in this migration with a real behavior change,
-and the point of 7-a through 7-e is to shrink its blast radius as much as
-possible before it is attempted on its own). This class exists, is tested
-against fakes and against the real ``ArchitectureSpec``/``LagunaBackend``
-pairing, but nothing in production constructs it yet.
+Wired into ``server/engine.py`` as of step 7-g
+(docs/a3-cache-coordinator-design.md §7 row 7-g): ``ServerEngine.
+slot_resources`` constructs one of these (bound to ``self.runner``/
+``self.architecture_spec``) on every access, and the admission block's two
+``capabilities.prefix_cache`` call sites (``find_best_slot_for_prompt``,
+``reconcile_prefix_hit``) read it instead of calling ``self.runner``
+directly. Every production checkpoint's ``needs_two_cache_families`` is
+still ``False`` today, so this remains a pure forward in practice -- 7-g
+made the call path real without changing what any call answers (its own
+gate is the shadow-consistency claim this module's tests already made,
+plus the same claim re-checked at the wiring boundary in
+``tests/test_engine_prefix_cache_admission.py``).
 """
 
 from __future__ import annotations

@@ -29,8 +29,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from runtime.architecture import ArchitectureSpec, parse_architecture
 from runtime.model_registry import IMPLEMENTED_BACKENDS
 from runtime.sampling import SamplingParams
+from runtime.slot_resource_manager import SlotResourceManager
 from server.formats.stop import find_earliest_stop_match, trim_ambiguous_stop_tail
 from server.formats.stream import StreamProcessor
 from server.tracing import tracer
@@ -47,6 +49,42 @@ _STOP_TRACKER_THINKING_CAPABLE = False
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("SM120_GQA_USE_V2_DECODE_KERNEL", "1")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+
+# A3 step 7-g (docs/a3-cache-coordinator-design.md §7 row 7-g): fallback for
+# constructing a ServerEngine without an explicit `architecture_spec` --
+# every existing test does this (they either never reach model loading, or
+# hand ServerEngine a fake runner directly, bypassing `_load_laguna_model`
+# entirely), and `server/app.py`'s production `lifespan()` is the only
+# caller that has a real one to pass (`resolve_checkpoint(...).spec`).
+#
+# `SlotResourceManager.__init__` requires a real `ArchitectureSpec` -- it has
+# no `None` case (see `tests/test_slot_resource_manager.py`, which never
+# constructs one with `None`) -- so `self.architecture_spec` must never be
+# `None` by the time `self.slot_resources` is read. A single paged-KV layer
+# forces `needs_two_cache_families=False`, matching every backend this
+# runtime ships today (`IMPLEMENTED_BACKENDS == frozenset({"laguna"})`,
+# `tests/test_architecture_spec.py::test_laguna_has_no_recurrent_layers`),
+# so the coordinator's pure-forward branch (§5 point 3) is what a caller who
+# does not pass a spec gets -- i.e. the same answer `self.runner` itself
+# would have given directly, never `NotImplementedError`. Built via
+# `parse_architecture` (not a hand-built `ArchitectureSpec(...)`) so it goes
+# through the same validated construction path production checkpoints do,
+# same pattern `tests/test_slot_resource_manager.py`'s own `_spec()` helper
+# uses.
+_DEFAULT_ARCHITECTURE_SPEC: ArchitectureSpec = parse_architecture(
+    {
+        "architectures": ["ServerEngineDefaultForCausalLM"],
+        "model_type": "server-engine-default",
+        "num_hidden_layers": 1,
+        "layer_types": ["full_attention"],
+        "hidden_size": 8,
+        "vocab_size": 16,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+    }
+)
 
 
 # -- D1/C5: Pure detection predicates (extracted for unit-testability) --------
@@ -205,6 +243,18 @@ class ServerEngine:
     production consumer: it resolves ``backend`` from the checkpoint's
     ``config.json`` via ``model_registry.resolve_checkpoint`` rather than
     hardcoding it, and passes the result in here.
+
+    A3 step 7-g (docs/a3-cache-coordinator-design.md §7 row 7-g):
+    ``architecture_spec`` is the same call's ``Resolution.spec`` -- the model
+    structure fact (parsed from ``config.json``) that decides whether
+    :attr:`slot_resources` (a :class:`runtime.slot_resource_manager.
+    SlotResourceManager`) needs a second cache-family allocator. ``None``
+    (the default -- every test today, since none of them constructs a real
+    ``ArchitectureSpec``) falls back to ``_DEFAULT_ARCHITECTURE_SPEC``, a
+    single-paged-KV-layer stand-in that forces
+    ``needs_two_cache_families=False``, matching every backend this runtime
+    ships (Laguna). See that module-level constant's own comment for why
+    this must never be ``None`` by the time :attr:`slot_resources` is read.
     """
 
     def __init__(
@@ -212,6 +262,7 @@ class ServerEngine:
         *,
         model: str = "poolside/Laguna-S-2.1-NVFP4",
         backend: str = "laguna",
+        architecture_spec: ArchitectureSpec | None = None,
         capacity: int = 1,
         num_slots: int = 2,
         block_size: int = 64,
@@ -234,6 +285,9 @@ class ServerEngine:
                 f"{sorted(IMPLEMENTED_BACKENDS)}"
             )
         self.backend_name = backend
+        self.architecture_spec = (
+            architecture_spec if architecture_spec is not None else _DEFAULT_ARCHITECTURE_SPEC
+        )
         self.enable_dflash = enable_dflash
         self.MODEL = model
         self.K = 0
@@ -419,6 +473,28 @@ class ServerEngine:
         self._prefill_chunk_size = 512
         self._near_tie_margin_diag = None
         self.near_tie_logit_margin = 0.0
+
+    # -- A3 step 7-g: cache coordinator -------------------------------------
+    @property
+    def slot_resources(self) -> SlotResourceManager:
+        """The coordinator admission and the decode round read instead of
+        calling ``self.runner`` directly for the two ``capabilities.
+        prefix_cache`` members (docs/a3-cache-coordinator-design.md §7 row
+        7-g).
+
+        Constructed fresh on every access rather than cached on ``self`` at
+        load time, on purpose: several tests (e.g. ``tests/
+        test_engine_prefix_cache_admission.py``) set ``engine.runner =
+        <fake>`` directly, bypassing ``_load_laguna_model`` entirely, and a
+        cached attribute built once in ``_load_laguna_model`` would then
+        keep pointing at whatever ``self.runner`` was at construction time
+        (``None``) instead of the fake -- silently wrong, not an error.
+        ``SlotResourceManager.__init__`` is two attribute assignments, so
+        rebuilding it per call costs nothing and this property is always
+        "constructed after ``self.runner`` exists" for whatever caller reads
+        it, real load or fake.
+        """
+        return SlotResourceManager(self.runner, self.architecture_spec)
 
     # -- model loading (engine thread only) --------------------------------
     def _load_model(self) -> None:
@@ -1124,9 +1200,14 @@ class ServerEngine:
                 # protocol.py's own module docstring names as the one to
                 # eliminate ("the scheduler must consult that BEFORE calling
                 # into a family -- never try/except AttributeError"; a bare
-                # hasattr probe is the same anti-pattern's sibling).
+                # hasattr probe is the same anti-pattern's sibling). The gate
+                # itself stays on ``self.runner`` (capabilities describe the
+                # backend, not the coordinator -- SlotResourceManager's own
+                # docstring: "Deliberately does NOT re-check ... that gate
+                # belongs to the caller"); only the call once gated moves to
+                # the coordinator (step 7-g).
                 if self.runner.capabilities.prefix_cache and remaining_slots:
-                    best_slot, _hit = self.runner.find_best_slot_for_prompt(
+                    best_slot, _hit = self.slot_resources.find_best_slot_for_prompt(
                         req.prompt_ids,
                         remaining_slots,
                     )
@@ -1145,7 +1226,11 @@ class ServerEngine:
                 # protocol.py); .effective is the length safe to skip prefill
                 # for (== state_hit, never kv_hit -- see PrefixHit's own
                 # docstring and docs/a3-cache-coordinator-design.md §3).
-                hit_depths = [self.runner.reconcile_prefix_hit(p).effective for p in new_prompts]
+                # A3 step 7-g: routed through the coordinator, not
+                # self.runner directly -- see self.slot_resources's docstring.
+                hit_depths = [
+                    self.slot_resources.reconcile_prefix_hit(p).effective for p in new_prompts
+                ]
                 # E2-b: only non-greedy requests carry an entry -- see the
                 # MTP-round call site's identical comment on why a missing
                 # entry preserves prior (greedy) behavior byte-for-byte.
