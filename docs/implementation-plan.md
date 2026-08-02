@@ -557,10 +557,16 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
     接诊断日志，故意让 verify CG 捕获失败或强制走 eager 分支，复现一次）。**如果坐实，修法与 `235f51e`
     完全同构**：给 `enable_dflash()` 声明 `mode="verify"` 的 `prefill_capacity_by_window_left`，warmup
     补一次 `mode="verify"` 的 dummy 调用
-  - [ ] C7-2 把 CUDA Graph 捕获**成功**的可观测性从"默认不可见"提到可查询——不是把日志级别拉到
-    warning 就完事（那只是把噪音换个位置），是把"这次运行 verify/draft CG 到底捕获成功没有"变成
-    `snapshot()`（§3.5.2）或 `/debug/stats` 里的一个字段，跟 `capabilities.cuda_graph` 一起构成
-    Track C2 分级降级判断真正需要的信号
+  - [x] ~~C7-2 把 CUDA Graph 捕获**成功**的可观测性从"默认不可见"提到可查询~~ —— ✅ **已落地并
+    2026-08-02 真机活体复验**（B3 落地代码，本轮 `work/cg-audit-20260802` 复验）：`snapshot()`/
+    `/debug/stats` 的 `dflash_cg_status`（不是把日志级别拉到 warning 就完事，那只是把噪音换个位置）
+    在两个后端、真实 HTTP 服务、真实请求下实测：Qwen3.6 `decode` 捕获成功且新增的
+    `_backend_stats_dbg.decode_graph_replays` 计数器证明一次真实请求的 23/23 个 decode round 全部
+    走 `graph.replay()`；Laguna 生产 DFlash 配置下 `decode`/`draft`/`verify` 三个图全部捕获成功。
+    **顺带确认了一个独立缺陷**：`server.engine`/两个 backend 模块的 logger 从未 `addHandler`，
+    root logger 也从未配置，INFO 级别（含"CUDA Graph captured at load"）永远到不了日志文件，只有
+    WARNING+ 可见——两次真实服务器运行的日志文件逐行核对，一行 `qwen_sm120_server.engine` 的输出都
+    没有。见 [`../notes/2026-08-02-gpu-memory-audit.md`](../notes/2026-08-02-gpu-memory-audit.md)
   - [ ] C7-3 这不只是 DFlash 一处的问题：`investigation-queue.md` C-1（flashinfer #3255）指向的是同一
     类别——warmup/autotune 是否用**生产真实形状**而不是 autotuner 的第一个合成小形状。B0-3（sparkinfer
     paged attention 在 `head_dim=256/gqa_group=6` 下的验证）应显式包含这条检查，不能只测正确性——
@@ -687,9 +693,14 @@ DSpark）。**分两步，先做便宜的那步**：
 
 **F2 · 投机 scratch 显存优化**（来自 `investigation-queue.md` D-3，ReplaySSM Ring Spec-Verify 报告
 11.5 GB → 1.8 GB——**别人的卡、别人的形状，不能当我们的数字用**）：
-- [ ] F2-0 先补一次带日期来源的显存审计（当前并发/上下文配置下的真实占用，与协调者汇报的
-  94.2/97.9 GB 对齐或更新），确认 DFlash 投机 scratch 实际占用多少、KV 实际还剩多少余量——没有这一步，
-  "值不值得做"无法判断
+- [~] F2-0 先补一次带日期来源的显存审计——**2026-08-02 部分完成**（`work/cg-audit-20260802`，
+  [`../notes/2026-08-02-gpu-memory-audit.md`](../notes/2026-08-02-gpu-memory-audit.md)）：权重
+  （69.04 GiB，主模型 66.96 GiB + DFlash draft 2.08 GiB，safetensors 精确求和）和"是否有反量化缓存"
+  （**没有**，代码 + 实测双证）这两项已经坐实，逐项相加对上 nvidia-smi。**仍未完成的部分**：本轮为
+  安全把 `blocks_per_slot` 从生产 4096 降到 128（KV 相关项按比例缩小约 32 倍），**没有在生产规模
+  `blocks_per_slot=4096/capacity=3` 下复现协调者 2026-08-01 汇报的 94.2/97.9 GB**，DFlash 投机
+  scratch 在生产规模下的真实占用、KV 实际余量仍需专门一次运行去测——"值不值得做"仍无法完全判断，
+  但已经排除了"权重本身在悄悄增长"这个混杂因素
 - [ ] F2-1 读 ReplaySSM 的 ring-buffer 技巧具体怎么把 scratch 降下来的，映射到我们自己的
   draft/verify CUDA Graph scratch 分配（`laguna_dflash_cudagraph.py`），判断有多少是**调度/复用层面**
   能拿到（我们做），有多少要动 sparkinfer 的 kernel 内部（转 SparkInfer，按 `AGENTS.md` 规矩写清楚

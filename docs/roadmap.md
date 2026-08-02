@@ -619,7 +619,13 @@ Track A 更急，是因为它们**不依赖 Track A、成本低，且直指本�
   别人的形状，不能当我们的数字用，第一步是补一次带日期来源的本机审计，再判断这个技巧
   有多少能在我们自己的调度/scratch 复用层面拿到（我们做），有多少要动 sparkinfer 的
   kernel 内部（转 SparkInfer，写清楚交接，不直接改源码）。这条的结论应该喂给 Track A 的
-  A3 协调者设计——投机 scratch 迟早要变成 A3 管理的资源类型之一。
+  A3 协调者设计——投机 scratch 迟早要变成 A3 管理的资源类型之一。**2026-08-02 更新**（
+  [`../notes/2026-08-02-gpu-memory-audit.md`](../notes/2026-08-02-gpu-memory-audit.md)）：权重
+  数字重新核实（主模型 66.96 GiB + DFlash draft 2.08 GiB，逐张量精确求和，与上面的 66.8 GB 一致）
+  并**排除了一个混杂因素**——Qwen3.6 有反量化缓存机制（一次前向后常驻涨 ~50 GiB），Laguna **实测确
+  认没有**（`PlainLinear` 从磁盘就是 BF16，MoE 专家直接在 NVFP4 上计算，代码和两次真机测量双重印
+  证）。生产规模（`blocks_per_slot=4096/capacity=3`）下的 94.2/97.9 GB 仍未重新复现，见该笔记"未能
+  验证的事项"。
 - **调度纪律**：这两条不需要 Track A，可以现在做；但都需要真机 GPU 时间，**应优先蹭
   P0-E 第 5 步或 C-LIVE 的 GPU 窗口，不单独申请专用时段**——本机只有一块 GPU，任何需要
   GPU 的验收项天然串行（RK5），这也是 D3 选 (b) 而不是 (a) 的同一条理由。
@@ -712,7 +718,7 @@ drafter + 投机专用 `kv_cache_dtype`）读代码后发现**不完全对**—�
 | RK6 | **依赖链漂移**（torch / cutlass-dsl / sparkinfer / transformers） | 静默变慢或变错 | T0-6 版本合同 + 启动期校验 + CI 锁定；`investigation-queue.md` C-3（PyTorch 2.13.0 wheel 是否带 `sm_120`）**另一 agent 在查，[待验证]，不预判**——若带，自编译要求终结，直接解这条风险 |
 | RK7 | ~~**GPU CI 缺失**~~ | 位精确与性能门禁只能人工跑 | ✅ **2026-08-01 已拍板 (b)**：本地 pre-push 门禁 + 人工签核（理由见 §7 D3）。RK5 补充的"GPU 验收天然串行"是这个选择成立的前提——自托管 runner（选项 a）不解决串行问题，只是把它挪到另一个进程里，还多了排队开销。机制落地见 [`implementation-plan.md`](implementation-plan.md) §7.3/C4 |
 | RK8 | **Qwen3.6 多模态字段** | 文本版 checkpoint 与多模态版共用架构名，加载器可能误判 | A1 的架构校验要显式拒绝带 vision tower 的权重，给明确错误。**2026-08-01 更新**：D6 拍板选了official `nvidia/Qwen3.6-27B-NVFP4`——这份 checkpoint **本身带 vision tower**，所以"拒绝带 vision tower 的权重"这条规则要改窄：不是"config 里出现 `vision_config` 就整体拒绝"，是"接受该 checkpoint，但要求 loader 显式处于 `language_model_only=True` 模式，断言零 vision 张量被实际加载"。这条留给 A1 落地时处理，不改 `architecture.md`，见 [`implementation-plan.md`](implementation-plan.md) §4/C-2 与 §7.1/B0-1b |
-| RK9 | **冷启动/首次真实生产形状路径系统性覆盖不足**（本批新增，2026-08-01） | `235f51e` 修的是"每个未见过的 page-table 宽度都触发 30–100s JIT 重编译"，而这个修复自己的提交记录留了一条**尚未坐实的同类缺口**：DFlash 的 eager verify 回退路径（`mode="verify"`）不在启动期预热覆盖范围内，且 CUDA Graph 捕获**成功**的可观测性目前是 0（只有失败会打 warning，成功只打 info，默认日志配置下不可见）——这不是一次性 bug，是一个模式："首次遇到的真实形状/真实路径"这一类代价一直系统性地被低估，直到真机流量把它暴露出来。`investigation-queue.md` C-1（sparkinfer warmup/autotune 是否用真实形状，另一 agent 在查）与 B0-3（sparkinfer paged attention 的验证范围）都属于同一类别 | 见 [`implementation-plan.md`](implementation-plan.md) §7.3/C7：C7-1（DFlash verify 路径预热覆盖，需 GPU 复现）、C7-2（CUDA Graph 捕获成功可观测性，可蹭 P0-E 第 5 步零增量 GPU 成本）、C7-3（呼应 investigation-queue C-1，纳入 B0-3 的验证范围）|
+| RK9 | **冷启动/首次真实生产形状路径系统性覆盖不足**（本批新增，2026-08-01） | `235f51e` 修的是"每个未见过的 page-table 宽度都触发 30–100s JIT 重编译"，而这个修复自己的提交记录留了一条**尚未坐实的同类缺口**：DFlash 的 eager verify 回退路径（`mode="verify"`）不在启动期预热覆盖范围内，且 CUDA Graph 捕获**成功**的可观测性目前是 0（只有失败会打 warning，成功只打 info，默认日志配置下不可见）——这不是一次性 bug，是一个模式："首次遇到的真实形状/真实路径"这一类代价一直系统性地被低估，直到真机流量把它暴露出来。`investigation-queue.md` C-1（sparkinfer warmup/autotune 是否用真实形状，另一 agent 在查）与 B0-3（sparkinfer paged attention 的验证范围）都属于同一类别 | 见 [`implementation-plan.md`](implementation-plan.md) §7.3/C7：C7-1（DFlash verify 路径预热覆盖，需 GPU 复现）、~~C7-2（CUDA Graph 捕获成功可观测性）~~ ✅ **2026-08-02 已落地并真机活体复验**（两个后端、真实 HTTP 服务，见 [`../notes/2026-08-02-gpu-memory-audit.md`](../notes/2026-08-02-gpu-memory-audit.md)；顺带坐实一个独立缺陷——`server.engine` 的 logger 到不了日志文件，INFO 级别全部丢失）、C7-3（呼应 investigation-queue C-1，纳入 B0-3 的验证范围）|
 
 ---
 

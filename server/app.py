@@ -736,6 +736,20 @@ async def debug_stats():
         # contract), not omitted from the response, so a caller can
         # distinguish "no capture attempted" from "field doesn't exist".
         engine.stats["_cuda_graph_dbg"] = dict(snapshot.dflash_cg_status)
+    # 2026-08-02 CG audit (docs/implementation-plan.md §7.3 C7-2, "activity
+    # confirmation"): `_cuda_graph_dbg` above proves capture succeeded, not
+    # that a real decode round actually replayed the captured graph instead
+    # of silently falling back to eager every time. `Qwen36Backend.stats`
+    # already counts `decode_graph_replays` (runtime/backends/qwen36.py);
+    # surfacing it here turns "did CUDA Graph actually engage for real
+    # traffic" into the same curl-able signal `_cuda_graph_dbg` is, without
+    # inventing a new counter. `getattr` because this is backend-specific --
+    # `LagunaBackend` has no `.stats` attribute at all (its decode-CG replay
+    # path, `runtime/backends/laguna_cuda_graph.py`'s `replay()`, carries no
+    # counter to expose) and must not be assumed present.
+    backend_stats = getattr(engine.runner, "stats", None)
+    if backend_stats is not None:
+        engine.stats["_backend_stats_dbg"] = dict(backend_stats)
     return engine.stats
 
 
