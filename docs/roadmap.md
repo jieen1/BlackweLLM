@@ -204,8 +204,8 @@ R1–R6、R8 已在 2026-08-01 的 Track 0 批次里解决，保留在表里是�
 
 | # | 问题 | 证据 | 归属 |
 |---|---|---|---|
-| N1 | **结构化输出是空壳** | `runtime/structured_output.py` 的 `GrammarState.apply_mask()` / `apply_mask_batch()` 在 `server/engine.py` 里**从未被调用**。`json_object` / `json_schema` 请求会被正常接受，但**完全不约束生成**——静默失败，客户端拿到的是普通文本 | Track E |
-| N2 | **`stop` 序列完全未实现** | 两套协议都是 | Track E |
+| N1 | ~~**结构化输出是空壳**~~ | `runtime/structured_output.py` 的 `GrammarState.apply_mask()` / `apply_mask_batch()` 在 `server/engine.py` 里**从未被调用**。`json_object` / `json_schema` 请求会被正常接受，但**完全不约束生成**——静默失败，客户端拿到的是普通文本 | ✅ **已解决（走"响亮失败"分支，不是"接上"分支）**，2026-08-03 复核。`server/app.py:562` 的 `_reject_unsupported_response_format` 在进引擎前就对 `json_object`/`json_schema` 返回 400，错误信息直说本运行时不强制结构化输出。**原文最危险的性质——静默——已经没有了。** 为什么选拒绝而不是接上，三条阻塞原因记在 `runtime/structured_output.py` 的模块 docstring 里（prefill 锚点 token 是 `laguna.py` 深处的裸 argmax、CG 重放把 argmax 烤进图里、eager 贪心走捷径绕过 `sample_from_logits`）——**重新接线前先复核那三条是否仍成立** |
+| N2 | ~~**`stop` 序列完全未实现**~~ | 两套协议都是 | ✅ **已实现**（2026-08-03 复核）：`server/formats/stop.py` 的 `find_earliest_stop_match` / `trim_ambiguous_stop_tail`，`server/app.py:767` 归一化两套协议的 `stop`/`stop_sequences` 后下发（`max_count=4`） |
 | N3 | **`seed` 语义可疑** | 每个 token 重新播种，而不是推进同一个 generator | Track E |
 | N4 | **bfdiag 的隔离保证可能已经失效** | `bfdiag/checkpoint/state.py` 有一条 `"bug_found_not_fixed"` 手册条目 + 专门的回归测试，指向 `laguna.py:1647,1653` 的张量轴错误。但真实的 `reset_slot` 已被重写（现在 1945-1965），为前缀缓存保留而**完全不再清零 KV 内存**；那两个行号现在指向另一个函数。连带问题：`bfdiag/checkpoint/restore.py` 明确依赖 `reset_slot` 清掉 checkpoint 范围外的残留来保证恢复隔离性。那个回归测试仍然绿，因为它**从不调用真实函数**，只在合成张量上复现抽象的切片 bug 模式 | Track C（**优先**——诊断平台自己说谎比一般 bug 危险） |
 | N5 | **Anthropic 侧拿不到规范形态的 reasoning** | 见 §1.4 | Track E |
