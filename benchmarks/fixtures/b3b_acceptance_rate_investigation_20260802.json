@@ -1,0 +1,7109 @@
+{
+  "model_load_s": 131.07420620101038,
+  "k_sweep": {
+    "n_tokens": 64,
+    "k_values": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "prompts": {
+      "1": {
+        "prose": {
+          "num_rounds": 42,
+          "accept_rate": 0.5238095238095238,
+          "mean_accepted_per_round": 0.5238095238095238,
+          "spec_tokens_per_sec": 4.7996263938316135,
+          "ref_tokens_per_sec": 5.9453188602303,
+          "speedup": 0.8072950344072367,
+          "tokens_match": true,
+          "first_diff_index": null,
+          "reject_position_histogram": {
+            "0": 20,
+            "full_accept": 22
+          },
+          "position_accuracy": [
+            0.5238095238095238
+          ],
+          "rounds": [
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3199520309572108
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.3231285830261186
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.34892128803767264
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3331822020118125
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.3267964590340853
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.3452169480151497
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.33591587998671457
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3240829110145569
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.32554034801432863
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3736951479804702
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3498523829621263
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.3592378979665227
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.34653742000227794
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3572982149780728
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3594319219700992
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3284945720224641
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.3041934379725717
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.3106932580121793
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.28037803201004863
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.27564887201879174
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.265548421011772
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.2987442179583013
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.29113146604504436
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.30601440399186686
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.29527453100308776
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.29366939200554043
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.30344883503858
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.304211939976085
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.26079377700807527
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.27825145999668166
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.2747533600195311
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.3019945050473325
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.2867923289886676
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3038963960134424
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.29454268695553765
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.29184000805253163
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.29280582402134314
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.28530884603969753
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3027412890223786
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.2879285600502044
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.27971076703397557
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.28560634597670287
+            }
+          ]
+        },
+        "code": {
+          "num_rounds": 36,
+          "accept_rate": 0.7777777777777778,
+          "mean_accepted_per_round": 0.7777777777777778,
+          "spec_tokens_per_sec": 5.801684669808133,
+          "ref_tokens_per_sec": 6.288264137618638,
+          "speedup": 0.922621019543436,
+          "tokens_match": true,
+          "first_diff_index": null,
+          "reject_position_histogram": {
+            "0": 8,
+            "full_accept": 28
+          },
+          "position_accuracy": [
+            0.7777777777777778
+          ],
+          "rounds": [
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.27064967300975695
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.29618734202813357
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.32104951597284526
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.2837000950239599
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.31041390396421775
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.2880573869915679
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.32625351700698957
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.28216770599829033
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.2997080630157143
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.26965495699550956
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3066369399894029
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.27801161201205105
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.29378842300502583
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.2867986080236733
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.3027741269906983
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.30097746499814093
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.28452954499516636
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3038223899784498
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.3044390630093403
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.30569825100246817
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.31044057302642614
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.28255335200810805
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.30707041500136256
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.304386377974879
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.31715114502003416
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3234433410107158
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.298967566981446
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.29602476803120226
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.28482005099067464
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3391087270574644
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.32795241702115163
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.2816357859992422
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.29605278302915394
+            },
+            {
+              "k": 1,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false
+              ],
+              "round_s": 0.27451547497184947
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.2885899340035394
+            },
+            {
+              "k": 1,
+              "num_accepted": 1,
+              "rejected_at": null,
+              "match_vector": [
+                true
+              ],
+              "round_s": 0.3037833599955775
+            }
+          ]
+        }
+      },
+      "2": {
+        "prose": {
+          "num_rounds": 31,
+          "accept_rate": 0.5161290322580645,
+          "mean_accepted_per_round": 1.032258064516129,
+          "spec_tokens_per_sec": 6.185107703690392,
+          "ref_tokens_per_sec": 5.9453188602303,
+          "speedup": 1.0403323773034443,
+          "tokens_match": true,
+          "first_diff_index": null,
+          "reject_position_histogram": {
+            "0": 12,
+            "1": 6,
+            "full_accept": 13
+          },
+          "position_accuracy": [
+            0.6129032258064516,
+            0.6451612903225806
+          ],
+          "rounds": [
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.34370791201945394
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.35572092997608706
+            },
+            {
+              "k": 2,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false
+              ],
+              "round_s": 0.3344486309797503
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false
+              ],
+              "round_s": 0.3599665949586779
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.2885658559971489
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.3284471809747629
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false
+              ],
+              "round_s": 0.3062727880314924
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.3084461669786833
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false
+              ],
+              "round_s": 0.2996900620055385
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.31876024295343086
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.3073621289804578
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.31766565702855587
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.31531838001683354
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.3315717850346118
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false
+              ],
+              "round_s": 0.3128796929959208
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.3049423029879108
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false
+              ],
+              "round_s": 0.352051148947794
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.3065948690054938
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.30851134203840047
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.30648870405275375
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.31006493902532384
+            },
+            {
+              "k": 2,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false
+              ],
+              "round_s": 0.34582938498351723
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.329217768041417
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.3054957949789241
+            },
+            {
+              "k": 2,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false
+              ],
+              "round_s": 0.34190296597080305
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.308898628980387
+            },
+            {
+              "k": 2,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false
+              ],
+              "round_s": 0.3346110809943639
+            },
+            {
+              "k": 2,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false
+              ],
+              "round_s": 0.33738008700311184
+            },
+            {
+              "k": 2,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false
+              ],
+              "round_s": 0.32357861095806584
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.34595074399840087
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.3228687329683453
+            }
+          ]
+        },
+        "code": {
+          "num_rounds": 29,
+          "accept_rate": 0.5862068965517241,
+          "mean_accepted_per_round": 1.1724137931034482,
+          "spec_tokens_per_sec": 6.656106196721935,
+          "ref_tokens_per_sec": 6.288264137618638,
+          "speedup": 1.058496597956618,
+          "tokens_match": false,
+          "first_diff_index": 2,
+          "reject_position_histogram": {
+            "0": 11,
+            "1": 2,
+            "full_accept": 16
+          },
+          "position_accuracy": [
+            0.6206896551724138,
+            0.8620689655172413
+          ],
+          "rounds": [
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.2920570290298201
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.27061183500336483
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.2850496140308678
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.3305757030029781
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.34469792002346367
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false
+              ],
+              "round_s": 0.309303457965143
+            },
+            {
+              "k": 2,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false
+              ],
+              "round_s": 0.3673982619657181
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.6735305329784751
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.33907929697306827
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.3075811699964106
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.2986588699859567
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.31512644805479795
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.29226985498098657
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.2848139639827423
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.3039069990045391
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.3024755819933489
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false
+              ],
+              "round_s": 0.26783713698387146
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.28029612702084705
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.2819018029840663
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.31478699803119525
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.320486249984242
+            },
+            {
+              "k": 2,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false
+              ],
+              "round_s": 0.31841999798780307
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.2978822360164486
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.2981683150283061
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.31407837802544236
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.313732692040503
+            },
+            {
+              "k": 2,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true
+              ],
+              "round_s": 0.3263013339601457
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.34776767500443384
+            },
+            {
+              "k": 2,
+              "num_accepted": 2,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true
+              ],
+              "round_s": 0.31381612399127334
+            }
+          ]
+        }
+      },
+      "4": {
+        "prose": {
+          "num_rounds": 28,
+          "accept_rate": 0.32142857142857145,
+          "mean_accepted_per_round": 1.2857142857142858,
+          "spec_tokens_per_sec": 6.057755504031365,
+          "ref_tokens_per_sec": 5.9453188602303,
+          "speedup": 1.018911793706,
+          "tokens_match": true,
+          "first_diff_index": null,
+          "reject_position_histogram": {
+            "0": 12,
+            "1": 5,
+            "2": 4,
+            "3": 5,
+            "full_accept": 2
+          },
+          "position_accuracy": [
+            0.5714285714285714,
+            0.6428571428571429,
+            0.5714285714285714,
+            0.39285714285714285
+          ],
+          "rounds": [
+            {
+              "k": 4,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false
+              ],
+              "round_s": 0.3836047950317152
+            },
+            {
+              "k": 4,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                false
+              ],
+              "round_s": 0.35270707303425297
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.39186137495562434
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                false
+              ],
+              "round_s": 0.38492955500259995
+            },
+            {
+              "k": 4,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.3911531009944156
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.31952152302255854
+            },
+            {
+              "k": 4,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.41000540502136573
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                true,
+                false
+              ],
+              "round_s": 0.3542285820003599
+            },
+            {
+              "k": 4,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.33939659799216315
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                false
+              ],
+              "round_s": 0.3557684429688379
+            },
+            {
+              "k": 4,
+              "num_accepted": 4,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.38457099901279435
+            },
+            {
+              "k": 4,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false
+              ],
+              "round_s": 0.3547136160195805
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                true,
+                true
+              ],
+              "round_s": 0.3516486450098455
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                false,
+                true
+              ],
+              "round_s": 0.357835337985307
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.4133990859845653
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                false,
+                true
+              ],
+              "round_s": 0.4224886650335975
+            },
+            {
+              "k": 4,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false
+              ],
+              "round_s": 0.3937204420217313
+            },
+            {
+              "k": 4,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false
+              ],
+              "round_s": 0.37012173898983747
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.35991907003335655
+            },
+            {
+              "k": 4,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.3388365210266784
+            },
+            {
+              "k": 4,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.33470547501929104
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.3689439399749972
+            },
+            {
+              "k": 4,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                true
+              ],
+              "round_s": 0.3476697099977173
+            },
+            {
+              "k": 4,
+              "num_accepted": 4,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.3462779050460085
+            },
+            {
+              "k": 4,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.33087866596179083
+            },
+            {
+              "k": 4,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                true
+              ],
+              "round_s": 0.357888838974759
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                false
+              ],
+              "round_s": 0.35968952102120966
+            },
+            {
+              "k": 4,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false
+              ],
+              "round_s": 0.37225135299377143
+            }
+          ]
+        },
+        "code": {
+          "num_rounds": 18,
+          "accept_rate": 0.625,
+          "mean_accepted_per_round": 2.5,
+          "spec_tokens_per_sec": 9.276467037204045,
+          "ref_tokens_per_sec": 6.288264137618638,
+          "speedup": 1.475203145763059,
+          "tokens_match": false,
+          "first_diff_index": 23,
+          "reject_position_histogram": {
+            "0": 3,
+            "1": 2,
+            "2": 3,
+            "3": 3,
+            "full_accept": 7
+          },
+          "position_accuracy": [
+            0.8333333333333334,
+            0.8333333333333334,
+            0.6111111111111112,
+            0.4444444444444444
+          ],
+          "rounds": [
+            {
+              "k": 4,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                true
+              ],
+              "round_s": 0.3908886850113049
+            },
+            {
+              "k": 4,
+              "num_accepted": 4,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.3785619619884528
+            },
+            {
+              "k": 4,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.34202195605030283
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.4080882410053164
+            },
+            {
+              "k": 4,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.40334521600743756
+            },
+            {
+              "k": 4,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false
+              ],
+              "round_s": 0.49643502302933484
+            },
+            {
+              "k": 4,
+              "num_accepted": 4,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.3545321080018766
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.36821207602042705
+            },
+            {
+              "k": 4,
+              "num_accepted": 4,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.3690996879595332
+            },
+            {
+              "k": 4,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.34544349694624543
+            },
+            {
+              "k": 4,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false
+              ],
+              "round_s": 0.34811134199844673
+            },
+            {
+              "k": 4,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.3647999269887805
+            },
+            {
+              "k": 4,
+              "num_accepted": 4,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.3786105720209889
+            },
+            {
+              "k": 4,
+              "num_accepted": 4,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.3534265930065885
+            },
+            {
+              "k": 4,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false
+              ],
+              "round_s": 0.31773206702200696
+            },
+            {
+              "k": 4,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.3225117669790052
+            },
+            {
+              "k": 4,
+              "num_accepted": 4,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.3211404799949378
+            },
+            {
+              "k": 4,
+              "num_accepted": 4,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.3431701700319536
+            }
+          ]
+        }
+      },
+      "8": {
+        "prose": {
+          "num_rounds": 27,
+          "accept_rate": 0.1712962962962963,
+          "mean_accepted_per_round": 1.3703703703703705,
+          "spec_tokens_per_sec": 5.6186496728704345,
+          "ref_tokens_per_sec": 5.9453188602303,
+          "speedup": 0.9450543873188979,
+          "tokens_match": true,
+          "first_diff_index": null,
+          "reject_position_histogram": {
+            "0": 11,
+            "1": 5,
+            "2": 4,
+            "3": 4,
+            "4": 3,
+            "5": 0,
+            "6": 0,
+            "7": 0,
+            "full_accept": 0
+          },
+          "position_accuracy": [
+            0.5925925925925926,
+            0.6296296296296297,
+            0.5925925925925926,
+            0.4444444444444444,
+            0.3333333333333333,
+            0.37037037037037035,
+            0.3333333333333333,
+            0.25925925925925924
+          ],
+          "rounds": [
+            {
+              "k": 8,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.39746971998829395
+            },
+            {
+              "k": 8,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.3921870510093868
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                true
+              ],
+              "round_s": 0.4643411130527966
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.40646830800687894
+            },
+            {
+              "k": 8,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false
+              ],
+              "round_s": 0.4368510639760643
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.42902584798866883
+            },
+            {
+              "k": 8,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false
+              ],
+              "round_s": 0.41242120100650936
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.3769064390216954
+            },
+            {
+              "k": 8,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.3754877400351688
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.3842306840233505
+            },
+            {
+              "k": 8,
+              "num_accepted": 4,
+              "rejected_at": 4,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false
+              ],
+              "round_s": 0.3736212059739046
+            },
+            {
+              "k": 8,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.4005851789843291
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                true,
+                true,
+                false,
+                true,
+                false,
+                true
+              ],
+              "round_s": 0.3915277970372699
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                false,
+                true,
+                false,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.43809020397020504
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false
+              ],
+              "round_s": 0.4198634590138681
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.4084223709651269
+            },
+            {
+              "k": 8,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+                true,
+                true
+              ],
+              "round_s": 0.4277795099769719
+            },
+            {
+              "k": 8,
+              "num_accepted": 4,
+              "rejected_at": 4,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false
+              ],
+              "round_s": 0.401855071017053
+            },
+            {
+              "k": 8,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.4186334969708696
+            },
+            {
+              "k": 8,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.4488831809721887
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.4263136889785528
+            },
+            {
+              "k": 8,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.4481204419862479
+            },
+            {
+              "k": 8,
+              "num_accepted": 4,
+              "rejected_at": 4,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.40602684998884797
+            },
+            {
+              "k": 8,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.37402408802881837
+            },
+            {
+              "k": 8,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.40071985498070717
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.42766467202454805
+            },
+            {
+              "k": 8,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                false
+              ],
+              "round_s": 0.4343046929570846
+            }
+          ]
+        },
+        "code": {
+          "num_rounds": 22,
+          "accept_rate": 0.23863636363636365,
+          "mean_accepted_per_round": 1.9090909090909092,
+          "spec_tokens_per_sec": 6.614660830010649,
+          "ref_tokens_per_sec": 6.288264137618638,
+          "speedup": 1.0519056905449296,
+          "tokens_match": false,
+          "first_diff_index": 2,
+          "reject_position_histogram": {
+            "0": 8,
+            "1": 4,
+            "2": 2,
+            "3": 3,
+            "4": 3,
+            "5": 1,
+            "6": 0,
+            "7": 0,
+            "full_accept": 1
+          },
+          "position_accuracy": [
+            0.6363636363636364,
+            0.7272727272727273,
+            0.8181818181818182,
+            0.5909090909090909,
+            0.4090909090909091,
+            0.36363636363636365,
+            0.5,
+            0.7272727272727273
+          ],
+          "rounds": [
+            {
+              "k": 8,
+              "num_accepted": 5,
+              "rejected_at": 5,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.4139220230281353
+            },
+            {
+              "k": 8,
+              "num_accepted": 4,
+              "rejected_at": 4,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.41058895096648484
+            },
+            {
+              "k": 8,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                false,
+                false,
+                false,
+                true,
+                true
+              ],
+              "round_s": 0.390898470999673
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                true
+              ],
+              "round_s": 0.425624611962121
+            },
+            {
+              "k": 8,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.400668767048046
+            },
+            {
+              "k": 8,
+              "num_accepted": 4,
+              "rejected_at": 4,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false
+              ],
+              "round_s": 0.4792104719672352
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.39463552698725834
+            },
+            {
+              "k": 8,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.37414316803915426
+            },
+            {
+              "k": 8,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.43877358199097216
+            },
+            {
+              "k": 8,
+              "num_accepted": 8,
+              "rejected_at": null,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.46750156598864123
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                true
+              ],
+              "round_s": 0.4055074480129406
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.4055330820265226
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                true
+              ],
+              "round_s": 0.4569426500238478
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+                true
+              ],
+              "round_s": 0.4544336899998598
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true
+              ],
+              "round_s": 0.44356286694528535
+            },
+            {
+              "k": 8,
+              "num_accepted": 4,
+              "rejected_at": 4,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.41854046104708686
+            },
+            {
+              "k": 8,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                false,
+                true,
+                true,
+                false,
+                true,
+                true
+              ],
+              "round_s": 0.4308787589543499
+            },
+            {
+              "k": 8,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.47139523597434163
+            },
+            {
+              "k": 8,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false
+              ],
+              "round_s": 0.44588472199393436
+            },
+            {
+              "k": 8,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.4168797140009701
+            },
+            {
+              "k": 8,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.43935877399053425
+            },
+            {
+              "k": 8,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.4023698680102825
+            }
+          ]
+        }
+      },
+      "16": {
+        "prose": {
+          "num_rounds": 28,
+          "accept_rate": 0.08035714285714286,
+          "mean_accepted_per_round": 1.2857142857142858,
+          "spec_tokens_per_sec": 3.8588275113874793,
+          "ref_tokens_per_sec": 5.9453188602303,
+          "speedup": 0.6490530789189669,
+          "tokens_match": true,
+          "first_diff_index": null,
+          "reject_position_histogram": {
+            "0": 12,
+            "1": 5,
+            "2": 4,
+            "3": 5,
+            "4": 2,
+            "5": 0,
+            "6": 0,
+            "7": 0,
+            "8": 0,
+            "9": 0,
+            "10": 0,
+            "11": 0,
+            "12": 0,
+            "13": 0,
+            "14": 0,
+            "15": 0,
+            "full_accept": 0
+          },
+          "position_accuracy": [
+            0.5714285714285714,
+            0.6428571428571429,
+            0.5714285714285714,
+            0.39285714285714285,
+            0.4642857142857143,
+            0.35714285714285715,
+            0.39285714285714285,
+            0.35714285714285715,
+            0.32142857142857145,
+            0.39285714285714285,
+            0.39285714285714285,
+            0.35714285714285715,
+            0.39285714285714285,
+            0.42857142857142855,
+            0.2857142857142857,
+            0.39285714285714285
+          ],
+          "rounds": [
+            {
+              "k": 16,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.5807131989859045
+            },
+            {
+              "k": 16,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.6164743949775584
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.579334296984598
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true
+              ],
+              "round_s": 0.5521212660241872
+            },
+            {
+              "k": 16,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.5455368620459922
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.6143749349866994
+            },
+            {
+              "k": 16,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.5271318490267731
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.5959719920065254
+            },
+            {
+              "k": 16,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+                false,
+                true,
+                false,
+                true,
+                true
+              ],
+              "round_s": 0.5386738610104658
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.832140858983621
+            },
+            {
+              "k": 16,
+              "num_accepted": 4,
+              "rejected_at": 4,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.5939117500092834
+            },
+            {
+              "k": 16,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+                true
+              ],
+              "round_s": 0.5871399819734506
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                true,
+                true,
+                false,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true,
+                false
+              ],
+              "round_s": 0.507941865012981
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                false,
+                true,
+                false,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.5518056259606965
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false
+              ],
+              "round_s": 0.4558010480250232
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                false,
+                true
+              ],
+              "round_s": 0.5637909320066683
+            },
+            {
+              "k": 16,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+                true,
+                true,
+                false,
+                true,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.5967779229977168
+            },
+            {
+              "k": 16,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.619175802974496
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                false,
+                false,
+                true,
+                false,
+                true,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true,
+                false,
+                true,
+                true
+              ],
+              "round_s": 0.5818397150142118
+            },
+            {
+              "k": 16,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+                true,
+                false,
+                true
+              ],
+              "round_s": 0.5627111250068992
+            },
+            {
+              "k": 16,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.5927588059566915
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true
+              ],
+              "round_s": 0.6505496500176378
+            },
+            {
+              "k": 16,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                true,
+                false,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+                false,
+                true,
+                false,
+                true
+              ],
+              "round_s": 0.5531857699970715
+            },
+            {
+              "k": 16,
+              "num_accepted": 4,
+              "rejected_at": 4,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.5855060589965433
+            },
+            {
+              "k": 16,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                true,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.5717818010016344
+            },
+            {
+              "k": 16,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.5202271220041439
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                false,
+                true,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false
+              ],
+              "round_s": 0.6253115229774266
+            },
+            {
+              "k": 16,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                true
+              ],
+              "round_s": 0.6116835909779184
+            }
+          ]
+        },
+        "code": {
+          "num_rounds": 17,
+          "accept_rate": 0.19117647058823528,
+          "mean_accepted_per_round": 3.0588235294117645,
+          "spec_tokens_per_sec": 6.12053839869401,
+          "ref_tokens_per_sec": 6.288264137618638,
+          "speedup": 0.9733271797663153,
+          "tokens_match": false,
+          "first_diff_index": 23,
+          "reject_position_histogram": {
+            "0": 3,
+            "1": 3,
+            "2": 3,
+            "3": 3,
+            "4": 0,
+            "5": 1,
+            "6": 0,
+            "7": 3,
+            "8": 1,
+            "9": 0,
+            "10": 0,
+            "11": 0,
+            "12": 0,
+            "13": 0,
+            "14": 0,
+            "15": 0,
+            "full_accept": 0
+          },
+          "position_accuracy": [
+            0.8235294117647058,
+            0.7647058823529411,
+            0.6470588235294118,
+            0.7647058823529411,
+            0.8235294117647058,
+            0.6470588235294118,
+            0.5294117647058824,
+            0.5882352941176471,
+            0.47058823529411764,
+            0.29411764705882354,
+            0.5882352941176471,
+            0.6470588235294118,
+            0.5294117647058824,
+            0.4117647058823529,
+            0.29411764705882354,
+            0.5294117647058824
+          ],
+          "rounds": [
+            {
+              "k": 16,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.5631592139834538
+            },
+            {
+              "k": 16,
+              "num_accepted": 5,
+              "rejected_at": 5,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.5635809359955601
+            },
+            {
+              "k": 16,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                true,
+                false,
+                true,
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.527053443947807
+            },
+            {
+              "k": 16,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.5507049210136756
+            },
+            {
+              "k": 16,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.5368132650037296
+            },
+            {
+              "k": 16,
+              "num_accepted": 8,
+              "rejected_at": 8,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true
+              ],
+              "round_s": 0.5875226520001888
+            },
+            {
+              "k": 16,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.5919045319897123
+            },
+            {
+              "k": 16,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false
+              ],
+              "round_s": 0.5727347830543295
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                true,
+                false,
+                true,
+                false,
+                true
+              ],
+              "round_s": 0.5843942430219613
+            },
+            {
+              "k": 16,
+              "num_accepted": 1,
+              "rejected_at": 1,
+              "match_vector": [
+                true,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                true,
+                false,
+                true,
+                false
+              ],
+              "round_s": 0.5726651540026069
+            },
+            {
+              "k": 16,
+              "num_accepted": 7,
+              "rejected_at": 7,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                true,
+                true,
+                true,
+                false,
+                true,
+                true,
+                true,
+                false
+              ],
+              "round_s": 0.6101594759966247
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                false,
+                true,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.6693477740045637
+            },
+            {
+              "k": 16,
+              "num_accepted": 0,
+              "rejected_at": 0,
+              "match_vector": [
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+                true,
+                true,
+                false,
+                false
+              ],
+              "round_s": 0.6035291570005938
+            },
+            {
+              "k": 16,
+              "num_accepted": 3,
+              "rejected_at": 3,
+              "match_vector": [
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.7246133909793571
+            },
+            {
+              "k": 16,
+              "num_accepted": 2,
+              "rejected_at": 2,
+              "match_vector": [
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                false,
+                true
+              ],
+              "round_s": 0.6279786259983666
+            },
+            {
+              "k": 16,
+              "num_accepted": 7,
+              "rejected_at": 7,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false
+              ],
+              "round_s": 0.7082533789798617
+            },
+            {
+              "k": 16,
+              "num_accepted": 7,
+              "rejected_at": 7,
+              "match_vector": [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true
+              ],
+              "round_s": 0.5901262349798344
+            }
+          ]
+        }
+      }
+    }
+  },
+  "teacher_forced": {
+    "n_tokens": 160,
+    "prompts": {
+      "prose": {
+        "n_positions": 159,
+        "accuracy": 0.6289308176100629,
+        "first_quarter_accuracy": 0.5128205128205128,
+        "last_quarter_accuracy": 0.7435897435897436,
+        "close_miss_rate_rank2_5": 0.6779661016949152,
+        "records": [
+          {
+            "i": 0,
+            "pred": 557,
+            "true": 557,
+            "match": true
+          },
+          {
+            "i": 1,
+            "pred": 264,
+            "true": 264,
+            "match": true
+          },
+          {
+            "i": 2,
+            "pred": 2902,
+            "true": 3777,
+            "match": false
+          },
+          {
+            "i": 3,
+            "pred": 855,
+            "true": 7914,
+            "match": false
+          },
+          {
+            "i": 4,
+            "pred": 6725,
+            "true": 6725,
+            "match": true
+          },
+          {
+            "i": 5,
+            "pred": 7366,
+            "true": 8105,
+            "match": false
+          },
+          {
+            "i": 6,
+            "pred": 557,
+            "true": 13,
+            "match": false
+          },
+          {
+            "i": 7,
+            "pred": 3648,
+            "true": 8105,
+            "match": false
+          },
+          {
+            "i": 8,
+            "pred": 557,
+            "true": 557,
+            "match": true
+          },
+          {
+            "i": 9,
+            "pred": 2590,
+            "true": 264,
+            "match": false
+          },
+          {
+            "i": 10,
+            "pred": 21520,
+            "true": 21520,
+            "match": true
+          },
+          {
+            "i": 11,
+            "pred": 10061,
+            "true": 321,
+            "match": false
+          },
+          {
+            "i": 12,
+            "pred": 2993,
+            "true": 2993,
+            "match": true
+          },
+          {
+            "i": 13,
+            "pred": 314,
+            "true": 66949,
+            "match": false
+          },
+          {
+            "i": 14,
+            "pred": 7914,
+            "true": 7914,
+            "match": true
+          },
+          {
+            "i": 15,
+            "pred": 11,
+            "true": 852,
+            "match": false
+          },
+          {
+            "i": 16,
+            "pred": 9939,
+            "true": 9939,
+            "match": true
+          },
+          {
+            "i": 17,
+            "pred": 9862,
+            "true": 310,
+            "match": false
+          },
+          {
+            "i": 18,
+            "pred": 279,
+            "true": 12804,
+            "match": false
+          },
+          {
+            "i": 19,
+            "pred": 491,
+            "true": 279,
+            "match": false
+          },
+          {
+            "i": 20,
+            "pred": 1814,
+            "true": 1814,
+            "match": true
+          },
+          {
+            "i": 21,
+            "pred": 13,
+            "true": 2094,
+            "match": false
+          },
+          {
+            "i": 22,
+            "pred": 1384,
+            "true": 1384,
+            "match": true
+          },
+          {
+            "i": 23,
+            "pred": 13,
+            "true": 13,
+            "match": true
+          },
+          {
+            "i": 24,
+            "pred": 271,
+            "true": 271,
+            "match": true
+          },
+          {
+            "i": 25,
+            "pred": 3833,
+            "true": 3833,
+            "match": true
+          },
+          {
+            "i": 26,
+            "pred": 1834,
+            "true": 1834,
+            "match": true
+          },
+          {
+            "i": 27,
+            "pred": 11,
+            "true": 11,
+            "match": true
+          },
+          {
+            "i": 28,
+            "pred": 1345,
+            "true": 8105,
+            "match": false
+          },
+          {
+            "i": 29,
+            "pred": 557,
+            "true": 13293,
+            "match": false
+          },
+          {
+            "i": 30,
+            "pred": 2414,
+            "true": 421,
+            "match": false
+          },
+          {
+            "i": 31,
+            "pred": 557,
+            "true": 279,
+            "match": false
+          },
+          {
+            "i": 32,
+            "pred": 3594,
+            "true": 13721,
+            "match": false
+          },
+          {
+            "i": 33,
+            "pred": 557,
+            "true": 557,
+            "match": true
+          },
+          {
+            "i": 34,
+            "pred": 12511,
+            "true": 12511,
+            "match": true
+          },
+          {
+            "i": 35,
+            "pred": 1599,
+            "true": 264,
+            "match": false
+          },
+          {
+            "i": 36,
+            "pred": 2330,
+            "true": 2330,
+            "match": true
+          },
+          {
+            "i": 37,
+            "pred": 3377,
+            "true": 3377,
+            "match": true
+          },
+          {
+            "i": 38,
+            "pred": 13,
+            "true": 13,
+            "match": true
+          },
+          {
+            "i": 39,
+            "pred": 561,
+            "true": 561,
+            "match": true
+          },
+          {
+            "i": 40,
+            "pred": 10629,
+            "true": 2919,
+            "match": false
+          },
+          {
+            "i": 41,
+            "pred": 557,
+            "true": 7892,
+            "match": false
+          },
+          {
+            "i": 42,
+            "pred": 557,
+            "true": 557,
+            "match": true
+          },
+          {
+            "i": 43,
+            "pred": 3583,
+            "true": 3583,
+            "match": true
+          },
+          {
+            "i": 44,
+            "pred": 10639,
+            "true": 10639,
+            "match": true
+          },
+          {
+            "i": 45,
+            "pred": 321,
+            "true": 321,
+            "match": true
+          },
+          {
+            "i": 46,
+            "pred": 1017,
+            "true": 10639,
+            "match": false
+          },
+          {
+            "i": 47,
+            "pred": 1056,
+            "true": 11,
+            "match": false
+          },
+          {
+            "i": 48,
+            "pred": 321,
+            "true": 321,
+            "match": true
+          },
+          {
+            "i": 49,
+            "pred": 279,
+            "true": 1599,
+            "match": false
+          },
+          {
+            "i": 50,
+            "pred": 1208,
+            "true": 1208,
+            "match": true
+          },
+          {
+            "i": 51,
+            "pred": 998,
+            "true": 998,
+            "match": true
+          },
+          {
+            "i": 52,
+            "pred": 3583,
+            "true": 3583,
+            "match": true
+          },
+          {
+            "i": 53,
+            "pred": 13633,
+            "true": 13633,
+            "match": true
+          },
+          {
+            "i": 54,
+            "pred": 494,
+            "true": 1521,
+            "match": false
+          },
+          {
+            "i": 55,
+            "pred": 314,
+            "true": 314,
+            "match": true
+          },
+          {
+            "i": 56,
+            "pred": 424,
+            "true": 424,
+            "match": true
+          },
+          {
+            "i": 57,
+            "pred": 13,
+            "true": 13,
+            "match": true
+          },
+          {
+            "i": 58,
+            "pred": 271,
+            "true": 8105,
+            "match": false
+          },
+          {
+            "i": 59,
+            "pred": 6661,
+            "true": 6426,
+            "match": false
+          },
+          {
+            "i": 60,
+            "pred": 310,
+            "true": 310,
+            "match": true
+          },
+          {
+            "i": 61,
+            "pred": 1423,
+            "true": 635,
+            "match": false
+          },
+          {
+            "i": 62,
+            "pred": 2414,
+            "true": 2414,
+            "match": true
+          },
+          {
+            "i": 63,
+            "pred": 310,
+            "true": 883,
+            "match": false
+          },
+          {
+            "i": 64,
+            "pred": 411,
+            "true": 424,
+            "match": false
+          },
+          {
+            "i": 65,
+            "pred": 13,
+            "true": 13,
+            "match": true
+          },
+          {
+            "i": 66,
+            "pred": 271,
+            "true": 271,
+            "match": true
+          },
+          {
+            "i": 67,
+            "pred": 5170,
+            "true": 1465,
+            "match": false
+          },
+          {
+            "i": 68,
+            "pred": 3727,
+            "true": 3727,
+            "match": true
+          },
+          {
+            "i": 69,
+            "pred": 539,
+            "true": 310,
+            "match": false
+          },
+          {
+            "i": 70,
+            "pred": 279,
+            "true": 1353,
+            "match": false
+          },
+          {
+            "i": 71,
+            "pred": 364,
+            "true": 364,
+            "match": true
+          },
+          {
+            "i": 72,
+            "pred": 1928,
+            "true": 5337,
+            "match": false
+          },
+          {
+            "i": 73,
+            "pred": 310,
+            "true": 310,
+            "match": true
+          },
+          {
+            "i": 74,
+            "pred": 1438,
+            "true": 11290,
+            "match": false
+          },
+          {
+            "i": 75,
+            "pred": 411,
+            "true": 411,
+            "match": true
+          },
+          {
+            "i": 76,
+            "pred": 3377,
+            "true": 3377,
+            "match": true
+          },
+          {
+            "i": 77,
+            "pred": 13,
+            "true": 13,
+            "match": true
+          },
+          {
+            "i": 78,
+            "pred": 5339,
+            "true": 1216,
+            "match": false
+          },
+          {
+            "i": 79,
+            "pred": 9218,
+            "true": 9218,
+            "match": true
+          },
+          {
+            "i": 80,
+            "pred": 883,
+            "true": 421,
+            "match": false
+          },
+          {
+            "i": 81,
+            "pred": 557,
+            "true": 1017,
+            "match": false
+          },
+          {
+            "i": 82,
+            "pred": 557,
+            "true": 557,
+            "match": true
+          },
+          {
+            "i": 83,
+            "pred": 264,
+            "true": 264,
+            "match": true
+          },
+          {
+            "i": 84,
+            "pred": 3175,
+            "true": 3175,
+            "match": true
+          },
+          {
+            "i": 85,
+            "pred": 1925,
+            "true": 2993,
+            "match": false
+          },
+          {
+            "i": 86,
+            "pred": 314,
+            "true": 314,
+            "match": true
+          },
+          {
+            "i": 87,
+            "pred": 2919,
+            "true": 2919,
+            "match": true
+          },
+          {
+            "i": 88,
+            "pred": 6179,
+            "true": 3915,
+            "match": false
+          },
+          {
+            "i": 89,
+            "pred": 421,
+            "true": 421,
+            "match": true
+          },
+          {
+            "i": 90,
+            "pred": 1362,
+            "true": 1362,
+            "match": true
+          },
+          {
+            "i": 91,
+            "pred": 1438,
+            "true": 1236,
+            "match": false
+          },
+          {
+            "i": 92,
+            "pred": 264,
+            "true": 279,
+            "match": false
+          },
+          {
+            "i": 93,
+            "pred": 2919,
+            "true": 2919,
+            "match": true
+          },
+          {
+            "i": 94,
+            "pred": 5902,
+            "true": 4101,
+            "match": false
+          },
+          {
+            "i": 95,
+            "pred": 13,
+            "true": 321,
+            "match": false
+          },
+          {
+            "i": 96,
+            "pred": 5902,
+            "true": 5902,
+            "match": true
+          },
+          {
+            "i": 97,
+            "pred": 310,
+            "true": 310,
+            "match": true
+          },
+          {
+            "i": 98,
+            "pred": 6808,
+            "true": 6808,
+            "match": true
+          },
+          {
+            "i": 99,
+            "pred": 470,
+            "true": 13,
+            "match": false
+          },
+          {
+            "i": 100,
+            "pred": 1921,
+            "true": 1921,
+            "match": true
+          },
+          {
+            "i": 101,
+            "pred": 1204,
+            "true": 411,
+            "match": false
+          },
+          {
+            "i": 102,
+            "pred": 3915,
+            "true": 3915,
+            "match": true
+          },
+          {
+            "i": 103,
+            "pred": 557,
+            "true": 557,
+            "match": true
+          },
+          {
+            "i": 104,
+            "pred": 1801,
+            "true": 1546,
+            "match": false
+          },
+          {
+            "i": 105,
+            "pred": 11064,
+            "true": 11064,
+            "match": true
+          },
+          {
+            "i": 106,
+            "pred": 310,
+            "true": 11,
+            "match": false
+          },
+          {
+            "i": 107,
+            "pred": 321,
+            "true": 321,
+            "match": true
+          },
+          {
+            "i": 108,
+            "pred": 424,
+            "true": 1379,
+            "match": false
+          },
+          {
+            "i": 109,
+            "pred": 1208,
+            "true": 1208,
+            "match": true
+          },
+          {
+            "i": 110,
+            "pred": 303,
+            "true": 303,
+            "match": true
+          },
+          {
+            "i": 111,
+            "pred": 279,
+            "true": 279,
+            "match": true
+          },
+          {
+            "i": 112,
+            "pred": 13721,
+            "true": 13721,
+            "match": true
+          },
+          {
+            "i": 113,
+            "pred": 7448,
+            "true": 7448,
+            "match": true
+          },
+          {
+            "i": 114,
+            "pred": 914,
+            "true": 914,
+            "match": true
+          },
+          {
+            "i": 115,
+            "pred": 9652,
+            "true": 9652,
+            "match": true
+          },
+          {
+            "i": 116,
+            "pred": 424,
+            "true": 424,
+            "match": true
+          },
+          {
+            "i": 117,
+            "pred": 13,
+            "true": 13,
+            "match": true
+          },
+          {
+            "i": 118,
+            "pred": 271,
+            "true": 271,
+            "match": true
+          },
+          {
+            "i": 119,
+            "pred": 23953,
+            "true": 23953,
+            "match": true
+          },
+          {
+            "i": 120,
+            "pred": 3272,
+            "true": 3272,
+            "match": true
+          },
+          {
+            "i": 121,
+            "pred": 11,
+            "true": 2503,
+            "match": false
+          },
+          {
+            "i": 122,
+            "pred": 321,
+            "true": 321,
+            "match": true
+          },
+          {
+            "i": 123,
+            "pred": 1179,
+            "true": 3571,
+            "match": false
+          },
+          {
+            "i": 124,
+            "pred": 685,
+            "true": 685,
+            "match": true
+          },
+          {
+            "i": 125,
+            "pred": 440,
+            "true": 440,
+            "match": true
+          },
+          {
+            "i": 126,
+            "pred": 449,
+            "true": 449,
+            "match": true
+          },
+          {
+            "i": 127,
+            "pred": 4374,
+            "true": 4374,
+            "match": true
+          },
+          {
+            "i": 128,
+            "pred": 13,
+            "true": 13,
+            "match": true
+          },
+          {
+            "i": 129,
+            "pred": 1216,
+            "true": 1216,
+            "match": true
+          },
+          {
+            "i": 130,
+            "pred": 6426,
+            "true": 6426,
+            "match": true
+          },
+          {
+            "i": 131,
+            "pred": 310,
+            "true": 310,
+            "match": true
+          },
+          {
+            "i": 132,
+            "pred": 279,
+            "true": 1236,
+            "match": false
+          },
+          {
+            "i": 133,
+            "pred": 780,
+            "true": 780,
+            "match": true
+          },
+          {
+            "i": 134,
+            "pred": 1765,
+            "true": 1765,
+            "match": true
+          },
+          {
+            "i": 135,
+            "pred": 2243,
+            "true": 2919,
+            "match": false
+          },
+          {
+            "i": 136,
+            "pred": 3915,
+            "true": 3915,
+            "match": true
+          },
+          {
+            "i": 137,
+            "pred": 13,
+            "true": 1608,
+            "match": false
+          },
+          {
+            "i": 138,
+            "pred": 1010,
+            "true": 1010,
+            "match": true
+          },
+          {
+            "i": 139,
+            "pred": 4145,
+            "true": 4145,
+            "match": true
+          },
+          {
+            "i": 140,
+            "pred": 7009,
+            "true": 7009,
+            "match": true
+          },
+          {
+            "i": 141,
+            "pred": 421,
+            "true": 421,
+            "match": true
+          },
+          {
+            "i": 142,
+            "pred": 998,
+            "true": 551,
+            "match": false
+          },
+          {
+            "i": 143,
+            "pred": 995,
+            "true": 1362,
+            "match": false
+          },
+          {
+            "i": 144,
+            "pred": 1423,
+            "true": 1423,
+            "match": true
+          },
+          {
+            "i": 145,
+            "pred": 6497,
+            "true": 6497,
+            "match": true
+          },
+          {
+            "i": 146,
+            "pred": 13,
+            "true": 13,
+            "match": true
+          },
+          {
+            "i": 147,
+            "pred": 1216,
+            "true": 1216,
+            "match": true
+          },
+          {
+            "i": 148,
+            "pred": 7157,
+            "true": 1429,
+            "match": false
+          },
+          {
+            "i": 149,
+            "pred": 11840,
+            "true": 449,
+            "match": false
+          },
+          {
+            "i": 150,
+            "pred": 2235,
+            "true": 2235,
+            "match": true
+          },
+          {
+            "i": 151,
+            "pred": 15162,
+            "true": 11840,
+            "match": false
+          },
+          {
+            "i": 152,
+            "pred": 16002,
+            "true": 16002,
+            "match": true
+          },
+          {
+            "i": 153,
+            "pred": 11,
+            "true": 11,
+            "match": true
+          },
+          {
+            "i": 154,
+            "pred": 1010,
+            "true": 1010,
+            "match": true
+          },
+          {
+            "i": 155,
+            "pred": 9002,
+            "true": 9002,
+            "match": true
+          },
+          {
+            "i": 156,
+            "pred": 11,
+            "true": 11,
+            "match": true
+          },
+          {
+            "i": 157,
+            "pred": 321,
+            "true": 321,
+            "match": true
+          },
+          {
+            "i": 158,
+            "pred": 1010,
+            "true": 1010,
+            "match": true
+          }
+        ]
+      },
+      "code": {
+        "n_positions": 159,
+        "accuracy": 0.8238993710691824,
+        "first_quarter_accuracy": 0.7692307692307693,
+        "last_quarter_accuracy": 0.8461538461538461,
+        "close_miss_rate_rank2_5": 0.6428571428571429,
+        "records": [
+          {
+            "i": 0,
+            "pred": 1393,
+            "true": 1393,
+            "match": true
+          },
+          {
+            "i": 1,
+            "pred": 471,
+            "true": 12,
+            "match": false
+          },
+          {
+            "i": 2,
+            "pred": 16,
+            "true": 16,
+            "match": true
+          },
+          {
+            "i": 3,
+            "pred": 8,
+            "true": 8,
+            "match": true
+          },
+          {
+            "i": 4,
+            "pred": 478,
+            "true": 478,
+            "match": true
+          },
+          {
+            "i": 5,
+            "pred": 73111,
+            "true": 73111,
+            "match": true
+          },
+          {
+            "i": 6,
+            "pred": 1393,
+            "true": 1393,
+            "match": true
+          },
+          {
+            "i": 7,
+            "pred": 12,
+            "true": 12,
+            "match": true
+          },
+          {
+            "i": 8,
+            "pred": 17,
+            "true": 17,
+            "match": true
+          },
+          {
+            "i": 9,
+            "pred": 8,
+            "true": 8,
+            "match": true
+          },
+          {
+            "i": 10,
+            "pred": 271,
+            "true": 271,
+            "match": true
+          },
+          {
+            "i": 11,
+            "pred": 727,
+            "true": 727,
+            "match": true
+          },
+          {
+            "i": 12,
+            "pred": 4406,
+            "true": 1822,
+            "match": false
+          },
+          {
+            "i": 13,
+            "pred": 4406,
+            "true": 4406,
+            "match": true
+          },
+          {
+            "i": 14,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 15,
+            "pred": 262,
+            "true": 262,
+            "match": true
+          },
+          {
+            "i": 16,
+            "pred": 307,
+            "true": 307,
+            "match": true
+          },
+          {
+            "i": 17,
+            "pred": 36256,
+            "true": 283,
+            "match": false
+          },
+          {
+            "i": 18,
+            "pred": 514,
+            "true": 514,
+            "match": true
+          },
+          {
+            "i": 19,
+            "pred": 5216,
+            "true": 5216,
+            "match": true
+          },
+          {
+            "i": 20,
+            "pred": 437,
+            "true": 437,
+            "match": true
+          },
+          {
+            "i": 21,
+            "pred": 478,
+            "true": 6072,
+            "match": false
+          },
+          {
+            "i": 22,
+            "pred": 279,
+            "true": 264,
+            "match": false
+          },
+          {
+            "i": 23,
+            "pred": 1324,
+            "true": 1324,
+            "match": true
+          },
+          {
+            "i": 24,
+            "pred": 25,
+            "true": 25,
+            "match": true
+          },
+          {
+            "i": 25,
+            "pred": 77405,
+            "true": 77405,
+            "match": true
+          },
+          {
+            "i": 26,
+            "pred": 8,
+            "true": 198,
+            "match": false
+          },
+          {
+            "i": 27,
+            "pred": 262,
+            "true": 262,
+            "match": true
+          },
+          {
+            "i": 28,
+            "pred": 1133,
+            "true": 1133,
+            "match": true
+          },
+          {
+            "i": 29,
+            "pred": 925,
+            "true": 925,
+            "match": true
+          },
+          {
+            "i": 30,
+            "pred": 564,
+            "true": 83565,
+            "match": false
+          },
+          {
+            "i": 31,
+            "pred": 564,
+            "true": 564,
+            "match": true
+          },
+          {
+            "i": 32,
+            "pred": 38044,
+            "true": 38044,
+            "match": true
+          },
+          {
+            "i": 33,
+            "pred": 1324,
+            "true": 2231,
+            "match": false
+          },
+          {
+            "i": 34,
+            "pred": 77,
+            "true": 77,
+            "match": true
+          },
+          {
+            "i": 35,
+            "pred": 5242,
+            "true": 5242,
+            "match": true
+          },
+          {
+            "i": 36,
+            "pred": 871,
+            "true": 283,
+            "match": false
+          },
+          {
+            "i": 37,
+            "pred": 313,
+            "true": 313,
+            "match": true
+          },
+          {
+            "i": 38,
+            "pred": 72758,
+            "true": 72758,
+            "match": true
+          },
+          {
+            "i": 39,
+            "pred": 38044,
+            "true": 38044,
+            "match": true
+          },
+          {
+            "i": 40,
+            "pred": 1393,
+            "true": 1393,
+            "match": true
+          },
+          {
+            "i": 41,
+            "pred": 12,
+            "true": 8866,
+            "match": false
+          },
+          {
+            "i": 42,
+            "pred": 871,
+            "true": 871,
+            "match": true
+          },
+          {
+            "i": 43,
+            "pred": 271,
+            "true": 271,
+            "match": true
+          },
+          {
+            "i": 44,
+            "pred": 331,
+            "true": 331,
+            "match": true
+          },
+          {
+            "i": 45,
+            "pred": 1259,
+            "true": 1259,
+            "match": true
+          },
+          {
+            "i": 46,
+            "pred": 591,
+            "true": 591,
+            "match": true
+          },
+          {
+            "i": 47,
+            "pred": 606,
+            "true": 548,
+            "match": false
+          },
+          {
+            "i": 48,
+            "pred": 606,
+            "true": 606,
+            "match": true
+          },
+          {
+            "i": 49,
+            "pred": 12880,
+            "true": 12880,
+            "match": true
+          },
+          {
+            "i": 50,
+            "pred": 3689,
+            "true": 3689,
+            "match": true
+          },
+          {
+            "i": 51,
+            "pred": 548,
+            "true": 548,
+            "match": true
+          },
+          {
+            "i": 52,
+            "pred": 763,
+            "true": 763,
+            "match": true
+          },
+          {
+            "i": 53,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 54,
+            "pred": 262,
+            "true": 262,
+            "match": true
+          },
+          {
+            "i": 55,
+            "pred": 1822,
+            "true": 1822,
+            "match": true
+          },
+          {
+            "i": 56,
+            "pred": 363,
+            "true": 363,
+            "match": true
+          },
+          {
+            "i": 57,
+            "pred": 248046,
+            "true": 248044,
+            "match": false
+          },
+          {
+            "i": 58,
+            "pred": 464,
+            "true": 2,
+            "match": false
+          },
+          {
+            "i": 59,
+            "pred": 653,
+            "true": 12654,
+            "match": false
+          },
+          {
+            "i": 60,
+            "pred": 1957,
+            "true": 1957,
+            "match": true
+          },
+          {
+            "i": 61,
+            "pred": 310,
+            "true": 310,
+            "match": true
+          },
+          {
+            "i": 62,
+            "pred": 1423,
+            "true": 1423,
+            "match": true
+          },
+          {
+            "i": 63,
+            "pred": 279,
+            "true": 279,
+            "match": true
+          },
+          {
+            "i": 64,
+            "pred": 76938,
+            "true": 53277,
+            "match": false
+          },
+          {
+            "i": 65,
+            "pred": 4496,
+            "true": 4496,
+            "match": true
+          },
+          {
+            "i": 66,
+            "pred": 314,
+            "true": 314,
+            "match": true
+          },
+          {
+            "i": 67,
+            "pred": 76938,
+            "true": 279,
+            "match": false
+          },
+          {
+            "i": 68,
+            "pred": 76938,
+            "true": 76938,
+            "match": true
+          },
+          {
+            "i": 69,
+            "pred": 8240,
+            "true": 8240,
+            "match": true
+          },
+          {
+            "i": 70,
+            "pred": 271,
+            "true": 1608,
+            "match": false
+          },
+          {
+            "i": 71,
+            "pred": 48575,
+            "true": 48575,
+            "match": true
+          },
+          {
+            "i": 72,
+            "pred": 198,
+            "true": 271,
+            "match": false
+          },
+          {
+            "i": 73,
+            "pred": 727,
+            "true": 727,
+            "match": true
+          },
+          {
+            "i": 74,
+            "pred": 73111,
+            "true": 73111,
+            "match": true
+          },
+          {
+            "i": 75,
+            "pred": 1393,
+            "true": 1393,
+            "match": true
+          },
+          {
+            "i": 76,
+            "pred": 35497,
+            "true": 1590,
+            "match": false
+          },
+          {
+            "i": 77,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 78,
+            "pred": 262,
+            "true": 262,
+            "match": true
+          },
+          {
+            "i": 79,
+            "pred": 413,
+            "true": 413,
+            "match": true
+          },
+          {
+            "i": 80,
+            "pred": 307,
+            "true": 307,
+            "match": true
+          },
+          {
+            "i": 81,
+            "pred": 2564,
+            "true": 2564,
+            "match": true
+          },
+          {
+            "i": 82,
+            "pred": 220,
+            "true": 220,
+            "match": true
+          },
+          {
+            "i": 83,
+            "pred": 16,
+            "true": 16,
+            "match": true
+          },
+          {
+            "i": 84,
+            "pred": 25,
+            "true": 25,
+            "match": true
+          },
+          {
+            "i": 85,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 86,
+            "pred": 285,
+            "true": 285,
+            "match": true
+          },
+          {
+            "i": 87,
+            "pred": 460,
+            "true": 460,
+            "match": true
+          },
+          {
+            "i": 88,
+            "pred": 307,
+            "true": 307,
+            "match": true
+          },
+          {
+            "i": 89,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 90,
+            "pred": 262,
+            "true": 262,
+            "match": true
+          },
+          {
+            "i": 91,
+            "pred": 460,
+            "true": 460,
+            "match": true
+          },
+          {
+            "i": 92,
+            "pred": 73111,
+            "true": 73111,
+            "match": true
+          },
+          {
+            "i": 93,
+            "pred": 1393,
+            "true": 1393,
+            "match": true
+          },
+          {
+            "i": 94,
+            "pred": 471,
+            "true": 12,
+            "match": false
+          },
+          {
+            "i": 95,
+            "pred": 16,
+            "true": 16,
+            "match": true
+          },
+          {
+            "i": 96,
+            "pred": 8,
+            "true": 8,
+            "match": true
+          },
+          {
+            "i": 97,
+            "pred": 478,
+            "true": 478,
+            "match": true
+          },
+          {
+            "i": 98,
+            "pred": 73111,
+            "true": 73111,
+            "match": true
+          },
+          {
+            "i": 99,
+            "pred": 1393,
+            "true": 1393,
+            "match": true
+          },
+          {
+            "i": 100,
+            "pred": 12,
+            "true": 12,
+            "match": true
+          },
+          {
+            "i": 101,
+            "pred": 17,
+            "true": 17,
+            "match": true
+          },
+          {
+            "i": 102,
+            "pred": 8,
+            "true": 8,
+            "match": true
+          },
+          {
+            "i": 103,
+            "pred": 271,
+            "true": 271,
+            "match": true
+          },
+          {
+            "i": 104,
+            "pred": 727,
+            "true": 727,
+            "match": true
+          },
+          {
+            "i": 105,
+            "pred": 1822,
+            "true": 1822,
+            "match": true
+          },
+          {
+            "i": 106,
+            "pred": 4406,
+            "true": 4406,
+            "match": true
+          },
+          {
+            "i": 107,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 108,
+            "pred": 262,
+            "true": 262,
+            "match": true
+          },
+          {
+            "i": 109,
+            "pred": 307,
+            "true": 307,
+            "match": true
+          },
+          {
+            "i": 110,
+            "pred": 36256,
+            "true": 283,
+            "match": false
+          },
+          {
+            "i": 111,
+            "pred": 514,
+            "true": 514,
+            "match": true
+          },
+          {
+            "i": 112,
+            "pred": 5216,
+            "true": 5216,
+            "match": true
+          },
+          {
+            "i": 113,
+            "pred": 437,
+            "true": 437,
+            "match": true
+          },
+          {
+            "i": 114,
+            "pred": 6072,
+            "true": 6072,
+            "match": true
+          },
+          {
+            "i": 115,
+            "pred": 264,
+            "true": 264,
+            "match": true
+          },
+          {
+            "i": 116,
+            "pred": 1324,
+            "true": 1324,
+            "match": true
+          },
+          {
+            "i": 117,
+            "pred": 25,
+            "true": 25,
+            "match": true
+          },
+          {
+            "i": 118,
+            "pred": 77405,
+            "true": 77405,
+            "match": true
+          },
+          {
+            "i": 119,
+            "pred": 871,
+            "true": 198,
+            "match": false
+          },
+          {
+            "i": 120,
+            "pred": 262,
+            "true": 262,
+            "match": true
+          },
+          {
+            "i": 121,
+            "pred": 1133,
+            "true": 1133,
+            "match": true
+          },
+          {
+            "i": 122,
+            "pred": 925,
+            "true": 925,
+            "match": true
+          },
+          {
+            "i": 123,
+            "pred": 564,
+            "true": 83565,
+            "match": false
+          },
+          {
+            "i": 124,
+            "pred": 564,
+            "true": 564,
+            "match": true
+          },
+          {
+            "i": 125,
+            "pred": 38044,
+            "true": 38044,
+            "match": true
+          },
+          {
+            "i": 126,
+            "pred": 2231,
+            "true": 2231,
+            "match": true
+          },
+          {
+            "i": 127,
+            "pred": 77,
+            "true": 77,
+            "match": true
+          },
+          {
+            "i": 128,
+            "pred": 5242,
+            "true": 5242,
+            "match": true
+          },
+          {
+            "i": 129,
+            "pred": 283,
+            "true": 283,
+            "match": true
+          },
+          {
+            "i": 130,
+            "pred": 313,
+            "true": 313,
+            "match": true
+          },
+          {
+            "i": 131,
+            "pred": 73111,
+            "true": 72758,
+            "match": false
+          },
+          {
+            "i": 132,
+            "pred": 38044,
+            "true": 38044,
+            "match": true
+          },
+          {
+            "i": 133,
+            "pred": 1393,
+            "true": 1393,
+            "match": true
+          },
+          {
+            "i": 134,
+            "pred": 12,
+            "true": 8866,
+            "match": false
+          },
+          {
+            "i": 135,
+            "pred": 271,
+            "true": 871,
+            "match": false
+          },
+          {
+            "i": 136,
+            "pred": 271,
+            "true": 271,
+            "match": true
+          },
+          {
+            "i": 137,
+            "pred": 331,
+            "true": 331,
+            "match": true
+          },
+          {
+            "i": 138,
+            "pred": 1259,
+            "true": 1259,
+            "match": true
+          },
+          {
+            "i": 139,
+            "pred": 591,
+            "true": 591,
+            "match": true
+          },
+          {
+            "i": 140,
+            "pred": 548,
+            "true": 548,
+            "match": true
+          },
+          {
+            "i": 141,
+            "pred": 606,
+            "true": 606,
+            "match": true
+          },
+          {
+            "i": 142,
+            "pred": 12880,
+            "true": 12880,
+            "match": true
+          },
+          {
+            "i": 143,
+            "pred": 3689,
+            "true": 3689,
+            "match": true
+          },
+          {
+            "i": 144,
+            "pred": 548,
+            "true": 548,
+            "match": true
+          },
+          {
+            "i": 145,
+            "pred": 763,
+            "true": 763,
+            "match": true
+          },
+          {
+            "i": 146,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 147,
+            "pred": 262,
+            "true": 262,
+            "match": true
+          },
+          {
+            "i": 148,
+            "pred": 1822,
+            "true": 1822,
+            "match": true
+          },
+          {
+            "i": 149,
+            "pred": 363,
+            "true": 363,
+            "match": true
+          },
+          {
+            "i": 150,
+            "pred": 248046,
+            "true": 248044,
+            "match": false
+          },
+          {
+            "i": 151,
+            "pred": 464,
+            "true": 2,
+            "match": false
+          },
+          {
+            "i": 152,
+            "pred": 12654,
+            "true": 12654,
+            "match": true
+          },
+          {
+            "i": 153,
+            "pred": 1957,
+            "true": 1957,
+            "match": true
+          },
+          {
+            "i": 154,
+            "pred": 310,
+            "true": 310,
+            "match": true
+          },
+          {
+            "i": 155,
+            "pred": 1423,
+            "true": 1423,
+            "match": true
+          },
+          {
+            "i": 156,
+            "pred": 279,
+            "true": 279,
+            "match": true
+          },
+          {
+            "i": 157,
+            "pred": 53277,
+            "true": 53277,
+            "match": true
+          },
+          {
+            "i": 158,
+            "pred": 4496,
+            "true": 4496,
+            "match": true
+          }
+        ]
+      },
+      "instruction": {
+        "n_positions": 159,
+        "accuracy": 0.710691823899371,
+        "first_quarter_accuracy": 0.6410256410256411,
+        "last_quarter_accuracy": 0.6666666666666666,
+        "close_miss_rate_rank2_5": 0.782608695652174,
+        "records": [
+          {
+            "i": 0,
+            "pred": 16,
+            "true": 248068,
+            "match": false
+          },
+          {
+            "i": 1,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 2,
+            "pred": 8160,
+            "true": 8160,
+            "match": true
+          },
+          {
+            "i": 3,
+            "pred": 579,
+            "true": 579,
+            "match": true
+          },
+          {
+            "i": 4,
+            "pred": 7047,
+            "true": 264,
+            "match": false
+          },
+          {
+            "i": 5,
+            "pred": 7047,
+            "true": 7047,
+            "match": true
+          },
+          {
+            "i": 6,
+            "pred": 8240,
+            "true": 1817,
+            "match": false
+          },
+          {
+            "i": 7,
+            "pred": 25,
+            "true": 25,
+            "match": true
+          },
+          {
+            "i": 8,
+            "pred": 271,
+            "true": 271,
+            "match": true
+          },
+          {
+            "i": 9,
+            "pred": 16,
+            "true": 16,
+            "match": true
+          },
+          {
+            "i": 10,
+            "pred": 220,
+            "true": 13,
+            "match": false
+          },
+          {
+            "i": 11,
+            "pred": 220,
+            "true": 220,
+            "match": true
+          },
+          {
+            "i": 12,
+            "pred": 2972,
+            "true": 2972,
+            "match": true
+          },
+          {
+            "i": 13,
+            "pred": 15771,
+            "true": 15771,
+            "match": true
+          },
+          {
+            "i": 14,
+            "pred": 2598,
+            "true": 2598,
+            "match": true
+          },
+          {
+            "i": 15,
+            "pred": 2570,
+            "true": 2570,
+            "match": true
+          },
+          {
+            "i": 16,
+            "pred": 11033,
+            "true": 5952,
+            "match": false
+          },
+          {
+            "i": 17,
+            "pred": 64700,
+            "true": 64700,
+            "match": true
+          },
+          {
+            "i": 18,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 19,
+            "pred": 256,
+            "true": 256,
+            "match": true
+          },
+          {
+            "i": 20,
+            "pred": 471,
+            "true": 471,
+            "match": true
+          },
+          {
+            "i": 21,
+            "pred": 2972,
+            "true": 2972,
+            "match": true
+          },
+          {
+            "i": 22,
+            "pred": 25562,
+            "true": 25562,
+            "match": true
+          },
+          {
+            "i": 23,
+            "pred": 64700,
+            "true": 64700,
+            "match": true
+          },
+          {
+            "i": 24,
+            "pred": 8169,
+            "true": 58439,
+            "match": false
+          },
+          {
+            "i": 25,
+            "pred": 37428,
+            "true": 13750,
+            "match": false
+          },
+          {
+            "i": 26,
+            "pred": 198,
+            "true": 11,
+            "match": false
+          },
+          {
+            "i": 27,
+            "pred": 11352,
+            "true": 11352,
+            "match": true
+          },
+          {
+            "i": 28,
+            "pred": 883,
+            "true": 279,
+            "match": false
+          },
+          {
+            "i": 29,
+            "pred": 2376,
+            "true": 2376,
+            "match": true
+          },
+          {
+            "i": 30,
+            "pred": 7594,
+            "true": 314,
+            "match": false
+          },
+          {
+            "i": 31,
+            "pred": 7739,
+            "true": 7594,
+            "match": false
+          },
+          {
+            "i": 32,
+            "pred": 13224,
+            "true": 777,
+            "match": false
+          },
+          {
+            "i": 33,
+            "pred": 13224,
+            "true": 13224,
+            "match": true
+          },
+          {
+            "i": 34,
+            "pred": 13,
+            "true": 383,
+            "match": false
+          },
+          {
+            "i": 35,
+            "pred": 49096,
+            "true": 13016,
+            "match": false
+          },
+          {
+            "i": 36,
+            "pred": 13,
+            "true": 13,
+            "match": true
+          },
+          {
+            "i": 37,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 38,
+            "pred": 256,
+            "true": 256,
+            "match": true
+          },
+          {
+            "i": 39,
+            "pred": 471,
+            "true": 471,
+            "match": true
+          },
+          {
+            "i": 40,
+            "pred": 2972,
+            "true": 2972,
+            "match": true
+          },
+          {
+            "i": 41,
+            "pred": 73211,
+            "true": 73211,
+            "match": true
+          },
+          {
+            "i": 42,
+            "pred": 64700,
+            "true": 64700,
+            "match": true
+          },
+          {
+            "i": 43,
+            "pred": 41774,
+            "true": 79091,
+            "match": false
+          },
+          {
+            "i": 44,
+            "pred": 303,
+            "true": 303,
+            "match": true
+          },
+          {
+            "i": 45,
+            "pred": 13983,
+            "true": 13983,
+            "match": true
+          },
+          {
+            "i": 46,
+            "pred": 3992,
+            "true": 3992,
+            "match": true
+          },
+          {
+            "i": 47,
+            "pred": 11,
+            "true": 11,
+            "match": true
+          },
+          {
+            "i": 48,
+            "pred": 5486,
+            "true": 1973,
+            "match": false
+          },
+          {
+            "i": 49,
+            "pred": 1608,
+            "true": 36655,
+            "match": false
+          },
+          {
+            "i": 50,
+            "pred": 13,
+            "true": 13,
+            "match": true
+          },
+          {
+            "i": 51,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 52,
+            "pred": 256,
+            "true": 256,
+            "match": true
+          },
+          {
+            "i": 53,
+            "pred": 471,
+            "true": 471,
+            "match": true
+          },
+          {
+            "i": 54,
+            "pred": 2972,
+            "true": 2972,
+            "match": true
+          },
+          {
+            "i": 55,
+            "pred": 5218,
+            "true": 5218,
+            "match": true
+          },
+          {
+            "i": 56,
+            "pred": 15380,
+            "true": 15380,
+            "match": true
+          },
+          {
+            "i": 57,
+            "pred": 64700,
+            "true": 64700,
+            "match": true
+          },
+          {
+            "i": 58,
+            "pred": 8169,
+            "true": 8169,
+            "match": true
+          },
+          {
+            "i": 59,
+            "pred": 3070,
+            "true": 3070,
+            "match": true
+          },
+          {
+            "i": 60,
+            "pred": 914,
+            "true": 914,
+            "match": true
+          },
+          {
+            "i": 61,
+            "pred": 7594,
+            "true": 7594,
+            "match": true
+          },
+          {
+            "i": 62,
+            "pred": 777,
+            "true": 777,
+            "match": true
+          },
+          {
+            "i": 63,
+            "pred": 13224,
+            "true": 13224,
+            "match": true
+          },
+          {
+            "i": 64,
+            "pred": 348,
+            "true": 2590,
+            "match": false
+          },
+          {
+            "i": 65,
+            "pred": 7042,
+            "true": 7042,
+            "match": true
+          },
+          {
+            "i": 66,
+            "pred": 13016,
+            "true": 13016,
+            "match": true
+          },
+          {
+            "i": 67,
+            "pred": 30,
+            "true": 30,
+            "match": true
+          },
+          {
+            "i": 68,
+            "pred": 271,
+            "true": 271,
+            "match": true
+          },
+          {
+            "i": 69,
+            "pred": 17,
+            "true": 17,
+            "match": true
+          },
+          {
+            "i": 70,
+            "pred": 13,
+            "true": 13,
+            "match": true
+          },
+          {
+            "i": 71,
+            "pred": 220,
+            "true": 220,
+            "match": true
+          },
+          {
+            "i": 72,
+            "pred": 2972,
+            "true": 2972,
+            "match": true
+          },
+          {
+            "i": 73,
+            "pred": 27382,
+            "true": 27382,
+            "match": true
+          },
+          {
+            "i": 74,
+            "pred": 5141,
+            "true": 1386,
+            "match": false
+          },
+          {
+            "i": 75,
+            "pred": 5141,
+            "true": 5141,
+            "match": true
+          },
+          {
+            "i": 76,
+            "pred": 73182,
+            "true": 73182,
+            "match": true
+          },
+          {
+            "i": 77,
+            "pred": 64700,
+            "true": 64700,
+            "match": true
+          },
+          {
+            "i": 78,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 79,
+            "pred": 256,
+            "true": 256,
+            "match": true
+          },
+          {
+            "i": 80,
+            "pred": 471,
+            "true": 471,
+            "match": true
+          },
+          {
+            "i": 81,
+            "pred": 5875,
+            "true": 58439,
+            "match": false
+          },
+          {
+            "i": 82,
+            "pred": 37428,
+            "true": 13750,
+            "match": false
+          },
+          {
+            "i": 83,
+            "pred": 3827,
+            "true": 3827,
+            "match": true
+          },
+          {
+            "i": 84,
+            "pred": 470,
+            "true": 539,
+            "match": false
+          },
+          {
+            "i": 85,
+            "pred": 40961,
+            "true": 8427,
+            "match": false
+          },
+          {
+            "i": 86,
+            "pred": 1472,
+            "true": 795,
+            "match": false
+          },
+          {
+            "i": 87,
+            "pred": 1472,
+            "true": 1472,
+            "match": true
+          },
+          {
+            "i": 88,
+            "pred": 13224,
+            "true": 13224,
+            "match": true
+          },
+          {
+            "i": 89,
+            "pred": 13,
+            "true": 13,
+            "match": true
+          },
+          {
+            "i": 90,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 91,
+            "pred": 12,
+            "true": 256,
+            "match": false
+          },
+          {
+            "i": 92,
+            "pred": 4254,
+            "true": 471,
+            "match": false
+          },
+          {
+            "i": 93,
+            "pred": 4254,
+            "true": 4254,
+            "match": true
+          },
+          {
+            "i": 94,
+            "pred": 13224,
+            "true": 13224,
+            "match": true
+          },
+          {
+            "i": 95,
+            "pred": 628,
+            "true": 283,
+            "match": false
+          },
+          {
+            "i": 96,
+            "pred": 777,
+            "true": 777,
+            "match": true
+          },
+          {
+            "i": 97,
+            "pred": 6150,
+            "true": 8390,
+            "match": false
+          },
+          {
+            "i": 98,
+            "pred": 310,
+            "true": 310,
+            "match": true
+          },
+          {
+            "i": 99,
+            "pred": 3827,
+            "true": 3827,
+            "match": true
+          },
+          {
+            "i": 100,
+            "pred": 470,
+            "true": 6150,
+            "match": false
+          },
+          {
+            "i": 101,
+            "pred": 12261,
+            "true": 12261,
+            "match": true
+          },
+          {
+            "i": 102,
+            "pred": 13,
+            "true": 13,
+            "match": true
+          },
+          {
+            "i": 103,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 104,
+            "pred": 256,
+            "true": 256,
+            "match": true
+          },
+          {
+            "i": 105,
+            "pred": 1921,
+            "true": 471,
+            "match": false
+          },
+          {
+            "i": 106,
+            "pred": 1921,
+            "true": 1921,
+            "match": true
+          },
+          {
+            "i": 107,
+            "pred": 777,
+            "true": 777,
+            "match": true
+          },
+          {
+            "i": 108,
+            "pred": 13224,
+            "true": 13224,
+            "match": true
+          },
+          {
+            "i": 109,
+            "pred": 628,
+            "true": 628,
+            "match": true
+          },
+          {
+            "i": 110,
+            "pred": 5073,
+            "true": 5073,
+            "match": true
+          },
+          {
+            "i": 111,
+            "pred": 5154,
+            "true": 5154,
+            "match": true
+          },
+          {
+            "i": 112,
+            "pred": 25,
+            "true": 25,
+            "match": true
+          },
+          {
+            "i": 113,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 114,
+            "pred": 256,
+            "true": 257,
+            "match": false
+          },
+          {
+            "i": 115,
+            "pred": 5875,
+            "true": 471,
+            "match": false
+          },
+          {
+            "i": 116,
+            "pred": 5875,
+            "true": 5875,
+            "match": true
+          },
+          {
+            "i": 117,
+            "pred": 6078,
+            "true": 6078,
+            "match": true
+          },
+          {
+            "i": 118,
+            "pred": 318,
+            "true": 1235,
+            "match": false
+          },
+          {
+            "i": 119,
+            "pred": 318,
+            "true": 318,
+            "match": true
+          },
+          {
+            "i": 120,
+            "pred": 10223,
+            "true": 10223,
+            "match": true
+          },
+          {
+            "i": 121,
+            "pred": 269,
+            "true": 269,
+            "match": true
+          },
+          {
+            "i": 122,
+            "pred": 4694,
+            "true": 4694,
+            "match": true
+          },
+          {
+            "i": 123,
+            "pred": 11639,
+            "true": 11639,
+            "match": true
+          },
+          {
+            "i": 124,
+            "pred": 4370,
+            "true": 4370,
+            "match": true
+          },
+          {
+            "i": 125,
+            "pred": 314,
+            "true": 314,
+            "match": true
+          },
+          {
+            "i": 126,
+            "pred": 1865,
+            "true": 6618,
+            "match": false
+          },
+          {
+            "i": 127,
+            "pred": 8,
+            "true": 4437,
+            "match": false
+          },
+          {
+            "i": 128,
+            "pred": 8076,
+            "true": 12261,
+            "match": false
+          },
+          {
+            "i": 129,
+            "pred": 8,
+            "true": 8,
+            "match": true
+          },
+          {
+            "i": 130,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 131,
+            "pred": 256,
+            "true": 257,
+            "match": false
+          },
+          {
+            "i": 132,
+            "pred": 55804,
+            "true": 471,
+            "match": false
+          },
+          {
+            "i": 133,
+            "pred": 9170,
+            "true": 55804,
+            "match": false
+          },
+          {
+            "i": 134,
+            "pred": 25206,
+            "true": 25206,
+            "match": true
+          },
+          {
+            "i": 135,
+            "pred": 303,
+            "true": 318,
+            "match": false
+          },
+          {
+            "i": 136,
+            "pred": 15190,
+            "true": 15190,
+            "match": true
+          },
+          {
+            "i": 137,
+            "pred": 10655,
+            "true": 10655,
+            "match": true
+          },
+          {
+            "i": 138,
+            "pred": 50398,
+            "true": 24993,
+            "match": false
+          },
+          {
+            "i": 139,
+            "pred": 490,
+            "true": 490,
+            "match": true
+          },
+          {
+            "i": 140,
+            "pred": 3574,
+            "true": 3574,
+            "match": true
+          },
+          {
+            "i": 141,
+            "pred": 50398,
+            "true": 50398,
+            "match": true
+          },
+          {
+            "i": 142,
+            "pred": 11,
+            "true": 11,
+            "match": true
+          },
+          {
+            "i": 143,
+            "pred": 3384,
+            "true": 3384,
+            "match": true
+          },
+          {
+            "i": 144,
+            "pred": 353,
+            "true": 353,
+            "match": true
+          },
+          {
+            "i": 145,
+            "pred": 1220,
+            "true": 1220,
+            "match": true
+          },
+          {
+            "i": 146,
+            "pred": 10033,
+            "true": 5471,
+            "match": false
+          },
+          {
+            "i": 147,
+            "pred": 470,
+            "true": 10597,
+            "match": false
+          },
+          {
+            "i": 148,
+            "pred": 3665,
+            "true": 492,
+            "match": false
+          },
+          {
+            "i": 149,
+            "pred": 68421,
+            "true": 68421,
+            "match": true
+          },
+          {
+            "i": 150,
+            "pred": 8,
+            "true": 8,
+            "match": true
+          },
+          {
+            "i": 151,
+            "pred": 198,
+            "true": 198,
+            "match": true
+          },
+          {
+            "i": 152,
+            "pred": 256,
+            "true": 257,
+            "match": false
+          },
+          {
+            "i": 153,
+            "pred": 471,
+            "true": 471,
+            "match": true
+          },
+          {
+            "i": 154,
+            "pred": 7870,
+            "true": 7870,
+            "match": true
+          },
+          {
+            "i": 155,
+            "pred": 258,
+            "true": 258,
+            "match": true
+          },
+          {
+            "i": 156,
+            "pred": 10655,
+            "true": 10655,
+            "match": true
+          },
+          {
+            "i": 157,
+            "pred": 4523,
+            "true": 4523,
+            "match": true
+          },
+          {
+            "i": 158,
+            "pred": 198,
+            "true": 593,
+            "match": false
+          }
+        ]
+      }
+    }
+  },
+  "divergence_gap": {
+    "k": 8,
+    "n_tokens": 32,
+    "prompts": {
+      "prose": {
+        "tokens_match": true,
+        "ref_tokens": [
+          1017,
+          557,
+          264,
+          3777,
+          7914,
+          6725,
+          8105,
+          13,
+          8105,
+          557,
+          264,
+          21520,
+          321,
+          2993,
+          66949,
+          7914,
+          852,
+          9939,
+          310,
+          12804,
+          279,
+          1814,
+          2094,
+          1384,
+          13,
+          271,
+          3833,
+          1834,
+          11,
+          8105,
+          13293,
+          421
+        ],
+        "spec_tokens": [
+          1017,
+          557,
+          264,
+          3777,
+          7914,
+          6725,
+          8105,
+          13,
+          8105,
+          557,
+          264,
+          21520,
+          321,
+          2993,
+          66949,
+          7914,
+          852,
+          9939,
+          310,
+          12804,
+          279,
+          1814,
+          2094,
+          1384,
+          13,
+          271,
+          3833,
+          1834,
+          11,
+          8105,
+          13293,
+          421
+        ]
+      },
+      "code": {
+        "tokens_match": false,
+        "ref_tokens": [
+          73111,
+          1393,
+          12,
+          16,
+          8,
+          478,
+          73111,
+          1393,
+          12,
+          17,
+          8,
+          271,
+          727,
+          1822,
+          4406,
+          198,
+          262,
+          307,
+          283,
+          514,
+          5216,
+          437,
+          6072,
+          264,
+          1324,
+          25,
+          77405,
+          198,
+          262,
+          1133,
+          925,
+          83565
+        ],
+        "spec_tokens": [
+          73111,
+          1393,
+          471,
+          220,
+          16,
+          8,
+          478,
+          73111,
+          1393,
+          471,
+          220,
+          17,
+          8,
+          271,
+          2,
+          12996,
+          10121,
+          198,
+          77,
+          283,
+          220,
+          16,
+          15,
+          198,
+          1302,
+          925,
+          9726,
+          313,
+          77,
+          92,
+          337,
+          76938
+        ],
+        "first_diff_index": 2,
+        "ref_token_text": "-",
+        "spec_token_text": " -",
+        "gap_error": 0.125,
+        "kl_topk": 0.001951376621977913,
+        "tie_slack_ulps": 1.0,
+        "step_agrees": false,
+        "step_mine_top1": 471,
+        "step_oracle_top1": 12,
+        "capture_gaps_missing_from_intersection": [],
+        "metrics": {
+          "max_gap_error": 0.125,
+          "p99_gap_error": 0.125,
+          "p90_gap_error": 0.125,
+          "median_gap_error": 0.125,
+          "max_tie_slack_ulps": 1.0,
+          "disagreement_rate": 1.0,
+          "mean_kl_topk": 0.001951376621977913,
+          "max_drift_ratio": 1.0,
+          "max_logprob_error": 0.06439971923828125,
+          "p90_logprob_error": 0.06439971923828125,
+          "nll_relative_excess": NaN,
+          "min_logits_cosine": NaN
+        },
+        "passes_calibrated_bars": false,
+        "reasons": [
+          "disagreement_rate=1 > 0.03",
+          "nll_relative_excess is gated but was not measured",
+          "min_logits_cosine is gated but was not measured"
+        ]
+      }
+    }
+  }
+}
