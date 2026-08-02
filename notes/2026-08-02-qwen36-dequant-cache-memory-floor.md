@@ -33,6 +33,32 @@ QSR_SERVER_GPU_MEM_UTIL=0.60  QSR_SERVER_BLOCKS_PER_SLOT=512
 **"降低槽位和显存利用率"这个直觉在 Qwen3.6 上不成立**——它是本轮踩了两次的坑，
 而不是一次孤立事故。
 
+## ✅ 已实测确认：**Laguna 没有这个问题**（2026-08-02 审计）
+
+这条底线**只属于 Qwen3.6**，不是本仓库的普遍性质。双重证据（见
+[`2026-08-02-gpu-memory-audit.md`](2026-08-02-gpu-memory-audit.md)）：
+
+- **代码**：Laguna 的非 MoE 层走 `runtime/model/plain_linear.py::PlainLinear`，
+  权重在磁盘上就是纯 BF16、从未量化（逐张量核实非 MoE 部分 100% 是 BF16 dtype）；
+  MoE 专家权重由 `laguna_sparkinfer_moe.py` **直接在打包 FP4 上**调 sparkinfer 的
+  CUTLASS kernel，代码里没有任何 `_bf16` 缓存字段。
+- **实测**：从"权重加载完成"到"CG 捕获完成"，nvidia-smi 只涨了 **0.83 GiB**；
+  Qwen3.6 同样区间涨 **49.72 GiB**。**差两个数量级。**
+
+逐项显存表（两侧逐项相加对上 nvidia-smi，误差 <0.5%）：
+
+| | Qwen3.6 | Laguna（生产 DFlash） |
+|---|---:|---:|
+| CUDA 上下文/分配器 | 5.36 GiB | 4.54 GiB |
+| 权重 | 18.77 GiB | 69.04 GiB（主 66.96 + draft 2.08） |
+| **反量化 BF16 缓存** | **49.72 GiB** | **≈0** |
+| 合计 | **76.34 GiB** | **74.66 GiB** |
+
+📌 **两者总量接近，成因完全不同**：Laguna 的占用几乎全在权重本身（BF16 权重天然大），
+Qwen3.6 的权重只有 18.77 GiB 却被反量化缓存推到同一量级。
+**所以"Laguna 能跑，Qwen3.6 应该也能"这个推断不成立**——前者是静态的，后者会在
+第一次完整前向时跳一次。
+
 ## 这是 B1 的一个**有意**设计选择，不是 bug
 
 `modelopt_linear.py` 的文档写明了缓存是刻意的（避免每次前向重复反量化）。

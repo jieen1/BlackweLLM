@@ -177,6 +177,14 @@ the KV cache, not the weight cache. Lowering them and expecting a smaller
 footprint is the natural guess and it is wrong; it was tried twice on
 2026-08-02 and the card still filled.
 
+Laguna does **not** behave this way -- verified 2026-08-02 both in code (its
+non-MoE layers are plain BF16 on disk and never quantized; MoE experts go
+straight to sparkinfer's CUTLASS kernel on packed FP4) and by measurement
+(0.83 GiB of growth between weights-settled and graph capture, against
+49.72 GiB for Qwen3.6). So "Laguna fits, therefore Qwen3.6 fits" does not
+follow: Laguna's footprint is static, Qwen3.6's steps up on first full
+forward.
+
 To verify something on a shared card, drive a **single layer** rather than the
 whole model. `scripts/b3_probe_gdn_spec_rollback.py` is the worked example: one
 real GDN layer with real FP8 weights, no full-model load. See
