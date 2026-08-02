@@ -40,13 +40,20 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 
-_ROOT = "/home/bot/project/qsr-w-b3"
+# Derived from this file's own location (not a hardcoded worktree path) --
+# 2026-08-03 std-model-serving round (work/std-serve-20260803), this script
+# is now run from whichever worktree happens to be doing the verifying, not
+# only the one it was written in. Same convention as
+# scripts/verify_nvfp4_gemm_full_model_gap.py's _ROOT.
+_ROOT = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, _ROOT)
 import runtime  # noqa: E402
 
 assert runtime.__file__.startswith(_ROOT), (
-    f"editable install shadowed the worktree: runtime.__file__={runtime.__file__}"
+    f"editable install shadowed the worktree: runtime.__file__={runtime.__file__} "
+    f"-- rerun with PYTHONPATH={_ROOT}"
 )
 
 import torch  # noqa: E402
@@ -71,7 +78,13 @@ from runtime.backends.qwen36 import Qwen36Backend  # noqa: E402
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 from runtime.sampling import SamplingParams  # noqa: E402
 
-MODEL_PATH = (
+# 2026-08-03 std-model-serving round (work/std-serve-20260803): CLI-
+# parameterized by --model-path (same convention as
+# verify_nvfp4_gemm_full_model_gap.py / measure_nvfp4_gemm_memory_and_
+# throughput.py, commit 9e67e4a) so this same B2 gate script can also
+# grade unsloth/Qwen3.6-27B-NVFP4 (the standard/served checkpoint) --
+# default unchanged, still nvidia's checkpoint.
+DEFAULT_MODEL_PATH = (
     "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/"
     "snapshots/0893e1606ff3d5f97a441f405d5fc541a6bdf404"
 )
@@ -391,17 +404,20 @@ def main() -> None:
         default="",
         help="comma-separated subset of: serial,batched,concurrency,graph,prefix",
     )
+    ap.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
     args = ap.parse_args()
     only = {s for s in args.only.split(",") if s}
+    model_path = args.model_path
 
     print("torch:", torch.__version__, "device:", torch.cuda.get_device_name(0))
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    print("model_path:", model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
     prompts = [tokenizer(p).input_ids for p in PROMPTS]
     print("prompt lengths:", [len(p) for p in prompts])
 
     t0 = time.time()
     model = load_qwen36_model(
-        MODEL_PATH, device="cuda", dtype=torch.bfloat16, max_seq_len=args.max_seq_len
+        model_path, device="cuda", dtype=torch.bfloat16, max_seq_len=args.max_seq_len
     )
     print(f"load_qwen36_model: {time.time()-t0:.1f}s")
     print(f"weights resident: {torch.cuda.memory_allocated()/2**30:.1f} GiB")
