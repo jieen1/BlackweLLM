@@ -504,7 +504,33 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
   `investigation-queue.md` D-3（ReplaySSM，投机 scratch 显存 11.5GB→1.8GB）合并排期**，
   ReplaySSM 把"状态回滚"问题转化成"缓存最近输入、O(1) ring-buffer 指针移动"，是候选机制而非
   从零设计。
-- [ ] GDN kernel 调优 · 128K/256K 容量与吞吐 · 主模型侧 GDN 递归状态回滚（与 D-3 合并排期）
+- [x] **主模型侧 GDN 递归状态回滚** —— ✅ **已实现并 GPU 证明逐位精确**：
+  `spec_forward()`/`commit_spec_snapshot()`，K=16 下每个接受数 m ∈ {0,1,5,8,15,16}
+  回滚后状态与顺序非投机解码 `max_abs_diff=0.0`。
+- [x] **MTP 草稿头 + 端到端接受率/吞吐** —— ✅ **已测，结果是负面的，见下**
+- [ ] GDN kernel 调优 · 128K/256K 容量与吞吐
+
+> 🔴 **B3 的前提不成立：MTP 投机解码目前比顺序解码慢 34–39%**（2026-08-02 实测，
+> 见 [`../notes/2026-08-02-b3-mtp-e2e-acceptance-throughput.md`](../notes/2026-08-02-b3-mtp-e2e-acceptance-throughput.md)）
+>
+> | prompt | 接受率 | 平均接受/轮 (K=8) | 投机 tok/s | 非投机 tok/s | 加速比 |
+> |---|---:|---:|---:|---:|---:|
+> | prose | 15.2% | 1.21 | 2.72 | 4.15 | **0.66×** |
+> | code | 35.0% | 2.80 | 3.14 | 5.16 | **0.61×** |
+>
+> **根因是结构性的，不是调参问题**：Qwen3.6 的 64 层里 **48 层是 GDN**，verify 每轮都要
+> 为每个 GDN 层付顺序 kernel 启动的代价（上一轮已量化为一次 chunk 调用的 **6.9×**），
+> 而草稿本身还额外加 ~73ms/轮（K=8）——这部分在非投机路径上根本不存在。
+>
+> **这不等于 MTP 走不通，但它给出了先决条件**。上一轮把那 6.9× 拆开过：
+> - **~6.8ms 是顺序递归的 kernel 启动开销** —— 只能靠真正的多步融合 kernel 解决，**属 sparkinfer/kernel 团队范畴**
+> - **~5.7ms 是 conv1d/投影/norm/clone 每步重跑而非批处理一次** —— **我们自己能做**
+>
+> **在这两项之一落地前，不应把 MTP 接进服务路径**——接进去会让 Qwen3.6 变慢。
+>
+> 📌 与 Laguna 的对比说明了为什么:Laguna 的 DFlash 投机是有效的(接受率 96.3–100%)，
+> 因为 Laguna **没有 GDN 层**，verify 不付这份代价。**"Laguna 的投机有效，Qwen3.6 也该有效"
+> 这个推断不成立。**
 - [x] ~~**KV dtype 待定**~~ —— ✅ **已答，而且是"选项不存在"而非"选了某个"**（C-2 结案）：
   sparkinfer 的 paged-attention（唯一的 attention 内核）只接受 fp16/bf16/fp8_e4m3 三种 KV dtype，
   NVFP4 KV 直接 `TypeError`。**所以这不是一个待选项，FP8 是唯一可达值。** 上游第三方在
