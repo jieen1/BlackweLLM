@@ -71,8 +71,13 @@ def eager_reference_sequence(n_steps: int, seeds: list[int]):
     for step in range(n_steps):
         query, key, value, gate, beta = make_step_inputs(seeds[step])
         out, state = fused_recurrent_gated_delta_rule(
-            query, key, value, g=gate, beta=beta,
-            initial_state=state, output_final_state=True,
+            query,
+            key,
+            value,
+            g=gate,
+            beta=beta,
+            initial_state=state,
+            output_final_state=True,
             use_qk_l2norm_in_kernel=True,
         )
         outs.append(out.clone())
@@ -105,8 +110,13 @@ def main():
     with torch.cuda.stream(warmup_stream):
         for _ in range(3):
             out, new_state = fused_recurrent_gated_delta_rule(
-                query_buf, key_buf, value_buf, g=gate_buf, beta=beta_buf,
-                initial_state=state_buf, output_final_state=True,
+                query_buf,
+                key_buf,
+                value_buf,
+                g=gate_buf,
+                beta=beta_buf,
+                initial_state=state_buf,
+                output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
             )
             state_buf.copy_(new_state)
@@ -120,19 +130,27 @@ def main():
     try:
         with torch.cuda.graph(graph):
             out, new_state = fused_recurrent_gated_delta_rule(
-                query_buf, key_buf, value_buf, g=gate_buf, beta=beta_buf,
-                initial_state=state_buf, output_final_state=True,
+                query_buf,
+                key_buf,
+                value_buf,
+                g=gate_buf,
+                beta=beta_buf,
+                initial_state=state_buf,
+                output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
             )
             # Mirror transformers/cache_utils.py exactly: copy_, never rebind.
             state_buf.copy_(new_state)
             output_buf.copy_(out)
         torch.cuda.synchronize()
-        print("RESULT: torch.cuda.graph() CAPTURE SUCCEEDED for fused_recurrent_gated_delta_rule "
-              "+ copy_-into-static-buffer state update.")
+        print(
+            "RESULT: torch.cuda.graph() CAPTURE SUCCEEDED for fused_recurrent_gated_delta_rule "
+            "+ copy_-into-static-buffer state update."
+        )
     except Exception as exc:  # noqa: BLE001
         print(f"RESULT: CAPTURE FAILED -- {type(exc).__name__}: {exc}")
         import traceback
+
         traceback.print_exc()
         return
 
@@ -165,11 +183,15 @@ def main():
     )
 
     if max_err_overall < 1e-3 and final_state_err < 1e-2:
-        print("\nRESULT: CAPTURE-SAFE AND NUMERICALLY CORRECT -- graph replay reproduces the "
-              "eager step-by-step recurrence within fp32/bf16 noise.")
+        print(
+            "\nRESULT: CAPTURE-SAFE AND NUMERICALLY CORRECT -- graph replay reproduces the "
+            "eager step-by-step recurrence within fp32/bf16 noise."
+        )
     else:
-        print("\nRESULT: CAPTURE SUCCEEDED BUT NUMERICS DIVERGED -- replay does not match the "
-              "eager recurrence; state is being lost/stale between replays.")
+        print(
+            "\nRESULT: CAPTURE SUCCEEDED BUT NUMERICS DIVERGED -- replay does not match the "
+            "eager recurrence; state is being lost/stale between replays."
+        )
 
 
 if __name__ == "__main__":

@@ -206,8 +206,7 @@ def main() -> None:
         lin = load_linear(ckpt, prefix)
         print(f"  in_features={lin.input_size} out_features={lin.output_size}")
         print(
-            f"  weight_scale={lin.weight_scale.item():.6g} "
-            f"input_scale={lin.input_scale.item():.6g}"
+            f"  weight_scale={lin.weight_scale.item():.6g} input_scale={lin.input_scale.item():.6g}"
         )
         output_scale = (lin.input_scale.data * lin.weight_scale.data).reshape(1).contiguous()
         packed = tensor_fp8_linear.pack_weight(lin.weight.data, output_scale)

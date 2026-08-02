@@ -212,9 +212,11 @@ def part_a(config: dict, quantized: dict[str, str], k: int, hidden: int) -> None
     perpos = torch.cat([mlp(x[:, t : t + 1, :]) for t in range(k)], dim=1)
     out["layer0_mlp"] = diff_report("layer0 mlp (dense, 17408)", batched, perpos)
     for sub, name in ((mlp.gate_proj, "gate_proj"), (mlp.down_proj, "down_proj")):
-        xin = x if name == "gate_proj" else torch.randn(
-            1, k, 17408, device=DEVICE, dtype=torch.bfloat16
-        ) * 0.1
+        xin = (
+            x
+            if name == "gate_proj"
+            else torch.randn(1, k, 17408, device=DEVICE, dtype=torch.bfloat16) * 0.1
+        )
         b = sub(xin)
         p = torch.cat([sub(xin[:, t : t + 1, :]) for t in range(k)], dim=1)
         out[f"layer0_mlp_{name}"] = diff_report(f"layer0 mlp.{name}", b, p)
@@ -303,9 +305,7 @@ def part_b(gdn: Qwen36GatedDeltaNet, k: int, hidden: int) -> None:
             f"batched closer on {closer_batched:.1%}, perpos closer on {closer_perpos:.1%}, "
             f"tied {rep['frac_tied']:.1%}"
         )
-        scale_ulp = 2.0 ** (
-            torch.tensor(max(rep["out_scale"], 1e-30)).log2().floor().item() - 7.0
-        )
+        scale_ulp = 2.0 ** (torch.tensor(max(rep["out_scale"], 1e-30)).log2().floor().item() - 7.0)
         print(
             f"                 in ULPs of the output scale ({rep['out_scale']:.3g}): "
             f"batched={rep['rmse_batched'] / scale_ulp:.4f}  "
@@ -363,9 +363,13 @@ def spec_forward_batched(
     core_outs: list[torch.Tensor] = []
     for t in range(seq_len):
         core_attn_out, last_state = fused_recurrent_gated_delta_rule(
-            query[:, t : t + 1], key[:, t : t + 1], value[:, t : t + 1],
-            g=g[:, t : t + 1], beta=beta[:, t : t + 1],
-            initial_state=recurrent_state, output_final_state=True,
+            query[:, t : t + 1],
+            key[:, t : t + 1],
+            value[:, t : t + 1],
+            g=g[:, t : t + 1],
+            beta=beta[:, t : t + 1],
+            initial_state=recurrent_state,
+            output_final_state=True,
             use_qk_l2norm_in_kernel=True,
         )
         recurrent_state = torch.empty_like(state.recurrent_state)
@@ -506,13 +510,10 @@ def part_d(gdn: Qwen36GatedDeltaNet, anchor: GdnLayerState, hidden: int, steps: 
     ulp = bf16_ulp(dirty.recurrent_state)
     sign = torch.randint(0, 2, dirty.recurrent_state.shape, device=DEVICE).float() * 2 - 1
     dirty.recurrent_state.copy_((dirty.recurrent_state.float() + sign * ulp).to(torch.bfloat16))
-    d0_state = (
-        (dirty.recurrent_state.float() - clean.recurrent_state.float()).abs().max().item()
-    )
+    d0_state = (dirty.recurrent_state.float() - clean.recurrent_state.float()).abs().max().item()
     d0_rel = (
-        (dirty.recurrent_state.float() - clean.recurrent_state.float()).abs().max().item()
-        / clean.recurrent_state.float().abs().max().item()
-    )
+        dirty.recurrent_state.float() - clean.recurrent_state.float()
+    ).abs().max().item() / clean.recurrent_state.float().abs().max().item()
     print(f"  injected state perturbation: max_abs={d0_state:.6g} (rel to max |S| = {d0_rel:.3%})")
 
     traj = []
@@ -523,12 +524,15 @@ def part_d(gdn: Qwen36GatedDeltaNet, anchor: GdnLayerState, hidden: int, steps: 
         s_diff = (dirty.recurrent_state.float() - clean.recurrent_state.float()).abs().max().item()
         s_rel = s_diff / max(clean.recurrent_state.float().abs().max().item(), 1e-30)
         o_diff = (y_dirty.float() - y_clean.float()).abs().max().item()
-        o_ulp = (
-            ((y_dirty.float() - y_clean.float()).abs() / bf16_ulp(y_clean)).max().item()
-        )
+        o_ulp = ((y_dirty.float() - y_clean.float()).abs() / bf16_ulp(y_clean)).max().item()
         traj.append(
-            {"step": t, "state_max_abs": s_diff, "state_rel": s_rel,
-             "out_max_abs": o_diff, "out_max_ulps": o_ulp}
+            {
+                "step": t,
+                "state_max_abs": s_diff,
+                "state_rel": s_rel,
+                "out_max_abs": o_diff,
+                "out_max_ulps": o_ulp,
+            }
         )
         if t < 5 or (t + 1) % 16 == 0:
             print(

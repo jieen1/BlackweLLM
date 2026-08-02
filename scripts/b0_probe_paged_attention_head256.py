@@ -45,12 +45,10 @@ def make_inputs(
     num_pages = max(1, total_pages_needed * 2)
 
     k_cache = (
-        torch.randn(num_pages, page_size, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
-        / 4
+        torch.randn(num_pages, page_size, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE) / 4
     )
     v_cache = (
-        torch.randn(num_pages, page_size, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE)
-        / 4
+        torch.randn(num_pages, page_size, NUM_KV_HEADS, HEAD_DIM, device=DEVICE, dtype=DTYPE) / 4
     )
     page_table = torch.zeros(batch, max_pages, dtype=torch.int32, device=DEVICE)
     page_order = torch.randperm(num_pages, device=DEVICE)
@@ -98,8 +96,16 @@ def quantize_e4m3(k_cache, v_cache, page_table, cache_seqlens, page_size):
 
 
 def run_eager(
-    q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
-    *, mode, k_descale=None, v_descale=None,
+    q,
+    k_cache,
+    v_cache,
+    page_table,
+    cache_seqlens,
+    cu_seqlens_q,
+    *,
+    mode,
+    k_descale=None,
+    v_descale=None,
 ):
     plan = paged.plan(
         paged.Caps(
@@ -160,15 +166,29 @@ def try_case(name, *, mode, q_seqlens, cache_seqlens, page_size, fp8):
         torch.cuda.synchronize()
         cold_start = time.perf_counter()
         out, lse = run_eager(
-            q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q,
-            mode=mode, k_descale=k_descale, v_descale=v_descale,
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens_t,
+            cu_seqlens_q,
+            mode=mode,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
         torch.cuda.synchronize()
         cold_elapsed = time.perf_counter() - cold_start
-        print(f"RESULT: first-call (JIT/autotune incl.) wall time = {cold_elapsed*1e3:.1f} ms")
+        print(f"RESULT: first-call (JIT/autotune incl.) wall time = {cold_elapsed * 1e3:.1f} ms")
         ref_out, _ = paged_attention_reference(
-            q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q,
-            k_descale=k_descale, v_descale=v_descale, causal=True,
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens_t,
+            cu_seqlens_q,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            causal=True,
         )
         torch.cuda.synchronize()
         abs_err = (out - ref_out).abs().max().item()
@@ -183,18 +203,38 @@ def try_case(name, *, mode, q_seqlens, cache_seqlens, page_size, fp8):
         # separately below).
         n_warmup, n_iters = 5, 50
         for _ in range(n_warmup):
-            run_eager(q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q,
-                       mode=mode, k_descale=k_descale, v_descale=v_descale)
+            run_eager(
+                q,
+                k_cache,
+                v_cache,
+                page_table,
+                cache_seqlens_t,
+                cu_seqlens_q,
+                mode=mode,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
         torch.cuda.synchronize()
         start = time.perf_counter()
         for _ in range(n_iters):
-            run_eager(q, k_cache, v_cache, page_table, cache_seqlens_t, cu_seqlens_q,
-                       mode=mode, k_descale=k_descale, v_descale=v_descale)
+            run_eager(
+                q,
+                k_cache,
+                v_cache,
+                page_table,
+                cache_seqlens_t,
+                cu_seqlens_q,
+                mode=mode,
+                k_descale=k_descale,
+                v_descale=v_descale,
+            )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
         total_q_val = int(q.shape[0])
-        print(f"RESULT: throughput {elapsed/n_iters*1e3:.4f} ms/call "
-              f"({total_q_val} q-rows/call, incl. plan+bind rebuild overhead each call)")
+        print(
+            f"RESULT: throughput {elapsed / n_iters * 1e3:.4f} ms/call "
+            f"({total_q_val} q-rows/call, incl. plan+bind rebuild overhead each call)"
+        )
         return True
     except Exception as exc:
         print(f"RESULT: FAILS -- {type(exc).__name__}: {exc}")
@@ -206,6 +246,7 @@ def main():
     print("torch:", torch.__version__)
     print("device:", torch.cuda.get_device_name(0), torch.cuda.get_device_capability(0))
     import sparkinfer
+
     print("sparkinfer:", sparkinfer.__file__)
 
     results = {}

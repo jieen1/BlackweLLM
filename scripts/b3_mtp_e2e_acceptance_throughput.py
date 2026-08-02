@@ -54,7 +54,7 @@ import sys
 import time
 from pathlib import Path
 
-_ROOT = "/home/bot/project/qsr-w-b3a"
+_ROOT = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, _ROOT)
 import runtime  # noqa: E402
 
@@ -216,9 +216,7 @@ def main() -> None:
     tok = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
 
     t_load0 = time.perf_counter()
-    model = load_qwen36_model(
-        MODEL_PATH, device=DEVICE, max_seq_len=MAX_SEQ_LEN, enable_mtp=True
-    )
+    model = load_qwen36_model(MODEL_PATH, device=DEVICE, max_seq_len=MAX_SEQ_LEN, enable_mtp=True)
     print(f"model loaded in {time.perf_counter() - t_load0:.1f}s")
 
     # -- Warmup: pay first-call JIT compiles (extend-mode at K, decode
@@ -266,8 +264,7 @@ def main() -> None:
             f"{spec_tok_s:.2f} tok/s, {len(rounds)} rounds"
         )
         print(
-            f"  acceptance rate: {accept_rate:.3f} "
-            f"({total_accepted}/{total_drafted} draft slots)"
+            f"  acceptance rate: {accept_rate:.3f} ({total_accepted}/{total_drafted} draft slots)"
         )
         print(f"  mean accepted per round (of K={K}): {mean_accept_per_round:.2f}")
         print(f"  speedup (tok/s ratio): {speedup:.2f}x")

@@ -58,6 +58,7 @@ BLOCKS_PER_SLOT = 1024  # block_size=64 -> 64K tokens, far above what we use
 # (gqa_group_size=6, head_dim=128 -> the planner flips tiles twice).
 LENGTHS = [2, 5, 7, 9, 11, 17, 33, 65, 129, 257]
 
+
 def make_token_ids(count: int) -> list[int]:
     """A fixed, reproducible id sequence.
 
@@ -170,11 +171,11 @@ def main() -> int:
 
     t0 = time.time()
     backend = build_backend()
-    print(f"LagunaBackend loaded in {time.time()-t0:.1f}s")
+    print(f"LagunaBackend loaded in {time.time() - t0:.1f}s")
     if args.warmup:
         t0 = time.time()
         backend.warmup_paged_attention_shapes(slot=0)
-        print(f"warmup_paged_attention_shapes: {time.time()-t0:.1f}s")
+        print(f"warmup_paged_attention_shapes: {time.time() - t0:.1f}s")
 
     workspaces = list(iter_prefill_workspaces(backend))
     budgets = [ws._extend_plan_budget for ws in workspaces]

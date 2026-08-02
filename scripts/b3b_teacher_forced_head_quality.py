@@ -143,18 +143,14 @@ def teacher_forced_accuracy(model, tokens: list[int], hiddens: list[torch.Tensor
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--n-tokens", type=int, default=N_TOKENS)
-    ap.add_argument(
-        "--out", type=str, default=".bfdiag/runs/b3b_teacher_forced_head_quality.json"
-    )
+    ap.add_argument("--out", type=str, default=".bfdiag/runs/b3b_teacher_forced_head_quality.json")
     args = ap.parse_args()
 
     print("torch:", torch.__version__, "device:", torch.cuda.get_device_name(0))
     tok = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
 
     t_load0 = time.perf_counter()
-    model = load_qwen36_model(
-        MODEL_PATH, device=DEVICE, max_seq_len=MAX_SEQ_LEN, enable_mtp=True
-    )
+    model = load_qwen36_model(MODEL_PATH, device=DEVICE, max_seq_len=MAX_SEQ_LEN, enable_mtp=True)
     print(f"model loaded in {time.perf_counter() - t_load0:.1f}s")
 
     results: dict = {"n_tokens": args.n_tokens, "prompts": {}}
@@ -174,9 +170,7 @@ def main() -> None:
         # rank-2 rescue rate: among misses, how often was the head's guess
         # the target's OWN #2 pick (a "close" miss vs a "nowhere near" miss).
         misses = [r for r in records if not r["match"]]
-        close_misses = sum(
-            1 for r in misses if r["pred"] in top5[r["i"]][1:5]
-        )
+        close_misses = sum(1 for r in misses if r["pred"] in top5[r["i"]][1:5])
         close_rate = close_misses / len(misses) if misses else float("nan")
 
         # first-quarter vs last-quarter accuracy -- does raw (non-chained)

@@ -63,8 +63,10 @@ def run_k_sweep(model, tok) -> dict:
         prompt_ids = tok(text, return_tensors=None)["input_ids"]
         ref_tokens, ref_time = ks.free_greedy_decode(model, prompt_ids, K_SWEEP_N_TOKENS)
         baselines[label] = (ref_tokens, ref_time)
-        print(f"baseline[{label}]: {K_SWEEP_N_TOKENS} tok in {ref_time:.3f}s "
-              f"= {K_SWEEP_N_TOKENS / ref_time:.2f} tok/s")
+        print(
+            f"baseline[{label}]: {K_SWEEP_N_TOKENS} tok in {ref_time:.3f}s "
+            f"= {K_SWEEP_N_TOKENS / ref_time:.2f} tok/s"
+        )
 
     for k in K_SWEEP_VALUES:
         print(f"\n{'=' * 70}\nK={k}\n{'=' * 70}")
@@ -156,8 +158,10 @@ def run_teacher_forced(model, tok) -> dict:
 
         print(f"  teacher-forced top-1 accuracy: {acc:.3f} ({matches}/{n})")
         print(f"  first-quarter acc: {first_q_acc:.3f}  last-quarter acc: {last_q_acc:.3f}")
-        print(f"  among misses, head's guess was target's rank 2-5: "
-              f"{close_rate:.3f} ({close_misses}/{len(misses)})")
+        print(
+            f"  among misses, head's guess was target's rank 2-5: "
+            f"{close_rate:.3f} ({close_misses}/{len(misses)})"
+        )
 
         results["prompts"][label] = {
             "n_positions": n,
@@ -199,12 +203,12 @@ def run_divergence_gap(model, tok) -> dict:
             results["prompts"][label] = entry
             continue
 
-        first_diff = next(
-            i for i, (a, b) in enumerate(zip(ref_tokens, spec_tokens)) if a != b
+        first_diff = next(i for i, (a, b) in enumerate(zip(ref_tokens, spec_tokens)) if a != b)
+        print(
+            f"  first_diff at index {first_diff}: ref={ref_tokens[first_diff]} "
+            f"({tok.decode([ref_tokens[first_diff]])!r}) vs "
+            f"spec={spec_tokens[first_diff]} ({tok.decode([spec_tokens[first_diff]])!r})"
         )
-        print(f"  first_diff at index {first_diff}: ref={ref_tokens[first_diff]} "
-              f"({tok.decode([ref_tokens[first_diff]])!r}) vs "
-              f"spec={spec_tokens[first_diff]} ({tok.decode([spec_tokens[first_diff]])!r})")
 
         oracle_row = seq_rows[first_diff]
         mine_row = dg.find_source_row(round_meta, first_diff)
@@ -226,9 +230,11 @@ def run_divergence_gap(model, tok) -> dict:
         metrics = report.summary_metrics()
         passed, reasons = dg.evaluate_summary(metrics, dg.CALIBRATED_THRESHOLDS)
 
-        print(f"  gap_error={step.gap_error:.4f}  kl_topk={step.kl_topk:.3e}  "
-              f"tie_slack_ulps={step.tie_slack_ulps:.1f}  agrees={step.agrees}  "
-              f"mine_top1={step.mine_top1} oracle_top1={step.oracle_top1}")
+        print(
+            f"  gap_error={step.gap_error:.4f}  kl_topk={step.kl_topk:.3e}  "
+            f"tie_slack_ulps={step.tie_slack_ulps:.1f}  agrees={step.agrees}  "
+            f"mine_top1={step.mine_top1} oracle_top1={step.oracle_top1}"
+        )
         print(f"  judged against B1-R CALIBRATED_THRESHOLDS: passes={passed}")
         for r in reasons:
             print(f"    {r}")
@@ -259,9 +265,7 @@ def main() -> None:
     tok = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
 
     t0 = time.perf_counter()
-    model = load_qwen36_model(
-        MODEL_PATH, device=DEVICE, max_seq_len=MAX_SEQ_LEN, enable_mtp=True
-    )
+    model = load_qwen36_model(MODEL_PATH, device=DEVICE, max_seq_len=MAX_SEQ_LEN, enable_mtp=True)
     print(f"model loaded in {time.perf_counter() - t0:.1f}s")
 
     all_results: dict = {"model_load_s": time.perf_counter() - t0}

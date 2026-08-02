@@ -121,9 +121,11 @@ def main() -> None:
         f"nvidia-smi after decode loop: {after_decode} MiB "
         "(peak resident, no growth beyond warmup expected)"
     )
-    print(f"\nsummary: before_load={before_load} after_load={after_load} "
-          f"after_prefill={after_prefill} after_warm_decode={after_warm_decode} "
-          f"after_decode_loop={after_decode} (MiB)")
+    print(
+        f"\nsummary: before_load={before_load} after_load={after_load} "
+        f"after_prefill={after_prefill} after_warm_decode={after_warm_decode} "
+        f"after_decode_loop={after_decode} (MiB)"
+    )
     print(f"total resident (GiB): {after_decode / 1024:.2f}")
 
 

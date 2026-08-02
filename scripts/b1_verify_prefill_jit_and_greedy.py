@@ -149,7 +149,7 @@ def main() -> int:
         max_seq_len=MAX_SEQ_LEN,
         warmup_attention=args.warmup,
     )
-    print(f"load_qwen36_model(warmup={args.warmup}): {time.time()-t0:.1f}s")
+    print(f"load_qwen36_model(warmup={args.warmup}): {time.time() - t0:.1f}s")
 
     results: dict[int, dict[str, object]] = {}
     print(f"\n{'seq_len':>8} {'prefill_s':>10}  first 8 generated ids")

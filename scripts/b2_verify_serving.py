@@ -70,7 +70,7 @@ import torch  # noqa: E402
 _mem_fraction = os.environ.get("QSR_DEBUG_MEM_FRACTION")
 if _mem_fraction:
     torch.cuda.set_per_process_memory_fraction(float(_mem_fraction), device=0)
-    print(f"[safety] capped this process to {float(_mem_fraction)*100:.0f}% of device memory")
+    print(f"[safety] capped this process to {float(_mem_fraction) * 100:.0f}% of device memory")
 
 from transformers import AutoTokenizer  # noqa: E402
 
@@ -191,25 +191,31 @@ def check_serial_matches_b1(model, prompts, steps, args) -> None:
 def check_batched_matches_serial(model, prompts, steps, args) -> None:
     print("\n== 2. batched decode vs serial decode ==")
     serial = Qwen36Backend(
-        model, num_slots=args.slots, max_seq_len=args.max_seq_len,
-        device="cuda", dtype=torch.bfloat16,
-        batched_decode=False, enable_prefix_cache=False,
+        model,
+        num_slots=args.slots,
+        max_seq_len=args.max_seq_len,
+        device="cuda",
+        dtype=torch.bfloat16,
+        batched_decode=False,
+        enable_prefix_cache=False,
     )
     ref = [backend_greedy(serial, 0, ids, steps) for ids in prompts]
     del serial
     torch.cuda.empty_cache()
 
     batched = Qwen36Backend(
-        model, num_slots=args.slots, max_seq_len=args.max_seq_len,
-        device="cuda", dtype=torch.bfloat16,
-        batched_decode=True, enable_prefix_cache=False,
+        model,
+        num_slots=args.slots,
+        max_seq_len=args.max_seq_len,
+        device="cuda",
+        dtype=torch.bfloat16,
+        batched_decode=True,
+        enable_prefix_cache=False,
     )
     for i, ids in enumerate(prompts):
         got = backend_greedy(batched, 0, ids, steps)
         same = got == ref[i]
-        first_div = next(
-            (j for j, (a, b) in enumerate(zip(got, ref[i])) if a != b), None
-        )
+        first_div = next((j for j, (a, b) in enumerate(zip(got, ref[i])) if a != b), None)
         record(
             f"prompt[{i}] batched(B=1) == serial",
             same,
@@ -221,9 +227,13 @@ def check_batched_matches_serial(model, prompts, steps, args) -> None:
 def check_concurrency(model, prompts, steps, args) -> None:
     print(f"\n== 3. concurrency: {args.slots} slots in one round, slot isolation ==")
     backend = Qwen36Backend(
-        model, num_slots=args.slots, max_seq_len=args.max_seq_len,
-        device="cuda", dtype=torch.bfloat16,
-        batched_decode=True, enable_prefix_cache=False,
+        model,
+        num_slots=args.slots,
+        max_seq_len=args.max_seq_len,
+        device="cuda",
+        dtype=torch.bfloat16,
+        batched_decode=True,
+        enable_prefix_cache=False,
     )
     use = prompts[: args.slots]
     alone = [backend_greedy(backend, i, ids, steps) for i, ids in enumerate(use)]
@@ -249,9 +259,7 @@ def check_concurrency(model, prompts, steps, args) -> None:
 
     for i in range(len(use)):
         same = together[i] == alone[i]
-        first_div = next(
-            (j for j, (a, b) in enumerate(zip(together[i], alone[i])) if a != b), None
-        )
+        first_div = next((j for j, (a, b) in enumerate(zip(together[i], alone[i])) if a != b), None)
         record(
             f"slot {i} concurrent output == its own solo output",
             same,
@@ -260,8 +268,8 @@ def check_concurrency(model, prompts, steps, args) -> None:
 
     med = sorted(step_times)[len(step_times) // 2]
     print(
-        f"  batch={len(use)}: median decode round {med*1000:.1f} ms "
-        f"=> {len(use)/med:.1f} tok/s aggregate, {1/med:.1f} tok/s per stream"
+        f"  batch={len(use)}: median decode round {med * 1000:.1f} ms "
+        f"=> {len(use) / med:.1f} tok/s aggregate, {1 / med:.1f} tok/s per stream"
     )
     return backend, med
 
@@ -281,16 +289,20 @@ def check_solo_throughput(backend, prompts, steps) -> float:
         torch.cuda.synchronize()
         times.append(time.perf_counter() - t0)
     med = sorted(times)[len(times) // 2]
-    print(f"  batch=1: median decode round {med*1000:.1f} ms => {1/med:.1f} tok/s")
+    print(f"  batch=1: median decode round {med * 1000:.1f} ms => {1 / med:.1f} tok/s")
     return med
 
 
 def check_prefix_cache(model, prompts, steps, args, tokenizer) -> None:
     print("\n== 5. prefix cache: (kv_hit, state_hit) and a real resume ==")
     backend = Qwen36Backend(
-        model, num_slots=args.slots, max_seq_len=args.max_seq_len,
-        device="cuda", dtype=torch.bfloat16,
-        batched_decode=True, enable_prefix_cache=True,
+        model,
+        num_slots=args.slots,
+        max_seq_len=args.max_seq_len,
+        device="cuda",
+        dtype=torch.bfloat16,
+        batched_decode=True,
+        enable_prefix_cache=True,
         block_size=args.block_size,
     )
     base = prompts[0]
@@ -317,9 +329,7 @@ def check_prefix_cache(model, prompts, steps, args, tokenizer) -> None:
     params = SamplingParams()
     tok = warm
     for _ in range(steps):
-        tok = backend.decode_batch_sampled(
-            [0], [tok], [backend.slot_state(0).kv_len], [params]
-        )[0]
+        tok = backend.decode_batch_sampled([0], [tok], [backend.slot_state(0).kv_len], [params])[0]
         warm_tokens.append(tok)
 
     cold_ref, _ = b1_eager_greedy(model, follow_up, steps)
@@ -338,19 +348,28 @@ def check_prefix_cache(model, prompts, steps, args, tokenizer) -> None:
 def check_cuda_graph(model, prompts, steps, args) -> None:
     print("\n== 4. CUDA Graph decode capture + replay ==")
     backend = Qwen36Backend(
-        model, num_slots=args.slots, max_seq_len=args.max_seq_len,
-        device="cuda", dtype=torch.bfloat16,
-        batched_decode=True, enable_prefix_cache=False,
+        model,
+        num_slots=args.slots,
+        max_seq_len=args.max_seq_len,
+        device="cuda",
+        dtype=torch.bfloat16,
+        batched_decode=True,
+        enable_prefix_cache=False,
     )
     eager_ref = [backend_greedy(backend, 0, ids, steps) for ids in prompts[:2]]
     for s in range(args.slots):
         backend.reset_slot(s)
 
     free_b, total_b = torch.cuda.mem_get_info()
-    print(f"  device free BEFORE capture: {free_b/2**30:.1f} / {total_b/2**30:.1f} GiB", flush=True)
+    print(
+        f"  device free BEFORE capture: {free_b / 2**30:.1f} / {total_b / 2**30:.1f} GiB",
+        flush=True,
+    )
     captured = backend.capture_decode_cuda_graph()
     free_b, total_b = torch.cuda.mem_get_info()
-    print(f"  device free AFTER capture: {free_b/2**30:.1f} / {total_b/2**30:.1f} GiB", flush=True)
+    print(
+        f"  device free AFTER capture: {free_b / 2**30:.1f} / {total_b / 2**30:.1f} GiB", flush=True
+    )
     record("capture returned a batch size", captured is not None, f"max_batch={captured}")
     # B3 step 0 (docs/implementation-plan.md §7.3 C7-2): this is the exact
     # question that was previously unanswerable from inside a real serving
@@ -423,10 +442,10 @@ def main() -> None:
     model = load_qwen36_model(
         model_path, device="cuda", dtype=torch.bfloat16, max_seq_len=args.max_seq_len
     )
-    print(f"load_qwen36_model: {time.time()-t0:.1f}s")
-    print(f"weights resident: {torch.cuda.memory_allocated()/2**30:.1f} GiB")
+    print(f"load_qwen36_model: {time.time() - t0:.1f}s")
+    print(f"weights resident: {torch.cuda.memory_allocated() / 2**30:.1f} GiB")
     free_b, total_b = torch.cuda.mem_get_info()
-    print(f"device free after load: {free_b/2**30:.1f} / {total_b/2**30:.1f} GiB")
+    print(f"device free after load: {free_b / 2**30:.1f} / {total_b / 2**30:.1f} GiB")
 
     def want(name: str) -> bool:
         return not only or name in only
@@ -445,7 +464,7 @@ def main() -> None:
         n = min(args.slots, len(prompts))
         print(
             f"  speedup at batch={n}: {n * med_solo / med_batch:.2f}x aggregate "
-            f"(round time {med_solo*1000:.1f} ms -> {med_batch*1000:.1f} ms)"
+            f"(round time {med_solo * 1000:.1f} ms -> {med_batch * 1000:.1f} ms)"
         )
         del b
         torch.cuda.empty_cache()

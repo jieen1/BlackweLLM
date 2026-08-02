@@ -73,12 +73,24 @@ def test_chunk_prefill():
     print("\n=== chunk_gated_delta_rule (prefill, T=300, not a multiple of chunk_size=64) ===")
     query, key, value, g, beta = make_layer_inputs(batch=2, seq_len=300, seed=11)
     fla_out, fla_state = chunk_gated_delta_rule(
-        query, key, value, g=g, beta=beta,
-        initial_state=None, output_final_state=True, use_qk_l2norm_in_kernel=True,
+        query,
+        key,
+        value,
+        g=g,
+        beta=beta,
+        initial_state=None,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
     )
     ref_out, ref_state = torch_chunk_gated_delta_rule(
-        query, key, value, g, beta,
-        initial_state=None, output_final_state=True, use_qk_l2norm_in_kernel=True,
+        query,
+        key,
+        value,
+        g,
+        beta,
+        initial_state=None,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
     )
     torch.cuda.synchronize()
     compare("chunk", fla_out, ref_out, fla_state, ref_state)
@@ -86,20 +98,34 @@ def test_chunk_prefill():
 
 
 def test_recurrent_decode_multistep(init_fla_state, init_ref_state, n_steps=8):
-    print(f"\n=== fused_recurrent_gated_delta_rule ({n_steps} sequential decode steps, "
-          f"starting from the prefill's final_state) ===")
+    print(
+        f"\n=== fused_recurrent_gated_delta_rule ({n_steps} sequential decode steps, "
+        f"starting from the prefill's final_state) ==="
+    )
     batch = init_fla_state.shape[0]
     fla_state = init_fla_state.clone()
     ref_state = init_ref_state.clone()
     for step in range(n_steps):
         query, key, value, g, beta = make_layer_inputs(batch=batch, seq_len=1, seed=100 + step)
         fla_out, fla_state = fused_recurrent_gated_delta_rule(
-            query, key, value, g=g, beta=beta,
-            initial_state=fla_state, output_final_state=True, use_qk_l2norm_in_kernel=True,
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=fla_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
         )
         ref_out, ref_state = torch_recurrent_gated_delta_rule(
-            query, key, value, g, beta,
-            initial_state=ref_state, output_final_state=True, use_qk_l2norm_in_kernel=True,
+            query,
+            key,
+            value,
+            g,
+            beta,
+            initial_state=ref_state,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
         )
         torch.cuda.synchronize()
         compare(f"decode step {step}", fla_out, ref_out, fla_state, ref_state)
@@ -112,16 +138,23 @@ def test_recurrent_decode_multistep_bf16_rounded(init_fla_state, init_ref_state,
     This is the "single-step FP32 compute, cross-step BF16 rounding" mechanism
     already identified from static reading; here we measure how much it costs.
     """
-    print(f"\n=== fused_recurrent_gated_delta_rule ({n_steps} steps) WITH BF16 "
-          f"cross-step state rounding (mirrors HF cache_utils.py exactly) vs FP32-clean FLA ===")
+    print(
+        f"\n=== fused_recurrent_gated_delta_rule ({n_steps} steps) WITH BF16 "
+        f"cross-step state rounding (mirrors HF cache_utils.py exactly) vs FP32-clean FLA ==="
+    )
     batch = init_fla_state.shape[0]
     fla_state_bf16_persisted = init_fla_state.clone().to(torch.bfloat16)
     fla_state_fp32_clean = init_fla_state.clone()
     for step in range(n_steps):
         query, key, value, g, beta = make_layer_inputs(batch=batch, seq_len=1, seed=200 + step)
         out_bf16path, new_state = fused_recurrent_gated_delta_rule(
-            query, key, value, g=g, beta=beta,
-            initial_state=fla_state_bf16_persisted, output_final_state=True,
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=fla_state_bf16_persisted,
+            output_final_state=True,
             use_qk_l2norm_in_kernel=True,
         )
         # HF's LinearAttentionLayer.update_recurrent_state does
@@ -129,14 +162,21 @@ def test_recurrent_decode_multistep_bf16_rounded(init_fla_state, init_ref_state,
         fla_state_bf16_persisted = fla_state_bf16_persisted.copy_(new_state).clone()
 
         out_fp32path, fla_state_fp32_clean = fused_recurrent_gated_delta_rule(
-            query, key, value, g=g, beta=beta,
-            initial_state=fla_state_fp32_clean, output_final_state=True,
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=fla_state_fp32_clean,
+            output_final_state=True,
             use_qk_l2norm_in_kernel=True,
         )
         torch.cuda.synchronize()
         out_err = (out_bf16path.float() - out_fp32path.float()).abs().max().item()
-        print(f"[step {step}] BF16-persisted-state vs FP32-clean-state core_attn_out "
-              f"max_abs_err={out_err:.6g}")
+        print(
+            f"[step {step}] BF16-persisted-state vs FP32-clean-state core_attn_out "
+            f"max_abs_err={out_err:.6g}"
+        )
 
 
 def main():

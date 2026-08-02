@@ -91,6 +91,7 @@ def _load_sibling_script(name: str):
     spec.loader.exec_module(module)
     return module
 
+
 # checkpoint-unify-20260803 KNOWN GAP: this script's ``stage_dequantized_
 # weights_to_disk``/``load_staged_weights_into_hf`` calls are reused
 # verbatim from ``b1_verify_greedy_alignment.py`` (via ``_load_sibling_
@@ -111,8 +112,7 @@ WORKLOADS: tuple[tuple[str, str], ...] = (
     ("math-short", "2 + 2 ="),
     (
         "instruction-longer",
-        "Write a short paragraph explaining, in simple terms, how a "
-        "refrigerator keeps food cold.",
+        "Write a short paragraph explaining, in simple terms, how a refrigerator keeps food cold.",
     ),
 )
 
@@ -166,9 +166,7 @@ def hf_greedy_with_logits(
     step_input = input_ids
     for _ in range(max_new_tokens):
         with torch.no_grad():
-            outputs = hf_model(
-                step_input, past_key_values=cache, use_cache=True, logits_to_keep=1
-            )
+            outputs = hf_model(step_input, past_key_values=cache, use_cache=True, logits_to_keep=1)
         row = outputs.logits[0, -1]
         logit_rows.append(row.detach().to("cpu", torch.bfloat16).clone())
         lse_rows.append(float(torch.logsumexp(row.float(), dim=-1).item()))
@@ -238,9 +236,7 @@ def main() -> None:
 
         t0 = time.time()
         hf_model = sibling.build_hf_reference_on_device(model_config, DEVICE)
-        loaded, missing = sibling.load_staged_weights_into_hf(
-            hf_model, scratch_dir, staged_names
-        )
+        loaded, missing = sibling.load_staged_weights_into_hf(hf_model, scratch_dir, staged_names)
         print(
             f"HF built + loaded in {time.time() - t0:.1f}s "
             f"({len(loaded)} in, {len(missing)} missing)"

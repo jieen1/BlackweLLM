@@ -19,11 +19,15 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "/home/bot/project/qsr-w-b1")
+_ROOT = str(Path(__file__).resolve().parent.parent)
+sys.path.insert(0, _ROOT)
 import runtime  # noqa: E402
 
-assert runtime.__file__.startswith("/home/bot/project/qsr-w-b1"), runtime.__file__
+assert runtime.__file__.startswith(_ROOT), (
+    f"imported runtime from {runtime.__file__}, expected under {_ROOT}"
+)
 
 import torch  # noqa: E402
 

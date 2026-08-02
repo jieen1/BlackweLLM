@@ -17,10 +17,13 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, "/home/bot/project/qsr-w-b1")
+_ROOT = str(Path(__file__).resolve().parent.parent)
+sys.path.insert(0, _ROOT)
 import runtime  # noqa: E402
 
-assert runtime.__file__.startswith("/home/bot/project/qsr-w-b1"), runtime.__file__
+assert runtime.__file__.startswith(_ROOT), (
+    f"imported runtime from {runtime.__file__}, expected under {_ROOT}"
+)
 
 import torch  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
@@ -131,8 +134,11 @@ def main() -> None:
     rope_params = model_config["rope_parameters"]
     rotary_dim = int(model_config["head_dim"] * rope_params["partial_rotary_factor"])
     cos_sin_cache = compute_cos_sin_cache_default(
-        rotary_dim, model_config["max_position_embeddings"], float(rope_params["rope_theta"]),
-        torch.bfloat16, device=DEVICE,
+        rotary_dim,
+        model_config["max_position_embeddings"],
+        float(rope_params["rope_theta"]),
+        torch.bfloat16,
+        device=DEVICE,
     )
 
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextRotaryEmbedding
@@ -147,8 +153,11 @@ def main() -> None:
 
     print(f"\n=== prefill (extend mode, T={prefill_len}) ===")
     my_cache = Qwen36PagedAttentionCache(
-        num_kv_heads=model_config["num_key_value_heads"], head_dim=model_config["head_dim"],
-        max_seq_len=MAX_SEQ_LEN, dtype=torch.bfloat16, device=DEVICE,
+        num_kv_heads=model_config["num_key_value_heads"],
+        head_dim=model_config["head_dim"],
+        max_seq_len=MAX_SEQ_LEN,
+        dtype=torch.bfloat16,
+        device=DEVICE,
     )
     my_positions = torch.arange(0, prefill_len, device=DEVICE, dtype=torch.long)
     my_out_prefill = mine(x_prefill, my_positions, cos_sin_cache, my_cache)
@@ -158,8 +167,10 @@ def main() -> None:
     cos, sin = hf_rope(x_prefill, pos_ids)
     attn_mask = make_causal_mask(prefill_len, prefill_len, 0, torch.bfloat16, DEVICE)
     hf_out_prefill, _ = hf_attn(
-        x_prefill, position_embeddings=(cos, sin),
-        attention_mask=attn_mask, past_key_values=hf_cache,
+        x_prefill,
+        position_embeddings=(cos, sin),
+        attention_mask=attn_mask,
+        past_key_values=hf_cache,
     )
     compare("prefill", my_out_prefill, hf_out_prefill)
 
@@ -172,8 +183,10 @@ def main() -> None:
     cos_d, sin_d = hf_rope(x_decode, pos_ids_d)
     attn_mask_d = make_causal_mask(1, prefill_len + 1, prefill_len, torch.bfloat16, DEVICE)
     hf_out_decode, _ = hf_attn(
-        x_decode, position_embeddings=(cos_d, sin_d),
-        attention_mask=attn_mask_d, past_key_values=hf_cache,
+        x_decode,
+        position_embeddings=(cos_d, sin_d),
+        attention_mask=attn_mask_d,
+        past_key_values=hf_cache,
     )
     compare("decode", my_out_decode, hf_out_decode)
 
@@ -188,7 +201,9 @@ def main() -> None:
     cos_d2, sin_d2 = hf_rope(x_decode2, pos_ids_d2)
     attn_mask_d2 = make_causal_mask(1, prefill_len + 2, prefill_len + 1, torch.bfloat16, DEVICE)
     hf_out_decode2, _ = hf_attn(
-        x_decode2, position_embeddings=(cos_d2, sin_d2), attention_mask=attn_mask_d2,
+        x_decode2,
+        position_embeddings=(cos_d2, sin_d2),
+        attention_mask=attn_mask_d2,
         past_key_values=hf_cache,
     )
     compare("decode2", my_out_decode2, hf_out_decode2)

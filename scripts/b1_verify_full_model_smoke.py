@@ -28,11 +28,15 @@ from __future__ import annotations
 
 import sys
 import time
+from pathlib import Path
 
-sys.path.insert(0, "/home/bot/project/qsr-w-b1")
+_ROOT = str(Path(__file__).resolve().parent.parent)
+sys.path.insert(0, _ROOT)
 import runtime  # noqa: E402
 
-assert runtime.__file__.startswith("/home/bot/project/qsr-w-b1"), runtime.__file__
+assert runtime.__file__.startswith(_ROOT), (
+    f"imported runtime from {runtime.__file__}, expected under {_ROOT}"
+)
 
 import torch  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
@@ -54,7 +58,7 @@ def run_prompt(model, tokenizer, prompt: str) -> None:
     hidden = model(input_ids, state)
     logits = model.compute_logits(hidden[:, -1:, :])
     torch.cuda.synchronize()
-    print(f"prefill: {time.time()-t0:.2f}s, logits finite={torch.isfinite(logits).all().item()}")
+    print(f"prefill: {time.time() - t0:.2f}s, logits finite={torch.isfinite(logits).all().item()}")
 
     generated = [int(input_ids[0, -1].item())]
     next_token = int(logits[0, -1].argmax().item())
@@ -95,7 +99,7 @@ def main() -> None:
 
     t0 = time.time()
     model = load_qwen36_model(MODEL_PATH, device="cuda", dtype=torch.bfloat16, max_seq_len=512)
-    print(f"load_qwen36_model: {time.time()-t0:.1f}s")
+    print(f"load_qwen36_model: {time.time() - t0:.1f}s")
 
     run_prompt(model, tokenizer, "The capital of France is")
     run_prompt(model, tokenizer, "2 + 2 =")

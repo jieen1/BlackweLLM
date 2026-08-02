@@ -71,9 +71,7 @@ def make_cache(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def make_workspace(device: torch.device, *, budget: bool) -> SparkinferPrefillWorkspace:
-    ws = SparkinferPrefillWorkspace(
-        device, max_total_q=MAX_TOTAL_Q, max_page_table_width=NUM_PAGES
-    )
+    ws = SparkinferPrefillWorkspace(device, max_total_q=MAX_TOTAL_Q, max_page_table_width=NUM_PAGES)
     if not budget:
         # Emulate the pre-fix planner call, which passed no budget at all.
         ws._extend_plan_budget = None
@@ -100,16 +98,30 @@ def section_buckets(device: torch.device, *, budget: bool, window_left: int) -> 
         cache_seqlens = torch.tensor([qo_len], dtype=torch.int32, device=device)
         cu_seqlens_q = torch.tensor([0, qo_len], dtype=torch.int32, device=device)
         plan = create_paged_plan(
-            q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
-            mode="extend", enable_cuda_graph=False, window_left=window_left,
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            mode="extend",
+            enable_cuda_graph=False,
+            window_left=window_left,
             plan_budget=getattr(ws, "_extend_plan_budget", None),
         )
         before = compile_cache_info()
         torch.cuda.synchronize(device)
         t0 = time.perf_counter()
         ws.forward(
-            q, k_cache, v_cache, out, page_table, cache_seqlens, cu_seqlens_q,
-            window_left=window_left, mode="extend",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            window_left=window_left,
+            mode="extend",
         )
         torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - t0
@@ -165,21 +177,38 @@ def section_exact(device: torch.device, *, window_left: int) -> int:
         for ws in (ws_no, ws_yes):
             budget = getattr(ws, "_extend_plan_budget", None)
             plan = create_paged_plan(
-                q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
-                mode="extend", enable_cuda_graph=False, window_left=window_left,
+                q,
+                k_cache,
+                v_cache,
+                page_table,
+                cache_seqlens,
+                cu_seqlens_q,
+                mode="extend",
+                enable_cuda_graph=False,
+                window_left=window_left,
                 plan_budget=budget,
             )
             tiles.append(int(plan.cta_tile_q))
             out = torch.empty_like(q)
             ws.forward(
-                q, k_cache, v_cache, out, page_table, cache_seqlens, cu_seqlens_q,
-                window_left=window_left, mode="extend",
+                q,
+                k_cache,
+                v_cache,
+                out,
+                page_table,
+                cache_seqlens,
+                cu_seqlens_q,
+                window_left=window_left,
+                mode="extend",
             )
             outs.append(out)
         ref = reference(q, k_cache, v_cache, page_table, qo_len, window_left)
         cos = [
-            float(torch.nn.functional.cosine_similarity(
-                o.float().flatten(), ref.flatten(), dim=0).item())
+            float(
+                torch.nn.functional.cosine_similarity(
+                    o.float().flatten(), ref.flatten(), dim=0
+                ).item()
+            )
             for o in outs
         ]
         exact = torch.equal(outs[0], outs[1])
@@ -206,10 +235,15 @@ def _policy_probe(
     tiles = []
     for budget in (None, PagedPlanBudget(max_total_q=max_total_q, max_batch=1)):
         plan = create_paged_plan(
-            q, k_cache, v_cache, page_table,
+            q,
+            k_cache,
+            v_cache,
+            page_table,
             torch.tensor([max(qo_len, 1024)], dtype=torch.int32, device=device),
             torch.tensor([0, qo_len], dtype=torch.int32, device=device),
-            mode=mode, enable_cuda_graph=False, window_left=window_left,
+            mode=mode,
+            enable_cuda_graph=False,
+            window_left=window_left,
             plan_budget=budget,
         )
         tiles.append(int(plan.cta_tile_q))
@@ -221,27 +255,90 @@ def section_verify(device: torch.device) -> None:
     budget would do to each. Only the first row is supposed to change."""
     print("\n=== policy: cta_tile_q without / with a plan budget ===")
     cases = [
-        ("main extend (48q/8kv, page64, wl=-1, qo=64)",
-         dict(mode="extend", num_q_heads=48, num_kv_heads=8, page_size=64,
-              qo_len=64, window_left=-1, max_total_q=MAX_TOTAL_Q)),
-        ("main extend, SWA group (wl=511, qo=64)",
-         dict(mode="extend", num_q_heads=48, num_kv_heads=8, page_size=64,
-              qo_len=64, window_left=SLIDING_WINDOW - 1, max_total_q=MAX_TOTAL_Q)),
-        ("main extend, short prompt (qo=5)",
-         dict(mode="extend", num_q_heads=48, num_kv_heads=8, page_size=64,
-              qo_len=5, window_left=-1, max_total_q=MAX_TOTAL_Q)),
-        ("DFlash draft extend (72q/8kv, page128, wl=511, qo=16, cap=16)",
-         dict(mode="extend", num_q_heads=72, num_kv_heads=8, page_size=128,
-              qo_len=16, window_left=511, max_total_q=16)),
-        ("verify (48q/8kv, page64, qo=8)",
-         dict(mode="verify", num_q_heads=48, num_kv_heads=8, page_size=64,
-              qo_len=8, window_left=-1, max_total_q=MAX_TOTAL_Q)),
-        ("verify (48q/8kv, page128, qo=8) -- MUST NOT get the budget",
-         dict(mode="verify", num_q_heads=48, num_kv_heads=8, page_size=128,
-              qo_len=8, window_left=-1, max_total_q=MAX_TOTAL_Q)),
-        ("decode (48q/8kv, page64, qo=1)",
-         dict(mode="decode", num_q_heads=48, num_kv_heads=8, page_size=64,
-              qo_len=1, window_left=-1, max_total_q=MAX_TOTAL_Q)),
+        (
+            "main extend (48q/8kv, page64, wl=-1, qo=64)",
+            dict(
+                mode="extend",
+                num_q_heads=48,
+                num_kv_heads=8,
+                page_size=64,
+                qo_len=64,
+                window_left=-1,
+                max_total_q=MAX_TOTAL_Q,
+            ),
+        ),
+        (
+            "main extend, SWA group (wl=511, qo=64)",
+            dict(
+                mode="extend",
+                num_q_heads=48,
+                num_kv_heads=8,
+                page_size=64,
+                qo_len=64,
+                window_left=SLIDING_WINDOW - 1,
+                max_total_q=MAX_TOTAL_Q,
+            ),
+        ),
+        (
+            "main extend, short prompt (qo=5)",
+            dict(
+                mode="extend",
+                num_q_heads=48,
+                num_kv_heads=8,
+                page_size=64,
+                qo_len=5,
+                window_left=-1,
+                max_total_q=MAX_TOTAL_Q,
+            ),
+        ),
+        (
+            "DFlash draft extend (72q/8kv, page128, wl=511, qo=16, cap=16)",
+            dict(
+                mode="extend",
+                num_q_heads=72,
+                num_kv_heads=8,
+                page_size=128,
+                qo_len=16,
+                window_left=511,
+                max_total_q=16,
+            ),
+        ),
+        (
+            "verify (48q/8kv, page64, qo=8)",
+            dict(
+                mode="verify",
+                num_q_heads=48,
+                num_kv_heads=8,
+                page_size=64,
+                qo_len=8,
+                window_left=-1,
+                max_total_q=MAX_TOTAL_Q,
+            ),
+        ),
+        (
+            "verify (48q/8kv, page128, qo=8) -- MUST NOT get the budget",
+            dict(
+                mode="verify",
+                num_q_heads=48,
+                num_kv_heads=8,
+                page_size=128,
+                qo_len=8,
+                window_left=-1,
+                max_total_q=MAX_TOTAL_Q,
+            ),
+        ),
+        (
+            "decode (48q/8kv, page64, qo=1)",
+            dict(
+                mode="decode",
+                num_q_heads=48,
+                num_kv_heads=8,
+                page_size=64,
+                qo_len=1,
+                window_left=-1,
+                max_total_q=MAX_TOTAL_Q,
+            ),
+        ),
     ]
     print(f"{'case':<62} {'no budget':>10} {'budget':>8}")
     for label, kwargs in cases:
@@ -251,9 +348,7 @@ def section_verify(device: torch.device) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--section", choices=("buckets", "exact", "verify", "all"), default="all"
-    )
+    parser.add_argument("--section", choices=("buckets", "exact", "verify", "all"), default="all")
     parser.add_argument(
         "--no-budget",
         action="store_true",

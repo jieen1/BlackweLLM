@@ -32,7 +32,7 @@ import sys
 import time
 from pathlib import Path
 
-_ROOT = "/home/bot/project/qsr-w-gdnopt"
+_ROOT = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, _ROOT)
 import runtime  # noqa: E402
 
@@ -82,7 +82,10 @@ def load_old_spec_forward():
     itself was not touched by this session)."""
     old_src = subprocess.run(
         ["git", "show", "main:runtime/model/qwen36_model.py"],
-        cwd=_ROOT, check=True, capture_output=True, text=True,
+        cwd=_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
     old_path = Path("/tmp/_b3_qwen36_model_old_20260802.py")
     old_path.write_text(old_src)
@@ -114,8 +117,8 @@ def load_layer(layer_idx: int) -> tuple[Qwen36GatedDeltaNet, int]:
         f"model.language_model.layers.{layer_idx}.linear_attn.out_proj": "FP8",
     }
     with DEVICE:
-        layer = Qwen36GatedDeltaNet(model_config, layer_idx, quantized).to(DEVICE).to(
-            torch.bfloat16
+        layer = (
+            Qwen36GatedDeltaNet(model_config, layer_idx, quantized).to(DEVICE).to(torch.bfloat16)
         )
     params = dict(layer.named_parameters())
     name_map = {
@@ -184,11 +187,15 @@ def main() -> None:
     for j in range(K + 1):
         conv_diff = (
             (old_snapshots[j].conv_state.float() - new_snapshots[j].conv_state.float())
-            .abs().max().item()
+            .abs()
+            .max()
+            .item()
         )
         rec_diff = (
             (old_snapshots[j].recurrent_state.float() - new_snapshots[j].recurrent_state.float())
-            .abs().max().item()
+            .abs()
+            .max()
+            .item()
         )
         max_diff = max(max_diff, conv_diff, rec_diff)
         bit_exact = torch.equal(

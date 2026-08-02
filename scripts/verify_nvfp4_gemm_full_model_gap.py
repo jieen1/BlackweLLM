@@ -154,9 +154,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=64)
     ap.add_argument("--max-seq-len", type=int, default=512)
-    ap.add_argument(
-        "--out", type=str, default=".bfdiag/runs/nvfp4_gemm_full_model_gap.json"
-    )
+    ap.add_argument("--out", type=str, default=".bfdiag/runs/nvfp4_gemm_full_model_gap.json")
     ap.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
     args = ap.parse_args()
     model_path = args.model_path

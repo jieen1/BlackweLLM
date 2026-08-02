@@ -221,9 +221,7 @@ def layer_scan(model, name: str, entry: dict) -> dict:
         for s in layer.submodules
         if s.submodule == "hidden_state"
     ]
-    logits = [
-        s for layer in report.layers for s in layer.submodules if s.submodule == "logits"
-    ]
+    logits = [s for layer in report.layers for s in layer.submodules if s.submodule == "logits"]
     min_layer, min_verdict = min(hidden, key=lambda pair: pair[1].cosine_similarity)
     first_reasons = []
     if report.first_divergent_layer is not None:
@@ -332,7 +330,8 @@ def selfcheck(model, reference: dict, workloads: list[str], steps: int) -> None:
         forced_rows = list(forced_decode_logits(model, prompt_ids, tokens))
         assert len(forced_rows) == len(free_rows), (len(forced_rows), len(free_rows))
         mismatch = [
-            i for i, (a, b) in enumerate(zip(free_rows, forced_rows, strict=True))
+            i
+            for i, (a, b) in enumerate(zip(free_rows, forced_rows, strict=True))
             if not torch.equal(a, b)
         ]
         status = "bit-exact" if not mismatch else f"MISMATCH at steps {mismatch[:5]}"
@@ -355,9 +354,7 @@ def main() -> None:
     torch.set_grad_enabled(False)
 
     reference = torch.load(args.reference, map_location="cpu", weights_only=False)
-    workloads = (
-        args.workloads.split(",") if args.workloads else list(reference["workloads"])
-    )
+    workloads = args.workloads.split(",") if args.workloads else list(reference["workloads"])
     specs = [
         parse_injection(text)
         for text in (args.configs.split(",") if args.configs else DEFAULT_CONFIGS)

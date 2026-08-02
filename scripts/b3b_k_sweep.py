@@ -226,9 +226,7 @@ def main() -> None:
     tok = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
 
     t_load0 = time.perf_counter()
-    model = load_qwen36_model(
-        MODEL_PATH, device=DEVICE, max_seq_len=MAX_SEQ_LEN, enable_mtp=True
-    )
+    model = load_qwen36_model(MODEL_PATH, device=DEVICE, max_seq_len=MAX_SEQ_LEN, enable_mtp=True)
     print(f"model loaded in {time.perf_counter() - t_load0:.1f}s")
 
     warm_ids = tok("Warm up the kernels before timing.", return_tensors=None)["input_ids"]
@@ -245,8 +243,10 @@ def main() -> None:
         prompt_ids = tok(text, return_tensors=None)["input_ids"]
         ref_tokens, ref_time = free_greedy_decode(model, prompt_ids, args.n_tokens)
         baselines[label] = (ref_tokens, ref_time)
-        print(f"baseline[{label}]: {args.n_tokens} tok in {ref_time:.3f}s "
-              f"= {args.n_tokens / ref_time:.2f} tok/s")
+        print(
+            f"baseline[{label}]: {args.n_tokens} tok in {ref_time:.3f}s "
+            f"= {args.n_tokens / ref_time:.2f} tok/s"
+        )
 
     for k in args.k_values:
         print(f"\n{'=' * 70}\nK={k}\n{'=' * 70}")
@@ -297,8 +297,7 @@ def main() -> None:
                 f"match={match}{'' if match else f' (first_diff={first_diff})'}"
             )
             print(f"    reject_position_histogram: {hist}")
-            print(f"    position_accuracy (p=0..{k - 1}): "
-                  f"{[round(x, 3) for x in pos_acc]}")
+            print(f"    position_accuracy (p=0..{k - 1}): {[round(x, 3) for x in pos_acc]}")
 
             entry = {
                 "num_rounds": len(rounds),

@@ -33,8 +33,9 @@ from __future__ import annotations
 
 import sys
 import time
+from pathlib import Path
 
-_ROOT = "/home/bot/project/qsr-w-b3a"
+_ROOT = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, _ROOT)
 import runtime  # noqa: E402
 
@@ -76,8 +77,8 @@ def summarize(label: str, times: list[float]) -> None:
     ts = sorted(times)
     mean = sum(ts) / len(ts)
     print(
-        f"  {label}: mean={mean*1000:.2f}ms median={ts[len(ts)//2]*1000:.2f}ms "
-        f"min={ts[0]*1000:.2f}ms max={ts[-1]*1000:.2f}ms n={len(ts)}"
+        f"  {label}: mean={mean * 1000:.2f}ms median={ts[len(ts) // 2] * 1000:.2f}ms "
+        f"min={ts[0] * 1000:.2f}ms max={ts[-1] * 1000:.2f}ms n={len(ts)}"
     )
 
 
@@ -171,9 +172,9 @@ def main() -> None:
     mean_b = sum(times_b) / len(times_b)
     mean_c = sum(times_c) / len(times_c)
     print()
-    print(f"ratio (a)/(b) [ordinary vs verify-K1]: {mean_a/mean_b:.3f}x")
-    print(f"ratio (a)/(c) [K1-ordinary vs K8-verify]: {mean_a/mean_c:.3f}x")
-    print(f"delta (a)-(b): {(mean_a-mean_b)*1000:.2f}ms")
+    print(f"ratio (a)/(b) [ordinary vs verify-K1]: {mean_a / mean_b:.3f}x")
+    print(f"ratio (a)/(c) [K1-ordinary vs K8-verify]: {mean_a / mean_c:.3f}x")
+    print(f"delta (a)-(b): {(mean_a - mean_b) * 1000:.2f}ms")
 
 
 if __name__ == "__main__":

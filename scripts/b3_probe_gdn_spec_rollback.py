@@ -37,7 +37,7 @@ import sys
 import time
 from pathlib import Path
 
-_ROOT = "/home/bot/project/qsr-w-gdnopt"
+_ROOT = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, _ROOT)
 import runtime  # noqa: E402
 
@@ -105,8 +105,8 @@ def load_layer(layer_idx: int) -> Qwen36GatedDeltaNet:
         f"model.language_model.layers.{layer_idx}.linear_attn.out_proj": "FP8",
     }
     with DEVICE:
-        layer = Qwen36GatedDeltaNet(model_config, layer_idx, quantized).to(DEVICE).to(
-            torch.bfloat16
+        layer = (
+            Qwen36GatedDeltaNet(model_config, layer_idx, quantized).to(DEVICE).to(torch.bfloat16)
         )
     params = dict(layer.named_parameters())
     name_map = {

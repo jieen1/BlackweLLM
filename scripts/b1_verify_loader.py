@@ -17,11 +17,15 @@ from __future__ import annotations
 
 import sys
 import time
+from pathlib import Path
 
-sys.path.insert(0, "/home/bot/project/qsr-w-b1")
+_ROOT = str(Path(__file__).resolve().parent.parent)
+sys.path.insert(0, _ROOT)
 import runtime  # noqa: E402
 
-assert runtime.__file__.startswith("/home/bot/project/qsr-w-b1"), runtime.__file__
+assert runtime.__file__.startswith(_ROOT), (
+    f"imported runtime from {runtime.__file__}, expected under {_ROOT}"
+)
 
 import torch  # noqa: E402
 
@@ -51,8 +55,10 @@ def main() -> None:
     mem = torch.cuda.memory_allocated() / (1024**3)
     print(f"GPU memory allocated after load: {mem:.2f} GiB")
 
-    print("\nRESULT: load_qwen36_model succeeded, assert_all_params_loaded passed, "
-          "vision/mtp skip counts match B0's expected values.")
+    print(
+        "\nRESULT: load_qwen36_model succeeded, assert_all_params_loaded passed, "
+        "vision/mtp skip counts match B0's expected values."
+    )
 
 
 if __name__ == "__main__":

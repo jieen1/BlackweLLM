@@ -15,10 +15,9 @@ to work around this with a separate, conservatively-oversized persistent
 scratch buffer (``Qwen36MLP._w4a16_c_tmp_scratch``) instead of using
 ``make_w4a16_packed_buffers``'s own ``fc1_c_tmp``/``fc2_c_tmp`` directly.
 
-sparkinfer worktree ``/home/bot/project/spark-w-w4a16``
-(``work/w4a16-scratch-20260803``) fixes the root cause in
-``plan_w4a16_buffers`` itself (unions the packed-mode and direct-topk-routes
-scratch bounds). This script confirms that fix makes the workaround
+That root cause is fixed in ``plan_w4a16_buffers`` itself (unions the
+packed-mode and direct-topk-routes scratch bounds), merged to sparkinfer
+master as ``8242340``. This script confirms that fix makes the workaround
 unnecessary -- and now that ``_forward_w4a16_fused`` has had the workaround
 removed and gone back to passing ``buffers.fc1_c_tmp``/``buffers.fc2_c_tmp``
 straight through, this exercises the REAL post-revert method, not a
@@ -30,11 +29,11 @@ shape that broke before (m=2, degenerate topk=1/num_experts=1).
 If capture succeeds and the replayed output matches eager bit-for-bit, the
 workaround is confirmed unnecessary against the fixed sparkinfer.
 
-*** Run from this worktree's root (``cd`` here first) so the relative
-``sys.path`` insert below resolves; sparkinfer defaults to the FIXED
-worktree via ``BF_SPARKINFER_PATH`` unless overridden, e.g.:
+Runs from wherever this file lives (``sys.path`` is derived from
+``__file__``); sparkinfer resolves through ``BF_SPARKINFER_PATH`` or its
+normal default, and the script asserts up front that whichever checkout it
+got actually carries the scratch fix:
 
-    cd /home/bot/project/qsr-w-w4a16fix
     ~/.venvs/vllm/bin/python scripts/verify_w4a16_cuda_graph_scratch_rootcause.py
 
 Not a pytest test (needs the GPU lock + a real checkpoint on disk) -- run
@@ -46,6 +45,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 _ROOT = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, _ROOT)
@@ -62,23 +62,43 @@ assert runtime.__file__.startswith(_ROOT), (
 # else in this process touches `sparkinfer` for the first time -- otherwise
 # ensure_sparkinfer_path() raises (sys.path edits can't retroactively
 # redirect an already-imported package; see that module's docstring).
-# BF_SPARKINFER_PATH picks which checkout; default here is the FIXED
-# worktree, not the buggy main sparkinfer checkout.
-import os  # noqa: E402
-
+# BF_SPARKINFER_PATH picks which checkout, falling back to
+# _sparkinfer_import's own default; the capability assert below is what
+# decides whether the one we got is usable.
 import torch  # noqa: E402
 
-os.environ.setdefault("BF_SPARKINFER_PATH", "/home/bot/project/spark-w-w4a16")
 from runtime.backends._sparkinfer_import import ensure_sparkinfer_path  # noqa: E402
 
 ensure_sparkinfer_path()
 
 import sparkinfer  # noqa: E402
 
-_EXPECTED_SPARKINFER_ROOT = "/home/bot/project/spark-w-w4a16"
-assert sparkinfer.__file__.startswith(_EXPECTED_SPARKINFER_ROOT), (
-    f"sparkinfer resolved to {sparkinfer.__file__}, not the fixed worktree "
-    f"{_EXPECTED_SPARKINFER_ROOT} -- rerun with BF_SPARKINFER_PATH set to it"
+# Assert the CAPABILITY, not a path. This used to pin sparkinfer to
+# /home/bot/project/spark-w-w4a16, the throwaway worktree the scratch fix was
+# developed in; the fix has since merged to sparkinfer master (8242340) and
+# that worktree is gone, so the path check could only ever fail from here on.
+# What the script actually needs is a sparkinfer whose allocator covers
+# decode's direct-topk path -- same contract tests/test_w4a16_scratch_contract.py
+# pins, restated here because this script runs outside pytest.
+from sparkinfer.moe._shared.kernels.w4a16.host import (  # noqa: E402
+    max_packed_route_slots,
+    plan_w4a16_buffers,
+)
+
+_probe_plan = plan_w4a16_buffers(
+    SimpleNamespace(num_experts=1, hidden_size=5120, intermediate_size=17408, is_gated=True),
+    m=2,
+    topk=1,
+    route_num_experts=1,
+    sms=128,
+)
+assert _probe_plan.route_slots >= 2 * 1 * _probe_plan.block_size_m, (
+    f"sparkinfer at {sparkinfer.__file__} sizes w4a16 scratch for the packed "
+    f"route path only (route_slots={_probe_plan.route_slots}, packed bound="
+    f"{max_packed_route_slots(2, _probe_plan.block_size_m, 1)}), so decode's "
+    f"direct-topk path needs {2 * _probe_plan.block_size_m} and CUDA Graph "
+    "capture of Qwen36MLP will fail -- this checkout predates the scratch "
+    "union fix (sparkinfer 8242340). Point BF_SPARKINFER_PATH at a fixed one."
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))

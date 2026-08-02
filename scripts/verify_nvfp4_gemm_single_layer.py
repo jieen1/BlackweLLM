@@ -133,9 +133,7 @@ def _detect_algo(ckpt: Path, layer: int) -> str:
     return algo
 
 
-def load_mlp_tensors(
-    ckpt: Path, layer: int, algo: str
-) -> dict[str, dict[str, torch.Tensor]]:
+def load_mlp_tensors(ckpt: Path, layer: int, algo: str) -> dict[str, dict[str, torch.Tensor]]:
     suffixes = _SUFFIXES_FOR_ALGO[algo]
     with open(ckpt / "model.safetensors.index.json") as f:
         weight_map = json.load(f)["weight_map"]

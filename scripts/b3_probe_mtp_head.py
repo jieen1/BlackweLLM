@@ -42,7 +42,7 @@ import sys
 import time
 from pathlib import Path
 
-_ROOT = "/home/bot/project/qsr-w-mtp"
+_ROOT = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, _ROOT)
 import runtime  # noqa: E402
 
@@ -89,8 +89,10 @@ def load_mtp_head() -> tuple[Qwen36MTPHead, dict]:
 
     model_config = _build_qwen36_model_config(MODEL_PATH)
     with DEVICE:
-        head = Qwen36MTPHead(model_config, quantized={}, max_seq_len=4096).to(DEVICE).to(
-            torch.bfloat16
+        head = (
+            Qwen36MTPHead(model_config, quantized={}, max_seq_len=4096)
+            .to(DEVICE)
+            .to(torch.bfloat16)
         )
     # head.named_parameters() gives names relative to `head` itself (no
     # "mtp." prefix -- that prefix only exists once this class is nested
@@ -171,7 +173,7 @@ def main() -> None:
     # forward would produce this from the 64-layer backbone; here it just
     # needs to be a plausible-scale BF16 vector (matches the probe script's
     # own x_prefill * 0.1 scaling convention for the same reason).
-    anchor_hidden = (torch.randn(hidden_size, device=DEVICE, dtype=torch.bfloat16) * 0.1)
+    anchor_hidden = torch.randn(hidden_size, device=DEVICE, dtype=torch.bfloat16) * 0.1
 
     cache = head.new_cache(device=DEVICE, dtype=torch.bfloat16)
     record("fresh MTP cache starts at seq_len=0", cache.seq_len == 0, f"got {cache.seq_len}")
