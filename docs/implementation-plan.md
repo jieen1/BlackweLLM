@@ -442,25 +442,25 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 
 **B1 正确性优先**（M2→M3，1 月）：eager、batch=1、无图、无投机、无前缀缓存
 - [ ] GDN 层（conv1d state + gated delta rule + 输出门）· Full attention（sparkinfer paged）· 稠密 SwiGLU（NVFP4）· RoPE partial 0.25 + mrope · modelopt 加载 · 注意力输出门控
-- **门禁**：与 HF transformers 贪心**逐 token 对齐**（≥ 3 工作负载 × 512 token）；逐层 logits 余弦相似度进 bfdiag
-  —— 🔴 **2026-08-02 首次实跑：不通过**（`overall_match_rate=0.3287`，首次分歧在第 32 / 120 / 218 步）。
-  权重两侧逐位相同（HF 侧是从我们反量化的张量拷过去的），**故不是反量化问题，是前向数学**。
-  分歧后我们退化成吐 `<think>`/`<|im_start|>` 控制 token 并重启回答。疑似 attention 层
-  `max_abs_err=0.0156` 在自回归数百步后累积翻转 argmax——**待坐实，见**
-  [`../notes/2026-08-02-b1-greedy-alignment-fails.md`](../notes/2026-08-02-b1-greedy-alignment-fails.md)。
-  ⚠️ 该笔记同时指出**门禁写法本身需复审**：要求两个独立实现在 bf16 下 512 步零 argmax 翻转，
-  与本仓库 eager-vs-CG 那次"两边都对也会在近似平局处翻转"的结论相冲突。
+- **门禁** —— ⚠️ **原判据已作废，替换为 B1-R（2026-08-02 拍板）**，见
+  [`b1-correctness-criterion.md`](b1-correctness-criterion.md)。
 
-  📄 **复审已完成，替代判据 B1-R 已设计并 GPU 实测**（分支 `work/b1-criterion-20260802`，
-  **未合并 main，等拍板**）：见 [`b1-correctness-criterion.md`](b1-correctness-criterion.md)。
-  要点：字面门禁在 bf16 下不可达（控制组噪声底实测为 gap_error 中位数 2 个 ULP、翻转裕度
-  ≤8 ULP，而平局间距只有 1–2 ULP，所以翻转是必然事件而非缺陷）。B1-R 改为**步锁强制解码**
-  ——两侧被强制走同一串 token，512 步全部可比，而不是把一次运行压成"首次分歧位置"一个数；
-  主判据是候选 token 相对 logit 间距的 p90 误差，"分歧必须是近似平局"作为**恒等式推论**
-  而不是第二个待调旋钮。**区分力是实测的，不是声称的**：16 个注入 bug 里，7 个在噪声底之上
-  的全部变红（最弱的一个是"每 64 步漏更新一次 GDN 递归状态"），控制组全绿，整张扫描表
-  checked-in 后由 CPU 测试回放。**§8 有需要拍板的项**（是否据此判 B1 通过；R3 逐层扫描
-  被查出的两个既有缺陷谁修）。
+  原文"与 HF transformers 贪心**逐 token 对齐**（≥3 工作负载 × 512 token）"**在 bf16 下要求了
+  一个不存在的东西**：实测三处首次分歧的 top-1/top-2 间距是 1、2、2 个 bf16 ULP，即两个候选
+  是该格式能表示的最近距离。作废不是因为跑不过——**它比 vLLM（32 token + top-5 豁免）和
+  SGLang（32 token + fp16 + prompt ≤100）任何一家都严格得多**。
+
+  **B1-R = R1 步锁强制解码下的 gap error + R2 平局审计 + R3 逐层余弦 + R4 强制解码 NLL，四条全绿。**
+  关键在于步锁**从不重新 prefill**，每步两侧都是 `seq_len==1`，因此绕开了 chunk-vs-recurrent
+  那个约 30 ULP 的陷阱；该方法的合法性由"步锁复现自由生成 logits **逐位相同**"实测坐实。
+
+- [x] **B1 判定：通过**（2026-08-02）。当前实现在全部 11 条 bar 上绿；控制组 gap_error 中位数
+  **0.125 = 恰好 2 个 bf16 ULP**，NLL 与 HF 相差 2.5e-5。判据的区分力由注入实验证明：
+  **7 个噪声底之上的注入全部变红**，红绿两组不重叠（6.8× 间隔）。
+  ⚠️ **`IMPLEMENTED_BACKENDS` 不翻**——B1 的范围是"eager、batch=1 的正确性"，可服务性属 B2。
+  ⚠️ **两个记录在案的缺口**：NVFP4 反量化未被覆盖（两侧共用同一份反量化结果）、
+  全部测量 ≤300 位置。
+
 
 **B2 服务化**（M3，1 月）
 - [ ] 固定槽位 + 连续批处理 · 递归状态纳入槽位生命周期 · CUDA Graph（**B0-5 已确认 capture-safe，2026-08-02**，
