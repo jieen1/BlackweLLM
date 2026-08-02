@@ -67,6 +67,10 @@ EXPECTED_PASS: dict[str, str] = {
     # pair is the measured detection floor for this bug class.
     "gdn-state-stale-every:128": "under the detection floor at a 256-step horizon",
     "gdn-state-stale-every:256": "under the detection floor at a 256-step horizon",
+    # Same three workloads run to their natural end (1164 steps instead of
+    # 768). The bars were fitted at 256 steps per workload; this checks
+    # they are not an artefact of that horizon.
+    "none@full": "control at the full 1164-step horizon",
 }
 
 #: Must fail, and must fail on at least these bars. Listing the specific
@@ -94,6 +98,8 @@ EXPECTED_FAIL: dict[str, tuple[str, ...]] = {
     "gdn-state-stale-every:64": ("p90_gap_error", "mean_kl_topk", "max_tie_slack_ulps"),
     "gdn-state-decay:0.01": ("p90_gap_error", "mean_kl_topk", "max_drift_ratio"),
     "gdn-state-decay:0.05": ("p90_gap_error", "mean_kl_topk", "max_drift_ratio"),
+    "drop-q-norm@full": ("p90_gap_error", "mean_kl_topk", "nll_relative_excess"),
+    "gdn-state-decay:0.01@full": ("p90_gap_error", "mean_kl_topk", "max_drift_ratio"),
 }
 
 
@@ -216,6 +222,18 @@ def test_widening_the_primary_bar_breaks_the_weakest_catch(sweep: dict) -> None:
     )
     _passed, reasons = evaluate_summary(weakest, widened)
     assert not any(r.startswith("p90_gap_error") for r in reasons)
+
+
+def test_the_calibration_is_not_an_artefact_of_the_fitting_horizon(sweep: dict) -> None:
+    """The bars were fitted on 256 steps per workload. Run to the natural
+    end (1164 steps total) the control gets *quieter*, not noisier -- p99
+    3.375 -> 2.125, mean KL 1.58e-3 -> 1.06e-3, drift 1.5 -> 1.0 -- so the
+    calibration is conservative at the horizon the gate actually runs at,
+    not tuned to a short one."""
+    short = _metrics(sweep, "none")
+    full = _metrics(sweep, "none@full")
+    for metric in ("p99_gap_error", "mean_kl_topk", "disagreement_rate", "max_drift_ratio"):
+        assert full[metric] <= short[metric] * 1.05, f"{metric} got worse at the full horizon"
 
 
 def test_every_recorded_metric_is_finite_where_it_is_gated(sweep: dict) -> None:

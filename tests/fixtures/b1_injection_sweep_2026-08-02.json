@@ -246,6 +246,49 @@
    "p90_logprob_error": 0.2493419647,
    "nll_relative_excess": 0.0013369579,
    "min_logits_cosine": 0.9998899702
+  },
+  "drop-q-norm@full": {
+   "max_gap_error": 17.71875,
+   "p99_gap_error": 12.1640625,
+   "p90_gap_error": 5.375,
+   "median_gap_error": 1.5625,
+   "max_tie_slack_ulps": 128.0,
+   "disagreement_rate": 0.058419244,
+   "mean_kl_topk": 0.0774759763,
+   "max_drift_ratio": 4.5,
+   "max_logprob_error": 17.6718158722,
+   "p90_logprob_error": 5.2497196198,
+   "nll_relative_excess": 0.0332414869,
+   "min_logits_cosine": 0.9955148522
+  },
+  "gdn-state-decay:0.01@full": {
+   "max_gap_error": 32.234375,
+   "p99_gap_error": 11.65625,
+   "p90_gap_error": 3.5625,
+   "median_gap_error": 1.1875,
+   "max_tie_slack_ulps": 257.875,
+   "disagreement_rate": 0.0481099656,
+   "mean_kl_topk": 0.0610104167,
+   "max_drift_ratio": 5.1666666667,
+   "max_logprob_error": 17.2335510254,
+   "p90_logprob_error": 3.4999465942,
+   "nll_relative_excess": -2.52028e-05,
+   "min_logits_cosine": 0.9998732971
+  },
+  "none@full": {
+   "max_gap_error": 10.5625,
+   "p99_gap_error": 2.125,
+   "p90_gap_error": 0.25,
+   "median_gap_error": 0.125,
+   "max_tie_slack_ulps": 8.0,
+   "disagreement_rate": 0.0060137457,
+   "mean_kl_topk": 0.0010623985,
+   "max_drift_ratio": 1.0,
+   "max_logprob_error": 10.5116386414,
+   "p90_logprob_error": 0.25,
+   "nll_relative_excess": -2.52028e-05,
+   "min_logits_cosine": 0.9998732971
   }
- }
+ },
+ "full_horizon_note": "Same three workloads run to their natural end (512/512/140 = 1164 steps) instead of 256 each, to check the calibration does not depend on the horizon it was fitted at. Keys are suffixed '@full'."
 }
