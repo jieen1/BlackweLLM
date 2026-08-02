@@ -120,7 +120,19 @@ SERVER_ENABLE_CUDAGRAPH = os.environ.get("QSR_SERVER_ENABLE_CUDAGRAPH", "1") != 
 # ON (this is THE product value -- warm prefix hits served across requests);
 # `python -m server.app --no-prefix-cache` (or QSR_SERVER_ENABLE_PREFIX_CACHE=0)
 # turns it off => byte-for-byte the old server.
-SERVER_ENABLE_PREFIX_CACHE = os.environ.get("QSR_SERVER_ENABLE_PREFIX_CACHE", "0") != "0"
+#
+# The default was "0" until 2026-08-02, contradicting every other signal
+# around it: this comment, the existence of a `--no-prefix-cache` opt-out
+# (an opt-out only makes sense against a default of ON), and the deployed
+# launcher pinning `QSR_SERVER_ENABLE_PREFIX_CACHE:=1`. It was a fossil --
+# `8f27f59` collapsed `"0" if _IS_LAGUNA else "1"` to `"0"` when the Qwen
+# branches were removed, preserving Laguna's then-experimental default,
+# and nobody flipped it once the prefix cache became the product. The
+# launcher's pin had been patching over it at the deployment layer, so
+# `python -m server.app` with no flags silently ran without the cache while
+# `--no-prefix-cache` was a no-op. `test_prefix_cache_default_is_on` now
+# pins this so it cannot drift back unnoticed.
+SERVER_ENABLE_PREFIX_CACHE = os.environ.get("QSR_SERVER_ENABLE_PREFIX_CACHE", "1") != "0"
 # P4b session affinity (notes/2026-07-20-p4b-session-affinity-plan.md): opt-in
 # warm-slot retention. Default OFF => byte-for-byte P4a (without a session_id, or
 # with the flag off, _finish_request does the unconditional reset_slot). Requires

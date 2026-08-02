@@ -203,10 +203,19 @@ P0-A 卫生（不卡任何人，可随时插）                                 
 
 > ⚠️ **7-g 的硬阻塞（2026-08-02 发现）：「前缀缓存命中率不回归」这条今天无法评估。**
 > 仓库里唯一带数字的记录是 `notes/prefix-cache-implementation-log.md:1190` 的
-> `prefix_cache_hits=1 / misses=10 / hit_rate=0.0909`——**这不是基线，比没有基线更危险**：
-> 它是某次 e2e 脚本的运行产物，而同一篇笔记自己写明"admission bootstrap check 给两轮都加了
-> 一次冷参考 prefill"，即这个比率主要由**记账性 miss** 主导，不反映缓存效能。拿 0.0909 当
-> "不回归"阈值，**一个完全坏掉的缓存也能轻松满足**。
+> `prefix_cache_hits=1 / misses=10 / hit_rate=0.0909`——**这不是基线，比没有基线更危险**。
+>
+> ⚠️ **本条的机制解释已于 2026-08-02 更正。** 原文写的是"admission bootstrap check 给两轮
+> 都加了一次冷参考 prefill，所以比率由记账性 miss 主导"——**那是错的**。读代码可证：
+> `_admission_bootstrap_check`（`server/engine.py:626`）调的是 `runner.prefill(ref_slot, ...)`，
+> 从不碰 `reconcile_prefix_hit`/`_record_prefix_cache_hits`（`prefix_cache_hits`/`misses` 的
+> 唯一自增点，`:683`/`:1133`），而且它只在 `production=False` 时运行——默认是 `True`，部署
+> 启动器 `scripts/blackwellm_ctl.sh` 也钉死 `QSR_SERVER_PRODUCTION=1`。
+>
+> **真实原因**：`/debug/stats` 的计数器是**进程级、无重置无作用域**的，而 `server_e2e_check.py`
+> 会对同一个服务跑约 9 个互不相关的子测试，全部计进同一个分母。
+>
+> 结论不变（0.0909 不能当阈值），但**理由不同**——记错机制会让下一个人去修一个不存在的问题。
 >
 > 这与 fox-64K 被撤下验收判据是同一个教训：**脱离生成条件的数字不是基线**。7-g 动工前必须
 > 先在**切换前的代码**上按固定负载打一份基线，并连同负载定义、轮次序列、bootstrap 探针是否

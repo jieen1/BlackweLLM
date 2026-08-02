@@ -81,8 +81,11 @@ Lint and format are enforced by `ruff` (config in `pyproject.toml`) and run in C
 on every push and PR. `benchmarks/` and `tests/debug/` are lint-relaxed for style
 rules but keep the bug-catching rules (F821, F811, F401, E9xx) active.
 
-**Current state of the gates (2026-08-01): CI is red and 4 tests fail.**
-See [`docs/roadmap.md`](docs/roadmap.md) §1.2. Do not assume green.
+**Current state of the gates (2026-08-02): green.** `ruff check .` passes, the
+torch-free job passes, and the full suite passes. The 4 failures and the red CI
+recorded here on 2026-08-01 were fixed by roadmap T0-1 through T0-6; this line
+outlived them by a day. Re-verify rather than trusting it — that is the point
+of the date stamp.
 
 ## Diagnostics — read this before debugging anything
 
@@ -176,7 +179,20 @@ worktree, regardless of cwd. Measured 2026-08-02:
 | `python <script>` where the script sits outside the worktree root | **the main worktree** ❌ silent |
 
 `-m` puts cwd on `sys.path[0]`, which is why the test gates are trustworthy
-from any worktree. A standalone script is not: `python foo.py` puts *the
+from any worktree.
+
+Related trap, same family, caught 2026-08-02: **stale `__pycache__` bytecode**.
+Python validates a `.pyc` against the source's `(mtime, size)`, so an edit that
+preserves both — flipping a `"1"` to a `"0"` and back, which is exactly what
+red/green verification of a one-character default looks like — can leave the
+old bytecode in place. `module.__file__` still reports the `.py`, so reading
+the file confirms your change while the interpreter runs the previous version.
+This makes a revert-and-confirm-it-goes-red check produce a **false green**.
+Before trusting any red/green pair on a small edit:
+
+```bash
+find . -name __pycache__ -type d -not -path './.venv/*' -exec rm -rf {} +
+``` A standalone script is not: `python foo.py` puts *the
 script's own directory* on `sys.path[0]`, so a script living in a scratch
 directory imports main's code and says nothing.
 
