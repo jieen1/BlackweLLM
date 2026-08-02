@@ -523,10 +523,31 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 > 而草稿本身还额外加 ~73ms/轮（K=8）——这部分在非投机路径上根本不存在。
 >
 > **这不等于 MTP 走不通，但它给出了先决条件**。上一轮把那 6.9× 拆开过：
-> - **~6.8ms 是顺序递归的 kernel 启动开销** —— 只能靠真正的多步融合 kernel 解决，**属 sparkinfer/kernel 团队范畴**
-> - **~5.7ms 是 conv1d/投影/norm/clone 每步重跑而非批处理一次** —— **我们自己能做**
+> - **~6.8ms 是顺序递归的 kernel 启动开销** —— 只能靠真正的多步融合 kernel
+> - **~5.7ms 是 conv1d/投影/norm/clone 每步重跑而非批处理一次** —— 我们自己能做
 >
-> **在这两项之一落地前，不应把 MTP 接进服务路径**——接进去会让 Qwen3.6 变慢。
+> 🔧 **后一半已完成（2026-08-02，`46b37c0`）**，见
+> [`../notes/2026-08-02-gdn-spec-forward-batching.md`](../notes/2026-08-02-gdn-spec-forward-batching.md)：
+> 单层 `spec_forward` **19.9ms → 12.0ms（1.5–1.75×）**，bit-exact 双路验证
+> （`max_abs_diff=0.0`，21/21 与 16/16）。
+>
+> **端到端外推（明确标注为解析估算，非二次实测）：prose 0.655× → ≈0.784×，
+> code 0.608× → ≈0.704×——仍然 <1.0×。**
+> 之所以敢外推：bit-exact 意味着 accept/reject 轨迹**可证明不变**，
+> 所以只有每轮耗时在变。不做二次全模型实测是因为显存底线（19GB→54GB+，无可用旋钮）。
+>
+> ⚠️ **结论因此从推断变成实测：sparkinfer 那 ~6.8ms 是决定 MTP 能否翻正的关键项。**
+> 规格见 [`../notes/2026-08-02-handoff-sparkinfer-gdn-multistep-kernel.md`](../notes/2026-08-02-handoff-sparkinfer-gdn-multistep-kernel.md)
+> （sparkinfer 约束已解除，改为自己实现，进行中）。
+>
+> 📌 **一条可推广的硬发现**：批处理只做到 1.5–1.75× 而不是更多，是因为
+> **`torch.bmm` 只在输出维 ≤512 时保逐位精确**——
+> `out=16/128/512` 为 `True`（`max_abs_diff=0`），`out=2048` 起为 `False`。
+> 朴素的批量 `F.linear` 更糟：BF16 GEMM 的归约顺序随行数变化，**用合成未量化权重同样复现，
+> 与 FP8/量化无关**。所以 `in_proj_a/b`（输出 48）可批，`in_proj_qkv`/`in_proj_z`/`out_proj`
+> （输出 5120–10240）只能保持顺序。**任何"把 K 个位置合成一次 GEMM"的优化都要先验这一条。**
+>
+> **在 sparkinfer 那一半落地前，不应把 MTP 接进服务路径**——接进去会让 Qwen3.6 变慢。
 >
 > 📌 与 Laguna 的对比说明了为什么:Laguna 的 DFlash 投机是有效的(接受率 96.3–100%)，
 > 因为 Laguna **没有 GDN 层**，verify 不付这份代价。**"Laguna 的投机有效，Qwen3.6 也该有效"
