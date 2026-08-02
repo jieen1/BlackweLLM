@@ -127,16 +127,42 @@ class TestCompressedTensorsNVFP4Linear:
         # TestDequantizeNvfp4.test_matches_hand_computed_value, run through
         # the Linear wrapper instead of the bare function: in_dim=32,
         # group_size=16 -> 2 blocks, both nibbles=2 (code value 1.0), block
-        # scales 2.0/4.0, global scale 0.5 -> per-element values 1.0/2.0.
+        # scales 2.0/4.0. checkpoint-side weight_global_scale is 2.0 here --
+        # _ensure_ready reciprocates it to the effective 0.5 the dequant
+        # math actually uses (see class docstring: unsloth's
+        # weight_global_scale is the reciprocal of modelopt's
+        # weight_scale_2, measured off real checkpoint headers, 2026-08-03)
+        # -> per-element values 1.0/2.0, same as the modelopt-side example.
         lin = CompressedTensorsNVFP4Linear(32, 1, bias=False)
         lin.weight_packed.data.copy_(torch.full((1, 16), 0x22, dtype=torch.uint8))
         lin.weight_scale.data.copy_(torch.tensor([[2.0, 4.0]], dtype=torch.float8_e4m3fn))
-        lin.weight_global_scale.data.copy_(torch.tensor(0.5))
+        lin.weight_global_scale.data.copy_(torch.tensor(2.0))
         x = torch.ones(1, 32, dtype=torch.bfloat16)
         out = lin(x)
         # weight row = [1.0]*16 + [2.0]*16 -> dot with all-ones input =
         # 16*1.0 + 16*2.0 = 48.0
         assert out.item() == 48.0
+
+    def test_weight_global_scale_is_reciprocated_not_used_directly(self):
+        # The regression this class exists to guard against (2026-08-03):
+        # a real GPU run that passed weight_global_scale straight into
+        # dequantize_nvfp4, unreciprocated, produced a layer-0 MLP weight
+        # with mean=247.8/std=426744 (nonsense for a neural net weight) and
+        # cascaded into "!!!!!!!!!!!!!!!!!!!!" degenerate model output.
+        # Pinned here with the real checkpoint's own measured value
+        # (layers.0.mlp.gate_proj.weight_global_scale == 6624.0) so a
+        # future edit that drops the reciprocal fails a fast CPU test
+        # instead of needing a full GPU generation run to notice.
+        lin = CompressedTensorsNVFP4Linear(32, 1, bias=False)
+        lin.weight_packed.data.copy_(torch.full((1, 16), 0x22, dtype=torch.uint8))  # code 1.0
+        lin.weight_scale.data.copy_(torch.tensor([[1.0, 1.0]], dtype=torch.float8_e4m3fn))
+        lin.weight_global_scale.data.copy_(torch.tensor(6624.0))
+        x = torch.ones(1, 32, dtype=torch.bfloat16)
+        out = lin(x)
+        naive_wrong = 32 * 1.0 * 6624.0  # what "no reciprocal" would produce
+        correct = 32 * 1.0 * (1.0 / 6624.0)
+        assert abs(out.item() - correct) < 1e-3
+        assert abs(out.item() - naive_wrong) > 1.0
 
     def test_rejects_odd_input_size(self):
         with pytest.raises(ValueError, match="must be even"):

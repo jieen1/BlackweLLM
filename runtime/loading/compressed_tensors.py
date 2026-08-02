@@ -71,23 +71,44 @@ group carrying its own ``format`` string:
   -- see :func:`dequantize_fp8_channel` below, a genuinely different
   function, not a shape-tolerant variant of the modelopt one.
 - ``group_1``, ``format: "nvfp4-pack-quantized"`` -- the **same format
-  string** ``SUPPORTED_QUANT_FORMATS`` already lists for Laguna, and indeed
-  the same physical layout: ``.weight_packed`` (``uint8``, ``[out, in //
-  2]``), ``.weight_scale`` (``float8_e4m3fn``, ``[out, in // 16]``, block
-  size 16), ``.weight_global_scale`` (``float32``, shape ``[1]``). Covers
-  ``mlp.{gate,up,down}_proj`` for layers 0-55. A fourth tensor,
-  ``.input_global_scale`` (``float32``, shape ``[1]``), also exists per
-  module -- unsloth's NVFP4 group additionally declares
+  string** ``SUPPORTED_QUANT_FORMATS`` already lists for Laguna, and the
+  same physical *byte* layout for the packed weight and block scale:
+  ``.weight_packed`` (``uint8``, ``[out, in // 2]``), ``.weight_scale``
+  (``float8_e4m3fn``, ``[out, in // 16]``, block size 16, same
+  min/max/mean value range as modelopt's own block scale for the identical
+  real module). Covers ``mlp.{gate,up,down}_proj`` for layers 0-55.
+  ``.weight_global_scale`` (``float32``, shape ``[1]``) is where the
+  layouts genuinely diverge, not just in name: **it is the reciprocal of
+  modelopt's ``weight_scale_2``, not the same value.** Measured directly
+  (2026-08-03, after a GPU run of the naive "reuse the value as-is" version
+  produced degenerate ``"!!!!!!!!!!!!"`` output): ``layers.0.mlp.gate_proj``
+  has unsloth ``weight_global_scale`` = ``6624.0`` vs. nvidia
+  ``weight_scale_2`` = ``0.0002`` for the same module -- ``1/6624 ≈
+  0.000151``, the same order of magnitude. This matches, and is explained
+  by, ``runtime/backends/laguna_sparkinfer_moe.py``'s own documented
+  convention for this exact checkpoint tensor in Laguna's MoE pipeline
+  (``w1_global_scale = 1/checkpoint_gs``) -- read before writing this
+  adapter, but its implication for *this* dequant path (not just
+  sparkinfer's kernel-side alpha) was missed on the first pass. A fourth
+  tensor, ``.input_global_scale`` (``float32``, shape ``[1]``, also
+  reciprocal-flavored per the same real checkpoint: ``776.0`` here vs.
+  modelopt's ``input_scale`` ``0.0016`` for the analogous module), exists
+  per module too -- unsloth's NVFP4 group additionally declares
   ``input_activations`` (dynamic, block-quantized, group_size 16), i.e. this
   is really a W4A4 scheme, unlike modelopt's weight-only W4A16. This adapter
   follows B1's existing "dequantize weights to BF16, ignore the activation
   side" simplification (``runtime/model/modelopt_linear.py``'s module
   docstring) and never reads ``.input_global_scale`` -- consistent with, not
   a new exception to, how ``.input_scale`` is already ignored for modelopt.
-  The two-level dequant math itself (E2M1 LUT, block scale x global scale)
-  is identical to modelopt's ``W4A16_NVFP4`` and is reused unchanged from
-  ``runtime/loading/modelopt.py`` (:func:`dequantize_nvfp4`) rather than
-  reimplemented here -- one packing convention, one place that decodes it.
+  The two-level dequant *math* itself (E2M1 LUT, block scale x global
+  scale) is identical to modelopt's ``W4A16_NVFP4`` and :func:`dequantize_fp8_channel`'s
+  sibling function :func:`~runtime.loading.modelopt.dequantize_nvfp4` is
+  reused unchanged, not reimplemented -- but the *caller*
+  (``runtime/model/compressed_tensors_linear.py``'s
+  ``CompressedTensorsNVFP4Linear``) must reciprocate
+  ``weight_global_scale`` before passing it in, precisely because the
+  checkpoint-side calling convention is not the same as modelopt's despite
+  the shared function.
 
 **The one overlap, resolved by measurement, not by guessing a precedence
 rule**: ``group_1``'s target (``re:.*mlp\\.(gate|up|down)_proj$``) matches

@@ -96,8 +96,8 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
 class CompressedTensorsNVFP4Linear(nn.Module):
     """Block-scaled NVFP4 (E2M1) weight-only-quantized Linear, dequantized to
     BF16 on first use -- unsloth's ``config_groups`` ``format:
-    "nvfp4-pack-quantized"`` group (same format string, same physical layout,
-    as Laguna's own NVFP4 -- ``runtime/backends/laguna_sparkinfer_moe.py``
+    "nvfp4-pack-quantized"`` group (same format string, same physical byte
+    layout, as Laguna's own NVFP4 -- ``runtime/backends/laguna_sparkinfer_moe.py``
     reads the identical three suffixes for its MoE experts, a separate
     pipeline; this class is the dense/Linear-path consumer for this format).
 
@@ -105,12 +105,41 @@ class CompressedTensorsNVFP4Linear(nn.Module):
     2026-08-02): ``weight_packed`` is ``[out, in // 2]`` ``uint8`` (two
     4-bit E2M1 codes/byte); ``weight_scale`` is ``[out, in // group_size]``
     ``float8_e4m3fn`` (one scale per 16-element input-dim block, identical
-    shape/dtype to modelopt's own NVFP4 block scale); ``weight_global_scale``
-    is shape ``[1]`` ``float32`` -- the same second-level global scale
-    modelopt calls ``weight_scale_2`` (shape ``()`` there; ``default_weight_
-    loader``'s scalar-numel special case handles the shape difference
-    transparently). A fourth tensor, ``input_global_scale``, also exists per
+    shape/dtype/value-range to modelopt's own NVFP4 block scale -- both
+    checkpoints' real ``layers.0.mlp.gate_proj.weight_scale`` measure
+    min=4.5/max=448/mean~22-26). ``weight_global_scale`` is shape ``[1]``
+    ``float32``. A fourth tensor, ``input_global_scale``, also exists per
     module and is never read here -- see this module's own docstring.
+
+    **``weight_global_scale`` is the RECIPROCAL of modelopt's
+    ``weight_scale_2``, not the same value under a different name --
+    measured, not assumed (2026-08-03, after a real GPU run of this class
+    produced degenerate ``"!!!!!!!!!!!!"`` output; per-layer hidden-state
+    hooks showed the very first MLP layer already saturating to ~4e22).**
+    Real checkpoint values for the same module (``layers.0.mlp.gate_proj``):
+    unsloth's ``weight_global_scale`` = ``6624.0``; nvidia's
+    ``weight_scale_2`` = ``0.0002`` -- and ``1 / 6624 ≈ 0.000151``, the same
+    order of magnitude, not a coincidence. This matches, and is explained
+    by, the convention ``runtime/backends/laguna_sparkinfer_moe.py``'s own
+    module docstring already documents for this exact checkpoint-side
+    tensor name in Laguna's MoE pipeline: ``w1_global_scale = 1 /
+    checkpoint_gs`` (its ``prepare_sparkinfer_layer`` literally computes
+    ``w1_alpha = (1.0 / raw["gate_gs"]).float()`` before handing it to
+    sparkinfer's kernel as the multiplicative alpha) -- this class's
+    ``_ensure_ready`` does the same reciprocal before calling
+    :func:`~runtime.loading.modelopt.dequantize_nvfp4`, which itself
+    performs a direct multiply (``per_block = weight_scale * global_scale``,
+    proven correct for modelopt's checkpoint, whose ``weight_scale_2`` is
+    already stored as the direct multiplier). Passing
+    ``weight_global_scale`` to that function unreciprocated -- reusing its
+    math but not its checkpoint-side calling convention -- is exactly the
+    bug this docstring is recording so it cannot regress silently:
+    dequantizing unsloth's real ``layers.0.mlp.gate_proj`` weight the wrong
+    way measured mean=247.8/std=426744 (nonsense for a neural net weight);
+    with the reciprocal applied it lands at std≈0.0097, the same order of
+    magnitude as a normal weight. ``default_weight_loader``'s scalar-numel
+    special case handles ``weight_global_scale``'s ``[1]``-vs-modelopt's
+    ``()`` shape difference transparently -- that part was never the issue.
     """
 
     def __init__(
@@ -157,10 +186,17 @@ class CompressedTensorsNVFP4Linear(nn.Module):
 
     def _ensure_ready(self) -> None:
         if self._weight_bf16 is None:
+            # Reciprocal, not a direct pass-through -- see class docstring
+            # for the measured evidence (unsloth weight_global_scale=6624.0
+            # vs modelopt weight_scale_2=0.0002 for the same real module;
+            # 1/6624 ≈ 0.000151, same order of magnitude) and for why this
+            # is a real checkpoint-convention difference, not a shape quirk
+            # dequantize_nvfp4 already handles.
+            reciprocal_global_scale = 1.0 / self.weight_global_scale.data.to(torch.float32)
             self._weight_bf16 = dequantize_nvfp4(
                 self.weight_packed.data,
                 self.weight_scale.data,
-                self.weight_global_scale.data,
+                reciprocal_global_scale,
                 group_size=self.group_size,
             )
 
