@@ -11,8 +11,56 @@ on first use" idiom as ``runtime/model/fp8_linear.py::FP8Linear._ensure_ready``)
 and runs a plain BF16 x BF16 ``F.linear``. This does not reproduce the
 checkpoint's *intended* W8A8 execution path -- that remains a deliberate
 B1 simplification (``docs/implementation-plan.md`` §7.1), not an
-oversight. ``.input_scale`` is still never read for FP8, for the same
-reason.
+oversight, still true as of the 2026-08-03 FP8 investigation below.
+
+**FP8 kernel investigation (2026-08-03, follow-up to the NVFP4-GEMM
+round -- see ``notes/2026-08-03-nvfp4-raw-param-free-and-fp8-w8a8-probe.md``
+for the full writeup)**: checked whether this class's ~14 GiB BF16 dequant
+cache (self_attn/GDN's FP8 projections across all 64 layers) could get the
+same treatment NVFP4's MLP got. The checkpoint's own scheme was verified
+first (learned from the NVFP4 round's ``blockscaled.mm`` mistake): every
+FP8-quantized projection genuinely IS static per-tensor W8A8 --
+``config_groups.group_0`` declares both ``weights`` and
+``input_activations`` as 8-bit float with ``dynamic: false``, and every
+real layer ships an actual scalar ``input_scale`` tensor (confirmed off
+real safetensors headers, not assumed from the config alone) -- unlike
+NVFP4's W4A16 (weight-only) checkpoint, which declares no
+``input_activations`` scheme at all. ``self.input_scale`` below (added
+this round) loads that real checkpoint data. ``sparkinfer.gemm.
+tensor_fp8_linear`` ("static per-tensor FP8 linear for SM12x") matches
+this scheme exactly -- a real kernel entry point exists, unlike the
+scheme mismatch that sank the first NVFP4 attempt.
+
+**Not wired into this class's `forward()` despite the scheme matching**:
+``scripts/verify_fp8_tensor_gemm_single_layer.py`` measured the kernel's
+actual precision against real checkpoint weights (self_attn.q_proj,
+linear_attn.in_proj_qkv) and found cosine ~0.9996 -- genuinely working,
+but roughly 30-40x further from 1.0 than NVFP4's fused kernel measured
+(~0.99998) on the equivalent single-layer check. That gap is not a bug in
+either kernel; it is what genuinely quantizing BOTH operands to
+per-tensor FP8 costs, on top of a checkpoint that (unlike NVFP4's
+weight-only scheme) was never going to let this be "free" the way the
+NVFP4 fusion was (that kernel dequantizes weight against an
+UN-quantized BF16 activation -- no new error source at all). Applied
+across every layer's attention/GDN projections (a larger footprint than
+NVFP4's MLP-only fusion) on top of B1-R's full-model gap error already
+sitting at its calibration bar's own noise floor after the NVFP4 fusion
+(``notes/2026-08-03-nvfp4-gemm-memory-audit.md``), wiring this into
+:meth:`Qwen36Attention.forward`/``decode_batch``/
+:meth:`Qwen36GatedDeltaNet.forward`/``spec_forward`` (CUDA-graph-safety-
+critical real serving code, not a diagnostic) without first re-running
+the full B1-R gap-error harness was judged too large a correctness risk
+for this round's scope -- reported as a finding, not implemented. See the
+note above for the exact numbers and what a follow-up round would need to
+do differently.
+
+Separately, ``sparkinfer.gemm.tensor_fp8_linear.is_supported()`` reports
+``False`` on this machine's installed ``nvidia-cutlass-dsl`` (4.5.2 <
+sparkinfer's own ``MIN_CUTLASS_DSL = "4.6.0"`` pin) even though the
+kernel call itself works correctly once called directly (verified, see
+the note) -- an environment/packaging gap in ``sparkinfer`` (a separate
+project this worktree only consumes), not a scheme mismatch and not
+something to patch from here.
 
 **NVFP4's dense-MLP hot path no longer dequantizes to BF16 -- but the fix
 lives one level up, not in this class.** GPU-measured 2026-08-03

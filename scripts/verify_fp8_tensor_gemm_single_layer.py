@@ -170,11 +170,28 @@ def run_case(lin: ModelOptFP8Linear, packed, in_features: int, m: int, seed: int
 
 
 def main() -> None:
-    supported = tensor_fp8_linear.is_supported()
-    print(f"tensor_fp8_linear.is_supported(): {supported}")
-    if not supported:
-        print("kernel not supported on this GPU/build -- aborting, nothing else to measure")
-        return
+    # sparkinfer.gemm.tensor_fp8_linear.is_supported() reports False on
+    # this machine's installed nvidia-cutlass-dsl (4.5.2): it gates on
+    # sparkinfer._lib.gating.MIN_CUTLASS_DSL == "4.6.0" via
+    # default_is_supported -> has_cutlass_dsl, a version-string floor, not
+    # a live capability probe. Checked directly (not assumed) that the
+    # floor is overly conservative for THIS op on THIS hardware:
+    # cute.nvgpu.warp.MmaMXF8Op (what
+    # sparkinfer.gemm.tensor_fp8_linear._kernel.is_tensor_fp8_linear_supported
+    # actually probes for) is present, and a synthetic pack_weight+mm call
+    # (matching sparkinfer's own tests/gemm/test_tensor_fp8_linear.py
+    # fixture) produces the expected result within that test's own
+    # tolerance (rtol=1e-2, atol=2e-3; measured max abs diff ~1.5e-5 on a
+    # [7,128]x[64,128] synthetic case, run 2026-08-03). sparkinfer's
+    # MIN_CUTLASS_DSL = "4.6.0" (sparkinfer/_lib/gating.py) is a flat
+    # version-string floor with no comment explaining why 4.6.0
+    # specifically -- not evidence this op is broken on 4.5.2, just an
+    # untested combination from sparkinfer's own perspective. So this
+    # script calls pack_weight/mm directly rather than gating on
+    # is_supported(). If this is ever wrong (a real functional gap in
+    # 4.5.2 that 4.6.0 fixes), this script's own cosine/max_abs_err
+    # numbers below on REAL checkpoint weights would show it.
+    print(f"tensor_fp8_linear.is_supported(): {tensor_fp8_linear.is_supported()} (see comment)")
 
     ckpt = _find_ckpt()
     print(f"checkpoint: {ckpt}")

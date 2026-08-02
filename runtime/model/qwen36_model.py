@@ -1873,11 +1873,28 @@ class Qwen36MLP(nn.Module):
         checkpoint, so nothing depends on the shape matching the real
         checkpoint header afterward) still finds a real tensor of the
         correct dtype/device at the expected attribute -- just shape
-        ``(0,)`` -- instead of hitting a missing attribute or ``None``."""
+        ``(0,)`` -- instead of hitting a missing attribute or ``None``.
+
+        Also returns the freed storage to the driver via
+        ``torch.cuda.empty_cache()`` -- measured directly (2026-08-03),
+        not assumed: without it, ``torch.cuda.memory_allocated()`` drops
+        as expected but PyTorch's caching allocator keeps the underlying
+        blocks reserved for its own reuse, so external ``nvidia-smi``
+        polling (what every memory-audit script in this repo actually
+        measures) barely moved -- 67.10 -> 64.58 GiB despite ~9.15 GiB of
+        real Parameter storage being dropped, because only a fraction of
+        it happened to get reused by later allocations before that run's
+        peak. Runs once per real MLP layer, ever (guarded the same way
+        ``_ensure_w4a16_fused_ready`` itself is -- this whole method only
+        runs once per instance), so the cost is a bounded ~64 calls over
+        the model's lifetime, not a per-token or per-forward recurring
+        one."""
         for lin in (self.gate_proj, self.up_proj, self.down_proj):
             for name in ("weight", "weight_scale", "weight_scale_2"):
                 param = getattr(lin, name)
                 param.data = param.data.new_empty(0)
+        if self.gate_proj.weight.device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def _forward_w4a16_fused(self, x: torch.Tensor) -> torch.Tensor:
         self._ensure_w4a16_fused_ready()
