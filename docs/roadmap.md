@@ -768,6 +768,13 @@ drafter + 投机专用 `kv_cache_dtype`）读代码后发现**不完全对**—�
   稠密 fp32 oracle 判定两条路径在 attention 算子层面都对（cos ≥ 0.999997，高于本仓库 ≥0.999991 的
   标准），分歧来自 MoE 离散路由放大微小数值差，**不是 split-KV merge 有 bug**。见
   `investigation-queue.md` C-1
+- [ ] **（2026-08-02 新增）接受率与槽位 KV 使用率的可观测性为 0** —— `record_mtp_acceptance` /
+  `record_slot_kv_usage` **生产零调用方**，两条 Prometheus 序列在空时**根本不出现**（不是显示 0，
+  仪表盘上像"还没数据"）；且 `engine.stats["mtp_acceptance_histogram"]` 只有 5 个桶而生产
+  `NUM_SPECULATIVE_TOKENS=15`，`na>=5` 被静默丢弃——**接受率越健康，被记录的比例越低**。
+  接受率是 A6 的正式验收判据，今天所有可信数字都来自离线 benchmark，不是服务器自己。
+  三条必须一起修（桶宽从 `NUM_SPECULATIVE_TOKENS` 推导，不是各写字面量：今天两处一个 5、
+  一个 9、真值 15）。见 [`../notes/2026-08-02-acceptance-rate-has-no-working-observability.md`](../notes/2026-08-02-acceptance-rate-has-no-working-observability.md)
 - [ ] CUDA Graph 捕获**成功**的可观测性缺口仍在（只有失败打 warning，成功打 info，默认日志下不可见）——
   见 RK9 / `implementation-plan.md` §7.3/C7-2
 - [ ] **（本批新增）** `NUM_SPECULATIVE_TOKENS` 从 15 静态调大是否能在不损失接受率的前提下提升吞吐
