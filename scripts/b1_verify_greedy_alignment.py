@@ -59,10 +59,19 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, "/home/bot/project/qsr-w-b1")
+# Derived from this file's own location, not hardcoded to the worktree it was
+# written in: the editable blackwellm install pins `runtime`/`server` to a
+# static path under the main worktree regardless of cwd, so a bare
+# `python scripts/...` silently imports main's code. Asserting after the
+# insert is what makes that impossible to do accidentally -- see AGENTS.md,
+# "Verifying from a git worktree".
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+sys.path.insert(0, _REPO_ROOT)
 import runtime  # noqa: E402
 
-assert runtime.__file__.startswith("/home/bot/project/qsr-w-b1"), runtime.__file__
+assert runtime.__file__.startswith(_REPO_ROOT), (
+    f"imported runtime from {runtime.__file__}, expected under {_REPO_ROOT}"
+)
 
 import torch  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
@@ -132,44 +141,74 @@ def copy_dequantized_weights_into_hf(
     -- a real run against the full model should see zero skips; any skip
     means a name genuinely doesn't exist on the HF side and needs
     investigating before trusting the comparison at all.
+
+    Dequantizes one module at a time and releases each cached BF16 weight as
+    soon as it has been copied. An earlier version called ``_ensure_ready()``
+    on every module first and held the results in a dict, which materialises a
+    third full copy of the model: 19 GiB quantized + 54 GiB on HF's side +
+    54 GiB of our own cached BF16. That OOM'd on the first real run
+    (2026-08-02, 106 GiB allocated against a 95.59 GiB card). Peak is now
+    19 + 54 + one layer's weight.
     """
-    for module in mine.modules():
-        ensure_ready = getattr(module, "_ensure_ready", None)
-        if ensure_ready is not None:
-            ensure_ready()
-
-    dequantized_by_module: dict[str, torch.Tensor] = {
-        name: module._weight_bf16
-        for name, module in mine.named_modules()
-        if getattr(module, "_weight_bf16", None) is not None
-    }
-
+    modules_by_path = dict(mine.named_modules())
     hf_params = dict(hf_model.named_parameters())
     copied: list[str] = []
     skipped: list[str] = []
+
     for name, param in mine.named_parameters():
         if name.endswith((".weight_scale", ".weight_scale_2")):
             continue
         module_path = name.rsplit(".", 1)[0] if "." in name else ""
-        is_dequantized_weight = name.endswith(".weight") and module_path in dequantized_by_module
-        value = dequantized_by_module[module_path] if is_dequantized_weight else param.data
+        module = modules_by_path.get(module_path)
+        ensure_ready = getattr(module, "_ensure_ready", None) if module is not None else None
+
+        value = param.data
+        if name.endswith(".weight") and ensure_ready is not None:
+            ensure_ready()
+            cached = getattr(module, "_weight_bf16", None)
+            if cached is not None:
+                value = cached
 
         hf_param = hf_params.get(name)
         if hf_param is None:
             skipped.append(name)
-            continue
-        hf_param.data.copy_(value.to(hf_param.dtype))
-        copied.append(name)
+        else:
+            hf_param.data.copy_(value.to(hf_param.dtype))
+            copied.append(name)
+
+        # Release immediately -- holding these is what blew the budget. The
+        # module re-dequantizes on demand if it is ever used for a forward.
+        if module is not None and getattr(module, "_weight_bf16", None) is not None:
+            module._weight_bf16 = None
+
     return copied, skipped
 
 
 def build_hf_reference(model_config: dict) -> torch.nn.Module:
+    """Materialise HF's reference model directly in bf16.
+
+    The obvious spelling -- ``Qwen3_5ForCausalLM(hf_config).to(torch.bfloat16)``
+    -- builds every ``nn.Linear`` at the fp32 default first and only then
+    halves it, so a 27B model transiently needs ~108 GiB rather than ~54.
+    That OOM'd on the first real run (2026-08-02): the card has 95.59 GiB and
+    PyTorch reported 108.26 GiB allocated, which is exactly 2x the bf16
+    footprint. This module's own docstring had flagged the combined
+    quantized + bf16 residency as arithmetic that had never been allocated
+    for real -- the arithmetic was right, the construction order was not.
+
+    Setting the default dtype makes the fp32 copy never exist.
+    """
     text_config_dict = dict(model_config)
     text_config_dict.pop("quantization_config", None)
     hf_config = Qwen3_5TextConfig(**text_config_dict)
     hf_config._attn_implementation = "eager"
-    with DEVICE:
-        hf_model = Qwen3_5ForCausalLM(hf_config).to(torch.bfloat16)
+    previous_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with DEVICE:
+            hf_model = Qwen3_5ForCausalLM(hf_config)
+    finally:
+        torch.set_default_dtype(previous_dtype)
     return hf_model.eval()
 
 
