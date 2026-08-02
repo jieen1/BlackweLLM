@@ -39,6 +39,7 @@
 ## 2. 已定案的根因分析 🟢
 
 - [2026-08-03 解码 kernel profiling：CG 下已 kernel-bound](2026-08-03-decode-kernel-profile.md) —— 🟢 GPU busy 31.01ms / CG 墙钟 34.67ms = **89%**；eager 只有 21% 忙（CPU 侧 paged 元数据 ~34ms/step）。按调用次数精确归属：NVFP4 融合 MLP **56 次/35%**，FP8 层反量化后的 BF16 GEMM **233 次/45%**（233 = 预期数，一个不差），**GDN 递归仅 0.6%**。含一处自我纠正（首版对 `key_averages()` 求和，重复计数）
+- [2026-08-03 阶段四盘点：解码 kernel 杠杆已用尽](2026-08-03-stage4-kernel-levers-exhausted.md) —— 🟢 四条路逐一关闭：W4A4 ✗、W8A8 ✗（两者都是降激活精度，这个模型对此敏感）、`bf16_gemv` 只覆盖 34/237 投影约 **0.8% kernel 时间**（先量后做，几分钟否掉）、sparkinfer 里除它之外**全是量化 GEMM**。**那 24.8% 的 SM80 kernel 没有更好替代品。**
 - [2026-08-03 FP8 W8A8 预演：误差下界都过不了 B1-R](2026-08-03-fp8-w8a8-preflight-negative.md) —— 🟢 **负面定案，且省掉一整轮实现**：不写 kernel，只注入激活 FP8 往返（真实 W8A8 误差的下界），`instruction` 负载即溢出 top-1024 捕获窗口。⚠️ 那些看似过线的 bar 是**排除掉最差负载后**算的（已修该假绿）。含一条对我自己的纠正：引用量化数字前先确认它测自哪个 checkpoint（今日第二次同型错误）
 - [2026-08-03 生产显存审计](2026-08-03-production-memory-audit.md) —— 🟢 标准模型、配置逐项写明：CG **72.39 GiB** vs eager 77.69。**反量化缓存只解决了一半**——FP8 侧 237 个张量的 BF16 缓存 19.99 GiB 与 FP8 原件 9.99 GiB 同时常驻，`forward` 只读前者
 - [2026-08-03 W4A4 blockscaled 走不通](2026-08-03-w4a4-blockscaled-negative-result.md) —— 🟢 **负面定案**：kernel 契约完全匹配、checkpoint 真是 W4A4，但单层 cosine 0.988 对 W4A16 的 0.99999（差 30×），**B1-R 全线不过**，一个负载发散到溢出 top-1024 窗口。生产未动。含陷阱留档：两个 global scale 都**直接用不取倒数**，与 W4A16 约定相反，4 种组合实测 3 种直接爆

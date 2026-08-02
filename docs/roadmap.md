@@ -163,10 +163,16 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
 
       两者都是"把**激活**也降到 4/8 bit"；而现有的**权重**量化路径 cosine 0.99999，
       毫无问题。**别再找更激进的激活量化，这个方向已两次撞墙。**
-      未探索且不降激活精度的方向：
-      ① 给那些 BF16 GEMM 换 Blackwell 原生 kernel（**24.8% 的 kernel 时间跑在
-      为 SM80 编译的 `cutlass_80_wmma` 上**）；
-      ② 回收 FP8 反量化缓存的 9.99 GiB（见生产显存审计那条）。
+      **① 换 Blackwell 原生 BF16 kernel —— 也查过了，没有可用的。**
+      `sparkinfer.gemm.bf16_gemv` 方向对（BF16×BF16，不动激活精度、CUDA-graph 安全），
+      **但先量后做**：它限 out≤1024/in≥1024，按真实形状筛 237 个投影只中 **34 个(14%)**，
+      且都是最小的那些——**约占 FP8 GEMM 工作的 1.7%、整个解码 kernel 时间的 ~0.8%**，
+      不值得做。主导形状全是宽输出(12288/10240/17408/248320)，需要真正的稠密 GEMM；
+      而 `sparkinfer/gemm/` 里除 `bf16_gemv` 外**全是量化 GEMM**，
+      用它们就等于量化激活——正是上面已证伪的那堵墙。自研更慢 2.4–3×（本仓库既有调研）。
+      **⇒ 那 24.8% 的 `cutlass_80_wmma` 看着刺眼，但没有更好的替代品。**
+      ② 回收 FP8 反量化缓存 —— ✅ 已做（见生产显存审计那条，实收 5.79 GiB）。
+      详见 [`../notes/2026-08-03-stage4-kernel-levers-exhausted.md`](../notes/2026-08-03-stage4-kernel-levers-exhausted.md)。
 - [x] ~~**`assert_all_params_loaded` 是单向的**~~ —— **已补反向检查**（`0ddab29`：`warn_on_unconsumed_tensor_families`，按名字尾部分族，警告而非抛错）。原记录：：保证"每个模型参数都拿到 checkpoint 张量"，
       **不保证"每个 checkpoint 张量都被消费"**。`input_global_scale` 因此被静默丢弃了很久
       （W4A4 调查时才发现，本次无害但盲区是真的）。补一个反向检查。
