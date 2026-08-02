@@ -190,9 +190,9 @@ R1–R6、R8 已在 2026-08-01 的 Track 0 批次里解决，保留在表里是�
 | R4 | **thinking 剥离逻辑有误伤风险** | 根因比"贪婪"更准确：两条正则**没有锚定**，把文本里任何位置的 `<think>`/`</think>` 都当成删除信号。`_ORPHAN_CLOSE_RE = r"\A.*?</think>"` 删掉任何 `</think>` 之前的全部内容 | ✅ 已解决 |
 | R5 | **sparkinfer 的性能补丁不可复现** | 2026-07-31 的 gating 放宽**从未提交到任何分支**，工作区被清后丢失（所以按分支做 pickaxe 搜索找不到）。已从悬空提交 `1e306d7`/`ec8bb1eb` 恢复，rebase 到 upstream `3bd3a2e`，现为 `jieen1/sparkinfer` `origin/master` 的 `7a1d69d`/`0844a4f` | ✅ 已解决，见 [`sparkinfer-fork-delta.md`](sparkinfer-fork-delta.md) |
 | R6 | **torch 版本合同不一致** | `pyproject.toml` 钉 `torch==2.11.0`；实测环境 `2.13.0a0`；sparkinfer 要求 `>=2.12` | ✅ 钉 `torch==2.13.0` |
-| R7 | **Qwen3.6 支持已被摘除** | `ff4d858` / `a9cb932` 把 Qwen3.6 + DirectModelRunner 整体移入 `oracle/qwen36_vllm/`（8370 行，仍依赖 vLLM）；`ServerEngine.__init__` 对 `backend != "laguna"` 直接抛 `ValueError` | 🔴 未动——不是"退化"是"截肢"，走 Track A/B 重新接入 |
+| R7 | **Qwen3.6 支持已被摘除** | `ff4d858` / `a9cb932` 把 Qwen3.6 + DirectModelRunner 整体移入 `oracle/qwen36_vllm/`（8370 行，仍依赖 vLLM）；`ServerEngine.__init__` 对 `backend != "laguna"` 直接抛 `ValueError` | ✅ **已重新接入**（2026-08-03 复核）。`IMPLEMENTED_BACKENDS = {"laguna","qwen36"}`（`runtime/model_registry.py:152`），`ServerEngine._load_qwen36_model`（`server/engine.py:526`，522 处分发）。标准模型已实际服务通过 C-LIVE 64/67，不是"能加载" |
 | R8 | **文档全面过期** | `AGENTS.md` 指名的 4 个模块都已不存在；README 英文段说"Currently optimized for Qwen3.6-27B"，中文段说"当前生产模型为 Laguna-S-2.1" | ✅ 已解决 |
-| R9 | **仓库卫生** | `server/engine.py.bak` / `.orig`、`runtime/backends/laguna.py.bak`、根目录 9 个 `*.log`、`build/`、21 个残留分支 / worktree | 🟡 部分——sparkinfer 侧的 `blackforge-main` 已删，仓库自身待清 |
+| R9 | **仓库卫生** | `server/engine.py.bak` / `.orig`、`runtime/backends/laguna.py.bak`、根目录 9 个 `*.log`、`build/`、21 个残留分支 / worktree | 🟡 **大部分已清**（2026-08-03）：根目录 `*.log` 与 `build/` 已无；**worktree 42 → 3**（清理前把 4 个有未提交改动的树各自提交到自己分支再删，分支全部保留，没有丢东西）。剩：3 个 `.bak`/`.orig`（**未跟踪、已在 `.gitignore` 第 37–38 行、无任何代码引用、2026-07-20~23 的旧备份**）——它们是主工作区里别人的未跟踪文件，**留待用户自己决定是否删**，不擅自动 |
 
 **这一批的方法论教训**（值得比修复本身更认真地记住）：
 
@@ -210,7 +210,7 @@ R1–R6、R8 已在 2026-08-01 的 Track 0 批次里解决，保留在表里是�
 | N4 | **bfdiag 的隔离保证可能已经失效** | `bfdiag/checkpoint/state.py` 有一条 `"bug_found_not_fixed"` 手册条目 + 专门的回归测试，指向 `laguna.py:1647,1653` 的张量轴错误。但真实的 `reset_slot` 已被重写（现在 1945-1965），为前缀缓存保留而**完全不再清零 KV 内存**；那两个行号现在指向另一个函数。连带问题：`bfdiag/checkpoint/restore.py` 明确依赖 `reset_slot` 清掉 checkpoint 范围外的残留来保证恢复隔离性。那个回归测试仍然绿，因为它**从不调用真实函数**，只在合成张量上复现抽象的切片 bug 模式 | Track C（**优先**——诊断平台自己说谎比一般 bug 危险） |
 | N5 | **Anthropic 侧拿不到规范形态的 reasoning** | 见 §1.4 | Track E |
 | N6 | **全套件下的 flaky** | `test_bfdiag_record.py::test_cli_ls_labels_an_unfinished_record_running`。已缩窄：单文件 8/8 过；bfdiag 子集 + 12 路 CPU 满载 3/3 过；只在**全套件**且机器有 GPU 负载时出现（3/5）。排除了两个显而易见的猜测——标签逻辑是 `finished_at is None → "running"`，**与时间无关**，不是老化阈值；`default_store()`/`bfdiag_dir()` 每次调用都重读环境变量，不是缓存 store。结论：来自 `tests/test_bfdiag_*` 之外某个测试的跨测试副作用 | Track 0 收尾 |
-| N7 | **`FakeEngineProvider.load` 与 Protocol 不符** | 没接 `EngineProvider` 声明、`LagunaEngineProvider` 实现了的 `on_stage` 参数。当前休眠（调用点没传），改了就炸 | Track C |
+| N7 | ~~**`FakeEngineProvider.load` 与 Protocol 不符**~~ | 没接 `EngineProvider` 声明、`LagunaEngineProvider` 实现了的 `on_stage` 参数。当前休眠（调用点没传），改了就炸 | ✅ **已修**（2026-08-03 复核）：`bfdiag/daemon/provider.py` 三处 `load` 签名一致（196/288/423），288 处的注释明写 "before this fix, this method took no `on_stage` parameter"。同类漂移现由 `tests/test_fake_runner_signatures.py` 按 `ModelBackend` 协议自动覆盖 |
 
 ### 1.4 thinking / reasoning 契约（D1 已定案）
 
