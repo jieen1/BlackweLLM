@@ -725,6 +725,17 @@ async def debug_stats():
             }
             for p in snapshot.prefix
         }
+        # B3 step 0 (docs/implementation-plan.md §7.3 C7-2): CUDA Graph
+        # capture success/failure, made observable here rather than only via
+        # /metrics' Prometheus gauges -- curl-able without a Prometheus text
+        # parser, and this is the exact question B3's throughput numbers are
+        # unattributable without answering ("did the decode CUDA Graph
+        # actually capture in THIS server process, or is decode silently
+        # running eager"). () when the backend has not attempted any capture
+        # yet (matches BackendSnapshot.dflash_cg_status's own "never missing"
+        # contract), not omitted from the response, so a caller can
+        # distinguish "no capture attempted" from "field doesn't exist".
+        engine.stats["_cuda_graph_dbg"] = dict(snapshot.dflash_cg_status)
     return engine.stats
 
 

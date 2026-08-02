@@ -658,6 +658,143 @@ class Qwen36GatedDeltaNet(nn.Module):
 
         return self.out_proj(core_attn_out)
 
+    def spec_forward(
+        self, hidden_states: torch.Tensor, state: GdnLayerState
+    ) -> tuple[torch.Tensor, list[GdnLayerState]]:
+        """B3: MTP verify's GDN forward -- K candidate positions, K+1
+        materialized state snapshots, no chunk algorithm involved.
+
+        **Why this exists** (``docs/implementation-plan.md`` §7.1 B3, the
+        "主模型侧 GDN 递归状态回滚" item -- see also
+        ``runtime/recurrent_state_pool.py``'s ``spec_row``/
+        ``runtime/block_pool.py``'s ``_ssm_spec_row``, whose docstrings
+        describe the addressing scheme this method's output is meant to
+        feed): verify runs ``K`` draft tokens through the model at once.
+        If accept/reject later keeps only the first ``m < K`` of them, the
+        recurrent state must resume from "as if only those ``m`` tokens
+        happened" -- but :func:`chunk_gated_delta_rule` (the ``forward``
+        method's ``seq_len > 1`` branch) only ever returns the state after
+        ALL ``K`` positions. Re-deriving an intermediate state from that one
+        call is not possible without re-deriving the kernel's internal
+        chunking (Qwen3.6's chunk size is 64 > any realistic ``K``, so a
+        verify-length span is always exactly one chunk -- no chunk-boundary
+        state is exposed either).
+
+        **The mechanism** (the "ReplaySSM ring-buffer" idea from
+        ``investigation-queue.md`` D-3, adapted to what this runtime already
+        has rather than re-derived from vLLM's custom kernel -- see the B3
+        report for the full derivation): call the exact same single-token
+        ``fused_recurrent_gated_delta_rule`` path :meth:`forward` already
+        uses for ordinary decode, once per candidate position, in a Python
+        loop, and keep every intermediate ``(conv_state, recurrent_state)``
+        pair instead of discarding all but the last. Because this is
+        *literally* the same kernel call ordinary single-token decode makes,
+        with the same inputs, snapshot ``j`` is not merely close to what ``j``
+        ordinary decode steps would have produced from the same anchor -- it
+        is the same floating-point computation, so it is bit-identical
+        (verified on GPU, see ``scripts/b3_probe_gdn_spec_rollback.py``).
+        This is strictly stronger than the B3 correctness bar in
+        ``docs/b1-correctness-criterion.md`` §7 ("接受/拒绝后GDN状态与非投机
+        路径的状态张量对比"), which only asks the two to agree, not to agree
+        by being the same code path.
+
+        **The cost this trades for that guarantee**: ``K`` sequential
+        kernel launches per GDN layer instead of one chunked call. This is
+        real (measured in the B3 report), not free -- it is the price of
+        never needing a recompute-forward repair on partial rejection,
+        which is what every other rollback strategy this runtime considered
+        (checkpoint + recompute the accepted prefix through the FULL 64-layer
+        model) would have cost instead, and that price scales with the
+        number of REJECTED tokens times the full model's per-token cost, not
+        just this one layer's.
+
+        Never touches ``state`` -- operates on clones throughout, so a crash
+        or an unhandled exception mid-call leaves the caller's live buffers
+        exactly as they were (snapshot 0, appended below, is provably
+        identical to the untouched anchor -- see
+        :func:`commit_spec_snapshot`'s docstring for why that matters for a
+        caller's own crash-safety, not just this function's).
+
+        Returns ``(output, snapshots)``: ``output`` is
+        ``[1, seq_len, hidden_size]``, this layer's contribution for every
+        candidate position (needed to feed the rest of the model, same as
+        :meth:`forward`'s return). ``snapshots`` has ``seq_len + 1`` entries;
+        ``snapshots[0]`` is the (cloned) anchor, unmodified;
+        ``snapshots[j]`` for ``j >= 1`` is the state after processing the
+        first ``j`` candidate positions. Pass ``snapshots[m]`` (``m`` =
+        accepted count) to :func:`commit_spec_snapshot` to resume decoding.
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        assert batch_size == 1
+        if not state.has_previous_state:
+            raise ValueError(
+                "spec_forward continues from a committed anchor (the token "
+                "immediately before the draft), which by construction "
+                "always has a previous state -- even the first verify round "
+                "of a sequence follows a real prefill's chunked forward. A "
+                "fresh, never-prefilled slot reaching this call is a caller "
+                "bug, not a case this method degrades gracefully for."
+            )
+
+        working = GdnLayerState(
+            conv_state=state.conv_state.clone(),
+            recurrent_state=state.recurrent_state.clone(),
+            has_previous_state=True,
+        )
+        snapshots: list[GdnLayerState] = [
+            GdnLayerState(
+                conv_state=working.conv_state.clone(),
+                recurrent_state=working.recurrent_state.clone(),
+                has_previous_state=True,
+            )
+        ]
+        outputs: list[torch.Tensor] = []
+        for t in range(seq_len):
+            step_out = self.forward(hidden_states[:, t : t + 1, :], working)
+            outputs.append(step_out)
+            snapshots.append(
+                GdnLayerState(
+                    conv_state=working.conv_state.clone(),
+                    recurrent_state=working.recurrent_state.clone(),
+                    has_previous_state=True,
+                )
+            )
+        return torch.cat(outputs, dim=1), snapshots
+
+
+def commit_spec_snapshot(
+    state: GdnLayerState, snapshots: list[GdnLayerState], accepted_count: int
+) -> None:
+    """Resume ``state`` from ``snapshots[accepted_count]`` -- the O(1) half
+    of B3's rollback (the expensive half is :meth:`Qwen36GatedDeltaNet.
+    spec_forward`, already paid before this is ever called).
+
+    ``.copy_()`` into the caller's existing buffers, never a rebind -- same
+    B0-5/B2 discipline as :meth:`Qwen36GatedDeltaNet.forward` and
+    :meth:`Qwen36SlotPool.restore_recurrent_state`, for the same reason: if
+    ``state`` is a slot pool's persistent, ``mark_static_address``-marked
+    view, rebinding would silently detach the sequence from its own slot.
+
+    ``accepted_count=0`` (every draft token rejected) is not a special case
+    here -- ``snapshots[0]`` is the untouched anchor clone
+    :meth:`spec_forward` made before running anything, so "roll all the way
+    back" and "roll back partway" are the same operation at a different
+    index. This is also what makes :meth:`spec_forward`'s "never touches
+    ``state``" property load-bearing for crash-safety: a caller that never
+    reaches this call (an exception between the two) has left ``state``
+    exactly where it was -- equivalent to having called this with
+    ``accepted_count=0``, not to having silently applied every candidate.
+    """
+    if not (0 <= accepted_count < len(snapshots)):
+        raise ValueError(
+            f"accepted_count={accepted_count} out of range for "
+            f"{len(snapshots)} snapshots (0..{len(snapshots) - 1})"
+        )
+    chosen = snapshots[accepted_count]
+    state.conv_state.copy_(chosen.conv_state)
+    state.recurrent_state.copy_(chosen.recurrent_state)
+    state.has_previous_state = True
+
 
 # ---------------------------------------------------------------------------
 # Full attention layer (sparkinfer paged attention).

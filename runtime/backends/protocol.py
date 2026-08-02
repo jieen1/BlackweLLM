@@ -163,14 +163,28 @@ class BackendSnapshot:
     caller may zip them or index them directly without a bounds check.
     See ``docs/architecture.md`` §3.5.2.
 
-    ``dflash_cg_status`` is ``()`` when DFlash is not enabled or has not
-    attempted any CUDA Graph capture yet -- never missing, never raising --
-    so ``/metrics`` can iterate it unconditionally. Each entry is
-    ``(graph_name, "captured"|"failed")`` for a graph DFlash actually
-    attempted to capture (see ``DFlashEngine.cg_status``,
-    notes/2026-08-01-c1-c2-gpu-investigation.md). Tuple-of-pairs rather than
-    a dict to keep this dataclass's fields all plain immutable values,
-    matching ``slots``/``prefix`` above.
+    ``dflash_cg_status`` is ``()`` when a backend has not attempted any CUDA
+    Graph capture yet -- never missing, never raising -- so ``/metrics`` can
+    iterate it unconditionally. Each entry is ``(graph_name,
+    "captured"|"failed")``.
+
+    **Not DFlash-specific despite the name** (kept as-is, 2026-08-02, B3 step
+    0 -- ``docs/implementation-plan.md`` §7.3 C7-2): the name predates a
+    second producer. ``LagunaBackend`` populates it from
+    ``DFlashEngine.cg_status`` (see notes/2026-08-01-c1-c2-gpu-investigation.md),
+    which happens to key one of its entries ``"decode"`` even though that
+    graph has nothing to do with DFlash verify/draft -- the field was always
+    "every CUDA Graph this backend attempted to capture," not "every DFlash
+    graph." ``Qwen36Backend`` (which has no DFlash) now populates the same
+    field from its own ``self.cg_status``, keyed ``"decode"`` for its
+    (DFlash-free) decode graph. Renaming the field was considered and
+    rejected: it is read by ``server/app.py`` (``/metrics`` and
+    ``/debug/stats``) and asserted on by ``tests/test_metrics.py``/
+    ``tests/test_qwen36_backend.py``/``tests/test_dflash_engine.py``; a
+    rename buys clarity at the cost of touching every one of those for no
+    behavior change. Tuple-of-pairs rather than a dict to keep this
+    dataclass's fields all plain immutable values, matching
+    ``slots``/``prefix`` above.
     """
 
     slots: tuple[SlotSnapshot, ...]

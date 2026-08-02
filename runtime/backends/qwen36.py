@@ -228,6 +228,16 @@ class Qwen36Backend:
         self._decode_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._decode_graph_logits: dict[int, torch.Tensor] = {}
         self._graph_pool = None
+        #: B3 step 0 (``docs/implementation-plan.md`` §7.3 C7-2): whether the
+        #: decode CUDA Graph actually captured in THIS process, made
+        #: queryable rather than only visible as a ``logger.info``/
+        #: ``logger.exception`` line that this runtime's default log config
+        #: does not persist. Same shape as ``DFlashEngine.cg_status``
+        #: (``"captured"``/``"failed"``, key = graph name) -- surfaced
+        #: through :meth:`snapshot`'s ``dflash_cg_status`` field, which despite
+        #: its name is not DFlash-specific (see that field's updated
+        #: docstring in ``runtime/backends/protocol.py``).
+        self.cg_status: dict[str, str] = {}
 
         self.pool.reset_all()
 
@@ -271,7 +281,9 @@ class Qwen36Backend:
             )
             for s in range(self.num_slots)
         )
-        return BackendSnapshot(slots=slots, prefix=prefix, dflash_cg_status=())
+        return BackendSnapshot(
+            slots=slots, prefix=prefix, dflash_cg_status=tuple(sorted(self.cg_status.items()))
+        )
 
     def reset_slot(self, slot: int) -> None:
         """Release ``slot``, saving its prefix cache; zero its GDN state.
@@ -750,9 +762,12 @@ class Qwen36Backend:
         if self.device.type != "cuda" or not self.batched_decode:
             return None
         try:
-            return self._capture_decode_graphs()
+            captured_batch = self._capture_decode_graphs()
+            self.cg_status["decode"] = "captured" if captured_batch else "failed"
+            return captured_batch
         except Exception:  # pragma: no cover - depends on driver/kernel support
             logger.exception("Qwen3.6 decode CUDA Graph capture failed; falling back to eager")
+            self.cg_status["decode"] = "failed"
             self._decode_graphs.clear()
             self._decode_graph_logits.clear()
             # Uninstall every graph driver too. Leaving one installed would

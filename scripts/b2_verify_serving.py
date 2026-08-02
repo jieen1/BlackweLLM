@@ -37,10 +37,11 @@ Run: ~/.venvs/vllm/bin/python scripts/b2_verify_serving.py [--slots N]
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 
-_ROOT = "/home/bot/project/qsr-w-b2"
+_ROOT = "/home/bot/project/qsr-w-b3"
 sys.path.insert(0, _ROOT)
 import runtime  # noqa: E402
 
@@ -49,6 +50,21 @@ assert runtime.__file__.startswith(_ROOT), (
 )
 
 import torch  # noqa: E402
+
+# B3 step 0 safety net (2026-08-02): this card is shared with a user's live
+# workload. A reactive nvidia-smi poll-and-kill watchdog has multi-second
+# lag -- observed directly this session: usage went 25.6 -> 49.8 -> 95.9 GiB
+# in under 10s during CUDA Graph capture, regardless of how small
+# --max-seq-len/--slots are (capture's real cost is apparently dominated by
+# something that does not scale with KV/context size -- see the B3 report).
+# QSR_DEBUG_MEM_FRACTION, set only for this deliberately cautious rerun,
+# makes the CUDA allocator itself refuse to cross a hard ceiling -- a
+# deterministic guard, not a race against a polling loop.
+_mem_fraction = os.environ.get("QSR_DEBUG_MEM_FRACTION")
+if _mem_fraction:
+    torch.cuda.set_per_process_memory_fraction(float(_mem_fraction), device=0)
+    print(f"[safety] capped this process to {float(_mem_fraction)*100:.0f}% of device memory")
+
 from transformers import AutoTokenizer  # noqa: E402
 
 from runtime.backends.qwen36 import Qwen36Backend  # noqa: E402
@@ -313,8 +329,26 @@ def check_cuda_graph(model, prompts, steps, args) -> None:
     for s in range(args.slots):
         backend.reset_slot(s)
 
+    free_b, total_b = torch.cuda.mem_get_info()
+    print(f"  device free BEFORE capture: {free_b/2**30:.1f} / {total_b/2**30:.1f} GiB", flush=True)
     captured = backend.capture_decode_cuda_graph()
+    free_b, total_b = torch.cuda.mem_get_info()
+    print(f"  device free AFTER capture: {free_b/2**30:.1f} / {total_b/2**30:.1f} GiB", flush=True)
     record("capture returned a batch size", captured is not None, f"max_batch={captured}")
+    # B3 step 0 (docs/implementation-plan.md §7.3 C7-2): this is the exact
+    # question that was previously unanswerable from inside a real serving
+    # process -- print both the raw dict and the snapshot()-derived tuple so
+    # this run itself is the GPU evidence that CG capture success/failure is
+    # now observable, not just asserted by a return value this script
+    # happens to have access to (a real server's /debug/stats caller does
+    # not get `captured` back, only the snapshot).
+    print(f"  backend.cg_status (raw dict): {backend.cg_status}")
+    print(f"  backend.snapshot().dflash_cg_status: {backend.snapshot().dflash_cg_status}")
+    record(
+        "cg_status observable via snapshot()",
+        backend.snapshot().dflash_cg_status == (("decode", "captured"),),
+        f"got {backend.snapshot().dflash_cg_status}",
+    )
     if captured is None:
         return backend
 

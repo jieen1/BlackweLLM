@@ -540,6 +540,16 @@ class LagunaBackend:
         # M=1 decode CUDA Graph (lazily captured on first generate call)
         self._decode_cg = None
         self._decode_cg_enabled = _os.environ.get("QSR_DECODE_CUDA_GRAPH", "1") != "0"
+        #: B3 step 0 (``docs/implementation-plan.md`` §7.3 C7-2): this
+        #: backend's OWN decode CG capture outcome, tracked the same way
+        #: ``DFlashEngine.cg_status`` tracks its verify/draft/decode graphs --
+        #: see that class's ``cg_status`` and ``BackendSnapshot.dflash_cg_status``'s
+        #: docstring for why this is not DFlash-specific. Before this, a
+        #: Laguna server running WITHOUT DFlash enabled had no queryable
+        #: answer to "did the decode CUDA Graph actually capture" -- only a
+        #: ``logger.info``/``logger.warning`` line this runtime's default
+        #: log config does not persist for the success case.
+        self._decode_cg_status: dict[str, str] = {}
 
         # Pre-allocated decode buffers (avoid per-step tensor allocation)
         max_batch = num_slots
@@ -2461,9 +2471,11 @@ class LagunaBackend:
             cg = LagunaCudaGraphDecode(self, batch_size=1)
             cg.capture()
             self._decode_cg = cg
+            self._decode_cg_status["decode"] = "captured"
             logger.info("Laguna: M=1 decode CUDA Graph captured")
         except Exception as e:
             logger.warning("Laguna: decode CG capture failed (falling back to eager): %s", e)
+            self._decode_cg_status["decode"] = "failed"
             self._decode_cg_enabled = False
 
     def capture_decode_cuda_graph(self) -> int | None:
@@ -2542,15 +2554,26 @@ class LagunaBackend:
         heads, no tensor reads. It has to stay safe to call while the engine
         thread is mid-round, because a scraper does not coordinate with it.
 
-        ``dflash_cg_status``: ``()`` when DFlash was never enabled
-        (``self._dflash is None``) -- never an attribute error, never a
-        differently-shaped guess for ``/metrics`` to trip on. See
-        ``BackendSnapshot.dflash_cg_status``'s docstring and
+        ``dflash_cg_status``: merges two sources, both keyed by graph name
+        (2026-08-02, B3 step 0 -- see the field's own updated docstring for
+        why this is not DFlash-specific despite the name): ``DFlashEngine
+        .cg_status`` when DFlash is enabled (``self._dflash is not None``),
+        and this backend's OWN ``self._decode_cg_status`` for its
+        DFlash-free ``_ensure_decode_cg`` path. The two are not expected to
+        collide on the same key in practice (DFlash's own decode capture and
+        this backend's are separate call paths -- see ``_ensure_decode_cg``'s
+        docstring), but DFlash's entry wins on a collision since it is
+        merged in second; ``()`` only when NEITHER path has attempted a
+        capture yet -- never an attribute error, never a differently-shaped
+        guess for ``/metrics`` to trip on. See
         notes/2026-08-01-c1-c2-gpu-investigation.md for why this exists:
         a CUDA Graph capture failure used to be observable only by grepping
         startup logs for one exact line, invisible to Prometheus entirely.
         """
         dflash = self._dflash
+        merged_cg_status = dict(self._decode_cg_status)
+        if dflash is not None:
+            merged_cg_status.update(dflash.cg_status)
         return BackendSnapshot(
             slots=tuple(
                 SlotSnapshot(slot=i, kv_len=kv_len, is_fresh=kv_len == 0)
@@ -2565,9 +2588,7 @@ class LagunaBackend:
                 )
                 for i, tokens in enumerate(self._prefix_cache_tokens)
             ),
-            dflash_cg_status=(
-                tuple(sorted(dflash.cg_status.items())) if dflash is not None else ()
-            ),
+            dflash_cg_status=tuple(sorted(merged_cg_status.items())),
         )
 
     def _unpatch_impls_for_prefill(self) -> None:
