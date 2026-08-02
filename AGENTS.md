@@ -127,6 +127,25 @@ valid for cold-prefill performance, OOM/memory-pressure limits, or any
 `max_model_len`, quantization backend) — those are fixed when the model loads and
 require a fresh process.
 
+### `sparkinfer.*.is_supported()` is not a capability signal here
+
+Measured 2026-08-03: **all five** kernels report `False` —
+`attention.paged`, `moe.fused_moe`, `gemm.blockscaled`,
+`gemm.tensor_fp8_linear`, `norm.mhc` — while production serves Laguna
+through the first two and C-LIVE passes 67/67. The gate is
+`_lib/gating.py`'s `MIN_CUTLASS_DSL = "4.6.0"` against an installed 4.5.2,
+and it is a version-string floor rather than a functional probe.
+
+So `False` here means "the declared floor is not met", not "this kernel does
+not work". Nothing in `runtime/` or `server/` branches on it today, and
+nothing should start: a fallback taken on this signal would be taken
+unconditionally on this machine.
+
+The floor is not arbitrary — `_lib/` carries real 4.5-vs-4.6 workarounds
+(MLIR helper relocation, `cute.kernel_smem_size` lowering). Raising or
+relaxing it is a sparkinfer change with its own verification, not a
+one-line edit.
+
 ## External dependencies
 
 - **SparkInfer** (`/home/bot/project/sparkinfer`) — SM120 kernel library.

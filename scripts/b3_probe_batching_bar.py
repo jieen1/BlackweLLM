@@ -177,6 +177,14 @@ def load_mlp(config: dict, quantized: dict[str, str], layer_idx: int) -> Qwen36M
     with DEVICE:
         mlp = Qwen36MLP(config, layer_idx, quantized).to(DEVICE).to(torch.bfloat16)
     _install(mlp, tensors)
+    # part_a below calls mlp.gate_proj/mlp.down_proj directly (their own
+    # legacy ModelOptNVFP4Linear.forward()) right after calling mlp(x) (the
+    # fused w4a16 path) on this SAME instance -- the fused path frees the
+    # raw NVFP4 Parameters by default once it builds its packed
+    # representation (see Qwen36MLP.__init__'s docstring on
+    # `_keep_raw_nvfp4_weights`), which would break those direct calls.
+    # Opt out here since this diagnostic genuinely needs both live.
+    mlp._keep_raw_nvfp4_weights = True
     return mlp
 
 

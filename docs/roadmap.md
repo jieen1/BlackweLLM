@@ -62,6 +62,56 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
 
 ---
 
+## 0.5 主线（2026-08-02 晚，用户定调）：完整支持 NVFP4 Qwen3.6，然后压榨 SM120
+
+标准模型是 **`unsloth/Qwen3.6-27B-NVFP4`**（不是 `nvidia/...`——今天的脚本指向后者是偏离，
+历史 47 个 benchmark 脚本指向前者才是对的）。
+
+**四个阶段，顺序不能颠倒**：
+
+### 阶段 1 · 完整支持（进行中）
+- [ ] `resolve_checkpoint(unsloth)` 放行 —— ⚠️ 目前被拒。`mixed-precision` 于本日被我
+      从 `SUPPORTED_QUANT_FORMATS` 移除（理由是"门禁不该承诺 loader 做不到的事"，理由本身
+      成立，但**正确解法是补 loader 而不是缩门禁**，我选了省事的那个）
+- [ ] `load_weights` 零缺失零多余（现缺 168 个 `weight_packed`）
+      —— 🔧 adapter 已写(`work/mixedprec-loader-20260802` 的 `ca50017`)，**未验证**
+- [ ] 能出连贯输出 + C-LIVE 通过
+      —— 🔴 **首次实跑输出是退化的:两个 prompt 都产出 `"!!!!!!!!!!!!"`**。
+      写它的 agent 明确说"这不能证明正确性"，并正准备用已知可用的 `nvidia/` checkpoint
+      跑同一脚本做对照，以隔离"adapter 的真 bug"还是"无关伪影(例如对指令模型做裸补全)"
+      —— 隔离没做完就被中断。**恢复这条时第一件事就是把那个对照跑完**，
+      不要拿"能加载"当"支持"。
+- **判据**：这四条全通才算"支持"，不是"能加载"
+
+### 阶段 2 · 系统质量与结构
+- [ ] 把 unsloth 纳入 registry/loader 的常规测试面，而不是特例
+- [ ] 现有 B1/B2/B3 的脚本与 fixture 统一切到标准模型
+- [ ] `IMPLEMENTED_BACKENDS` 与实际可服务范围一致
+
+### 阶段 3 · 输出速度
+- [ ] ⚠️ **首要项：消除反量化缓存**。实测时间线（`../notes/2026-08-02-gpu-memory-audit.md`）：
+      CG 捕获的 warmup 前向摸遍 64 层，**5 秒内 27,259 → 76,052 MiB**，
+      其中 **49.72 GiB 是永久缓存的 BF16 反量化权重**。
+      **模型本体只有 18.77 GiB —— 76 GiB 是我们自己造的。**
+      而且这意味着 **NVFP4 量化完全白做**：显存没省（两份都在）、速度没快（用 BF16 GEMM 算）。
+      B2 已把"绝对吞吐 ~4 tok/s"归因到这里。
+- [ ] MTP：默认 K 已从 8 改到 4（`f616029`，K 曲线实测 prose 1.11× / code 1.38×）；
+      重同步 A/B 数据待回
+
+### 阶段 4 · Kernel 深度适配，压榨 SM120
+- [ ] **`sparkinfer.gemm.blockscaled`**（导出 `mm` / `mm_fused_quant_a` /
+      `mm_fused_quant_a_grouped`，`is_supported()` 自称 SM120/SM121）——
+      **BlackweLLM 目前一处都没用**（`grep -rn blockscaled runtime/` 为空）。
+      稠密 NVFP4 层应当走它，而不是反量化成 BF16 再 `F.linear`。
+      ⚠️ 参照实现就在仓库里：`runtime/backends/laguna_sparkinfer_moe.py` 的 MoE 专家权重
+      **直接在打包 FP4 上**调 sparkinfer kernel，从不反量化。**Laguna 做对了，Qwen3.6 没有。**
+- [ ] sparkinfer 现在**可以直接改**（2026-08-02 起解除，只动 `origin`）。
+      已合入的先例：`fused_recurrent_gated_delta_rule_multistep`（`1fd76d1`，17 单测 bit-exact）
+- [ ] GDN 侧的剩余项见 §7.1 B3；⚠️ 但**硬上限已排除 GDN 是 MTP 的决定项**
+
+**阶段 3/4 曾被短暂叫停**（用户："不要去反量化啥的 就正常跑"），现按新指示恢复，
+**但严格排在阶段 1/2 之后**——先完整支持，再谈速度。
+
 ## 1. 现状盘点（2026-08-01 实测）
 
 ### 1.1 已经建成的（真资产）

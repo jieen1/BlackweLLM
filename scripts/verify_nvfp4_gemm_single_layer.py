@@ -1,0 +1,187 @@
+"""Single-MLP-block validation: Qwen36MLP's new fused NVFP4 W4A16 kernel
+forward path (``sparkinfer.moe._shared.kernels.w4a16.kernel.run_w4a16_moe``,
+degenerate 1-expert/top-1 MoE) vs the legacy per-Linear BF16-dequant forward
+path, on one *real* checkpoint layer's gate/up/down_proj (nvidia/Qwen3.6-27B-
+NVFP4, layer 5 -- real quantized weights + block scales + global scales, not
+synthetic).
+
+Not a pytest test (needs the GPU lock + a real checkpoint on disk) -- run
+manually, one shot, under /tmp/gpu_lock.sh. Reports cosine similarity and
+max abs error between the two forward paths across several M (decode-like
+M=1 up to prefill-like M=512).
+
+Unit granularity changed from the first attempt on this branch: that one
+compared per-Linear (down_proj/gate_proj/up_proj individually) because
+ModelOptNVFP4Linear.forward() itself ran the candidate GEMM. This attempt's
+candidate kernel (run_w4a16_moe) is shaped like one full gated-MLP block
+(FC1=w13 fused gate+up -> silu -> FC2=w2 down) in a single launch -- there
+is no per-Linear granularity to compare at anymore, so this compares the
+whole Qwen36MLP block's output instead. See runtime/model/qwen36_model.py's
+Qwen36MLP docstring for why.
+
+*** MUST be run with PYTHONPATH pointing at this worktree -- see
+``scripts/verify_nvfp4_gemm_full_model_gap.py``'s docstring for why.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import time
+from pathlib import Path
+
+_ROOT = str(Path(__file__).resolve().parent.parent)
+sys.path.insert(0, _ROOT)
+import runtime  # noqa: E402
+
+assert runtime.__file__.startswith(_ROOT), (
+    f"editable install shadowed the worktree: runtime.__file__={runtime.__file__} "
+    f"-- rerun with PYTHONPATH={_ROOT}"
+)
+
+import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
+from safetensors import safe_open  # noqa: E402
+
+from runtime.loading.modelopt import QUANT_ALGO_NVFP4  # noqa: E402
+from runtime.model.qwen36_model import Qwen36MLP  # noqa: E402
+
+CKPT = Path(
+    "/home/bot/.cache/huggingface/hub/models--nvidia--Qwen3.6-27B-NVFP4/snapshots"
+)
+LAYER = 5
+DEVICE = "cuda"
+HIDDEN_ACT = "silu"
+
+
+def _find_ckpt() -> Path:
+    snaps = sorted(CKPT.iterdir())
+    assert snaps, f"no snapshot under {CKPT}"
+    return snaps[0]
+
+
+def load_mlp_tensors(ckpt: Path, layer: int) -> dict[str, dict[str, torch.Tensor]]:
+    with open(ckpt / "model.safetensors.index.json") as f:
+        weight_map = json.load(f)["weight_map"]
+    prefix = f"model.language_model.layers.{layer}.mlp"
+    projs = ("gate_proj", "up_proj", "down_proj")
+    needed: dict[str, None] = {}
+    for proj in projs:
+        for suffix in ("weight", "weight_scale", "weight_scale_2"):
+            needed[f"{prefix}.{proj}.{suffix}"] = None
+    shards = {weight_map[k] for k in needed}
+    raw: dict[str, torch.Tensor] = {}
+    for shard in shards:
+        with safe_open(str(ckpt / shard), framework="pt", device="cpu") as f:
+            for k in f.keys():
+                if k in needed:
+                    raw[k] = f.get_tensor(k)
+    assert set(raw) == set(needed), set(needed) - set(raw)
+    out: dict[str, dict[str, torch.Tensor]] = {}
+    for proj in projs:
+        out[proj] = {
+            suffix: raw[f"{prefix}.{proj}.{suffix}"]
+            for suffix in ("weight", "weight_scale", "weight_scale_2")
+        }
+    return out
+
+
+def build_mlp(ckpt: Path, layer: int) -> tuple[Qwen36MLP, int, int]:
+    tensors = load_mlp_tensors(ckpt, layer)
+    gate_out, gate_packed_in = tensors["gate_proj"]["weight"].shape
+    hidden_size = gate_packed_in * 2
+    intermediate_size = gate_out
+    down_out, down_packed_in = tensors["down_proj"]["weight"].shape
+    assert down_out == hidden_size, (down_out, hidden_size)
+    assert down_packed_in * 2 == intermediate_size, (down_packed_in, intermediate_size)
+
+    config = {
+        "hidden_size": hidden_size,
+        "intermediate_size": intermediate_size,
+        "hidden_act": HIDDEN_ACT,
+    }
+    quantized = {
+        f"model.language_model.layers.{layer}.mlp.{proj}": QUANT_ALGO_NVFP4
+        for proj in ("gate_proj", "up_proj", "down_proj")
+    }
+    mlp = Qwen36MLP(config, layer, quantized)
+    assert mlp._nvfp4_fused, "checkpoint tensors did not classify as all-NVFP4"
+
+    for proj_name, proj_module in (
+        ("gate_proj", mlp.gate_proj),
+        ("up_proj", mlp.up_proj),
+        ("down_proj", mlp.down_proj),
+    ):
+        t = tensors[proj_name]
+        proj_module.weight.data.copy_(t["weight"].to(DEVICE))
+        proj_module.weight_scale.data.copy_(t["weight_scale"].to(DEVICE))
+        proj_module.weight_scale_2.data.copy_(t["weight_scale_2"].to(DEVICE))
+
+    mlp = mlp.to(DEVICE)
+    # run_case (below) calls legacy_forward (each submodule's own
+    # ModelOptNVFP4Linear.forward()/_ensure_ready(), reading raw
+    # .weight/.weight_scale/.weight_scale_2 directly) BEFORE mlp(x) on every
+    # M in main()'s loop, all on this ONE mlp instance -- but the fused path
+    # frees those raw Parameters by default the first time it runs (see
+    # Qwen36MLP.__init__'s docstring on `_keep_raw_nvfp4_weights`), which
+    # would break every M after the first. Opt out: this script's whole
+    # point is comparing the two paths against each other repeatedly.
+    mlp._keep_raw_nvfp4_weights = True
+    return mlp, hidden_size, intermediate_size
+
+
+def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
+    a64 = a.reshape(-1).double()
+    b64 = b.reshape(-1).double()
+    return (a64 @ b64 / (a64.norm() * b64.norm() + 1e-30)).item()
+
+
+def legacy_forward(mlp: Qwen36MLP, x: torch.Tensor) -> torch.Tensor:
+    return mlp.down_proj(F.silu(mlp.gate_proj(x)) * mlp.up_proj(x))
+
+
+def run_case(mlp: Qwen36MLP, hidden_size: int, m: int, seed: int) -> None:
+    torch.manual_seed(seed)
+    x = (torch.randn(m, hidden_size, device=DEVICE, dtype=torch.bfloat16) * 0.02).contiguous()
+
+    ref = legacy_forward(mlp, x)
+    # legacy_forward's own Linears cache BF16 dequants -- drop them so they
+    # don't become a resident cache the fused path doesn't need.
+    for sub in (mlp.gate_proj, mlp.up_proj, mlp.down_proj):
+        sub._weight_bf16 = None
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    n_iters = 20 if m <= 8 else 5
+    for _ in range(n_iters):
+        out = mlp(x)
+    torch.cuda.synchronize()
+    dt = (time.perf_counter() - t0) / n_iters
+
+    max_abs_err = (out.double() - ref.double()).abs().max().item()
+    cos = cosine(out, ref)
+    ref_norm = ref.double().norm().item()
+    rel_err = max_abs_err / (ref.double().abs().max().item() + 1e-30)
+    print(
+        f"  M={m:4d}  cosine={cos:.6f}  max_abs_err={max_abs_err:.6f}  "
+        f"rel_to_max={rel_err:.6f}  ref_norm={ref_norm:.2f}  "
+        f"latency={dt * 1e6:.1f}us/call"
+    )
+
+
+def main() -> None:
+    ckpt = _find_ckpt()
+    print(f"checkpoint: {ckpt}")
+    print(f"=== layer {LAYER} MLP (fused gate/up/down_proj) ===")
+    mlp, hidden_size, intermediate_size = build_mlp(ckpt, LAYER)
+    print(f"  hidden_size={hidden_size} intermediate_size={intermediate_size}")
+    for m in (1, 2, 8, 32, 128, 512):
+        run_case(mlp, hidden_size, m, seed=1234 + m)
+    del mlp
+    torch.cuda.empty_cache()
+    mem = torch.cuda.max_memory_allocated() / (1024**3)
+    print(f"\npeak allocated during this script: {mem:.3f} GiB")
+
+
+if __name__ == "__main__":
+    main()

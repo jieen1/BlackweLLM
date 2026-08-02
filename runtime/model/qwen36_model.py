@@ -110,14 +110,17 @@ from runtime.model.modelopt_linear import ModelOptFP8Linear, ModelOptNVFP4Linear
 from runtime.model.plain_linear import PlainLinear
 
 #: Checkpoint tensor suffixes this loader deliberately never consumes into
-#: a Parameter -- see runtime/model/modelopt_linear.py's module docstring
-#: for why ``.input_scale`` specifically is dead weight for a
-#: dequantize-to-BF16 B1 implementation. ``.input_global_scale`` is
-#: unsloth's mixed-precision NVFP4 group's own name for the same idea (see
-#: ``runtime/model/compressed_tensors_linear.py``'s module docstring) --
-#: listed explicitly, like ``.input_scale``, so a reader sees this is a
-#: known, deliberate skip rather than an accident.
-_IGNORED_WEIGHT_SUFFIXES: tuple[str, ...] = (".input_scale", ".input_global_scale")
+#: a Parameter. Empty since the 2026-08-03 FP8 follow-up: ``ModelOptFP8Linear``
+#: now has a real ``input_scale`` Parameter (see its docstring), so that
+#: suffix is routed like any other tensor -- and every quantization format's
+#: activation-side scale that this model graph has no Parameter for
+#: (NVFP4's weight-only ``.input_scale``/modelopt, unsloth's mixed-precision
+#: NVFP4 ``.input_global_scale`` -- see ``runtime/model/
+#: compressed_tensors_linear.py``'s module docstring for why that one is
+#: never read either) still falls through harmlessly via the ``mapped not in
+#: params_dict: continue`` check below, same as it always has for any
+#: checkpoint tensor with no matching Parameter.
+_IGNORED_WEIGHT_SUFFIXES: tuple[str, ...] = ()
 
 #: Which ``nn.Module`` factory each classifier's algo string maps to.
 #: Deliberately the single place that knows about every quantization format
@@ -1698,6 +1701,68 @@ class Qwen36Attention(nn.Module):
 
 
 class Qwen36MLP(nn.Module):
+    """Dense SwiGLU MLP: ``down_proj(silu(gate_proj(x)) * up_proj(x))``.
+
+    **NVFP4 fused fast path (``work/nvfp4-gemm-20260802`` follow-up)**: when
+    the checkpoint declares ``gate_proj``/``up_proj``/``down_proj`` all
+    ``W4A16_NVFP4`` (true for every real MLP layer per B0-2 -- the
+    checkpoint quantizes ``mlp.{gate,up,down}_proj`` uniformly, never a
+    mix), ``forward()`` does NOT call the three ``ModelOptNVFP4Linear``
+    submodules individually. Instead it fuses them into one call to
+    ``sparkinfer.moe._shared.kernels.w4a16.kernel.run_w4a16_moe`` -- the
+    weight-only kernel that dequantizes NVFP4 *inside* the kernel against
+    the real BF16 activation (``packed_dequant_e2m1x4_to_bfloat2x2`` +
+    ``bf16_mma_m16n8k16_f32``), not a kernel that requires both operands
+    pre-quantized like ``sparkinfer.gemm.blockscaled.mm`` (the previous
+    attempt on this branch -- see git history: that one turned a genuine
+    W4A16 checkpoint into an unintended W4A4 approximation because it needs
+    a quantized activation operand, and failed B1-R's calibrated gap-error
+    bars).
+
+    Why fusion is required, not optional: ``run_w4a16_moe`` is shaped like
+    one full MoE expert's gated MLP block (FC1 = ``w13`` fused gate+up ->
+    activation -> FC2 = ``w2`` down-proj) in a single launch -- there is no
+    way to call it for "just gate_proj alone" or "just down_proj alone"
+    the way the individual ``ModelOptNVFP4Linear.forward()`` used to. This
+    class degenerates the call into a 1-expert/top-1 MoE (``topk_ids`` is
+    always ``[[0]]``, ``topk_weights`` is always ``[[1.0]]``) -- exactly
+    the untested-on-GPU path B0 already flagged
+    (``notes/2026-08-02-trackB-b0-facts.md`` references
+    ``prepare_w4a16_modelopt_nvfp4_weights`` + ``num_experts=1``).
+
+    ``gate_proj``/``up_proj``/``down_proj`` stay real ``ModelOptNVFP4Linear``
+    submodules (unchanged Parameter shapes, unchanged ``weight_loader``
+    wiring) purely so the existing checkpoint-loading machinery keeps
+    working unmodified -- ``forward()`` below reads their ``.weight``/
+    ``.weight_scale``/``.weight_scale_2`` tensors directly to build the
+    fused ``w13``/``w2`` representation once, lazily, and never calls
+    their own ``.forward()``. Their ``_ensure_ready()``/``_weight_bf16``
+    legacy dequant path is left completely alone (still there for whatever
+    standalone diagnostics construct a bare ``ModelOptNVFP4Linear``, e.g.
+    ``scripts/verify_nvfp4_gemm_single_layer.py``) -- this class just
+    never triggers it.
+
+    ``gate_proj.weight_scale_2`` and ``up_proj.weight_scale_2`` must be
+    exactly equal for the fused ``w13`` global scale to be valid (the
+    kernel's packed W4A16 format has ONE global scale per w13 tensor,
+    shared by both halves). Empirically true for every one of the real
+    checkpoint's 64 MLP layers (verified directly off safetensors headers,
+    not assumed) -- ``_ensure_w4a16_fused_ready`` asserts it rather than
+    silently averaging/picking one if a future checkpoint variant differs.
+
+    **Raw-Parameter freeing (2026-08-03 follow-up)**: once
+    ``_w4a16_prepared`` is built, ``gate_proj``/``up_proj``/``down_proj``'s
+    raw ``.weight``/``.weight_scale``/``.weight_scale_2`` (~9.15 GiB across
+    64 real layers) are no longer read by this class -- by default
+    ``_ensure_w4a16_fused_ready`` frees them (see
+    ``_free_raw_nvfp4_weights``), so the two copies (raw + repacked) don't
+    stay resident together the way ``notes/2026-08-03-nvfp4-gemm-memory-
+    audit.md`` measured. Set ``self._keep_raw_nvfp4_weights = True`` before
+    the first fused forward to opt out -- see ``__init__``'s docstring on
+    that attribute for exactly which diagnostic/verification scripts need
+    this and why.
+    """
+
     def __init__(
         self,
         config: dict[str, Any],
@@ -1709,6 +1774,8 @@ class Qwen36MLP(nn.Module):
         super().__init__()
         hidden_size = config["hidden_size"]
         intermediate_size = config["intermediate_size"]
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
         # See Qwen36Attention.__init__'s ``weight_prefix`` docstring -- same
         # override, same reason (Qwen36MTPHead's checkpoint prefix is
         # ``mtp.layers.0.mlp``, not ``model.language_model.layers.N.mlp``).
@@ -1724,7 +1791,197 @@ class Qwen36MLP(nn.Module):
         )
         assert config["hidden_act"] == "silu"
 
+        # All-or-nothing: only fuse when every one of the three is a real
+        # NVFP4 Linear (never true for the mixed/unquantized configs some
+        # unit tests build, e.g. tests/test_qwen36_mtp_head.py's
+        # TestWeightPrefixOverride, which only quantizes gate_proj -- those
+        # fall through to the plain per-Linear forward below, unaffected).
+        self._nvfp4_fused = (
+            isinstance(self.gate_proj, ModelOptNVFP4Linear)
+            and isinstance(self.up_proj, ModelOptNVFP4Linear)
+            and isinstance(self.down_proj, ModelOptNVFP4Linear)
+        )
+        self._w4a16_prepared = None  # built lazily, once, on first fused forward
+
+        # Memory-audit follow-up (2026-08-03, notes/2026-08-03-nvfp4-gemm-
+        # memory-audit.md "What was not verified"): once `_w4a16_prepared`
+        # exists, gate/up/down_proj's raw NVFP4 Parameters
+        # (`.weight`/`.weight_scale`/`.weight_scale_2`, ~9.15 GiB across 64
+        # real layers) are never read again by this class's own forward
+        # path -- `_ensure_w4a16_fused_ready` below frees them by default.
+        # Set this True BEFORE the first fused forward to opt out (keeps
+        # them resident) -- required by any caller that alternates between
+        # this fused path and a submodule's own legacy
+        # `ModelOptNVFP4Linear.forward()` / `_ensure_ready()` on the SAME
+        # instance after that point, since that path independently
+        # dequantizes straight from the raw Parameters:
+        # `scripts/verify_nvfp4_gemm_full_model_gap.py` (oracle/candidate
+        # monkeypatch of `Qwen36MLP.forward`, re-run per workload on one
+        # loaded model), `scripts/verify_nvfp4_gemm_single_layer.py`
+        # (legacy-vs-fused comparison repeated across M values on one MLP
+        # instance), `scripts/b3_probe_batching_bar.py` (calls
+        # `gate_proj`/`down_proj` directly, for a DIFFERENT diagnostic
+        # purpose, right after the fused `mlp(x)` call on the same
+        # instance). `scripts/b1_verify_greedy_alignment.py` does NOT need
+        # this: it dequantizes every submodule once, up front, strictly
+        # before this class's fused forward ever runs for the first time.
+        self._keep_raw_nvfp4_weights = False
+
+    def _ensure_w4a16_fused_ready(self) -> None:
+        """Build the fused ``w13``/``w2`` W4A16 packed representation from
+        the three NVFP4 submodules' checkpoint tensors. Lazy + cached: runs
+        once per module instance, not once per forward call. Also frees the
+        three submodules' raw NVFP4 Parameters afterward, unless
+        ``self._keep_raw_nvfp4_weights`` is set -- see that attribute's
+        docstring in ``__init__``."""
+        if self._w4a16_prepared is not None:
+            return
+        from runtime.backends._sparkinfer_import import ensure_sparkinfer_path
+
+        ensure_sparkinfer_path()
+        from sparkinfer._lib.intrinsics import swizzle_block_scale
+        from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+            prepare_w4a16_modelopt_nvfp4_weights,
+        )
+
+        gate, up, down = self.gate_proj, self.up_proj, self.down_proj
+        gate_gs = gate.weight_scale_2.data.reshape(()).to(torch.float32)
+        up_gs = up.weight_scale_2.data.reshape(()).to(torch.float32)
+        if gate_gs.item() != up_gs.item():
+            raise ValueError(
+                "Qwen36MLP: gate_proj.weight_scale_2 "
+                f"({gate_gs.item()!r}) != up_proj.weight_scale_2 "
+                f"({up_gs.item()!r}) -- the fused w13 kernel needs one "
+                "shared global scale for both halves; this checkpoint "
+                "layer breaks the assumption every real layer was "
+                "verified to satisfy."
+            )
+
+        # w13 physical row order: [gate rows; up rows] -- pass
+        # w13_layout="gate_up" so the kernel knows this is already its own
+        # native (no-row-rotation) order. See class docstring.
+        w13_fp4 = torch.cat([gate.weight.data, up.weight.data], dim=0).unsqueeze(0).contiguous()
+        w13_blockscale = swizzle_block_scale(
+            torch.cat([gate.weight_scale.data, up.weight_scale.data], dim=0)
+            .unsqueeze(0)
+            .contiguous()
+        )
+        w13_global_scale = gate_gs.reshape(1).contiguous()
+
+        w2_fp4 = down.weight.data.unsqueeze(0).contiguous()
+        w2_blockscale = swizzle_block_scale(down.weight_scale.data.unsqueeze(0).contiguous())
+        w2_global_scale = down.weight_scale_2.data.reshape(1).to(torch.float32).contiguous()
+
+        self._w4a16_prepared = prepare_w4a16_modelopt_nvfp4_weights(
+            w13_fp4,
+            w13_blockscale,
+            w13_global_scale,
+            w2_fp4,
+            w2_blockscale,
+            w2_global_scale,
+            activation="silu",
+            params_dtype=torch.bfloat16,
+            w13_layout="gate_up",
+        )
+        # Drop this function's own references before freeing the raw
+        # Parameters below: `w2_fp4`/`w2_blockscale` are (for w2 -- w13's
+        # `torch.cat` above already decoupled it) VIEWS that can alias
+        # `down.weight`/`down.weight_scale`'s storage (`.unsqueeze(0)
+        # .contiguous()` is a no-op on an already-contiguous tensor), and a
+        # still-live local reference would keep that storage resident even
+        # after the Parameter itself is reassigned below. `_repack_weight`/
+        # `swizzle_block_scale` (verified directly, not assumed) always
+        # write `self._w4a16_prepared`'s tensors into freshly allocated
+        # storage -- never a view of their inputs -- so nothing above holds
+        # onto these once this function returns.
+        del w13_fp4, w13_blockscale, w2_fp4, w2_blockscale
+        if not self._keep_raw_nvfp4_weights:
+            self._free_raw_nvfp4_weights()
+
+    def _free_raw_nvfp4_weights(self) -> None:
+        """Release gate/up/down_proj's raw NVFP4 Parameter storage
+        (``.weight``/``.weight_scale``/``.weight_scale_2``) now that
+        ``self._w4a16_prepared`` holds an independent repacked copy --
+        ``_forward_w4a16_fused`` never reads these three submodules'
+        Parameters again. Reassigns each Parameter's ``.data`` to a
+        0-element tensor rather than deleting the ``nn.Parameter`` itself or
+        setting it to ``None``, so anything that walks ``named_parameters()``
+        or reads ``module.weight`` directly (this runtime never re-saves a
+        checkpoint, so nothing depends on the shape matching the real
+        checkpoint header afterward) still finds a real tensor of the
+        correct dtype/device at the expected attribute -- just shape
+        ``(0,)`` -- instead of hitting a missing attribute or ``None``.
+
+        Also returns the freed storage to the driver via
+        ``torch.cuda.empty_cache()`` -- measured directly (2026-08-03),
+        not assumed: without it, ``torch.cuda.memory_allocated()`` drops
+        as expected but PyTorch's caching allocator keeps the underlying
+        blocks reserved for its own reuse, so external ``nvidia-smi``
+        polling (what every memory-audit script in this repo actually
+        measures) barely moved -- 67.10 -> 64.58 GiB despite ~9.15 GiB of
+        real Parameter storage being dropped, because only a fraction of
+        it happened to get reused by later allocations before that run's
+        peak. Runs once per real MLP layer, ever (guarded the same way
+        ``_ensure_w4a16_fused_ready`` itself is -- this whole method only
+        runs once per instance), so the cost is a bounded ~64 calls over
+        the model's lifetime, not a per-token or per-forward recurring
+        one."""
+        for lin in (self.gate_proj, self.up_proj, self.down_proj):
+            for name in ("weight", "weight_scale", "weight_scale_2"):
+                param = getattr(lin, name)
+                param.data = param.data.new_empty(0)
+        if self.gate_proj.weight.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def _forward_w4a16_fused(self, x: torch.Tensor) -> torch.Tensor:
+        self._ensure_w4a16_fused_ready()
+        from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+        from sparkinfer.moe._shared.kernels.w4a16.prepare import make_w4a16_packed_buffers
+
+        if x.dtype != torch.bfloat16:
+            raise TypeError(
+                f"Qwen36MLP._forward_w4a16_fused expects bf16 activations, got {x.dtype}"
+            )
+        orig_shape = x.shape
+        x2d = x.reshape(-1, self.hidden_size).contiguous()
+        m = x2d.shape[0]
+        device = x2d.device
+
+        # Degenerate 1-expert/top-1 MoE: every row routes to expert 0 with
+        # router weight 1.0 -- see class docstring for why this is the
+        # shape run_w4a16_moe requires.
+        topk_ids = torch.zeros((m, 1), dtype=torch.int32, device=device)
+        topk_weights = torch.ones((m, 1), dtype=torch.float32, device=device)
+
+        buffers = make_w4a16_packed_buffers(
+            self._w4a16_prepared,
+            m=m,
+            topk=1,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        out = run_w4a16_moe(
+            x2d,
+            self._w4a16_prepared,
+            topk_weights,
+            topk_ids,
+            activation="silu",
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            fast_math=True,
+        )
+        return out.reshape(*orig_shape[:-1], self.hidden_size)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._nvfp4_fused:
+            return self._forward_w4a16_fused(x)
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 

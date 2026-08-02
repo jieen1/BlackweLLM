@@ -134,7 +134,11 @@ WORKLOADS: tuple[tuple[str, str], ...] = (
 
 #: Real parameter suffixes that only exist on this runtime's side (the
 #: quantized-scale metadata) -- never staged, never expected on HF's side.
-_NEVER_STAGED_SUFFIXES = (".weight_scale", ".weight_scale_2")
+#: ``.input_scale`` joined this list 2026-08-03: ``ModelOptFP8Linear`` grew
+#: a real ``input_scale`` Parameter (see its docstring) that this runtime's
+#: own FP8 kernel path reads directly, but HF's plain ``nn.Linear`` has no
+#: activation-scale equivalent to load it into, same as the other two.
+_NEVER_STAGED_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
 
 
 def _staged_filename(param_name: str) -> str:
