@@ -93,48 +93,54 @@ class TestRefusalsHappenBeforeAnyWeightIsRead:
             resolve_checkpoint(tmp_path)
 
 
-class TestQwen36IsRefusedHonestly:
-    """Registered, refused, and the message says which of those it is."""
+class TestQwen36Resolves:
+    """Track B / B2 flipped this class's premise.
 
-    def test_unimplemented_backend_is_named_rather_than_pretending(self):
-        resolution_target = load_config(QWEN_TEXT_MTP)
-        with pytest.raises(UnsupportedArchitectureError) as excinfo:
-            resolve_config(resolution_target)
+    It used to be ``TestQwen36IsRefusedHonestly`` and asserted the refusal:
+    ``qwen36`` was registered so the error could name it, and
+    ``IMPLEMENTED_BACKENDS`` withheld it so nothing pretended to work. B2
+    landed ``runtime.backends.qwen36.Qwen36Backend``, wired
+    ``ServerEngine._load_qwen36_model``, and served real OpenAI and
+    Anthropic requests against the real ``nvidia/Qwen3.6-27B-NVFP4``
+    checkpoint, so the refusal is now the dishonest answer.
+
+    The claim that survives the flip unchanged is the one that was never
+    about implementedness: the vision gate does not fire for these
+    checkpoints (B0-1b -- resolution validates with
+    ``language_model_only=True`` unconditionally)."""
+
+    def test_text_only_checkpoint_resolves_to_the_qwen36_backend(self):
+        resolution = resolve_config(load_config(QWEN_TEXT_MTP))
+        assert resolution.backend == "qwen36"
+        assert resolution.spec.has_vision_tower is False
+
+    def test_multimodal_builds_resolve_and_the_vision_gate_does_not_fire(self):
+        # B0-1b: a vision tower in config.json is no longer a refusal --
+        # the loader runs language_model_only and the tensors are filtered.
+        for repo in (QWEN_OFFICIAL, QWEN_UNSLOTH):
+            resolution = resolve_config(load_config(repo))
+            assert resolution.backend == "qwen36"
+            assert resolution.spec.has_vision_tower is True
+
+    def test_an_unregistered_backend_is_still_named_rather_than_pretending(self):
+        # The refusal path must stay reachable and stay honest now that
+        # qwen36 no longer exercises it -- otherwise flipping the flag also
+        # silently retired the only test of that message.
+        config = minimal_config(
+            architectures=["Qwen3_5ForConditionalGeneration"],
+            language_model_only=True,
+            quantization_config={"quant_method": "modelopt"},
+        )
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(
+                "runtime.model_registry.IMPLEMENTED_BACKENDS",
+                IMPLEMENTED_BACKENDS - {"qwen36"},
+            )
+            with pytest.raises(UnsupportedArchitectureError) as excinfo:
+                resolve_config(config)
         message = str(excinfo.value)
         assert "qwen36" in message
         assert "not implemented" in message
-
-    def test_multimodal_builds_now_fail_on_missing_backend_not_vision(self):
-        # B0-1b flipped this: the vision gate no longer fires for these two
-        # (resolve_config validates with language_model_only=True
-        # unconditionally), so what a user pointing at either checkpoint
-        # actually hits today is qwen36 not being implemented -- the same
-        # message TestQwen36IsRefusedHonestly.
-        # test_unimplemented_backend_is_named_rather_than_pretending checks
-        # for the vision-free QWEN_TEXT_MTP checkpoint. This is the honest
-        # replacement for the old "vision gate fires first" claim, not a
-        # weakened version of it.
-        for repo in (QWEN_OFFICIAL, QWEN_UNSLOTH):
-            with pytest.raises(UnsupportedArchitectureError) as excinfo:
-                resolve_config(load_config(repo))
-            message = str(excinfo.value)
-            assert "vision" not in message
-            assert "qwen36" in message
-            assert "not implemented" in message
-
-    def test_multimodal_builds_resolve_once_the_backend_exists(self):
-        # Positive proof of B0-1b, not just "a different error fires first":
-        # with qwen36 hypothetically implemented, both real vision-bearing
-        # checkpoints resolve successfully, and the resolution says so.
-        for repo in (QWEN_OFFICIAL, QWEN_UNSLOTH):
-            with pytest.MonkeyPatch.context() as monkeypatch:
-                monkeypatch.setattr(
-                    "runtime.model_registry.IMPLEMENTED_BACKENDS",
-                    IMPLEMENTED_BACKENDS | {"qwen36"},
-                )
-                resolution = resolve_config(load_config(repo))
-            assert resolution.backend == "qwen36"
-            assert resolution.spec.has_vision_tower is True
 
 
 class TestSpeculativeStrategyFollowsTheCheckpoint:
@@ -147,12 +153,7 @@ class TestSpeculativeStrategyFollowsTheCheckpoint:
             language_model_only=True,
             quantization_config={"quant_method": "modelopt"},
         )
-        with pytest.MonkeyPatch.context() as monkeypatch:
-            monkeypatch.setattr(
-                "runtime.model_registry.IMPLEMENTED_BACKENDS",
-                IMPLEMENTED_BACKENDS | {"qwen36"},
-            )
-            resolution = resolve_config(config)
+        resolution = resolve_config(config)
         assert resolution.spec.has_mtp is False
         assert resolution.speculative is None
 
@@ -163,10 +164,5 @@ class TestSpeculativeStrategyFollowsTheCheckpoint:
             quantization_config={"quant_method": "modelopt"},
             mtp_num_hidden_layers=1,
         )
-        with pytest.MonkeyPatch.context() as monkeypatch:
-            monkeypatch.setattr(
-                "runtime.model_registry.IMPLEMENTED_BACKENDS",
-                IMPLEMENTED_BACKENDS | {"qwen36"},
-            )
-            resolution = resolve_config(config)
+        resolution = resolve_config(config)
         assert resolution.speculative == "mtp"

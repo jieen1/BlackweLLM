@@ -553,11 +553,27 @@ class ServerEngine:
         import torch  # local: this module stays importable without torch
 
         from runtime.backends.qwen36 import Qwen36Backend
+        from runtime.laguna_config import _resolve_laguna_model_dir
         from runtime.model_loading import load_qwen36_model
+
+        if self.enable_dflash:
+            # capabilities.speculative_decode is False for this backend, and
+            # the scheduler reads self.enable_dflash directly (it decides
+            # whether classify_decode_slots routes a request to
+            # mtp_verify_and_commit_batch, which this backend does not
+            # implement). Refusing here rather than silently downgrading:
+            # a deployment that asked for speculative decoding and got
+            # ordinary decoding without being told is how an acceptance-rate
+            # counter sits at zero unnoticed (N8).
+            raise ValueError(
+                "enable_dflash is not supported by the qwen36 backend "
+                "(capabilities.speculative_decode is False; MTP is Track B / B3). "
+                "Start the server with QSR_SERVER_ENABLE_DFLASH=0."
+            )
 
         max_model_len = self.blocks_per_slot * self.block_size
         model = load_qwen36_model(
-            self.MODEL,
+            _resolve_laguna_model_dir(self.MODEL),
             device="cuda",
             dtype=torch.bfloat16,
             max_seq_len=max_model_len,

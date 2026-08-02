@@ -87,7 +87,7 @@ REGISTRY: tuple[ArchitectureFamily, ...] = (
 #: nothing has exercised, which is the failure mode this repo keeps
 #: re-learning (N8: a capability claimed by silence, swallowed by
 #: try/except, unnoticed for three years).
-IMPLEMENTED_BACKENDS = frozenset({"laguna"})
+IMPLEMENTED_BACKENDS = frozenset({"laguna", "qwen36"})
 
 
 @dataclass(frozen=True)
