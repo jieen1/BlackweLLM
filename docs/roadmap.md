@@ -126,6 +126,18 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
 - [ ] 并发/批量下的 CG 收益未测（本轮只测了单并发单请求解码）。
 - [ ] MTP：默认 K 已从 8 改到 4（`f616029`，K 曲线实测 prose 1.11× / code 1.38×）；
       重同步 A/B 数据待回（代码在 `work/mtp-resync-20260802` 的 `aed0e2d`，无数据）
+- [ ] ⚠️ **全部 MTP 接受率数字都是在非标准 checkpoint（`nvidia/`）上测的，需要在标准
+      模型上重测。** 两个发布方的 NVFP4 **不是同一份权重的两次量化**：`nvidia/` 是
+      全模型统一 NVFP4，`unsloth/` 是混合布局（多数投影走 int8/float8-dynamic，
+      NVFP4 只覆盖 56–63 层的 `mlp.(gate|up|down)_proj`）。
+      **这个对照此前做不了**——`scripts/mtpfix_unsloth_checkpoint_probe.py` 在加载就死
+      （`168 parameter(s) never received a checkpoint tensor`），因为当时没有
+      mixed-precision adapter。**该 adapter 本日已合入（`ca50017`），阻塞已解除，
+      这个实验现在第一次可做。**
+      ⚠️ 注意别把历史的 "~4.0/4 (K=3)" 当靶子：那个数字出自历史仓库 47 个
+      unsloth benchmark 脚本，与今天的测法**不可比**（128K 前缀 / c=4 vs 512 token
+      单槽），该对照已于 2026-08-02 明确撤回。**重测是为了拿到标准模型自己的数，
+      不是为了追那个数。**
 
 ### 阶段 4 · Kernel 深度适配，压榨 SM120
 - [x] **目标已达成，但走的不是原处方的路。** 原文要求稠密 NVFP4 层改用
