@@ -1052,11 +1052,20 @@ class Qwen36DecodeGraphAttention:
             num_cache_pages=num_cache_pages,
             use_cuda_graph=True,
         )
+        # ``max_cache_page_count`` is per REQUEST, not the physical pool size:
+        # it bounds how many pages one sequence's page-table row may address,
+        # and sparkinfer plans the replay schedule against
+        # ``max_cache_page_count * page_size`` tokens. Passing the pool total
+        # here raised "page_table width is smaller than required by
+        # cache_seqlens" (measured 2026-08-02) -- the planner asked for a
+        # 12-page row out of a 4-page-wide table. ``num_cache_pages`` above is
+        # the other number, the physical page count the kernel may index into,
+        # and that one IS the pool total.
         self._workspace.prepare_decode_graph_replay_state(
             batch=batch,
             max_page_table_width=pages_per_slot,
             total_q_capacity=batch,
-            max_cache_page_count=num_cache_pages,
+            max_cache_page_count=pages_per_slot,
             window_left=-1,
         )
         # Bind the WORST case before capture, not a representative one: the
