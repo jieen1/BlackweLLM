@@ -37,7 +37,7 @@ import sys
 import time
 from pathlib import Path
 
-_ROOT = "/home/bot/project/qsr-w-b3"
+_ROOT = "/home/bot/project/qsr-w-gdnopt"
 sys.path.insert(0, _ROOT)
 import runtime  # noqa: E402
 

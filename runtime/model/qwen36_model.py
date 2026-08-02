@@ -128,6 +128,48 @@ def _make_linear(
     return PlainLinear(in_features, out_features, bias=False)
 
 
+def _bmm_project(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Apply a Linear-like ``module`` (:class:`~runtime.model.plain_linear.
+    PlainLinear`, :class:`~runtime.model.modelopt_linear.ModelOptFP8Linear`,
+    or ``...ModelOptNVFP4Linear``) to ``x`` (``[1, seq_len, in_features]``)
+    via ``torch.bmm`` over an explicit batch dimension -- one independent
+    ``[1, in] @ [in, out]`` matmul per position, weight broadcast in with
+    ``expand`` (a stride-0 view, no copy) -- used by
+    :meth:`Qwen36GatedDeltaNet.spec_forward` instead of calling ``module``
+    directly.
+
+    **Why this exists, not just ``module(x)``**: measured directly
+    (2026-08-02, ``notes/2026-08-02-gdn-spec-forward-batching.md``) that
+    calling a Linear once over all ``seq_len`` positions at once produces a
+    DIFFERENT BF16 rounding (~1-2 ULP, up to ``0.00195`` absolute on real
+    checkpoint weights) than calling it once per position in a loop --
+    ordinary batched GEMM (``F.linear``/``torch.matmul`` broadcasting/
+    ``torch.einsum`` all measured equally non-bit-exact) picks a reduction
+    order that depends on the row count, so naively "batching the matmul"
+    silently breaks bit-exactness. ``torch.bmm`` over an explicit batch
+    dimension does not: measured bit-exact against ``seq_len`` sequential
+    single-row calls, for both unquantized (:class:`PlainLinear`) and
+    dequantize-to-BF16 quantized (FP8/NVFP4) weights alike -- it evidently
+    dispatches to a genuinely per-batch-independent kernel rather than
+    fusing rows into one wider reduction, so it reproduces each position's
+    exact sequential-call result while still costing ONE kernel launch
+    instead of ``seq_len``.
+    """
+    if hasattr(module, "_ensure_ready"):
+        module._ensure_ready()  # ModelOptFP8Linear / ModelOptNVFP4Linear
+        weight = module._weight_bf16  # [out, in], BF16 (dequantized once, cached)
+    else:
+        weight = module.weight  # PlainLinear -- already BF16
+    bias = getattr(module, "bias", None)
+    assert bias is None, "_bmm_project: every GDN projection is bias=False; bias path untested"
+
+    seq_len = x.shape[1]
+    x2d = x.reshape(seq_len, -1)  # [seq_len, in]
+    weight_batched = weight.t().unsqueeze(0).expand(seq_len, -1, -1)  # [seq_len, in, out], no copy
+    out = torch.bmm(x2d.unsqueeze(1), weight_batched).squeeze(1)  # [seq_len, out]
+    return out.unsqueeze(0)  # [1, seq_len, out]
+
+
 # ---------------------------------------------------------------------------
 # Norms -- see module docstring for why these are two different formulas.
 # ---------------------------------------------------------------------------
@@ -708,6 +750,62 @@ class Qwen36GatedDeltaNet(nn.Module):
         number of REJECTED tokens times the full model's per-token cost, not
         just this one layer's.
 
+        **Batching everything except the recurrence itself** (this
+        session, 2026-08-02): of the ~12.6ms this method cost for one
+        layer at K=16 (measured, B3 report), only ~6.8ms is the K
+        sequential :func:`fused_recurrent_gated_delta_rule` calls
+        themselves -- the rest (~5.7ms) was ``in_proj_qkv``/``in_proj_z``/
+        ``in_proj_b``/``in_proj_a``, the causal conv1d state update,
+        ``beta``/``g``, ``norm``, ``out_proj``, and per-step ``clone()``
+        calls being *re-run once per candidate position inside the Python
+        loop*, even though none of them has a cross-step dependency: each
+        is a pure per-position map from ``hidden_states[:, t, :]`` (plus,
+        for conv1d only, a window of raw pre-conv values that are already
+        fully known before the recurrent loop starts -- they never depend
+        on the recurrence's output). This method now runs each of those
+        exactly once, over all ``seq_len`` positions at once, using the
+        same batched causal-conv construction :meth:`forward`'s own
+        ``seq_len > 1`` branch already uses for ordinary prefill (a single
+        conv1d call over ``[state.conv_state, mixed_qkv]``, ``padding=0``)
+        -- and recovers every intermediate conv_state snapshot by slicing
+        a fixed ``kernel_size``-wide window out of that one concatenated
+        tensor, since a causal conv's window contents at position ``t``
+        don't depend on how many further positions are computed alongside
+        it. Only the recurrent kernel call itself stays in a ``for t in
+        range(seq_len)`` loop, because it is the one part with a genuine
+        sequential dependency: each step's ``initial_state`` is the
+        previous step's output. Proven bit-exact against sequential decode
+        by the same probe as before
+        (``scripts/b3_probe_gdn_spec_rollback.py``) -- batching changes
+        WHICH kernel call computes a value, never the value itself, but
+        this turned out to be a narrower claim than it first looked:
+
+        - conv1d's causal window and ``Qwen36RMSNormGated``'s per-row
+          reduction ARE both per-position maps whose result at position
+          ``t`` is bit-identical whether ``t`` rides along with other
+          positions in the same kernel call or not (measured directly) --
+          both are batched here, unconditionally.
+        - ``in_proj_a``/``in_proj_b`` (output dim = ``num_v_heads``, e.g.
+          48 on the real checkpoint) are ALSO safe to batch, but only
+          through :func:`_bmm_project` (``torch.bmm`` over an explicit
+          batch dimension) -- a plain batched ``F.linear`` call measurably
+          does NOT reproduce ``seq_len`` sequential single-row calls
+          bit-for-bit (BF16 GEMM's reduction order depends on row count on
+          this stack).
+        - ``in_proj_qkv``/``in_proj_z``/``out_proj`` (output dims in the
+          thousands -- ``conv_dim``/``value_dim``/``hidden_size``) are
+          NOT safe to batch by EITHER method: measured directly that
+          ``_bmm_project``'s bit-exactness itself breaks down somewhere
+          between output dim 512 and 2048 (independent of quantization --
+          reproduced with plain unquantized BF16 weights at those sizes
+          too), and every one of these three projections' output dim
+          exceeds that. These three stay in the ``for t in
+          range(seq_len)`` loop, unchanged from the original
+          implementation -- this is real, measured cost this batching
+          pass could NOT remove while keeping the bit-exact guarantee
+          (see ``notes/2026-08-02-gdn-spec-forward-batching.md`` for the
+          measurement and the exact breakpoint search).
+
         Never touches ``state`` -- operates on clones throughout, so a crash
         or an unhandled exception mid-call leaves the caller's live buffers
         exactly as they were (snapshot 0, appended below, is provably
@@ -736,30 +834,109 @@ class Qwen36GatedDeltaNet(nn.Module):
                 "bug, not a case this method degrades gracefully for."
             )
 
-        working = GdnLayerState(
-            conv_state=state.conv_state.clone(),
-            recurrent_state=state.recurrent_state.clone(),
-            has_previous_state=True,
+        # ---- in_proj_qkv / in_proj_z stay per-position, sequential:
+        # their output dims (conv_dim, value_dim) are past the point where
+        # even `_bmm_project` stops being bit-exact (see docstring above
+        # and that function's own docstring) -- this loop is structurally
+        # identical to what the original implementation's `self.forward()`
+        # calls did for these two projections, just extracted so conv1d
+        # and norm below can still batch across the results. ---------------
+        mixed_qkv_steps: list[torch.Tensor] = []
+        z_steps: list[torch.Tensor] = []
+        for t in range(seq_len):
+            h_t = hidden_states[:, t : t + 1, :]
+            mixed_qkv_steps.append(self.in_proj_qkv(h_t).transpose(1, 2))  # [1, conv_dim, 1]
+            z_steps.append(self.in_proj_z(h_t))  # [1, 1, value_dim]
+        mixed_qkv = torch.cat(mixed_qkv_steps, dim=-1)  # [1, conv_dim, seq_len]
+        z = torch.cat(z_steps, dim=1).reshape(batch_size, seq_len, -1, self.head_v_dim)
+
+        # ---- in_proj_a/in_proj_b: safe to batch (output dim =
+        # num_v_heads, well under the threshold above) -- via
+        # `_bmm_project`, NOT `self.in_proj_b(hidden_states)` directly
+        # (plain batched Linear is not bit-exact even at this size). ------
+        b = _bmm_project(self.in_proj_b, hidden_states)
+        a = _bmm_project(self.in_proj_a, hidden_states)
+
+        # ---- one causal conv1d call covers every position's state
+        # update, fed the bit-exact per-position `mixed_qkv` collected
+        # above. Exactly :meth:`forward`'s ``seq_len == 1`` branch's
+        # window construction (`cat([state.conv_state, mixed_qkv]);
+        # conv1d(padding=0)`), just with `seq_len` new positions appended
+        # instead of 1 in a single call -- ``state.conv_state`` itself is
+        # only ever read here, never mutated (this method's "never
+        # touches state" contract). ----------------------------------
+        state_len = state.conv_state.shape[-1]
+        catted = torch.cat([state.conv_state, mixed_qkv], dim=-1).to(self.conv1d.weight.dtype)
+        conv_out = F.conv1d(catted, self.conv1d.weight, bias=None, padding=0, groups=self.conv_dim)
+        mixed_qkv = F.silu(conv_out[:, :, -seq_len:]).transpose(1, 2)  # [1, seq_len, conv_dim]
+
+        split_sizes = [self.key_dim, self.key_dim, self.value_dim]
+        query, key, value = torch.split(mixed_qkv, split_sizes, dim=-1)
+        query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+
+        beta = b.sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+
+        if self.repeat > 1:
+            query = query.repeat_interleave(self.repeat, dim=2)
+            key = key.repeat_interleave(self.repeat, dim=2)
+
+        # ---- the one genuinely sequential part: `seq_len` single-token
+        # fused_recurrent_gated_delta_rule calls, each step's
+        # initial_state coming from the previous step's output. Every
+        # conv_state snapshot needed no compute above (pure slicing of
+        # `catted`, see below); only recurrent_state needs one here. -----
+        recurrent_state = state.recurrent_state.clone()
+        recurrent_snapshots: list[torch.Tensor] = [recurrent_state]
+        core_outs: list[torch.Tensor] = []
+        for t in range(seq_len):
+            core_attn_out, last_state = fused_recurrent_gated_delta_rule(
+                query[:, t : t + 1], key[:, t : t + 1], value[:, t : t + 1],
+                g=g[:, t : t + 1], beta=beta[:, t : t + 1],
+                initial_state=recurrent_state, output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+            # Fresh BF16 buffer each step (never rebinding `state`'s own
+            # buffer -- this is a clone-of-a-clone chain, not `state`
+            # itself), same round-fp32-to-bf16-between-steps discipline as
+            # :meth:`forward` (B0-4/B0-7).
+            recurrent_state = torch.empty_like(state.recurrent_state)
+            recurrent_state.copy_(last_state)
+            recurrent_snapshots.append(recurrent_state)
+            core_outs.append(core_attn_out)
+
+        # ---- batched norm, once over all `seq_len` positions' recurrent
+        # outputs (was: once per position, inside the loop). RMSNormGated
+        # measured bit-exact when batched -- see docstring above. ---------
+        core_attn_out = torch.cat(core_outs, dim=1)  # [1, seq_len, num_v_heads, head_v_dim]
+        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
+        z_flat = z.reshape(-1, self.head_v_dim)
+        core_attn_out = self.norm(core_attn_out, z_flat)
+        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+
+        # ---- out_proj stays per-position, sequential: output dim is
+        # hidden_size, past the `_bmm_project` bit-exactness threshold
+        # (same reasoning as in_proj_qkv/in_proj_z above). ------------------
+        output = torch.cat(
+            [self.out_proj(core_attn_out[:, t : t + 1, :]) for t in range(seq_len)], dim=1
         )
+
+        # ---- assemble the `seq_len + 1` snapshots: conv_state via pure
+        # slicing of `catted` (position j's window is
+        # ``catted[:, :, j : j + state_len]`` -- j=0 is the untouched
+        # anchor, j=seq_len is the state after all candidates), recurrent
+        # state from the sequential loop above. -------------------------
         snapshots: list[GdnLayerState] = [
             GdnLayerState(
-                conv_state=working.conv_state.clone(),
-                recurrent_state=working.recurrent_state.clone(),
+                conv_state=catted[:, :, j : j + state_len].clone(),
+                recurrent_state=recurrent_snapshots[j],
                 has_previous_state=True,
             )
+            for j in range(seq_len + 1)
         ]
-        outputs: list[torch.Tensor] = []
-        for t in range(seq_len):
-            step_out = self.forward(hidden_states[:, t : t + 1, :], working)
-            outputs.append(step_out)
-            snapshots.append(
-                GdnLayerState(
-                    conv_state=working.conv_state.clone(),
-                    recurrent_state=working.recurrent_state.clone(),
-                    has_previous_state=True,
-                )
-            )
-        return torch.cat(outputs, dim=1), snapshots
+        return output, snapshots
 
 
 def commit_spec_snapshot(
