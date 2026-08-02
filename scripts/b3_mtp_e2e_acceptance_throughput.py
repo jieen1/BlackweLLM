@@ -75,7 +75,25 @@ MODEL_PATH = (
 )
 DEVICE = torch.device("cuda")
 MAX_SEQ_LEN = 256
-K = 8  # draft tokens per speculative round
+# Draft tokens per speculative round. 4, not 8.
+#
+# 8 was picked when the head was first wired up, for no measured reason. The
+# K sweep (scripts/b3b_k_sweep.py, real 27B, two independent runs) shows
+# acceptance falling monotonically with K while speedup peaks at K in 3..6:
+#
+#   K=3  prose 1.06x  code 1.27x
+#   K=4  prose 1.11x  code 1.38x     <- here
+#   K=5  prose 1.11x  code 1.41x
+#   K=8  prose 0.88x  code 1.09x     <- the old default, net-negative on prose
+#   K=16 prose 0.65x  code 0.97x
+#
+# K=8 was the single reason every earlier B3 measurement reported speculation
+# as a net loss. Changing this constant is the whole fix; no other code moved.
+#
+# Caveat carried from that sweep: these ran in a standalone eager script, not
+# ServerEngine, so "4 beats 8" is trustworthy and "1.38x" is not a production
+# number. See notes/2026-08-02-b3b-acceptance-rate-vs-k.md.
+K = 4
 N_TOKENS = 32  # tokens to generate per prompt (both paths)
 
 PROMPTS = {
