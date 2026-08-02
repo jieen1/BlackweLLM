@@ -403,9 +403,18 @@ linear_conv_kernel_dim=4
 `modeling_qwen3_5.py` 确认 K/Q 会 `repeat_interleave` 从 16 头扩到 48 头
 （`num_v_heads // num_k_heads = 3`）再进 delta-rule，所以递归状态的头数
 维度是 **48**（不是 16）。单层 SSM 状态元素数 = `48 × 128(k) × 128(v)
-= 786,432`；单层 conv1d 状态元素数 = `conv_dim(10240) × (kernel-1=3)
-= 30,720`（`conv_dim = 128×16×2 + 128×48 = 10240`，与实测的
-`conv1d.weight` shape `(10240,1,4)` 对应）。本轮独立 Python 脚本重新算出：
+= 786,432`。
+
+⚠️ **conv1d 状态数已于 2026-08-02 更正（B1 实测推翻本节的理论推导）。**
+本节原写 `conv_dim(10240) × (kernel-1=3) = 30,720`——那是按因果卷积缓存的**标准惯例**
+（只存 kernel-1 个历史元素）推出来的，合理但**不是 HF 实际做的**。B1 在真实模型上读
+`DynamicCache`：`cache.layers[0].conv_states.shape == (1, 10240, 4)`，是**完整 kernel size**。
+正确值：`10240 × 4 = 40,960` 元素/层，比原值大 4/3。
+
+下表的 conv 列已按 40,960 重算（SSM 列不受影响）。这条差异对单槽总量只有约 1.3%
+（SSM 状态占绝对大头），但**推导方式的教训更重要：能读到真实缓存对象时不要从惯例推**。
+
+本轮独立 Python 脚本重新算出（SSM 部分）：
 
 ```
 ssm elems/layer 786432
@@ -413,10 +422,12 @@ FP32 SSM total MiB 144.0   BF16 SSM total MiB 72.0
 FP32 conv total MiB 5.625  BF16 conv total MiB 2.8125
 ```
 
-| 状态 dtype | SSM（48层） | conv（48层） | 单槽合计 |
+| 状态 dtype | SSM（48层） | conv（48层，已更正） | 单槽合计 |
 |---|---:|---:|---:|
-| FP32 | 144.0 MiB | 5.6 MiB | **~149.6 MiB** |
-| BF16 | 72.0 MiB | 2.8 MiB | **~74.8 MiB** |
+| FP32 | 144.0 MiB | 7.5 MiB | **~151.5 MiB** |
+| BF16 | 72.0 MiB | 3.75 MiB | **~75.75 MiB** |
+
+（更正前分别是 5.6 / 2.8 MiB 与 ~149.6 / ~74.8 MiB，按 `kernel-1=3` 算。）
 
 **dtype 该取哪个**——本轮独立重新读了 `transformers/cache_utils.py` 与
 `flash-linear-attention` 源码确认机制（`~/.venvs/vllm` 里两者都是本机

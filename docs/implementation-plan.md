@@ -333,7 +333,20 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
   `page_size∈{64,128}`）全部跑通，精度对齐 fp32 参照 cosine≥0.99999、绝对误差 2.4e-4~3.9e-3（优于
   sparkinfer 自己认定"通过"的容差）。**但这个具体组合（256+24Q/4KV）在 sparkinfer 自己的测试套件里
   从未被测过**，且首次调用 JIT/autotune 耗时 **decode 62-64 秒、extend 27 秒**——直接印证 §7.3 C7-3
-  的担忧，warmup 必须显式覆盖这个形状。CUDA-Graph 专属加速内核（`_is_laguna_fp8_gqa6_analytic_decode_graph`
+  的担忧，warmup 必须显式覆盖这个形状。
+
+  ⚠️ **B1 实测把这条的严重性又推高了一档（2026-08-02）**：JIT **不是"每种 mode 一次"，而是按
+  每个不同的 `(seq_len, cache_seqlens)` 形状重新触发**——B1 的全模型冒烟里，一个 8 token 的
+  prompt 又付了一次 ~24 秒的 extend 编译。
+
+  **这与 Laguna 已经踩过并修好的是同一个病**：`235f51e` 修的正是"每个未见过的 page-table 宽度
+  触发 30–110 秒 JIT 重编译"，根因是 JIT 按 **workspace 容量**分桶而非按逻辑 mode 分桶，解法是
+  `PagedAttentionWorkspace.for_fixed_capacity`（`runtime/backends/laguna_sparkinfer_attn.py:475`）——
+  用一个固定的最坏容量规划，让所有真实形状落进同一个已编译的桶。
+
+  **Qwen3.6 侧目前没有采用这个手法**（`grep for_fixed_capacity` 在 Qwen3.6 代码里为空）。
+  真实 agent 流量几乎不会重复 prompt 长度，所以不做这一步的话，Qwen3.6 会**逐字重演** Laguna
+  2026-08-01 那次"每轮对话卡 30 秒"的故障。这不是 B2 的性能优化项，是 B1/B2 的可用性前提。CUDA-Graph 专属加速内核（`_is_laguna_fp8_gqa6_analytic_decode_graph`
   等）全部硬编码 `head_dim_qk==128`，摸不到，head_dim=256 decode 只能走通用
   `plan_decode_graph_capacity`（该函数本身对 head_dim 无上限，未实测 `use_cuda_graph=True`，留给 B2）。
   证据：`notes/2026-08-02-trackB-b0-gpu-facts.md` §B0-3、`scripts/b0_probe_paged_attention_head256.py`
