@@ -2,60 +2,79 @@
 x 512 token）；逐层 logits 余弦相似度进 bfdiag" (``docs/implementation-plan.md``
 §7.1).
 
-**Written but NOT YET RUN** -- no GPU time was available for this in the
-pass that wrote it (see the B1 handoff notes). Per the coordinator's
-explicit ask ("准备 HF 逐 token 对齐的脚手架...写好之后等拿到 GPU 一次跑完"),
-this script is meant to be run once, end to end, the next time the GPU is
-free -- read it once before running, since three things in it are
-designed-not-measured and should be double-checked against the real
-output the first time, not assumed correct because they compiled:
+**Structural memory ordering, not just a coding fix** (2026-08-02, third
+round): running this the first time surfaced three OOMs. Two were coding
+slips (fp8-then-halve construction transiently needing ~108 GiB; caching
+every dequantized weight before copying, materializing a third full
+model) -- both fixed upstream of this docstring. The third is
+structural: this runtime's own forward pass caches every quantized
+Linear's dequantized BF16 weight *forever* once touched
+(``runtime/model/modelopt_linear.py``'s ``_ensure_ready``, by design, so
+repeated decode steps don't re-dequantize every token) -- so running our
+own generation across all 64 layers eventually caches ~54 GiB of BF16
+weights ON TOP OF the ~19 GiB quantized originals, ~73 GiB total. A
+resident 54 GiB HF reference cannot coexist with that on a 96 GiB card
+(73 + 54 = 127 GiB). B0-7's 73 GiB capacity estimate assumed this
+runtime's own side stays quantized throughout -- true right up until a
+forward pass actually runs, not after.
 
-1. **HF-side weight copying** (:func:`copy_dequantized_weights_into_hf`).
-   Relies on this runtime's model graph (``runtime/model/qwen36_model.py``)
-   using IDENTICAL dotted parameter names to HF's own
-   ``Qwen3_5ForCausalLM`` (``model.layers.{i}.self_attn.q_proj.weight``,
-   ``model.layers.{i}.linear_attn.A_log``, etc.) -- true by construction
-   (this runtime's classes mirror HF's attribute names one-for-one, see
-   that module's docstring). Partially exercised already: a 2-layer toy
-   model (tiny hidden size, one GDN + one full-attention layer) dry-run on
-   CPU caught a real bug in an earlier version of this function (it
-   walked module *paths* keyed on ``.weight`` and silently missed
-   ``A_log``/``dt_bias``, which live directly on ``Qwen36GatedDeltaNet``
-   itself, not inside a ``.weight``-bearing leaf) -- see that function's
-   docstring for the fix. The toy-model check confirmed 28/28 parameters
-   copy with exactly matching values after the fix, including through the
-   FP8 dequantization path. **Never exercised at the real 27B scale or
-   against real checkpoint weights** -- the toy model's weights were
-   random, and NVFP4 (only FP8 was reachable at that tiny hidden size)
-   was not exercised in the toy check at all.
-2. **HF-side per-layer indexing convention**
-   (``bfdiag/divergence/qwen36_capture.py``'s ``hidden_states[i+1] ==
-   after layer i``) -- documented there as read-from-HF-docs, not
-   confirmed against a live forward pass.
-3. **27B-in-BF16 memory headroom**: this script holds BOTH a quantized
-   copy of the model (~19 GiB, this runtime's own) AND a fully
-   BF16-dequantized HF copy (~54 GiB) resident on the GPU at once (~73
-   GiB total) -- arithmetically fits a 96 GiB card per B0-7's own
-   capacity math, but was never actually allocated together before this
-   script runs it.
+**Fix: never let both full-size copies be resident on the GPU at once.**
+Greedy decoding is deterministic, so the two sides do not need to run
+concurrently:
 
-Also note: since the HF side's weights come from copying THIS runtime's
-own dequantized tensors (there is no independent modelopt-aware HF loader
-in this environment -- see ``runtime/loading/modelopt.py``'s module
+1. Load ``mine`` on GPU (~19 GiB quantized).
+2. Stage every one of ``mine``'s real parameters to individual files on
+   local disk, dequantizing on GPU one at a time and releasing each
+   cache immediately after writing -- never holds more than one
+   tensor's worth of extra memory. This runs BEFORE HF's reference is
+   built at all, so it also serves as the source of truth for HF's
+   weights later, without ever needing a second full BF16 copy resident
+   anywhere while ``mine`` is doing the heavy lifting.
+
+   (Originally planned to build HF's reference directly on the CPU
+   during this step, per the coordinator's proposed ordering -- checked
+   against this machine's actual host RAM first, per their explicit
+   "先确认主机内存够放 54 GiB": ``free -h`` showed ~20 GiB available,
+   not 54 GiB, so CPU residency was not viable here. Disk (170 GiB free)
+   was -- the coordinator's own documented fallback ("不够就把 HF 权重
+   落盘再分阶段加载") -- so this script stages to disk instead of RAM.)
+3. Run OUR side's full generation + ``Qwen36EngineCaptureSource`` for
+   every workload (GPU grows to ~73 GiB as ``mine``'s own caches fill in
+   -- HF is not resident on the GPU at all yet, so this is fine).
+   Captured per-layer activations are cloned to CPU immediately so they
+   survive step 4.
+4. ``del mine`` + ``torch.cuda.empty_cache()``.
+5. Construct HF's reference for real, directly on the GPU in BF16 (using
+   the same "set the default dtype during construction" fix that solved
+   OOM #1, so the fp32-then-halve doubling never happens here either).
+6. Load every staged weight from disk into HF's model, freeing each
+   staged file as it's consumed.
+7. Run HF's side's full generation + ``Qwen36HFOracleCaptureSource`` for
+   every workload.
+8. Compare: per-workload token-for-token match (against the traces
+   captured in step 3, held in memory since then) and per-layer
+   divergence scan.
+
+Peak GPU usage across the whole run: ~73 GiB (step 3, our side alone) or
+~54 GiB (step 7, HF alone) -- never both at once.
+
+Also note: since HF's weights come from copying THIS runtime's own
+dequantized tensors (there is no independent modelopt-aware HF loader in
+this environment -- see ``runtime/loading/modelopt.py``'s module
 docstring), a PASS here proves "does this runtime's Qwen3.6 FORWARD MATH
 match HF's reference implementation" -- it does NOT independently confirm
 the NVFP4 dequantization itself is bit-correct relative to what modelopt
-intended (no oracle for that exists on this machine either; see that same
-docstring for what the strongest available evidence for THAT question is
-instead -- coherent, factually correct generation, already measured in
-``scripts/b1_verify_full_model_smoke.py``).
+intended (see ``notes/2026-08-02-b1-nvfp4-nibble-packing-unverified.md``
+for what that would take).
 
 Run with: ~/.venvs/vllm/bin/python scripts/b1_verify_greedy_alignment.py
 """
 
 from __future__ import annotations
 
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -113,50 +132,42 @@ WORKLOADS: tuple[tuple[str, str], ...] = (
     ),
 )
 
+#: Real parameter suffixes that only exist on this runtime's side (the
+#: quantized-scale metadata) -- never staged, never expected on HF's side.
+_NEVER_STAGED_SUFFIXES = (".weight_scale", ".weight_scale_2")
 
-def copy_dequantized_weights_into_hf(
-    mine: torch.nn.Module, hf_model: torch.nn.Module
-) -> tuple[list[str], list[str]]:
-    """Copy every real parameter from ``mine`` into the identically-named
-    parameter in ``hf_model`` -- dequantized to BF16 first for anything
-    that came from a quantized Linear. See this script's module docstring
-    point 1 for why identical parameter names hold by construction.
+
+def _staged_filename(param_name: str) -> str:
+    return param_name.replace("/", "_") + ".pt"
+
+
+def stage_dequantized_weights_to_disk(mine: torch.nn.Module, scratch_dir: Path) -> list[str]:
+    """Write every real parameter of ``mine`` to its own file under
+    ``scratch_dir``, dequantized to BF16 first for anything that came from
+    a quantized Linear -- one tensor at a time, releasing both the GPU
+    dequant cache and the transient CPU tensor immediately after each
+    write. See this script's module docstring for why this exists (avoids
+    ever needing a second full-size copy of the model resident anywhere
+    while ``mine`` is doing its own work).
 
     Iterates ``mine.named_parameters()`` directly (not a module-tree walk
-    keyed on ``.weight``) specifically because two real parameters
+    keyed on ``.weight``) because two real parameters
     (``linear_attn.A_log``/``linear_attn.dt_bias``) live directly on
     ``Qwen36GatedDeltaNet`` itself, not inside a ``.weight``-bearing leaf
-    submodule -- an earlier version of this function that only walked
-    "leaf modules with a `.weight` attribute" silently missed exactly
-    these two (caught by a CPU-scale dry run against a 2-layer toy model
-    before this script was ever pointed at the real 27B checkpoint: 26/28
-    real parameters copied, 0 reported as skipped -- the 2 missing ones
-    never entered the walk at all, so they could not even show up as a
-    logged skip. Fixed by iterating parameters, not modules.).
-    ``.weight_scale``/``.weight_scale_2`` are the only real parameters
-    deliberately never copied -- HF has no quantized-scale equivalent at
-    all, by design (see runtime/model/modelopt_linear.py).
+    submodule -- an earlier version of this function's ancestor (the old
+    ``copy_dequantized_weights_into_hf``) missed exactly these two for
+    that reason; fixed by iterating parameters, not modules, and verified
+    against a CPU-scale 2-layer toy model (28/28 parameters, exact value
+    match) before ever running at the real 27B scale.
 
-    Returns ``(copied_names, skipped_names)`` for the caller to sanity-log
-    -- a real run against the full model should see zero skips; any skip
-    means a name genuinely doesn't exist on the HF side and needs
-    investigating before trusting the comparison at all.
-
-    Dequantizes one module at a time and releases each cached BF16 weight as
-    soon as it has been copied. An earlier version called ``_ensure_ready()``
-    on every module first and held the results in a dict, which materialises a
-    third full copy of the model: 19 GiB quantized + 54 GiB on HF's side +
-    54 GiB of our own cached BF16. That OOM'd on the first real run
-    (2026-08-02, 106 GiB allocated against a 95.59 GiB card). Peak is now
-    19 + 54 + one layer's weight.
+    Returns the list of staged parameter names (``.weight_scale``/
+    ``.weight_scale_2`` excluded -- HF has no quantized-scale equivalent
+    to load them into).
     """
     modules_by_path = dict(mine.named_modules())
-    hf_params = dict(hf_model.named_parameters())
-    copied: list[str] = []
-    skipped: list[str] = []
-
+    staged: list[str] = []
     for name, param in mine.named_parameters():
-        if name.endswith((".weight_scale", ".weight_scale_2")):
+        if name.endswith(_NEVER_STAGED_SUFFIXES):
             continue
         module_path = name.rsplit(".", 1)[0] if "." in name else ""
         module = modules_by_path.get(module_path)
@@ -169,34 +180,56 @@ def copy_dequantized_weights_into_hf(
             if cached is not None:
                 value = cached
 
-        hf_param = hf_params.get(name)
-        if hf_param is None:
-            skipped.append(name)
-        else:
-            hf_param.data.copy_(value.to(hf_param.dtype))
-            copied.append(name)
+        cpu_value = value.detach().to("cpu", torch.bfloat16).clone()
+        torch.save(cpu_value, scratch_dir / _staged_filename(name))
+        staged.append(name)
+        del cpu_value
 
-        # Release immediately -- holding these is what blew the budget. The
-        # module re-dequantizes on demand if it is ever used for a forward.
+        # Release immediately -- this is the memory this function exists
+        # to bound. The module re-dequantizes on demand if it is ever
+        # used for a real forward (which it will be, in step 3).
         if module is not None and getattr(module, "_weight_bf16", None) is not None:
             module._weight_bf16 = None
+    return staged
 
-    return copied, skipped
+
+def load_staged_weights_into_hf(
+    hf_model: torch.nn.Module, scratch_dir: Path, staged_names: list[str]
+) -> tuple[list[str], list[str]]:
+    """Load every file :func:`stage_dequantized_weights_to_disk` wrote into
+    the identically-named parameter on ``hf_model``, deleting each staged
+    file as it is consumed. Returns ``(loaded_names, missing_names)`` --
+    ``missing_names`` is anything staged but not found on ``hf_model``
+    (should be empty on a real run; see this script's module docstring
+    point 1 for why identical names hold by construction).
+    """
+    hf_params = dict(hf_model.named_parameters())
+    loaded: list[str] = []
+    missing: list[str] = []
+    for name in staged_names:
+        path = scratch_dir / _staged_filename(name)
+        hf_param = hf_params.get(name)
+        if hf_param is None:
+            missing.append(name)
+            path.unlink(missing_ok=True)
+            continue
+        cpu_tensor = torch.load(path, map_location="cpu", weights_only=True)
+        hf_param.data.copy_(cpu_tensor.to(hf_param.dtype))
+        loaded.append(name)
+        path.unlink()
+    return loaded, missing
 
 
-def build_hf_reference(model_config: dict) -> torch.nn.Module:
-    """Materialise HF's reference model directly in bf16.
+def build_hf_reference_on_device(model_config: dict, device: torch.device) -> torch.nn.Module:
+    """Materialise HF's reference model directly in BF16 on ``device``.
 
     The obvious spelling -- ``Qwen3_5ForCausalLM(hf_config).to(torch.bfloat16)``
     -- builds every ``nn.Linear`` at the fp32 default first and only then
     halves it, so a 27B model transiently needs ~108 GiB rather than ~54.
-    That OOM'd on the first real run (2026-08-02): the card has 95.59 GiB and
-    PyTorch reported 108.26 GiB allocated, which is exactly 2x the bf16
-    footprint. This module's own docstring had flagged the combined
-    quantized + bf16 residency as arithmetic that had never been allocated
-    for real -- the arithmetic was right, the construction order was not.
-
-    Setting the default dtype makes the fp32 copy never exist.
+    That OOM'd on the first real run (2026-08-02): the card has 95.59 GiB
+    and PyTorch reported 108.26 GiB allocated, exactly 2x the BF16
+    footprint. Setting the default dtype during construction means the
+    fp32 copy never exists.
     """
     text_config_dict = dict(model_config)
     text_config_dict.pop("quantization_config", None)
@@ -205,29 +238,42 @@ def build_hf_reference(model_config: dict) -> torch.nn.Module:
     previous_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
-        with DEVICE:
+        with device:
             hf_model = Qwen3_5ForCausalLM(hf_config)
     finally:
         torch.set_default_dtype(previous_dtype)
     return hf_model.eval()
 
 
-def greedy_generate_mine(
-    model, input_ids: torch.Tensor, max_new_tokens: int, eos_id: int
+def greedy_generate(
+    model_call, input_ids: torch.Tensor, max_new_tokens: int, eos_id: int
 ) -> list[int]:
-    state = model.new_generation_state(device=input_ids.device, dtype=torch.bfloat16)
-    hidden = model(input_ids, state)
-    logits = model.compute_logits(hidden[:, -1:, :])
-    next_token = int(logits[0, -1].argmax().item())
+    """Shared greedy loop -- ``model_call(tok)`` must return that step's
+    logits for the last position, and close over whatever cache/state
+    object it needs between calls (mine's ``Qwen36GenerationState`` or
+    HF's ``DynamicCache``, set up by the caller before the first call)."""
+    logits = model_call(input_ids)
+    next_token = int(logits.argmax().item())
     generated = [next_token]
     for _ in range(max_new_tokens - 1):
         if generated[-1] == eos_id:
             break
         tok = torch.tensor([[generated[-1]]], device=input_ids.device, dtype=torch.long)
-        hidden = model(tok, state)
-        logits = model.compute_logits(hidden)
-        generated.append(int(logits[0, -1].argmax().item()))
+        logits = model_call(tok)
+        generated.append(int(logits.argmax().item()))
     return generated
+
+
+def greedy_generate_mine(
+    model, input_ids: torch.Tensor, max_new_tokens: int, eos_id: int
+) -> list[int]:
+    state = model.new_generation_state(device=input_ids.device, dtype=torch.bfloat16)
+
+    def call(tok: torch.Tensor) -> torch.Tensor:
+        hidden = model(tok, state)
+        return model.compute_logits(hidden[:, -1:, :])[0, -1]
+
+    return greedy_generate(call, input_ids, max_new_tokens, eos_id)
 
 
 def greedy_generate_hf(
@@ -236,18 +282,25 @@ def greedy_generate_hf(
     from transformers.cache_utils import DynamicCache
 
     cache = DynamicCache(config=hf_model.config)
-    with torch.no_grad():
-        outputs = hf_model(input_ids, past_key_values=cache, use_cache=True, logits_to_keep=1)
-    next_token = int(outputs.logits[0, -1].argmax().item())
-    generated = [next_token]
-    for _ in range(max_new_tokens - 1):
-        if generated[-1] == eos_id:
-            break
-        tok = torch.tensor([[generated[-1]]], device=input_ids.device, dtype=torch.long)
+
+    def call(tok: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
             outputs = hf_model(tok, past_key_values=cache, use_cache=True, logits_to_keep=1)
-        generated.append(int(outputs.logits[0, -1].argmax().item()))
-    return generated
+        return outputs.logits[0, -1]
+
+    return greedy_generate(call, input_ids, max_new_tokens, eos_id)
+
+
+TraceType = dict[int, dict[str, torch.Tensor]]
+
+
+def _clone_trace_to_cpu(trace: TraceType) -> TraceType:
+    """Detach a captured activation trace from the GPU entirely -- needed
+    so ``mine``'s trace survives past ``del mine`` in step 4."""
+    return {
+        layer_idx: {name: tensor.detach().cpu().clone() for name, tensor in submodules.items()}
+        for layer_idx, submodules in trace.items()
+    }
 
 
 def main() -> None:
@@ -256,54 +309,101 @@ def main() -> None:
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
     model_config = _build_qwen36_model_config(MODEL_PATH)
-
-    t0 = time.time()
-    mine = load_qwen36_model(MODEL_PATH, device="cuda", dtype=torch.bfloat16, max_seq_len=1024)
-    print(f"load_qwen36_model: {time.time() - t0:.1f}s")
-
-    t0 = time.time()
-    hf_model = build_hf_reference(model_config)
-    copied, skipped = copy_dequantized_weights_into_hf(mine, hf_model)
-    print(
-        f"build_hf_reference + copy: {time.time() - t0:.1f}s, "
-        f"copied={len(copied)} skipped={len(skipped)}"
-    )
-    if skipped:
-        print(f"WARNING: {len(skipped)} weight(s) not matched into HF, e.g. {skipped[:5]!r}")
-
     eos_id = tokenizer.eos_token_id
 
-    token_results = []
-    divergence_reports = []
-    for name, prompt in WORKLOADS:
-        input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
-        prompt_ids = input_ids[0].tolist()
+    scratch_dir = Path(tempfile.mkdtemp(prefix="b1_hf_weights_"))
+    print(f"staging directory: {scratch_dir}")
 
-        engine_trace = Qwen36EngineCaptureSource(model=mine).capture(prompt_ids)
-        oracle_trace = Qwen36HFOracleCaptureSource(hf_model=hf_model).capture(prompt_ids)
-        report = scan_layers(oracle_trace, engine_trace)
-        divergence_reports.append((name, report))
-        print(f"\n--- {name}: per-layer divergence scan ---")
-        print(format_text_report(report))
+    try:
+        # -- Step 1: load our own model --
+        t0 = time.time()
+        mine = load_qwen36_model(
+            MODEL_PATH, device="cuda", dtype=torch.bfloat16, max_seq_len=1024
+        )
+        print(f"load_qwen36_model: {time.time() - t0:.1f}s")
 
-        mine_tokens = greedy_generate_mine(mine, input_ids, MAX_NEW_TOKENS, eos_id)
-        hf_tokens = greedy_generate_hf(hf_model, input_ids, MAX_NEW_TOKENS, eos_id)
-        result = compare_greedy_token_ids(name, prompt_ids, mine_tokens, hf_tokens)
-        token_results.append(result)
+        # -- Step 2: stage every real parameter to disk, dequantized --
+        t0 = time.time()
+        staged_names = stage_dequantized_weights_to_disk(mine, scratch_dir)
         print(
-            f"{name}: match_rate={result.match_rate:.4f} "
-            f"first_divergence={result.first_divergence_index} "
-            f"compared={result.num_tokens_compared}"
+            f"stage_dequantized_weights_to_disk: {time.time() - t0:.1f}s, "
+            f"staged={len(staged_names)}"
         )
 
-    alignment_report = GreedyAlignmentReport(workloads=tuple(token_results))
-    out_path = Path("/home/bot/project/qsr-w-b1/.bfdiag/runs/b1_greedy_alignment.json")
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    alignment_report.save(out_path)
-    print(f"\nsaved alignment report to {out_path}")
+        # -- Step 3: run OUR side's generation + capture for every workload --
+        mine_traces: dict[str, dict] = {}
+        mine_tokens: dict[str, list[int]] = {}
+        prompt_ids_by_workload: dict[str, list[int]] = {}
+        for name, prompt in WORKLOADS:
+            input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(DEVICE)
+            prompt_ids = input_ids[0].tolist()
+            prompt_ids_by_workload[name] = prompt_ids
 
-    passed, reason = passes_b1_gate(alignment_report)
-    print(f"\nB1 GATE: {'PASS' if passed else 'FAIL'} -- {reason}")
+            t0 = time.time()
+            trace = Qwen36EngineCaptureSource(model=mine).capture(prompt_ids)
+            mine_traces[name] = _clone_trace_to_cpu(trace)
+            mine_tokens[name] = greedy_generate_mine(mine, input_ids, MAX_NEW_TOKENS, eos_id)
+            print(
+                f"[mine] {name}: {time.time() - t0:.1f}s, "
+                f"generated {len(mine_tokens[name])} tokens"
+            )
+
+        mem_after_mine = torch.cuda.memory_allocated() / (1024**3)
+        print(f"GPU allocated after our own generation: {mem_after_mine:.2f} GiB")
+
+        # -- Step 4: free our model entirely before HF ever touches the GPU --
+        del mine
+        torch.cuda.empty_cache()
+        mem_after_free = torch.cuda.memory_allocated() / (1024**3)
+        print(f"GPU allocated after del mine + empty_cache: {mem_after_free:.2f} GiB")
+
+        # -- Step 5+6: build HF's reference for real, load the staged weights --
+        t0 = time.time()
+        hf_model = build_hf_reference_on_device(model_config, DEVICE)
+        loaded, missing = load_staged_weights_into_hf(hf_model, scratch_dir, staged_names)
+        print(
+            f"build_hf_reference_on_device + load: {time.time() - t0:.1f}s, "
+            f"loaded={len(loaded)} missing={len(missing)}"
+        )
+        if missing:
+            print(
+                f"WARNING: {len(missing)} staged weight(s) not matched into HF, "
+                f"e.g. {missing[:5]!r}"
+            )
+
+        # -- Step 7: run HF's side's generation + capture for every workload --
+        token_results = []
+        for name, prompt_ids in prompt_ids_by_workload.items():
+            input_ids = torch.tensor([prompt_ids], device=DEVICE, dtype=torch.long)
+
+            t0 = time.time()
+            hf_trace = Qwen36HFOracleCaptureSource(hf_model=hf_model).capture(prompt_ids)
+            hf_tokens = greedy_generate_hf(hf_model, input_ids, MAX_NEW_TOKENS, eos_id)
+            print(f"[hf] {name}: {time.time() - t0:.1f}s, generated {len(hf_tokens)} tokens")
+
+            # -- Step 8: compare --
+            divergence = scan_layers(hf_trace, mine_traces[name])
+            print(f"\n--- {name}: per-layer divergence scan ---")
+            print(format_text_report(divergence))
+
+            result = compare_greedy_token_ids(name, prompt_ids, mine_tokens[name], hf_tokens)
+            token_results.append(result)
+            print(
+                f"{name}: match_rate={result.match_rate:.4f} "
+                f"first_divergence={result.first_divergence_index} "
+                f"compared={result.num_tokens_compared}"
+            )
+
+        alignment_report = GreedyAlignmentReport(workloads=tuple(token_results))
+        out_path = Path(_REPO_ROOT) / ".bfdiag" / "runs" / "b1_greedy_alignment.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        alignment_report.save(out_path)
+        print(f"\nsaved alignment report to {out_path}")
+
+        passed, reason = passes_b1_gate(alignment_report)
+        print(f"\nB1 GATE: {'PASS' if passed else 'FAIL'} -- {reason}")
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
