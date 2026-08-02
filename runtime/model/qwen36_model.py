@@ -1659,6 +1659,56 @@ class Qwen36Attention(nn.Module):
 
 
 class Qwen36MLP(nn.Module):
+    """Dense SwiGLU MLP: ``down_proj(silu(gate_proj(x)) * up_proj(x))``.
+
+    **NVFP4 fused fast path (``work/nvfp4-gemm-20260802`` follow-up)**: when
+    the checkpoint declares ``gate_proj``/``up_proj``/``down_proj`` all
+    ``W4A16_NVFP4`` (true for every real MLP layer per B0-2 -- the
+    checkpoint quantizes ``mlp.{gate,up,down}_proj`` uniformly, never a
+    mix), ``forward()`` does NOT call the three ``ModelOptNVFP4Linear``
+    submodules individually. Instead it fuses them into one call to
+    ``sparkinfer.moe._shared.kernels.w4a16.kernel.run_w4a16_moe`` -- the
+    weight-only kernel that dequantizes NVFP4 *inside* the kernel against
+    the real BF16 activation (``packed_dequant_e2m1x4_to_bfloat2x2`` +
+    ``bf16_mma_m16n8k16_f32``), not a kernel that requires both operands
+    pre-quantized like ``sparkinfer.gemm.blockscaled.mm`` (the previous
+    attempt on this branch -- see git history: that one turned a genuine
+    W4A16 checkpoint into an unintended W4A4 approximation because it needs
+    a quantized activation operand, and failed B1-R's calibrated gap-error
+    bars).
+
+    Why fusion is required, not optional: ``run_w4a16_moe`` is shaped like
+    one full MoE expert's gated MLP block (FC1 = ``w13`` fused gate+up ->
+    activation -> FC2 = ``w2`` down-proj) in a single launch -- there is no
+    way to call it for "just gate_proj alone" or "just down_proj alone"
+    the way the individual ``ModelOptNVFP4Linear.forward()`` used to. This
+    class degenerates the call into a 1-expert/top-1 MoE (``topk_ids`` is
+    always ``[[0]]``, ``topk_weights`` is always ``[[1.0]]``) -- exactly
+    the untested-on-GPU path B0 already flagged
+    (``notes/2026-08-02-trackB-b0-facts.md`` references
+    ``prepare_w4a16_modelopt_nvfp4_weights`` + ``num_experts=1``).
+
+    ``gate_proj``/``up_proj``/``down_proj`` stay real ``ModelOptNVFP4Linear``
+    submodules (unchanged Parameter shapes, unchanged ``weight_loader``
+    wiring) purely so the existing checkpoint-loading machinery keeps
+    working unmodified -- ``forward()`` below reads their ``.weight``/
+    ``.weight_scale``/``.weight_scale_2`` tensors directly to build the
+    fused ``w13``/``w2`` representation once, lazily, and never calls
+    their own ``.forward()``. Their ``_ensure_ready()``/``_weight_bf16``
+    legacy dequant path is left completely alone (still there for whatever
+    standalone diagnostics construct a bare ``ModelOptNVFP4Linear``, e.g.
+    ``scripts/verify_nvfp4_gemm_single_layer.py``) -- this class just
+    never triggers it.
+
+    ``gate_proj.weight_scale_2`` and ``up_proj.weight_scale_2`` must be
+    exactly equal for the fused ``w13`` global scale to be valid (the
+    kernel's packed W4A16 format has ONE global scale per w13 tensor,
+    shared by both halves). Empirically true for every one of the real
+    checkpoint's 64 MLP layers (verified directly off safetensors headers,
+    not assumed) -- ``_ensure_w4a16_fused_ready`` asserts it rather than
+    silently averaging/picking one if a future checkpoint variant differs.
+    """
+
     def __init__(
         self,
         config: dict[str, Any],
@@ -1670,6 +1720,8 @@ class Qwen36MLP(nn.Module):
         super().__init__()
         hidden_size = config["hidden_size"]
         intermediate_size = config["intermediate_size"]
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
         # See Qwen36Attention.__init__'s ``weight_prefix`` docstring -- same
         # override, same reason (Qwen36MTPHead's checkpoint prefix is
         # ``mtp.layers.0.mlp``, not ``model.language_model.layers.N.mlp``).
@@ -1685,7 +1737,121 @@ class Qwen36MLP(nn.Module):
         )
         assert config["hidden_act"] == "silu"
 
+        # All-or-nothing: only fuse when every one of the three is a real
+        # NVFP4 Linear (never true for the mixed/unquantized configs some
+        # unit tests build, e.g. tests/test_qwen36_mtp_head.py's
+        # TestWeightPrefixOverride, which only quantizes gate_proj -- those
+        # fall through to the plain per-Linear forward below, unaffected).
+        self._nvfp4_fused = (
+            isinstance(self.gate_proj, ModelOptNVFP4Linear)
+            and isinstance(self.up_proj, ModelOptNVFP4Linear)
+            and isinstance(self.down_proj, ModelOptNVFP4Linear)
+        )
+        self._w4a16_prepared = None  # built lazily, once, on first fused forward
+
+    def _ensure_w4a16_fused_ready(self) -> None:
+        """Build the fused ``w13``/``w2`` W4A16 packed representation from
+        the three NVFP4 submodules' checkpoint tensors. Lazy + cached: runs
+        once per module instance, not once per forward call."""
+        if self._w4a16_prepared is not None:
+            return
+        from runtime.backends._sparkinfer_import import ensure_sparkinfer_path
+
+        ensure_sparkinfer_path()
+        from sparkinfer._lib.intrinsics import swizzle_block_scale
+        from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+            prepare_w4a16_modelopt_nvfp4_weights,
+        )
+
+        gate, up, down = self.gate_proj, self.up_proj, self.down_proj
+        gate_gs = gate.weight_scale_2.data.reshape(()).to(torch.float32)
+        up_gs = up.weight_scale_2.data.reshape(()).to(torch.float32)
+        if gate_gs.item() != up_gs.item():
+            raise ValueError(
+                "Qwen36MLP: gate_proj.weight_scale_2 "
+                f"({gate_gs.item()!r}) != up_proj.weight_scale_2 "
+                f"({up_gs.item()!r}) -- the fused w13 kernel needs one "
+                "shared global scale for both halves; this checkpoint "
+                "layer breaks the assumption every real layer was "
+                "verified to satisfy."
+            )
+
+        # w13 physical row order: [gate rows; up rows] -- pass
+        # w13_layout="gate_up" so the kernel knows this is already its own
+        # native (no-row-rotation) order. See class docstring.
+        w13_fp4 = torch.cat([gate.weight.data, up.weight.data], dim=0).unsqueeze(0).contiguous()
+        w13_blockscale = swizzle_block_scale(
+            torch.cat([gate.weight_scale.data, up.weight_scale.data], dim=0)
+            .unsqueeze(0)
+            .contiguous()
+        )
+        w13_global_scale = gate_gs.reshape(1).contiguous()
+
+        w2_fp4 = down.weight.data.unsqueeze(0).contiguous()
+        w2_blockscale = swizzle_block_scale(down.weight_scale.data.unsqueeze(0).contiguous())
+        w2_global_scale = down.weight_scale_2.data.reshape(1).to(torch.float32).contiguous()
+
+        self._w4a16_prepared = prepare_w4a16_modelopt_nvfp4_weights(
+            w13_fp4,
+            w13_blockscale,
+            w13_global_scale,
+            w2_fp4,
+            w2_blockscale,
+            w2_global_scale,
+            activation="silu",
+            params_dtype=torch.bfloat16,
+            w13_layout="gate_up",
+        )
+
+    def _forward_w4a16_fused(self, x: torch.Tensor) -> torch.Tensor:
+        self._ensure_w4a16_fused_ready()
+        from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+        from sparkinfer.moe._shared.kernels.w4a16.prepare import make_w4a16_packed_buffers
+
+        if x.dtype != torch.bfloat16:
+            raise TypeError(
+                f"Qwen36MLP._forward_w4a16_fused expects bf16 activations, got {x.dtype}"
+            )
+        orig_shape = x.shape
+        x2d = x.reshape(-1, self.hidden_size).contiguous()
+        m = x2d.shape[0]
+        device = x2d.device
+
+        # Degenerate 1-expert/top-1 MoE: every row routes to expert 0 with
+        # router weight 1.0 -- see class docstring for why this is the
+        # shape run_w4a16_moe requires.
+        topk_ids = torch.zeros((m, 1), dtype=torch.int32, device=device)
+        topk_weights = torch.ones((m, 1), dtype=torch.float32, device=device)
+
+        buffers = make_w4a16_packed_buffers(
+            self._w4a16_prepared,
+            m=m,
+            topk=1,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        out = run_w4a16_moe(
+            x2d,
+            self._w4a16_prepared,
+            topk_weights,
+            topk_ids,
+            activation="silu",
+            intermediate_cache13=buffers.intermediate_cache13,
+            intermediate_cache2=buffers.intermediate_cache2,
+            output=buffers.output,
+            fc1_c_tmp=buffers.fc1_c_tmp,
+            fc2_c_tmp=buffers.fc2_c_tmp,
+            packed_route_indices=buffers.packed_route_indices,
+            block_expert_ids=buffers.block_expert_ids,
+            packed_route_count=buffers.packed_route_count,
+            expert_offsets=buffers.expert_offsets,
+            fast_math=True,
+        )
+        return out.reshape(*orig_shape[:-1], self.hidden_size)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._nvfp4_fused:
+            return self._forward_w4a16_fused(x)
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
