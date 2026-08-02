@@ -466,10 +466,11 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
   ReplaySSM 把"状态回滚"问题转化成"缓存最近输入、O(1) ring-buffer 指针移动"，是候选机制而非
   从零设计。
 - [ ] GDN kernel 调优 · 128K/256K 容量与吞吐 · 主模型侧 GDN 递归状态回滚（与 D-3 合并排期）
-- [ ] **KV dtype 待定**：`investigation-queue.md` C-2 正在测 NVFP4 KV vs FP8 KV 在我们卡上的 prefill/decode
-  对比（另一 agent 进行中）。上游第三方在 RTX PRO 5000 上的数字（NVFP4 KV prefill 慢 1.7–1.8×，
-  decode 更快）不是我们的卡也不是我们的形状，**只作为倾向 FP8 KV 的参考，不作为决定**——等 C-2 本机
-  结果回来再定，本文档暂标 **[待验证]**，不写死"FP8 KV"
+- [x] ~~**KV dtype 待定**~~ —— ✅ **已答，而且是"选项不存在"而非"选了某个"**（C-2 结案）：
+  sparkinfer 的 paged-attention（唯一的 attention 内核）只接受 fp16/bf16/fp8_e4m3 三种 KV dtype，
+  NVFP4 KV 直接 `TypeError`。**所以这不是一个待选项，FP8 是唯一可达值。** 上游第三方在
+  RTX PRO 5000 上的数字（NVFP4 KV prefill 慢 1.7–1.8×）在我们的栈上**连对照组都不存在**。
+  见 `investigation-queue.md` C-2
 - **门禁**：接受率与吞吐进 bfdiag 基线；与上游框架同 prompt 同参数 A/B
 
 ### 7.2 P1 · Track D · 易用性（M2→M5，与 B 并行）
