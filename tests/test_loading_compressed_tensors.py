@@ -8,7 +8,16 @@ through ``LagunaModelSelfBuilt.load_weights`` on a real checkpoint.
 
 from __future__ import annotations
 
-from runtime.loading.compressed_tensors import IGNORE_WEIGHT_SUFFIXES, remap_kv_scale_name
+import pytest
+
+from runtime.loading.compressed_tensors import (
+    IGNORE_WEIGHT_SUFFIXES,
+    QUANT_ALGO_MP_FP8_CHANNEL,
+    QUANT_ALGO_MP_NVFP4,
+    MixedPrecisionQuantMap,
+    mixed_precision_quant_map,
+    remap_kv_scale_name,
+)
 
 
 class TestRemapKvScaleName:
@@ -90,3 +99,130 @@ class TestIgnoreWeightSuffixes:
         # remap_kv_scale_name agree on the same four suffixes.
         for suffix in (".k_scale", "_k_scale", ".v_scale", "_v_scale"):
             assert suffix in IGNORE_WEIGHT_SUFFIXES
+
+
+# ---------------------------------------------------------------------------
+# "mixed-precision" sub-format classification (unsloth's Qwen3.6-27B-NVFP4).
+# Pure string/regex logic -- no torch needed here, matching this module's
+# own "runtime/loading/compressed_tensors.py stays torch-free" design (see
+# that module's docstring). Fixture shapes below are the real checkpoint's
+# ``config_groups``/``ignore`` entries, verified 2026-08-02 against its
+# actual config.json, not invented.
+# ---------------------------------------------------------------------------
+
+_UNSLOTH_LIKE_QUANT_CONFIG = {
+    "quant_method": "compressed-tensors",
+    "format": "mixed-precision",
+    "ignore": [
+        "model.language_model.layers.0.linear_attn.in_proj_a",
+        "model.language_model.layers.0.linear_attn.in_proj_b",
+        "model.language_model.layers.0.linear_attn.norm",
+        r"re:^mtp.*",
+    ],
+    "config_groups": {
+        "group_0": {
+            "format": "float-quantized",
+            "targets": [
+                r"re:.*self_attn\.(q|k|v|o)_proj$",
+                r"re:.*linear_attn\.(in_proj_qkv|in_proj_z|out_proj)$",
+                r"re:.*lm_head",
+                r"re:.*layers\.(56|57|58|59|60|61|62|63)\.mlp\.(gate|up|down)_proj$",
+            ],
+        },
+        "group_1": {
+            "format": "nvfp4-pack-quantized",
+            "targets": [r"re:.*mlp\.(gate|up|down)_proj$"],
+        },
+    },
+}
+
+
+class TestMixedPrecisionQuantMap:
+    def test_fp8_group_classifies_self_attn_and_lm_head(self):
+        qmap = MixedPrecisionQuantMap(_UNSLOTH_LIKE_QUANT_CONFIG)
+        assert (
+            qmap.get("model.language_model.layers.3.self_attn.q_proj")
+            == QUANT_ALGO_MP_FP8_CHANNEL
+        )
+        assert qmap.get("lm_head") == QUANT_ALGO_MP_FP8_CHANNEL
+
+    def test_fp8_group_classifies_linear_attn_projections(self):
+        qmap = MixedPrecisionQuantMap(_UNSLOTH_LIKE_QUANT_CONFIG)
+        for suffix in ("in_proj_qkv", "in_proj_z", "out_proj"):
+            assert (
+                qmap.get(f"model.language_model.layers.1.linear_attn.{suffix}")
+                == QUANT_ALGO_MP_FP8_CHANNEL
+            )
+
+    def test_nvfp4_group_classifies_early_layer_mlp(self):
+        qmap = MixedPrecisionQuantMap(_UNSLOTH_LIKE_QUANT_CONFIG)
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            assert (
+                qmap.get(f"model.language_model.layers.0.mlp.{proj}") == QUANT_ALGO_MP_NVFP4
+            )
+
+    def test_fp8_wins_the_layer_56_63_mlp_overlap(self):
+        # The one real overlap: group_1's blanket mlp regex also matches
+        # layers 56-63, which group_0 explicitly carves out. Verified
+        # against the real checkpoint's safetensors headers (module
+        # docstring) that FP8 is what actually got baked into those
+        # tensors -- this test pins that measured precedence, not an
+        # assumption about config_groups dict order.
+        qmap = MixedPrecisionQuantMap(_UNSLOTH_LIKE_QUANT_CONFIG)
+        for layer in (56, 63):
+            assert (
+                qmap.get(f"model.language_model.layers.{layer}.mlp.gate_proj")
+                == QUANT_ALGO_MP_FP8_CHANNEL
+            )
+
+    def test_ignore_list_wins_over_a_matching_target(self):
+        qmap = MixedPrecisionQuantMap(_UNSLOTH_LIKE_QUANT_CONFIG)
+        assert qmap.get("model.language_model.layers.0.linear_attn.in_proj_a") is None
+        assert qmap.get("model.language_model.layers.0.linear_attn.in_proj_b") is None
+
+    def test_ignore_regex_entry_matches(self):
+        qmap = MixedPrecisionQuantMap(_UNSLOTH_LIKE_QUANT_CONFIG)
+        assert qmap.get("mtp.fc") is None
+        assert qmap.get("mtp.layers.0.self_attn.q_proj") is None
+
+    def test_module_matching_no_target_is_unquantized(self):
+        qmap = MixedPrecisionQuantMap(_UNSLOTH_LIKE_QUANT_CONFIG)
+        assert qmap.get("model.language_model.embed_tokens") is None
+        assert qmap.get("model.language_model.layers.0.input_layernorm") is None
+
+    def test_get_default_is_returned_not_none_literal(self):
+        qmap = MixedPrecisionQuantMap(_UNSLOTH_LIKE_QUANT_CONFIG)
+        sentinel = object()
+        assert qmap.get("model.language_model.embed_tokens", sentinel) is sentinel
+
+    def test_unknown_group_format_raises(self):
+        config = {
+            "config_groups": {"group_0": {"format": "some-future-format", "targets": ["x"]}}
+        }
+        with pytest.raises(ValueError, match="some-future-format"):
+            MixedPrecisionQuantMap(config)
+
+    def test_missing_ignore_and_config_groups_keys_default_empty(self):
+        # A minimal config_groups-only dict (no "ignore" key at all) must
+        # not raise -- every real key here is optional per compressed-
+        # tensors' own schema.
+        qmap = MixedPrecisionQuantMap({"config_groups": {}})
+        assert qmap.get("anything") is None
+
+
+class TestMixedPrecisionQuantMapFn:
+    def test_empty_when_no_quantization_config(self):
+        assert mixed_precision_quant_map({}) == {}
+        assert mixed_precision_quant_map({"quantization_config": None}) == {}
+
+    def test_empty_when_format_is_not_mixed_precision(self):
+        # modelopt checkpoints (or a hypothetical single-format
+        # compressed-tensors checkpoint) must not be misrouted here.
+        config = {"quantization_config": {"quant_method": "modelopt"}}
+        assert mixed_precision_quant_map(config) == {}
+
+    def test_builds_a_working_classifier_for_a_real_shaped_config(self):
+        config = {"quantization_config": _UNSLOTH_LIKE_QUANT_CONFIG}
+        qmap = mixed_precision_quant_map(config)
+        assert isinstance(qmap, MixedPrecisionQuantMap)
+        assert qmap.get("lm_head") == QUANT_ALGO_MP_FP8_CHANNEL

@@ -68,23 +68,23 @@ class TestFormatIsPartOfTheGate:
         resolution = resolve_config(_config("compressed-tensors", "nvfp4-pack-quantized"))
         assert resolution.loader == "compressed_tensors"
 
-    def test_mixed_precision_is_refused_for_a_different_reason(self):
-        """Two refusals, two causes -- the message must not conflate them.
-
-        ``pack-quantized`` is refused because loading it would be silently
-        wrong. ``mixed-precision`` is refused because no adapter exists, which
-        is a scoped piece of work rather than a correctness risk. Someone
-        deciding whether to add support needs to know which they are looking
-        at.
+    def test_mixed_precision_now_resolves_since_the_adapter_landed(self):
+        """Used to be refused ("no adapter exists yet") -- ``mixed-precision``
+        was listed then removed on 2026-08-02 (registry accepted it,
+        ``load_weights`` failed with "168 parameter(s) never received a
+        checkpoint tensor"), and restored the same day the adapter did:
+        ``runtime/loading/compressed_tensors.py``'s ``MixedPrecisionQuantMap``
+        classifies unsloth's FP8-channel/NVFP4 split and
+        ``runtime/model/compressed_tensors_linear.py`` supplies the matching
+        Linear classes -- see ``runtime/model_registry.py``'s
+        ``SUPPORTED_QUANT_FORMATS`` comment for the measured evidence. This
+        is the same shape as ``test_supported_format_still_resolves`` above,
+        for the format that used to be this class's one *refused-but-known*
+        case -- ``pack-quantized`` (asymmetric zero point, nothing here
+        models) is the only one left.
         """
-        with pytest.raises(UnsupportedArchitectureError) as excinfo:
-            resolve_config(_config("compressed-tensors", "mixed-precision"))
-        message = str(excinfo.value)
-        assert "no adapter exists yet" in message
-        assert "zero point" not in message, (
-            "the mixed-precision refusal borrowed pack-quantized's reason; they "
-            "fail for opposite causes"
-        )
+        resolution = resolve_config(_config("compressed-tensors", "mixed-precision"))
+        assert resolution.loader == "compressed_tensors"
 
     def test_method_without_subformat_still_resolves(self):
         resolution = resolve_config(_config("modelopt", None))

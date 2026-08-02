@@ -69,23 +69,29 @@ LOADER_FOR_QUANT_METHOD = {
 #: So the gate is the (method, format) pair, and an unlisted format is refused
 #: rather than assumed compatible. ``None`` means the method carries no
 #: sub-format (modelopt).
-#: ⚠️ ``mixed-precision`` was listed here on 2026-08-02 and removed the same
-#: day. The registry accepted it, and then ``load_weights`` failed with
-#: "168 parameter(s) never received a checkpoint tensor" -- because
-#: ``runtime/loading/compressed_tensors.py`` only handles Laguna's
-#: ``nvfp4-pack-quantized`` and says so in its own docstring ("Not yet
-#: exercised by a second real quantization format"). unsloth's layout names
-#: its NVFP4 weights ``weight_packed``/``weight_global_scale``/
-#: ``input_global_scale`` where the loader looks for ``.weight``, and 168 is
-#: exactly the count of ``weight_packed`` tensors in that checkpoint.
+#: ``mixed-precision`` was listed here on 2026-08-02 and removed the same
+#: day: the registry accepted it, and then ``load_weights`` failed with
+#: "168 parameter(s) never received a checkpoint tensor" (168 == unsloth's
+#: ``weight_packed`` tensor count), because ``runtime/loading/
+#: compressed_tensors.py`` at the time only handled Laguna's
+#: ``nvfp4-pack-quantized``. It was restored the same day the adapter
+#: landed (same commit as this comment's edit): ``runtime/loading/
+#: compressed_tensors.py`` now also carries unsloth's naming knowledge
+#: (:class:`~runtime.loading.compressed_tensors.MixedPrecisionQuantMap`,
+#: :func:`~runtime.loading.compressed_tensors.dequantize_fp8_channel`), and
+#: ``runtime/model/qwen36_model.py``'s ``_make_linear`` dispatches to
+#: ``runtime/model/compressed_tensors_linear.py``'s Linear classes for it --
+#: see those modules' docstrings for the measured evidence (real safetensors
+#: headers) this rests on, and ``tests/test_qwen36_mixed_precision_checkpoint.py``
+#: for the real-checkpoint, header-only "every module classifies to exactly
+#: the tensors it actually has, zero missing, zero extra" cross-check that
+#: earns this format its place back in this frozenset (not merely "the
+#: registry no longer says no").
 #:
-#: Listing a format the loader cannot load turns a question answerable at
-#: resolve time into a confusing failure much later. Restore it in the same
-#: change that adds the adapter, not before.
 #: Why a specific known-but-unsupported format is refused. Generic text would
-#: be worse than useless here: the two refusals below fail for opposite
-#: reasons, and telling them apart is what decides whether adding the format
-#: is a loader task or a correctness problem.
+#: be worse than useless here: the refusal below and the one above fail for
+#: opposite reasons, and telling them apart is what decides whether adding
+#: the format is a loader task or a correctness problem.
 _WHY_REFUSED: dict[str | None, str] = {
     "pack-quantized": (
         "Refusing rather than loading: this is group-wise INT4 with an "
@@ -95,19 +101,11 @@ _WHY_REFUSED: dict[str | None, str] = {
         "all-params-loaded assertion and still dequantize every weight as if "
         "it were symmetric -- wrong output, no error."
     ),
-    "mixed-precision": (
-        "Refusing rather than loading: no adapter exists yet. This layout names "
-        "its NVFP4 weights weight_packed/weight_global_scale/input_global_scale "
-        "where runtime/loading/compressed_tensors.py looks for .weight, so the "
-        "load fails partway with 'N parameter(s) never received a checkpoint "
-        "tensor'. Answering here rather than there is the only difference; "
-        "adding the adapter is a scoped piece of work, not a correctness risk."
-    ),
 }
 
 
 SUPPORTED_QUANT_FORMATS: dict[str, frozenset[str | None]] = {
-    "compressed-tensors": frozenset({"nvfp4-pack-quantized", None}),
+    "compressed-tensors": frozenset({"nvfp4-pack-quantized", "mixed-precision", None}),
     "modelopt": frozenset({None}),
 }
 

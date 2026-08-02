@@ -39,20 +39,83 @@ scope for a Linear/Embedding phase" -- the same scoping logic applies here).
 Folding it into this adapter would touch sparkinfer-kernel-prep code for no
 benefit this step's gate (dense-path tensor checksums) would catch.
 
-Not yet exercised by a second real quantization format. modelopt (Qwen3.6,
-Track B / B0-2) is the second real consumer this abstraction is eventually
-built to take, and it turns out to need materially different loading logic,
-not just different suffix strings -- see
-``notes/2026-08-02-qwen36-b0-fact-baseline.md`` §1.6-1.7 (modelopt's
-``.weight`` suffix is ambiguous between NVFP4-packed / FP8-unpacked / plain
-BF16 depending on ``quantization_config.quantized_layers[name]``; Laguna's
-``weight_packed`` suffix is self-describing). Until that adapter exists,
-everything below is proven only by continuing to serve Laguna's own
-checkpoint bit-exactly, not by two formats actually diverging in a caller's
-hands.
+Not yet exercised by a second real quantization format *of Laguna's own
+kind* -- ``IGNORE_WEIGHT_SUFFIXES``/:func:`remap_kv_scale_name` above are
+still proven only by Laguna's own checkpoint. modelopt (Qwen3.6, Track B /
+B0-2) is a sibling loader adapter, not a second consumer of this module --
+see ``runtime/loading/modelopt.py`` for why it needed materially different
+loading logic, not just different suffix strings (modelopt's ``.weight``
+suffix is ambiguous between NVFP4-packed / FP8-unpacked / plain BF16
+depending on ``quantization_config.quantized_layers[name]``; Laguna's
+``weight_packed`` suffix is self-describing).
+
+**2026-08-02, Track B "mixed-precision" adapter**: unsloth's
+``unsloth/Qwen3.6-27B-NVFP4`` declares ``quant_method: "compressed-tensors"``,
+``format: "mixed-precision"`` -- a *second* real compressed-tensors format,
+this time landing in this module rather than modelopt.py. It is not one
+payload but two, layered via ``quantization_config.config_groups``, each
+group carrying its own ``format`` string:
+
+- ``group_0``, ``format: "float-quantized"``: FP8 (E4M3) weights,
+  **per-output-channel** scale (``strategy: "channel"``) -- covers every
+  ``self_attn.{q,k,v,o}_proj``, ``linear_attn.{in_proj_qkv,in_proj_z,
+  out_proj}``, ``lm_head``, and (see the overlap note below) ``mlp.{gate,up,
+  down}_proj`` for layers 56-63 only. Checkpoint tensors: ``.weight``
+  (``float8_e4m3fn``, ``[out, in]``, unpacked -- verified against real
+  safetensors headers, 2026-08-02) and ``.weight_scale`` (``bfloat16``,
+  ``[out, 1]`` -- one scale per output row). This is a **different physical
+  layout from modelopt's own FP8** (``runtime/loading/modelopt.py``'s
+  ``dequantize_fp8``): that one is a single per-*tensor* ``float32`` scalar;
+  this one is per-*channel* and stored in ``bfloat16``. Using
+  ``dequantize_fp8`` here would silently broadcast the wrong scale per row
+  -- see :func:`dequantize_fp8_channel` below, a genuinely different
+  function, not a shape-tolerant variant of the modelopt one.
+- ``group_1``, ``format: "nvfp4-pack-quantized"`` -- the **same format
+  string** ``SUPPORTED_QUANT_FORMATS`` already lists for Laguna, and indeed
+  the same physical layout: ``.weight_packed`` (``uint8``, ``[out, in //
+  2]``), ``.weight_scale`` (``float8_e4m3fn``, ``[out, in // 16]``, block
+  size 16), ``.weight_global_scale`` (``float32``, shape ``[1]``). Covers
+  ``mlp.{gate,up,down}_proj`` for layers 0-55. A fourth tensor,
+  ``.input_global_scale`` (``float32``, shape ``[1]``), also exists per
+  module -- unsloth's NVFP4 group additionally declares
+  ``input_activations`` (dynamic, block-quantized, group_size 16), i.e. this
+  is really a W4A4 scheme, unlike modelopt's weight-only W4A16. This adapter
+  follows B1's existing "dequantize weights to BF16, ignore the activation
+  side" simplification (``runtime/model/modelopt_linear.py``'s module
+  docstring) and never reads ``.input_global_scale`` -- consistent with, not
+  a new exception to, how ``.input_scale`` is already ignored for modelopt.
+  The two-level dequant math itself (E2M1 LUT, block scale x global scale)
+  is identical to modelopt's ``W4A16_NVFP4`` and is reused unchanged from
+  ``runtime/loading/modelopt.py`` (:func:`dequantize_nvfp4`) rather than
+  reimplemented here -- one packing convention, one place that decodes it.
+
+**The one overlap, resolved by measurement, not by guessing a precedence
+rule**: ``group_1``'s target (``re:.*mlp\\.(gate|up|down)_proj$``) matches
+*every* layer's MLP, including 56-63, which ``group_0`` also explicitly
+targets (``re:.*layers\\.(56|57|58|59|60|61|62|63)\\.mlp\\.(gate|up|down)_proj$``).
+Checked directly against the real checkpoint's safetensors headers
+(2026-08-02): layer 56's ``mlp.gate_proj`` is ``float8_e4m3fn`` ``.weight`` +
+``bfloat16`` ``[17408, 1]`` ``.weight_scale`` -- no ``.weight_packed``
+anywhere. FP8 wins the overlap. :class:`MixedPrecisionQuantMap` below checks
+``group_0``'s (FP8) targets before ``group_1``'s (NVFP4) to match, rather
+than relying on ``config_groups`` dict order (which happens to agree here,
+but is not what this module's correctness rests on).
+
+Deliberately torch-free at module scope (see the file's own tests, which
+import this module with no ``pytest.importorskip("torch")`` guard): the
+classification logic above (:class:`MixedPrecisionQuantMap`) is plain
+string/regex work and stays that way, but :func:`dequantize_fp8_channel`
+below is genuine tensor arithmetic and imports ``torch`` locally inside the
+function body rather than at module scope, so importing this module never
+requires torch to be installed. ``runtime/model/compressed_tensors_linear.py``
+(a new, torch-heavy sibling of ``runtime/model/modelopt_linear.py``) is
+where the Parameter-holding ``nn.Module`` classes that call it live.
 """
 
 from __future__ import annotations
+
+import re
+from typing import Any
 
 #: compressed-tensors' checkpoint-side suffixes that never have a matching
 #: model Parameter for this checkpoint's real, symmetric per-tensor
@@ -112,3 +175,162 @@ def remap_kv_scale_name(name: str, params_dict: dict) -> str | None:
         remapped = f"{prefix}.attn.{suffix}"
         return remapped if remapped in params_dict else None
     return name
+
+
+# ---------------------------------------------------------------------------
+# "mixed-precision" sub-format (unsloth's Qwen3.6-27B-NVFP4). See module
+# docstring for the measured semantics; everything below implements exactly
+# that, nothing more.
+# ---------------------------------------------------------------------------
+
+#: The two ``config_groups[*].format`` strings unsloth's checkpoint actually
+#: declares (verified directly against its ``config.json``, 2026-08-02). A
+#: group declaring anything else is refused loudly by
+#: :class:`MixedPrecisionQuantMap` rather than silently treated as
+#: unquantized -- see its docstring.
+MIXED_PRECISION_FORMAT_FP8_CHANNEL = "float-quantized"
+MIXED_PRECISION_FORMAT_NVFP4 = "nvfp4-pack-quantized"
+_KNOWN_MIXED_PRECISION_FORMATS = (
+    MIXED_PRECISION_FORMAT_FP8_CHANNEL,
+    MIXED_PRECISION_FORMAT_NVFP4,
+)
+
+#: Algo strings :func:`mixed_precision_quant_map` produces, consumed by
+#: ``runtime/model/qwen36_model.py``'s ``_make_linear``. Deliberately
+#: distinct spellings from ``runtime.loading.modelopt``'s ``QUANT_ALGO_FP8``/
+#: ``QUANT_ALGO_NVFP4`` -- same math (NVFP4) or same bit width (FP8), but a
+#: different physical layout each time (see module docstring), so
+#: ``_make_linear`` must never confuse the two.
+QUANT_ALGO_MP_FP8_CHANNEL = "mixed_precision_fp8_channel"
+QUANT_ALGO_MP_NVFP4 = "mixed_precision_nvfp4"
+
+
+def _compile_target(entry: str) -> re.Pattern[str] | str:
+    """compressed-tensors' own convention: a ``"re:"``-prefixed target is a
+    regex (matched with :func:`re.match` -- every real pattern this
+    checkpoint declares already starts with ``.*`` or ``^``, so anchoring at
+    position 0 only is equivalent to a search here, not a narrowing);
+    anything else is an exact module-name literal (as seen in unsloth's own
+    ``ignore`` list, e.g. ``"model.language_model.layers.0.linear_attn.
+    in_proj_a"``)."""
+    if entry.startswith("re:"):
+        return re.compile(entry[len("re:") :])
+    return entry
+
+
+def _matches_any(name: str, patterns: list[re.Pattern[str] | str]) -> bool:
+    for pattern in patterns:
+        if isinstance(pattern, re.Pattern):
+            if pattern.match(name):
+                return True
+        elif pattern == name:
+            return True
+    return False
+
+
+class MixedPrecisionQuantMap:
+    """Classifies a dotted module name against unsloth's mixed-precision
+    ``quantization_config`` -- duck-types dict's ``.get(name, default)`` so
+    ``runtime/model/qwen36_model.py``'s ``_make_linear`` can use one straight
+    off either this or ``runtime.loading.modelopt.quantized_layers_map``'s
+    plain ``dict[str, str]`` without caring which format produced it.
+
+    A precomputed flat ``dict[str, str]`` (what ``quantized_layers_map``
+    returns for modelopt) is not possible here: modelopt's checkpoint lists
+    every quantized module explicitly
+    (``quantization_config.quantized_layers``); compressed-tensors instead
+    declares *regex* ``targets`` per ``config_groups`` entry, so which module
+    names exist is never enumerated in the config at all -- only the model
+    graph knows that, one dotted name at a time, exactly when it calls
+    :meth:`get`. Classifying lazily like this also means correctness never
+    depends on re-deriving the graph's own layer/module shape a second time
+    outside it.
+
+    ``ignore`` is checked first (unsloth's own opt-out list -- e.g.
+    ``linear_attn.in_proj_a``/``in_proj_b``/``norm``, kept plain BF16), then
+    the FP8 group's targets, then the NVFP4 group's -- see module docstring
+    for why FP8 is checked first (the one real overlap, resolved by reading
+    the real checkpoint's tensors rather than assumed from either group's
+    position in ``config_groups``).
+    """
+
+    def __init__(self, quant_config: dict[str, Any]) -> None:
+        self._ignore = [_compile_target(p) for p in (quant_config.get("ignore") or [])]
+        groups = quant_config.get("config_groups") or {}
+        fp8_targets: list[str] = []
+        nvfp4_targets: list[str] = []
+        for group_name, group in groups.items():
+            fmt = group.get("format")
+            targets = list(group.get("targets") or [])
+            if fmt == MIXED_PRECISION_FORMAT_FP8_CHANNEL:
+                fp8_targets.extend(targets)
+            elif fmt == MIXED_PRECISION_FORMAT_NVFP4:
+                nvfp4_targets.extend(targets)
+            else:
+                raise ValueError(
+                    f"compressed-tensors mixed-precision config_groups[{group_name!r}] "
+                    f"declares format {fmt!r}, which this adapter does not know how to "
+                    f"load; known sub-formats are {_KNOWN_MIXED_PRECISION_FORMATS}. Failing "
+                    "loudly here beats silently treating an unrecognized layout's weights "
+                    "as plain unquantized BF16."
+                )
+        self._fp8_targets = [_compile_target(p) for p in fp8_targets]
+        self._nvfp4_targets = [_compile_target(p) for p in nvfp4_targets]
+
+    def get(self, name: str, default: str | None = None) -> str | None:
+        if _matches_any(name, self._ignore):
+            return default
+        if _matches_any(name, self._fp8_targets):
+            return QUANT_ALGO_MP_FP8_CHANNEL
+        if _matches_any(name, self._nvfp4_targets):
+            return QUANT_ALGO_MP_NVFP4
+        return default
+
+
+def mixed_precision_quant_map(config: dict[str, Any]) -> MixedPrecisionQuantMap | dict:
+    """``config`` -> a classifier usable exactly like
+    ``runtime.loading.modelopt.quantized_layers_map``'s return value (plain
+    ``.get(name, default)``). Empty dict (never ``None``) when the checkpoint
+    declares no ``mixed-precision`` quantization at all, matching that
+    function's same "callers never need a None-check" contract.
+    """
+    quant_config = config.get("quantization_config")
+    if not isinstance(quant_config, dict):
+        return {}
+    if quant_config.get("format") != "mixed-precision":
+        return {}
+    return MixedPrecisionQuantMap(quant_config)
+
+
+def dequantize_fp8_channel(weight_fp8: Any, weight_scale: Any) -> Any:
+    """Per-output-channel FP8 (E4M3) weight dequantization to BF16 --
+    compressed-tensors' ``"float-quantized"``/``strategy: "channel"`` scheme
+    (unsloth's Qwen3.6 checkpoint). **Not** the same layout as
+    ``runtime.loading.modelopt.dequantize_fp8``, whose ``weight_scale`` is a
+    single per-*tensor* scalar -- this one is one scale per output row and
+    must not be conflated with it (a scalar-shaped call into that function
+    against this checkpoint's weights would silently apply only the first
+    row's scale to every row).
+
+    ``weight_fp8``: ``[out, in]``, ``torch.float8_e4m3fn``, unpacked (one
+    byte per element -- verified against real safetensors headers,
+    2026-08-02). ``weight_scale``: ``[out, 1]`` (or anything reshaping to
+    it), any float dtype -- the real checkpoint stores ``bfloat16``, unlike
+    modelopt's ``float32`` scalar.
+
+    Imports ``torch`` locally rather than at module scope -- see this
+    module's docstring for why ``runtime/loading/compressed_tensors.py``
+    stays importable without torch installed.
+    """
+    import torch
+
+    if weight_fp8.dtype != torch.float8_e4m3fn:
+        raise ValueError(f"expected float8_e4m3fn weight, got {weight_fp8.dtype}")
+    out_dim = weight_fp8.shape[0]
+    if weight_scale.numel() != out_dim:
+        raise ValueError(
+            f"weight_scale has {weight_scale.numel()} element(s), expected {out_dim} "
+            f"(one per output channel) for weight shape {tuple(weight_fp8.shape)}"
+        )
+    scale = weight_scale.reshape(out_dim, 1).to(torch.float32)
+    return (weight_fp8.to(torch.float32) * scale).to(torch.bfloat16)

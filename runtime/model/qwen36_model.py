@@ -90,22 +90,50 @@ from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
 from torch import nn
 
 from runtime.kernels.rope import apply_rotary_embedding_inplace, compute_cos_sin_cache_default
+from runtime.loading.compressed_tensors import (
+    QUANT_ALGO_MP_FP8_CHANNEL,
+    QUANT_ALGO_MP_NVFP4,
+    mixed_precision_quant_map,
+)
 from runtime.loading.modelopt import (
     QUANT_ALGO_FP8,
     QUANT_ALGO_NVFP4,
     QUANT_ALGO_UNQUANTIZED,
-    classify_module,
     quantized_layers_map,
 )
 from runtime.model._weight_loading import default_weight_loader
+from runtime.model.compressed_tensors_linear import (
+    CompressedTensorsFP8ChannelLinear,
+    CompressedTensorsNVFP4Linear,
+)
 from runtime.model.modelopt_linear import ModelOptFP8Linear, ModelOptNVFP4Linear
 from runtime.model.plain_linear import PlainLinear
 
 #: Checkpoint tensor suffixes this loader deliberately never consumes into
 #: a Parameter -- see runtime/model/modelopt_linear.py's module docstring
 #: for why ``.input_scale`` specifically is dead weight for a
-#: dequantize-to-BF16 B1 implementation.
-_IGNORED_WEIGHT_SUFFIXES: tuple[str, ...] = (".input_scale",)
+#: dequantize-to-BF16 B1 implementation. ``.input_global_scale`` is
+#: unsloth's mixed-precision NVFP4 group's own name for the same idea (see
+#: ``runtime/model/compressed_tensors_linear.py``'s module docstring) --
+#: listed explicitly, like ``.input_scale``, so a reader sees this is a
+#: known, deliberate skip rather than an accident.
+_IGNORED_WEIGHT_SUFFIXES: tuple[str, ...] = (".input_scale", ".input_global_scale")
+
+#: Which ``nn.Module`` factory each classifier's algo string maps to.
+#: Deliberately the single place that knows about every quantization format
+#: this model graph can build Linears for -- two checkpoint *formats*
+#: (modelopt, compressed-tensors mixed-precision) can both declare "FP8" or
+#: "NVFP4" in spirit, but never the same algo *string* (see
+#: ``runtime/loading/compressed_tensors.py``'s module docstring for why
+#: they are genuinely different physical layouts, not just different
+#: names for the same bytes), so a checkpoint's own classifier output
+#: dispatches here unambiguously regardless of which format produced it.
+_LINEAR_FACTORY_FOR_ALGO: dict[str, type[nn.Module]] = {
+    QUANT_ALGO_FP8: ModelOptFP8Linear,
+    QUANT_ALGO_NVFP4: ModelOptNVFP4Linear,
+    QUANT_ALGO_MP_FP8_CHANNEL: CompressedTensorsFP8ChannelLinear,
+    QUANT_ALGO_MP_NVFP4: CompressedTensorsNVFP4Linear,
+}
 
 
 def _make_linear(
@@ -115,17 +143,28 @@ def _make_linear(
     out_features: int,
 ) -> nn.Module:
     """Pick the Linear class for ``dotted_name`` from the checkpoint's own
-    ``quantized_layers`` declaration -- never hardcoded per-projection, so
-    a checkpoint that quantizes something differently fails loud at
-    construction time instead of silently loading raw bytes as BF16.
+    per-module quantization classification (``quantized``, produced by
+    :func:`~runtime.loading.modelopt.quantized_layers_map` for a modelopt
+    checkpoint or :func:`~runtime.loading.compressed_tensors.
+    mixed_precision_quant_map` for a compressed-tensors mixed-precision one
+    -- see :meth:`Qwen36ForCausalLMSelfBuilt.__init__`, the one place that
+    decides which) -- never hardcoded per-projection, so a checkpoint that
+    quantizes something differently fails loud at construction time instead
+    of silently loading raw bytes as BF16.
     """
-    algo = classify_module(dotted_name, quantized)
-    if algo == QUANT_ALGO_FP8:
-        return ModelOptFP8Linear(in_features, out_features, bias=False)
-    if algo == QUANT_ALGO_NVFP4:
-        return ModelOptNVFP4Linear(in_features, out_features, bias=False)
-    assert algo == QUANT_ALGO_UNQUANTIZED
-    return PlainLinear(in_features, out_features, bias=False)
+    algo = quantized.get(dotted_name, QUANT_ALGO_UNQUANTIZED)
+    if algo == QUANT_ALGO_UNQUANTIZED:
+        return PlainLinear(in_features, out_features, bias=False)
+    factory = _LINEAR_FACTORY_FOR_ALGO.get(algo)
+    if factory is None:
+        raise ValueError(
+            f"module {dotted_name!r} declares quant_algo {algo!r}, which this loader does "
+            f"not know how to dequantize; known algos are "
+            f"{sorted(_LINEAR_FACTORY_FOR_ALGO)} (plus {QUANT_ALGO_UNQUANTIZED!r}). Failing "
+            "loudly here beats silently loading this module's raw checkpoint bytes as if "
+            "they were plain BF16."
+        )
+    return factory(in_features, out_features, bias=False)
 
 
 def _bmm_project(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -2193,6 +2232,35 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         return self.norm(hidden_states)
 
 
+def _quantized_layers_map_for_checkpoint(config: dict[str, Any]) -> dict[str, str]:
+    """Pick which checkpoint format's classifier :func:`_make_linear` should
+    use, from ``config["quantization_config"]["quant_method"]``.
+
+    Both real formats this backend can load (``runtime.model_registry``'s
+    ``SUPPORTED_QUANT_FORMATS`` for the ``qwen36`` backend) reach here
+    already validated -- this function does not re-implement that gate, it
+    only decides *which* per-module classifier to build, and fails loudly
+    for anything ``model_registry.resolve_checkpoint`` should have refused
+    before construction ever got this far (a caller that constructs this
+    class directly, bypassing the registry, is the one real way to reach
+    that branch).
+    """
+    quant_config = config.get("quantization_config")
+    if quant_config is None:
+        return {}
+    method = quant_config.get("quant_method") if isinstance(quant_config, dict) else None
+    if method == "modelopt":
+        return quantized_layers_map(config)
+    if method == "compressed-tensors":
+        return mixed_precision_quant_map(config)
+    raise ValueError(
+        f"Qwen36ForCausalLMSelfBuilt: quantization_config.quant_method {method!r} has no "
+        "loader adapter wired into this model graph (known: 'modelopt', "
+        "'compressed-tensors'); runtime.model_registry.resolve_checkpoint should have "
+        "refused this checkpoint before construction reached here."
+    )
+
+
 class Qwen36ForCausalLMSelfBuilt(nn.Module):
     """Top-level model: :class:`Qwen36TextModelSelfBuilt` + ``lm_head``
     (NVFP4-quantized, per B0-2). Not tied to ``embed_tokens`` (checkpoint
@@ -2206,7 +2274,7 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         # `config` is the merged dict runtime.model_loading.load_qwen36_model
         # builds (text_config's fields + top-level quantization_config
         # injected under the same key) -- see that function's docstring.
-        quantized = quantized_layers_map(config)
+        quantized = _quantized_layers_map_for_checkpoint(config)
         self.quantized = quantized
         self.model = Qwen36TextModelSelfBuilt(config, quantized, max_seq_len=max_seq_len)
         assert not config.get("tie_word_embeddings", False)
