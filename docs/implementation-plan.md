@@ -324,9 +324,40 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
   `kv_cache_quant_algo=FP8` 有声明但**零个** `k_scale`/`v_scale`/`kv_cache_scale` 张量
   （Laguna 对照组证实这不是格式通例）。证据：`notes/2026-08-02-trackB-b0-facts.md` §B0-2、
   `notes/2026-08-02-qwen36-b0-fact-baseline.md` §1、`docs/qwen36-rebuild-spec.md` §1.9/§3.4
-- [ ] B0-3 sparkinfer paged attention 在 `head_dim=256 / gqa_group=6 / page_size ∈ {64,128} / fp8 KV` 下的正确性与吞吐
-- [ ] B0-4 GDN 方案三选一：① FLA v0.5.2 `gated_delta_rule` ② 从 `oracle/qwen36_vllm/` 移植 ③ 自研。**建议先 ① 拿正确性，profiling 说话后再决定 ③**
-- [ ] B0-5 GDN 递归状态更新是否 **CUDA Graph capture-safe**（决定 B2 可行性）
+- [x] B0-3 sparkinfer paged attention 在 `head_dim=256 / gqa_group=6 / page_size ∈ {64,128} / fp8 KV` 下的正确性与吞吐 —— ✅
+  **能跑，且正确**：Python 侧形状校验（`traits.py::select_paged_forward_traits`）与底层 CUTLASS
+  kernel 派发条件（`forward_paged.py`/`forward_extend_generic.py`）逐层读过，**没有发现任何针对
+  `head_dim=256` 的硬门**——decode 落进一个不限定 head_dim 的通用 TMA 分支，extend 命中一个
+  sparkinfer 本为 GB10/SM121、gqa=8 场景写的 `head_dim_qk==256` TMA 分支（该分支本身未绑定
+  device capability 或 gqa_group_size，对我们的 SM120/gqa=6 同样命中）。GPU 实测（decode + extend，
+  `page_size∈{64,128}`）全部跑通，精度对齐 fp32 参照 cosine≥0.99999、绝对误差 2.4e-4~3.9e-3（优于
+  sparkinfer 自己认定"通过"的容差）。**但这个具体组合（256+24Q/4KV）在 sparkinfer 自己的测试套件里
+  从未被测过**，且首次调用 JIT/autotune 耗时 **decode 62-64 秒、extend 27 秒**——直接印证 §7.3 C7-3
+  的担忧，warmup 必须显式覆盖这个形状。CUDA-Graph 专属加速内核（`_is_laguna_fp8_gqa6_analytic_decode_graph`
+  等）全部硬编码 `head_dim_qk==128`，摸不到，head_dim=256 decode 只能走通用
+  `plan_decode_graph_capacity`（该函数本身对 head_dim 无上限，未实测 `use_cuda_graph=True`，留给 B2）。
+  证据：`notes/2026-08-02-trackB-b0-gpu-facts.md` §B0-3、`scripts/b0_probe_paged_attention_head256.py`
+- [x] B0-4 GDN 方案三选一：① FLA v0.5.2 `gated_delta_rule` ② 从 `oracle/qwen36_vllm/` 移植 ③ 自研 —— ✅
+  **① 正确，直接用，不需要现在做③**：GPU 实测 FLA `chunk_gated_delta_rule`/`fused_recurrent_gated_delta_rule`
+  在 Qwen3.6 真实 GDN 形状（16K头/48V头，头维128/128）下与 HF transformers 自带的 torch 参照实现逐层比对，
+  cosine≥0.99998，误差量级 1e-3~5e-3（浮点噪声，非 bug），8 步连续 decode 递归误差不发散。**追加事实**：
+  HF 官方 `Qwen3_5GatedDeltaNet` 在 `fla` 可用时本身就调用这两个函数——"① FLA"与"HF 参照实现"在生产配置
+  下是**同一份代码**，不是两个独立实现。已知的"单步 FP32 计算+跨步 BF16 舍入"机制本轮首次用真实数值坐实
+  代价：额外误差仅 6e-5~1.2e-4，比 FLA-vs-参照本身的误差还小一个量级，对齐这个舍入动作成本很低。吞吐：
+  decode 单步 48 层合计约 1.6~1.9ms，prefill(4096 token) 48 层合计约 37.8ms，量级健康，不支持现在投入③。
+  证据：`notes/2026-08-02-trackB-b0-gpu-facts.md` §B0-4、`scripts/b0_probe_gdn_correctness.py`
+- [x] B0-5 GDN 递归状态更新是否 **CUDA Graph capture-safe**（决定 B2 可行性） —— ✅
+  **capture-safe，且有现成可抄的模式**：`transformers/cache_utils.py::LinearAttentionLayer` 已经是标准
+  答案——状态 buffer 只分配一次、`torch._dynamo.mark_static_address` 标记、永远 `.copy_()` 写回、永远不
+  重新绑定 Python 引用（FLA kernel 本身不做原地更新，每次调用 `q.new_empty(...)` 分配全新返回值，是
+  调用方这层纪律让整条链路 capture-safe，不是 kernel 自己的性质）。GPU 实测原样复刻这个模式：
+  `torch.cuda.graph()` 捕获"读 state → `fused_recurrent_gated_delta_rule` → `.copy_()` 写回"，重放 6 步
+  （每步换真实输入）与逐步 eager 参照**逐 bit 一致**（`max_abs_err=0`）。唯一需要注意的操作要求（呼应
+  `qwen36-rebuild-spec.md:135` 点破的"Laguna 的安全论证不能直接搬"）：递归状态非幂等，warmup 会污染
+  state buffer，必须在捕获前/服务前对新槶位显式 `.zero_()` 一次（图外的普通 eager 操作，不需要每次重放
+  都做）——这与 roadmap 原有的"递归状态纳入槶位生命周期"完全对得上，不是新增工作项。未测：64 层完整
+  decode 图（GDN+全注意力交织）、多槶位跨 capture/reset 的生命周期。证据：
+  `notes/2026-08-02-trackB-b0-gpu-facts.md` §B0-5、`scripts/b0_probe_gdn_cudagraph_capture.py`
 - [x] B0-6 mrope-interleaved 在纯文本下能否退化为标准 1D RoPE —— ✅ **确认退化，可直接当断言用**：
   纯文本请求（无 `image_grid_thw`/`video_grid_thw`）下 T/H/W 三个 mrope 维度的 position_ids
   是同一个 `.expand()` 视图，逐元素恒等，`apply_interleaved_mrope`
@@ -359,7 +390,9 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 - **门禁**：与 HF transformers 贪心**逐 token 对齐**（≥ 3 工作负载 × 512 token）；逐层 logits 余弦相似度进 bfdiag
 
 **B2 服务化**（M3，1 月）
-- [ ] 固定槽位 + 连续批处理 · 递归状态纳入槽位生命周期 · CUDA Graph（依赖 B0-5）· 前缀缓存联动驱逐（A3 的第一个真实用户）· 并发 ≥ 2
+- [ ] 固定槽位 + 连续批处理 · 递归状态纳入槽位生命周期 · CUDA Graph（**B0-5 已确认 capture-safe，2026-08-02**，
+  落地时复刻 `mark_static_address`+`.copy_()` 模式，新槶位分配时需显式 `.zero_()` 一次） ·
+  前缀缓存联动驱逐（A3 的第一个真实用户）· 并发 ≥ 2
 - **门禁**：双协议回归全绿 + **C-LIVE 通过** + 与 B1 eager 贪心 bit-exact
 
 **B3 性能与投机**（M4，1 月）—— **B0-8 已答（✅ MTP 不含 GDN），体量按下文收窄，不是两个分支待选**：
@@ -428,7 +461,11 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
     Track C2 分级降级判断真正需要的信号
   - [ ] C7-3 这不只是 DFlash 一处的问题：`investigation-queue.md` C-1（flashinfer #3255）指向的是同一
     类别——warmup/autotune 是否用**生产真实形状**而不是 autotuner 的第一个合成小形状。B0-3（sparkinfer
-    paged attention 在 `head_dim=256/gqa_group=6` 下的验证）应显式包含这条检查，不能只测正确性
+    paged attention 在 `head_dim=256/gqa_group=6` 下的验证）应显式包含这条检查，不能只测正确性——
+    **2026-08-02 已实测坐实**：这个具体形状（256+24Q/4KV，sparkinfer 自己的测试套件从未覆盖）首次
+    调用 JIT/autotune 耗时 decode 62-64 秒、extend 27 秒，是本条担忧的一个具体真实数字，不再是假设。
+    B1/B2 的 warmup 路径必须显式覆盖这个形状，否则生产第一个真实全注意力请求会卡这么久。见
+    `notes/2026-08-02-trackB-b0-gpu-facts.md` §B0-3
   - **为什么现在记录、但不立即安排 GPU 时间**：C7-1/C7-3 都需要真机复现，且是**假设未坐实**（`235f51e`
     的作者本人也说"两个假设都没彻底坐实"）；C7-2（可观测性）不需要额外 GPU，可以和 P0-E 第 5 步
     的第一次真机验证捆一起做，零增量 GPU 成本
@@ -623,7 +660,7 @@ DSpark）。**分两步，先做便宜的那步**：
 | B0-8 GDN 是否存在于 MTP | `investigation-queue.md` B-6（另一 agent 在查） | 🟡 进行中，**不预判**；决定 B3 的两个分支（§7.1） |
 | ~~eager verify vs CG verify 数值分歧~~ | ~~根因未明~~ | 🟢 **已结案（2026-08-02）**：稠密 fp32 oracle 判定两条路径在 attention 算子层面都对（cos ≥ 0.999997），分歧源自 MoE 离散路由放大微小数值差。`QSR_DFLASH_REQUIRE_CG=1` 保持默认但理由改变，见 `investigation-queue.md` C-1 |
 | B3 KV dtype 选型 | `investigation-queue.md` C-2（另一 agent 在查） | 🟡 进行中，**不预判**；上游数字仅供参考，不当结论用 |
-| B2 CUDA Graph | B0-5（GDN 是否 capture-safe） | 🔴 未验证 |
+| B2 CUDA Graph | B0-5（GDN 是否 capture-safe） | 🟢 **已验证 capture-safe**（2026-08-02，GPU 实测 capture+replay 逐 bit 一致），见 §7.1 B0-5 与 `notes/2026-08-02-trackB-b0-gpu-facts.md` |
 | C2 分级降级的接口 | P0-D/D-3 能力查询形状 | 🔴 未定 |
 | Track G 排期 | G0 拿到 config | 🔴 本地无 checkpoint |
 | H1 发布 | sparkinfer 上游化（RK2） | 🔴 仍钉私有 fork |
