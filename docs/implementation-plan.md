@@ -536,9 +536,19 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 > 之所以敢外推：bit-exact 意味着 accept/reject 轨迹**可证明不变**，
 > 所以只有每轮耗时在变。不做二次全模型实测是因为显存底线（19GB→54GB+，无可用旋钮）。
 >
-> ⚠️ **结论因此从推断变成实测：sparkinfer 那 ~6.8ms 是决定 MTP 能否翻正的关键项。**
-> 规格见 [`../notes/2026-08-02-handoff-sparkinfer-gdn-multistep-kernel.md`](../notes/2026-08-02-handoff-sparkinfer-gdn-multistep-kernel.md)
-> （sparkinfer 约束已解除，改为自己实现，进行中）。
+> 🔴 **原先"~6.8ms 是顺序递归 kernel 启动开销"这个拆分已被实测推翻（同日，kernel 实现完成后）。**
+> 隔离测量：K=16 次顺序 `fla` 递归调用只占 **~0.84–1.12ms**，融合成一次后 **~0.08ms**
+> ——**10–15× 的比例，绝对节省只有 ~0.8–1.0ms。** 递归 kernel 只是每步 15+ 次 launch
+> 中的 1 次，从来不是主导项。
+>
+> ✅ **多步融合 kernel 已实现并合入 sparkinfer master**（`1fd76d1`，
+> `fused_recurrent_gated_delta_rule_multistep`）：17 个单测 + 真实 FP8 权重 30/30
+> 全部 **bit-exact（`max_abs_diff=0.0`，用 `torch.equal` 而非 cosine）**，
+> `spec_forward` 由此再快 1.2–1.5×。**但它不是决定性项。**
+>
+> ⚠️ **真正的主导项已定位：被重复 K 次的大投影**（`in_proj_qkv`/`in_proj_z`/`out_proj`，
+> 输出 5120–10240）。它们**无法保 bit-exact 地批处理**——落在 `torch.bmm` 逐位精确的
+> 512 上限之外。**这才是 MTP 翻正的真正门槛，且目前没有已知的 bit-exact 解法。**
 >
 > 📌 **一条可推广的硬发现**：批处理只做到 1.5–1.75× 而不是更多，是因为
 > **`torch.bmm` 只在输出维 ≤512 时保逐位精确**——

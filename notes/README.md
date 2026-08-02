@@ -39,7 +39,7 @@
 ## 2. 已定案的根因分析 🟢
 
 - [2026-08-02 GDN spec_forward 批处理](2026-08-02-gdn-spec-forward-batching.md) —— 19.9→12.0ms 且 bit-exact；含 torch.bmm 只在输出维 ≤512 保逐位精确的硬发现
-- [GDN 多步融合 kernel 规格](2026-08-02-handoff-sparkinfer-gdn-multistep-kernel.md) —— 投机 verify 每层每轮 ~6.8ms 顺序 kernel 启动开销；原为交接单，约束解除后改为自己实现
+- [GDN 多步融合 kernel 规格](2026-08-02-handoff-sparkinfer-gdn-multistep-kernel.md) —— ⚠️ 其 ~6.8ms 归因已被实测推翻（真值 ~0.8–1.0ms）；kernel 已实现并 bit-exact，但不是决定性项
 - [2026-08-02 Qwen3.6 显存底线由反量化缓存决定](2026-08-02-qwen36-dequant-cache-memory-floor.md) —— 一次完整前向后常驻 19GB→54GB+，`GPU_MEM_UTIL`/`num_slots` 全部管不到
 - [2026-08-02 B1 对齐门禁的证据链（原门禁已作废）](2026-08-02-b1-greedy-alignment-fails.md) —— 分歧只差 1–2 个 bf16 ULP，证明原门禁要求的东西不存在；含一条被自我推翻的误报
 - [2026-08-02 第 7 步 GPU 验收结果](2026-08-02-a3-step7g-gpu-acceptance-results.md) —— bit-exact/前缀缓存/C-LIVE 三条通过；接受率那条对照组错了需重做，另发现 4 条与 7-g 无关的下降

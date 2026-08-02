@@ -12,6 +12,23 @@
 > fork，改动进 `origin/master`；`upstream`（`local-inference-lab`）不碰。仍在独立
 > worktree 干活再合并。
 
+> 🔴 **本文的核心归因已被实测推翻（2026-08-02，kernel 实现完成后）。**
+>
+> 本文（及据此下发的任务）把 `spec_forward` 6.9× 里的 **~6.8ms 归给"顺序递归的 kernel
+> 启动开销"**。**那个拆分是错的。** 隔离测量：K=16 次顺序 `fla` 递归调用只占
+> **~0.84–1.12ms**，融合成一次后 **~0.08ms**——**10–15× 的比例，但绝对节省只有 ~0.8–1.0ms。**
+>
+> 原因很直白:**递归 kernel 只是每步 15+ 次 launch 中的 1 次**（4 个投影、conv1d、norm、
+> out_proj，外加快照 clone）。它从来就不是主导项。
+>
+> **真正的主导项是那些被重复 K 次的大投影**，而它们**无法保 bit-exact 地批处理**——
+> `out_proj` 输出维 5120，落在 `torch.bmm` 逐位精确的 512 上限之外
+> （见 [`2026-08-02-gdn-spec-forward-batching.md`](2026-08-02-gdn-spec-forward-batching.md)）。
+>
+> **kernel 本身是对的、已合入 sparkinfer master、17 个单测 + 真实权重 30/30 全部 bit-exact
+> （`max_abs_diff=0.0`）**，也确实带来 1.2–1.5× 的 `spec_forward` 改善。
+> 但它**不是**当初以为的那个决定性项。下文保留原文以存证。
+
 ## 一句话
 
 Qwen3.6 的投机解码需要在一次调用里推进 K 步 GDN 递归并**物化每一步的中间状态**。
