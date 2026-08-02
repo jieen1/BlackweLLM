@@ -346,7 +346,20 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
 
   **Qwen3.6 侧目前没有采用这个手法**（`grep for_fixed_capacity` 在 Qwen3.6 代码里为空）。
   真实 agent 流量几乎不会重复 prompt 长度，所以不做这一步的话，Qwen3.6 会**逐字重演** Laguna
-  2026-08-01 那次"每轮对话卡 30 秒"的故障。这不是 B2 的性能优化项，是 B1/B2 的可用性前提。CUDA-Graph 专属加速内核（`_is_laguna_fp8_gqa6_analytic_decode_graph`
+  2026-08-01 那次"每轮对话卡 30 秒"的故障。这不是 B2 的性能优化项，是 B1/B2 的可用性前提。
+
+  🔧 **进展与更正（2026-08-02，`ffaeb9d` → `8910fc2`）：`Qwen36AttentionWorkspace` 只修好了一半。**
+  第一次提交时声称修好了，GPU 复跑后**自行更正**——没有因为"能编译"就假定生效：
+
+  | mode | 状态 | 实测 |
+  |---|---|---|
+  | `decode` | ✅ **真的修好了** | 三个不同长度 prompt（5/5/8 token），进程内第一次之后每次都是 ~0.13–0.16s，与长度无关 |
+  | `extend`（prefill） | ❌ **没修好** | 第 3 个 prompt（8 token，前两个 5-token 没用过的长度）仍付 **~25.7s** 全新编译，与冷启动统计上无区别 |
+
+  两个同长度的 prompt **确实**复用了编译（0.14s），所以 workspace 对象本身不是没起作用——
+  它只对**重复出现的**形状不变，对**新出现的**形状仍然重编译。**prefill 路径的可用性阻塞依然成立**，
+  而 prefill 恰好是历史差距分解里最大的一块（60–70%，见
+  [`../notes/2026-08-02-qwen36-historical-performance-record.md`](../notes/2026-08-02-qwen36-historical-performance-record.md)）。CUDA-Graph 专属加速内核（`_is_laguna_fp8_gqa6_analytic_decode_graph`
   等）全部硬编码 `head_dim_qk==128`，摸不到，head_dim=256 decode 只能走通用
   `plan_decode_graph_capacity`（该函数本身对 head_dim 无上限，未实测 `use_cuda_graph=True`，留给 B2）。
   证据：`notes/2026-08-02-trackB-b0-gpu-facts.md` §B0-3、`scripts/b0_probe_paged_attention_head256.py`
