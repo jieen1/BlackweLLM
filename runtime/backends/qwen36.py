@@ -354,6 +354,17 @@ class Qwen36Backend:
         rather than a coincidence.
         """
         state = self.pool.slot_state(slot)
+        if self.pool.slot_kv_len[slot] != prefix_hit:
+            # The slot must be at exactly the position this prefill intends to
+            # continue from: 0 for a cold prefill, ``prefix_hit`` after a
+            # restore. Anything else means the caller skipped a reset, and the
+            # GDN layers would start from another sequence's recurrent state
+            # -- no exception, no NaN, just a wrong continuation
+            # (INV-A3-1's symptom, and the reason reset_slot zeroes).
+            raise RuntimeError(
+                f"slot {slot} is at kv_len={self.pool.slot_kv_len[slot]}, but this prefill "
+                f"continues from {prefix_hit}; the caller must reset_slot first"
+            )
         suffix = prompt_ids[prefix_hit:]
         if not suffix:
             raise ValueError(

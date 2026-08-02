@@ -205,6 +205,26 @@ class Qwen36SlotPool:
                         device=self.device, dtype=dtype,
                     )
                 )
+                layer_max = getattr(attn, "max_seq_len", None)
+                if layer_max is not None:
+                    layer_pages = (layer_max + self.page_size - 1) // self.page_size
+                    if layer_pages != self.pages_per_slot:
+                        # Qwen36Attention caches ONE extend workspace per layer,
+                        # sized from the first cache it is handed
+                        # (``_workspace_for``). Load-time warmup hands it a
+                        # cache built from the layer's own ``max_seq_len``. If
+                        # the pool's per-slot page count disagrees, prefill
+                        # later feeds a differently-sized page table into a
+                        # workspace whose capacity was fixed for the other one
+                        # -- a capacity error at best, and at worst a silent
+                        # mis-plan. Refuse at construction, where the two
+                        # numbers are both in scope.
+                        raise ValueError(
+                            f"slot pool wants {self.pages_per_slot} pages/slot but layer {i} "
+                            f"was built for max_seq_len={layer_max} "
+                            f"({layer_pages} pages); load the model with the same "
+                            "max_seq_len the backend is given"
+                        )
                 geometry = {
                     "num_q_heads": attn.num_heads,
                     "num_kv_heads": attn.num_kv_heads,

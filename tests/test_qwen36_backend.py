@@ -207,6 +207,16 @@ class TestSlotLifecycle:
     def test_empty_decode_round_is_a_no_op(self) -> None:
         assert _backend().decode_batch_sampled([], [], [], []) == []
 
+    def test_prefill_into_a_dirty_slot_is_refused(self) -> None:
+        # Without this guard the GDN layers would continue from the previous
+        # sequence's recurrent state: no exception, no NaN, just a wrong
+        # continuation. That is INV-A3-1's symptom and the reason reset_slot
+        # zeroes rather than marks.
+        backend = _backend()
+        _run(backend, 0, [1, 2, 3], steps=1)
+        with pytest.raises(RuntimeError, match="must reset_slot first"):
+            backend.prefill_chunked_begin([0], [[4, 5, 6]])
+
 
 class TestPrefixCacheTwoFamilies:
     def test_cold_backend_reports_no_hit(self) -> None:
