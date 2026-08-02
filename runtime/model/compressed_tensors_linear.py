@@ -35,6 +35,8 @@ measured evidence (real safetensors headers, 2026-08-02) that:
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -42,6 +44,63 @@ from torch import nn
 from runtime.loading.compressed_tensors import dequantize_fp8_channel
 from runtime.loading.modelopt import NVFP4_GROUP_SIZE, dequantize_nvfp4
 from runtime.model._weight_loading import default_weight_loader
+
+#: Pre-flight-only diagnostic switch (2026-08-03, FP8 W8A8 B1-R pre-flight --
+#: see ``scripts/verify_fp8_w8a8_activation_emulation_single_layer.py`` and
+#: ``scripts/verify_fp8_w8a8_activation_emulation_full_model_gap.py``, the
+#: two consumers this flag exists for). Default OFF: production must never
+#: pay this, and must never even risk paying it
+#: through a stale env var left set in a shell -- ``forward()`` below reads
+#: this at call time (not cached at import time) specifically so a test can
+#: toggle it with ``monkeypatch.setenv``/``delenv`` and see the effect
+#: immediately, matching this codebase's existing ``QSR_*`` flag idiom (e.g.
+#: ``runtime/backends/laguna.py``'s ``QSR_PROFILE_MOE_PHASES``).
+QSR_EMULATE_FP8_ACTIVATION_ENV = "QSR_EMULATE_FP8_ACTIVATION"
+
+
+def _fp8_activation_emulation_enabled() -> bool:
+    return os.environ.get(QSR_EMULATE_FP8_ACTIVATION_ENV) == "1"
+
+
+def emulate_fp8_activation_round_trip(x: torch.Tensor) -> torch.Tensor:
+    """Per-token dynamic FP8 (E4M3) activation quantize/dequantize
+    round-trip -- emulates the DOMINANT new error term a genuine W8A8 GEMM
+    would add over today's dequantize-weight-to-BF16-and-``F.linear`` path,
+    without building an FP8xFP8 kernel.
+
+    Matches this checkpoint's own declared scheme for every FP8-channel
+    target (verified directly against the standard checkpoint's
+    ``config.json``, 2026-08-03: ``quantization_config.config_groups.
+    group_0.input_activations`` = ``{num_bits: 8, type: float, strategy:
+    "token", dynamic: true, symmetric: true}``) -- one scale per row (per
+    token), derived from that row's own max-abs value, never loaded from
+    the checkpoint (there is no ``.input_scale`` Parameter for this group;
+    see :class:`CompressedTensorsFP8ChannelLinear`'s docstring for why).
+    This is the compressed-tensors library's own standard per-token E4M3
+    recipe (``scale = amax / fp8_max``, symmetric, round-to-nearest via the
+    ``float8_e4m3fn`` cast, no zero-point), the same convention
+    ``scripts/verify_fp8_tensor_gemm_single_layer.py::quantize_activation_fp8``
+    already used for modelopt's *static per-tensor* FP8 scheme -- here
+    applied per-row instead of once for the whole tensor, because this
+    checkpoint's activation scale is dynamic and per-token, not static and
+    per-tensor (a different checkpoint, a different declared scheme -- see
+    that script's own docstring for why the two are not interchangeable).
+
+    This is a **lower bound** on real W8A8's error, not an equivalent of
+    it: a genuine ``sparkinfer``-style FP8xFP8 GEMM would also change
+    accumulation order relative to today's BF16xBF16 ``F.linear``, which
+    this round-trip does not touch (only the activation values change; the
+    GEMM itself still runs in BF16). See this module's docstring and
+    ``scripts/verify_fp8_w8a8_activation_emulation_full_model_gap.py`` for
+    what this is being used to decide (a B1-R gap-error gate) and why a
+    lower bound is sufficient for a negative verdict there.
+    """
+    fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)  # 448.0
+    x32 = x.to(torch.float32)
+    amax = x32.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+    scale = amax / fp8_max
+    x_fp8 = (x32 / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    return (x_fp8.to(torch.float32) * scale).to(x.dtype)
 
 
 class CompressedTensorsFP8ChannelLinear(nn.Module):
@@ -58,6 +117,20 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
     scale, computed at runtime for the intended FP8xFP8 GEMM this B1
     implementation does not perform), so there is nothing to ignore here the
     way modelopt's ``.input_scale`` is.
+
+    **FP8 W8A8 pre-flight (2026-08-03,** ``QSR_EMULATE_FP8_ACTIVATION``
+    **env flag, default OFF)**: :meth:`forward` optionally round-trips the
+    activation through :func:`emulate_fp8_activation_round_trip` before
+    ``F.linear`` -- a cheap way to measure a genuine W8A8 GEMM's *dominant*
+    new error source (activation quantization) without building an FP8xFP8
+    kernel, since the weight side is already dequantized exactly from the
+    checkpoint's real FP8 values either way. See
+    :func:`emulate_fp8_activation_round_trip`'s docstring for the scheme
+    and why it is a lower, not exact, bound, and
+    ``scripts/verify_fp8_w8a8_activation_emulation_full_model_gap.py`` for
+    the full-model verdict this flag was built to produce. Default OFF
+    means this can never affect production; nothing sets this env var
+    except a diagnostic script or a test.
     """
 
     def __init__(self, input_size: int, output_size: int, *, bias: bool = False) -> None:
@@ -90,6 +163,8 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         self._ensure_ready()
+        if _fp8_activation_emulation_enabled():
+            x = emulate_fp8_activation_round_trip(x)
         return F.linear(x, self._weight_bf16, self.bias)
 
 
@@ -251,9 +326,7 @@ class CompressedTensorsNVFP4Linear(nn.Module):
         this reciprocal produces degenerate output (``"!!!!!!!!!!!!"``,
         2026-08-03).
         """
-        reciprocal_global_scale = 1.0 / self.weight_global_scale.data.reshape(()).to(
-            torch.float32
-        )
+        reciprocal_global_scale = 1.0 / self.weight_global_scale.data.reshape(()).to(torch.float32)
         return self.weight_packed.data, self.weight_scale.data, reciprocal_global_scale
 
     def nvfp4_w4a4_components_for_fuse(
