@@ -229,7 +229,26 @@ def render(model_name: str) -> list[str]:
 # D2: Runtime-internal metrics (MTP acceptance, prefix cache, KV usage)
 # ---------------------------------------------------------------------------
 
-MTP_ACCEPT_BUCKETS = (0, 1, 2, 3, 4, 5, 6, 7, 8)  # 0..K accepted tokens
+def _accept_buckets() -> tuple[int, ...]:
+    """0..K, derived from the real speculative depth rather than written out.
+
+    This was a literal ``(0, ..., 8)`` while ``NUM_SPECULATIVE_TOKENS`` was 15
+    and ``ServerEngine.stats`` kept its own 5-wide list -- three numbers for one
+    quantity, none of them agreeing. A healthy DFlash round accepts most of its
+    drafts, so the buckets that mattered were exactly the ones that did not
+    exist: the better acceptance got, the smaller the fraction recorded.
+
+    Imported lazily because ``dflash_constants`` is a runtime module and this
+    one is imported by the torch-free CI job.
+    """
+    try:
+        from runtime.backends.dflash_constants import NUM_SPECULATIVE_TOKENS
+    except Exception:  # pragma: no cover - keeps /metrics alive if runtime moves
+        NUM_SPECULATIVE_TOKENS = 15
+    return tuple(range(NUM_SPECULATIVE_TOKENS + 1))
+
+
+MTP_ACCEPT_BUCKETS = _accept_buckets()  # 0..K accepted tokens
 
 # MTP acceptance per round (histogram of num_accepted per verify round)
 mtp_acceptance_histogram = _Histogram(MTP_ACCEPT_BUCKETS)

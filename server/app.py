@@ -1291,6 +1291,17 @@ async def metrics_endpoint():
         used_blocks = sum(
             (by_slot.get(s, 0) + engine.block_size - 1) // engine.block_size for s in engine.active
         )
+        # Feed the per-slot gauge here, where the per-slot numbers already
+        # exist. `record_slot_kv_usage` had zero callers, so D2's
+        # `slot_kv_usage_fraction` series was exported and never populated --
+        # and an empty series is omitted entirely, so it read as "no data yet"
+        # rather than as a broken pipe.
+        for slot in engine.active:
+            metrics.record_slot_kv_usage(
+                slot,
+                (by_slot.get(slot, 0) + engine.block_size - 1) // engine.block_size,
+                engine.blocks_per_slot,
+            )
     kv_usage = used_blocks / total_blocks if total_blocks > 0 else 0.0
 
     num_running = len(engine.active)

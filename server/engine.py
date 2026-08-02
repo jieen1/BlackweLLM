@@ -30,9 +30,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from runtime.architecture import ArchitectureSpec, parse_architecture
+from runtime.backends.dflash_constants import NUM_SPECULATIVE_TOKENS
 from runtime.model_registry import IMPLEMENTED_BACKENDS
 from runtime.sampling import SamplingParams
 from runtime.slot_resource_manager import SlotResourceManager
+from server import metrics
 from server.formats.stop import find_earliest_stop_match, trim_ambiguous_stop_tail
 from server.formats.stream import StreamProcessor
 from server.tracing import tracer
@@ -304,8 +306,12 @@ class ServerEngine:
             # per-slot isolation (verified: notes/2026-07-27-dflash-multi-slot-
             # concurrency.md), but N sequential single-token-batch replays,
             # not one batched N-wide replay like decode CG. No capacity cap.
-            from runtime.backends.dflash_constants import NUM_SPECULATIVE_TOKENS
-
+            # NUM_SPECULATIVE_TOKENS is imported at module scope. Importing it
+            # here as well made it a *local* of __init__ for the whole function
+            # body -- Python binds a name locally if it is assigned anywhere in
+            # the function -- so the histogram sizing below raised
+            # UnboundLocalError whenever this branch was not taken. Caught by
+            # the full suite (25 failures), not by review.
             self.K = NUM_SPECULATIVE_TOKENS
 
         # CUDA Graph slot budget:
@@ -446,7 +452,11 @@ class ServerEngine:
             "timeouts": 0,
             "watchdog_triggers": 0,
             "watchdog_events": [],
-            "mtp_acceptance_histogram": [0] * 5,
+            # Width follows NUM_SPECULATIVE_TOKENS (+1 for the 0 bucket, +1 for
+            # overflow). It was a bare 5 while K was 15, so `elif 0 <= na <
+            # len(...)` silently dropped every round accepting 5 or more --
+            # i.e. the healthier acceptance was, the less of it got recorded.
+            "mtp_acceptance_histogram": [0] * (NUM_SPECULATIVE_TOKENS + 2),
             "sampled_decode_rounds": 0,
             # E2-b (docs/e2e-and-quality-plan.md §2.2): non-greedy MTP rounds'
             # acceptance is tracked SEPARATELY from mtp_acceptance_histogram
@@ -1480,8 +1490,13 @@ class ServerEngine:
                     self.stats["mtp_sampled_total_accepted"] += na
                     self.stats["mtp_sampled_total_draft"] += len(st["drafts"])
                     self.stats["mtp_sampled_rounds"] += 1
-                elif 0 <= na < len(self.stats["mtp_acceptance_histogram"]):
-                    self.stats["mtp_acceptance_histogram"][na] += 1
+                elif na >= 0:
+                    # Clamp into a final overflow bucket rather than dropping:
+                    # a discarded sample is indistinguishable from one that
+                    # never happened, which is how this went unnoticed.
+                    hist = self.stats["mtp_acceptance_histogram"]
+                    hist[min(na, len(hist) - 1)] += 1
+                    metrics.record_mtp_acceptance(na)
 
                 # N2: a single MTP round can commit several draft tokens at
                 # once -- a stop sequence can land anywhere inside that
