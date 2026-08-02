@@ -1801,12 +1801,13 @@ class DFlashEngine:
         parameter is purely additive.
 
         The anchor/first token itself (``first_token`` above, from
-        ``prefill_with_aux``) is unaffected by ``params`` either way: it was
-        already chosen the same way for every request regardless of
-        temperature before E2-b, and closing that gap is out of this
-        change's scope (see ``docs/e2e-and-quality-plan.md`` §2.2 -- E2-b
-        is specifically about the DRAFT/verify speculative loop, not the
-        anchor token selection admission already does).
+        ``prefill_with_aux``) is, as of E-N1-b0
+        (docs/e2e-and-quality-plan.md §2.3), ALSO sampled -- not argmax'd --
+        when ``params`` is non-greedy: ``params`` is forwarded straight
+        through to ``backend.prefill_with_aux``, which does the sampling
+        (see its docstring). Before E-N1-b0 this was unconditionally
+        argmax'd regardless of temperature; ``None`` (the default) or greedy
+        ``params`` still preserves that exact prior behavior byte-for-byte.
 
         Returns ``{"anchor": int, "draft_tokens": list[int]}``.
         """
@@ -1815,6 +1816,7 @@ class DFlashEngine:
             slot,
             prompt_ids,
             prefix_hit=prefix_hit,
+            params=params,
         )
 
         if aux_hidden_states is not None:

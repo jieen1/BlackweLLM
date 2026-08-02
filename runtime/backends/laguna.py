@@ -136,6 +136,25 @@ def _physical_slot(slot: int) -> int:
     return slot + RESERVED_PHYSICAL_SLOTS
 
 
+def _select_anchor_token(logits: torch.Tensor, params: SamplingParams | None) -> int:
+    """Select the anchor/first token from prefill logits (E-N1-b0,
+    docs/e2e-and-quality-plan.md).
+
+    ``params is None`` or greedy (``temperature <= 0``) preserves the prior
+    behavior byte-for-byte: ``int(logits[-1].argmax(dim=-1).item())``, the
+    exact same computation, just routed through this helper. A non-greedy
+    ``params`` instead samples the anchor from ``temperature``/``top_k``/
+    ``top_p`` the SAME way ``prefill_sampled`` already does for its (dead,
+    production-unreachable) caller -- this is that logic finally reaching a
+    live admission path.
+    """
+    if params is not None and not params.is_greedy:
+        last_logits = logits[-1].unsqueeze(0)
+        gen = make_generator(params.seed)
+        return int(sample_from_logits(last_logits, params, generator=gen).item())
+    return int(logits[-1].argmax(dim=-1).item())
+
+
 def _prefill_chunk_ranges(
     start: int,
     end: int,
@@ -1701,6 +1720,7 @@ class LagunaBackend:
         prompt_ids: list[int],
         *,
         prefix_hit: int = 0,
+        params: SamplingParams | None = None,
     ) -> tuple[int, list[torch.Tensor] | None]:
         """Prefill prompt and return (first_token, aux_hidden_states).
 
@@ -1718,13 +1738,20 @@ class LagunaBackend:
         Processes long suffixes in chunks of PREFILL_CHUNK_SIZE tokens to
         reduce peak GPU memory. Only returns aux hidden states from the
         last chunk (sufficient for DFlash's initial context precompute).
+
+        ``params`` (E-N1-b0, docs/e2e-and-quality-plan.md §2.3): when given
+        and non-greedy (``temperature>0``), the returned ``first_token`` (the
+        anchor) is sampled from ``params`` via ``_select_anchor_token``
+        instead of always argmax'd. ``None`` (the default) or greedy
+        ``params`` preserves this function's exact prior behavior
+        byte-for-byte -- this parameter is purely additive.
         """
         prompt_len = len(prompt_ids)
         PREFILL_CHUNK = self._prefill_chunk_tokens
         self._prefix_chunk_snapshots[slot] = None
 
         if prefix_hit > 0:
-            return self._prefill_with_prefix_hit(slot, prompt_ids, prefix_hit)
+            return self._prefill_with_prefix_hit(slot, prompt_ids, prefix_hit, params=params)
 
         # --- Cold path (no prefix hit) ---
         if prompt_len <= PREFILL_CHUNK and self._swa_scratch is not None:
@@ -1815,7 +1842,7 @@ class LagunaBackend:
                 if chunk_end == snapshot_boundary:
                     self._capture_prefix_chunk_snapshot(slot, chunk_end)
 
-        first_token = int(logits[-1].argmax(dim=-1).item())
+        first_token = _select_anchor_token(logits, params)
         self.slot_kv_len[slot] = prompt_len
         self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
         return first_token, aux
@@ -1825,6 +1852,8 @@ class LagunaBackend:
         slot: int,
         prompt_ids: list[int],
         prefix_hit: int,
+        *,
+        params: SamplingParams | None = None,
     ) -> tuple[int, list[torch.Tensor] | None]:
         """Prefix-cache-aware prefill: skip [0, prefix_hit), process suffix.
 
@@ -1951,7 +1980,7 @@ class LagunaBackend:
                             skip_logits=True,
                         )
 
-        first_token = int(logits[-1].argmax(dim=-1).item())
+        first_token = _select_anchor_token(logits, params)
         self.slot_kv_len[slot] = prompt_len
         self.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
         return first_token, aux
@@ -2291,6 +2320,13 @@ class LagunaBackend:
         see that function's docstring. ``None`` (the default) or a missing
         entry for a given slot preserves this function's exact prior
         behavior for that slot.
+
+        As of E-N1-b0 (docs/e2e-and-quality-plan.md §2.3), the same
+        per-slot ``SamplingParams`` is also forwarded to
+        ``prefill_with_aux``/``dflash_prefill_bootstrap`` for the ANCHOR
+        (first) token itself: a non-greedy slot's anchor is now sampled,
+        not always argmax'd. Greedy (or missing) params still produce the
+        anchor byte-for-byte as before.
         """
         if len(slots) != len(prompts_per_slot):
             raise ValueError("slots and prompts_per_slot must have equal length")
@@ -2325,6 +2361,7 @@ class LagunaBackend:
                         slot,
                         prompt,
                         prefix_hit=prefix_hit,
+                        params=slot_params,
                     )
                     result[slot] = {"anchor": first_token, "draft_tokens": []}
             else:
@@ -2333,7 +2370,7 @@ class LagunaBackend:
                         slot, prompt, params=slot_params
                     )
                 else:
-                    first_token, _ = self.prefill_with_aux(slot, prompt)
+                    first_token, _ = self.prefill_with_aux(slot, prompt, params=slot_params)
                     result[slot] = {"anchor": first_token, "draft_tokens": []}
         # Clear any stale pending hits for slots not in this batch
         self._pending_prefix_hits.clear()
