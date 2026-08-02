@@ -504,7 +504,9 @@ class ServerEngine:
         "constructed after ``self.runner`` exists" for whatever caller reads
         it, real load or fake.
         """
-        return SlotResourceManager(self.runner, self.architecture_spec)
+        return SlotResourceManager(
+            self.runner, self.architecture_spec, block_size=self.block_size
+        )
 
     # -- model loading (engine thread only) --------------------------------
     def _load_model(self) -> None:

@@ -259,6 +259,50 @@ class Qwen36PagedAttentionCache:
         self.page_table = self.page_table.unsqueeze(0)  # [1, num_pages]
         self.seq_len = 0  # tokens currently resident
 
+    @classmethod
+    def wrap(
+        cls,
+        *,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_size: int,
+    ) -> Qwen36PagedAttentionCache:
+        """Build a cache **over storage someone else owns** (B2's slot pool).
+
+        ``k_cache``/``v_cache`` are ``[num_pages, page_size, num_kv_heads,
+        head_dim]`` slices of a per-layer pool -- for slot ``s`` with
+        ``P`` pages each, ``pool[s*P:(s+1)*P]``, which is contiguous, so
+        this view's *local* page ids ``0..P-1`` address exactly slot
+        ``s``'s own pages and nothing else. That is what lets B2's
+        single-slot path (prefill, and eager per-slot decode) be the
+        **same code** ``__init__``-allocated caches run in B1: identical
+        page table, identical ``append`` arithmetic, identical kernel
+        call. The batched decode path addresses the same bytes through
+        the *global* page table instead (``slot*P + local``); both views
+        are over one allocation, so they never disagree.
+
+        Deliberately a second constructor rather than an ``__init__``
+        keyword: ``__init__`` allocating is the invariant B1's callers
+        rely on, and a ``storage=None`` parameter would make "who owns
+        this memory" a runtime question at every call site instead of a
+        choice visible in the constructor's name.
+        """
+        obj = cls.__new__(cls)
+        obj.page_size = page_size
+        obj.num_pages = int(k_cache.shape[0])
+        obj.max_seq_len = obj.num_pages * page_size
+        obj.num_kv_heads = int(k_cache.shape[2])
+        obj.head_dim = int(k_cache.shape[3])
+        obj.dtype = k_cache.dtype
+        obj.device = k_cache.device
+        obj.k_cache = k_cache
+        obj.v_cache = v_cache
+        obj.page_table = torch.arange(
+            obj.num_pages, dtype=torch.int32, device=k_cache.device
+        ).unsqueeze(0)
+        obj.seq_len = 0
+        return obj
+
     def append(self, new_k: torch.Tensor, new_v: torch.Tensor) -> tuple[int, int]:
         """Write ``new_k``/``new_v`` (``[seq_len, num_kv_heads, head_dim]``)
         at the tail, scattering across page boundaries as needed. Returns
@@ -278,6 +322,44 @@ class Qwen36PagedAttentionCache:
         self.v_cache[page_ids, offsets] = new_v.to(self.dtype)
         self.seq_len = new_total
         return past_len, new_total
+
+
+@dataclass
+class Qwen36DecodeBatch:
+    """Everything one batched decode step needs, addressed globally (B2).
+
+    Built once per step by :class:`runtime.model.qwen36_slots.Qwen36SlotPool`
+    and threaded down to the layers, so no layer has to know what a "slot"
+    is: by the time this object exists, slot identity has already been
+    reduced to (a) ``slot_index``, the one gather/scatter key the recurrent
+    layers use, and (b) ``page_table``/``write_index``, the global KV
+    addresses the attention layers use.
+
+    Lists are indexed by **global layer index** and carry ``None`` for
+    layers of the other kind, exactly like
+    :class:`Qwen36GenerationState` -- same convention, so the two paths
+    stay readable against each other.
+
+    Every tensor here is a persistent buffer owned by the pool, refilled
+    in place each step. That is what makes the whole step CUDA-Graph
+    replayable: a replay re-reads these same addresses, so "run the graph"
+    and "run eager" differ only in whether the pool's contents were
+    updated before the launch.
+    """
+
+    input_ids: torch.Tensor  # [B, 1] int64
+    positions: torch.Tensor  # [B] int64
+    cache_seqlens: torch.Tensor  # [B] int32, INCLUDING this step's token
+    cu_seqlens_q: torch.Tensor  # [B+1] int32 == arange(B+1)
+    page_table: torch.Tensor  # [B, pages_per_slot] int32, global page ids
+    write_index: torch.Tensor  # [B] int64, flat row into k_pool.view(-1, H, D)
+    slot_index: torch.Tensor  # [B] int64, which pool row each batch entry is
+    k_pools: list[torch.Tensor | None]
+    v_pools: list[torch.Tensor | None]
+    conv_pools: list[torch.Tensor | None]
+    recurrent_pools: list[torch.Tensor | None]
+    workspaces: list[Any]
+    attn_outputs: list[torch.Tensor | None]
 
 
 @dataclass
@@ -469,8 +551,92 @@ class Qwen36GatedDeltaNet(nn.Module):
         # explicitly round the persisted copy back down here, matching
         # transformers/cache_utils.py's LinearAttentionLayer exactly
         # rather than relying on an implicit dtype coercion somewhere.
-        state.recurrent_state = last_state.to(state.recurrent_state.dtype)
+        #
+        # ``.copy_()``, never rebinding (B2): this used to be
+        # ``state.recurrent_state = last_state.to(dtype)``, which allocates
+        # a fresh tensor and rebinds the Python attribute. That is the one
+        # thing B0-5 identified as fatal for CUDA Graph capture
+        # (notes/2026-08-02-trackB-b0-gpu-facts.md §B0-5: "状态 buffer 只分配
+        # 一次、mark_static_address 标记、永远 .copy_() 写回、永不重新绑定
+        # 引用"), and it also breaks pooling: B2 hands this dataclass a
+        # *view* into a per-slot pool buffer (runtime/model/qwen36_slots.py),
+        # and a rebind would silently detach the sequence from its own slot
+        # -- the state would keep being computed correctly and keep being
+        # thrown away. Numerically identical: both round fp32 -> bf16 with
+        # torch's single round-to-nearest-even path.
+        state.recurrent_state.copy_(last_state)
         state.has_previous_state = True
+
+        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
+        z_flat = z.reshape(-1, self.head_v_dim)
+        core_attn_out = self.norm(core_attn_out, z_flat)
+        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+
+        return self.out_proj(core_attn_out)
+
+    def decode_batch(
+        self,
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+    ) -> torch.Tensor:
+        """One decode step for ``B`` independent sequences at once (B2).
+
+        ``hidden_states`` is ``[B, 1, hidden_size]``; ``conv_state`` is
+        ``[B, conv_dim, conv_kernel_size]`` and ``recurrent_state`` is
+        ``[B, num_v_heads, head_k_dim, head_v_dim]``, both **written in
+        place** (``.copy_()``, never rebound -- see :meth:`forward`).
+
+        This is :meth:`forward`'s ``state.has_previous_state and
+        seq_len == 1`` branch with the batch axis left free instead of
+        asserted to 1. Every op in it is already batch-elementwise:
+        ``torch.cat``/``F.conv1d`` with ``groups=conv_dim`` treat dim 0 as
+        independent, and FLA's ``fused_recurrent_gated_delta_rule``
+        parallelizes over ``(batch, head)`` -- so B==1 through here must
+        reproduce :meth:`forward` bit-for-bit, which is a claim B2's GPU
+        gate checks rather than assumes (a per-batch-element reduction
+        order change would be invisible to any shape assertion).
+
+        Callers hand batched (gathered) state rather than a per-slot view
+        on purpose: the gather/scatter is the only place slot identity
+        enters, so nothing below this line needs to know which physical
+        slot a row came from -- which is also what makes the whole call
+        CUDA-Graph replayable against a fixed index buffer.
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        assert seq_len == 1, "decode_batch is the single-token continuation path"
+
+        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)  # [b, conv_dim, 1]
+        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
+        b = self.in_proj_b(hidden_states)
+        a = self.in_proj_a(hidden_states)
+
+        state_len = conv_state.shape[-1]
+        catted = torch.cat([conv_state, mixed_qkv], dim=-1).to(self.conv1d.weight.dtype)
+        conv_state.copy_(catted[:, :, -state_len:])
+        out = F.conv1d(catted, self.conv1d.weight, bias=None, padding=0, groups=self.conv_dim)
+        mixed_qkv = F.silu(out[:, :, -seq_len:])
+
+        mixed_qkv = mixed_qkv.transpose(1, 2)  # [b, 1, conv_dim]
+        split_sizes = [self.key_dim, self.key_dim, self.value_dim]
+        query, key, value = torch.split(mixed_qkv, split_sizes, dim=-1)
+        query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+
+        beta = b.sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+
+        if self.repeat > 1:
+            query = query.repeat_interleave(self.repeat, dim=2)
+            key = key.repeat_interleave(self.repeat, dim=2)
+
+        core_attn_out, last_state = fused_recurrent_gated_delta_rule(
+            query, key, value, g=g, beta=beta,
+            initial_state=recurrent_state, output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+        recurrent_state.copy_(last_state)
 
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z_flat = z.reshape(-1, self.head_v_dim)
@@ -614,10 +780,12 @@ class Qwen36AttentionWorkspace:
         dtype: torch.dtype,
         kv_dtype: torch.dtype,
         device: torch.device,
+        max_batch: int = 1,
     ) -> None:
         if mode not in ("extend", "decode"):
             raise ValueError(f"Qwen36AttentionWorkspace: unsupported mode {mode!r}")
         self.mode = mode
+        self.max_batch = max_batch
         self._descale = torch.ones(1, dtype=torch.float32, device=device)
         # eager_extend_work_items_capacity is sparkinfer's own estimator
         # for exactly this pair of modes (its name and design track
@@ -639,7 +807,7 @@ class Qwen36AttentionWorkspace:
             head_dim_vo=head_dim,
             page_size=page_size,
             max_total_q=max_total_q,
-            max_batch=1,
+            max_batch=max_batch,
             max_page_table_width=max_page_table_width,
             max_work_items=max_work_items,
             max_partial_rows=0,  # matches PagedExtendGraphCapacity: no split-KV merge buffer
@@ -652,7 +820,7 @@ class Qwen36AttentionWorkspace:
         # from the live request's query length. See the class docstring.
         self._plan_budget = PagedPlanBudget(
             max_total_q=max_total_q,
-            max_batch=1,
+            max_batch=max_batch,
             max_page_table_width=max_page_table_width,
         )
         self._prepared_metadata: object | None = None
@@ -838,6 +1006,87 @@ class Qwen36Attention(nn.Module):
         attn_out = attn_out * torch.sigmoid(gate)
         return self.o_proj(attn_out)
 
+    def decode_batch(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        *,
+        k_pool: torch.Tensor,
+        v_pool: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        write_index: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        workspace: Qwen36AttentionWorkspace,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """One decode step for ``B`` sequences sharing this layer's KV pool.
+
+        Unlike :meth:`forward`, which owns a single sequence's cache object
+        and appends through it, this takes the **whole layer pool** plus
+        pre-computed global addresses:
+
+        * ``k_pool``/``v_pool``: ``[num_pages_total, page_size,
+          num_kv_heads, head_dim]`` -- every slot's pages in one
+          allocation.
+        * ``page_table``: ``[B, pages_per_slot]`` int32, **global** page
+          ids (slot ``s``'s local page ``p`` is ``s * pages_per_slot + p``).
+        * ``write_index``: ``[B]`` int64, flat row index into
+          ``k_pool.view(-1, num_kv_heads, head_dim)`` for this step's new
+          token -- i.e. ``global_page * page_size + offset``. Computed by
+          the caller because it depends only on each slot's ``kv_len``,
+          which the slot bookkeeping already owns; doing it here would
+          mean handing this layer slot identities it otherwise never sees.
+        * ``cache_seqlens``: ``[B]`` int32, each sequence's length
+          **including** the token written this step.
+
+        ``output`` and ``workspace`` are caller-owned so a CUDA Graph
+        capture can pin them; every tensor this method touches is either
+        an argument or derived by a shape-stable op, so nothing here
+        allocates a buffer whose address a replay could invalidate.
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        assert seq_len == 1, "decode_batch is the single-token continuation path"
+
+        q_and_gate = self.q_proj(hidden_states)
+        q_and_gate = q_and_gate.view(batch_size, self.num_heads, self.head_dim * 2)
+        query, gate = torch.chunk(q_and_gate, 2, dim=-1)
+        gate = gate.reshape(batch_size, 1, -1)
+
+        kv_shape = (batch_size, self.num_kv_heads, self.head_dim)
+        query = self.q_norm(query)
+        key = self.k_norm(self.k_proj(hidden_states).view(*kv_shape))
+        value = self.v_proj(hidden_states).view(*kv_shape)
+
+        query_flat = query.reshape(batch_size, self.num_heads * self.head_dim).contiguous()
+        key_flat = key.reshape(batch_size, self.num_kv_heads * self.head_dim).contiguous()
+        apply_rotary_embedding_inplace(positions, query_flat, self.head_dim, cos_sin_cache)
+        apply_rotary_embedding_inplace(positions, key_flat, self.head_dim, cos_sin_cache)
+        query = query_flat.view(batch_size, self.num_heads, self.head_dim)
+        key = key_flat.view(batch_size, self.num_kv_heads, self.head_dim)
+
+        k_flat = k_pool.view(-1, self.num_kv_heads, self.head_dim)
+        v_flat = v_pool.view(-1, self.num_kv_heads, self.head_dim)
+        k_flat.index_copy_(0, write_index, key.to(k_pool.dtype))
+        v_flat.index_copy_(0, write_index, value.to(v_pool.dtype))
+
+        needs_cast = query.dtype != k_pool.dtype
+        q_for_kernel = query.to(k_pool.dtype) if needs_cast else query
+        workspace.forward(
+            q=q_for_kernel,
+            k_cache=k_pool,
+            v_cache=v_pool,
+            output=output,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+        )
+
+        attn_out = output.reshape(batch_size, 1, -1)
+        attn_out = attn_out * torch.sigmoid(gate)
+        return self.o_proj(attn_out)
+
 
 # ---------------------------------------------------------------------------
 # Dense SwiGLU MLP.
@@ -911,6 +1160,54 @@ class Qwen36DecoderLayer(nn.Module):
         else:
             assert attn_cache is not None
             hidden_states = self.self_attn(hidden_states, positions, cos_sin_cache, attn_cache)
+
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return residual + hidden_states
+
+    def decode_batch(
+        self,
+        hidden_states: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        batch: Qwen36DecodeBatch,
+    ) -> torch.Tensor:
+        """:meth:`forward`'s structure with the batched, globally addressed
+        decode kernels substituted for the single-sequence ones.
+
+        The gather/scatter of the recurrent state lives here rather than
+        inside :meth:`Qwen36GatedDeltaNet.decode_batch` so that method
+        stays a pure function of its arguments (see its docstring): this
+        is the only place in the decode path where "batch row i is slot
+        ``slot_index[i]``" is known.
+        """
+        i = self.layer_idx
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        if self.layer_type == "linear_attention":
+            slot_index = batch.slot_index
+            conv = batch.conv_pools[i].index_select(0, slot_index)
+            recurrent = batch.recurrent_pools[i].index_select(0, slot_index)
+            hidden_states = self.linear_attn.decode_batch(hidden_states, conv, recurrent)
+            batch.conv_pools[i].index_copy_(0, slot_index, conv)
+            batch.recurrent_pools[i].index_copy_(0, slot_index, recurrent)
+        else:
+            hidden_states = self.self_attn.decode_batch(
+                hidden_states,
+                batch.positions,
+                cos_sin_cache,
+                k_pool=batch.k_pools[i],
+                v_pool=batch.v_pools[i],
+                page_table=batch.page_table,
+                cache_seqlens=batch.cache_seqlens,
+                write_index=batch.write_index,
+                cu_seqlens_q=batch.cu_seqlens_q,
+                workspace=batch.workspaces[i],
+                output=batch.attn_outputs[i],
+            )
 
         hidden_states = residual + hidden_states
 
@@ -1017,6 +1314,22 @@ class Qwen36TextModelSelfBuilt(nn.Module):
             return hidden_states, per_layer_hidden
         return hidden_states
 
+    def decode_batch(self, batch: Qwen36DecodeBatch) -> torch.Tensor:
+        """Batched single-token continuation for ``B`` slots -> ``[B, 1, H]``.
+
+        Deliberately does **not** touch any Python-side bookkeeping (no
+        ``state.num_tokens_seen +=``): every quantity this step depends on
+        arrives pre-computed inside ``batch``'s device tensors, which is
+        the property that lets the whole call be captured into a CUDA
+        Graph and replayed. Advancing lengths is the slot pool's job, on
+        the host, outside the graph.
+        """
+        hidden_states = self.embed_tokens(batch.input_ids)
+        cos_sin_cache = self.cos_sin_cache
+        for layer in self.layers:
+            hidden_states = layer.decode_batch(hidden_states, cos_sin_cache, batch)
+        return self.norm(hidden_states)
+
 
 class Qwen36ForCausalLMSelfBuilt(nn.Module):
     """Top-level model: :class:`Qwen36TextModelSelfBuilt` + ``lm_head``
@@ -1099,6 +1412,16 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         capture_hidden_states: bool = False,
     ):
         return self.model(input_ids, state, capture_hidden_states=capture_hidden_states)
+
+    def decode_batch(self, batch: Qwen36DecodeBatch) -> torch.Tensor:
+        """Batched decode -> ``[B, vocab_size]`` logits (B2).
+
+        Returns logits, not hidden states, because that is the whole of
+        what a decode step is for and because keeping ``lm_head`` inside
+        the graphed region is what makes a captured step self-contained.
+        """
+        hidden_states = self.model.decode_batch(batch)
+        return self.lm_head(hidden_states.reshape(hidden_states.shape[0], -1))
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
