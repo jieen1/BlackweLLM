@@ -38,7 +38,7 @@ Track B 要把 Qwen3.6 在自研框架里重建出来，性能目标不能凭印
 | 成分 | 占差距 | 证据 |
 |---|---:|---|
 | **TTFT / prefill 调度**（缺跨步交错的 chunked prefill） | **60–70%** | 25.7 s vs 4.4 s |
-| **接受长度**（3.3 vs 4.85 tokens/step） | 20–25% | kernel 数值分歧导致 |
+| ~~**接受长度**（3.3 vs 4.85 tokens/step）~~ | ~~20–25%~~ | 🔴 **这一行作废**（2026-08-03 更正）——「原生 4.85」是 `benchmarks/native_warm_compare.py` 的 Prometheus 抓取**双重计数 bug**：`"num_accepted_tokens" in metric_name` 同时匹配了主计数器和 per-position 计数器，把原生**膨胀约 2×**（修复：第 101 行加 `"per_pos" not in metric_name`）。**修正后 128K/c=4：原生 64.2% / 2.926，我们 66.7% / 3.0 —— 我们略优于原生。** 见 `2026-08-03-historical-implementation-survey.md` §4.6 |
 | 稳态 decode 步时 | 10–15% | 15 vs 20 ms/step，基本持平 |
 
 ### 稳态 decode 步内部构成
@@ -88,7 +88,9 @@ Track B 要把 Qwen3.6 在自研框架里重建出来，性能目标不能凭印
    ⚠️ 与今天已知的另一件事叠加会更糟：sparkinfer JIT **按每个不同 `(seq_len, cache_seqlens)`
    形状重编译**，B1 实测一个 8-token prompt 付了 ~24 秒（`implementation-plan.md` §7.1 B0-3）。
    **prefill 侧同时背着"调度不交错"和"每个新形状重编译"两个问题。**
-3. **接受长度（3.3 vs 4.85）当年归因于 kernel 数值分歧**——今天换了 sparkinfer + FLA，
+3. ~~**接受长度（3.3 vs 4.85）当年归因于 kernel 数值分歧**~~ 🔴 **前提已作废**（见上表）：
+   原生那个 4.85 是 benchmark 双重计数造成的，修正后我们（3.0）反而略优于原生（2.926）。
+   **「接受长度落后于原生」这个问题当年就不存在。** 下面这段保留存证——今天换了 sparkinfer + FLA，
    这条要重测，不能沿用。
 4. 报告口径必须同时给 **含 TTFT** 与 **稳态** 两个数，否则会重演"稳态赢了但标题输了"的误读。
 
