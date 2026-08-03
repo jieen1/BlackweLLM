@@ -173,6 +173,15 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       **⇒ 那 24.8% 的 `cutlass_80_wmma` 看着刺眼，但没有更好的替代品。**
       ② 回收 FP8 反量化缓存 —— ✅ 已做（见生产显存审计那条，实收 5.79 GiB）。
       详见 [`../notes/2026-08-03-stage4-kernel-levers-exhausted.md`](../notes/2026-08-03-stage4-kernel-levers-exhausted.md)。
+- [ ] 🔴 **但"因此没得优化了"这个总结已被推翻(同日晚)——decode 步比历史慢约 1.6×。**
+      按每步实际读取量换算有效带宽:**历史 564 GB/s(128K/c=4)vs 今天 343 GB/s(短上下文/c=4)**,
+      而且历史还额外扛着 128K 的 attention。**同模型、同卡。**
+      **"已 kernel-bound"不等于"kernel 已最优"**——上面四条否定各自仍成立,
+      但缺口在**当前 kernel 组合本身比历史那套慢**,不在"没有杠杆"。
+      见 [`../notes/2026-08-03-performance-gap-vs-historical.md`](../notes/2026-08-03-performance-gap-vs-historical.md)。
+      **下一步:在 128K/c=4 同口径实测坐实,然后按历史文档的分解逐项对账。**
+- [ ] 🔴 **MTP 接受长度退化 2.75×**:历史 3.3 tokens/step,今天 1.20。
+      疑似根因已定位((token,hidden) 配对错误,修复已合入),**实际改善待 GPU 实测**。
 - [x] ~~**`assert_all_params_loaded` 是单向的**~~ —— **已补反向检查**（`0ddab29`：`warn_on_unconsumed_tensor_families`，按名字尾部分族，警告而非抛错）。原记录：：保证"每个模型参数都拿到 checkpoint 张量"，
       **不保证"每个 checkpoint 张量都被消费"**。`input_global_scale` 因此被静默丢弃了很久
       （W4A4 调查时才发现，本次无害但盲区是真的）。补一个反向检查。
