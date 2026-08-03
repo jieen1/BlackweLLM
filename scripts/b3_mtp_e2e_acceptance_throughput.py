@@ -50,6 +50,7 @@ Run: ~/.venvs/vllm/bin/python scripts/b3_mtp_e2e_acceptance_throughput.py
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -79,7 +80,11 @@ from runtime.mtp_accept import determine_accept_reject_from_predictions  # noqa:
 # standard checkpoint may change them enough to change those conclusions.
 MODEL_PATH = standard_checkpoint_path()
 DEVICE = torch.device("cuda")
-MAX_SEQ_LEN = 256
+# Derived from N_TOKENS below rather than fixed, so raising the generation
+# depth does not hit "Qwen36PagedAttentionCache overflow" instead of
+# measuring anything. Headroom covers the prompt plus the K drafts a round
+# writes speculatively before commit rewinds them.
+MAX_SEQ_LEN = max(256, int(os.environ.get("QSR_B3_N_TOKENS", "32")) + 256)
 # Draft tokens per speculative round. 4, not 8.
 #
 # 8 was picked when the head was first wired up, for no measured reason. The
@@ -99,7 +104,13 @@ MAX_SEQ_LEN = 256
 # ServerEngine, so "4 beats 8" is trustworthy and "1.38x" is not a production
 # number. See notes/2026-08-02-b3b-acceptance-rate-vs-k.md.
 K = 4
-N_TOKENS = 32  # tokens to generate per prompt (both paths)
+# Tokens to generate per prompt (both paths). Overridable because acceptance
+# is strongly depth-dependent, so a single depth is not a characterization:
+# the historical survey measured its OWN acceptance moving 76.81% -> 94.46%
+# between short requests and 4x2000-token outputs
+# (notes/2026-08-03-historical-implementation-survey.md:484). Any acceptance
+# figure has to be quoted with the depth it came from.
+N_TOKENS = int(os.environ.get("QSR_B3_N_TOKENS", "32"))
 
 PROMPTS = {
     "prose": "Once upon a time, in a small village near the mountains,",
