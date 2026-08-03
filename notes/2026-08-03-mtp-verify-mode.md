@@ -447,3 +447,64 @@ M-2 = 给 verify 建一套与 `Qwen36DecodeGraphAttention` 对等的批量驱动
 没接线的部件。
 
 **这是 MTP 距离"服务形态下真正可用"唯一剩下的结构性缺口。**
+
+## 十一、M-2 的历史蓝图（照抄，不重新设计）
+
+`oracle/qwen36_vllm/backends/qwen36.py:48` + `metadata_builders.py:524`。
+
+### 结构
+
+```python
+def verify_batch_spec(slot_ids, draft_token_ids, kv_lengths, *,
+                      num_accepted_tokens_prev, return_hidden=False):
+    qo_len = len(draft_token_ids[0])
+    return self._r._forward_batch(
+        slot_ids, draft_token_ids, kv_lengths,
+        qo_len=qo_len, commit=False, return_hidden=return_hidden,
+        fixed_kv_split_size=self._r.decode_fixed_kv_split_size,
+        fixed_max_num_splits=self._r.decode_fixed_max_num_splits,
+        gdn_spec_num_accepted_tokens_prev=num_accepted_tokens_prev,
+    )
+```
+
+它是 **`verify_batch` 的兄弟方法，唯一差别是 GDN 元数据构造**。注意力那半完全
+复用已有的批量前向。
+
+### 五条直接决定实现的约束
+
+1. **`qo_len` 恒等于 `num_spec + 1`** —— 原文：「the K draft continuations
+   + 1 bonus/anchor position」。这正是本仓库 §七 刚做的合并前向；历史从第一天
+   就是这个形状。
+2. **各槽 `qo_len` 统一，不做 ragged**：「every slot in one spec-decode verify
+   call always submits the SAME K+1-token draft (a global engine config),
+   matching ``verify_batch``'s own existing uniform-qo_len contract」。
+   → M-2 **不需要**处理不等长批，`spec_query_start_loc = arange(B+1) * qo_len`。
+3. **列数是 `qo_len`（= k+1），不是 k+2**：
+   `[[_ssm_spec_row(slot, col, ...) for col in range(qo_len)] for slot in slots]`。
+   历史的列 `c` 存「位置 `c` **之后**」的状态，入态**不单独占一行**——靠
+   `num_accepted_tokens_prev[i] - 1` 选上一轮写过的列。
+   → 本仓库当前用 k+2（列 0 专放入态）是**多花一行**（~80 MiB/槽）。正确性
+   等价，但要"超越"就该收敛到 k+1。
+4. **`num_accepted_tokens_prev`** 是每槽上一轮的真实提交长度，**首次 verify
+   恰好是 1**（prefill 后只提交了 anchor，选中列 0 —— 即 chunked prefill 自己
+   写进去的那一行）。这与 §七 的 `accepted_count = m + 1` 是同一件事。
+5. **`spec_token_indx`/`non_spec_token_indx`/`has_initial_state` 全部为 None**，
+   并给了理由：`num_prefills=0 and num_decodes=0` 分支直接
+   `mixed_qkv_spec = mixed_qkv`（无 `index_select`），且该分支从不读
+   `has_initial_state`——因为设计上不存在"全新"的 spec-decode 请求，每个槽在
+   首次 verify 前必定已经过真实 prefill。
+
+### 还要照抄的一条教训
+
+`fixed_kv_split_size`/`fixed_max_num_splits` 取自 `decode_fixed_*`，
+**图和 eager 必须读同一份**。`survey.md:547` 记着血的教训：图里留了一份过期的
+`TARGET_SPLITS=16`、eager 是 64，归约顺序不同，把接受率从 70.29% 变成 76.67%
+的**假象**。做 M-2 时这两个值只能有一个来源。
+
+### 目标不是打平
+
+历史 128K/c=4 是 **174.30 accepted tok/s**（步 74.87 ms，committed/step 13.05）。
+那是它优化到最后的稳态数字，且它还带着我们已经修掉的一些开销（比如 §七 之前
+我们多跑的那次 anchor 前向，历史从来没有）。我们已有的领先项：verify 模式路由
+正确、每轮 105.9 ms 的单槽成本、GDN 多步内核一次发射 K+1 步。M-2 补齐批量后
+应当以**超过 174.30**（同上下文、同并发口径）为目标，而不是追平。
