@@ -544,6 +544,50 @@ class ServerEngine:
         else:
             self._load_laguna_model()
 
+    def _warmup_qwen36_full_forward(self) -> None:
+        """One real short prefill through the whole model, then reset the slot.
+
+        `Qwen36ForCausalLMSelfBuilt.warmup_attention_shapes` warms **only the
+        attention kernels** -- its own docstring says so, and explains the
+        reason: GDN's recurrent state is order-dependent (B0-5), so a real
+        forward would risk leaving a warmed-up state behind.
+
+        The consequence is that everything else stays cold until a user's
+        first request pays for it: the w4a16 fused MoE across all 56 NVFP4 MLP
+        layers (including `_ensure_w4a16_fused_ready`'s one-time fused-weight
+        preparation), the GDN recurrent kernels, `lm_head`. Measured, that is
+        the whole of the first-request TTFT anomaly -- 4.67s on the first
+        request against 0.25s on every one after it.
+
+        The historical vLLM-era runtime did exactly this and no more:
+        `oracle/qwen36_vllm/direct_model_runner.py:860`'s `_warmup` runs
+        `self.prefill(0, [0, 0, 0, 0, 0])` inside a `try/finally` whose
+        `finally` is `self.reset_slot(0)`. That is also the answer to the GDN
+        objection above: `reset_slot` zeroes the recurrent state, which is the
+        one operational requirement B0-5 attached to its capture-safe verdict
+        -- so a real forward is safe as long as the slot is reset afterwards.
+
+        Deliberately before CUDA Graph capture, matching the order the
+        Laguna+DFlash path already uses: capture wants the kernels it will
+        record to have been compiled already.
+
+        Failure here is logged and swallowed. A warmup that cannot run is a
+        latency problem on the first request, not a correctness one, and
+        refusing to start the server over it would trade a 4-second stall for
+        a total outage.
+        """
+        try:
+            state = self.runner.prefill_chunked_begin([0], [[0, 0, 0, 0, 0]])
+            while not state.done:
+                self.runner.prefill_chunked_step(state)
+        except Exception:
+            logger.exception("Qwen3.6 full-forward warmup failed; first request will be slow")
+        finally:
+            try:
+                self.runner.reset_slot(0)
+            except Exception:
+                logger.exception("reset_slot(0) failed after warmup")
+
     def _load_qwen36_model(self) -> None:
         """Load ``Qwen36Backend`` (Track B / B2, B3). MUST run on engine thread.
 
@@ -604,7 +648,36 @@ class ServerEngine:
             max_seq_len=max_model_len,
             enable_mtp=self.enable_mtp,
         )
-        self._prefill_chunk_size = 512  # unused: Qwen36Backend prefill is one-shot
+        # A5/B4: this is live again. Qwen36Backend.prefill_chunked_step now
+        # advances one chunk per round and returns done=False until the prompt
+        # is consumed, so the incremental branch below is reachable and a long
+        # admission no longer blocks active slots' decode.
+        #
+        # 2048, not 512, and the difference is not cosmetic. Measured on a 60k
+        # prompt against an already-decoding request (capacity=2, CG on):
+        #
+        #   one-shot     max stall 24,939 ms   prefill 25.7s   decode ITL   35 ms
+        #   chunk 512    max stall     688 ms  prefill 56.1s   decode ITL  367 ms
+        #
+        # Chunking at 512 does remove the stall -- 36x -- but turns 8 forwards
+        # into 118, so the prefill itself takes 2.2x longer and the concurrent
+        # request's steady-state ITL degrades 10x. Totalled over the short
+        # request's 220 tokens that is a net loss, despite the stall being
+        # gone: ~33s one-shot versus ~80s at chunk 512.
+        #
+        # So the chunk size is the actual knob here, trading stall length
+        # against per-forward overhead. Picking it from the measurements
+        # rather than by feel: prefill runs at ~2335 tok/s (60000/25.7s), so
+        # bounding a chunk at roughly one second of prefill gives ~2048
+        # tokens, i.e. ~30 rounds for a 60k prompt instead of 118.
+        #
+        # Worth stating because it revises something this repo already
+        # concluded: notes/2026-07-20-comprehensive-optimization-plan.md
+        # records intra-admission chunking (Phase A) as worth only -10.7%,
+        # which is true and is about chunking WITHOUT interleaving. It does
+        # not mean chunk size is irrelevant once interleaving exists -- here
+        # it is the parameter that decides whether interleaving pays at all.
+        self._prefill_chunk_size = 2048
         self.runner = Qwen36Backend(
             model,
             num_slots=self.num_slots,
@@ -614,6 +687,7 @@ class ServerEngine:
             dtype=torch.bfloat16,
             enable_prefix_cache=self.enable_prefix_cache,
         )
+        self._warmup_qwen36_full_forward()
         if self._enable_cudagraph:
             graph_batch_size = self.runner.capture_decode_cuda_graph()
             if graph_batch_size is not None:
