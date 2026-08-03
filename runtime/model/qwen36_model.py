@@ -1013,15 +1013,51 @@ class Qwen36GatedDeltaNet(nn.Module):
                 f"spec_state_rows has {len(spec_state_rows)} rows for seq_len={seq_len}; "
                 "expected K+1 rows"
             )
-        core_attn_out, recurrent_states = fused_recurrent_gated_delta_rule_multistep(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=state.recurrent_state,
-            output_all_states=True,
-        )
+        # The multistep kernel is CUDA + BF16 only. Production is exactly
+        # that, so it is the fast path -- but `spec_forward`'s own CPU
+        # equivalence gate builds a float32 layer on purpose (the layer's
+        # parameters are uninitialized allocations, so a CPU fixture is the
+        # only way to compare the row path against the snapshot oracle
+        # deterministically). Calling the kernel unconditionally makes that
+        # gate raise `q must be bfloat16`, i.e. removes the test that guards
+        # this exact code. Fall back to K sequential calls instead: same
+        # contract, same K+1 states, just without the fusion.
+        use_multistep = query.is_cuda and query.dtype == torch.bfloat16
+        if use_multistep:
+            # The multistep kernel requires an innermost-contiguous layout;
+            # FLA's sequential entry point does not, which is why this never
+            # surfaced before. `mixed_qkv` arrives transposed and is then
+            # `torch.split`, so these are strided views. Cheap to fix here:
+            # q/k/v are [1, K, H, 128] with K=4, orders of magnitude smaller
+            # than the K+1 recurrent-state clones this path exists to delete.
+            core_attn_out, recurrent_states = fused_recurrent_gated_delta_rule_multistep(
+                query.contiguous(),
+                key.contiguous(),
+                value.contiguous(),
+                g=g.contiguous(),
+                beta=beta.contiguous(),
+                initial_state=state.recurrent_state.contiguous(),
+                output_all_states=True,
+            )
+        else:
+            outs = []
+            states = [state.recurrent_state]
+            running = state.recurrent_state
+            for t in range(seq_len):
+                out_t, running = fused_recurrent_gated_delta_rule(
+                    query[:, t : t + 1],
+                    key[:, t : t + 1],
+                    value[:, t : t + 1],
+                    g=g[:, t : t + 1],
+                    beta=beta[:, t : t + 1],
+                    initial_state=running,
+                    output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                outs.append(out_t)
+                states.append(running)
+            core_attn_out = torch.cat(outs, dim=1)
+            recurrent_states = torch.stack(states, dim=1)
         if spec_state_rows is None:
             recurrent_snapshots = [recurrent_states[:, j].clone() for j in range(seq_len + 1)]
         else:
