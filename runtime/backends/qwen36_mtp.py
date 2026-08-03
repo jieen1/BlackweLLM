@@ -78,11 +78,14 @@ import torch
 from runtime.backends.qwen36_mtp_cudagraph import (
     Qwen36MTPAnchorCudaGraph,
     Qwen36MTPDraftCudaGraph,
+    Qwen36MTPVerifyCudaGraph,
     attempt_mtp_cg_capture,
     build_pooled_mtp_caches,
 )
 from runtime.logprobs import compute_logprobs
+from runtime.model.qwen36_model import GdnLayerState
 from runtime.mtp_accept import determine_accept_reject_from_predictions, sample_accept_reject
+from runtime.recurrent_state_pool import spec_row
 from runtime.sampling import SamplingParams, compute_sampling_distribution, make_generator
 
 if TYPE_CHECKING:
@@ -106,6 +109,101 @@ def _resync_env_default() -> bool:
     return os.environ.get("QSR_SERVER_MTP_RESYNC", "0") != "0"
 
 
+class Qwen36MTPGDNRows:
+    """Permanent ``K+1`` GDN rows used by one MTP engine.
+
+    The old verify path cloned every recurrent state once per speculative
+    position and copied one clone back after accept/reject. A candidate state
+    can instead live at its fixed ``spec_row`` address and the next round
+    selects the accepted row. The allocation is owned by MTP because the
+    backbone's ordinary decode graphs are captured before MTP is enabled.
+    """
+
+    def __init__(self, backend: Qwen36Backend, num_speculative_tokens: int) -> None:
+        self.backend = backend
+        self.pool = backend.pool
+        self.k = num_speculative_tokens
+        self.total_physical_slots = self.pool.num_slots + 1
+        self.total_rows = self.total_physical_slots * (self.k + 1)
+        self.conv_pools: list[torch.Tensor | None] = [None] * self.pool.num_layers
+        self.recurrent_pools: list[torch.Tensor | None] = [None] * self.pool.num_layers
+        self._states: dict[int, list[list[GdnLayerState]]] = {}
+
+        marker = getattr(torch._dynamo, "mark_static_address", None)
+        for layer in self.pool.model.model.layers:
+            if layer.layer_type != "linear_attention":
+                continue
+            gdn = layer.linear_attn
+            conv = torch.zeros(
+                self.total_rows,
+                gdn.conv_dim,
+                gdn.conv_kernel_size,
+                device=self.pool.device,
+                dtype=self.pool.dtype,
+            )
+            recurrent = torch.zeros(
+                self.total_rows,
+                gdn.num_v_heads,
+                gdn.head_k_dim,
+                gdn.head_v_dim,
+                device=self.pool.device,
+                dtype=self.pool.dtype,
+            )
+            if marker is not None:
+                marker(conv)
+                marker(recurrent)
+            self.conv_pools[layer.layer_idx] = conv
+            self.recurrent_pools[layer.layer_idx] = recurrent
+            per_layer: list[list[GdnLayerState]] = []
+            for slot in range(self.pool.num_slots + 1):
+                columns: list[GdnLayerState] = []
+                for col in range(self.k + 1):
+                    row = spec_row(slot, col, self.total_physical_slots, self.k)
+                    columns.append(
+                        GdnLayerState(
+                            conv_state=conv[row : row + 1],
+                            recurrent_state=recurrent[row : row + 1],
+                            has_previous_state=False,
+                        )
+                    )
+                per_layer.append(columns)
+            self._states[layer.layer_idx] = per_layer
+
+        if not self._states:
+            raise ValueError("MTP GDN row allocation requires a linear-attention layer")
+
+    def rows_for_slot(self, slot: int) -> dict[int, list[GdnLayerState]]:
+        return {layer_idx: per_slot[slot] for layer_idx, per_slot in self._states.items()}
+
+    def row_for_slot(self, slot: int, col: int) -> int:
+        return spec_row(slot, col, self.total_physical_slots, self.k)
+
+    def activate(self, slot: int, col: int) -> None:
+        state = self.pool.slot_state(slot)
+        for layer_idx, per_slot in self._states.items():
+            state.gdn_states[layer_idx] = per_slot[slot][col]
+
+    def sync_from_live(self, slot: int) -> None:
+        """Copy an ordinary prefill state into column zero once."""
+        state = self.pool.slot_state(slot)
+        for layer_idx, per_slot in self._states.items():
+            live = state.gdn_states[layer_idx]
+            assert live is not None
+            target = per_slot[slot][0]
+            target.conv_state.copy_(live.conv_state)
+            target.recurrent_state.copy_(live.recurrent_state)
+            target.has_previous_state = live.has_previous_state
+        self.activate(slot, 0)
+
+    def reset_slot(self, slot: int) -> None:
+        for per_slot in self._states.values():
+            for state in per_slot[slot]:
+                state.conv_state.zero_()
+                state.recurrent_state.zero_()
+                state.has_previous_state = False
+        self.activate(slot, 0)
+
+
 class Qwen36MTPEngine:
     """Owns per-slot MTP draft-head state (its own small KV cache per slot)
     and drives one draft+verify+accept/reject+re-draft round, the way
@@ -120,13 +218,11 @@ class Qwen36MTPEngine:
     precedent (``LagunaBackend.mtp_verify_and_commit_batch``'s docstring:
     "the loop below still handles >1 slots correctly (just sequentially, no
     batched replay)"). ``Qwen36ForCausalLMSelfBuilt``'s whole model graph is
-    batch=1 by construction (B1's own scope), so there is no batched verify
-    path to reach for here the way the historical vLLM-based runner's
-    ``verify_batch_spec``/``_ssm_spec_row`` had -- ``runtime.
-    recurrent_state_pool``'s ``spec_row`` addressing (built for exactly that
-    kind of batched multi-slot GDN spec verify) stays uncalled; wiring it in
-    is a real future throughput lever, not attempted here (out of scope --
-    this landing is about reachability, not batched-verify throughput).
+    batch=1 by construction (B1's own scope). Within that single-slot path,
+    GDN state uses the fixed ``spec_row`` topology: column zero is the live
+    state and columns one through K are candidate destinations. This removes
+    the old per-round snapshot/restore copies while preserving the same
+    accepted-prefix semantics as the historical vLLM runner.
     """
 
     def __init__(
@@ -198,8 +294,16 @@ class Qwen36MTPEngine:
         self.mtp_v_pool: torch.Tensor | None = None
         self.mtp_page_size: int | None = None
         self.mtp_pages_per_slot: int | None = None
+        self._spec_rows: Qwen36MTPGDNRows | None = None
+        if any(
+            layer.layer_type == "linear_attention" and hasattr(layer.linear_attn, "spec_forward")
+            for layer in backend.pool.model.model.layers
+        ):
+            self._spec_rows = Qwen36MTPGDNRows(backend, self.k)
+        self._spec_state_col = [0] * (backend.num_slots + 1)
         self._anchor_cg: Qwen36MTPAnchorCudaGraph | None = None
         self._draft_cg: Qwen36MTPDraftCudaGraph | None = None
+        self._verify_cg = None
         self._cg_captured = False
 
         if self._use_cuda_graph:
@@ -266,7 +370,15 @@ class Qwen36MTPEngine:
         strict = os.environ.get("QSR_QWEN36_MTP_REQUIRE_CG", "0") == "1"
 
         def _do_capture_anchor() -> None:
-            cg = Qwen36MTPAnchorCudaGraph(self.backend)
+            cg = Qwen36MTPAnchorCudaGraph(
+                self.backend,
+                conv_pools=None if self._spec_rows is None else self._spec_rows.conv_pools,
+                recurrent_pools=(
+                    None if self._spec_rows is None else self._spec_rows.recurrent_pools
+                ),
+                state_row=(None if self._spec_rows is None else self._spec_rows.row_for_slot),
+                reset_spec_state=(None if self._spec_rows is None else self._spec_rows.reset_slot),
+            )
             cg.capture()
             self._anchor_cg = cg
 
@@ -284,6 +396,20 @@ class Qwen36MTPEngine:
         self.cg_status["draft"] = status
         if status == "failed":
             self._draft_cg = None
+
+        def _do_capture_verify() -> None:
+            if self._spec_rows is None:
+                raise RuntimeError(
+                    "verify CUDA Graph requires real Qwen3.6 GDN row-addressed state"
+                )
+            cg = Qwen36MTPVerifyCudaGraph(self)
+            cg.capture()
+            self._verify_cg = cg
+
+        status = attempt_mtp_cg_capture("verify", _do_capture_verify, strict=strict)
+        self.cg_status["verify"] = status
+        if status == "failed":
+            self._verify_cg = None
 
         self._cg_captured = True
 
@@ -310,6 +436,9 @@ class Qwen36MTPEngine:
         cache shares the same offset for that slot's whole generation).
         """
         self._caches[slot].seq_len = 0
+        if self._spec_rows is not None:
+            self._spec_rows.reset_slot(slot)
+        self._spec_state_col[slot] = 0
 
     # -- drafting --------------------------------------------------------
 
@@ -367,6 +496,9 @@ class Qwen36MTPEngine:
                 f"draft_after_prefill: slot {slot} mtp cache is not fresh "
                 f"(seq_len={self._caches[slot].seq_len}); caller must reset_slot first"
             )
+        if self._spec_rows is not None:
+            self._spec_rows.sync_from_live(slot)
+            self._spec_state_col[slot] = 0
         return self._draft_loop(slot, first_token, pred_hidden)
 
     # -- verify + commit + re-draft (the hot path) ------------------------
@@ -436,7 +568,12 @@ class Qwen36MTPEngine:
             # the eager self.model(anchor_input, state) call below would
             # otherwise have done internally (Qwen36TextModelSelfBuilt
             # .forward/Qwen36PagedAttentionCache.append).
-            anchor_hidden = self._anchor_cg.replay(slot, anchor_token, state.num_tokens_seen)
+            anchor_hidden = self._anchor_cg.replay(
+                slot,
+                anchor_token,
+                state.num_tokens_seen,
+                state_col=self._spec_state_col[slot],
+            )
             state.num_tokens_seen += 1
             for attn_cache in state.attn_caches:
                 if attn_cache is not None:
@@ -449,7 +586,17 @@ class Qwen36MTPEngine:
         # -- (b) verify the K drafts in one pass.
         past_len = state.num_tokens_seen
         draft_tensor = torch.tensor([drafts], dtype=torch.long, device=self.device)
-        verify_hidden, gdn_snapshots = self.model.verify_forward(draft_tensor, state)
+        if self._verify_cg is not None:
+            verify_hidden = self._verify_cg.replay(slot, drafts, past_len)
+            gdn_snapshots = None
+        elif self._spec_rows is not None:
+            verify_hidden, gdn_snapshots = self.model.verify_forward(
+                draft_tensor,
+                state,
+                spec_state_rows=self._spec_rows.rows_for_slot(slot),
+            )
+        else:
+            verify_hidden, gdn_snapshots = self.model.verify_forward(draft_tensor, state)
         verify_logits = self.model.compute_logits(verify_hidden)[0]  # [k, vocab]
 
         all_hiddens = torch.cat([anchor_hidden, verify_hidden], dim=1)  # [1, k+1, H]
@@ -480,6 +627,9 @@ class Qwen36MTPEngine:
         # -- (c) commit: roll the target's GDN/attention state back to the
         # accepted prefix (m real tokens past the anchor).
         self.model.commit_verify(state, gdn_snapshots, past_len=past_len, accepted_count=m)
+        if self._spec_rows is not None:
+            self._spec_rows.activate(slot, m)
+            self._spec_state_col[slot] = m
 
         # -- KV/committed-token bookkeeping, "committed ahead of kv by one"
         # (the same invariant DFlash's own round already keeps for Laguna

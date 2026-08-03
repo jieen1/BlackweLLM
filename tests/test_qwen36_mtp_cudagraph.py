@@ -131,3 +131,19 @@ class TestAttemptMtpCgCapture:
 
         with pytest.raises(RuntimeError, match="simulated sparkinfer"):
             attempt_mtp_cg_capture("anchor", _boom, strict=True)
+
+    def test_verify_capture_uses_the_same_observable_failure_signal(self, caplog) -> None:
+        """The verify graph is the expensive path this change adds.
+
+        It must go through the same status choke point as anchor/draft: a
+        graph-capacity or GDN capture bug otherwise falls back to eager while
+        leaving ``cg_status`` looking healthy, which is invisible to a token
+        smoke test and was the failure mode that let scratch undersizing ship.
+        """
+
+        def _boom() -> None:
+            raise RuntimeError("verify boom")
+
+        status = attempt_mtp_cg_capture("verify", _boom, strict=False)
+        assert status == "failed"
+        assert any("verify" in record.message for record in caplog.records)

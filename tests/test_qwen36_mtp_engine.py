@@ -37,7 +37,7 @@ pytest.importorskip("fla")
 pytest.importorskip("sparkinfer")
 
 from runtime.backends.qwen36 import Qwen36Backend  # noqa: E402
-from runtime.backends.qwen36_mtp import Qwen36MTPEngine  # noqa: E402
+from runtime.backends.qwen36_mtp import Qwen36MTPEngine, Qwen36MTPGDNRows  # noqa: E402
 from runtime.sampling import SamplingParams  # noqa: E402
 
 _VOCAB = 1000
@@ -244,6 +244,27 @@ class TestBackendWiring:
         assert engine._anchor_cg is None
         assert engine._draft_cg is None
         assert engine.cuda_graphs_healthy() is True  # vacuous: nothing attempted
+
+    def test_spec_rows_are_fixed_and_disjoint_from_the_live_pool(self) -> None:
+        """MTP state must have a stable K+1 address for every slot/column.
+
+        A shape-only test would miss the dangerous regression: reusing the
+        live row for a candidate makes rejection overwrite the state that the
+        next round must continue from, while copying snapshots back hides the
+        mistake behind large ``aten::copy_`` costs. This checks the actual
+        pool views and the column-zero bootstrap copy without a CUDA kernel.
+        """
+        backend, _ = _backend()
+        live_before = backend.pool.slot_state(0).gdn_states[1].conv_state
+        rows = Qwen36MTPGDNRows(backend, num_speculative_tokens=3)
+        rows.sync_from_live(0)
+        columns = rows.rows_for_slot(0)[1]
+        assert int(columns[0].conv_state.data_ptr()) != int(live_before.data_ptr())
+        assert backend.pool.slot_state(0).gdn_states[1] is columns[0]
+        assert len({int(state.conv_state.data_ptr()) for state in columns}) == 4
+        assert len({int(state.recurrent_state.data_ptr()) for state in columns}) == 4
+        assert rows.row_for_slot(0, 0) == 0
+        assert rows.row_for_slot(0, 1) > backend.pool.num_slots
 
 
 class TestPairingFix:
@@ -490,9 +511,7 @@ class TestResyncFlagRefusesWithoutAnImplementation:
     def _engine(self, *, enable_resync: bool) -> Qwen36MTPEngine:
         backend, _ = _backend()
         backend.model.mtp = object()
-        return Qwen36MTPEngine(
-            backend, num_speculative_tokens=4, enable_resync=enable_resync
-        )
+        return Qwen36MTPEngine(backend, num_speculative_tokens=4, enable_resync=enable_resync)
 
     def test_it_refuses_when_the_model_cannot_resync(self):
         """The real model has no `mtp_resync_step`; the stub in this file does,

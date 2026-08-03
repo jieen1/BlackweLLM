@@ -21,7 +21,12 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("fla")
 pytest.importorskip("sparkinfer")
 
-from runtime.model.qwen36_model import GdnLayerState, commit_spec_snapshot  # noqa: E402
+from runtime.model import qwen36_model as qwen36_model_module  # noqa: E402
+from runtime.model.qwen36_model import (  # noqa: E402
+    GdnLayerState,
+    Qwen36GatedDeltaNet,
+    commit_spec_snapshot,
+)
 
 
 def _state(seed: float) -> GdnLayerState:
@@ -126,3 +131,74 @@ class TestCommitSpecSnapshotBoundsChecking:
         snapshots = _snapshots(3)
         with pytest.raises(ValueError, match="out of range"):
             commit_spec_snapshot(live, snapshots, accepted_count=10)
+
+
+class TestSpecRowAddressing:
+    def test_rows_match_snapshot_oracle_without_mutating_source(self, monkeypatch) -> None:
+        """K+1 row addressing must preserve the old state oracle exactly.
+
+        A row path can pass shape checks while accidentally reading the live
+        state after the first candidate, or while writing candidate ``j`` to
+        row ``j-1``. That failure is invisible until a partial accept, when
+        the next round resumes from the wrong recurrent/conv state. A tiny
+        deterministic recurrent stub lets this CPU test compare every row
+        and output against the legacy clone-based path without requiring a
+        CUDA driver; the real FLA kernel remains covered by the GPU probe.
+        """
+        config = {
+            "hidden_size": 8,
+            "linear_num_value_heads": 2,
+            "linear_num_key_heads": 1,
+            "linear_key_head_dim": 2,
+            "linear_value_head_dim": 2,
+            "linear_conv_kernel_dim": 3,
+            "rms_norm_eps": 1e-6,
+            "hidden_act": "silu",
+        }
+        torch.manual_seed(7)
+        layer = Qwen36GatedDeltaNet(config, layer_idx=0, quantized={})
+        layer = layer.float()
+        source = layer.new_state(batch=1, device=torch.device("cpu"), dtype=torch.float32)
+        source.conv_state.copy_(
+            torch.arange(source.conv_state.numel()).reshape_as(source.conv_state)
+        )
+        source.recurrent_state.copy_(
+            torch.arange(source.recurrent_state.numel()).reshape_as(source.recurrent_state)
+        )
+        source.has_previous_state = True
+        hidden = torch.randn(1, 4, config["hidden_size"])
+
+        def fake_recurrent(query, key, value, *, initial_state, **kwargs):
+            del query, key, kwargs
+            last_state = initial_state + value[:, 0].unsqueeze(1)
+            return value, last_state
+
+        monkeypatch.setattr(
+            qwen36_model_module,
+            "fused_recurrent_gated_delta_rule",
+            fake_recurrent,
+        )
+        snapshot_output, snapshots = layer.spec_forward(hidden, source)
+        assert snapshots is not None
+
+        rows = [
+            GdnLayerState(
+                conv_state=torch.zeros_like(source.conv_state),
+                recurrent_state=torch.zeros_like(source.recurrent_state),
+                has_previous_state=False,
+            )
+            for _ in range(hidden.shape[1] + 1)
+        ]
+        rows[0].conv_state.copy_(source.conv_state)
+        rows[0].recurrent_state.copy_(source.recurrent_state)
+        rows[0].has_previous_state = True
+        row_output, row_snapshots = layer.spec_forward(hidden, source, spec_state_rows=rows)
+
+        assert row_snapshots is None
+        assert torch.equal(row_output, snapshot_output)
+        assert torch.equal(source.conv_state, rows[0].conv_state)
+        assert torch.equal(source.recurrent_state, rows[0].recurrent_state)
+        for row, expected in zip(rows, snapshots, strict=True):
+            assert torch.equal(row.conv_state, expected.conv_state)
+            assert torch.equal(row.recurrent_state, expected.recurrent_state)
+            assert row.has_previous_state == expected.has_previous_state

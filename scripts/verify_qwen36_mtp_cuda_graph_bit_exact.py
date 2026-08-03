@@ -1,11 +1,10 @@
 """B3 CUDA-Graph follow-up: GPU bit-exactness proof for
-``runtime.backends.qwen36_mtp_cudagraph``'s two graphs
-(``Qwen36MTPAnchorCudaGraph``/``Qwen36MTPDraftCudaGraph``).
+``runtime.backends.qwen36_mtp_cudagraph``'s anchor, draft, and verify graphs.
 
-**What this proves, and why it needs a real GPU + real checkpoint**: both
-graphs replace an EXISTING, already-verified eager code path
-(``Qwen36MTPEngine.round``'s anchor-advance forward /
-``Qwen36MTPEngine._draft_loop``'s chained ``mtp_step`` calls) with a
+**What this proves, and why it needs a real GPU + real checkpoint**: these
+graphs replace EXISTING, already-verified eager code paths
+(``Qwen36MTPEngine.round``'s anchor-advance forward, chained ``mtp_step``
+calls, and K-token target verify) with a
 DIFFERENT kernel code path (``decode_batch()`` against a pooled KV tensor,
 vs ``forward()``/``mtp_step()`` against a standalone
 ``Qwen36PagedAttentionCache``). Same weights, same math on paper -- but a
@@ -14,7 +13,7 @@ different kernel schedule, same class of claim
 path ("batched decode is bit-exact against B1's eager path") and which
 that script's own docstring says explicitly is "a claim about a real
 checkpoint on a real GPU", not something a CPU/stub test can make. This
-script makes the SAME kind of claim for MTP's two new graphs specifically
+script makes the SAME kind of claim for all MTP graphs specifically
 -- nothing before this landing exercised ``Qwen36Attention.decode_batch``
 against MTP's own head/cache at all.
 
@@ -22,7 +21,7 @@ against MTP's own head/cache at all.
 ``round()`` calls) on TWO DIFFERENT slots of the SAME loaded model/backend
 -- one with the captured graphs live (the default once ``enable_mtp``
 succeeds on a real GPU), one with them forced off
-(``engine._anchor_cg = engine._draft_cg = None`` for the duration, which
+(``engine._anchor_cg = engine._draft_cg = engine._verify_cg = None`` for the duration, which
 routes every call through the pre-existing eager path unchanged). Greedy
 decoding is deterministic given fixed weights and fixed inputs, so if both
 graphs replay bit-exactly, the two slots' full per-round traces
@@ -78,10 +77,11 @@ def _run(
 ) -> list[dict]:
     engine = backend._mtp
     backend.reset_slot(slot)
-    saved = (engine._anchor_cg, engine._draft_cg)
+    saved = (engine._anchor_cg, engine._draft_cg, engine._verify_cg)
     if not use_graphs:
         engine._anchor_cg = None
         engine._draft_cg = None
+        engine._verify_cg = None
     try:
         state = backend.prefill_chunked_begin([slot], [prompt_ids], params_per_slot={})
         anchor = state.result[slot]["anchor"]
@@ -101,7 +101,7 @@ def _run(
             drafts = result["next_draft_tokens"]
         return trace
     finally:
-        engine._anchor_cg, engine._draft_cg = saved
+        engine._anchor_cg, engine._draft_cg, engine._verify_cg = saved
 
 
 def main() -> None:
@@ -133,8 +133,12 @@ def main() -> None:
     assert engine.cg_status.get("draft") == "captured", (
         f"draft CUDA Graph did not capture: {engine.cg_status}"
     )
+    assert engine.cg_status.get("verify") == "captured", (
+        f"verify CUDA Graph did not capture: {engine.cg_status}"
+    )
     assert engine._anchor_cg is not None
     assert engine._draft_cg is not None
+    assert engine._verify_cg is not None
 
     tok = AutoTokenizer.from_pretrained(MODEL_PATH)
     prompt_ids = tok(PROMPT, return_tensors=None)["input_ids"]
@@ -154,7 +158,7 @@ def main() -> None:
         print(f"  round {i}: accepted={t['num_accepted']}/{K} committed={t['committed']}")
 
     assert match, (
-        "Qwen36MTPAnchorCudaGraph/Qwen36MTPDraftCudaGraph replay diverged from "
+        "Qwen36MTP anchor/draft/verify CUDA Graph replay diverged from "
         "eager Qwen36MTPEngine.round for identical inputs -- NOT bit-exact"
     )
     print(f"PASS: MTP CUDA-Graph replay is bit-exact vs eager for {NUM_ROUNDS} rounds, K={K}")

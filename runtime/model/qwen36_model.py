@@ -486,6 +486,29 @@ class Qwen36DecodeBatch:
 
 
 @dataclass
+class Qwen36VerifyBatch:
+    """Persistent inputs for one captured K-token target verify.
+
+    Unlike :meth:`Qwen36TextModelSelfBuilt.verify_forward`, this descriptor
+    owns no Python cache lengths and never calls ``Qwen36PagedAttentionCache
+    .append``.  The graph driver updates page metadata and candidate write
+    rows in place before replay, which is the distinction that makes a graph
+    replay at a different round position correct rather than a replay of the
+    capture round's addresses.
+    """
+
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    write_index: torch.Tensor
+    k_pools: list[torch.Tensor | None]
+    v_pools: list[torch.Tensor | None]
+    attn_drivers: list[Any | None]
+    attn_outputs: list[torch.Tensor | None]
+    gdn_sources: dict[int, GdnLayerState]
+    gdn_state_rows: dict[int, list[GdnLayerState]]
+
+
+@dataclass
 class Qwen36GenerationState:
     """Per-sequence state a caller owns and threads through forward calls.
 
@@ -590,8 +613,12 @@ class Qwen36GatedDeltaNet(nn.Module):
                 batch, self.conv_dim, self.conv_kernel_size, device=device, dtype=dtype
             ),
             recurrent_state=torch.zeros(
-                batch, self.num_v_heads, self.head_k_dim, self.head_v_dim,
-                device=device, dtype=dtype,
+                batch,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                device=device,
+                dtype=dtype,
             ),
             has_previous_state=False,
         )
@@ -611,8 +638,11 @@ class Qwen36GatedDeltaNet(nn.Module):
         """
         input_len = x.shape[-1]
         out = F.conv1d(
-            x, self.conv1d.weight, bias=None,
-            padding=self.conv_kernel_size - 1, groups=self.conv_dim,
+            x,
+            self.conv1d.weight,
+            bias=None,
+            padding=self.conv_kernel_size - 1,
+            groups=self.conv_dim,
         )
         return F.silu(out[:, :, :input_len])
 
@@ -658,14 +688,24 @@ class Qwen36GatedDeltaNet(nn.Module):
         initial_state = state.recurrent_state if state.has_previous_state else None
         if state.has_previous_state and seq_len == 1:
             core_attn_out, last_state = fused_recurrent_gated_delta_rule(
-                query, key, value, g=g, beta=beta,
-                initial_state=initial_state, output_final_state=True,
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
             )
         else:
             core_attn_out, last_state = chunk_gated_delta_rule(
-                query, key, value, g=g, beta=beta,
-                initial_state=initial_state, output_final_state=True,
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
             )
 
@@ -755,8 +795,13 @@ class Qwen36GatedDeltaNet(nn.Module):
             key = key.repeat_interleave(self.repeat, dim=2)
 
         core_attn_out, last_state = fused_recurrent_gated_delta_rule(
-            query, key, value, g=g, beta=beta,
-            initial_state=recurrent_state, output_final_state=True,
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=recurrent_state,
+            output_final_state=True,
             use_qk_l2norm_in_kernel=True,
         )
         recurrent_state.copy_(last_state)
@@ -769,8 +814,12 @@ class Qwen36GatedDeltaNet(nn.Module):
         return self.out_proj(core_attn_out)
 
     def spec_forward(
-        self, hidden_states: torch.Tensor, state: GdnLayerState
-    ) -> tuple[torch.Tensor, list[GdnLayerState]]:
+        self,
+        hidden_states: torch.Tensor,
+        state: GdnLayerState,
+        *,
+        spec_state_rows: list[GdnLayerState] | None = None,
+    ) -> tuple[torch.Tensor, list[GdnLayerState] | None]:
         """B3: MTP verify's GDN forward -- K candidate positions, K+1
         materialized state snapshots, no chunk algorithm involved.
 
@@ -874,12 +923,10 @@ class Qwen36GatedDeltaNet(nn.Module):
           (see ``notes/2026-08-02-gdn-spec-forward-batching.md`` for the
           measurement and the exact breakpoint search).
 
-        Never touches ``state`` -- operates on clones throughout, so a crash
-        or an unhandled exception mid-call leaves the caller's live buffers
-        exactly as they were (snapshot 0, appended below, is provably
-        identical to the untouched anchor -- see
-        :func:`commit_spec_snapshot`'s docstring for why that matters for a
-        caller's own crash-safety, not just this function's).
+        The legacy snapshot mode never touches ``state`` and operates on
+        clones throughout, preserving crash-safety. The row-addressed mode
+        writes fixed candidate rows as it advances; the caller selects the
+        accepted row after the decision, so no snapshot copy is needed.
 
         Returns ``(output, snapshots)``: ``output`` is
         ``[1, seq_len, hidden_size]``, this layer's contribution for every
@@ -889,6 +936,8 @@ class Qwen36GatedDeltaNet(nn.Module):
         ``snapshots[j]`` for ``j >= 1`` is the state after processing the
         first ``j`` candidate positions. Pass ``snapshots[m]`` (``m`` =
         accepted count) to :func:`commit_spec_snapshot` to resume decoding.
+        When ``spec_state_rows`` is supplied, the second value is ``None``
+        because the rows themselves are the committed-state candidates.
         """
         batch_size, seq_len, _ = hidden_states.shape
         assert batch_size == 1
@@ -956,23 +1005,39 @@ class Qwen36GatedDeltaNet(nn.Module):
         # initial_state coming from the previous step's output. Every
         # conv_state snapshot needed no compute above (pure slicing of
         # `catted`, see below); only recurrent_state needs one here. -----
-        recurrent_state = state.recurrent_state.clone()
-        recurrent_snapshots: list[torch.Tensor] = [recurrent_state]
+        recurrent_state = state.recurrent_state
+        recurrent_snapshots: list[torch.Tensor] | None = (
+            [recurrent_state.clone()] if spec_state_rows is None else None
+        )
+        if spec_state_rows is not None and len(spec_state_rows) != seq_len + 1:
+            raise ValueError(
+                f"spec_state_rows has {len(spec_state_rows)} rows for seq_len={seq_len}; "
+                "expected K+1 rows"
+            )
         core_outs: list[torch.Tensor] = []
         for t in range(seq_len):
             core_attn_out, last_state = fused_recurrent_gated_delta_rule(
-                query[:, t : t + 1], key[:, t : t + 1], value[:, t : t + 1],
-                g=g[:, t : t + 1], beta=beta[:, t : t + 1],
-                initial_state=recurrent_state, output_final_state=True,
+                query[:, t : t + 1],
+                key[:, t : t + 1],
+                value[:, t : t + 1],
+                g=g[:, t : t + 1],
+                beta=beta[:, t : t + 1],
+                initial_state=recurrent_state,
+                output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
             )
-            # Fresh BF16 buffer each step (never rebinding `state`'s own
-            # buffer -- this is a clone-of-a-clone chain, not `state`
-            # itself), same round-fp32-to-bf16-between-steps discipline as
-            # :meth:`forward` (B0-4/B0-7).
-            recurrent_state = torch.empty_like(state.recurrent_state)
-            recurrent_state.copy_(last_state)
-            recurrent_snapshots.append(recurrent_state)
+            # The snapshot path allocates a clone-of-a-clone chain. The
+            # row-addressed path writes each intermediate directly into its
+            # permanent K+1 destination row; the next recurrence reads that
+            # row back, so rejected candidates need no copy/restore later.
+            if spec_state_rows is None:
+                assert recurrent_snapshots is not None
+                recurrent_state = torch.empty_like(state.recurrent_state)
+                recurrent_state.copy_(last_state)
+                recurrent_snapshots.append(recurrent_state)
+            else:
+                recurrent_state = spec_state_rows[t + 1].recurrent_state
+                recurrent_state.copy_(last_state)
             core_outs.append(core_attn_out)
 
         # ---- batched norm, once over all `seq_len` positions' recurrent
@@ -996,15 +1061,22 @@ class Qwen36GatedDeltaNet(nn.Module):
         # ``catted[:, :, j : j + state_len]`` -- j=0 is the untouched
         # anchor, j=seq_len is the state after all candidates), recurrent
         # state from the sequential loop above. -------------------------
-        snapshots: list[GdnLayerState] = [
-            GdnLayerState(
-                conv_state=catted[:, :, j : j + state_len].clone(),
-                recurrent_state=recurrent_snapshots[j],
-                has_previous_state=True,
-            )
-            for j in range(seq_len + 1)
-        ]
-        return output, snapshots
+        if spec_state_rows is None:
+            assert recurrent_snapshots is not None
+            snapshots: list[GdnLayerState] = [
+                GdnLayerState(
+                    conv_state=catted[:, :, j : j + state_len].clone(),
+                    recurrent_state=recurrent_snapshots[j],
+                    has_previous_state=True,
+                )
+                for j in range(seq_len + 1)
+            ]
+            return output, snapshots
+
+        for j in range(1, seq_len + 1):
+            spec_state_rows[j].conv_state.copy_(catted[:, :, j : j + state_len])
+            spec_state_rows[j].has_previous_state = True
+        return output, None
 
 
 def commit_spec_snapshot(
@@ -1257,8 +1329,15 @@ class Qwen36AttentionWorkspace:
         it -- including query lengths never seen before, which is what
         ``plan_budget`` buys (class docstring)."""
         plan = create_paged_plan(
-            q, k_cache, v_cache, page_table, cache_seqlens, cu_seqlens_q,
-            mode=self.mode, enable_cuda_graph=False, window_left=-1,
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            mode=self.mode,
+            enable_cuda_graph=False,
+            window_left=-1,
             plan_budget=self._plan_budget,
         )
         ws = self._workspace
@@ -1267,8 +1346,13 @@ class Qwen36AttentionWorkspace:
         ws._copy_plan_metadata(plan)
         ws._plan = plan
         binding = build_paged_attention_binding(
-            scratch=ws, q=q, k_cache=k_cache, v_cache=v_cache, output=output,
-            k_descale=self._k_descale, v_descale=self._v_descale,
+            scratch=ws,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            k_descale=self._k_descale,
+            v_descale=self._v_descale,
         )
         paged_attention_forward(binding=binding)
 
@@ -1320,9 +1404,7 @@ class Qwen36BatchedDecodeAttention:
         # argument here, not something this driver can hold fixed at
         # construction like the old single `self._descale` used to.
         self._default_descale = torch.ones(1, dtype=torch.float32, device=device)
-        self.page_table = torch.zeros(
-            batch, pages_per_slot, dtype=torch.int32, device=device
-        )
+        self.page_table = torch.zeros(batch, pages_per_slot, dtype=torch.int32, device=device)
         self.cache_seqlens = torch.ones(batch, dtype=torch.int32, device=device)
         self.cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=device)
         # ``eager_extend_work_items_capacity`` is the WRONG estimator here and
@@ -1400,8 +1482,15 @@ class Qwen36BatchedDecodeAttention:
         docstring -- this driver is shared across layers, so the real
         descale cannot live on ``self``)."""
         plan = create_paged_plan(
-            q, k_cache, v_cache, self.page_table, self.cache_seqlens, self.cu_seqlens_q,
-            mode="decode", enable_cuda_graph=False, window_left=-1,
+            q,
+            k_cache,
+            v_cache,
+            self.page_table,
+            self.cache_seqlens,
+            self.cu_seqlens_q,
+            mode="decode",
+            enable_cuda_graph=False,
+            window_left=-1,
             plan_budget=self._plan_budget,
         )
         ws = self._workspace
@@ -1410,7 +1499,11 @@ class Qwen36BatchedDecodeAttention:
         ws._copy_plan_metadata(plan)
         ws._plan = plan
         binding = build_paged_attention_binding(
-            scratch=ws, q=q, k_cache=k_cache, v_cache=v_cache, output=output,
+            scratch=ws,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
             k_descale=k_descale if k_descale is not None else self._default_descale,
             v_descale=v_descale if v_descale is not None else self._default_descale,
         )
@@ -1491,12 +1584,12 @@ class Qwen36DecodeGraphAttention:
         # Bind the WORST case before capture, not a representative one: the
         # graph's schedule is fixed at capture time, so a shorter context
         # captured here would silently under-serve every longer one later.
-        capture_page_table = torch.arange(
-            pages_per_slot, dtype=torch.int32, device=device
-        ).unsqueeze(0).repeat(batch, 1)
-        capture_cache_seqlens = torch.full(
-            (batch,), max_seq_len, dtype=torch.int32, device=device
+        capture_page_table = (
+            torch.arange(pages_per_slot, dtype=torch.int32, device=device)
+            .unsqueeze(0)
+            .repeat(batch, 1)
         )
+        capture_cache_seqlens = torch.full((batch,), max_seq_len, dtype=torch.int32, device=device)
         self.cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=device)
         self._workspace._copy_runtime_metadata(
             capture_page_table, capture_cache_seqlens, self.cu_seqlens_q
@@ -1525,7 +1618,96 @@ class Qwen36DecodeGraphAttention:
         Parameter object (never reallocated after load), capture bakes in
         the correct per-layer address and replay keeps reading it."""
         binding = build_paged_attention_binding(
-            scratch=self._workspace, q=q, k_cache=k_cache, v_cache=v_cache,
+            scratch=self._workspace,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            k_descale=k_descale if k_descale is not None else self._default_descale,
+            v_descale=v_descale if v_descale is not None else self._default_descale,
+        )
+        paged_attention_forward(binding=binding)
+
+
+class Qwen36VerifyGraphAttention:
+    """Fixed-capacity ``mode="verify"`` paged-attention replay driver.
+
+    ``Qwen36AttentionWorkspace`` deliberately remains the eager extend path;
+    this small driver is the graph-only counterpart used by MTP. Sparkinfer's
+    prefill replay metadata updater is called before every replay, so the
+    captured plan is capacity-sized while page ids, cache length, and query
+    offsets remain round-specific.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        pages_per_slot: int,
+        num_cache_pages: int,
+        max_seq_len: int,
+        verify_tokens: int,
+        dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        self.verify_tokens = verify_tokens
+        self.device = device
+        self._default_descale = torch.ones(1, dtype=torch.float32, device=device)
+        self._workspace = PagedAttentionWorkspace.for_contract(
+            mode="verify",
+            device=device,
+            dtype=dtype,
+            kv_dtype=kv_dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            page_size=page_size,
+            max_total_q=verify_tokens,
+            num_cache_pages=num_cache_pages,
+            use_cuda_graph=True,
+        )
+        self._cu_seqlens_q = torch.tensor([0, verify_tokens], dtype=torch.int32, device=device)
+        self._workspace.prepare_prefill_graph_replay_state(
+            batch=1,
+            total_q_capacity=verify_tokens,
+            max_page_table_width=pages_per_slot,
+            max_cache_seqlen=max_seq_len,
+            cu_seqlens_q=self._cu_seqlens_q,
+            window_left=-1,
+        )
+        self.page_table = self._workspace.page_table
+        self.cache_seqlens = self._workspace.cache_seqlens
+
+    def update_metadata(
+        self,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+    ) -> None:
+        self._workspace.update_prefill_graph_replay_metadata(
+            page_table, cache_seqlens, cu_seqlens_q
+        )
+
+    def forward(
+        self,
+        *,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        output: torch.Tensor,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
+    ) -> None:
+        binding = build_paged_attention_binding(
+            scratch=self._workspace,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
             output=output,
             k_descale=k_descale if k_descale is not None else self._default_descale,
             v_descale=v_descale if v_descale is not None else self._default_descale,
@@ -1659,8 +1841,10 @@ class Qwen36Attention(nn.Module):
         # + sparkinfer paged attention + sigmoid output gate), which has
         # already been through B1/B2 GPU verification for every OTHER
         # full-attention layer in this model.
-        prefix = weight_prefix if weight_prefix is not None else (
-            f"model.language_model.layers.{layer_idx}.self_attn"
+        prefix = (
+            weight_prefix
+            if weight_prefix is not None
+            else (f"model.language_model.layers.{layer_idx}.self_attn")
         )
         qkv_in = self.hidden_size
         kv_out = self.num_kv_heads * self.head_dim
@@ -1897,6 +2081,67 @@ class Qwen36Attention(nn.Module):
         attn_out = attn_out * torch.sigmoid(gate)
         return self.o_proj(attn_out)
 
+    def verify_batch(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        *,
+        k_pool: torch.Tensor,
+        v_pool: torch.Tensor,
+        write_index: torch.Tensor,
+        attn: Qwen36VerifyGraphAttention,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """K-token graph-safe verify attention over a pooled KV cache.
+
+        This mirrors :meth:`decode_batch`, but uses sparkinfer's graph-mode
+        ``verify`` workspace and caller-owned K-row metadata. It deliberately
+        does not touch a Python ``Qwen36PagedAttentionCache`` or its
+        ``seq_len``; the MTP engine resolves the accepted prefix after all
+        layers finish.
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+        assert batch_size == 1 and seq_len == attn.verify_tokens
+
+        q_and_gate = self.q_proj(hidden_states).view(
+            batch_size, seq_len, self.num_heads, self.head_dim * 2
+        )
+        query, gate = torch.chunk(q_and_gate, 2, dim=-1)
+        gate = gate.reshape(batch_size, seq_len, -1)
+        kv_shape = (batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        query = self.q_norm(query)
+        key = self.k_norm(self.k_proj(hidden_states).view(*kv_shape))
+        value = self.v_proj(hidden_states).view(*kv_shape)
+        query = query.reshape(seq_len, self.num_heads, self.head_dim)
+        key = key.reshape(seq_len, self.num_kv_heads, self.head_dim)
+        value = value.reshape(seq_len, self.num_kv_heads, self.head_dim)
+
+        query_flat = query.reshape(seq_len, self.num_heads * self.head_dim).contiguous()
+        key_flat = key.reshape(seq_len, self.num_kv_heads * self.head_dim).contiguous()
+        apply_rotary_embedding_inplace(positions, query_flat, self.head_dim, cos_sin_cache)
+        apply_rotary_embedding_inplace(positions, key_flat, self.head_dim, cos_sin_cache)
+        query = query_flat.view(seq_len, self.num_heads, self.head_dim)
+        key = key_flat.view(seq_len, self.num_kv_heads, self.head_dim)
+
+        k_to_store, v_to_store = _kv_to_cache_dtype(
+            key, value, cache_dtype=k_pool.dtype, k_scale=self.k_scale, v_scale=self.v_scale
+        )
+        k_pool.view(-1, self.num_kv_heads, self.head_dim)[write_index] = k_to_store
+        v_pool.view(-1, self.num_kv_heads, self.head_dim)[write_index] = v_to_store
+        attn.forward(
+            q=query,
+            k_cache=k_pool,
+            v_cache=v_pool,
+            output=output,
+            k_descale=self.k_scale,
+            v_descale=self.v_scale,
+        )
+
+        attn_out = output.reshape(batch_size, seq_len, -1)
+        attn_out = attn_out * torch.sigmoid(gate)
+        return self.o_proj(attn_out)
+
 
 # ---------------------------------------------------------------------------
 # Dense SwiGLU MLP.
@@ -2026,8 +2271,10 @@ class Qwen36MLP(nn.Module):
         # See Qwen36Attention.__init__'s ``weight_prefix`` docstring -- same
         # override, same reason (Qwen36MTPHead's checkpoint prefix is
         # ``mtp.layers.0.mlp``, not ``model.language_model.layers.N.mlp``).
-        prefix = weight_prefix if weight_prefix is not None else (
-            f"model.language_model.layers.{layer_idx}.mlp"
+        prefix = (
+            weight_prefix
+            if weight_prefix is not None
+            else (f"model.language_model.layers.{layer_idx}.mlp")
         )
         self.gate_proj = _make_linear(
             quantized, f"{prefix}.gate_proj", hidden_size, intermediate_size
@@ -2690,8 +2937,12 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         return hidden_states
 
     def verify_forward(
-        self, draft_token_ids: torch.Tensor, state: Qwen36GenerationState
-    ) -> tuple[torch.Tensor, dict[int, list[GdnLayerState]]]:
+        self,
+        draft_token_ids: torch.Tensor,
+        state: Qwen36GenerationState,
+        *,
+        spec_state_rows: dict[int, list[GdnLayerState]] | None = None,
+    ) -> tuple[torch.Tensor, dict[int, list[GdnLayerState]] | None]:
         """B3: run ``K`` draft tokens through every layer in ONE pass,
         WITHOUT committing ``state`` -- the target-model half of MTP verify.
 
@@ -2742,7 +2993,9 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         hidden_states = self.embed_tokens(draft_token_ids)
         cos_sin_cache = self.cos_sin_cache.to(hidden_states.device)
 
-        gdn_snapshots: dict[int, list[GdnLayerState]] = {}
+        gdn_snapshots: dict[int, list[GdnLayerState]] | None = (
+            {} if spec_state_rows is None else None
+        )
         for layer in self.layers:
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)
@@ -2750,8 +3003,16 @@ class Qwen36TextModelSelfBuilt(nn.Module):
             if layer.layer_type == "linear_attention":
                 gdn_state = state.gdn_states[layer.layer_idx]
                 assert gdn_state is not None
-                out, snapshots = layer.linear_attn.spec_forward(hidden_states, gdn_state)
-                gdn_snapshots[layer.layer_idx] = snapshots
+                out, snapshots = layer.linear_attn.spec_forward(
+                    hidden_states,
+                    gdn_state,
+                    spec_state_rows=(
+                        None if spec_state_rows is None else spec_state_rows[layer.layer_idx]
+                    ),
+                )
+                if gdn_snapshots is not None:
+                    assert snapshots is not None
+                    gdn_snapshots[layer.layer_idx] = snapshots
                 hidden_states = out
             else:
                 attn_cache = state.attn_caches[layer.layer_idx]
@@ -2767,10 +3028,54 @@ class Qwen36TextModelSelfBuilt(nn.Module):
 
         return self.norm(hidden_states), gdn_snapshots
 
+    def verify_batch(self, batch: Qwen36VerifyBatch) -> torch.Tensor:
+        """Run the graph-safe K-token target verify forward.
+
+        GDN rows and full-attention metadata are supplied by the persistent
+        graph descriptor. No Python cache length is read or advanced here;
+        this makes the captured body independent of which speculative row was
+        accepted by the preceding round.
+        """
+        hidden_states = self.embed_tokens(batch.input_ids)
+        cos_sin_cache = self.cos_sin_cache.to(hidden_states.device)
+        for layer in self.layers:
+            residual = hidden_states
+            hidden_states = layer.input_layernorm(hidden_states)
+            if layer.layer_type == "linear_attention":
+                source = batch.gdn_sources[layer.layer_idx]
+                rows = batch.gdn_state_rows[layer.layer_idx]
+                hidden_states, snapshots = layer.linear_attn.spec_forward(
+                    hidden_states, source, spec_state_rows=rows
+                )
+                assert snapshots is None
+            else:
+                attn_cache = batch.k_pools[layer.layer_idx]
+                v_cache = batch.v_pools[layer.layer_idx]
+                driver = batch.attn_drivers[layer.layer_idx]
+                output = batch.attn_outputs[layer.layer_idx]
+                assert attn_cache is not None
+                assert v_cache is not None and driver is not None and output is not None
+                hidden_states = layer.self_attn.verify_batch(
+                    hidden_states,
+                    batch.positions,
+                    cos_sin_cache,
+                    k_pool=attn_cache,
+                    v_pool=v_cache,
+                    write_index=batch.write_index,
+                    attn=driver,
+                    output=output,
+                )
+            hidden_states = residual + hidden_states
+            residual = hidden_states
+            hidden_states = layer.post_attention_layernorm(hidden_states)
+            hidden_states = layer.mlp(hidden_states)
+            hidden_states = residual + hidden_states
+        return self.norm(hidden_states)
+
     def commit_verify(
         self,
         state: Qwen36GenerationState,
-        gdn_snapshots: dict[int, list[GdnLayerState]],
+        gdn_snapshots: dict[int, list[GdnLayerState]] | None,
         *,
         past_len: int,
         accepted_count: int,
@@ -2789,7 +3094,7 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         the two calls cannot silently corrupt this one.
         """
         for layer in self.layers:
-            if layer.layer_type == "linear_attention":
+            if layer.layer_type == "linear_attention" and gdn_snapshots is not None:
                 commit_spec_snapshot(
                     state.gdn_states[layer.layer_idx],
                     gdn_snapshots[layer.layer_idx],
@@ -2929,9 +3234,7 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
             torch.cuda.empty_cache()
         return freed
 
-    def warmup_attention_shapes(
-        self, *, device: torch.device | str, dtype: torch.dtype
-    ) -> None:
+    def warmup_attention_shapes(self, *, device: torch.device | str, dtype: torch.dtype) -> None:
         """Pay sparkinfer's one-time CuTe compile for both attention modes
         now, on throwaway buffers, instead of on whichever real request
         happens to arrive first.
@@ -2969,21 +3272,15 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
                 # path -- caught by an actual FP8 KV load attempt raising
                 # "unsupported q dtype torch.float8_e4m3fn" from
                 # sparkinfer's planner (real error, not hypothetical).
-                q = torch.zeros(
-                    seq_len, attn.num_heads, attn.head_dim, dtype=dtype, device=device
-                )
+                q = torch.zeros(seq_len, attn.num_heads, attn.head_dim, dtype=dtype, device=device)
                 workspace.forward(
                     q=q,
                     k_cache=cache.k_cache,
                     v_cache=cache.v_cache,
                     output=torch.empty_like(q),
                     page_table=cache.page_table,
-                    cache_seqlens=torch.tensor(
-                        [seq_len], dtype=torch.int32, device=device
-                    ),
-                    cu_seqlens_q=torch.tensor(
-                        [0, seq_len], dtype=torch.int32, device=device
-                    ),
+                    cache_seqlens=torch.tensor([seq_len], dtype=torch.int32, device=device),
+                    cu_seqlens_q=torch.tensor([0, seq_len], dtype=torch.int32, device=device),
                 )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -3013,15 +3310,23 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
     # -- B3: MTP verify + draft head ------------------------------------
 
     def verify_forward(
-        self, draft_token_ids: torch.Tensor, state: Qwen36GenerationState
-    ) -> tuple[torch.Tensor, dict[int, list[GdnLayerState]]]:
+        self,
+        draft_token_ids: torch.Tensor,
+        state: Qwen36GenerationState,
+        *,
+        spec_state_rows: dict[int, list[GdnLayerState]] | None = None,
+    ) -> tuple[torch.Tensor, dict[int, list[GdnLayerState]] | None]:
         """See :meth:`Qwen36TextModelSelfBuilt.verify_forward`."""
-        return self.model.verify_forward(draft_token_ids, state)
+        return self.model.verify_forward(draft_token_ids, state, spec_state_rows=spec_state_rows)
+
+    def verify_batch(self, batch: Qwen36VerifyBatch) -> torch.Tensor:
+        """Graph-safe target verify body; see the text-model method."""
+        return self.model.verify_batch(batch)
 
     def commit_verify(
         self,
         state: Qwen36GenerationState,
-        gdn_snapshots: dict[int, list[GdnLayerState]],
+        gdn_snapshots: dict[int, list[GdnLayerState]] | None,
         *,
         past_len: int,
         accepted_count: int,
