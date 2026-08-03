@@ -994,6 +994,18 @@ drafter + 投机专用 `kv_cache_dtype`）读代码后发现**不完全对**—�
   56 层 MLP；**FP8 那 237 个张量的 BF16 缓存是永久的，且 FP8 原件同时常驻**——
   按 checkpoint 真实尺寸算：原件 9.99 GiB + BF16 缓存 19.99 GiB = **两份 29.98 GiB**，
   而 `forward` 只读 BF16 那份。**照搬 NVFP4 做法可立刻回收 ~9.99 GiB，无需任何 kernel 工作。**
+- [ ] 🔴 **FP8 KV 是显存杠杆，不是速度杠杆——长上下文下它反而减速(实测)。**
+  @128K/c=1:`PagedForwardKernel` **44.97 → 53.64 ms/step(+19%)**,读的字节减半但 kernel 更慢
+  (sparkinfer 的 FP8-KV attention 路径内部代价更高)。eager 下墙钟看不出来是因为 GPU 只有
+  45–50% 忙、被空转掩盖;**CG 下已 kernel-bound,这 19% 会直接变成吞吐损失**。
+  **翻默认值前必须在 CG 下补一轮长上下文对照。** 省 12.3 GiB 与 B1-R 2–8× 余量不变。
+  见 [`../notes/2026-08-03-128k-decode-profile.md`](../notes/2026-08-03-128k-decode-profile.md)。
+- [ ] 📌 **长/短上下文是两个不同的瓶颈区间,结论不可互推(实测)**:
+  128K 下 **attention 占 58.5%**(16 次调用/步),短上下文下它几乎不可见、
+  BF16 通用 GEMM 占 45%。GDN 两边都是 0.3–0.6%,**再次确认不是量级项**。
+- [ ] ⚠️ **单次 forward 硬上限 ≈ 61,681 token**(裸模型 API):`m × fc1_cols` 溢出 int32
+  (`sparkinfer/.../w4a16/kernel.py:8594`)。生产按 512 分块不受影响,
+  **但直接调 `model(...)` 喂长序列的脚本会崩**。
   ✅ **已实施**（W8A8 预演否定后不再需要保留 FP8 原件）：`free_fp8_raw_weights()`，
   真机实测**释放 233 个 Linear、常驻 44,626 → 38,698 MiB、实收 5.79 GiB**，输出不变。
   （实收小于预估 9.99 GiB 是分配器复用所致，与 NVFP4 那轮同一现象，不是没生效。）
