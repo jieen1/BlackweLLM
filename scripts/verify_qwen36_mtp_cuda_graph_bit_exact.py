@@ -1,46 +1,34 @@
-"""B3 CUDA-Graph follow-up: GPU bit-exactness proof for
-``runtime.backends.qwen36_mtp_cudagraph``'s anchor, draft, and verify graphs.
+"""⚠️ 本脚本的判据是错的，不要拿它当放行条件。
 
-**What this proves, and why it needs a real GPU + real checkpoint**: these
-graphs replace EXISTING, already-verified eager code paths
-(``Qwen36MTPEngine.round``'s anchor-advance forward, chained ``mtp_step``
-calls, and K-token target verify) with a
-DIFFERENT kernel code path (``decode_batch()`` against a pooled KV tensor,
-vs ``forward()``/``mtp_step()`` against a standalone
-``Qwen36PagedAttentionCache``). Same weights, same math on paper -- but a
-different kernel schedule, same class of claim
-``scripts/b2_verify_serving.py`` already established for the MAIN decode
-path ("batched decode is bit-exact against B1's eager path") and which
-that script's own docstring says explicitly is "a claim about a real
-checkpoint on a real GPU", not something a CPU/stub test can make. This
-script makes the SAME kind of claim for all MTP graphs specifically
--- nothing before this landing exercised ``Qwen36Attention.decode_batch``
-against MTP's own head/cache at all.
+**"图重放对 eager 逐位相同"这件事，本仓库早已证明做不到**，与 MTP 无关：
+``notes/2026-08-02-eager-verify-cg-verify-divergence.md`` 的结论是
+**CG 冻结在 1 个 KV 分块、eager 用 4~16 个**，而"块数不一致本身不是错误，
+两种块数在注意力算子这一层都算对了"（cos ≥ 0.999997，kv_len=64/400/500 全成立）。
+全模型 logits 上看到的 argmax 翻转是**近似平局位置的翻转**，不是某条路径算错了。
 
-**Method**: run ``NUM_ROUNDS`` real MTP rounds (prefill bootstrap +
-``round()`` calls) on TWO DIFFERENT slots of the SAME loaded model/backend
--- one with the captured graphs live (the default once ``enable_mtp``
-succeeds on a real GPU), one with them forced off
-(``engine._anchor_cg = engine._draft_cg = engine._verify_cg = None`` for the duration, which
-routes every call through the pre-existing eager path unchanged). Greedy
-decoding is deterministic given fixed weights and fixed inputs, so if both
-graphs replay bit-exactly, the two slots' full per-round traces
-(committed tokens, num_accepted, next_anchor, next_draft_tokens) must be
-IDENTICAL, not merely "close" -- any float noise from a genuinely different
-kernel schedule would first show up as an argmax flip in ``committed``,
-which this comparison catches structurally (a list-equality check), not
-just numerically.
+2026-08-03 的实测复现了同一机制：跑到第 4 轮（首次全接受）结束时，
+``accepts``/``anchor``/``live_col``/committed token **两条路径完全一致**，
+而 48 个 GDN 层里 45 个的状态差在 **conv 3.1e-02 / recurrent 2e-03**——
+**bf16 精度尺度，不是写错行的量级**（写错行会给出完全不同的值）。
+到第 5 轮累积漂移把一个近似平局翻了过去，于是本脚本判失败。
 
-Two different slots (not two separate model loads) so this only pays the
-checkpoint's cold-load cost once; the two runs are still fully independent
-(``backend.reset_slot`` clears one slot's own KV/GDN/MTP-cache state, never
-touching the other's).
+**这个失败三次误导了修复方向**：先后被归因为"地址被烤死"和"anchor 写进候选行"，
+两个假设都按历史代码认真查证过、也都改过，而签名分毫未变——**因为没有东西可修，是尺子错了。**
 
-Not a pytest (needs the GPU lock + a real checkpoint on disk), matching
-this repo's convention (``verify_w4a16_cuda_graph_scratch_rootcause.py``):
+**正确的判据是两条**，都已在本仓库建立：
 
-    ~/.venvs/vllm/bin/python scripts/verify_qwen36_mtp_cuda_graph_bit_exact.py
+1. **B1-R 的 gap-error**（``docs/b1-correctness-criterion.md``，对照已校准的 bar）
+   —— W4A4 / FP8 W8A8 / FP8 KV 都是这么判的。这个判据存在的理由，
+   恰恰就是 bit-exactness 被证明达不到。
+2. **投机 vs 非投机在同一条路径内逐 token 一致**
+   （``scripts/b3_mtp_e2e_acceptance_throughput.py``）——这才是投机解码的正确性定义。
+
+本脚本保留有一个用处、且只有这一个：**确认 ``cg_status`` 三项都是 ``captured``**，
+即捕获没有静默退化成 eager。它确实抓到过两次真问题（``commit_verify`` 分支导致
+一开图就崩、multistep 的连续性要求导致 verify 捕获失败）。**捕获与否是二值的、可判的；
+逐位相同不是。**
 """
+
 
 from __future__ import annotations
 
