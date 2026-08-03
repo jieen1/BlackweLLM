@@ -388,3 +388,62 @@ capacity=1 只有 16~32 tok/s（还随热态漂）。
 按这个定义，**当前没达标**。已完成的是：verify 模式根因修复（正确性）、
 每轮 303.8 → 105.9 ms（结构）、capacity=1 下投机由亏转盈。**没完成的是让
 它在服务形态下真正快**，下一步是 M-2。
+
+## 十、M-2（跨槽批量 verify）的工作面 —— 已探明，可行
+
+### 为什么必须是 M-2，不是动态选路
+
+一个便宜的想法是「按在飞请求数动态选路：1 个走 MTP，多个走批量 decode」。
+算术支持它（见下），但**实现上有坑，先不做**：
+
+- plain 路径不碰 `self.active[s]["anchor"]/["drafts"]`，槽从 MTP 切到 plain 后
+  这两个值就陈旧了，切回来会拿旧 draft 对上已经前进的状态；
+- 而且 `classify_decode_slots` 今天传的 `grammar_slots` 恒为 `[]`
+  （`server/engine.py:1566`），**混合路由从未真正执行过**。启用它等于上线一条
+  没测过的路径。
+
+要做也得先让 plain step 保留 hidden 以便重新播种 MTP（和 `draft_after_prefill`
+同样的播种方式）。这是可做的，但属于另一件事。
+
+### 交叉点的算术（解释 0.49x，不是拟合）
+
+n 个活跃槽：
+
+- plain：**1 次批量 step** ≈ 40 ms → n 个 token
+- MTP：**n 轮串行** × ~100 ms → n × 2.6 个 token
+
+MTP 胜出条件 `2.6/(n×100) > 1/40` → `n < 1.04`。即**只有 n=1 时赢**。
+实测 n=1 → 1.6~2.0x、n=4 → 0.49x，与之吻合。
+
+### M-2 的实际工作面
+
+批量 decode 之所以能批，是因为**另建了**一个 `Qwen36DecodeGraphAttention`
+（`qwen36_model.py:1644`）；eager 路径整体仍是 batch=1，模块文档开头就写着
+「Every forward path below assumes ``batch_size == 1``」，并有 4 处断言：
+
+| 行 | 位置 |
+|---|---|
+| 654 | GDN `forward` |
+| 946 | GDN `spec_forward` |
+| 2093 | 注意力 `forward` |
+| 2277 | `verify_batch` 的注意力 |
+
+M-2 = 给 verify 建一套与 `Qwen36DecodeGraphAttention` 对等的批量驱动。
+**两个底层都已经支持批量，不需要改内核：**
+
+1. **GDN**：`fused_recurrent_gated_delta_rule_multistep` 的签名就是
+   `q/k/v: [B, T, H, K]`、`initial_state` 同批（sparkinfer
+   `attention/gated_delta_rule/api.py:118-141`）。多槽只是把 B 从 1 提上去。
+2. **注意力**：sparkinfer 的 verify 模式 planner 本来就按 `batch`/`total_q`
+   分派（`planner.py:552-557`，`mode == "verify"` 时 work items 取 `total_q`），
+   页表/`cache_seqlens`/`cu_seqlens_q` 按 `[B, ...]`/`[B]`/`[B+1]` 给即可。
+
+历史实现就是**一次跨槽 `verify_batch_spec`**（`direct_model_runner.py:1581`），
+当年这项 **+43%**（`survey.md:75`）。
+
+`runtime/mtp_accept.py::determine_accept_reject_batch`（`[num_reqs, k+1]`
+一次 argmax + 一次 `.tolist()`）**已实现、零调用**，正是给这条路径准备的
+（`survey.md:115`）——和 `block_pool.py`、`spec_row` 一样，是当年做过、这次
+没接线的部件。
+
+**这是 MTP 距离"服务形态下真正可用"唯一剩下的结构性缺口。**
