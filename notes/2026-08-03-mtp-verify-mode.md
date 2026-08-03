@@ -190,3 +190,48 @@ code 的线。所以 M-1b 之后预期 prose 打平上下、code 净胜。
 
 接受率的提升（M-2 跨槽批处理）是**叠加**项。深生成的自然增益已实测**不存在**
 （§四·五(1)），不要再计入。
+
+## 六、空隙的确切来源：每轮两次主机同步（已定位到行）
+
+§四·五(3) 说「输在发射空隙」，但没说空隙在哪。用包装 `Tensor.tolist/item/cpu/to`
+并在阻塞超过 2 ms 时记录 Python 栈的办法测出来（`find_mtp_syncs.py`）：
+
+```
+round wall 137.72 ms; blocking transfers > 2.0 ms
+
+  66.82 ms/round  x1.0  tolist  <-  qwen36_mtp.py:618  round()
+                                    predicted_tokens = all_logits.argmax(dim=-1).tolist()
+  13.72 ms/round  x1.0  tolist  <-  qwen36_mtp_cudagraph.py:638  replay()
+                                    return self._draft_tokens.tolist()
+
+  80.54 ms/round  TOTAL attributed (58% of the round)
+```
+
+**这两次等待本身不是浪费**——GPU 在这 80 ms 里确实在算 anchor+verify+draft。
+浪费的是**等待前后的空档**：CPU 被同步卡住时无法给 GPU 排下一批活，于是同步
+一返回、Python 在跑 accept/reject 的那段时间 GPU 完全空转。整轮 137.7 ms 墙钟
+对 105.6 ms 内核 = **32 ms 纯空转**（23%）。
+
+（记一下方法：chrome trace 只说 `aten::to` 花了 94.9/42.5/14.0 ms，不说是谁调的。
+一个几十毫秒的 D2H 拷贝不是在搬字节，是在**等**。要定位就得给调用点打栈，
+而不是从 op 名字猜。之前我差点去改 `torch.tensor(list, device=cuda)` 那类
+每次几微秒的小拷贝——那个方向是错的，先量再改省下了这次返工。）
+
+### 依赖链其实不需要经过主机
+
+draft 的种子 = `next_anchor` ← accept/reject ← verify 的 logits。今天这条链
+**穿过主机**：logits 读回 CPU → Python 算接受数 → 把种子 token 作为 Python int
+写回设备。
+
+但 accept/reject 是纯 argmax + 前缀比较，可以整个留在设备上，`next_anchor` 用
+设备端 gather 取（`predicted_tokens[m]`，`m` 是设备标量）。这样一轮到最后
+才需要一次读回（提交的 token，流式输出必需），CPU 可以在 verify 还没算完时
+就把 draft 图排进去。
+
+仓库里已有一半：`runtime/mtp_accept.py::determine_accept_reject_batch`
+（`[num_reqs, k+1]` 一次 argmax + 一次 `.tolist()`）**实现了但零调用**——
+和 `block_pool.py`、`recurrent_state_pool.py::spec_row` 一样，是当年做过、
+这次没接线的东西（`historical-implementation-survey.md:115`）。
+
+**M-1c**：accept/reject 全程留在设备上，draft 图接受设备端种子 token。
+预期回收那 32 ms 空转的大部分。与 M-1b（anchor 折进 verify）正交，两者叠加。
