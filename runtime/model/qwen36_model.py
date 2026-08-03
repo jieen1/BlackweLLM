@@ -1145,9 +1145,12 @@ def commit_spec_snapshot(
 
 class Qwen36AttentionWorkspace:
     """Fixed-capacity sparkinfer paged-attention workspace for one
-    ``Qwen36Attention`` layer, covering both ``mode="extend"`` (prefill)
-    and ``mode="decode"`` (single-token continuation) -- no ``"verify"``
-    (B1 has no speculative decoding) and no ``window_left``/SWA (Qwen3.6's
+    ``Qwen36Attention`` layer, covering ``mode="extend"`` (prefill),
+    ``mode="decode"`` (single-token continuation) and ``mode="verify"``
+    (MTP's K-token speculative verify, added 2026-08-03 -- B1 itself had
+    no speculative decoding, and routing verify onto the extend workspace
+    is what broke MTP under FP8 KV; see
+    notes/2026-08-03-mtp-verify-mode.md). No ``window_left``/SWA (Qwen3.6's
     ``layer_types`` has no ``"sliding_attention"`` entry, only
     ``"full_attention"``/``"linear_attention"`` -- verified against the
     real checkpoint's ``config.json``, B0-6/B1).
@@ -1275,8 +1278,16 @@ class Qwen36AttentionWorkspace:
         max_batch: int = 1,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
+        # Required for mode="verify" only: the largest query length any
+        # verify call will present (the speculator's K), plus the real KV
+        # caches, so the worst-case plan below is built against the same
+        # tensors the live calls will use rather than a guess at their
+        # layout. Unused by extend/decode.
+        max_verify_query_len: int = 0,
+        k_cache: torch.Tensor | None = None,
+        v_cache: torch.Tensor | None = None,
     ) -> None:
-        if mode not in ("extend", "decode"):
+        if mode not in ("extend", "decode", "verify"):
             raise ValueError(f"Qwen36AttentionWorkspace: unsupported mode {mode!r}")
         self.mode = mode
         self.max_batch = max_batch
@@ -1301,12 +1312,31 @@ class Qwen36AttentionWorkspace:
         # eager_extend_work_items_capacity is sparkinfer's own estimator
         # for exactly this pair of modes (its name and design track
         # max_total_q, which is what extend/decode's real work-item count
-        # scales with) -- see SparkinferPrefillWorkspace's docstring for
-        # why this estimator specifically does NOT generalize to
-        # mode="verify" (not a concern here: B1 has none).
-        max_work_items = PagedAttentionWorkspace.eager_extend_work_items_capacity(
-            max_total_q=max_total_q, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
-        )
+        # scales with). It does NOT generalize to mode="verify" -- see
+        # SparkinferPrefillWorkspace's docstring, which recorded this the
+        # first time (notes/2026-08-01-c1-c2-gpu-investigation.md §C-1):
+        # the same estimator applied to verify under-provisioned and
+        # sparkinfer's _ensure_capacity hard-failed with "fixed-capacity
+        # paged workspace exceeded" before any attention math ran.
+        # mode="verify" therefore takes the recipe that investigation
+        # landed on: run the REAL eager planner once, up front, at this
+        # workspace's own declared worst case, and trust its numbers.
+        if mode == "verify":
+            max_work_items, max_partial_rows = self._verify_capacity(
+                max_verify_query_len=max_verify_query_len,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                num_q_heads=num_q_heads,
+                dtype=dtype,
+                device=device,
+                head_dim=head_dim,
+            )
+        else:
+            max_work_items = PagedAttentionWorkspace.eager_extend_work_items_capacity(
+                max_total_q=max_total_q, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
+            )
+            # matches PagedExtendGraphCapacity: no split-KV merge buffer
+            max_partial_rows = 0
         self._workspace = PagedAttentionWorkspace.for_fixed_capacity(
             mode=mode,
             device=device,
@@ -1321,7 +1351,7 @@ class Qwen36AttentionWorkspace:
             max_batch=max_batch,
             max_page_table_width=max_page_table_width,
             max_work_items=max_work_items,
-            max_partial_rows=0,  # matches PagedExtendGraphCapacity: no split-KV merge buffer
+            max_partial_rows=max_partial_rows,
             num_cache_pages=num_cache_pages,
             use_cuda_graph=False,
         )
@@ -1329,12 +1359,88 @@ class Qwen36AttentionWorkspace:
         # own policy knobs -- above all ``cta_tile_q``, which is part of
         # sparkinfer's compile cache key -- are derived from capacity, not
         # from the live request's query length. See the class docstring.
-        self._plan_budget = PagedPlanBudget(
-            max_total_q=max_total_q,
-            max_batch=max_batch,
-            max_page_table_width=max_page_table_width,
+        #
+        # mode="verify" is deliberately EXCLUDED, and this is load-bearing
+        # rather than conservatism -- SparkinferPrefillWorkspace's docstring
+        # records why: _paged_determine_cta_tile_q selects the M64 verifier
+        # by an exact match on packed_qo_len, and several downstream
+        # kernel-policy flags (use_laguna_verify_kernel,
+        # laguna_verify_two_wave_b1, the FP8 PV MMA path) are gated on
+        # plan.cta_tile_q == 64. A capacity-derived packed_qo_len misses
+        # that match and silently drops verify onto cta_tile_q=16. Verify
+        # does not have extend's multi-bucket problem anyway: its query
+        # length is a fixed K-token window, so it is single-bucket already.
+        self._plan_budget = (
+            None
+            if mode == "verify"
+            else PagedPlanBudget(
+                max_total_q=max_total_q,
+                max_batch=max_batch,
+                max_page_table_width=max_page_table_width,
+            )
         )
         self._prepared_metadata: object | None = None
+
+    @staticmethod
+    def _verify_capacity(
+        *,
+        max_verify_query_len: int,
+        k_cache: torch.Tensor | None,
+        v_cache: torch.Tensor | None,
+        num_q_heads: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        head_dim: int,
+    ) -> tuple[int, int]:
+        """``(max_work_items, max_partial_rows)`` for a fixed-capacity
+        ``mode="verify"`` workspace.
+
+        Built by running sparkinfer's REAL eager planner
+        (``create_paged_plan(enable_cuda_graph=False, mode="verify", ...)``
+        -- the exact function every live verify call below will use) once
+        against a synthetic worst case: every cache page occupied, query at
+        the declared K. This is the recipe
+        ``SparkinferPrefillWorkspace._capacity_for`` already validated on
+        real GPU; its docstring also records the dead end not to repeat
+        (``plan_verify_graph_capacity`` predicted 47/112 where the real
+        eager plan needed 96/256 -- the graph and eager paths compute
+        different schedules and are not interchangeable capacity sources).
+
+        Sizing at the max KV bound is a genuine upper bound, not another
+        guess: work items were confirmed monotonically increasing with
+        kv_len on real GPU for this same full-attention geometry.
+        """
+        if max_verify_query_len <= 0:
+            raise ValueError(
+                "Qwen36AttentionWorkspace: mode='verify' requires "
+                "max_verify_query_len > 0 (the speculator's K). Guessing one "
+                "here would repeat the under-provisioning bug recorded in "
+                "notes/2026-08-01-c1-c2-gpu-investigation.md, which surfaces "
+                "as sparkinfer's 'fixed-capacity paged workspace exceeded'."
+            )
+        if k_cache is None or v_cache is None:
+            raise ValueError(
+                "Qwen36AttentionWorkspace: mode='verify' requires the real "
+                "k_cache/v_cache to build its worst-case plan."
+            )
+        num_cache_pages = int(k_cache.shape[0])
+        page_size = int(k_cache.shape[1])
+        max_kv = max(num_cache_pages * page_size - 1, 1)
+        worst_plan = create_paged_plan(
+            torch.empty(
+                max_verify_query_len, num_q_heads, head_dim, dtype=dtype, device=device
+            ),
+            k_cache,
+            v_cache,
+            torch.arange(num_cache_pages, dtype=torch.int32, device=device).unsqueeze(0),
+            torch.tensor([max_kv], dtype=torch.int32, device=device),
+            torch.tensor([0, max_verify_query_len], dtype=torch.int32, device=device),
+            mode="verify",
+            enable_cuda_graph=False,
+            window_left=-1,
+        )
+        max_partial_rows = int(worst_plan.total_num_partial_rows) if worst_plan.split_kv else 0
+        return int(worst_plan.new_batch_size), max_partial_rows
 
     def forward(
         self,
@@ -1892,6 +1998,32 @@ class Qwen36Attention(nn.Module):
         # Qwen36AttentionWorkspace's docstring for why this exists.
         self._extend_workspace: Qwen36AttentionWorkspace | None = None
         self._decode_workspace: Qwen36AttentionWorkspace | None = None
+        # Speculative verify (K>1 tokens against an existing KV span) is a
+        # THIRD mode, not a short extend. sparkinfer distinguishes the two
+        # throughout its planner, and routing verify onto the extend
+        # workspace is what broke MTP under FP8 KV -- see
+        # notes/2026-08-03-mtp-verify-mode.md.
+        self._verify_workspace: Qwen36AttentionWorkspace | None = None
+        # Declared by declare_verify_capacity() before any verify traffic.
+        self._max_verify_query_len = 0
+
+    def declare_verify_capacity(self, max_query_len: int) -> None:
+        """Declare the largest ``mode="verify"`` query length this layer
+        will ever be asked for (the speculator's K).
+
+        Must be called before the first verify forward: the verify
+        workspace is fixed-capacity and sparkinfer hard-fails rather than
+        growing it, by design. Raising K after the workspace exists
+        discards it so the next call rebuilds at the larger bound --
+        silently keeping the old one would under-provision exactly the way
+        notes/2026-08-01-c1-c2-gpu-investigation.md describes.
+        """
+        max_query_len = int(max_query_len)
+        if max_query_len <= 0:
+            raise ValueError("declare_verify_capacity: max_query_len must be positive")
+        if max_query_len > self._max_verify_query_len:
+            self._max_verify_query_len = max_query_len
+            self._verify_workspace = None
 
     def _workspace_for(
         self,
@@ -1900,7 +2032,11 @@ class Qwen36Attention(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> Qwen36AttentionWorkspace:
-        attr = "_extend_workspace" if mode == "extend" else "_decode_workspace"
+        attr = {
+            "extend": "_extend_workspace",
+            "decode": "_decode_workspace",
+            "verify": "_verify_workspace",
+        }[mode]
         existing = getattr(self, attr)
         if existing is not None:
             return existing
@@ -1921,6 +2057,10 @@ class Qwen36Attention(nn.Module):
             # as before this parameter existed.
             k_descale=self.k_scale,
             v_descale=self.v_scale,
+            # Only consulted for mode="verify"; see _verify_capacity.
+            max_verify_query_len=self._max_verify_query_len,
+            k_cache=cache.k_cache,
+            v_cache=cache.v_cache,
         )
         setattr(self, attr, workspace)
         return workspace
@@ -1947,6 +2087,7 @@ class Qwen36Attention(nn.Module):
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         cache: Qwen36PagedAttentionCache,
+        paged_mode: str | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
         assert batch_size == 1
@@ -1978,7 +2119,13 @@ class Qwen36Attention(nn.Module):
             key, value, cache_dtype=cache.dtype, k_scale=self.k_scale, v_scale=self.v_scale
         )
         _past_len, total_len = cache.append(k_to_store, v_to_store)
-        mode = "decode" if seq_len == 1 else "extend"
+        # paged_mode is passed explicitly by speculative verify, which is a
+        # K>1 query against an existing KV span -- shape-indistinguishable
+        # from a K-token prefill here, but a different sparkinfer mode with
+        # a different plan and different kernel-policy flags. Inferring it
+        # from seq_len alone silently routed verify onto extend; see
+        # notes/2026-08-03-mtp-verify-mode.md.
+        mode = paged_mode or ("decode" if seq_len == 1 else "extend")
 
         workspace = self._workspace_for(mode, cache, query.dtype, query.device)
         output = torch.empty(
@@ -3042,7 +3189,10 @@ class Qwen36TextModelSelfBuilt(nn.Module):
             else:
                 attn_cache = state.attn_caches[layer.layer_idx]
                 assert attn_cache is not None
-                hidden_states = layer.self_attn(hidden_states, positions, cos_sin_cache, attn_cache)
+                layer.self_attn.declare_verify_capacity(seq_len)
+                hidden_states = layer.self_attn(
+                    hidden_states, positions, cos_sin_cache, attn_cache, paged_mode="verify"
+                )
 
             hidden_states = residual + hidden_states
 
