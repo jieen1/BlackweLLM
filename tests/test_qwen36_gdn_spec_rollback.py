@@ -155,9 +155,23 @@ class TestSpecRowAddressing:
             "rms_norm_eps": 1e-6,
             "hidden_act": "silu",
         }
-        torch.manual_seed(7)
         layer = Qwen36GatedDeltaNet(config, layer_idx=0, quantized={})
         layer = layer.float()
+        # Seeding BEFORE construction does not make this layer deterministic.
+        # Qwen36GatedDeltaNet allocates its parameters uninitialized, expecting
+        # a checkpoint to overwrite them -- measured: 8 of its 9 parameters
+        # differ between two constructions under the same seed. So the values
+        # come from whatever the allocator hands back, which depends on what
+        # ran before. That is why this test passed alone and failed in the
+        # suite: the comparison below is between two `spec_forward` paths over
+        # the SAME weights, and with garbage weights the two paths can diverge
+        # for reasons that have nothing to do with either one being wrong.
+        #
+        # Fill every parameter explicitly instead, so the fixture is hermetic.
+        gen = torch.Generator().manual_seed(7)
+        with torch.no_grad():
+            for param in layer.parameters():
+                param.copy_(torch.empty_like(param).uniform_(-0.5, 0.5, generator=gen))
         source = layer.new_state(batch=1, device=torch.device("cpu"), dtype=torch.float32)
         source.conv_state.copy_(
             torch.arange(source.conv_state.numel()).reshape_as(source.conv_state)

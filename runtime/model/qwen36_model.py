@@ -3094,12 +3094,28 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         the two calls cannot silently corrupt this one.
         """
         for layer in self.layers:
-            if layer.layer_type == "linear_attention" and gdn_snapshots is not None:
-                commit_spec_snapshot(
-                    state.gdn_states[layer.layer_idx],
-                    gdn_snapshots[layer.layer_idx],
-                    accepted_count,
-                )
+            if layer.layer_type == "linear_attention":
+                # `gdn_snapshots is None` means the caller used the K+1
+                # `spec_row` path instead of clone-and-restore: every
+                # candidate's state already lives at its own permanent row,
+                # and the accepted one is selected by the caller's
+                # `Qwen36MTPGDNRows.activate(slot, m)` immediately after this
+                # returns -- a pointer swap, not a copy. So there is nothing
+                # to commit here for a GDN layer in that mode.
+                #
+                # This branch used to read `layer_type == "linear_attention"
+                # and gdn_snapshots is not None`, which sent GDN layers into
+                # the KV branch below as soon as the row path returned None --
+                # and GDN layers have no `attn_cache`, so it tripped
+                # `assert attn_cache is not None` on the first graph-enabled
+                # round. Branching on layer type is the invariant; whether
+                # snapshots exist is a mode question that belongs inside it.
+                if gdn_snapshots is not None:
+                    commit_spec_snapshot(
+                        state.gdn_states[layer.layer_idx],
+                        gdn_snapshots[layer.layer_idx],
+                        accepted_count,
+                    )
             else:
                 attn_cache = state.attn_caches[layer.layer_idx]
                 assert attn_cache is not None
