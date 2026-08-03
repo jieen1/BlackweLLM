@@ -141,6 +141,26 @@ class Qwen36MTPEngine:
         self.model = model
         self.k = num_speculative_tokens
         self.enable_resync = _resync_env_default() if enable_resync is None else enable_resync
+        if self.enable_resync and not hasattr(model, "mtp_resync_step"):
+            # Fail here, not on round 3. `_resync` calls
+            # `self.model.mtp_resync_step(...)`, and that method exists only
+            # on the unmerged branch `work/mtp-resync-20260802` (@ aed0e2d) --
+            # never on main. So this flag could only ever produce an
+            # AttributeError partway through a live request, after the server
+            # had come up and started answering. A flag whose sole reachable
+            # behaviour is a mid-request crash should refuse at construction.
+            #
+            # Not fixed by porting the method: that is ~166 lines which also
+            # reimplements `mtp_step` in terms of itself, on the MTP hot path,
+            # in service of an optimization that has never been A/B measured.
+            # It needs its own evidence before it earns that risk.
+            raise RuntimeError(
+                "QSR_SERVER_MTP_RESYNC is set, but this model has no "
+                "`mtp_resync_step` -- the per-round resync was ported only on "
+                "branch work/mtp-resync-20260802 and never merged, so the flag "
+                "has no working implementation here. Unset it (default off) to "
+                "run MTP without resync, which is the only measured path."
+            )
         self.device = backend.device
         self.dtype = backend.dtype
         self.vocab_size = int(model.config["vocab_size"])

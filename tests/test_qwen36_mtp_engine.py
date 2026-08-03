@@ -444,3 +444,53 @@ class TestSampledRoundStaysCorrect:
         assert len(result["committed"]) == result["num_accepted"] + 1
         assert len(result["next_draft_tokens"]) == 3
         assert backend._mtp.stats["sampled_rounds"] == 1
+
+
+class TestResyncFlagRefusesWithoutAnImplementation:
+    """`QSR_SERVER_MTP_RESYNC=1` used to be a flag that could only crash.
+
+    `Qwen36MTPEngine._resync` calls `self.model.mtp_resync_step(...)`. On the
+    real model that method does not exist -- it was written only on the
+    unmerged branch `work/mtp-resync-20260802` (@ aed0e2d). So setting the flag
+    brought the server up normally, answered requests, and then raised
+    AttributeError partway through the first round that accepted more than one
+    draft token: as far from the cause as a failure can get, on a path a
+    startup config flag had opted into.
+
+    Note the stub in this file DOES define `mtp_resync_step`, which is exactly
+    why nothing here caught it -- every other test in this file constructs the
+    engine against a model more capable than the real one. These tests use a
+    model without the method, i.e. the shape production actually has.
+
+    The engine now refuses at construction. That is the right trade for a flag
+    with no implementation behind it: porting it means ~166 lines that also
+    reimplement `mtp_step` in terms of themselves, on the MTP hot path, for an
+    optimization with no A/B measurement behind it.
+    """
+
+    def _engine(self, *, enable_resync: bool) -> Qwen36MTPEngine:
+        backend, _ = _backend()
+        backend.model.mtp = object()
+        return Qwen36MTPEngine(
+            backend, num_speculative_tokens=4, enable_resync=enable_resync
+        )
+
+    def test_it_refuses_when_the_model_cannot_resync(self):
+        """The real model has no `mtp_resync_step`; the stub in this file does,
+        which is precisely why nothing here caught the flag being unusable."""
+        saved = _StubMTPModel.mtp_resync_step
+        try:
+            del _StubMTPModel.mtp_resync_step  # type: ignore[attr-defined]
+            with pytest.raises(RuntimeError, match="mtp_resync_step"):
+                self._engine(enable_resync=True)
+        finally:
+            _StubMTPModel.mtp_resync_step = saved  # type: ignore[attr-defined]
+
+    def test_the_default_path_is_unaffected(self):
+        """Resync off must construct exactly as before -- the guard is scoped."""
+        self._engine(enable_resync=False)
+
+    def test_a_model_that_can_resync_is_accepted(self):
+        """The guard checks capability, not a version string, so a real port of
+        `mtp_resync_step` turns the flag on without touching this code."""
+        self._engine(enable_resync=True)
