@@ -226,6 +226,25 @@ class TestBackendWiring:
         backend.reset_slot(0)
         assert cache.seq_len == 0
 
+    def test_cpu_device_never_attempts_cuda_graph_capture(self) -> None:
+        """2026-08-03 CUDA-Graph follow-up
+        (runtime.backends.qwen36_mtp_cudagraph): capture is only ever
+        attempted on a real CUDA device -- this stub model's ``model.mtp``
+        is a bare ``object()`` sentinel with no ``.layers[0].self_attn``
+        geometry to pool from, so an unconditional capture attempt would
+        crash every test in this file, not just this one. Pinning this
+        stays green even if a future edit accidentally drops the device
+        guard.
+        """
+        backend, _ = _backend()
+        backend.enable_mtp(num_speculative_tokens=2, enable_resync=False)
+        engine: Qwen36MTPEngine = backend._mtp
+        assert engine._use_cuda_graph is False
+        assert engine.cg_status == {}
+        assert engine._anchor_cg is None
+        assert engine._draft_cg is None
+        assert engine.cuda_graphs_healthy() is True  # vacuous: nothing attempted
+
 
 class TestPairingFix:
     """The core claim: the NEXT round's draft loop is seeded with the
