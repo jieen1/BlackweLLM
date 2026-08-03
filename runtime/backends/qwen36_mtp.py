@@ -110,21 +110,46 @@ def _resync_env_default() -> bool:
 
 
 class Qwen36MTPGDNRows:
-    """Permanent ``K+1`` GDN rows used by one MTP engine.
+    """Permanent ``K+2`` GDN rows used by one MTP engine.
 
     The old verify path cloned every recurrent state once per speculative
     position and copied one clone back after accept/reject. A candidate state
     can instead live at its fixed ``spec_row`` address and the next round
     selects the accepted row. The allocation is owned by MTP because the
     backbone's ordinary decode graphs are captured before MTP is enabled.
+
+    ``K+2``, not ``K+1``, since the round folded the anchor into the verify
+    forward: that forward covers ``k+1`` positions (anchor + K drafts), and
+    ``spec_forward``'s contract is ``seq_len + 1`` rows -- one incoming state
+    plus one per position. The columns line up as:
+
+      * column 0        -- the state BEFORE the anchor, i.e. what the previous
+                           round committed. ``spec_row`` already defines column
+                           0 as the ordinary non-speculative row the chunked
+                           prefill writes, which is exactly the right home for
+                           an incoming state.
+      * columns 1..k+1  -- the state after position 0..k of this round's
+                           forward. Accepting ``m`` drafts means committing
+                           ``m + 1`` positions (the anchor is never rejected),
+                           so the committed column is ``m + 1``.
+
+    The historical implementation held only ``k+1`` columns because it never
+    materialised the incoming state as a row of its own -- its kernel read
+    that state straight from the column the PREVIOUS round wrote
+    (``ssm_state_indices[i_n, num_accepted - 1]``, see ``_ssm_spec_row``'s
+    docstring). Matching that would save one row per slot (~80 MiB here);
+    it is a memory optimisation, not a correctness requirement.
     """
 
     def __init__(self, backend: Qwen36Backend, num_speculative_tokens: int) -> None:
         self.backend = backend
         self.pool = backend.pool
         self.k = num_speculative_tokens
+        # Columns are k+2; `spec_row`'s `num_spec` counts the NON-zero
+        # columns, so it gets k+1.
+        self.num_spec_cols = self.k + 1
         self.total_physical_slots = self.pool.num_slots + 1
-        self.total_rows = self.total_physical_slots * (self.k + 1)
+        self.total_rows = self.total_physical_slots * (self.num_spec_cols + 1)
         self.conv_pools: list[torch.Tensor | None] = [None] * self.pool.num_layers
         self.recurrent_pools: list[torch.Tensor | None] = [None] * self.pool.num_layers
         self._states: dict[int, list[list[GdnLayerState]]] = {}
@@ -157,8 +182,8 @@ class Qwen36MTPGDNRows:
             per_layer: list[list[GdnLayerState]] = []
             for slot in range(self.pool.num_slots + 1):
                 columns: list[GdnLayerState] = []
-                for col in range(self.k + 1):
-                    row = spec_row(slot, col, self.total_physical_slots, self.k)
+                for col in range(self.num_spec_cols + 1):
+                    row = spec_row(slot, col, self.total_physical_slots, self.num_spec_cols)
                     columns.append(
                         GdnLayerState(
                             conv_state=conv[row : row + 1],
@@ -176,7 +201,7 @@ class Qwen36MTPGDNRows:
         return {layer_idx: per_slot[slot] for layer_idx, per_slot in self._states.items()}
 
     def row_for_slot(self, slot: int, col: int) -> int:
-        return spec_row(slot, col, self.total_physical_slots, self.k)
+        return spec_row(slot, col, self.total_physical_slots, self.num_spec_cols)
 
     def activate(self, slot: int, col: int) -> None:
         state = self.pool.slot_state(slot)
@@ -369,23 +394,14 @@ class Qwen36MTPEngine:
             return
         strict = os.environ.get("QSR_QWEN36_MTP_REQUIRE_CG", "0") == "1"
 
-        def _do_capture_anchor() -> None:
-            cg = Qwen36MTPAnchorCudaGraph(
-                self.backend,
-                conv_pools=None if self._spec_rows is None else self._spec_rows.conv_pools,
-                recurrent_pools=(
-                    None if self._spec_rows is None else self._spec_rows.recurrent_pools
-                ),
-                state_row=(None if self._spec_rows is None else self._spec_rows.row_for_slot),
-                reset_spec_state=(None if self._spec_rows is None else self._spec_rows.reset_slot),
-            )
-            cg.capture()
-            self._anchor_cg = cg
-
-        status = attempt_mtp_cg_capture("anchor", _do_capture_anchor, strict=strict)
-        self.cg_status["anchor"] = status
-        if status == "failed":
-            self._anchor_cg = None
+        # The anchor graph is no longer captured: the round folded the anchor
+        # into the verify forward (qo_len=k+1), so there is no separate
+        # [1,1] anchor pass left for it to accelerate. Capturing it anyway
+        # would cost capture time and a pool of graph-private buffers for a
+        # graph nothing replays. Qwen36MTPAnchorCudaGraph itself is kept --
+        # it is still the reference for how a single-token MTP step writes
+        # the KV/GDN pools, and scripts still construct it directly.
+        self.cg_status["anchor"] = "unused"
 
         def _do_capture_draft() -> None:
             cg = Qwen36MTPDraftCudaGraph(self)
@@ -548,59 +564,41 @@ class Qwen36MTPEngine:
                 "exactly k rows before this call"
             )
 
-        # -- (a) advance the target through anchor_token. Structurally
-        # required regardless of the fix below: verify_forward's own
-        # precondition is that `state` already reflects having processed
-        # the anchor, and nothing else in this round's flow ever forwards
-        # anchor_token through the target -- accept/reject only ever
-        # produces token IDS, never runs them through the model. This is
-        # the SAME forward every prior script already did here; the only
-        # change is that this module also KEEPS its hidden state for the
-        # correctly-shifted purpose the module docstring describes,
-        # instead of discarding it and reusing anchor_hidden (hidden AFTER,
-        # not before, anchor_token) for that purpose.
-        if self._anchor_cg is not None:
-            # 2026-08-03 CUDA-Graph follow-up (runtime.backends.
-            # qwen36_mtp_cudagraph): Qwen36MTPAnchorCudaGraph.replay does
-            # ONLY the forward + KV/GDN pool write build_decode_batch would
-            # also do -- state.num_tokens_seen/cache.seq_len are this
-            # method's own bookkeeping to advance, exactly matching what
-            # the eager self.model(anchor_input, state) call below would
-            # otherwise have done internally (Qwen36TextModelSelfBuilt
-            # .forward/Qwen36PagedAttentionCache.append).
-            anchor_hidden = self._anchor_cg.replay(
-                slot,
-                anchor_token,
-                state.num_tokens_seen,
-                state_col=self._spec_state_col[slot],
-            )
-            state.num_tokens_seen += 1
-            for attn_cache in state.attn_caches:
-                if attn_cache is not None:
-                    attn_cache.seq_len += 1
-        else:
-            anchor_input = torch.tensor([[anchor_token]], dtype=torch.long, device=self.device)
-            anchor_hidden = self.model(anchor_input, state)  # [1, 1, H]
-        anchor_logits = self.model.compute_logits(anchor_hidden)[0]  # [1, vocab]
-
-        # -- (b) verify the K drafts in one pass.
+        # -- (a) ONE forward over [anchor] + drafts, qo_len = k+1.
+        #
+        # This used to be TWO full 64-layer forwards: a [1,1] pass to advance
+        # the target through anchor_token, then a [1,k] verify. Decode here is
+        # memory-bandwidth-bound, so the k+1-token forward costs about what
+        # the 1-token one alone did, and the anchor's KV write simply happens
+        # at position 0 of this pass. The historical implementation was built
+        # this way from the start -- `verify_batch_spec` at qo_len=k+1,
+        # oracle/.../direct_model_runner.py:1581 -- and the extra forward was
+        # measured at ~35 ms of the ~137 ms round
+        # (notes/2026-08-03-mtp-verify-mode.md).
+        #
+        # `all_hiddens` means exactly what it meant before, row for row:
+        # row 0 is the hidden AFTER the anchor (it predicted drafts[0]), and
+        # row i is the hidden after drafts[i-1]. It is now produced directly
+        # instead of being torch.cat'd from two forwards' outputs, so every
+        # downstream index (pred_hidden_next, _resync) is unchanged.
+        #
+        # `past_len` is now the length BEFORE the anchor, so the commit below
+        # keeps `m + 1` positions (the anchor is always accepted), not `m`.
         past_len = state.num_tokens_seen
-        draft_tensor = torch.tensor([drafts], dtype=torch.long, device=self.device)
+        verify_tokens = [anchor_token, *drafts]
+        verify_input = torch.tensor([verify_tokens], dtype=torch.long, device=self.device)
         if self._verify_cg is not None:
-            verify_hidden = self._verify_cg.replay(slot, drafts, past_len)
+            all_hiddens = self._verify_cg.replay(slot, verify_tokens, past_len)
             gdn_snapshots = None
         elif self._spec_rows is not None:
-            verify_hidden, gdn_snapshots = self.model.verify_forward(
-                draft_tensor,
+            all_hiddens, gdn_snapshots = self.model.verify_forward(
+                verify_input,
                 state,
                 spec_state_rows=self._spec_rows.rows_for_slot(slot),
             )
         else:
-            verify_hidden, gdn_snapshots = self.model.verify_forward(draft_tensor, state)
-        verify_logits = self.model.compute_logits(verify_hidden)[0]  # [k, vocab]
-
-        all_hiddens = torch.cat([anchor_hidden, verify_hidden], dim=1)  # [1, k+1, H]
-        all_logits = torch.cat([anchor_logits, verify_logits], dim=0)  # [k+1, vocab]
+            all_hiddens, gdn_snapshots = self.model.verify_forward(verify_input, state)
+        all_logits = self.model.compute_logits(all_hiddens)[0]  # [k+1, vocab]
 
         sampled = params is not None and not params.is_greedy
         if sampled:
@@ -624,36 +622,48 @@ class Qwen36MTPEngine:
         committed: list[int] = decision["committed"]
         new_anchor = committed[-1]
 
-        # -- (c) commit: roll the target's GDN/attention state back to the
-        # accepted prefix (m real tokens past the anchor).
-        self.model.commit_verify(state, gdn_snapshots, past_len=past_len, accepted_count=m)
+        # -- (b) commit: roll the target's GDN/attention state back to the
+        # accepted prefix. That prefix is `m + 1` positions, not `m`: this
+        # round's forward started at the anchor, and the anchor is committed
+        # unconditionally (accept/reject only ever rejects DRAFTS). past_len
+        # is correspondingly the length before the anchor.
+        self.model.commit_verify(
+            state, gdn_snapshots, past_len=past_len, accepted_count=m + 1
+        )
         if self._spec_rows is not None:
-            self._spec_rows.activate(slot, m)
-            self._spec_state_col[slot] = m
+            # m + 1 for the same reason accepted_count is: this round's
+            # forward began at the anchor, so the committed state sits one
+            # column past the accepted-draft count. Column 0 holds the state
+            # this round STARTED from, which is never the one to commit.
+            self._spec_rows.activate(slot, m + 1)
+            self._spec_state_col[slot] = m + 1
 
         # -- KV/committed-token bookkeeping, "committed ahead of kv by one"
         # (the same invariant DFlash's own round already keeps for Laguna
         # -- runtime/backends/laguna_dflash.py's dflash_round): the FINAL
         # committed token (recovery/bonus) is client-visible now but its
-        # own KV write is deferred to the NEXT round's anchor-advance step
-        # (a)); `committed` extends slot_committed_tokens in full, while
+        # own KV write is deferred to the NEXT round -- which since the
+        # anchor was folded into the verify forward means position 0 of the
+        # next round's own (a), rather than a separate anchor step. The
+        # invariant is unchanged; only the place that discharges it moved.
+        # `committed` extends slot_committed_tokens in full, while
         # slot_kv_len only advances by what commit_verify actually wrote.
         pool.slot_kv_len[slot] = state.num_tokens_seen
         pool.slot_committed_tokens[slot].extend(committed)
         self.backend._maybe_checkpoint(slot)  # noqa: SLF001 -- friend-class access, same pattern DFlash uses
 
-        # -- (d) truncate mtp_cache's exploratory tail; optionally resync
+        # -- (c) truncate mtp_cache's exploratory tail; optionally resync
         # the interior accepted positions first.
         cache.seq_len = round_mtp_start + m
         if self.enable_resync and m >= 2:
             self._resync(cache, round_mtp_start, drafts, all_hiddens, m)
             self.stats["resync_rounds"] += 1
 
-        # -- (e) draft the NEXT round, correctly-shifted seed (module
+        # -- (d) draft the NEXT round, correctly-shifted seed (module
         # docstring's fix): row `m` of all_hiddens is exactly the hidden
-        # state that predicted new_anchor (row 0 = anchor_hidden, used when
-        # m==0; rows 1..k = verify_hidden[0..k-1], used when m>=1 -- the
-        # SAME row verify_argmax[m-1] was read from to decide new_anchor's
+        # state that predicted new_anchor (row 0 = hidden after the anchor,
+        # used when m==0; rows 1..k = hidden after drafts[0..k-1], used when
+        # m>=1 -- the SAME row verify_argmax[m-1] was read from to decide new_anchor's
         # own identity, so this is never a fresh computation, only a kept
         # reference to one already made).
         pred_hidden_next = all_hiddens[:, m : m + 1, :]

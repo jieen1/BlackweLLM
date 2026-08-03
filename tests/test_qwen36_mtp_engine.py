@@ -246,13 +246,19 @@ class TestBackendWiring:
         assert engine.cuda_graphs_healthy() is True  # vacuous: nothing attempted
 
     def test_spec_rows_are_fixed_and_disjoint_from_the_live_pool(self) -> None:
-        """MTP state must have a stable K+1 address for every slot/column.
+        """MTP state must have a stable K+2 address for every slot/column.
 
         A shape-only test would miss the dangerous regression: reusing the
         live row for a candidate makes rejection overwrite the state that the
         next round must continue from, while copying snapshots back hides the
         mistake behind large ``aten::copy_`` costs. This checks the actual
         pool views and the column-zero bootstrap copy without a CUDA kernel.
+
+        K+2 columns, not K+1, since the round folded the anchor into the
+        verify forward: that forward runs k+1 positions and ``spec_forward``
+        requires ``seq_len + 1`` rows. Column 0 is the incoming state;
+        columns 1..k+1 hold the state after each position, and accepting
+        ``m`` drafts commits column ``m + 1``. See ``Qwen36MTPGDNRows``.
         """
         backend, _ = _backend()
         live_before = backend.pool.slot_state(0).gdn_states[1].conv_state
@@ -261,8 +267,9 @@ class TestBackendWiring:
         columns = rows.rows_for_slot(0)[1]
         assert int(columns[0].conv_state.data_ptr()) != int(live_before.data_ptr())
         assert backend.pool.slot_state(0).gdn_states[1] is columns[0]
-        assert len({int(state.conv_state.data_ptr()) for state in columns}) == 4
-        assert len({int(state.recurrent_state.data_ptr()) for state in columns}) == 4
+        assert len(columns) == 5  # K+2 for K=3
+        assert len({int(state.conv_state.data_ptr()) for state in columns}) == 5
+        assert len({int(state.recurrent_state.data_ptr()) for state in columns}) == 5
         assert rows.row_for_slot(0, 0) == 0
         assert rows.row_for_slot(0, 1) > backend.pool.num_slots
 
