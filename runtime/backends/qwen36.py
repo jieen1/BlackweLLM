@@ -60,11 +60,30 @@ prefix drop cascades into the checkpoint; the checkpoint's own byte budget
 never reclaims live KV, it only "turns a future would-be hit into a safe
 compute miss").
 
-Deliberately out of scope, stated rather than implied
-------------------------------------------------------
-* **Speculative decoding / MTP.** ``capabilities.speculative_decode`` is
-  ``False``; B3 owns it. ``runtime/recurrent_state_pool.py``'s ``spec_row``
-  addressing is built and tested for it but nothing here calls it.
+Speculative decoding / MTP (B3, wired 2026-08-03)
+---------------------------------------------------
+``capabilities.speculative_decode`` is ``True``: MTP is reachable through
+:meth:`Qwen36Backend.enable_mtp`, wired the same way Laguna's DFlash is
+(``LagunaBackend.enable_dflash`` / ``has_speculative_decode``). The round
+driver itself -- per-slot MTP KV cache, draft/verify/accept-reject/re-draft
+-- lives in :mod:`runtime.backends.qwen36_mtp` (:class:`Qwen36MTPEngine`),
+kept separate from this class for the same reason ``DFlashEngine`` is kept
+separate from ``LagunaBackend``: opt-in bookkeeping layered on top of the
+always-on slot pool, not a change to it. See that module's docstring for
+the (token, hidden) pairing bug found and fixed while wiring this in --
+every prior standalone B3 script measured acceptance far below what the
+model API's own documented contract implies, because every one of them
+violated that contract the same way.
+``runtime/recurrent_state_pool.py``'s ``spec_row`` addressing (built for a
+BATCHED multi-slot GDN spec verify, matching the historical vLLM-based
+runner's ``verify_batch_spec``) still has no caller here: this backend's
+model graph is batch=1 by construction, so MTP rounds are driven
+sequentially per slot (matching DFlash's own documented precedent), not
+through a fused batched verify. A real future throughput lever, not
+attempted in this landing.
+
+Still deliberately out of scope, stated rather than implied
+--------------------------------------------------------------
 * **Warm continue.** ``capabilities.warm_continue`` is ``False`` -- the same
   honest ``False`` that ``protocol.py``'s docstring says the Laguna path
   should have been carrying all along (N8).
@@ -76,6 +95,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -92,6 +112,9 @@ from runtime.model.qwen36_model import Qwen36ForCausalLMSelfBuilt
 from runtime.model.qwen36_slots import Qwen36SlotPool
 from runtime.recurrent_state_pool import RecurrentStatePool
 from runtime.sampling import SamplingParams, make_generator, sample_from_logits
+
+if TYPE_CHECKING:
+    from runtime.backends.qwen36_mtp import Qwen36MTPEngine
 
 logger = logging.getLogger(__name__)
 
@@ -239,6 +262,10 @@ class Qwen36Backend:
         #: docstring in ``runtime/backends/protocol.py``).
         self.cg_status: dict[str, str] = {}
 
+        #: B3 (2026-08-03): the MTP round driver, wired via :meth:`enable_mtp`.
+        #: ``None`` until then -- see :mod:`runtime.backends.qwen36_mtp`.
+        self._mtp: Qwen36MTPEngine | None = None
+
         self.pool.reset_all()
 
     # -- protocol: always required ----------------------------------------
@@ -246,7 +273,7 @@ class Qwen36Backend:
     @property
     def capabilities(self) -> BackendCapabilities:
         return BackendCapabilities(
-            speculative_decode=False,
+            speculative_decode=True,
             prefix_cache=self.enable_prefix_cache,
             cuda_graph=True,
             chunked_prefill=True,
@@ -255,7 +282,32 @@ class Qwen36Backend:
 
     @property
     def has_speculative_decode(self) -> bool:
-        return False
+        """Whether MTP-verified rounds are active on THIS instance.
+
+        ``capabilities.speculative_decode`` above says this backend CAN do
+        MTP (:meth:`enable_mtp` may be called); this says whether it IS
+        active right now -- same split Laguna's own ``has_speculative_decode``
+        docstring documents for DFlash.
+        """
+        return self._mtp is not None
+
+    def enable_mtp(self, *, num_speculative_tokens: int, enable_resync: bool | None = None) -> None:
+        """Attach the owned MTP round driver before any production slot is
+        used -- same "capture/wire before real use" window
+        ``LagunaBackend.enable_dflash`` and this class's own
+        ``capture_decode_cuda_graph`` already rely on. Requires the model
+        to have been loaded with ``enable_mtp=True``
+        (``runtime.model_loading.load_qwen36_model``) -- ``Qwen36MTPEngine``
+        raises a clear error otherwise rather than this method silently
+        doing nothing.
+        """
+        if self._mtp is not None:
+            return
+        from runtime.backends.qwen36_mtp import Qwen36MTPEngine
+
+        self._mtp = Qwen36MTPEngine(
+            self, num_speculative_tokens=num_speculative_tokens, enable_resync=enable_resync
+        )
 
     def slot_state(self, slot: int) -> Qwen36SlotStateView:
         return Qwen36SlotStateView(
@@ -303,6 +355,8 @@ class Qwen36Backend:
             self._prefix_cache_kv_len[slot] = self.pool.slot_kv_len[slot]
         self.pool.reset_slot(slot)
         self._pending_prefix_hits.pop(slot, None)
+        if self._mtp is not None:
+            self._mtp.reset_slot(slot)
 
     def drop_prefix_cache(self, slot: int) -> None:
         """Forget ``slot``'s saved KV prefix -- and, in lockstep, its
@@ -338,9 +392,7 @@ class Qwen36Backend:
         self._commit_prefill(slot, prompt_ids, first_token)
         return first_token
 
-    def prefill_sampled(
-        self, slot: int, prompt_ids: list[int], params: SamplingParams
-    ) -> int:
+    def prefill_sampled(self, slot: int, prompt_ids: list[int], params: SamplingParams) -> int:
         logits = self._prefill_forward(slot, prompt_ids, prefix_hit=0)
         gen = make_generator(params.seed)
         first_token = int(sample_from_logits(logits[-1].unsqueeze(0), params, generator=gen).item())
@@ -348,8 +400,13 @@ class Qwen36Backend:
         return first_token
 
     def _prefill_forward(
-        self, slot: int, prompt_ids: list[int], *, prefix_hit: int
-    ) -> torch.Tensor:
+        self,
+        slot: int,
+        prompt_ids: list[int],
+        *,
+        prefix_hit: int,
+        return_hidden: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run the prompt's suffix through the model, return ``[q, vocab]``.
 
         ``prefix_hit`` tokens are taken as already resident: the slot's KV
@@ -364,6 +421,17 @@ class Qwen36Backend:
         slot pool instead of freshly allocated -- which is what makes
         "bit-exact against B1 eager" a structural claim about this path
         rather than a coincidence.
+
+        ``return_hidden`` (B3, default False -- every pre-MTP caller keeps
+        the old ``logits``-only return byte-for-byte): also returns
+        ``hidden`` (``[q, hidden_size]``, the SAME forward's post-norm
+        hidden states this method already computes and previously
+        discarded). MTP needs the LAST row of this -- the hidden state
+        that predicted ``first_token``'s own argmax, one position before
+        it -- to correctly seed its first draft step (see
+        ``runtime.backends.qwen36_mtp``'s module docstring for why every
+        prior B3 script got this wrong by recomputing a DIFFERENT, later
+        hidden state instead of keeping this one).
         """
         state = self.pool.slot_state(slot)
         if self.pool.slot_kv_len[slot] != prefix_hit:
@@ -386,7 +454,10 @@ class Qwen36Backend:
             )
         input_ids = torch.tensor([suffix], dtype=torch.long, device=self.device)
         hidden = self.model(input_ids, state)
-        return self.model.compute_logits(hidden[0])
+        logits = self.model.compute_logits(hidden[0])
+        if return_hidden:
+            return logits, hidden[0]
+        return logits
 
     def _commit_prefill(self, slot: int, prompt_ids: list[int], first_token: int) -> None:
         self.pool.slot_kv_len[slot] = len(prompt_ids)
@@ -411,12 +482,19 @@ class Qwen36Backend:
         is accepted and ignored so the protocol signature holds. Returning
         ``done=True`` immediately is what tells ``ServerEngine`` to activate
         the slots in the same round.
+
+        When MTP is enabled (:meth:`enable_mtp`), also drafts this slot's
+        first round of speculative tokens right after prefill -- see
+        ``runtime.backends.qwen36_mtp.Qwen36MTPEngine.draft_after_prefill``.
+        Without it, ``draft_tokens`` stays ``[]`` (byte-for-byte prior
+        behavior) and ``ServerEngine`` routes every round for this slot
+        through plain sampled decode (``classify_decode_slots``).
         """
         params_per_slot = params_per_slot or {}
         result: dict[int, dict] = {}
         for slot, prompt in zip(slots, prompts_per_slot):
             hit = self._apply_prefix_hit(slot, prompt)
-            logits = self._prefill_forward(slot, prompt, prefix_hit=hit)
+            logits, hidden = self._prefill_forward(slot, prompt, prefix_hit=hit, return_hidden=True)
             params = params_per_slot.get(slot)
             if params is None or params.is_greedy:
                 token = int(logits[-1].argmax(dim=-1).item())
@@ -426,7 +504,13 @@ class Qwen36Backend:
                     sample_from_logits(logits[-1].unsqueeze(0), params, generator=gen).item()
                 )
             self._commit_prefill(slot, prompt, token)
-            result[slot] = {"anchor": token, "draft_tokens": []}
+            draft_tokens: list[int] = []
+            if self._mtp is not None:
+                pred_hidden = hidden[-1:].unsqueeze(0)  # [1, 1, H]
+                draft_tokens = self._mtp.draft_after_prefill(
+                    slot, first_token=token, pred_hidden=pred_hidden
+                )
+            result[slot] = {"anchor": token, "draft_tokens": draft_tokens}
         return ChunkedPrefillState(
             done=True,
             result=result,
@@ -496,9 +580,7 @@ class Qwen36Backend:
             return next_tokens, lp
         return next_tokens
 
-    def _decode_forward_batched(
-        self, slot_ids: list[int], token_ids: list[int]
-    ) -> torch.Tensor:
+    def _decode_forward_batched(self, slot_ids: list[int], token_ids: list[int]) -> torch.Tensor:
         batch, b = self.pool.build_decode_batch(slot_ids, token_ids)
         graph = self._decode_graphs.get(b)
         if graph is not None:
@@ -507,9 +589,7 @@ class Qwen36Backend:
             return self._decode_graph_logits[b]
         return self.model.decode_batch(batch)
 
-    def _decode_forward_serial(
-        self, slot_ids: list[int], token_ids: list[int]
-    ) -> torch.Tensor:
+    def _decode_forward_serial(self, slot_ids: list[int], token_ids: list[int]) -> torch.Tensor:
         """One slot at a time through B1's single-sequence path.
 
         Kept as a first-class, selectable path (``batched_decode=False``),
@@ -528,6 +608,47 @@ class Qwen36Backend:
             self.pool.slot_kv_len[slot] += 1
             self.pool.slot_committed_tokens[slot].append(int(token))
         return torch.stack(rows, dim=0)
+
+    # -- protocol: MTP speculative decode -----------------------------------
+
+    def mtp_verify_and_commit_batch(
+        self,
+        slots: list[int],
+        anchors: dict[int, int],
+        drafts: dict[int, list[int]],
+        *,
+        params_per_slot: dict[int, SamplingParams] | None = None,
+        return_logprobs: bool = False,
+        top_logprobs: int = 0,
+    ) -> dict[int, dict]:
+        """B3: Qwen3.6's sibling of ``LagunaBackend.mtp_verify_and_commit_batch``
+        -- called by the SAME ``ServerEngine._step_sync`` MTP branch
+        (``classify_decode_slots`` routes here once ``self.has_speculative_decode``
+        is true, i.e. once :meth:`enable_mtp` has been called).
+
+        Sequential per slot, not a fused batched verify -- see
+        ``runtime.backends.qwen36_mtp.Qwen36MTPEngine``'s class docstring
+        for why (this backend's whole model graph is batch=1 by
+        construction; DFlash's own docstring documents the identical
+        choice for the same structural reason).
+
+        ``params_per_slot``: optional per-slot ``SamplingParams``, forwarded
+        to :meth:`Qwen36MTPEngine.round`. A missing entry (or ``None``
+        altogether) takes the greedy path for that slot.
+        """
+        if self._mtp is None:
+            raise RuntimeError("mtp_verify_and_commit_batch called without enable_mtp()")
+        return {
+            slot: self._mtp.round(
+                slot,
+                anchors[slot],
+                drafts[slot],
+                params=(params_per_slot.get(slot) if params_per_slot else None),
+                return_logprobs=return_logprobs,
+                top_logprobs=top_logprobs,
+            )
+            for slot in slots
+        }
 
     # -- protocol: prefix cache --------------------------------------------
 

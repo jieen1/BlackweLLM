@@ -341,11 +341,19 @@ router kernel（同上）。
 §3.2 给的是形状，本节给的是**照着能写代码的那一层**。所有事实核实自
 `main @ 619a09d`，行号会漂移，引用符号名优先。
 
-### 3.5.1 协议的真实面：13 个成员，不是 50
+### 3.5.1 协议的真实面：12 个成员，不是 50
 
 `ServerEngine` 通过 `self.runner` 访问执行层，**全仓库唯一入口**。
 `LagunaBackend` 有 50 个方法（其中公开 24 个 + 2 个 property），
-但 `ServerEngine` 只用到 **13 个**——协议应当由这 13 个倒推，而不是照抄 24 个。
+但 `ServerEngine` 只用到 **12 个**——协议应当由这 12 个倒推，而不是照抄 24 个。
+
+（B3，2026-08-03：曾经是 13，含 `enable_dflash`。第二个投机解码 backend
+——`Qwen36Backend` + MTP——落地后发现 `enable_dflash` 是纯粹的 LOAD-TIME
+装配调用，从未经过 `_step_sync` 那条常驻调度路径，且 qwen36 自己的等价物
+`enable_mtp` 签名真的不同（多一个 `enable_resync` 关键字、返回 `None` 不是
+`bool`）——不是换个名字就能套进同一个协议成员。已从 `CAPABILITY_MEMBERS`
+移出；见 `runtime/backends/protocol.py` 里 `CAPABILITY_MEMBERS` 自己的
+docstring。）
 
 | 成员 | 调用次数 | 签名（`runtime/backends/laguna.py`） |
 |---|---|---|
@@ -358,10 +366,14 @@ router kernel（同上）。
 | `find_best_slot_for_prompt` | 1 | `(token_ids: list[int], free_slots: list[int]) -> tuple[int, int]` |
 | `reconcile_prefix_hit` | 1 | `(token_ids: list[int]) -> int` |
 | `has_speculative_decode` | 1 | **`@property` → `bool`**（不是方法；`engine.py` 按值传给 `classify_decode_slots`） |
-| `enable_dflash` | 1 | `(*, num_speculative_tokens: int) -> bool` |
 | `mtp_verify_and_commit_batch` | 1 | `(slots, anchors: dict[int,int], drafts: dict[int,list[int]], *, return_logprobs=False, top_logprobs=0) -> dict[int, dict]` |
 | `capture_decode_cuda_graph` | 1 | `() -> int \| None` |
 | **`mtp_prefill_warm_continue`** | 1 | ⚠️ **`LagunaBackend` 没有这个方法** —— 见 3.5.6 |
+
+每个 backend 自己的"怎么打开投机解码"方法（`LagunaBackend.enable_dflash` /
+`Qwen36Backend.enable_mtp`）保留各自诚实的名字和签名，不再是协议成员——
+`_load_laguna_model`/`_load_qwen36_model` 本来就已经是分开的、各管各的
+load-time 方法，这里只是把同一种不对称也应用到"怎么打开投机解码"这一步。
 
 伴随的两个数据类型也属于协议面：
 
@@ -406,7 +418,8 @@ BackendSnapshot(frozen)  slots: tuple[SlotSnapshot, ...]
 
 ```
 BackendCapabilities (frozen)
-    speculative_decode: bool      # 决定 mtp_* / enable_dflash 是否可调
+    speculative_decode: bool      # 决定 mtp_* 是否可调；backend 自己的开关方法
+                                   # （enable_dflash / enable_mtp）不在协议面里
     prefix_cache:       bool      # 决定 reconcile_prefix_hit / find_best_slot 是否可调
     cuda_graph:         bool      # 决定 capture_decode_cuda_graph 是否可调
     chunked_prefill:    bool      # 决定 prefill_chunked_* 是否可调

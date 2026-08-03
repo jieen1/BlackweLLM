@@ -137,6 +137,22 @@ def _run(backend: Qwen36Backend, slot: int, prompt: list[int], steps: int) -> li
 
 class TestContractShape:
     def test_conforms_to_the_model_backend_protocol(self) -> None:
+        # B3 (2026-08-03): speculative_decode=True now -- was False before
+        # MTP was wired into the serving path. Using the REAL capabilities
+        # value (not a hand-picked hypothetical) is the strongest form of
+        # this check: it requires has_speculative_decode/
+        # mtp_verify_and_commit_batch to actually exist with the protocol's
+        # exact signatures, which is exactly the drift a real caller
+        # (server/engine.py's classify_decode_slots + _step_sync) would hit.
+        #
+        # Unlike LagunaBackend.capabilities, this property reads
+        # self.enable_prefix_cache -- ``.fget(None)`` is not available here,
+        # so a real (stub-model) instance is used instead.
+        assert check_conformance(Qwen36Backend, _backend().capabilities) == []
+
+    def test_conforms_when_declared_without_speculative_decode_too(self) -> None:
+        # The weaker hypothetical still holds (a caller that doesn't know
+        # about MTP yet is not required to see it).
         caps = BackendCapabilities(
             speculative_decode=False,
             prefix_cache=True,
@@ -149,12 +165,16 @@ class TestContractShape:
     def test_capabilities_are_honest_about_what_is_not_implemented(self) -> None:
         backend = _backend()
         caps = backend.capabilities
-        # protocol.py's own docstring (N8) is about a capability claimed by
-        # silence and swallowed by try/except for three years. These two are
-        # False on purpose, and B3 is where they change.
-        assert caps.speculative_decode is False
-        assert caps.warm_continue is False
+        # B3 (2026-08-03): speculative_decode flipped True -- the backend
+        # CAN do MTP now (enable_mtp exists and works). has_speculative_decode
+        # stays False on a fresh instance that never called enable_mtp(),
+        # same split LagunaBackend's own capabilities/has_speculative_decode
+        # docstring documents for DFlash. warm_continue is still honestly
+        # False -- protocol.py's own docstring (N8) is about a capability
+        # claimed by silence and swallowed by try/except for three years.
+        assert caps.speculative_decode is True
         assert backend.has_speculative_decode is False
+        assert caps.warm_continue is False
 
     def test_page_size_must_be_a_multiple_of_block_size(self) -> None:
         # §1.7: the divisibility that holds today holds by coincidence of two

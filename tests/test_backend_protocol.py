@@ -31,13 +31,19 @@ class TestContractShape:
     """Torch-free: the contract's own invariants."""
 
     def test_covers_exactly_the_members_the_scheduler_uses(self) -> None:
-        # 13 members are reached through ``self.runner`` in server/engine.py,
+        # 12 members are reached through ``self.runner`` in server/engine.py,
         # plus ``capabilities`` (consulted instead of ``hasattr``/``try-except``)
         # and ``snapshot`` (the observability contract). Locking the count here
-        # makes silent contract growth visible in review: a 16th member means
+        # makes silent contract growth visible in review: a 15th member means
         # someone widened what every future backend must implement.
+        #
+        # B3 (2026-08-03): was 15 -- ``enable_dflash`` (a Laguna-specific
+        # LOAD-TIME wiring method, never reached through ``self.runner`` at
+        # all) dropped out of ``speculative_decode``'s governed set; see
+        # ``CAPABILITY_MEMBERS``'s own updated docstring in
+        # ``runtime/backends/protocol.py``.
         governed = [m for members in CAPABILITY_MEMBERS.values() for m in members]
-        assert len(set(REQUIRED_MEMBERS) | set(governed)) == 15
+        assert len(set(REQUIRED_MEMBERS) | set(governed)) == 14
 
     def test_no_member_is_governed_by_two_capabilities(self) -> None:
         seen: set[str] = set()
