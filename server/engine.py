@@ -605,10 +605,35 @@ class ServerEngine:
             enable_mtp=self.enable_mtp,
         )
         # A5/B4: this is live again. Qwen36Backend.prefill_chunked_step now
-        # advances one chunk per round and returns done=False until the
-        # prompt is consumed, so the incremental branch below is reachable
-        # and a long admission no longer blocks active slots' decode.
-        self._prefill_chunk_size = 512
+        # advances one chunk per round and returns done=False until the prompt
+        # is consumed, so the incremental branch below is reachable and a long
+        # admission no longer blocks active slots' decode.
+        #
+        # 2048, not 512, and the difference is not cosmetic. Measured on a 60k
+        # prompt against an already-decoding request (capacity=2, CG on):
+        #
+        #   one-shot     max stall 24,939 ms   prefill 25.7s   decode ITL   35 ms
+        #   chunk 512    max stall     688 ms  prefill 56.1s   decode ITL  367 ms
+        #
+        # Chunking at 512 does remove the stall -- 36x -- but turns 8 forwards
+        # into 118, so the prefill itself takes 2.2x longer and the concurrent
+        # request's steady-state ITL degrades 10x. Totalled over the short
+        # request's 220 tokens that is a net loss, despite the stall being
+        # gone: ~33s one-shot versus ~80s at chunk 512.
+        #
+        # So the chunk size is the actual knob here, trading stall length
+        # against per-forward overhead. Picking it from the measurements
+        # rather than by feel: prefill runs at ~2335 tok/s (60000/25.7s), so
+        # bounding a chunk at roughly one second of prefill gives ~2048
+        # tokens, i.e. ~30 rounds for a 60k prompt instead of 118.
+        #
+        # Worth stating because it revises something this repo already
+        # concluded: notes/2026-07-20-comprehensive-optimization-plan.md
+        # records intra-admission chunking (Phase A) as worth only -10.7%,
+        # which is true and is about chunking WITHOUT interleaving. It does
+        # not mean chunk size is irrelevant once interleaving exists -- here
+        # it is the parameter that decides whether interleaving pays at all.
+        self._prefill_chunk_size = 2048
         self.runner = Qwen36Backend(
             model,
             num_slots=self.num_slots,
