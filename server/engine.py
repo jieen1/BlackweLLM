@@ -544,6 +544,50 @@ class ServerEngine:
         else:
             self._load_laguna_model()
 
+    def _warmup_qwen36_full_forward(self) -> None:
+        """One real short prefill through the whole model, then reset the slot.
+
+        `Qwen36ForCausalLMSelfBuilt.warmup_attention_shapes` warms **only the
+        attention kernels** -- its own docstring says so, and explains the
+        reason: GDN's recurrent state is order-dependent (B0-5), so a real
+        forward would risk leaving a warmed-up state behind.
+
+        The consequence is that everything else stays cold until a user's
+        first request pays for it: the w4a16 fused MoE across all 56 NVFP4 MLP
+        layers (including `_ensure_w4a16_fused_ready`'s one-time fused-weight
+        preparation), the GDN recurrent kernels, `lm_head`. Measured, that is
+        the whole of the first-request TTFT anomaly -- 4.67s on the first
+        request against 0.25s on every one after it.
+
+        The historical vLLM-era runtime did exactly this and no more:
+        `oracle/qwen36_vllm/direct_model_runner.py:860`'s `_warmup` runs
+        `self.prefill(0, [0, 0, 0, 0, 0])` inside a `try/finally` whose
+        `finally` is `self.reset_slot(0)`. That is also the answer to the GDN
+        objection above: `reset_slot` zeroes the recurrent state, which is the
+        one operational requirement B0-5 attached to its capture-safe verdict
+        -- so a real forward is safe as long as the slot is reset afterwards.
+
+        Deliberately before CUDA Graph capture, matching the order the
+        Laguna+DFlash path already uses: capture wants the kernels it will
+        record to have been compiled already.
+
+        Failure here is logged and swallowed. A warmup that cannot run is a
+        latency problem on the first request, not a correctness one, and
+        refusing to start the server over it would trade a 4-second stall for
+        a total outage.
+        """
+        try:
+            state = self.runner.prefill_chunked_begin([0], [[0, 0, 0, 0, 0]])
+            while not state.done:
+                self.runner.prefill_chunked_step(state)
+        except Exception:
+            logger.exception("Qwen3.6 full-forward warmup failed; first request will be slow")
+        finally:
+            try:
+                self.runner.reset_slot(0)
+            except Exception:
+                logger.exception("reset_slot(0) failed after warmup")
+
     def _load_qwen36_model(self) -> None:
         """Load ``Qwen36Backend`` (Track B / B2, B3). MUST run on engine thread.
 
@@ -643,6 +687,7 @@ class ServerEngine:
             dtype=torch.bfloat16,
             enable_prefix_cache=self.enable_prefix_cache,
         )
+        self._warmup_qwen36_full_forward()
         if self._enable_cudagraph:
             graph_batch_size = self.runner.capture_decode_cuda_graph()
             if graph_batch_size is not None:
