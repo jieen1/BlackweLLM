@@ -38,6 +38,8 @@
 
 ## 2. 已定案的根因分析 🟢
 
+- ⭐ [2026-08-03 历史实现完整测绘](2026-08-03-historical-implementation-survey.md) —— 🟢 **要查历史做过什么、量到多少，先读这份,别再回老树一次问一个问题**。含 12 条按收益排序的"今天缺什么"、每个实测数字的完整配置与可比性标注。三条纠偏:① 历史终点是 `a9cb932`(07-30)不是 `8f5c195`,中间 330 个提交;② **代码没丢——就在今天仓库的 `oracle/qwen36_vllm/`(8047 行)和 `docs/archive/2026-07-20-PROGRESS.md`**;③ 跨步交织 chunked prefill **建过**(`a8bd167`),今天是 stub
+
 - [2026-08-03 解码 kernel profiling：CG 下已 kernel-bound](2026-08-03-decode-kernel-profile.md) —— 🟢 GPU busy 31.01ms / CG 墙钟 34.67ms = **89%**；eager 只有 21% 忙（CPU 侧 paged 元数据 ~34ms/step）。按调用次数精确归属：NVFP4 融合 MLP **56 次/35%**，FP8 层反量化后的 BF16 GEMM **233 次/45%**（233 = 预期数，一个不差），**GDN 递归仅 0.6%**。含一处自我纠正（首版对 `key_averages()` 求和，重复计数）
 - [2026-08-03 FP8 KV cache：过了 B1-R，省 ~12.3 GiB](2026-08-03-fp8-kv-cache.md) —— 🟢 **今天唯一的正面结论**。标准 checkpoint 一直发着 16+16 个 `k_scale`/`v_scale` 而无人消费(反向 loader 检查首次真实运行抓到)；历史上 FP8 KV 就是本模型的默认值。判据每条 2–8× 余量、**无捕获窗口溢出**——与 W4A4/W8A8 形成对照:**量化 KV 没事，量化激活不行**。KV 8192→4096 MiB/槽。途中修掉两个静默出错(Q 被一起量化成 FP8、`index_copy_` 不支持 fp8)。当前默认关，建议翻开
 - [2026-08-03 128K 解码 profiling](2026-08-03-128k-decode-profile.md) —— 🟢 **实测,非推断**:128K 下 **attention 占 58.5%**(短上下文下几乎不可见——两个区间结论不可互推);🔴 **FP8 KV 让 attention 慢 19%**(44.97→53.64ms),读的字节减半而 kernel 更慢,**推翻了我自己'它是长上下文最大提速杠杆'的预测**;另记单次 forward 上限 ≈61,681 token(int32 溢出)
