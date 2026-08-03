@@ -141,6 +141,20 @@ def speculative_decode(
     verify against the target in one pass (GDN spec_forward + ordinary
     multi-token attention), greedy accept/reject, roll back on partial
     accept, advance the new anchor through one ordinary target forward.
+
+    2026-08-03 pairing fix (see ``runtime/backends/qwen36_mtp.py``'s module
+    docstring for the full derivation, cross-checked against vLLM's own
+    native Qwen3.6 MTP kernel): the draft head's first step of each round
+    must be seeded with ``pred_hidden`` -- the hidden state that PREDICTED
+    the current anchor, one position before it -- not ``anchor_hidden``,
+    the hidden state produced BY processing the anchor (same-position,
+    what this function used until now). ``anchor_hidden``/``anchor_argmax``
+    are still needed, but only as the accept/reject verification baseline
+    for this round's ``draft_tokens[0]``, never as the draft head's input.
+    Costs nothing extra: ``pred_hidden`` is always already sitting in a
+    tensor this function computed anyway (``_logits_for``'s own discarded
+    hidden at bootstrap; ``verify_hidden``/``anchor_hidden`` from the SAME
+    round at every later step).
     """
     state = model.new_generation_state(device=DEVICE, dtype=torch.bfloat16)
     mtp_cache = model.mtp_new_cache(device=DEVICE, dtype=torch.bfloat16)
@@ -150,16 +164,14 @@ def speculative_decode(
     t0 = time.perf_counter()
 
     # Prefill picks the first generated token (anchor_token) from the
-    # prompt's own logits -- but that forward has NOT consumed
-    # anchor_token yet, so its hidden state / next-token prediction are
-    # NOT what MTP or accept/reject need (those need the state/prediction
-    # AFTER anchor_token has been processed). One more ordinary forward,
-    # consuming anchor_token, produces both: anchor_hidden (MTP's
-    # prev_hidden seed) and anchor_argmax (predicted_tokens[0] for round
-    # 1's accept/reject) -- the exact same "process the new anchor" step
-    # every later round performs at its own end, just needed once more
-    # up front for the very first anchor.
-    prompt_logits, _ = _logits_for(model, prompt, state)
+    # prompt's own logits; pred_hidden (the hidden that PREDICTED it,
+    # i.e. this same forward's own hidden state) is MTP's correct seed --
+    # see the docstring above. One more ordinary forward, consuming
+    # anchor_token, produces anchor_hidden/anchor_argmax, needed ONLY as
+    # this round's accept/reject verification baseline for draft_tokens[0]
+    # -- the exact same "process the new anchor" step every later round
+    # performs at its own end, just needed once more up front here.
+    prompt_logits, pred_hidden = _logits_for(model, prompt, state)
     anchor_token = int(prompt_logits.argmax().item())
     anchor_step = torch.tensor([[anchor_token]], device=DEVICE, dtype=torch.long)
     anchor_logits, anchor_hidden = _logits_for(model, anchor_step, state)
@@ -171,7 +183,7 @@ def speculative_decode(
     while len(committed) < n_tokens:
         round_mtp_start = mtp_cache.seq_len
         draft_tokens: list[int] = []
-        mtp_hidden = anchor_hidden
+        mtp_hidden = pred_hidden  # fix: was anchor_hidden (same-position, wrong)
         next_input = torch.tensor([[anchor_token]], device=DEVICE, dtype=torch.long)
         for _step in range(k):
             draft_token, mtp_hidden = model.mtp_step(
@@ -197,6 +209,15 @@ def speculative_decode(
 
         committed.extend(decision["committed"])
         rounds.append({"k": k, "num_accepted": m, "rejected_at": decision["rejected_at"]})
+
+        # The hidden that predicted new_anchor -- row 0 (anchor_hidden) if
+        # the very first draft was already wrong (m==0: new_anchor is the
+        # target's own recovery prediction from anchor_hidden), else
+        # verify_hidden[m-1] (new_anchor is either the recovery prediction
+        # at the rejection point, or the bonus prediction on full accept --
+        # both read off verify_hidden[m-1] by determine_accept_reject_
+        # from_predictions's own construction).
+        pred_hidden = anchor_hidden if m == 0 else verify_hidden[:, m - 1 : m, :]
 
         new_anchor = decision["committed"][-1]
         new_anchor_tensor = torch.tensor([[new_anchor]], device=DEVICE, dtype=torch.long)
