@@ -28,8 +28,8 @@ as a fact the scheduler can read. See ``docs/architecture.md`` §3.5.6 (N8).
 
 Naming debt
 -----------
-Three member names still carry model-specific vocabulary inherited from the
-current implementation: ``enable_dflash``, ``mtp_verify_and_commit_batch``,
+Two member names still carry model-specific vocabulary inherited from the
+current implementation: ``mtp_verify_and_commit_batch``,
 ``mtp_prefill_warm_continue``. They are declared here under today's names on
 purpose -- this module ships as a shadow contract that must hold with **zero**
 edits to call sites.
@@ -40,10 +40,21 @@ taking this rename -- deliberately: renaming methods on ``LagunaBackend``
 touches GPU-executed code this migration step did not otherwise need to
 touch, widening the change under the same bit-exact gate for no benefit to
 step 5's own claim. The rename to neutral names
-(``enable_speculative_decode``, ``verify_and_commit_batch``,
-``prefill_warm_continue``) stays available to take whenever call sites next
-change for an unrelated reason (naturally: step 7's A3 coordinator, or
-whichever step first touches these three call sites again). See §3.5.5.
+(``verify_and_commit_batch``, ``prefill_warm_continue``) stays available to
+take whenever call sites next change for an unrelated reason (naturally:
+step 7's A3 coordinator, or whichever step first touches these two call
+sites again). See §3.5.5.
+
+``enable_dflash`` used to be a third member here, governed by
+``speculative_decode`` -- B3 (2026-08-03) removed it from this protocol
+entirely rather than renaming it: unlike the two members above, it is a
+LOAD-TIME wiring call (``server/engine.py``'s ``_load_laguna_model``, once,
+never from the recurring per-round scheduler path), and the qwen36 backend's
+own equivalent (``Qwen36Backend.enable_mtp``) has a genuinely different
+signature (an extra ``enable_resync`` kwarg, ``-> None`` not ``-> bool``),
+not just a different name -- there was no single shape left to declare here
+that both backends could honestly satisfy. See ``CAPABILITY_MEMBERS``'s own
+docstring below for the full reasoning.
 """
 
 from __future__ import annotations
@@ -68,7 +79,10 @@ class BackendCapabilities:
     instead of something to reconstruct from logs.
 
     These describe what the backend *can* do, not what is currently switched
-    on. ``speculative_decode=True`` means ``enable_dflash`` may be called; ask
+    on. ``speculative_decode=True`` means the backend's own speculative-decode
+    wiring call may be made (``LagunaBackend.enable_dflash`` /
+    ``Qwen36Backend.enable_mtp`` -- backend-specific, not part of this shared
+    protocol; see the module docstring's "Naming debt" section); ask
     :attr:`ModelBackend.has_speculative_decode` whether it is active right now.
     """
 
@@ -210,7 +224,7 @@ class SlotStateView(Protocol):
 
 
 class ModelBackend(Protocol):
-    """The 13 members ``ServerEngine`` actually depends on, plus capabilities.
+    """The 12 members ``ServerEngine`` actually depends on, plus capabilities.
 
     Deliberately *not* ``@runtime_checkable``: ``isinstance`` against a
     Protocol only checks that attribute names exist, which would report a
@@ -270,8 +284,6 @@ class ModelBackend(Protocol):
     @property
     def has_speculative_decode(self) -> bool: ...
 
-    def enable_dflash(self, *, num_speculative_tokens: int) -> bool: ...
-
     def mtp_verify_and_commit_batch(
         self,
         slots: list[int],
@@ -299,12 +311,29 @@ class ModelBackend(Protocol):
 
 #: Which protocol members each capability flag governs. Members not listed
 #: here are unconditionally required.
+#:
+#: B3 (2026-08-03): ``speculative_decode`` used to also govern
+#: ``enable_dflash`` -- a LOAD-TIME wiring method (called once from
+#: ``server/engine.py``'s ``_load_laguna_model``, never from the recurring
+#: ``_step_sync`` scheduler path every other governed member here is reached
+#: through), not a steady-state per-round contract member. That was
+#: harmless while Laguna+DFlash was the only speculative-decode-capable
+#: backend; adding a second one (qwen36+MTP, ``Qwen36Backend.enable_mtp``)
+#: exposed it as Laguna-specific naming leaked into a supposedly
+#: backend-agnostic contract -- ``enable_mtp``'s signature (an extra
+#: ``enable_resync`` kwarg, ``-> None`` not ``-> bool``) could never satisfy
+#: a conformance check pinned to ``enable_dflash``'s exact shape, and
+#: renaming it to match would have been the tail wagging the dog. Each
+#: backend's own "how do I turn this on" method keeps its own honest name
+#: (``enable_dflash``/``enable_mtp``), same asymmetry
+#: ``_load_laguna_model``/``_load_qwen36_model`` already have; only the
+#: steady-state members (``has_speculative_decode``,
+#: ``mtp_verify_and_commit_batch``) are cross-backend contract.
 CAPABILITY_MEMBERS: dict[str, tuple[str, ...]] = {
     "chunked_prefill": ("prefill_chunked_begin", "prefill_chunked_step"),
     "prefix_cache": ("reconcile_prefix_hit", "find_best_slot_for_prompt"),
     "speculative_decode": (
         "has_speculative_decode",
-        "enable_dflash",
         "mtp_verify_and_commit_batch",
     ),
     "cuda_graph": ("capture_decode_cuda_graph",),

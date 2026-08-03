@@ -152,6 +152,23 @@ SERVER_PRODUCTION = os.environ.get("QSR_SERVER_PRODUCTION", "1") != "0"
 # (ServerEngine raises otherwise) -- opt-in via QSR_SERVER_ENABLE_DFLASH=1
 # until it has run in production for a while, not flipped on by default yet.
 SERVER_ENABLE_DFLASH = os.environ.get("QSR_SERVER_ENABLE_DFLASH", "0") != "0"
+# MTP speculative decoding (2026-08-03, Track B / B3): qwen36's own draft
+# head, the sibling of SERVER_ENABLE_DFLASH above (Laguna's). Default OFF
+# for the same reason: this landing is the first time it is reachable from
+# the serving path at all, so main's shipping behaviour must stay unchanged
+# (plain per-token decode) until MTP has run through the same acceptance/
+# correctness gate DFlash did before its own default flip. See
+# runtime/backends/qwen36_mtp.py for the round driver and the (token,
+# hidden) pairing fix this landing carries.
+SERVER_ENABLE_MTP = os.environ.get("QSR_SERVER_ENABLE_MTP", "0") != "0"
+SERVER_MTP_K = int(os.environ.get("QSR_SERVER_MTP_K", "4"))
+# Per-round KV resync (runtime/backends/qwen36_mtp.py's Qwen36MTPEngine
+# docstring): independently toggleable from MTP itself so it can be A/B
+# measured on real hardware separately from the pairing fix. Only consulted
+# when SERVER_ENABLE_MTP is set; "unset" (None) lets Qwen36MTPEngine fall
+# back to its own QSR_SERVER_MTP_RESYNC-driven default (also off).
+_mtp_resync_env = os.environ.get("QSR_SERVER_MTP_RESYNC")
+SERVER_MTP_RESYNC = None if _mtp_resync_env is None else _mtp_resync_env != "0"
 # T0-3/E4 (docs/roadmap.md §7 D1): reasoning/thinking contract. "expose"
 # (default) surfaces a <think> block as OpenAI message.reasoning_content /
 # delta.reasoning_content, and Anthropic's non-standard top-level
@@ -404,13 +421,17 @@ async def lifespan(app: FastAPI):
         enable_session_affinity=SERVER_ENABLE_SESSION_AFFINITY,
         session_ttl_s=SERVER_SESSION_TTL_S,
         enable_dflash=SERVER_ENABLE_DFLASH,
+        enable_mtp=SERVER_ENABLE_MTP,
+        mtp_num_speculative_tokens=SERVER_MTP_K,
+        mtp_resync=SERVER_MTP_RESYNC,
         gpu_memory_utilization=SERVER_GPU_MEM_UTIL,
         production=SERVER_PRODUCTION,
     )
     engine.start()
     logger.info(
         "engine ready: backend=%s model=%s capacity=%d num_slots=%d capacity_tokens_per_slot=%d "
-        "cudagraph=%s prefix_cache=%s session_affinity=%s ttl=%.1fs",
+        "cudagraph=%s prefix_cache=%s session_affinity=%s ttl=%.1fs dflash=%s "
+        "mtp=%s(K=%d,resync=%s)",
         engine.backend_name,
         engine.MODEL,
         engine.capacity,
@@ -420,6 +441,10 @@ async def lifespan(app: FastAPI):
         SERVER_ENABLE_PREFIX_CACHE,
         SERVER_ENABLE_SESSION_AFFINITY,
         SERVER_SESSION_TTL_S,
+        SERVER_ENABLE_DFLASH,
+        SERVER_ENABLE_MTP,
+        SERVER_MTP_K,
+        SERVER_MTP_RESYNC,
     )
     try:
         yield
@@ -1168,6 +1193,30 @@ def main() -> None:
             "multi-slot-concurrency.md."
         ),
     )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help=(
+            "Enable MTP speculative decoding (qwen36 backend only). Sibling "
+            "of --dflash for Qwen3.6's own draft head -- see "
+            "runtime/backends/qwen36_mtp.py."
+        ),
+    )
+    parser.add_argument(
+        "--mtp-k",
+        type=int,
+        default=SERVER_MTP_K,
+        help="MTP draft tokens per round (only used with --mtp). Default 4.",
+    )
+    parser.add_argument(
+        "--mtp-resync",
+        action="store_true",
+        help=(
+            "Enable per-round MTP KV resync (only used with --mtp) -- see "
+            "runtime/backends/qwen36_mtp.py's Qwen36MTPEngine docstring. "
+            "Default off, independently A/B-measurable from --mtp itself."
+        ),
+    )
     from server.formats.tool_parsers import available_parsers
 
     parser.add_argument(
@@ -1217,6 +1266,11 @@ def main() -> None:
     os.environ["QSR_SERVER_SESSION_TTL_S"] = str(args.session_ttl_s)
     if args.dflash:
         os.environ["QSR_SERVER_ENABLE_DFLASH"] = "1"
+    if args.mtp:
+        os.environ["QSR_SERVER_ENABLE_MTP"] = "1"
+    os.environ["QSR_SERVER_MTP_K"] = str(args.mtp_k)
+    if args.mtp_resync:
+        os.environ["QSR_SERVER_MTP_RESYNC"] = "1"
     os.environ["QSR_TOOL_CALL_PARSER"] = args.tool_call_parser
 
     # Runs before uvicorn imports the app module, so the model is not loaded

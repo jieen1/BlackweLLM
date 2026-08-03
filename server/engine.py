@@ -275,6 +275,9 @@ class ServerEngine:
         enable_session_affinity: bool = False,
         session_ttl_s: float = 30.0,
         enable_dflash: bool = False,
+        enable_mtp: bool = False,
+        mtp_num_speculative_tokens: int = 4,
+        mtp_resync: bool | None = None,
         gpu_memory_utilization: float = 0.85,
         idle_sleep_s: float = 0.005,
         production: bool = True,
@@ -291,6 +294,21 @@ class ServerEngine:
             architecture_spec if architecture_spec is not None else _DEFAULT_ARCHITECTURE_SPEC
         )
         self.enable_dflash = enable_dflash
+        # B3 (2026-08-03): MTP speculative decode, qwen36 only -- symmetric
+        # with enable_dflash's own Laguna-only scope. Rejected here, at
+        # construction and before any GPU work, rather than left to
+        # Qwen36Backend (which does not exist for a Laguna instance) --
+        # same "fail loud at construction, not deep inside a request" rule
+        # enable_session_affinity's own guard above follows.
+        if enable_mtp and backend != "qwen36":
+            raise ValueError(
+                f"enable_mtp requires backend='qwen36' (got {backend!r}); MTP is "
+                "the qwen36 draft head, not a Laguna capability (that is DFlash, "
+                "enable_dflash)"
+            )
+        self.enable_mtp = enable_mtp
+        self.mtp_num_speculative_tokens = mtp_num_speculative_tokens
+        self.mtp_resync = mtp_resync
         self.MODEL = model
         self.K = 0
 
@@ -313,6 +331,11 @@ class ServerEngine:
             # UnboundLocalError whenever this branch was not taken. Caught by
             # the full suite (25 failures), not by review.
             self.K = NUM_SPECULATIVE_TOKENS
+        elif enable_mtp:
+            # Same headroom reasoning as the DFlash branch above:
+            # capacity_ok() below must reserve room for up to K drafted-but-
+            # not-yet-committed tokens per slot.
+            self.K = mtp_num_speculative_tokens
 
         # CUDA Graph slot budget:
         # - Decode CG (M=1) captures against ONE slot (the last), not capacity
@@ -504,9 +527,7 @@ class ServerEngine:
         "constructed after ``self.runner`` exists" for whatever caller reads
         it, real load or fake.
         """
-        return SlotResourceManager(
-            self.runner, self.architecture_spec, block_size=self.block_size
-        )
+        return SlotResourceManager(self.runner, self.architecture_spec, block_size=self.block_size)
 
     # -- model loading (engine thread only) --------------------------------
     def _load_model(self) -> None:
@@ -524,23 +545,17 @@ class ServerEngine:
             self._load_laguna_model()
 
     def _load_qwen36_model(self) -> None:
-        """Load ``Qwen36Backend`` (Track B / B2). MUST run on engine thread.
+        """Load ``Qwen36Backend`` (Track B / B2, B3). MUST run on engine thread.
 
-        **Not reachable yet, on purpose.** ``__init__`` refuses any backend
-        outside ``runtime.model_registry.IMPLEMENTED_BACKENDS``, and that
-        frozenset still excludes ``"qwen36"``. Flipping it is a one-line
-        change that belongs in the commit that carries the end-to-end
-        evidence -- a served, verified Qwen3.6 request -- not in the one
-        that merely makes the construction possible. Landing this branch
-        first keeps that flip honest and small; landing the flip first
-        would mean any user pointing at a Qwen3.6 checkpoint gets served by
-        a path nothing has run.
+        The qwen36 backend itself is reachable (``runtime.model_registry
+        .IMPLEMENTED_BACKENDS`` includes ``"qwen36"`` as of ``0e83b52``,
+        "B2: Qwen3.6 is servable"); this docstring used to say otherwise --
+        that was already stale before this B3 change touched the file.
 
-        Deliberately narrower than ``_load_laguna_model``: no DFlash (this
-        checkpoint's speculative story is B3's, and
-        ``Qwen36Backend.capabilities.speculative_decode`` says ``False``),
-        and prefix caching is passed through rather than forced, same as
-        Laguna's.
+        No DFlash for this backend (DFlash is Laguna's own draft model;
+        Qwen3.6's speculative story is MTP, wired below via
+        ``self.enable_mtp``); prefix caching is passed through rather than
+        forced, same as Laguna's.
 
         ``enable_cudagraph`` captures here, before ``start()``'s admission
         loop can hand out a slot, for the same reason Laguna does -- plus
@@ -548,7 +563,18 @@ class ServerEngine:
         real recurrent state, and a recurrent state left behind is read by
         the next sequence rather than ignored (B0-5).
         ``capture_decode_cuda_graph`` zeroes every slot on the way out for
-        exactly that reason.
+        exactly that reason. MTP is wired AFTER capture, for the identical
+        reason DFlash is wired after Laguna's own capture call
+        (``_load_laguna_model`` below) -- capture must run while every slot
+        is still definitionally empty, and MTP's own per-slot draft cache
+        allocation has nothing to do with the decode CUDA graph at all (MTP
+        rounds never go through ``decode_batch_sampled``/the captured
+        graph -- ``classify_decode_slots`` routes them to
+        ``mtp_verify_and_commit_batch`` instead, the same split DFlash+
+        Laguna's decode CG already established), so the two features do not
+        interact and this ordering is not load-bearing for correctness, only
+        for keeping the "capture before real slot use" invariant obviously
+        true by inspection.
         """
         import torch  # local: this module stays importable without torch
 
@@ -557,17 +583,16 @@ class ServerEngine:
         from runtime.model_loading import load_qwen36_model
 
         if self.enable_dflash:
-            # capabilities.speculative_decode is False for this backend, and
-            # the scheduler reads self.enable_dflash directly (it decides
-            # whether classify_decode_slots routes a request to
-            # mtp_verify_and_commit_batch, which this backend does not
-            # implement). Refusing here rather than silently downgrading:
-            # a deployment that asked for speculative decoding and got
-            # ordinary decoding without being told is how an acceptance-rate
-            # counter sits at zero unnoticed (N8).
+            # capabilities.speculative_decode is True for this backend (B3),
+            # but DFlash specifically is Laguna's own draft-model mechanism,
+            # not qwen36's (that is enable_mtp). Refusing here rather than
+            # silently downgrading: a deployment that asked for speculative
+            # decoding and got ordinary decoding without being told is how
+            # an acceptance-rate counter sits at zero unnoticed (N8).
             raise ValueError(
                 "enable_dflash is not supported by the qwen36 backend "
-                "(capabilities.speculative_decode is False; MTP is Track B / B3). "
+                "(DFlash is Laguna's draft model; qwen36's is MTP -- "
+                "enable_mtp/QSR_SERVER_ENABLE_MTP). "
                 "Start the server with QSR_SERVER_ENABLE_DFLASH=0."
             )
 
@@ -577,6 +602,7 @@ class ServerEngine:
             device="cuda",
             dtype=torch.bfloat16,
             max_seq_len=max_model_len,
+            enable_mtp=self.enable_mtp,
         )
         self._prefill_chunk_size = 512  # unused: Qwen36Backend prefill is one-shot
         self.runner = Qwen36Backend(
@@ -600,6 +626,16 @@ class ServerEngine:
                     "Qwen3.6 decode CUDA Graph capture failed or unavailable; "
                     "falling back to eager batched decode"
                 )
+        if self.enable_mtp:
+            self.runner.enable_mtp(
+                num_speculative_tokens=self.mtp_num_speculative_tokens,
+                enable_resync=self.mtp_resync,
+            )
+            logger.info(
+                "Qwen3.6 MTP speculative decode wired: K=%d, resync=%s",
+                self.mtp_num_speculative_tokens,
+                self.runner._mtp.enable_resync,  # noqa: SLF001 -- log-only introspection
+            )
         logger.info(
             "Qwen3.6 model loaded on engine thread: num_slots=%d max_context=%d tokens/slot, "
             "recurrent state %.1f MiB/slot, KV %.1f MiB/slot",
