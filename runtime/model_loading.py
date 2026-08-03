@@ -316,17 +316,15 @@ def load_qwen36_model(
         #   memory       58.64 -> 46.63 GiB resident, KV 8192 -> 4096 MiB/slot
         #   speed        1.047x at a 100k-token prompt under CUDA Graph
         #                (25.058 -> 26.229 tok/s)
-        # ⚠️ One incompatibility, measured 2026-08-03 and not covered by the
-        # bars above: FP8 KV breaks speculative decoding's token-identity
-        # guarantee. Same script, same GPU, only this flag changed --
-        # speculative and non-speculative commit identical tokens with it OFF
-        # and diverge (prose position 14, code position 17) with it ON.
-        # Acceptance moves too: 1.54/1.82 -> 1.29/2.18. Mechanism: verify
-        # covers K positions in extend mode while decode does one at a time,
-        # and quantizing the KV amplifies that asymmetry past the near-tie
-        # threshold the accept/reject algorithm needs to be negligible.
-        # Harmless today because MTP is default off, but **enabling MTP means
-        # re-evaluating this default**. See
+        # An earlier version of this comment claimed FP8 KV breaks
+        # speculative decoding's token-identity guarantee, measured the same
+        # day. The measurement was real; the attribution was wrong. MTP's
+        # verify was running sparkinfer's mode="extend" instead of
+        # mode="verify", and only the FP8-shaped plan diverged. With the
+        # mode routed correctly, FP8 KV ON gives identical speculative and
+        # non-speculative tokens at K=4, with acceptance 1.54/2.00 (better
+        # than the 1.54/1.82 that turning FP8 KV off used to give). See
+        # notes/2026-08-03-mtp-verify-mode.md; the retracted note is
         # notes/2026-08-03-fp8kv-breaks-speculative-token-identity.md.
         #
         # It also matches what this model shipped with historically

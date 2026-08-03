@@ -1,4 +1,32 @@
-# FP8 KV 与投机解码的 token 一致性保证不相容（实测）
+# ~~FP8 KV 与投机解码的 token 一致性保证不相容~~（**已撤回：归因错了**）
+
+> ## ⚠️ 本文结论已被推翻（2026-08-03 当日）
+>
+> **本文测到的现象是真的，归因是错的。** FP8 KV 从来没有和投机解码不相容。
+> 真正的原因是 **MTP 的 verify 走了 sparkinfer 的 `mode="extend"` 而不是
+> `mode="verify"`**——见 [`2026-08-03-mtp-verify-mode.md`](2026-08-03-mtp-verify-mode.md)。
+>
+> 修好模式路由之后，**FP8 KV 开着**，K=4：
+>
+> | | 每轮接受 (prose/code) | token 逐一致 |
+> |---|---|---|
+> | 本文所记（verify 跑 extend） | 1.29 / 2.18 | **False** |
+> | 修复后（verify 跑 verify） | 1.54 / **2.00** | **True** |
+>
+> 下面「机制」一节里那句「verify 一次覆盖 K 个位置（extend 模式），decode
+> 一次一个（decode 模式）」**观察是对的**——那正是线索。错在把它当成 FP8 KV
+> 的固有代价，而不是当成一个「verify 就不该跑 extend 模式」的 bug。
+>
+> 教训：两个变量（FP8 KV × 投机）同时动的时候，「关掉其中一个就好了」证明的是
+> **相关**，不是**因果**。真正定位它的是第三个数据点——K=1 + FP8 KV 开也是
+> `True`（1 个 token 的 verify 塌回 decode 路径），那个形状不对称说明问题出在
+> 模式路由，不在量化。
+>
+> 保留原文以记录当时的推理链。**下面的内容不要再引用。**
+
+---
+
+## 原文（已过时）
 
 日期：2026-08-03 · 模型：`unsloth/Qwen3.6-27B-NVFP4`（标准模型）· K=4 ·
 `scripts/b3_mtp_e2e_acceptance_throughput.py` · 单卡 RTX PRO 6000 Blackwell Max-Q
