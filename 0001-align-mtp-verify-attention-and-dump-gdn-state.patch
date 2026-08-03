@@ -1,0 +1,225 @@
+diff --git a/runtime/model/qwen36_model.py b/runtime/model/qwen36_model.py
+--- a/runtime/model/qwen36_model.py
++++ b/runtime/model/qwen36_model.py
+@@ -1655,11 +1655,12 @@ class Qwen36DecodeGraphAttention:
+ 
+ 
+ class Qwen36VerifyGraphAttention:
+-    """Fixed-capacity ``mode="verify"`` paged-attention replay driver.
++    """Fixed-capacity ``mode="extend"`` paged-attention replay driver.
+ 
+-    ``Qwen36AttentionWorkspace`` deliberately remains the eager extend path;
+-    this small driver is the graph-only counterpart used by MTP. Sparkinfer's
+-    prefill replay metadata updater is called before every replay, so the
+-    captured plan is capacity-sized while page ids, cache length, and query
+-    offsets remain round-specific.
++    MTP's eager target verify calls ``Qwen36Attention``'s extend workspace.
++    The graph counterpart must use the same planner/kernel family: sparkinfer
++    gives ``mode="verify"`` a different split-KV policy and therefore a
++    different attention schedule. Its prefill replay metadata updater is
++    still called before every replay, so page ids, cache length, and query
++    offsets remain round-specific.
+     """
+@@ -1683,7 +1684,7 @@ class Qwen36VerifyGraphAttention:
+         self.verify_tokens = verify_tokens
+         self.device = device
+         self._default_descale = torch.ones(1, dtype=torch.float32, device=device)
+         self._workspace = PagedAttentionWorkspace.for_contract(
+-            mode="verify",
++            mode="extend",
+             device=device,
+             dtype=dtype,
+             kv_dtype=kv_dtype,
+             num_q_heads=num_q_heads,
+diff --git a/scripts/verify_qwen36_mtp_cuda_graph_bit_exact.py b/scripts/verify_qwen36_mtp_cuda_graph_bit_exact.py
+--- a/scripts/verify_qwen36_mtp_cuda_graph_bit_exact.py
++++ b/scripts/verify_qwen36_mtp_cuda_graph_bit_exact.py
+@@ -72,9 +72,118 @@ NUM_ROUNDS = 8
+ PROMPT = "Once upon a time, in a small village near the mountains,"
+ 
+ 
++def _snapshot_gdn_state(
++    backend: Qwen36Backend, slot: int, *, round_index: int, source_col: int
++) -> dict:
++    """Clone the active post-round GDN rows for graph/eager diagnosis.
++
++    ``slot_state().gdn_states`` is intentional: MTP ``activate()`` changes
++    those objects to point at the accepted spec row. Reading the base slot
++    pool row would silently compare the wrong state after a partial/full
++    accept. Cloning here is also required because the next draft/round mutates
++    the same pooled storage.
++    """
++    engine = backend._mtp
++    if engine._spec_rows is None:  # noqa: SLF001
++        raise RuntimeError("round-4 GDN probe requires MTP spec rows")
++    state = backend.pool.slot_state(slot)
++    active_col = engine._spec_state_col[slot]  # noqa: SLF001
++    layers: dict[int, dict[str, torch.Tensor]] = {}
++    for layer_idx, gdn_state in enumerate(state.gdn_states):
++        if gdn_state is None:
++            continue
++        layers[layer_idx] = {
++            "conv_state": gdn_state.conv_state.detach().cpu().clone(),
++            "recurrent_state": gdn_state.recurrent_state.detach().cpu().clone(),
++        }
++    return {
++        "round_index": round_index,
++        "slot": slot,
++        "source_col_before_round": source_col,
++        "source_row_before_round": engine._spec_rows.row_for_slot(  # noqa: SLF001
++            slot, source_col
++        ),
++        "active_col_after_round": active_col,
++        "active_row_after_round": engine._spec_rows.row_for_slot(slot, active_col),  # noqa: SLF001
++        "layers": layers,
++    }
++
++
++def _diff_gdn_states(graph_state: dict, eager_state: dict) -> bool:
++    """Print an exact per-layer/field state diff and return exact equality."""
++    print(
++        "GDN state provenance after round "
++        f"{graph_state['round_index']}: "
++        f"graph source_col={graph_state['source_col_before_round']} "
++        f"source_row={graph_state['source_row_before_round']} "
++        f"active_col={graph_state['active_col_after_round']} "
++        f"active_row={graph_state['active_row_after_round']}; "
++        f"eager source_col={eager_state['source_col_before_round']} "
++        f"source_row={eager_state['source_row_before_round']} "
++        f"active_col={eager_state['active_col_after_round']} "
++        f"active_row={eager_state['active_row_after_round']}"
++    )
++    state_exact = True
++    graph_layers = graph_state["layers"]
++    eager_layers = eager_state["layers"]
++    for layer_idx in sorted(set(graph_layers) | set(eager_layers)):
++        graph_layer = graph_layers.get(layer_idx)
++        eager_layer = eager_layers.get(layer_idx)
++        if graph_layer is None or eager_layer is None:
++            side = "graph" if graph_layer is None else "eager"
++            print(f"  layer={layer_idx}: missing on {side}")
++            state_exact = False
++            continue
++        for field in ("conv_state", "recurrent_state"):
++            graph_tensor = graph_layer[field]
++            eager_tensor = eager_layer[field]
++            if graph_tensor.shape != eager_tensor.shape:
++                print(
++                    f"  layer={layer_idx} field={field}: "
++                    f"shape graph={tuple(graph_tensor.shape)} "
++                    f"eager={tuple(eager_tensor.shape)}"
++                )
++                state_exact = False
++                continue
++            mismatch = int(torch.count_nonzero(graph_tensor != eager_tensor).item())
++            if mismatch:
++                delta = (graph_tensor.float() - eager_tensor.float()).abs()
++                max_abs = float(delta.max().item())
++                first = (graph_tensor != eager_tensor).nonzero(as_tuple=False)[0].tolist()
++                print(
++                    f"  layer={layer_idx} field={field}: exact=False "
++                    f"mismatches={mismatch}/{graph_tensor.numel()} "
++                    f"max_abs={max_abs:.8g} first_index={first}"
++                )
++                state_exact = False
++            else:
++                print(
++                    f"  layer={layer_idx} field={field}: exact=True "
++                    f"shape={tuple(graph_tensor.shape)}"
++                )
++    logits_exact = True
++    for index, name in enumerate(("anchor_logits", "verify_logits")):
++        graph_logits = graph_state["logits"][index]
++        eager_logits = eager_state["logits"][index]
++        exact = torch.equal(graph_logits, eager_logits)
++        if exact:
++            print(f"  {name}: exact=True shape={tuple(graph_logits.shape)}")
++        else:
++            delta = (graph_logits.float() - eager_logits.float()).abs()
++            mismatch = int(torch.count_nonzero(graph_logits != eager_logits).item())
++            print(
++                f"  {name}: exact=False mismatches={mismatch}/{graph_logits.numel()} "
++                f"max_abs={float(delta.max().item()):.8g}"
++            )
++        logits_exact = logits_exact and exact
++    print("GDN state exact:", state_exact)
++    print("Round-4 logits exact:", logits_exact)
++    return state_exact
++
++
+ def _run(
+     backend: Qwen36Backend, slot: int, *, use_graphs: bool, prompt_ids: list[int]
+-) -> list[dict]:
++) -> tuple[list[dict], dict]:
+     engine = backend._mtp
+     backend.reset_slot(slot)
+     saved = (engine._anchor_cg, engine._draft_cg, engine._verify_cg)
+@@ -81,13 +190,30 @@ def _run(
+     if not use_graphs:
+         engine._anchor_cg = None
+         engine._draft_cg = None
+         engine._verify_cg = None
+     try:
+         state = backend.prefill_chunked_begin([slot], [prompt_ids], params_per_slot={})
+         anchor = state.result[slot]["anchor"]
+         drafts = state.result[slot]["draft_tokens"]
+         trace: list[dict] = []
+-        for _ in range(NUM_ROUNDS):
+-            result = engine.round(slot, anchor, list(drafts))
++        state_dump: dict | None = None
++        logits_round4: list[torch.Tensor] = []
++        for round_index in range(NUM_ROUNDS):
++            source_col = engine._spec_state_col[slot]  # noqa: SLF001
++            if round_index == 4:
++                original_compute_logits = engine.model.compute_logits
++
++                def capture_logits(hidden: torch.Tensor) -> torch.Tensor:
++                    logits = original_compute_logits(hidden)
++                    logits_round4.append(logits.detach().cpu().clone())
++                    return logits
++
++                engine.model.compute_logits = capture_logits  # type: ignore[method-assign]
++                try:
++                    result = engine.round(slot, anchor, list(drafts))
++                finally:
++                    engine.model.compute_logits = original_compute_logits  # type: ignore[method-assign]
++            else:
++                result = engine.round(slot, anchor, list(drafts))
+             trace.append(
+                 {
+@@ -99,7 +226,19 @@ def _run(
+                 }
+             )
++            if round_index == 4:
++                state_dump = _snapshot_gdn_state(
++                    # Capture both the state and the two logits produced by
++                    # this round, before the next-round draft loop runs.
++                    backend, slot, round_index=round_index, source_col=source_col
++                )
++                if len(logits_round4) != 2:
++                    raise RuntimeError(
++                        f"round-4 probe captured {len(logits_round4)} logits; expected 2"
++                    )
++                state_dump["logits"] = logits_round4
+             anchor = result["next_anchor"]
+             drafts = result["next_draft_tokens"]
+-        return trace
++        assert state_dump is not None
++        return trace, state_dump
+     finally:
+         engine._anchor_cg, engine._draft_cg, engine._verify_cg = saved
+@@ -145,7 +284,12 @@ def main() -> None:
+     prompt_ids = tok(PROMPT, return_tensors=None)["input_ids"]
+     print(f"prompt_ids: {len(prompt_ids)} tokens")
+ 
+-    trace_graph = _run(backend, 0, use_graphs=True, prompt_ids=prompt_ids)
+-    trace_eager = _run(backend, 1, use_graphs=False, prompt_ids=prompt_ids)
++    trace_graph, gdn_graph = _run(backend, 0, use_graphs=True, prompt_ids=prompt_ids)
++    trace_eager, gdn_eager = _run(backend, 1, use_graphs=False, prompt_ids=prompt_ids)
++    gdn_match = _diff_gdn_states(gdn_graph, gdn_eager)
++    if not gdn_match:
++        print("GDN state diverged; inspect the first layer/field above before logits.")
++    else:
++        print("GDN state agrees exactly; remaining divergence is downstream logits/attention.")
+ 
+     match = trace_graph == trace_eager

@@ -39,6 +39,7 @@
 ## 2. 已定案的根因分析 🟢
 
 - [2026-08-03 交织 prefill + 全前向 warmup](2026-08-03-interleaved-prefill-and-warmup.md) —— 🟢 **两项实测收益,都照搬 `oracle/` 已跑通的实现**:首请求 TTFT **4.67s → 0.538s**(warmup 只暖 attention,MLP/GDN 全冷);长 prefill 对并发请求的停顿 **24.9s → 1.2s 且 ITL 零退化**(chunk 2048)。含一处自我修正:块大小在**交织语义下**是关键旋钮,不能拿"Phase A 只值 −10.7%"否掉
+- [2026-08-03 FP8 KV 打破投机 token 一致性](2026-08-03-fp8kv-breaks-speculative-token-identity.md) —— 🟢 **只切一个开关的实测**:FP8 KV 开 → 投机与非投机 token 不一致(第 14/17 位起);关 → 一致,接受率回到 1.54/1.82。生产不受影响(MTP 默认关),但**将来启用 MTP 必须重评 FP8 KV**。含方法论教训:三次因错误判据/无效对照卡住无缺陷分支
 - [2026-08-03 MTP 一轮实测分解](2026-08-03-mtp-round-profile.md) —— 🟢 **GPU 只有 31% 忙,瓶颈是主机侧拷贝不是接受率**:一轮 276.8ms/leaf kernel 87.0ms,`aten::copy_` 113.3ms(41%);`verify_forward` 占 70% 且没进图。⚠️ 反直觉:**verify 4 个 token 只花单次 decode 的 1.2×,投机前提在 GPU 侧成立**
 - ⭐ [2026-08-03 历史实现完整测绘](2026-08-03-historical-implementation-survey.md) —— 🟢 **要查历史做过什么、量到多少，先读这份,别再回老树一次问一个问题**。含 12 条按收益排序的"今天缺什么"、每个实测数字的完整配置与可比性标注。三条纠偏:① 历史终点是 `a9cb932`(07-30)不是 `8f5c195`,中间 330 个提交;② **代码没丢——就在今天仓库的 `oracle/qwen36_vllm/`(8047 行)和 `docs/archive/2026-07-20-PROGRESS.md`**;③ 跨步交织 chunked prefill **建过**(`a8bd167`),今天是 stub
 

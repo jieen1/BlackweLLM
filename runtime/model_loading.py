@@ -316,6 +316,19 @@ def load_qwen36_model(
         #   memory       58.64 -> 46.63 GiB resident, KV 8192 -> 4096 MiB/slot
         #   speed        1.047x at a 100k-token prompt under CUDA Graph
         #                (25.058 -> 26.229 tok/s)
+        # ⚠️ One incompatibility, measured 2026-08-03 and not covered by the
+        # bars above: FP8 KV breaks speculative decoding's token-identity
+        # guarantee. Same script, same GPU, only this flag changed --
+        # speculative and non-speculative commit identical tokens with it OFF
+        # and diverge (prose position 14, code position 17) with it ON.
+        # Acceptance moves too: 1.54/1.82 -> 1.29/2.18. Mechanism: verify
+        # covers K positions in extend mode while decode does one at a time,
+        # and quantizing the KV amplifies that asymmetry past the near-tie
+        # threshold the accept/reject algorithm needs to be negligible.
+        # Harmless today because MTP is default off, but **enabling MTP means
+        # re-evaluating this default**. See
+        # notes/2026-08-03-fp8kv-breaks-speculative-token-identity.md.
+        #
         # It also matches what this model shipped with historically
         # (qsr-hist's direct_model_runner.py defaulted kv_cache_dtype to
         # fp8_e4m3). `QSR_QWEN36_FP8_KV=0` opts back out.
