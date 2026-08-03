@@ -180,8 +180,18 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       但缺口在**当前 kernel 组合本身比历史那套慢**,不在"没有杠杆"。
       见 [`../notes/2026-08-03-performance-gap-vs-historical.md`](../notes/2026-08-03-performance-gap-vs-historical.md)。
       **下一步:在 128K/c=4 同口径实测坐实,然后按历史文档的分解逐项对账。**
-- [ ] 🔴 **MTP 接受长度退化 2.75×**:历史 3.3 tokens/step,今天 1.20。
-      疑似根因已定位((token,hidden) 配对错误,修复已合入),**实际改善待 GPU 实测**。
+- [x] ~~**MTP 接进服务路径**~~ —— 已接(默认关),但 🔴 **不可上生产,原因是架构不是接受率**:
+      服务路径实测 **MTP 关 28.0 tok/s vs MTP 开 7.80 tok/s = 0.28×,慢 3.6×**。
+      根因:`Qwen36MTPEngine.round` **全程 eager,从不走 `decode_batch_sampled`**
+      ——那是被捕获的 CUDA Graph 唯一重放的路径。MTP 一开,`classify_decode_slots`
+      把每个 slot 都路由过去,**捕获没被关掉,只是不可达**。
+      等于拿 4.71× 的 CG 收益换 1.54/4 的接受率。
+      DFlash 靠自建 draft/verify CUDA Graph 规避了这个,`Qwen36MTPEngine` 没有对应物。
+- [ ] 🎯 **MTP 要能用,必须先给 verify/draft 路径做 CUDA Graph 捕获**(参照 DFlash)。
+      在那之前接受率再高也没意义。
+- [x] ~~接受长度退化~~ —— (token,hidden) 配对 bug 已修并实测:
+      prose 1.20 → **1.54**,code 1.67 → **1.82**。真实改善但幅度有限,
+      **远不足以抵消上面那 3.6×**。C-LIVE **66/67**(基线 64/67,无退化)。
 - [x] ~~**`assert_all_params_loaded` 是单向的**~~ —— **已补反向检查**（`0ddab29`：`warn_on_unconsumed_tensor_families`，按名字尾部分族，警告而非抛错）。原记录：：保证"每个模型参数都拿到 checkpoint 张量"，
       **不保证"每个 checkpoint 张量都被消费"**。`input_global_scale` 因此被静默丢弃了很久
       （W4A4 调查时才发现，本次无害但盲区是真的）。补一个反向检查。
