@@ -632,9 +632,16 @@ class ServerEngine:
                 enable_resync=self.mtp_resync,
             )
             logger.info(
-                "Qwen3.6 MTP speculative decode wired: K=%d, resync=%s",
+                "Qwen3.6 MTP speculative decode wired: K=%d, resync=%s, cg_status=%s",
                 self.mtp_num_speculative_tokens,
                 self.runner._mtp.enable_resync,  # noqa: SLF001 -- log-only introspection
+                # 2026-08-03 CUDA-Graph follow-up: this is the ONLY log line
+                # that would ever surface a degraded (eager-fallback) anchor
+                # or draft graph -- see runtime.backends.qwen36_mtp_cudagraph's
+                # module docstring on why silent degradation is exactly the
+                # failure mode to avoid here (same lesson as C7-2/the w4a16
+                # scratch bug).
+                self.runner._mtp.cg_status,  # noqa: SLF001 -- log-only introspection
             )
         logger.info(
             "Qwen3.6 model loaded on engine thread: num_slots=%d max_context=%d tokens/slot, "

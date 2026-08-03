@@ -75,6 +75,12 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from runtime.backends.qwen36_mtp_cudagraph import (
+    Qwen36MTPAnchorCudaGraph,
+    Qwen36MTPDraftCudaGraph,
+    attempt_mtp_cg_capture,
+    build_pooled_mtp_caches,
+)
 from runtime.logprobs import compute_logprobs
 from runtime.mtp_accept import determine_accept_reject_from_predictions, sample_accept_reject
 from runtime.sampling import SamplingParams, compute_sampling_distribution, make_generator
@@ -145,22 +151,128 @@ class Qwen36MTPEngine:
         self.dtype = backend.dtype
         self.vocab_size = int(model.config["vocab_size"])
 
-        #: One persistent MTP self-attention cache per real slot (no
-        #: scratch row -- unlike Qwen36SlotPool, nothing here is
-        #: CUDA-graph-captured, so there is no padding-row aliasing hazard
-        #: to guard against). Allocated once, reset (not reallocated) by
-        #: :meth:`reset_slot`, same discipline B0-5 established for the
-        #: backbone's own recurrent-state buffers.
-        self._caches: list[Qwen36PagedAttentionCache] = [
-            model.mtp_new_cache(device=self.device, dtype=self.dtype)
-            for _ in range(backend.num_slots)
-        ]
+        #: 2026-08-03 CUDA-Graph follow-up (see
+        #: runtime.backends.qwen36_mtp_cudagraph's module docstring): CUDA
+        #: Graph capture is only attempted on a real CUDA device with a
+        #: real model -- a CPU/stub model (this repo's own
+        #: tests/test_qwen36_mtp_engine.py) has no
+        #: model.mtp.layers[0].self_attn geometry to build a pool from,
+        #: and every stub test's ``model.mtp_new_cache`` fake would break
+        #: under a pooled allocation it was never written to model. The
+        #: eager per-slot cache (unchanged from before this follow-up)
+        #: stays the CPU/stub/opt-out path; QSR_QWEN36_MTP_CUDA_GRAPH=0
+        #: forces it even on a real GPU (diagnostic escape hatch, same
+        #: convention as QSR_DFLASH_CUDA_GRAPH/QSR_VERIFY_CUDA_GRAPH).
+        self._use_cuda_graph = (
+            self.device.type == "cuda" and os.environ.get("QSR_QWEN36_MTP_CUDA_GRAPH", "1") != "0"
+        )
+        #: cg_status / scratch_row / mtp_k_pool / mtp_v_pool / mtp_page_size
+        #: / mtp_pages_per_slot are only ever populated in the CUDA-graph
+        #: branch below; they stay at these CPU/stub-safe defaults
+        #: otherwise, and every graph-replay call site below is itself
+        #: gated on ``self._anchor_cg``/``self._draft_cg`` being non-None,
+        #: so nothing downstream needs to re-check ``self._use_cuda_graph``.
+        self.cg_status: dict[str, str] = {}
+        self.scratch_row: int | None = None
+        self.mtp_k_pool: torch.Tensor | None = None
+        self.mtp_v_pool: torch.Tensor | None = None
+        self.mtp_page_size: int | None = None
+        self.mtp_pages_per_slot: int | None = None
+        self._anchor_cg: Qwen36MTPAnchorCudaGraph | None = None
+        self._draft_cg: Qwen36MTPDraftCudaGraph | None = None
+        self._cg_captured = False
+
+        if self._use_cuda_graph:
+            #: One persistent MTP self-attention cache per real slot, plus
+            #: one scratch row -- POOLED (module docstring's "one
+            #: allocation, two addressings", scaled down to MTP's 1-layer
+            #: head), required so :class:`Qwen36MTPDraftCudaGraph` can
+            #: serve every slot from a single captured graph (a CUDA Graph
+            #: bakes in the exact address its kernels read; an
+            #: independently-allocated per-slot cache could only ever be
+            #: replayed correctly for the ONE slot it was captured
+            #: against).
+            (
+                self._caches,
+                self.mtp_k_pool,
+                self.mtp_v_pool,
+                self.mtp_page_size,
+                self.mtp_pages_per_slot,
+            ) = build_pooled_mtp_caches(
+                model, num_slots=backend.num_slots, device=self.device, dtype=self.dtype
+            )
+            self.scratch_row = backend.num_slots
+        else:
+            #: One persistent MTP self-attention cache per real slot (no
+            #: scratch row -- nothing here is CUDA-graph-captured on this
+            #: path, so there is no padding-row aliasing hazard to guard
+            #: against). Allocated once, reset (not reallocated) by
+            #: :meth:`reset_slot`, same discipline B0-5 established for
+            #: the backbone's own recurrent-state buffers.
+            self._caches = [
+                model.mtp_new_cache(device=self.device, dtype=self.dtype)
+                for _ in range(backend.num_slots)
+            ]
 
         self.stats: dict[str, int] = {
             "rounds": 0,
             "resync_rounds": 0,
             "sampled_rounds": 0,
         }
+
+        if self._use_cuda_graph:
+            self.capture_cuda_graphs()
+
+    # -- CUDA Graph capture (2026-08-03 follow-up) -----------------------
+
+    def capture_cuda_graphs(self) -> None:
+        """Capture the anchor-advance and draft-loop graphs, before any
+        production slot is used -- same "capture while every slot is
+        definitionally empty" window ``Qwen36Backend.enable_mtp``'s own
+        docstring already documents, and the same one
+        ``DFlashEngine.capture_cuda_graphs``/``_init_cuda_graph`` rely on.
+        Idempotent; a no-op if ``self._use_cuda_graph`` is False (CPU/stub
+        or QSR_QWEN36_MTP_CUDA_GRAPH=0) or capture already ran.
+
+        Each site goes through :func:`attempt_mtp_cg_capture` -- status
+        recorded in :attr:`cg_status`, degrading to that path's existing
+        eager fallback (never crashing) unless QSR_QWEN36_MTP_REQUIRE_CG=1.
+        See ``runtime.backends.qwen36_mtp_cudagraph``'s module docstring
+        for why this defaults to "degrade", the opposite of DFlash's
+        default.
+        """
+        if not self._use_cuda_graph or self._cg_captured:
+            return
+        strict = os.environ.get("QSR_QWEN36_MTP_REQUIRE_CG", "0") == "1"
+
+        def _do_capture_anchor() -> None:
+            cg = Qwen36MTPAnchorCudaGraph(self.backend)
+            cg.capture()
+            self._anchor_cg = cg
+
+        status = attempt_mtp_cg_capture("anchor", _do_capture_anchor, strict=strict)
+        self.cg_status["anchor"] = status
+        if status == "failed":
+            self._anchor_cg = None
+
+        def _do_capture_draft() -> None:
+            cg = Qwen36MTPDraftCudaGraph(self)
+            cg.capture()
+            self._draft_cg = cg
+
+        status = attempt_mtp_cg_capture("draft", _do_capture_draft, strict=strict)
+        self.cg_status["draft"] = status
+        if status == "failed":
+            self._draft_cg = None
+
+        self._cg_captured = True
+
+    def cuda_graphs_healthy(self) -> bool:
+        """True iff every MTP CUDA Graph capture attempted so far
+        succeeded -- vacuously True before capture runs or when CUDA
+        Graphs are disabled entirely, matching
+        ``DFlashEngine.cuda_graphs_healthy``'s own contract."""
+        return all(status == "captured" for status in self.cg_status.values())
 
     # -- slot lifecycle ------------------------------------------------
 
@@ -190,6 +302,15 @@ class Qwen36MTPEngine:
         docstring's "chained continuation steps... NOT affected").
         """
         cache = self._caches[slot]
+        if self._draft_cg is not None:
+            # 2026-08-03 CUDA-Graph follow-up (runtime.backends.
+            # qwen36_mtp_cudagraph): replaces the eager K-step loop below
+            # with one captured-graph replay, bit-exact by construction
+            # (same ops, same weights, same cache -- see
+            # scripts/verify_qwen36_mtp_cuda_graph_bit_exact.py). Advances
+            # cache.seq_len itself (module docstring on Qwen36MTPDraftCudaGraph
+            # .replay: bypasses Qwen36PagedAttentionCache.append entirely).
+            return self._draft_cg.replay(slot, seed_token, seed_hidden, cache.seq_len)
         mtp_hidden = seed_hidden
         next_input = torch.tensor([[seed_token]], dtype=torch.long, device=self.device)
         drafts: list[int] = []
@@ -286,8 +407,23 @@ class Qwen36MTPEngine:
         # correctly-shifted purpose the module docstring describes,
         # instead of discarding it and reusing anchor_hidden (hidden AFTER,
         # not before, anchor_token) for that purpose.
-        anchor_input = torch.tensor([[anchor_token]], dtype=torch.long, device=self.device)
-        anchor_hidden = self.model(anchor_input, state)  # [1, 1, H]
+        if self._anchor_cg is not None:
+            # 2026-08-03 CUDA-Graph follow-up (runtime.backends.
+            # qwen36_mtp_cudagraph): Qwen36MTPAnchorCudaGraph.replay does
+            # ONLY the forward + KV/GDN pool write build_decode_batch would
+            # also do -- state.num_tokens_seen/cache.seq_len are this
+            # method's own bookkeeping to advance, exactly matching what
+            # the eager self.model(anchor_input, state) call below would
+            # otherwise have done internally (Qwen36TextModelSelfBuilt
+            # .forward/Qwen36PagedAttentionCache.append).
+            anchor_hidden = self._anchor_cg.replay(slot, anchor_token, state.num_tokens_seen)
+            state.num_tokens_seen += 1
+            for attn_cache in state.attn_caches:
+                if attn_cache is not None:
+                    attn_cache.seq_len += 1
+        else:
+            anchor_input = torch.tensor([[anchor_token]], dtype=torch.long, device=self.device)
+            anchor_hidden = self.model(anchor_input, state)  # [1, 1, H]
         anchor_logits = self.model.compute_logits(anchor_hidden)[0]  # [1, vocab]
 
         # -- (b) verify the K drafts in one pass.
