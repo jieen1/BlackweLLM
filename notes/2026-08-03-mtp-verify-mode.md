@@ -292,7 +292,31 @@ draft 的种子 = `next_anchor` ← accept/reject ← verify 的 logits。今天
    "对"但不逐位相同；verify 在 qo_len=5 下用的内核与 decode 的 qo_len=1 不同，
    归约顺序不同，近似平局会翻转。
 
-不能假定是 (2) 就放过。**下一步**：按 B1-R 的标定判据量化差异幅度（而不是只看
-"第一个不同字符在哪"），并做一个 MTP-off 自身 CG-vs-eager 的对照，确定 MTP-on
-的偏差是否落在同一包络内。在判定之前，**MTP 保持默认关闭**——尽管性能已经
-达标（1.6~2.0x）。
+### 已判定：是 (2)，而且对照极其干净
+
+做了 MTP-off 自身的 CG-vs-eager 对照（`greedy_divergence_control.py`：两臂都
+关 MTP，唯一变量是 `QSR_SERVER_ENABLE_CUDAGRAPH`）：
+
+| 对比 | prose | code |
+|---|---|---|
+| MTP-on vs MTP-off（都开图） | 第 **525** 字符分叉 | 一致 |
+| **CUDA 图 vs eager（都关 MTP）** | 第 **525** 字符分叉 | 一致 |
+
+**同一个字符位置、同一个模式**。而且两组的文本是**逐字对应**的：
+
+```
+CG-vs-eager 对照:  cg_on  = " keeper's past self? From a ship that never "
+                   cg_off = "mselves? From a lost love? A warning about t"
+MTP A/B:           off    = " keeper's past self? From a ship that ne"
+                   on     = "mselves? From a lost love? A warning abo"
+```
+
+即 **MTP-on 的输出等于 eager 的输出，MTP-off（开图）的输出等于 cg_on 的输出**。
+分叉是 `docs/b1-correctness-criterion.md` 早就确立的那一类路径相关数值差异——
+非投机路径**自己**在同一个字符上就已经有了，MTP 一点没往里加。
+
+（这也解释了为什么合并前向"改善"了一致性：合并前 MTP 多跑一次 `[1,1]` anchor
+前向，那一次走的是 decode 内核；合并后整轮只剩 verify 内核，路径更单一，与
+eager 的归约顺序反而更接近。第 45/232 → 525/一致 是这个原因，不是簿记变对了。）
+
+**结论：MTP 的正确性落在本仓库既有的、已接受的数值包络内，不是 bug。**
