@@ -38,6 +38,7 @@
 
 ## 2. 已定案的根因分析 🟢
 
+- [2026-08-03 MTP 一轮实测分解](2026-08-03-mtp-round-profile.md) —— 🟢 **GPU 只有 31% 忙,瓶颈是主机侧拷贝不是接受率**:一轮 276.8ms/leaf kernel 87.0ms,`aten::copy_` 113.3ms(41%);`verify_forward` 占 70% 且没进图。⚠️ 反直觉:**verify 4 个 token 只花单次 decode 的 1.2×,投机前提在 GPU 侧成立**
 - ⭐ [2026-08-03 历史实现完整测绘](2026-08-03-historical-implementation-survey.md) —— 🟢 **要查历史做过什么、量到多少，先读这份,别再回老树一次问一个问题**。含 12 条按收益排序的"今天缺什么"、每个实测数字的完整配置与可比性标注。三条纠偏:① 历史终点是 `a9cb932`(07-30)不是 `8f5c195`,中间 330 个提交;② **代码没丢——就在今天仓库的 `oracle/qwen36_vllm/`(8047 行)和 `docs/archive/2026-07-20-PROGRESS.md`**;③ 跨步交织 chunked prefill **建过**(`a8bd167`),今天是 stub
 
 - [2026-08-03 解码 kernel profiling：CG 下已 kernel-bound](2026-08-03-decode-kernel-profile.md) —— 🟢 GPU busy 31.01ms / CG 墙钟 34.67ms = **89%**；eager 只有 21% 忙（CPU 侧 paged 元数据 ~34ms/step）。按调用次数精确归属：NVFP4 融合 MLP **56 次/35%**，FP8 层反量化后的 BF16 GEMM **233 次/45%**（233 = 预期数，一个不差），**GDN 递归仅 0.6%**。含一处自我纠正（首版对 `key_averages()` 求和，重复计数）

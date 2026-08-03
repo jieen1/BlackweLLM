@@ -187,8 +187,22 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       把每个 slot 都路由过去,**捕获没被关掉,只是不可达**。
       等于拿 4.71× 的 CG 收益换 1.54/4 的接受率。
       DFlash 靠自建 draft/verify CUDA Graph 规避了这个,`Qwen36MTPEngine` 没有对应物。
-- [ ] 🎯 **MTP 要能用,必须先给 verify/draft 路径做 CUDA Graph 捕获**(参照 DFlash)。
-      在那之前接受率再高也没意义。
+- [x] ~~MTP 要能用,必须先给 verify/draft 路径做 CUDA Graph 捕获~~ —— **anchor + draft 已捕获**
+      (`fb573bf`,bit-exact 验证通过,`cg_status` 可观测):8.1 → **11.6–11.8 tok/s(1.44×)**,
+      但仍是 **0.42× vs MTP-off**,**不可上生产**。
+- [ ] 🔴 **实测定位:一轮 GPU 只有 31% 忙,瓶颈是主机侧拷贝,不是接受率。**
+      一轮 276.8ms / leaf kernel 仅 87.0ms;`aten::copy_` **113.3ms(占墙钟 41%)**。
+      `verify_forward` 192.8ms **占一轮 70% 且没进图**——每轮原样再付 CG 本该消掉的开销。
+      ⚠️ 反直觉但关键:**verify 4 个 token 只花单次 decode 的 1.2 倍(192.8 vs 160.8),
+      投机的前提在 GPU 侧是成立的。** 接受率翻倍也补不上那 190ms 空转。
+      详见 [`../notes/2026-08-03-mtp-round-profile.md`](../notes/2026-08-03-mtp-round-profile.md)。
+- [ ] 🎯 **① 捕获 `verify_forward`**(一轮 70%)。阻塞点已定位:
+      `qwen36_model.py:1261` 硬编码 `enable_cuda_graph=False`,而 sparkinfer 有
+      `prepare_prefill_graph_replay_state`(`workspace.py:1325`,Laguna verify 图在用);
+      GDN `spec_forward` 的捕获安全性未验证。
+- [ ] 🎯 **② 用 `recurrent_state_pool.spec_row` 的 K+1 行寻址替掉 GDN snapshot/restore**
+      —— 直接冲那 113ms `copy_` 去。历史(M-3)靠这个删掉命中 84.4% 轮次、
+      占 56% 墙钟的重算,值 +18.76%;**今天 `spec_row` 实现了零调用**。
 - [x] ~~接受长度退化~~ —— (token,hidden) 配对 bug 已修并实测:
       prose 1.20 → **1.54**,code 1.67 → **1.82**。真实改善但幅度有限,
       **远不足以抵消上面那 3.6×**。C-LIVE **66/67**(基线 64/67,无退化)。
