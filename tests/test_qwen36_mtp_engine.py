@@ -93,7 +93,13 @@ class _StubMTPModel:
         ]
         self.model = SimpleNamespace(layers=layers)
         self.mtp = object()  # any non-None sentinel; Qwen36MTPEngine only checks "is None"
-        self.config = {"vocab_size": _VOCAB}
+        # `intermediate_size` is not MTP's business, but this fake stands in
+        # for the whole model and `Qwen36Backend._prefill_chunk_tokens` reads
+        # it to derive the prefill chunk cap (the w4a16 int32 memref bound --
+        # see tests/test_qwen36_prefill_chunking.py). A fake that omits a key
+        # the real config always carries makes these tests pass against a
+        # model shape that does not exist.
+        self.config = {"vocab_size": _VOCAB, "intermediate_size": 17408}
 
         self.mtp_step_calls: list[dict] = []
         self.mtp_resync_calls: list[dict] = []

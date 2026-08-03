@@ -154,6 +154,17 @@ class Qwen36SlotStateView:
         return self.kv_len == 0 and not self.committed_tokens
 
 
+#: int32's positive range -- the width of the element count in the cutlass DSL
+#: memref descriptor sparkinfer's w4a16 fused MoE builds. Exceeding it raises
+#: OverflowError from inside the kernel launch, not from anything we control.
+_W4A16_MEMREF_ELEMENT_LIMIT = 2**31 - 1
+
+#: Preferred tokens per prefill forward. Matches LagunaBackend's own
+#: ``_prefill_chunk_tokens`` default; capped by model geometry in
+#: :meth:`Qwen36Backend._prefill_chunk_tokens`.
+_PREFERRED_PREFILL_CHUNK_TOKENS = 8192
+
+
 class Qwen36Backend:
     """Fixed-slot, continuously-batched serving backend for Qwen3.6.
 
@@ -452,12 +463,66 @@ class Qwen36Backend:
                 f"(prefix_hit={prefix_hit} == len(prompt)); the caller must leave "
                 "at least one token so there are logits to sample from"
             )
-        input_ids = torch.tensor([suffix], dtype=torch.long, device=self.device)
-        hidden = self.model(input_ids, state)
+        # Chunked, and NOT optional. A single forward over the whole suffix
+        # overflows int32 inside sparkinfer's w4a16 fused MoE: it builds a
+        # memref whose element count is `m * fc1_cols`, and with
+        # fc1_cols = 2 * intermediate_size = 34816 that exceeds 2**31-1 at
+        # m = 61,682. Above that the kernel raises OverflowError deep in the
+        # cutlass DSL, `ServerEngine` swallows it, and the client gets HTTP
+        # 200 with `finish=stop` and ZERO tokens -- no error anywhere. The
+        # model advertises max_context=131072 per slot, so every prompt
+        # between ~61.7k and 131k silently returned nothing.
+        #
+        # This method previously ran one forward for the whole suffix and
+        # `prefill_chunked_begin` documented itself as "one-shot", accepting
+        # and ignoring the caller's chunk_size. The one-shot *protocol* is
+        # kept (still returns done=True in a single round, which is what lets
+        # ServerEngine activate slots immediately) -- only the forward is
+        # split. Chunking here is exactly what a continuation already does:
+        # each call advances `state`, and only the final chunk's rows are
+        # returned, because only the last position's logits are sampled from.
+        chunk = self._prefill_chunk_tokens()
+        hidden = None
+        for start in range(0, len(suffix), chunk):
+            piece = suffix[start : start + chunk]
+            input_ids = torch.tensor([piece], dtype=torch.long, device=self.device)
+            hidden = self.model(input_ids, state)
+        assert hidden is not None  # `suffix` is non-empty, checked above
         logits = self.model.compute_logits(hidden[0])
         if return_hidden:
             return logits, hidden[0]
         return logits
+
+    def _prefill_chunk_tokens(self) -> int:
+        """Tokens per prefill forward: large for speed, capped for correctness.
+
+        The cap is derived from the model's own geometry rather than pinned to
+        a constant, so a different `intermediate_size` cannot silently walk
+        back into the overflow. `_W4A16_MEMREF_ELEMENT_LIMIT` is int32's
+        positive range, which is what the cutlass DSL memref descriptor
+        actually holds.
+
+        The preferred size is Laguna's own `_prefill_chunk_tokens` default,
+        for consistency; on this model the derived cap (61,681) is far above
+        it, so the cap only ever binds for a model with a much wider MLP.
+        """
+        # `Qwen36ForCausalLMSelfBuilt.config` is the raw checkpoint config
+        # dict, not an attribute object -- see that class's `__init__`.
+        #
+        # Falls back to the preferred size when the model does not expose an
+        # `intermediate_size`, which is only ever a test double standing in
+        # for the model. Deliberately a fallback rather than a raise: the cap
+        # exists to bound a REAL long prefill, and making every stub in the
+        # suite carry a field it has no other use for would couple unrelated
+        # tests to this bound. A stub that never prefills 61k tokens cannot
+        # trip the limit the cap protects against. Any real model built from
+        # a checkpoint always has the key.
+        config = getattr(self.model, "config", None)
+        intermediate = (config or {}).get("intermediate_size") if isinstance(config, dict) else None
+        if not intermediate:
+            return _PREFERRED_PREFILL_CHUNK_TOKENS
+        hard_cap = _W4A16_MEMREF_ELEMENT_LIMIT // (2 * int(intermediate))
+        return max(1, min(_PREFERRED_PREFILL_CHUNK_TOKENS, hard_cap))
 
     def _commit_prefill(self, slot: int, prompt_ids: list[int], first_token: int) -> None:
         self.pool.slot_kv_len[slot] = len(prompt_ids)

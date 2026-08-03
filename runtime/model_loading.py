@@ -308,7 +308,25 @@ def load_qwen36_model(
     """
     torch.set_grad_enabled(False)
     if enable_fp8_kv is None:
-        enable_fp8_kv = os.environ.get(QSR_QWEN36_FP8_KV_ENV) == "1"
+        # Default ON as of 2026-08-03. Measured on the standard checkpoint,
+        # positive on all three axes that matter, so there is nothing left to
+        # trade off:
+        #   correctness  B1-R clears every bar by 2-8x, no capture-window
+        #                overflow (notes/2026-08-03-fp8-kv-cache.md)
+        #   memory       58.64 -> 46.63 GiB resident, KV 8192 -> 4096 MiB/slot
+        #   speed        1.047x at a 100k-token prompt under CUDA Graph
+        #                (25.058 -> 26.229 tok/s)
+        # It also matches what this model shipped with historically
+        # (qsr-hist's direct_model_runner.py defaulted kv_cache_dtype to
+        # fp8_e4m3). `QSR_QWEN36_FP8_KV=0` opts back out.
+        #
+        # The speed figure is worth stating because it contradicts the
+        # prediction made from an eager profile, where FP8 KV made
+        # sparkinfer's PagedForwardKernel 19% slower (44.97 -> 53.64 ms) and
+        # that was expected to surface as loss once decode became
+        # kernel-bound under CUDA Graph. It did not; it became a small gain.
+        # Trust the CG measurement, not the eager extrapolation.
+        enable_fp8_kv = os.environ.get(QSR_QWEN36_FP8_KV_ENV, "1") != "0"
     model_config = _build_qwen36_model_config(model_path)
     target_device = torch.device(device)
 

@@ -1,5 +1,7 @@
 """FP8 KV cache (2026-08-03 follow-up) -- gated by ``enable_fp8_kv``/
-``QSR_QWEN36_FP8_KV``, default OFF.
+``QSR_QWEN36_FP8_KV``, **default ON since 2026-08-03** (`QSR_QWEN36_FP8_KV=0`
+opts out) -- measured positive on correctness, memory and speed at once; see
+``notes/2026-08-03-fp8-kv-cache.md`` and ``runtime/model_loading.py``.
 
 Same convention as ``tests/test_qwen36_mtp_head.py``/
 ``tests/test_qwen36_slot_pool.py``: CPU-only, tiny synthetic config or a
