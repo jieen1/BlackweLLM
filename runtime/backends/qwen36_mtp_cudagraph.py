@@ -76,10 +76,9 @@ follow-up brief)**:
   captured once while page ids, cache length, query positions, and K/V write
   rows stay replay inputs. GDN's ``spec_forward`` writes fixed ``spec_row``
   destinations instead of allocating snapshots. One graph is captured for
-  each possible accepted source column; replay selects that graph by the
-  engine's current accepted count. This is the captured equivalent of
-  ``verify_forward`` -- the old eager method remains the fallback and the
-  bit-exact oracle.
+  each physical slot; a device source-row index selects the accepted column
+  before replay. This is the captured equivalent of ``verify_forward`` -- the
+  old eager method remains the fallback and the bit-exact oracle.
 
 **Discipline**: every capture site goes through
 :func:`attempt_mtp_cg_capture`, the same "record status, log loud, degrade
@@ -332,12 +331,11 @@ class Qwen36MTPAnchorCudaGraph:
 class Qwen36MTPVerifyCudaGraph:
     """CUDA Graphs for the K-token target verify body.
 
-    One graph is captured for each possible accepted GDN column. The
-    recurrent source address is therefore fixed inside each graph while the
-    page table, query positions, and K/V write rows are updated before every
-    replay. This is the smallest graph-safe form of ``verify_forward``: it
-    removes host attention replanning and snapshot allocation without making
-    a captured graph depend on a Python cache length from its warmup round.
+    One graph is captured for each physical slot. The recurrent source row is
+    selected through a device index that is updated before replay, so the
+    source address set remains fixed while the accepted column changes. This
+    removes the old K+1 graph variants and makes the graph agree with the
+    fixed pooled-row mechanism used by the eager path.
     """
 
     def __init__(self, engine: Qwen36MTPEngine) -> None:
@@ -390,34 +388,41 @@ class Qwen36MTPVerifyCudaGraph:
             )
         self._attn_drivers = attn_drivers
         self._attn_outputs = attn_outputs
-        self._graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
-        self._hidden: dict[tuple[int, int], torch.Tensor] = {}
-        self._batches: dict[tuple[int, int], Qwen36VerifyBatch] = {}
-        # A graph captures tensor addresses, so the source row cannot be
-        # selected from a host integer at replay time. Capture each physical
-        # slot and each accepted column; capacity=1 therefore has only ten
-        # small K-token graphs for K=4, while replay remains one launch.
+        self._gdn_source_index = torch.zeros(1, dtype=torch.long, device=self.device)
+        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._hidden: dict[int, torch.Tensor] = {}
+        self._batches: dict[int, Qwen36VerifyBatch] = {}
+        # The graph captures this index tensor's address, not a particular
+        # source row. Replay changes its value to select the accepted row from
+        # the fixed GDN pools, just as the anchor graph does.
         for slot in range(self.pool.num_slots + 1):
             rows = engine._spec_rows.rows_for_slot(slot)
-            for state_col in range(self.k + 1):
-                sources = {layer_idx: states[state_col] for layer_idx, states in rows.items()}
-                destinations = {
-                    layer_idx: [states[0], *states[1:]] for layer_idx, states in rows.items()
-                }
-                self._batches[(slot, state_col)] = Qwen36VerifyBatch(
-                    input_ids=self._draft_ids,
-                    positions=self._positions,
-                    write_index=self._write_index,
-                    k_pools=self.pool.k_pools,
-                    v_pools=self.pool.v_pools,
-                    attn_drivers=self._attn_drivers,
-                    attn_outputs=self._attn_outputs,
-                    gdn_sources=sources,
-                    gdn_state_rows=destinations,
-                )
+            destinations = {
+                layer_idx: [states[0], *states[1:]] for layer_idx, states in rows.items()
+            }
+            self._batches[slot] = Qwen36VerifyBatch(
+                input_ids=self._draft_ids,
+                positions=self._positions,
+                write_index=self._write_index,
+                k_pools=self.pool.k_pools,
+                v_pools=self.pool.v_pools,
+                attn_drivers=self._attn_drivers,
+                attn_outputs=self._attn_outputs,
+                gdn_source_index=self._gdn_source_index,
+                gdn_conv_pools=engine._spec_rows.conv_pools,
+                gdn_recurrent_pools=engine._spec_rows.recurrent_pools,
+                gdn_state_rows=destinations,
+            )
         self._captured = False
 
-    def _fill(self, slot: int, drafts: list[int], past_len: int) -> None:
+    def _fill(
+        self, slot: int, drafts: list[int], past_len: int, *, state_col: int | None = None
+    ) -> None:
+        if state_col is None:
+            state_col = self.engine._spec_state_col[slot]  # noqa: SLF001
+        self._gdn_source_index[0] = self.engine._spec_rows.row_for_slot(  # noqa: SLF001
+            slot, state_col
+        )
         self._draft_ids[0].copy_(torch.tensor(drafts, dtype=torch.long, device=self.device))
         self._positions.copy_(
             torch.arange(past_len, past_len + self.k, dtype=torch.long, device=self.device)
@@ -441,24 +446,22 @@ class Qwen36MTPVerifyCudaGraph:
         if self._captured:
             return
         try:
-            for (slot, state_col), batch in self._batches.items():
+            for slot, batch in self._batches.items():
                 self.engine._spec_rows.reset_slot(slot)  # noqa: SLF001
-                for source in batch.gdn_sources.values():
-                    source.has_previous_state = True
                 side = torch.cuda.Stream()
                 side.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(side):
                     for _ in range(3):
-                        self._fill(slot, [0] * self.k, 0)
+                        self._fill(slot, [0] * self.k, 0, state_col=0)
                         self.model.verify_batch(batch)
                 torch.cuda.current_stream().wait_stream(side)
 
-                self._fill(slot, [0] * self.k, 0)
+                self._fill(slot, [0] * self.k, 0, state_col=0)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     hidden = self.model.verify_batch(batch)
-                self._graphs[(slot, state_col)] = graph
-                self._hidden[(slot, state_col)] = hidden
+                self._graphs[slot] = graph
+                self._hidden[slot] = hidden
         finally:
             for slot in range(self.pool.num_slots + 1):
                 self.engine._spec_rows.reset_slot(slot)  # noqa: SLF001
@@ -469,10 +472,9 @@ class Qwen36MTPVerifyCudaGraph:
             raise RuntimeError("verify CUDA Graph replay requested before capture")
         if len(drafts) != self.k:
             raise ValueError(f"verify graph expects K={self.k}, got {len(drafts)} drafts")
-        state_col = self.engine._spec_state_col[slot]  # noqa: SLF001
         self._fill(slot, drafts, past_len)
-        self._graphs[(slot, state_col)].replay()
-        return self._hidden[(slot, state_col)]
+        self._graphs[slot].replay()
+        return self._hidden[slot]
 
 
 class Qwen36MTPDraftCudaGraph:

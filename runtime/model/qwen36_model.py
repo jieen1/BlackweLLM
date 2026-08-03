@@ -105,6 +105,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+from sparkinfer.attention.gated_delta_rule import fused_recurrent_gated_delta_rule_multistep
 from sparkinfer.attention.paged._forward import paged_attention_forward
 from sparkinfer.attention.paged._scratch import build_paged_attention_binding
 from sparkinfer.attention.paged.planner import (
@@ -504,7 +505,9 @@ class Qwen36VerifyBatch:
     v_pools: list[torch.Tensor | None]
     attn_drivers: list[Any | None]
     attn_outputs: list[torch.Tensor | None]
-    gdn_sources: dict[int, GdnLayerState]
+    gdn_source_index: torch.Tensor
+    gdn_conv_pools: list[torch.Tensor | None]
+    gdn_recurrent_pools: list[torch.Tensor | None]
     gdn_state_rows: dict[int, list[GdnLayerState]]
 
 
@@ -1000,50 +1003,36 @@ class Qwen36GatedDeltaNet(nn.Module):
             query = query.repeat_interleave(self.repeat, dim=2)
             key = key.repeat_interleave(self.repeat, dim=2)
 
-        # ---- the one genuinely sequential part: `seq_len` single-token
-        # fused_recurrent_gated_delta_rule calls, each step's
-        # initial_state coming from the previous step's output. Every
-        # conv_state snapshot needed no compute above (pure slicing of
-        # `catted`, see below); only recurrent_state needs one here. -----
-        recurrent_state = state.recurrent_state
-        recurrent_snapshots: list[torch.Tensor] | None = (
-            [recurrent_state.clone()] if spec_state_rows is None else None
-        )
+        # The multistep kernel advances the whole speculative sequence in one
+        # launch and returns every recurrent state, including the initial one.
+        # This removes the per-token recurrent-state copies from the graph path
+        # while preserving the exact K+1 row contract used for rollback-free
+        # verification.
         if spec_state_rows is not None and len(spec_state_rows) != seq_len + 1:
             raise ValueError(
                 f"spec_state_rows has {len(spec_state_rows)} rows for seq_len={seq_len}; "
                 "expected K+1 rows"
             )
-        core_outs: list[torch.Tensor] = []
-        for t in range(seq_len):
-            core_attn_out, last_state = fused_recurrent_gated_delta_rule(
-                query[:, t : t + 1],
-                key[:, t : t + 1],
-                value[:, t : t + 1],
-                g=g[:, t : t + 1],
-                beta=beta[:, t : t + 1],
-                initial_state=recurrent_state,
-                output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-            )
-            # The snapshot path allocates a clone-of-a-clone chain. The
-            # row-addressed path writes each intermediate directly into its
-            # permanent K+1 destination row; the next recurrence reads that
-            # row back, so rejected candidates need no copy/restore later.
-            if spec_state_rows is None:
-                assert recurrent_snapshots is not None
-                recurrent_state = torch.empty_like(state.recurrent_state)
-                recurrent_state.copy_(last_state)
-                recurrent_snapshots.append(recurrent_state)
-            else:
-                recurrent_state = spec_state_rows[t + 1].recurrent_state
-                recurrent_state.copy_(last_state)
-            core_outs.append(core_attn_out)
+        core_attn_out, recurrent_states = fused_recurrent_gated_delta_rule_multistep(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=state.recurrent_state,
+            output_all_states=True,
+        )
+        if spec_state_rows is None:
+            recurrent_snapshots = [recurrent_states[:, j].clone() for j in range(seq_len + 1)]
+        else:
+            # Column zero is the live pre-verify state. Keep it untouched;
+            # only candidate results belong in the permanent destination rows.
+            for j in range(1, seq_len + 1):
+                spec_state_rows[j].recurrent_state.copy_(recurrent_states[:, j])
 
         # ---- batched norm, once over all `seq_len` positions' recurrent
         # outputs (was: once per position, inside the loop). RMSNormGated
         # measured bit-exact when batched -- see docstring above. ---------
-        core_attn_out = torch.cat(core_outs, dim=1)  # [1, seq_len, num_v_heads, head_v_dim]
         core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
         z_flat = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z_flat)
@@ -1060,7 +1049,7 @@ class Qwen36GatedDeltaNet(nn.Module):
         # slicing of `catted` (position j's window is
         # ``catted[:, :, j : j + state_len]`` -- j=0 is the untouched
         # anchor, j=seq_len is the state after all candidates), recurrent
-        # state from the sequential loop above. -------------------------
+        # state from the multistep kernel above. -------------------------
         if spec_state_rows is None:
             assert recurrent_snapshots is not None
             snapshots: list[GdnLayerState] = [
@@ -3042,7 +3031,14 @@ class Qwen36TextModelSelfBuilt(nn.Module):
             residual = hidden_states
             hidden_states = layer.input_layernorm(hidden_states)
             if layer.layer_type == "linear_attention":
-                source = batch.gdn_sources[layer.layer_idx]
+                conv_pool = batch.gdn_conv_pools[layer.layer_idx]
+                recurrent_pool = batch.gdn_recurrent_pools[layer.layer_idx]
+                assert conv_pool is not None and recurrent_pool is not None
+                source = GdnLayerState(
+                    conv_state=conv_pool.index_select(0, batch.gdn_source_index),
+                    recurrent_state=recurrent_pool.index_select(0, batch.gdn_source_index),
+                    has_previous_state=True,
+                )
                 rows = batch.gdn_state_rows[layer.layer_idx]
                 hidden_states, snapshots = layer.linear_attn.spec_forward(
                     hidden_states, source, spec_state_rows=rows
