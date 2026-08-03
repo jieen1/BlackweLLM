@@ -556,10 +556,103 @@ class Qwen36Backend:
         through plain sampled decode (``classify_decode_slots``).
         """
         params_per_slot = params_per_slot or {}
-        result: dict[int, dict] = {}
+        requested = chunk_size if chunk_size and chunk_size > 0 else self._prefill_chunk_tokens()
+        chunk = min(requested, self._prefill_chunk_tokens())
+
+        suffixes: list[list[int]] = []
         for slot, prompt in zip(slots, prompts_per_slot):
             hit = self._apply_prefix_hit(slot, prompt)
-            logits, hidden = self._prefill_forward(slot, prompt, prefix_hit=hit, return_hidden=True)
+            # Both guards moved here from `_prefill_forward`, which the chunked
+            # path no longer goes through. Dropping them is not cosmetic: a
+            # slot at the wrong kv_len makes the GDN layers continue from
+            # ANOTHER sequence's recurrent state, which raises nothing and
+            # produces no NaN -- just a wrong continuation (INV-A3-1). That is
+            # the exact silent-wrongness this repo keeps being bitten by, and
+            # tests/test_qwen36_backend.py's dirty-slot case caught their loss
+            # the moment this method stopped calling `_prefill_forward`.
+            if self.pool.slot_kv_len[slot] != hit:
+                raise RuntimeError(
+                    f"slot {slot} is at kv_len={self.pool.slot_kv_len[slot]}, but this prefill "
+                    f"continues from {hit}; the caller must reset_slot first"
+                )
+            suffix = list(prompt[hit:])
+            if not suffix:
+                raise ValueError(
+                    f"prefill for slot {slot} has nothing to compute "
+                    f"(prefix_hit={hit} == len(prompt)); the caller must leave "
+                    "at least one token so there are logits to sample from"
+                )
+            suffixes.append(suffix)
+
+        state = ChunkedPrefillState(
+            done=False,
+            result={},
+            slots=list(slots),
+            prompts_per_slot=list(prompts_per_slot),
+            suffix_per_slot=suffixes,
+            chunk_size=chunk,
+            chunk_start=0,
+            total_len=max((len(s) for s in suffixes), default=0),
+            anchors=dict(params_per_slot),
+        )
+        # Advance once here, so a prompt that fits in one chunk still finishes
+        # within this round. ``ServerEngine`` activates slots immediately on
+        # done=True, which is what every short request did before and must
+        # keep doing -- interleaving is for long prompts, not a new round-trip
+        # for short ones.
+        self.prefill_chunked_step(state)
+        return state
+
+    def prefill_chunked_step(self, state: ChunkedPrefillState) -> bool:
+        """Advance every pending slot by one chunk. Returns ``done``.
+
+        A5/B4 -- cross-step interleaved chunked prefill. This used to be a
+        no-op returning ``True``, with :meth:`prefill_chunked_begin`
+        documenting itself as "one-shot" and discarding the caller's
+        ``chunk_size``. That made ``ServerEngine``'s entire incremental branch
+        (``self._pending_prefill``, ``server/engine.py`` ~1310) unreachable
+        dead code: nothing ever returned ``done=False``, so no prefill was
+        ever advanced across rounds, and a long admission monopolised the
+        engine until it finished.
+
+        The cost is the largest single item on record. With prefill blocking
+        the round, a 128K admission starves every active slot's decode for its
+        whole duration -- historically TTFT 25.7s against native's 4.4s, which
+        ``notes/2026-07-20-comprehensive-optimization-plan.md`` attributes
+        **60-70% of the end-to-end gap** to. The same document records that
+        chunking *within* one admission (Phase A) bought only -10.7%: the win
+        is in yielding between chunks, not in the chunk size. The historical
+        implementation of this state machine is in this repo, at
+        ``oracle/qwen36_vllm/direct_model_runner.py:1731-1938``.
+
+        Only the LAST chunk's logits matter -- earlier chunks exist to advance
+        the slot's KV and recurrent state -- so anchor sampling,
+        :meth:`_commit_prefill` and the MTP first draft all happen on the
+        final call for that slot, exactly as they did when this ran in one
+        shot. Slots whose prompts differ in length finish on different calls;
+        each is committed when it finishes and skipped thereafter.
+        """
+        params_per_slot = state.anchors or {}
+        start = state.chunk_start
+        chunk = state.chunk_size
+        finished = True
+
+        for slot, prompt, suffix in zip(
+            state.slots, state.prompts_per_slot, state.suffix_per_slot
+        ):
+            if start >= len(suffix):
+                continue  # shorter prompt: already committed on an earlier call
+            end = min(start + chunk, len(suffix))
+            is_last = end >= len(suffix)
+            if not is_last:
+                finished = False
+
+            input_ids = torch.tensor([suffix[start:end]], dtype=torch.long, device=self.device)
+            hidden = self.model(input_ids, self.pool.slot_state(slot))
+            if not is_last:
+                continue
+
+            logits = self.model.compute_logits(hidden[0])
             params = params_per_slot.get(slot)
             if params is None or params.is_greedy:
                 token = int(logits[-1].argmax(dim=-1).item())
@@ -571,22 +664,15 @@ class Qwen36Backend:
             self._commit_prefill(slot, prompt, token)
             draft_tokens: list[int] = []
             if self._mtp is not None:
-                pred_hidden = hidden[-1:].unsqueeze(0)  # [1, 1, H]
+                pred_hidden = hidden[0][-1:].unsqueeze(0)  # [1, 1, H]
                 draft_tokens = self._mtp.draft_after_prefill(
                     slot, first_token=token, pred_hidden=pred_hidden
                 )
-            result[slot] = {"anchor": token, "draft_tokens": draft_tokens}
-        return ChunkedPrefillState(
-            done=True,
-            result=result,
-            slots=list(slots),
-            prompts_per_slot=list(prompts_per_slot),
-            chunk_size=chunk_size,
-        )
+            state.result[slot] = {"anchor": token, "draft_tokens": draft_tokens}
 
-    def prefill_chunked_step(self, state: ChunkedPrefillState) -> bool:
-        """No-op: :meth:`prefill_chunked_begin` always finishes in one go."""
-        return True
+        state.chunk_start = start + chunk
+        state.done = finished
+        return finished
 
     # -- protocol: decode ---------------------------------------------------
 

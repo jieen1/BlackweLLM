@@ -604,7 +604,11 @@ class ServerEngine:
             max_seq_len=max_model_len,
             enable_mtp=self.enable_mtp,
         )
-        self._prefill_chunk_size = 512  # unused: Qwen36Backend prefill is one-shot
+        # A5/B4: this is live again. Qwen36Backend.prefill_chunked_step now
+        # advances one chunk per round and returns done=False until the
+        # prompt is consumed, so the incremental branch below is reachable
+        # and a long admission no longer blocks active slots' decode.
+        self._prefill_chunk_size = 512
         self.runner = Qwen36Backend(
             model,
             num_slots=self.num_slots,
