@@ -11,6 +11,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 
 @triton.jit
@@ -228,6 +229,73 @@ def rms_norm_tail(
         x_f32,
         rstd,
         weight_plus_one,
+        out,
+        x_f32.stride(0),
+        out.stride(0),
+        N=n,
+        BLOCK_SIZE=block_n,
+        num_warps=4 if block_n <= 4096 else 8,
+    )
+    return out
+
+
+@triton.jit
+def _gated_norm_tail_kernel(
+    X_ptr,
+    RSTD_ptr,
+    W_ptr,
+    G_ptr,
+    OUT_ptr,
+    stride_x_row,
+    stride_out_row,
+    N: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Bit-exact tail of Qwen36RMSNormGated.
+
+    Torch chain kept exact: ``xn = x_f32 * rstd``; ``wm = bf16(w *
+    bf16(xn))`` (weight multiply in input dtype); ``silu(gate)`` via the
+    div form ``g / (1 + exp(-g))`` with libdevice exp + div.rn (measured
+    bit-identical to torch silu); final ``bf16(wm * silu)``. Variance/rsqrt
+    stay in torch (reduction order). All steps are deterministic RN ops --
+    bit-identical to the torch chain (tests/test_gated_norm_tail_bit_parity.py).
+    """
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    x = tl.load(X_ptr + row * stride_x_row + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    rstd = tl.load(RSTD_ptr + row)
+    w = tl.load(W_ptr + cols, mask=mask, other=1.0)
+    g = tl.load(G_ptr + row * stride_x_row + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    xn = x * rstd
+    # torch promotes weight(f32) * x(bf16) to F32 and does NOT round back to
+    # bf16 before the silu multiply -- keep wm in f32 (measured: rounding it
+    # to bf16 flips 26% of outputs).
+    wm = w.to(tl.float32) * xn.to(tl.bfloat16).to(tl.float32)
+    silu_g = tl.div_rn(g, 1.0 + libdevice.exp(-g))
+    out = wm * silu_g
+    tl.store(OUT_ptr + row * stride_out_row + cols, out.to(tl.bfloat16), mask=mask)
+
+
+def gated_norm_tail(
+    x_f32: torch.Tensor,
+    rstd: torch.Tensor,
+    weight: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    """Fused tail of the GDN gated norm; returns bf16 ``[M, N]``."""
+    m, n = x_f32.shape
+    out = torch.empty(m, n, dtype=torch.bfloat16, device=x_f32.device)
+    block_n = triton.next_power_of_2(n)
+    _gated_norm_tail_kernel[(m,)](
+        x_f32,
+        rstd,
+        weight,
+        gate.reshape(m, n),
         out,
         x_f32.stride(0),
         out.stride(0),

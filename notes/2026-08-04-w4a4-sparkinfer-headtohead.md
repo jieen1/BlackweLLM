@@ -319,3 +319,17 @@ M=16384 microbench: gate 3.963 -> 4.480 ms (+13% WORSE), down 4.727 ->
 swizzle pattern hurts. Lever closed; FP4 large-M GEMM sits at its practical
 ceiling (~730-790 TFLOPS). All config-level levers for the prefill gap are
 now exhaustively measured and closed; the remainder is kernel-code work.
+
+## GDN gated-norm tail fusion: anchor moved in production, wiring REVERTED (2026-08-04)
+
+gated_norm_tail kernel (runtime/kernels/fused_rms_norm.py): bit-identical
+to the torch chain on synthetic parity tests (4/4; needed two fixes: silu
+must use the div form g/(1+exp(-g)) with libdevice exp + div.rn, and the
+weight multiply stays f32 -- torch promotes weight(f32)*x(bf16) to f32
+without rounding back; rounding to bf16 flips 26% of outputs). BUT the
+production e2e moved the anchor (acceptance 68.2% vs 72.3%, committed
+4115 vs 4120) -- some production-path detail (shape/dtype combination not
+covered by the synthetic test) breaks parity. Wiring REVERTED per the
+anchors-first constraint; kernel + tests kept, production divergence
+unroot-caused. Gain would have been <=0.5 s; not worth further turns
+before higher-value work.
