@@ -77,6 +77,8 @@ class _StubModel:
             )
         self.model = SimpleNamespace(layers=layers)
         self.forward_lengths: list[int] = []
+        self.prefill_batches: list[list[list[int]]] = []
+        self.logit_sequence_lengths: list[int] = []
 
     def __call__(self, input_ids, state):
         seq_len = int(input_ids.shape[1])
@@ -98,14 +100,47 @@ class _StubModel:
             out[i, (int(tok) + 1) % _VOCAB] = 1.0
         return out
 
+    def prefill_batch(self, batch):
+        self.prefill_batches.append(batch.input_ids.tolist())
+        return batch.input_ids.to(torch.float32).unsqueeze(-1)
+
     def compute_logits(self, hidden):
         # hidden is [seq, 1]; produce a one-hot-ish row per position whose
         # argmax is (last_token + 1) % vocab -- deterministic and distinct.
         seq = hidden.shape[0]
+        self.logit_sequence_lengths.append(seq)
         out = torch.zeros(seq, _VOCAB)
         for i in range(seq):
             out[i, (int(hidden[i, 0]) + 1) % _VOCAB] = 1.0
         return out
+
+
+class _PrefixMTPState:
+    """Minimal MTP-prefix facade for exercising the backend ownership hook.
+
+    MTP's cache implementation is covered by ``test_qwen36_mtp_engine``;
+    this deliberately small fake pins the separate backend responsibility:
+    it may restore target/GDN prefix state only when MTP can restore the
+    identically-sized causal prefix too.
+    """
+
+    def __init__(self, *, restorable: bool) -> None:
+        self.restorable = restorable
+        self.restore_calls: list[tuple[int, int]] = []
+        self.copy_calls: list[tuple[int, int, int]] = []
+
+    def can_restore_prefix(self, slot: int, kv_len: int) -> bool:
+        del slot, kv_len
+        return self.restorable
+
+    def restore_prefix(self, slot: int, kv_len: int) -> None:
+        self.restore_calls.append((slot, kv_len))
+
+    def copy_prefix(self, source_slot: int, target_slot: int, kv_len: int) -> None:
+        self.copy_calls.append((source_slot, target_slot, kv_len))
+
+    def drop_prefix(self, slot: int) -> None:
+        del slot
 
 
 def _backend(num_slots: int = 3, block_size: int = 64, **kw) -> Qwen36Backend:
@@ -237,6 +272,36 @@ class TestSlotLifecycle:
         with pytest.raises(RuntimeError, match="must reset_slot first"):
             backend.prefill_chunked_begin([0], [[4, 5, 6]])
 
+    def test_equal_length_multi_slot_prefill_uses_the_batched_model_entry(
+        self, monkeypatch
+    ) -> None:
+        backend = _backend(num_slots=2)
+        built: list[tuple[list[int], list[list[int]]]] = []
+
+        def build(slots: list[int], tokens: list[list[int]]):
+            built.append((list(slots), [list(row) for row in tokens]))
+            return SimpleNamespace(
+                input_ids=torch.tensor(tokens, dtype=torch.long),
+            )
+
+        monkeypatch.setattr(backend.pool, "build_prefill_batch", build)
+        state = backend.prefill_chunked_begin([0, 1], [[1, 2, 3], [9, 8, 7]])
+
+        assert built == [([0, 1], [[1, 2, 3], [9, 8, 7]])]
+        assert backend.model.prefill_batches == [[[1, 2, 3], [9, 8, 7]]]
+        assert backend.model.forward_lengths == []
+        assert state.done is True
+        assert backend.pool.slot_kv_len[:2] == [3, 3]
+        assert backend.stats["prefill_batched_forwards"] == 1
+        # Two anchors are projected together; the rest of the prompt remains
+        # available as hidden state for MTP sync but never reaches lm_head.
+        assert backend.model.logit_sequence_lengths == [2]
+
+    def test_serial_prefill_projects_only_the_final_hidden_position(self) -> None:
+        backend = _backend()
+        _run(backend, 0, [1, 2, 3, 4], steps=0)
+        assert backend.model.logit_sequence_lengths == [1]
+
 
 class TestPrefixCacheTwoFamilies:
     def test_cold_backend_reports_no_hit(self) -> None:
@@ -289,6 +354,177 @@ class TestPrefixCacheTwoFamilies:
         # Only the two novel tokens are forwarded, not all 66.
         assert backend.model.forward_lengths == [2]
         assert backend.slot_state(0).kv_len == 66
+
+    def test_mtp_prefix_state_restores_in_lockstep_with_target_and_gdn(self) -> None:
+        backend = _backend(block_size=64)
+        prompt = list(range(64))
+        _run(backend, 0, prompt, steps=0)
+        backend.reset_slot(0)
+        mtp = _PrefixMTPState(restorable=True)
+        backend._mtp = mtp  # noqa: SLF001 - pin the backend/MTP boundary directly
+
+        follow_up = prompt + [777]
+        backend.reconcile_prefix_hit(follow_up)
+        assert backend._apply_prefix_hit(0, follow_up) == 64  # noqa: SLF001
+        assert mtp.restore_calls == [(0, 64)]
+
+    def test_mtp_prefix_miss_forces_a_safe_target_recompute(self) -> None:
+        backend = _backend(block_size=64)
+        prompt = list(range(64))
+        _run(backend, 0, prompt, steps=0)
+        backend.reset_slot(0)
+        mtp = _PrefixMTPState(restorable=False)
+        backend._mtp = mtp  # noqa: SLF001 - pin the backend/MTP boundary directly
+
+        follow_up = prompt + [777]
+        backend.reconcile_prefix_hit(follow_up)
+        assert backend._apply_prefix_hit(0, follow_up) == 0  # noqa: SLF001
+        assert mtp.restore_calls == []
+
+    def test_cross_slot_hit_copies_kv_and_checkpoint_before_only_forwarding_suffix(self) -> None:
+        backend = _backend(num_slots=2, block_size=64)
+        prefix = list(range(64))
+        _run(backend, 0, prefix, steps=0)
+        backend.reset_slot(0)
+
+        source_page = backend.pool._global_page_table[0, 0]  # noqa: SLF001
+        target_page = backend.pool._global_page_table[1, 0]  # noqa: SLF001
+        backend.pool.k_pools[0][source_page].fill_(3.0)
+        backend.pool.v_pools[0][source_page].fill_(4.0)
+        source_checkpoint = [tensor.clone() for tensor in backend._checkpoint_tensors[0]]  # noqa: SLF001
+
+        follow_up = prefix + [777]
+        backend.model.forward_lengths.clear()
+        # No source-slot side channel: the target discovers the retained
+        # source during prefill and must clone every causal cache family.
+        backend.prefill_chunked_begin([1], [follow_up])
+
+        assert backend.model.forward_lengths == [1]
+        assert backend.slot_state(1).kv_len == 65
+        # The 64-token checkpoint shares an attention page, so the one-token
+        # suffix must have detached target page 0 before its write.
+        assert int(backend.pool._global_page_table[1, 0]) == int(target_page)  # noqa: SLF001
+        assert torch.all(backend.pool.k_pools[0][target_page] == 3.0)
+        assert torch.all(backend.pool.v_pools[0][target_page] == 4.0)
+        assert torch.all(backend.pool.k_pools[0][source_page] == 3.0)
+        assert backend.stats["prefix_cross_slot_restores"] == 1
+        restored = backend.pool.capture_recurrent_state(1)
+        assert all(
+            torch.equal(actual, expected) for actual, expected in zip(restored, source_checkpoint)
+        )
+
+    def test_cross_slot_hit_copies_mtp_context_in_lockstep(self) -> None:
+        backend = _backend(num_slots=2, block_size=64)
+        prefix = list(range(64))
+        _run(backend, 0, prefix, steps=0)
+        backend.reset_slot(0)
+        mtp = _PrefixMTPState(restorable=True)
+        backend._mtp = mtp  # noqa: SLF001 - exercise cross-cache ownership directly
+
+        assert backend._apply_prefix_hit(1, prefix + [777]) == 64  # noqa: SLF001
+        assert mtp.restore_calls == []
+        assert mtp.copy_calls == [(0, 1, 64)]
+
+    def test_scratch_prefix_survives_source_slot_reuse(self) -> None:
+        """The persistent arena is not an idle-slot affinity cache.
+
+        After slot 0 has been admitted for an unrelated prompt, its old page
+        row is no longer a legal prefix source.  The retained scratch snapshot
+        must nevertheless restore the old prefix into slot 1 and forward only
+        its novel suffix.
+        """
+        backend = _backend(
+            num_slots=2,
+            block_size=64,
+            enable_persistent_prefix_cache=True,
+        )
+        prefix = list(range(64))
+        _run(backend, 0, prefix, steps=0)
+        backend.reset_slot(0)
+        assert backend.stats["prefix_persistent_stores"] == 1
+
+        # First restore into its original slot.  This used to remove the
+        # persistent hash index when it discarded the superseded slot-local
+        # checkpoint, making every later cross-slot lookup a false miss.
+        backend.prefill_chunked_begin([0], [prefix + [123]])
+        backend.reset_slot(0)
+        backend.prefill_chunked_begin([0], [[999]])
+        assert backend.pool.slot_kv_len[0] == 1
+        backend.model.forward_lengths.clear()
+        backend.prefill_chunked_begin([1], [prefix + [777]])
+
+        assert backend.model.forward_lengths == [1]
+        assert backend.pool.slot_kv_len[1] == 65
+        assert backend.stats["prefix_persistent_restores"] == 2
+
+    def test_same_prompt_repeat_restores_the_prompt_boundary_without_forward(self) -> None:
+        """A full-prompt hit must skip every forward, anchor included.
+
+        The rolling checkpoint drifts past the prompt end as soon as decode
+        starts, so the exact-length entry is published at prefill commit with
+        its anchor-row hidden.  A same-prompt repeat then restores KV/GDN
+        state and reproduces the anchor logits from that row alone.
+        """
+        backend = _backend(
+            num_slots=2,
+            block_size=64,
+            enable_persistent_prefix_cache=True,
+        )
+        prompt = list(range(64))
+        first = _run(backend, 0, prompt, steps=2)
+        backend.reset_slot(0)
+
+        backend.model.forward_lengths.clear()
+        state = backend.prefill_chunked_begin([1], [prompt])
+
+        assert backend.model.forward_lengths == []
+        assert backend.stats["prefix_persistent_restores"] == 1
+        assert state.result[1]["anchor"] == first[0]
+        assert backend.pool.slot_kv_len[1] == len(prompt)
+
+    def test_scratch_arena_retains_multiple_lru_entries_within_checkpoint_budget(self) -> None:
+        backend = _backend(
+            num_slots=3,
+            block_size=64,
+            enable_persistent_prefix_cache=True,
+        )
+        first = list(range(64))
+        second = list(range(100, 164))
+        _run(backend, 0, first, steps=0)
+        backend.reset_slot(0)
+        _run(backend, 1, second, steps=0)
+        backend.reset_slot(1)
+
+        # The default two-checkpoint budget holds both independent contents;
+        # keeping them in different scratch pages is what makes this a cache,
+        # rather than one global "last prompt" slot.
+        assert len(backend._persistent_prefixes) == 2  # noqa: SLF001
+        assert len(backend._persistent_free_scratch_pages) == 2  # noqa: SLF001
+
+        backend.prefill_chunked_begin([0], [[999]])
+        backend.prefill_chunked_begin([1], [[998]])
+        backend.prefill_chunked_begin([2], [first + [777]])
+        assert backend.pool.slot_kv_len[2] == 65
+        backend.reset_slot(2)
+        backend.prefill_chunked_begin([2], [second + [776]])
+        assert backend.pool.slot_kv_len[2] == 65
+        assert backend.stats["prefix_persistent_restores"] == 2
+
+    def test_graph_recapture_invalidation_drops_every_persistent_identity(self) -> None:
+        backend = _backend(
+            num_slots=2,
+            block_size=64,
+            enable_persistent_prefix_cache=True,
+        )
+        _run(backend, 0, list(range(64)), steps=0)
+        backend.reset_slot(0)
+        assert backend._persistent_prefixes  # noqa: SLF001
+
+        backend._clear_persistent_prefixes()  # noqa: SLF001 - capture lifecycle hook
+
+        assert not backend._persistent_prefixes  # noqa: SLF001
+        assert len(backend._persistent_free_scratch_pages) == backend.pool.pages_per_slot  # noqa: SLF001
+        assert len(backend.checkpoint_pool) == 0
 
     def test_a_checkpoint_from_a_different_prefix_of_the_same_length_is_rejected(self) -> None:
         # Length agreement is not identity. A checkpoint produced by other

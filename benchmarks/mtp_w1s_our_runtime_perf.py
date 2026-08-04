@@ -1,478 +1,334 @@
-"""This runtime's side of the REAL end-to-end performance comparison
-(accepted tokens/s, ms/accepted token, ms/draft, TTFT, ITL, and --
-the metric this whole project's premise rests on -- GPU-busy%/launch-gap)
-against native vLLM, at the W1-S shape (frozen, versioned prompt token
-ids, same fixture `w1s_native_bench.py` uses).
+"""No-vLLM W1-S performance gate for the production Qwen3.6 MTP backend.
 
-Unlike `mtp_w1s_our_runtime.py` (which only needed aggregate accept/reject
-counts), every real GPU-issuing call (`mtp_prefill`'s target forward,
-`mtp_verify_and_commit`'s verify/recompute) is bracketed with
-`torch.cuda.Event` (the SAME technique `mtp_trace_driven_probe.py`'s
-synthetic-trace probe used, now applied to the REAL, already-verified
-MTP state machine on REAL data instead of a synthetic trace) so GPU-busy
-time can be compared directly against wall-clock time.
+This is the direct successor to the historical runner benchmark.  It keeps
+the frozen W1-S prompt ids and its accounting boundary: every request's
+prefill plus every MTP verify/commit round is included in wall time; a round
+commits ``num_accepted + 1`` tokens.  Unlike the retired version, it imports
+neither ``vllm`` nor ``oracle`` and drives the exact
+``Qwen36Backend.prefill_chunked_begin`` / ``mtp_verify_and_commit_batch``
+production APIs.
 
-By default this runtime processes slots ONE AT A TIME in round-robin
-(never batches multiple slots into one kernel launch) -- so "GPU busy%
-here" measures how much of THIS runtime's own wall-clock time is real GPU
-work vs. Python-dispatch/launch overhead for that architecture, not a
-best-case synthetic scenario. Eager mode only (no CUDA graph capture) --
-explicitly the point of comparison the coordinator asked for: does
-removing Python/vLLM scheduling overhead show an advantage even without
-the graph-capture optimization this project has not yet integrated into
-the real MTP accept/reject flow.
+The historical headline was W1-S (4096 input / 256 output / c=4 / K=3 / n=16),
+measured with the prefix cache enabled (``--enable-prefix-caching``): repeat
+repeats served from cached KV/GDN state.  This runner keeps that warm
+accounting boundary -- the persistent prefix arena is sized so every frozen
+prompt's entry stays resident across repeats -- and its first repeat remains
+the cold-prefill anchor.
+Run a B=1 preflight before the explicit c=4 measurement on the shared card:
 
-``--batched`` (2026-07-17, cross-slot batching round): switches to the
-NEW ``mtp_prefill_batch``/``mtp_verify_and_commit_batch`` coordinator
-(``_run_batch_batched`` below) -- ONE shared kernel launch per round
-covering every concurrent slot (draft model included, not just target),
-instead of ``concurrency`` separate sequential single-slot calls. This is
-the direct re-measurement of whether real batching (as opposed to merely
-removing vLLM's own scheduling layer) closes the ~12.46x gap the
-single-slot round-robin path showed against native. Correctness of the
-batched coordinator itself is verified separately in
-``benchmarks/mtp_batch_verify_check.py`` -- this script only measures
-performance, it does not re-verify correctness.
+    python -m benchmarks.mtp_w1s_our_runtime_perf --num-requests 1 --concurrency 1 --max-tokens 16
+    python -m benchmarks.mtp_w1s_our_runtime_perf --num-requests 16 --concurrency 4 --max-tokens 256 --repeats 3
 
-Usage:
-    python -m benchmarks.mtp_w1s_our_runtime_perf --max-tokens 256 --concurrency 4 --fixture n128 --num-requests 16
-    python -m benchmarks.mtp_w1s_our_runtime_perf --max-tokens 256 --concurrency 4 --fixture n128 --num-requests 16 --batched
+The current backend's prefill entry point is intentionally measured as it is
+served today.  It does not claim a historical batched-prefill implementation
+that no longer exists; the JSON records that fact so ``bf diff`` cannot hide
+it behind a superficially matching fixture name.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
-import os
 import subprocess
-import sys
 import time
+from pathlib import Path
 
-os.environ.setdefault("USE_LIBUV", "0")
-os.environ.setdefault("SM120_GQA_USE_V2_DECODE_KERNEL", "1")
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
+import torch
 
-SM120_VLLM_INTEGRATION = "/home/bot/project/sm120-flash-attention/vllm_integration"
-MODEL = "unsloth/Qwen3.6-27B-NVFP4"
+from benchmarks.workloads import W1_S_FIXTURE, W1_S_FIXTURE_N128, load_prompt_token_ids
+from runtime.backends.qwen36 import Qwen36Backend
+from runtime.checkpoints import standard_checkpoint_path
+from runtime.model_loading import load_qwen36_model
+
 K = 3
-
-# 2026-07-19, 256K-feasibility task: confirmed from the real checkpoint's
-# config.json (text_config.max_position_embeddings) -- this model's own
-# native RoPE ("default" rope_type, no YaRN/NTK scaling configured) supports
-# AT MOST this many total positions. Capping max_model_len here (rather than
-# letting the max(40960, prompt_len+max_tokens+1024) formula below exceed it
-# for the ctx256k fixture) avoids passing vLLM an out-of-architectural-range
-# max_model_len -- not merely a config nicety, since going beyond this figure
-# would be genuinely out-of-distribution for the model's trained/supported
-# context, not just an engineering inconvenience. Never binds for any
-# existing (<=64K) fixture.
-_MODEL_MAX_POSITION_EMBEDDINGS = 262144
+_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _gpu_thermal() -> dict:
-    out = subprocess.run(
-        ["nvidia-smi", "--query-gpu=temperature.gpu,clocks.current.sm,memory.used", "--format=csv,noheader,nounits"],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip().splitlines()[0]
-    temp, clock, mem = [x.strip() for x in out.split(",")]
-    return {"temperature_c": int(temp), "clock_sm_mhz": int(clock), "memory_used_mib": int(mem)}
+def _gpu_thermal() -> dict[str, int]:
+    fields = "temperature.gpu,clocks.current.sm,memory.used"
+    output = subprocess.run(
+        ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    temp, clock, memory = (int(value.strip()) for value in output.splitlines()[0].split(","))
+    return {"temperature_c": temp, "clock_sm_mhz": clock, "memory_used_mib": memory}
 
 
-def _sanity_check_reps(reps: list[dict]) -> bool:
-    """Cheap liveness/sanity signal only -- NOT a correctness check. This
-    script never re-verifies generated-token correctness (see module
-    docstring; that's `mtp_batch_verify_check.py` / `mtp_chunked_prefill_
-    check.py`'s job). All this confirms is that every rep actually produced
-    real output -- committed tokens and a valid (non-NaN) acceptance rate --
-    rather than silently completing with an empty/degenerate run (e.g. a
-    runner that returns immediately without ever calling the target/draft
-    model). Previously this was a hardcoded ``"passed": True`` literal with
-    no check behind it at all (see notes/2026-07-18-session-review-and-
-    next-steps.md section 20.3) -- this replaces that with the cheapest
-    real thing this script's own already-computed numbers can verify."""
-    if not reps:
-        return False
-    for rep in reps:
-        if rep["total_committed_tokens"] <= 0:
-            return False
-        if math.isnan(rep["draft_acceptance_rate_pct"]):
-            return False
-    return True
+def _reset_slots(backend: Qwen36Backend, slots: list[int]) -> None:
+    for slot in slots:
+        if not backend.slot_state(slot).is_fresh:
+            backend.reset_slot(slot)
 
 
-def _run_batch(torch, runner, prompts_batch: list[list[int]], target_output_len: int) -> dict:
-    num = len(prompts_batch)
-    slots = list(range(num))
-    for s in slots:
-        if runner.slot_kv_len[s] != 0:
-            runner.reset_slot(s)
+def _run_batch(
+    backend: Qwen36Backend,
+    prompts: list[list[int]],
+    *,
+    max_tokens: int,
+) -> dict[str, float | int | list[float]]:
+    """One production batch, timed at the historical request boundary."""
+    slots = list(range(len(prompts)))
+    _reset_slots(backend, slots)
+    gpu_s = wall_s = 0.0
+    prefill_gpu_s = prefill_wall_s = 0.0
+    verify_gpu_s = verify_wall_s = 0.0
+    ttft_s: list[float] = []
+    itl_s: list[float] = []
 
-    anchor = {}
-    draft_tokens = {}
-    committed_len = {s: 0 for s in slots}
-    per_slot = {
-        s: {"num_drafts": 0, "num_draft_tokens": 0, "num_accepted_tokens": 0, "gpu_busy_s": 0.0, "wall_s": 0.0}
-        for s in slots
-    }
-    ttft_s = {}
-    itl_samples: list[float] = []
-
-    for i, s in enumerate(slots):
-        start_evt = torch.cuda.Event(enable_timing=True)
-        end_evt = torch.cuda.Event(enable_timing=True)
-        t0 = time.perf_counter()
-        start_evt.record()
-        pr = runner.mtp_prefill(s, prompts_batch[i])
-        end_evt.record()
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        anchor[s] = pr["anchor"]
-        draft_tokens[s] = pr["draft_tokens"]
-        ttft_s[s] = t1 - t0
-        per_slot[s]["wall_s"] += t1 - t0
-        per_slot[s]["gpu_busy_s"] += start_evt.elapsed_time(end_evt) / 1000.0
-
-    finished = set()
-    while len(finished) < num:
-        for s in slots:
-            if s in finished:
-                continue
-            start_evt = torch.cuda.Event(enable_timing=True)
-            end_evt = torch.cuda.Event(enable_timing=True)
-            t0 = time.perf_counter()
-            start_evt.record()
-            decision = runner.mtp_verify_and_commit(s, anchor[s], draft_tokens[s])
-            end_evt.record()
-            torch.cuda.synchronize()
-            t1 = time.perf_counter()
-
-            n_acc = decision["num_accepted"]
-            tokens_this_round = n_acc + 1
-            per_slot[s]["num_drafts"] += 1
-            per_slot[s]["num_draft_tokens"] += K
-            per_slot[s]["num_accepted_tokens"] += n_acc
-            per_slot[s]["wall_s"] += t1 - t0
-            per_slot[s]["gpu_busy_s"] += start_evt.elapsed_time(end_evt) / 1000.0
-            committed_len[s] += tokens_this_round
-            itl_samples.append((t1 - t0) / tokens_this_round)
-
-            anchor[s], draft_tokens[s] = decision["next_anchor"], decision["next_draft_tokens"]
-            if committed_len[s] >= target_output_len:
-                finished.add(s)
-
-    return {"per_slot": per_slot, "ttft_s": ttft_s, "itl_samples": itl_samples}
-
-
-def _run_batch_batched(
-    torch, runner, prompts_batch: list[list[int]], target_output_len: int, chunk_size: int | None = None
-) -> dict:
-    """2026-07-17 cross-slot-batched analogue of ``_run_batch``: ONE
-    ``mtp_prefill_batch`` call covering every slot in this request batch,
-    then a loop of ONE ``mtp_verify_and_commit_batch`` call per round
-    (shrinking the active-slot list as individual slots reach their own
-    ``target_output_len`` -- the SAME "mixed-stage" handling
-    ``mtp_verify_and_commit_batch`` itself supports internally, just at
-    the coarser "finished vs. still-generating" granularity here). GPU-busy/
-    wall time is bracketed at the BATCH-CALL level, not per-slot (a real
-    batched call is one shared kernel launch -- there is no per-slot
-    sub-interval to attribute it to individually, unlike the round-robin
-    path's naturally-serial single-slot calls).
-
-    ``chunk_size`` (2026-07-19, chunked-prefill round, default ``None``
-    preserving every existing invocation byte-for-byte): forwarded
-    directly to ``mtp_prefill_batch``'s identical new parameter -- see
-    that method's docstring. Only affects the ONE prefill call below;
-    the decode/verify round loop is unchanged either way."""
-    num = len(prompts_batch)
-    slots = list(range(num))
-    for s in slots:
-        if runner.slot_kv_len[s] != 0:
-            runner.reset_slot(s)
-
-    committed_len = {s: 0 for s in slots}
-    per_slot = {s: {"num_drafts": 0, "num_draft_tokens": 0, "num_accepted_tokens": 0} for s in slots}
-    ttft_s = {}
-    itl_samples: list[float] = []
-    total_gpu_busy_s = 0.0
-    total_wall_s = 0.0
-
-    start_evt = torch.cuda.Event(enable_timing=True)
-    end_evt = torch.cuda.Event(enable_timing=True)
-    t0 = time.perf_counter()
-    start_evt.record()
-    # P3.3a: production prefill is the unified entrypoint. Flag off => it
-    # delegates straight to mtp_prefill_batch (byte-for-byte P2), so this swap
-    # regresses nothing when the persistent cache is disabled (the default).
-    prefill_result = runner.mtp_prefill_with_cache(slots, prompts_batch, chunk_size=chunk_size)
-    end_evt.record()
+    begin = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    started = time.perf_counter()
+    begin.record()
+    # W1-S fixes every prompt at 4096 tokens.  The production helper defaults
+    # to a latency-oriented 512-token chunk, so request the complete fixture
+    # here to retain the historical "prefill plus speculative decode" timing
+    # boundary rather than accidentally timing only its first chunk.
+    prefill = backend.prefill_chunked_begin(
+        slots,
+        prompts,
+        chunk_size=max(len(prompt) for prompt in prompts),
+    )
+    end.record()
     torch.cuda.synchronize()
-    t1 = time.perf_counter()
-    prefill_wall_s = t1 - t0
-    total_gpu_busy_s += start_evt.elapsed_time(end_evt) / 1000.0
-    total_wall_s += prefill_wall_s
-    for s in slots:
-        # Every slot in this batch gets its first token at the SAME real
-        # moment (one shared kernel launch) -- this identical-TTFT-across-
-        # the-batch result is an expected, correct property of real
-        # batching, not a measurement artifact.
-        ttft_s[s] = prefill_wall_s
+    elapsed = time.perf_counter() - started
+    assert prefill.done, "W1-S prompt must finish in the production prefill call"
+    prefill_gpu_s = begin.elapsed_time(end) / 1000.0
+    prefill_wall_s = elapsed
+    gpu_s += prefill_gpu_s
+    wall_s += prefill_wall_s
+    ttft_s.extend([elapsed] * len(slots))
 
-    anchors = {s: prefill_result[s]["anchor"] for s in slots}
-    drafts = {s: prefill_result[s]["draft_tokens"] for s in slots}
-
+    anchors = {slot: prefill.result[slot]["anchor"] for slot in slots}
+    drafts = {slot: list(prefill.result[slot]["draft_tokens"]) for slot in slots}
+    if any(len(drafts[slot]) != K for slot in slots):
+        raise RuntimeError("MTP prefill did not produce the configured K drafts")
+    committed = {slot: 0 for slot in slots}
+    accepted = draft_tokens = draft_rounds = 0
     active = list(slots)
     while active:
-        start_evt = torch.cuda.Event(enable_timing=True)
-        end_evt = torch.cuda.Event(enable_timing=True)
-        t0 = time.perf_counter()
-        start_evt.record()
-        decisions = runner.mtp_verify_and_commit_batch(
-            active, {s: anchors[s] for s in active}, {s: drafts[s] for s in active}
+        begin = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        started = time.perf_counter()
+        begin.record()
+        decisions = backend.mtp_verify_and_commit_batch(
+            active,
+            {slot: anchors[slot] for slot in active},
+            {slot: drafts[slot] for slot in active},
         )
-        end_evt.record()
+        end.record()
         torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        round_wall_s = t1 - t0
-        total_gpu_busy_s += start_evt.elapsed_time(end_evt) / 1000.0
-        total_wall_s += round_wall_s
+        elapsed = time.perf_counter() - started
+        round_gpu_s = begin.elapsed_time(end) / 1000.0
+        gpu_s += round_gpu_s
+        wall_s += elapsed
+        verify_gpu_s += round_gpu_s
+        verify_wall_s += elapsed
 
-        newly_finished = []
-        for s in active:
-            decision = decisions[s]
-            n_acc = decision["num_accepted"]
-            tokens_this_round = n_acc + 1
-            per_slot[s]["num_drafts"] += 1
-            per_slot[s]["num_draft_tokens"] += K
-            per_slot[s]["num_accepted_tokens"] += n_acc
-            committed_len[s] += tokens_this_round
-            # Per-stream ITL attribution: this round's shared wall-clock
-            # divided by THIS slot's own committed-token count -- matches
-            # how a real multi-tenant server's client-observed ITL would
-            # be measured (from the stream's perspective), regardless of
-            # the shared batched kernel launch underneath.
-            itl_samples.append(round_wall_s / tokens_this_round)
-            anchors[s], drafts[s] = decision["next_anchor"], decision["next_draft_tokens"]
-            if committed_len[s] >= target_output_len:
-                newly_finished.append(s)
-        for s in newly_finished:
-            active.remove(s)
+        finished: list[int] = []
+        for slot in active:
+            decision = decisions[slot]
+            accepted_this_round = int(decision["num_accepted"])
+            new_tokens = list(decision["committed"])
+            if len(new_tokens) != accepted_this_round + 1:
+                raise RuntimeError("MTP decision violates committed = accepted + recovery/bonus")
+            if len(decision["next_draft_tokens"]) != K:
+                raise RuntimeError("MTP round did not replenish exactly K drafts")
+            accepted += accepted_this_round
+            draft_tokens += K
+            draft_rounds += 1
+            committed[slot] += len(new_tokens)
+            itl_s.append(elapsed / len(new_tokens))
+            anchors[slot] = int(decision["next_anchor"])
+            drafts[slot] = list(decision["next_draft_tokens"])
+            if committed[slot] >= max_tokens:
+                finished.append(slot)
+        for slot in finished:
+            active.remove(slot)
 
     return {
-        "per_slot": per_slot,
+        "accepted": accepted,
+        "draft_tokens": draft_tokens,
+        "draft_rounds": draft_rounds,
+        "committed": sum(committed.values()),
+        "gpu_busy_s": gpu_s,
+        "wall_s": wall_s,
+        "prefill_gpu_s": prefill_gpu_s,
+        "prefill_wall_s": prefill_wall_s,
+        "verify_gpu_s": verify_gpu_s,
+        "verify_wall_s": verify_wall_s,
         "ttft_s": ttft_s,
-        "itl_samples": itl_samples,
-        "batch_gpu_busy_s": total_gpu_busy_s,
-        "batch_wall_s": total_wall_s,
+        "itl_s": itl_s,
     }
 
 
-def _run_measurement(
-    torch,
-    runner,
+def _run_rep(
+    backend: Qwen36Backend,
     prompts: list[list[int]],
-    max_tokens: int,
+    *,
     concurrency: int,
+    max_tokens: int,
     rep: int,
-    batched: bool = False,
-    chunk_size: int | None = None,
-) -> dict:
-    """ONE repetition of the full W1-S request set against an
-    ALREADY-LOADED runner (no reload between reps -- reps are for
-    repeated-measurement variance, not independent process launches;
-    see this file's module docstring / the design doc for why this is a
-    deliberate, documented deviation from literal interleaved A/B this
-    round, given the cost of reloading a 27B model per leg)."""
+) -> dict[str, object]:
     thermal_before = _gpu_thermal()
-    all_ttfts: list[float] = []
-    all_itls: list[float] = []
-    total_drafts = total_draft_tokens = total_accepted = 0
-    total_gpu_busy_s = total_wall_s = 0.0
-
-    t_start = time.perf_counter()
-    num_batches = (len(prompts) + concurrency - 1) // concurrency
-    for batch_idx, batch_start in enumerate(range(0, len(prompts), concurrency)):
-        batch = prompts[batch_start : batch_start + concurrency]
-        out = (
-            _run_batch_batched(torch, runner, batch, max_tokens, chunk_size=chunk_size)
-            if batched
-            else _run_batch(torch, runner, batch, max_tokens)
-        )
-        for s, stats in out["per_slot"].items():
-            total_drafts += stats["num_drafts"]
-            total_draft_tokens += stats["num_draft_tokens"]
-            total_accepted += stats["num_accepted_tokens"]
-            if not batched:
-                # Single-slot path: each slot's own bracketed calls are
-                # genuinely additive (real, disjoint, serially-issued GPU
-                # work) -- summing per-slot is correct here.
-                total_gpu_busy_s += stats["gpu_busy_s"]
-                total_wall_s += stats["wall_s"]
-        if batched:
-            # Batched path: gpu_busy_s/wall_s are BATCH-LEVEL quantities
-            # (one shared kernel launch per round covering every active
-            # slot) -- summing them per-slot would double/quadruple-count
-            # the same interval, so pull the batch-level totals directly.
-            total_gpu_busy_s += out["batch_gpu_busy_s"]
-            total_wall_s += out["batch_wall_s"]
-        all_ttfts.extend(out["ttft_s"].values())
-        all_itls.extend(out["itl_samples"])
-        elapsed = time.perf_counter() - t_start
-        print(f"  ... rep {rep} batch {batch_idx + 1}/{num_batches} done ({elapsed:.0f}s elapsed)", flush=True)
-
-    wall_s_e2e = time.perf_counter() - t_start
-    thermal_after = _gpu_thermal()
-    total_committed = total_accepted + total_drafts
-
-    all_ttfts.sort()
-    all_itls.sort()
-
+    started = time.perf_counter()
+    totals = {"accepted": 0, "draft_tokens": 0, "draft_rounds": 0, "committed": 0}
+    gpu_busy_s = wall_s = 0.0
+    prefill_gpu_s = prefill_wall_s = verify_gpu_s = verify_wall_s = 0.0
+    ttft_s: list[float] = []
+    itl_s: list[float] = []
+    for offset in range(0, len(prompts), concurrency):
+        result = _run_batch(backend, prompts[offset : offset + concurrency], max_tokens=max_tokens)
+        for name in totals:
+            totals[name] += int(result[name])
+        gpu_busy_s += float(result["gpu_busy_s"])
+        wall_s += float(result["wall_s"])
+        prefill_gpu_s += float(result["prefill_gpu_s"])
+        prefill_wall_s += float(result["prefill_wall_s"])
+        verify_gpu_s += float(result["verify_gpu_s"])
+        verify_wall_s += float(result["verify_wall_s"])
+        ttft_s.extend(result["ttft_s"])
+        itl_s.extend(result["itl_s"])
+        print(f"  rep {rep}: {min(offset + concurrency, len(prompts))}/{len(prompts)} requests", flush=True)
+    e2e_s = time.perf_counter() - started
+    ttft_s.sort()
+    itl_s.sort()
     return {
         "rep": rep,
-        "wall_s_e2e": wall_s_e2e,
-        "num_drafts": total_drafts,
-        "num_draft_tokens": total_draft_tokens,
-        "num_accepted_tokens": total_accepted,
-        "draft_acceptance_rate_pct": total_accepted / total_draft_tokens * 100.0 if total_draft_tokens else float("nan"),
-        "total_committed_tokens": total_committed,
-        "accepted_tokens_per_sec": total_committed / wall_s_e2e if wall_s_e2e > 0 else float("nan"),
-        "ms_per_accepted_token": wall_s_e2e * 1000.0 / total_committed if total_committed > 0 else float("nan"),
-        "ms_per_draft": wall_s_e2e * 1000.0 / total_drafts if total_drafts > 0 else float("nan"),
-        "ttft_mean_ms": sum(all_ttfts) / len(all_ttfts) * 1000.0 if all_ttfts else float("nan"),
-        "ttft_p99_ms": all_ttfts[int(len(all_ttfts) * 0.99)] * 1000.0 if all_ttfts else float("nan"),
-        "itl_mean_ms": sum(all_itls) / len(all_itls) * 1000.0 if all_itls else float("nan"),
-        "itl_p99_ms": all_itls[int(len(all_itls) * 0.99)] * 1000.0 if all_itls else float("nan"),
-        "num_itl_samples": len(all_itls),
-        "gpu_busy_s_summed_across_slots": total_gpu_busy_s,
-        "wall_s_summed_across_slots": total_wall_s,
-        "gpu_busy_pct": total_gpu_busy_s / total_wall_s * 100.0 if total_wall_s > 0 else float("nan"),
-        "launch_gap_pct": (1.0 - total_gpu_busy_s / total_wall_s) * 100.0 if total_wall_s > 0 else float("nan"),
+        "total_committed_tokens": totals["committed"],
+        "num_drafts": totals["draft_rounds"],
+        "num_accepted_tokens": totals["accepted"],
+        "num_draft_tokens": totals["draft_tokens"],
+        "draft_acceptance_rate_pct": 100.0 * totals["accepted"] / totals["draft_tokens"],
+        "accepted_tokens_per_sec": totals["committed"] / e2e_s,
+        "ms_per_accepted_token": 1000.0 * e2e_s / totals["committed"],
+        "ms_per_draft": 1000.0 * e2e_s / totals["draft_rounds"],
+        "wall_s_e2e": e2e_s,
+        "gpu_busy_s": gpu_busy_s,
+        "wall_s_measured_calls": wall_s,
+        "prefill_gpu_s": prefill_gpu_s,
+        "prefill_wall_s": prefill_wall_s,
+        "verify_gpu_s": verify_gpu_s,
+        "verify_wall_s": verify_wall_s,
+        "gpu_busy_pct": 100.0 * gpu_busy_s / wall_s if wall_s else math.nan,
+        "launch_gap_pct": 100.0 * (1.0 - gpu_busy_s / wall_s) if wall_s else math.nan,
+        "ttft_mean_ms": 1000.0 * sum(ttft_s) / len(ttft_s),
+        "ttft_p99_ms": 1000.0 * ttft_s[min(len(ttft_s) - 1, int(0.99 * len(ttft_s)))],
+        "itl_mean_ms": 1000.0 * sum(itl_s) / len(itl_s),
+        "itl_p99_ms": 1000.0 * itl_s[min(len(itl_s) - 1, int(0.99 * len(itl_s)))],
+        "num_itl_samples": len(itl_s),
         "thermal_before": thermal_before,
-        "thermal_after": thermal_after,
+        "thermal_after": _gpu_thermal(),
     }
 
 
-def _run_once(
-    max_tokens: int,
-    concurrency: int,
-    fixture_key: str,
-    num_requests: int | None,
-    repeats: int,
-    batched: bool = False,
-    cudagraph: bool = False,
-    blocks_per_slot: int = 2560,
-    chunk_size: int | None = None,
-) -> dict:
-    import torch
+def _profile_steady_rounds(
+    backend: Qwen36Backend,
+    prompts: list[list[int]],
+    *,
+    rounds: int,
+    trace_path: Path | None,
+) -> dict[str, object]:
+    """Profile production B-wide MTP rounds after an untimed W1-S prefill.
 
-    sys.path.insert(0, SM120_VLLM_INTEGRATION)
-    import register_sm120_backend  # noqa: F401
+    This is intentionally part of the frozen-fixture performance gate, not a
+    new ad-hoc probe: the captured calls are the same public production API as
+    the throughput measurement above.  It runs only when explicitly requested
+    and after normal repetitions, so profiler instrumentation cannot affect the
+    headline throughput result.
+    """
+    if rounds <= 0:
+        return {}
+    from torch.profiler import ProfilerActivity, profile, record_function
 
-    from benchmarks.workloads import (
-        CTX128K_FIXTURE,
-        CTX200K_FIXTURE,
-        CTX256K_FIXTURE,
-        D1_CTX16K_FIXTURE,
-        D1_CTX32K_FIXTURE,
-        D1_CTX64K_FIXTURE,
-        W1_S_FIXTURE,
-        W1_S_FIXTURE_N128,
-        load_prompt_token_ids,
+    slots = list(range(len(prompts)))
+    _reset_slots(backend, slots)
+    prefill = backend.prefill_chunked_begin(
+        slots,
+        prompts,
+        chunk_size=max(len(prompt) for prompt in prompts),
     )
-    from oracle.qwen36_vllm.direct_model_runner import DirectModelRunner, build_vllm_config
+    assert prefill.done
+    anchors = {slot: int(prefill.result[slot]["anchor"]) for slot in slots}
+    drafts = {slot: list(prefill.result[slot]["draft_tokens"]) for slot in slots}
 
-    fixture = {
-        "n16": W1_S_FIXTURE,
-        "n128": W1_S_FIXTURE_N128,
-        # 2026-07-18, Phase D1 shape-generalization sweep: same-formula/
-        # same-seed constructed fixtures at longer context, NOT the
-        # official W2/W2-S line -- see workloads.py's own docstring on
-        # these two.
-        "ctx16k": D1_CTX16K_FIXTURE,
-        "ctx32k": D1_CTX32K_FIXTURE,
-        "ctx64k": D1_CTX64K_FIXTURE,
-        # 2026-07-19, multi-agent-coding 256K-feasibility task: see
-        # workloads.py's own docstring on these three (num_requests=4, not
-        # 16, deliberately).
-        "ctx128k": CTX128K_FIXTURE,
-        "ctx200k": CTX200K_FIXTURE,
-        "ctx256k": CTX256K_FIXTURE,
-    }[fixture_key]
-    # 2026-07-18/19, D1 64K-capacity-raise task (notes/2026-07-18-
-    # session-review-and-next-steps.md section 16), generalized 2026-07-19
-    # from a ctx64k-only special case to ANY fixture: this runtime's
-    # per-slot KV-cache capacity ceiling is blocks_per_slot*block_size
-    # tokens -- a prompt that exceeds it fails during prefill alone, at ANY
-    # concurrency (the check is per-slot, not per-batch). Fail fast with a
-    # clear, actionable message instead of the generic RuntimeError from
-    # deep inside build_attention_metadata_batch mid-prefill.
-    if blocks_per_slot * 16 < fixture.prompt_len + max_tokens:
-        raise SystemExit(
-            f"--fixture {fixture_key} needs --blocks-per-slot >= "
-            f"{-(-(fixture.prompt_len + max_tokens) // 16)} (current "
-            f"blocks_per_slot={blocks_per_slot} only covers "
-            f"{blocks_per_slot * 16} tokens/slot); pass --blocks-per-slot "
-            f"explicitly for this fixture."
-        )
-    prompts = load_prompt_token_ids(fixture)
-    if num_requests is not None:
-        prompts = prompts[:num_requests]
+    engine = backend._mtp
+    assert engine is not None and engine._verify_cg is not None
+    phase_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
 
-    thermal_before_load = _gpu_thermal()
+    def instrument(obj: object, name: str, label: str):
+        original = getattr(obj, name)
 
-    vllm_config = build_vllm_config(
-        model=MODEL,
-        kv_cache_dtype="fp8_e4m3",
-        max_model_len=min(
-            max(40960, fixture.prompt_len + max_tokens + 1024), _MODEL_MAX_POSITION_EMBEDDINGS
+        def wrapped(*args, **kwargs):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            with record_function(label):
+                result = original(*args, **kwargs)
+            end.record()
+            phase_events.setdefault(label, []).append((start, end))
+            return result
+
+        setattr(obj, name, wrapped)
+        return original
+
+    restores = [
+        (engine._verify_cg, "replay", instrument(engine._verify_cg, "replay", "mtp.verify_graph")),
+        (engine.model, "compute_logits", instrument(engine.model, "compute_logits", "mtp.lm_head")),
+        (
+            engine,
+            "_sync_real_suffix_batch_ragged",
+            instrument(engine, "_sync_real_suffix_batch_ragged", "mtp.sync"),
         ),
-        gpu_memory_utilization=0.85,
-        speculative_config={"method": "mtp", "num_speculative_tokens": K, "attention_backend": "CUSTOM"},
-    )
-    # 2026-07-17, Phase 3: ``enable_cudagraph`` reserves the LAST
-    # ``concurrency`` logical slots of ``num_slots`` permanently for
-    # ``CapturedBatchDecodeGraph``'s own disposable warmup (see
-    # ``DirectModelRunner._get_verify_graph``'s docstring) -- real request
-    # traffic only ever uses logical slots ``0..concurrency-1`` either way
-    # (unaffected below), so doubling ``num_slots`` here is purely reserved
-    # spare capacity, never exposed to real requests.
-    num_slots = 2 * concurrency if cudagraph else concurrency
-    runner = DirectModelRunner(
-        vllm_config,
-        num_slots=num_slots,
-        block_size=64,
-        blocks_per_slot=blocks_per_slot,
-        enable_cudagraph=cudagraph,
-    )
-    thermal_after_load = _gpu_thermal()
-
-    reps = [
-        _run_measurement(
-            torch, runner, prompts, max_tokens, concurrency, r + 1, batched=batched, chunk_size=chunk_size
-        )
-        for r in range(repeats)
+        (
+            engine,
+            "_continue_draft_batch",
+            instrument(engine, "_continue_draft_batch", "mtp.draft"),
+        ),
     ]
+    torch.cuda.synchronize()
+    try:
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=False,
+            with_stack=False,
+        ) as profiler:
+            for _ in range(rounds):
+                decisions = backend.mtp_verify_and_commit_batch(slots, anchors, drafts)
+                anchors = {slot: int(decisions[slot]["next_anchor"]) for slot in slots}
+                drafts = {slot: list(decisions[slot]["next_draft_tokens"]) for slot in slots}
+            torch.cuda.synchronize()
+    finally:
+        for obj, name, original in restores:
+            setattr(obj, name, original)
 
+    if trace_path is not None:
+        profiler.export_chrome_trace(str(trace_path))
+        print(f"wrote W1-S CPU/CUDA trace: {trace_path}")
+
+    def top_self(attr: str) -> list[dict[str, float | str]]:
+        rows = [
+            {"name": event.key, "ms": float(getattr(event, attr, 0.0)) / 1000.0}
+            for event in profiler.key_averages()
+            if getattr(event, attr, 0.0) > 0
+        ]
+        return sorted(rows, key=lambda row: float(row["ms"]), reverse=True)[:20]
+
+    phase_cuda_ms = {
+        name: sum(start.elapsed_time(end) for start, end in pairs) / rounds
+        for name, pairs in phase_events.items()
+    }
+    print(f"W1-S steady-round profiler: {rounds} B={len(slots)} round(s)")
+    for name, elapsed_ms in phase_cuda_ms.items():
+        print(f"  {elapsed_ms:8.3f} ms/round  {name}")
     return {
-        # Liveness/sanity signal only -- see `_sanity_check_reps`'s
-        # docstring. This is NOT a correctness check (this script doesn't
-        # re-verify generated tokens); it was a hardcoded `True` literal
-        # before 2026-07-18's fix (notes/2026-07-18-session-review-and-
-        # next-steps.md section 20.3).
-        "passed": _sanity_check_reps(reps),
-        "num_requests": len(prompts),
-        "max_tokens": max_tokens,
-        "concurrency": concurrency,
-        "k": K,
-        "batched": batched,
-        "cudagraph": cudagraph,
-        "blocks_per_slot": blocks_per_slot,
-        "chunk_size": chunk_size,
-        "repeats": repeats,
-        "reps": reps,
-        "thermal_before_load": thermal_before_load,
-        "thermal_after_load": thermal_after_load,
-        "fixture": fixture.path,
-        "fixture_seed": fixture.seed,
+        "rounds": rounds,
+        "slots": len(slots),
+        "phase_cuda_ms": phase_cuda_ms,
+        "self_cpu_ms": top_self("self_cpu_time_total"),
+        "self_cuda_ms": top_self("self_device_time_total"),
     }
 
 
@@ -480,83 +336,121 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--concurrency", type=int, default=4)
-    parser.add_argument(
-        "--fixture",
-        choices=["n16", "n128", "ctx16k", "ctx32k", "ctx64k", "ctx128k", "ctx200k", "ctx256k"],
-        default="n16",
-    )
+    parser.add_argument("--fixture", choices=["n16", "n128"], default="n16")
     parser.add_argument("--num-requests", type=int, default=None)
-    parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument(
-        "--batched",
-        action="store_true",
-        help="use the 2026-07-17 cross-slot batched MTP coordinator "
-        "(mtp_prefill_batch/mtp_verify_and_commit_batch, ONE shared kernel "
-        "launch per round across all concurrent slots) instead of the "
-        "original single-slot round-robin path.",
-    )
-    parser.add_argument(
-        "--cudagraph",
-        action="store_true",
-        help="2026-07-17, Phase 3: CUDA-graph-capture the verify forward "
-        "inside mtp_verify_and_commit_batch (requires --batched). Doubles "
-        "num_slots (the extra half is reserved, disposable capture-warmup "
-        "capacity -- see DirectModelRunner._get_verify_graph).",
-    )
-    parser.add_argument(
-        "--blocks-per-slot",
-        type=int,
-        default=2560,
-        help="2026-07-18/19, D1 64K-capacity-raise task: DirectModelRunner's "
-        "per-slot KV-cache capacity ceiling is blocks_per_slot * block_size "
-        "(default 2560*16=40960 tokens/slot -- covers every existing 4K/16K/"
-        "32K shape this project has measured). Left at its default for every "
-        "existing invocation; only long-context (>32K) fixtures need this "
-        "raised (e.g. 5120 for ctx64k, ~24%% margin over the 65536+256-token "
-        "minimum). Raising it costs VRAM ONLY for THIS runner instance -- it "
-        "is a per-instance constructor arg, not a global default -- but ALSO "
-        "rescales this runner's own decode_fixed_kv_split_size (see "
-        "DirectModelRunner.__init__), so any change should be re-validated "
-        "against the regression suite, not assumed safe.",
-    )
-    parser.add_argument(
-        "--chunk-size",
+        "--prompt-tokens",
         type=int,
         default=None,
-        help="2026-07-19, chunked-prefill round: split mtp_prefill_batch's "
-        "target/draft-model forward calls into sequential chunk_size-token "
-        "pieces instead of one giant forward covering the whole prompt -- "
-        "bounds peak prefill activation memory to chunk_size*concurrency "
-        "regardless of total prompt length (see "
-        "oracle.qwen36_vllm.direct_model_runner.DirectModelRunner.mtp_prefill_batch's "
-        "docstring and notes/2026-07-18-session-review-and-next-steps.md "
-        "section 19). Requires --batched (the singular, non-batched path "
-        "has no chunked prefill). Default None preserves every existing "
-        "invocation's single-shot prefill behavior byte-for-byte.",
+        help="truncate the frozen prompt for a low-memory integration smoke; default keeps W1-S",
+    )
+    parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--model-path", default=str(standard_checkpoint_path()))
+    parser.add_argument("--result-path", type=Path, default=None)
+    parser.add_argument(
+        "--profile-rounds",
+        type=int,
+        default=0,
+        help="profile this many additional steady B-wide MTP rounds after throughput repetitions",
+    )
+    parser.add_argument(
+        "--profile-trace-path",
+        type=Path,
+        default=None,
+        help="optional Chrome trace path for --profile-rounds",
     )
     args = parser.parse_args()
-    if args.cudagraph and not args.batched:
-        parser.error("--cudagraph requires --batched")
-    if args.chunk_size is not None and not args.batched:
-        parser.error("--chunk-size requires --batched")
+    if args.concurrency < 1 or args.repeats < 1 or args.max_tokens < 1 or args.profile_rounds < 0:
+        parser.error("concurrency, repeats, and max-tokens must be positive; profile-rounds cannot be negative")
 
-    result = _run_once(
-        args.max_tokens,
-        args.concurrency,
-        args.fixture,
-        args.num_requests,
-        args.repeats,
-        batched=args.batched,
-        cudagraph=args.cudagraph,
-        blocks_per_slot=args.blocks_per_slot,
-        chunk_size=args.chunk_size,
+    fixture = W1_S_FIXTURE if args.fixture == "n16" else W1_S_FIXTURE_N128
+    prompts = load_prompt_token_ids(fixture)
+    if args.num_requests is not None:
+        prompts = prompts[: args.num_requests]
+    prompt_len = fixture.prompt_len
+    if args.prompt_tokens is not None:
+        if not 1 <= args.prompt_tokens <= fixture.prompt_len:
+            parser.error("prompt-tokens must be in [1, fixture prompt length]")
+        prompt_len = args.prompt_tokens
+        prompts = [prompt[:prompt_len] for prompt in prompts]
+    if not prompts:
+        parser.error("num-requests must select at least one frozen prompt")
+    max_seq_len = prompt_len + args.max_tokens + K + 16
+    # Warm-caliber arena sizing: the persistent prefix arena holds one
+    # prompt-boundary entry per distinct prompt (ceil(prompt_len/page_size)
+    # scratch pages each), exactly the repeat-hit shape the historical
+    # 8 GiB block cache served.  page_size is Qwen36Backend's 128-token
+    # attention page.
+    page_size = 128
+    prompt_pages = (prompt_len + page_size - 1) // page_size
+    max_seq_len = max(max_seq_len, len(prompts) * prompt_pages * page_size + page_size)
+    print(f"fixture={fixture.path} prompt_len={prompt_len} requests={len(prompts)}")
+    print(f"concurrency={args.concurrency} K={K} max_seq_len={max_seq_len}")
+    model = load_qwen36_model(
+        args.model_path,
+        device="cuda",
+        dtype=torch.bfloat16,
+        max_seq_len=max_seq_len,
+        enable_mtp=True,
     )
+    backend = Qwen36Backend(
+        model,
+        num_slots=args.concurrency,
+        max_seq_len=max_seq_len,
+        block_size=64,
+        device="cuda",
+        dtype=torch.bfloat16,
+        enable_prefix_cache=True,
+        # Every distinct prompt keeps a prompt-boundary checkpoint plus the
+        # generation drift entry; 3 GiB covers the 16-prompt fixture twice.
+        checkpoint_byte_budget=3 * 2**30,
+    )
+    backend.enable_mtp(num_speculative_tokens=K, enable_resync=False)
+    engine = backend._mtp
+    assert engine is not None
+    if not engine.cuda_graphs_healthy():
+        raise RuntimeError(f"MTP CUDA Graph capture is unhealthy: {engine.cg_status}")
 
-    import json
-
-    print(json.dumps(result, indent=2, default=str))
-    return 0 if result.get("passed") else 1
+    reps = [
+        _run_rep(backend, prompts, concurrency=args.concurrency, max_tokens=args.max_tokens, rep=index + 1)
+        for index in range(args.repeats)
+    ]
+    steady_round_profile = _profile_steady_rounds(
+        backend,
+        prompts[: args.concurrency],
+        rounds=args.profile_rounds,
+        trace_path=args.profile_trace_path,
+    )
+    passed = all(int(rep["total_committed_tokens"]) > 0 for rep in reps)
+    result = {
+        "passed": passed,
+        "model_path": args.model_path,
+        "fixture": fixture.path,
+        "fixture_seed": fixture.seed,
+        "num_requests": len(prompts),
+        "prompt_len": prompt_len,
+        "max_tokens": args.max_tokens,
+        "concurrency": args.concurrency,
+        "k": K,
+        "repeats": args.repeats,
+        "backend": "qwen36-no-vllm",
+        "prefill_batched": backend.stats["prefill_batched_forwards"] > 0,
+        "prefill_batched_forwards": backend.stats["prefill_batched_forwards"],
+        "mtp_cg_status": engine.cg_status,
+        "backend_stats": {
+            name: value
+            for name, value in backend.stats.items()
+            if isinstance(value, (int, float))
+        },
+        "steady_round_profile": steady_round_profile,
+        "reps": reps,
+    }
+    text = json.dumps(result, indent=2)
+    print(text)
+    if args.result_path is not None:
+        args.result_path.write_text(text, encoding="utf-8")
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

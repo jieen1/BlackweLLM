@@ -333,3 +333,40 @@ covered by the synthetic test) breaks parity. Wiring REVERTED per the
 anchors-first constraint; kernel + tests kept, production divergence
 unroot-caused. Gain would have been <=0.5 s; not worth further turns
 before higher-value work.
+
+## Warm prefix-cache parity: reached and exceeded (2026-08-04)
+
+The historical W1-S headline (136.75 accepted / ~201.5 committed tok/s)
+was measured with prefix caching enabled; this runner previously forced
+`enable_prefix_cache=False`, so every "gap vs historical" comparison was
+cold-vs-warm. Two structural bugs kept the arena from hitting even when
+enabled:
+
+1. The reset-time store publishes the DRIFTED generation boundary
+   (prompt+decode, checkpoint already past the prompt end), which an
+   exact same-prompt query can never match (`len(query) <= entry.kv_len`).
+   Fix: publish a prompt-boundary entry at prefill commit, storing the
+   anchor-row hidden so an exact-length hit needs no forward at all
+   (`_store_persistent_prefix(prompt_hidden=...)`, `final_hidden` on the
+   arena entry, `_pending_cached_hidden` through the chunked-prefill step).
+   Drift entries that merely extend a resident prompt entry are skipped
+   (they cost scratch pages and are only reachable by exact replays).
+2. A full-prompt restore used to re-sync the anchor row into the MTP
+   causal cache that the snapshot already contained -> sync_len ran one
+   row ahead of backbone KV (caught by `preserve_prefix`'s lockstep
+   invariant). Fix: `Qwen36MTPEngine.resync_prefix_tail` backs up one row
+   before re-teacher-forcing the tail.
+
+Locked W1-S (n16/c=4/K=3, arena sized for all 16 prompts, 3 GiB
+checkpoint budget), same process:
+
+| rep | wall | prefill | committed | accept% | committed tok/s |
+|---|---:|---:|---:|---:|---:|
+| 1 (cold anchor) | 32.92 s | 15.51 s | 4112 | 72.43 | 124.9 |
+| 2 (warm) | **18.08 s** | **0.43 s** | 4114 | 75.76 | **227.5** |
+
+16/16 persistent restores, zero evictions. The warm rep exceeds the
+historical committed-rate headline (~201.5 tok/s derived) with quality at
+or above the historical acceptance anchor (70.29%). Cold rep1 stays at
+the combo anchor. CPU regression: tests/test_qwen36_backend.py
+test_same_prompt_repeat_restores_the_prompt_boundary_without_forward.

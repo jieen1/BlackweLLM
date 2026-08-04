@@ -60,12 +60,12 @@ tokens[i] -- i.e. exactly the prev_hidden MTP needs to predict tokens[i+1]"
 -- exactly the unshifted convention), so even that ceiling may understate
 the head's true single-step quality.
 
-The fix costs nothing extra: the correctly-shifted hidden state is always
-already available from a computation this round needed anyway (either the
-prefill's own last-position hidden -- :meth:`Qwen36MTPEngine
-.draft_after_prefill` -- or, within :meth:`Qwen36MTPEngine.round`, the SAME
-verify/anchor forward every round already performs for accept/reject). No
-additional target forward pass is added to get it right.
+The complete historical contract is stronger than a one-row handoff: MTP
+teacher-forces every newly real target position into its own cache, then
+generates only the remaining speculative continuation.  The target hidden
+rows already exist in prefill/verify, so that restoration adds no backbone
+forward; it merely keeps the MTP cache's real-prefix boundary in lockstep
+with target KV and GDN state.
 """
 
 from __future__ import annotations
@@ -77,6 +77,7 @@ import torch
 
 from runtime.backends.qwen36_mtp_cudagraph import (
     Qwen36MTPAnchorCudaGraph,
+    Qwen36MTPBatchedSync,
     Qwen36MTPDraftCudaGraph,
     Qwen36MTPVerifyCudaGraph,
     attempt_mtp_cg_capture,
@@ -84,114 +85,61 @@ from runtime.backends.qwen36_mtp_cudagraph import (
 )
 from runtime.logprobs import compute_logprobs
 from runtime.model.qwen36_model import GdnLayerState
-from runtime.mtp_accept import determine_accept_reject_from_predictions, sample_accept_reject
+from runtime.mtp_accept import (
+    determine_accept_reject_batch,
+    determine_accept_reject_from_predictions,
+    sample_accept_reject,
+)
 from runtime.recurrent_state_pool import spec_row
 from runtime.sampling import SamplingParams, compute_sampling_distribution, make_generator
 
 if TYPE_CHECKING:
     from runtime.backends.qwen36 import Qwen36Backend
-    from runtime.model.qwen36_model import Qwen36PagedAttentionCache
-
-
-#: QSR_SERVER_MTP_RESYNC (default off): per-round re-grounding of the
-#: interior accepted draft positions with the target's own real
-#: verify_hidden, instead of leaving them holding the draft head's
-#: self-chained hidden state from the exploratory loop that first drafted
-#: them. Ported in spirit from the historical runner's per-round resync
-#: (``qsr-hist`` @ ``8f5c195``, ``_mtp_sync_and_propose`` /
-#: ``mtp_verify_and_commit``) -- see :meth:`Qwen36MTPEngine._resync`'s
-#: docstring for why this module's indexing differs from that port's
-#: (``work/mtp-resync-20260802`` @ ``aed0e2d``) own, which carried the
-#: same unshifted pairing convention documented above. Default OFF and
-#: independently toggleable from MTP itself so it can be A/B measured on
-#: real hardware separately from the pairing fix.
-def _resync_env_default() -> bool:
-    return os.environ.get("QSR_SERVER_MTP_RESYNC", "0") != "0"
 
 
 class Qwen36MTPGDNRows:
-    """Permanent ``K+2`` GDN rows used by one MTP engine.
+    """Permanent ``K+1`` GDN candidate rows used by one MTP engine.
 
     The old verify path cloned every recurrent state once per speculative
     position and copied one clone back after accept/reject. A candidate state
     can instead live at its fixed ``spec_row`` address and the next round
-    selects the accepted row. The allocation is owned by MTP because the
-    backbone's ordinary decode graphs are captured before MTP is enabled.
+    selects the accepted row. MTP configures the slot pool before any decode
+    graph capture, so column zero is the ordinary live row in that same
+    graph-safe allocation.
 
-    ``K+2``, not ``K+1``, since the round folded the anchor into the verify
-    forward: that forward covers ``k+1`` positions (anchor + K drafts), and
-    ``spec_forward``'s contract is ``seq_len + 1`` rows -- one incoming state
-    plus one per position. The columns line up as:
-
-      * column 0        -- the state BEFORE the anchor, i.e. what the previous
-                           round committed. ``spec_row`` already defines column
-                           0 as the ordinary non-speculative row the chunked
-                           prefill writes, which is exactly the right home for
-                           an incoming state.
-      * columns 1..k+1  -- the state after position 0..k of this round's
-                           forward. Accepting ``m`` drafts means committing
-                           ``m + 1`` positions (the anchor is never rejected),
-                           so the committed column is ``m + 1``.
-
-    The historical implementation held only ``k+1`` columns because it never
-    materialised the incoming state as a row of its own -- its kernel read
-    that state straight from the column the PREVIOUS round wrote
-    (``ssm_state_indices[i_n, num_accepted - 1]``, see ``_ssm_spec_row``'s
-    docstring). Matching that would save one row per slot (~80 MiB here);
-    it is a memory optimisation, not a correctness requirement.
+    The verify has ``k+1`` positions (anchor + K drafts), so it owns exactly
+    ``k+1`` output rows: column ``p`` is the state after verify position
+    ``p``.  The incoming prefill state already resides in ordinary live
+    column zero, is selected before the forward, and is then safely
+    overwritten by the anchor's candidate state.  After accepting ``m``
+    drafts, column ``m`` is the state after the anchor plus its accepted
+    prefix.  This is the historical
+    ``num_accepted_tokens_prev - 1`` addressing, with no extra input row.
     """
 
     def __init__(self, backend: Qwen36Backend, num_speculative_tokens: int) -> None:
         self.backend = backend
         self.pool = backend.pool
         self.k = num_speculative_tokens
-        # Columns are k+2; `spec_row`'s `num_spec` counts the NON-zero
-        # columns, so it gets k+1.
-        self.num_spec_cols = self.k + 1
+        # ``spec_row`` addresses column zero plus exactly ``num_spec``
+        # dedicated candidate rows: K speculative drafts therefore means
+        # K+1 rows for anchor + drafts.  Column zero is the slot pool's
+        # ordinary live state, never a copied private bootstrap row.
+        self.num_spec_cols = self.k
         self.total_physical_slots = self.pool.num_slots + 1
         self.total_rows = self.total_physical_slots * (self.num_spec_cols + 1)
-        self.conv_pools: list[torch.Tensor | None] = [None] * self.pool.num_layers
-        self.recurrent_pools: list[torch.Tensor | None] = [None] * self.pool.num_layers
+        self.pool.enable_mtp_gdn_rows(self.k)
+        self.conv_pools = self.pool.conv_pools
+        self.recurrent_pools = self.pool.recurrent_pools
         self._states: dict[int, list[list[GdnLayerState]]] = {}
 
-        marker = getattr(torch._dynamo, "mark_static_address", None)
         for layer in self.pool.model.model.layers:
             if layer.layer_type != "linear_attention":
                 continue
-            gdn = layer.linear_attn
-            conv = torch.zeros(
-                self.total_rows,
-                gdn.conv_dim,
-                gdn.conv_kernel_size,
-                device=self.pool.device,
-                dtype=self.pool.dtype,
-            )
-            recurrent = torch.zeros(
-                self.total_rows,
-                gdn.num_v_heads,
-                gdn.head_k_dim,
-                gdn.head_v_dim,
-                device=self.pool.device,
-                dtype=self.pool.dtype,
-            )
-            if marker is not None:
-                marker(conv)
-                marker(recurrent)
-            self.conv_pools[layer.layer_idx] = conv
-            self.recurrent_pools[layer.layer_idx] = recurrent
-            per_layer: list[list[GdnLayerState]] = []
-            for slot in range(self.pool.num_slots + 1):
-                columns: list[GdnLayerState] = []
-                for col in range(self.num_spec_cols + 1):
-                    row = spec_row(slot, col, self.total_physical_slots, self.num_spec_cols)
-                    columns.append(
-                        GdnLayerState(
-                            conv_state=conv[row : row + 1],
-                            recurrent_state=recurrent[row : row + 1],
-                            has_previous_state=False,
-                        )
-                    )
-                per_layer.append(columns)
+            per_layer = [
+                self.pool.mtp_gdn_columns(layer.layer_idx, slot)
+                for slot in range(self.total_physical_slots)
+            ]
             self._states[layer.layer_idx] = per_layer
 
         if not self._states:
@@ -204,21 +152,17 @@ class Qwen36MTPGDNRows:
         return spec_row(slot, col, self.total_physical_slots, self.num_spec_cols)
 
     def activate(self, slot: int, col: int) -> None:
-        state = self.pool.slot_state(slot)
-        for layer_idx, per_slot in self._states.items():
-            state.gdn_states[layer_idx] = per_slot[slot][col]
+        self.pool.activate_mtp_gdn_state(slot, col)
 
     def sync_from_live(self, slot: int) -> None:
-        """Copy an ordinary prefill state into column zero once."""
+        """Validate that prefill already wrote MTP's aliased column zero."""
         state = self.pool.slot_state(slot)
         for layer_idx, per_slot in self._states.items():
             live = state.gdn_states[layer_idx]
-            assert live is not None
-            target = per_slot[slot][0]
-            target.conv_state.copy_(live.conv_state)
-            target.recurrent_state.copy_(live.recurrent_state)
-            target.has_previous_state = live.has_previous_state
-        self.activate(slot, 0)
+            if live is not per_slot[slot][0]:
+                raise RuntimeError(
+                    f"slot {slot} GDN layer {layer_idx} is not on MTP column zero after prefill"
+                )
 
     def reset_slot(self, slot: int) -> None:
         for per_slot in self._states.values():
@@ -239,15 +183,14 @@ class Qwen36MTPEngine:
     opt-in, backend-private bookkeeping layered on top of the always-on
     slot pool, not a change to it.
 
-    Sequential per slot, not batched -- matches DFlash's own documented
-    precedent (``LagunaBackend.mtp_verify_and_commit_batch``'s docstring:
-    "the loop below still handles >1 slots correctly (just sequentially, no
-    batched replay)"). ``Qwen36ForCausalLMSelfBuilt``'s whole model graph is
-    batch=1 by construction (B1's own scope). Within that single-slot path,
-    GDN state uses the fixed ``spec_row`` topology: column zero is the live
-    state and columns one through K are candidate destinations. This removes
-    the old per-round snapshot/restore copies while preserving the same
-    accepted-prefix semantics as the historical vLLM runner.
+    The hot path now matches the historical split: the target verify batches
+    across active slots, and the autoregressive draft head batches each
+    chained step across those same slots. Only sampled fallback retains the
+    proven single-slot round path. GDN state uses the fixed ``spec_row``
+    topology: column zero is the live state and columns one through K are
+    candidate destinations. This removes the old per-round snapshot/restore
+    copies while preserving the same accepted-prefix semantics as the
+    historical vLLM runner.
     """
 
     def __init__(
@@ -267,27 +210,13 @@ class Qwen36MTPEngine:
         self.backend = backend
         self.model = model
         self.k = num_speculative_tokens
-        self.enable_resync = _resync_env_default() if enable_resync is None else enable_resync
-        if self.enable_resync and not hasattr(model, "mtp_resync_step"):
-            # Fail here, not on round 3. `_resync` calls
-            # `self.model.mtp_resync_step(...)`, and that method exists only
-            # on the unmerged branch `work/mtp-resync-20260802` (@ aed0e2d) --
-            # never on main. So this flag could only ever produce an
-            # AttributeError partway through a live request, after the server
-            # had come up and started answering. A flag whose sole reachable
-            # behaviour is a mid-request crash should refuse at construction.
-            #
-            # Not fixed by porting the method: that is ~166 lines which also
-            # reimplements `mtp_step` in terms of itself, on the MTP hot path,
-            # in service of an optimization that has never been A/B measured.
-            # It needs its own evidence before it earns that risk.
-            raise RuntimeError(
-                "QSR_SERVER_MTP_RESYNC is set, but this model has no "
-                "`mtp_resync_step` -- the per-round resync was ported only on "
-                "branch work/mtp-resync-20260802 and never merged, so the flag "
-                "has no working implementation here. Unset it (default off) to "
-                "run MTP without resync, which is the only measured path."
+        if enable_resync:
+            raise ValueError(
+                "QSR_SERVER_MTP_RESYNC is retired: MTP now always teacher-forces every "
+                "newly committed target suffix, so the old interior-only repair is invalid."
             )
+        # Kept as a read-only compatibility attribute for load-time logging.
+        self.enable_resync = False
         self.device = backend.device
         self.dtype = backend.dtype
         self.vocab_size = int(model.config["vocab_size"])
@@ -326,8 +255,23 @@ class Qwen36MTPEngine:
         ):
             self._spec_rows = Qwen36MTPGDNRows(backend, self.k)
         self._spec_state_col = [0] * (backend.num_slots + 1)
+        # MTP attention has two lengths.  ``cache.seq_len`` is the
+        # teacher-forced real prefix plus the ``K-1`` continuation rows; the
+        # first draft is predicted by the final teacher-forced row and does
+        # not occupy a speculative cache row of its own. ``_sync_len`` is
+        # the real-prefix boundary. The distinction is load-bearing: a
+        # partial accept must overwrite, rather than reuse, draft-head rows
+        # produced from speculative hidden states.
+        self._sync_len = [0] * backend.num_slots
+        # The backend's prefix cache is same-slot reuse: reset is pointer-only
+        # and therefore leaves this one-layer MTP KV allocation intact too.
+        # Retain only its authenticated real-prefix length; the backend will
+        # call ``restore_prefix`` only after its own token+GDN checkpoint has
+        # proven the same prefix identity.
+        self._cached_prefix_sync_len = [0] * backend.num_slots
         self._anchor_cg: Qwen36MTPAnchorCudaGraph | None = None
         self._draft_cg: Qwen36MTPDraftCudaGraph | None = None
+        self._batched_sync: Qwen36MTPBatchedSync | None = None
         self._verify_cg = None
         self._cg_captured = False
 
@@ -351,6 +295,12 @@ class Qwen36MTPEngine:
                 model, num_slots=backend.num_slots, device=self.device, dtype=self.dtype
             )
             self.scratch_row = backend.num_slots
+            # Historical `_mtp_sync_and_propose_batch` is also the B=1
+            # production path.  Keep one static bucket for that shape so a
+            # single active request does not fall back to eager
+            # `model.mtp_forward` between the captured verify and draft
+            # phases.
+            self._batched_sync = Qwen36MTPBatchedSync(self)
         else:
             #: One persistent MTP self-attention cache per real slot (no
             #: scratch row -- nothing here is CUDA-graph-captured on this
@@ -365,17 +315,50 @@ class Qwen36MTPEngine:
 
         self.stats: dict[str, int] = {
             "rounds": 0,
-            "resync_rounds": 0,
             "sampled_rounds": 0,
+            "verify_graph_replays": 0,
+            "verify_graph_slots": 0,
+            "batched_verify_replays": 0,
+            "draft_graph_replays": 0,
+            "draft_graph_slots": 0,
+            "batched_draft_replays": 0,
+            "batched_sync_replays": 0,
+            "batched_sync_slots": 0,
         }
 
         if self._use_cuda_graph:
             self.capture_cuda_graphs()
 
+    def _record_verify_graph_replay(self, batch_size: int) -> None:
+        """Record actual replay use, separately from capture health.
+
+        Capture status establishes eligibility only.  This counter is the
+        runtime proof that a c>1 scheduler round reached M-2's fused body
+        instead of a fallback, and is mirrored into backend stats because
+        that is the existing ``/debug/stats`` observability surface.
+        """
+        self.stats["verify_graph_replays"] += 1
+        self.stats["verify_graph_slots"] += batch_size
+        self.backend.stats["mtp_verify_graph_replays"] += 1
+        self.backend.stats["mtp_verify_graph_slots"] += batch_size
+        if batch_size > 1:
+            self.stats["batched_verify_replays"] += 1
+            self.backend.stats["mtp_batched_verify_replays"] += 1
+
+    def _record_draft_graph_replay(self, batch_size: int) -> None:
+        """Record use of the B-wide chained draft graph, not just capture."""
+        self.stats["draft_graph_replays"] += 1
+        self.stats["draft_graph_slots"] += batch_size
+        self.backend.stats["mtp_draft_graph_replays"] += 1
+        self.backend.stats["mtp_draft_graph_slots"] += batch_size
+        if batch_size > 1:
+            self.stats["batched_draft_replays"] += 1
+            self.backend.stats["mtp_batched_draft_replays"] += 1
+
     # -- CUDA Graph capture (2026-08-03 follow-up) -----------------------
 
     def capture_cuda_graphs(self) -> None:
-        """Capture the anchor-advance and draft-loop graphs, before any
+        """Capture the draft-loop and batched-verify graphs, before any
         production slot is used -- same "capture while every slot is
         definitionally empty" window ``Qwen36Backend.enable_mtp``'s own
         docstring already documents, and the same one
@@ -413,6 +396,12 @@ class Qwen36MTPEngine:
         if status == "failed":
             self._draft_cg = None
 
+        if self._batched_sync is None:
+            self.cg_status["sync"] = "unused"
+        else:
+            status = attempt_mtp_cg_capture("sync", self._batched_sync.capture, strict=strict)
+            self.cg_status["sync"] = status
+
         def _do_capture_verify() -> None:
             if self._spec_rows is None:
                 raise RuntimeError(
@@ -434,7 +423,13 @@ class Qwen36MTPEngine:
         succeeded -- vacuously True before capture runs or when CUDA
         Graphs are disabled entirely, matching
         ``DFlashEngine.cuda_graphs_healthy``'s own contract."""
-        return all(status == "captured" for status in self.cg_status.values())
+        # ``anchor`` is deliberately ``"unused"``: the anchor token is
+        # folded into the K+1 verify body.  It is descriptive lifecycle
+        # state, not a failed capture, so it must not make a healthy draft +
+        # verify pair report unhealthy forever.
+        return all(
+            status == "captured" for status in self.cg_status.values() if status != "unused"
+        )
 
     # -- slot lifecycle ------------------------------------------------
 
@@ -452,34 +447,342 @@ class Qwen36MTPEngine:
         cache shares the same offset for that slot's whole generation).
         """
         self._caches[slot].seq_len = 0
+        self._sync_len[slot] = 0
         if self._spec_rows is not None:
             self._spec_rows.reset_slot(slot)
         self._spec_state_col[slot] = 0
 
+    def preserve_prefix(self, slot: int, kv_len: int) -> None:
+        """Remember the real MTP prefix retained in this slot's KV bytes."""
+        if self._sync_len[slot] != kv_len:
+            raise RuntimeError(
+                f"MTP prefix for slot {slot} has sync_len={self._sync_len[slot]}, "
+                f"but target KV has {kv_len} rows"
+            )
+        self._cached_prefix_sync_len[slot] = kv_len
+
+    def can_restore_prefix(self, slot: int, kv_len: int) -> bool:
+        return self._cached_prefix_sync_len[slot] >= kv_len
+
+    def restore_prefix(self, slot: int, kv_len: int) -> None:
+        if not self.can_restore_prefix(slot, kv_len):
+            raise RuntimeError(f"slot {slot} has no retained MTP prefix of length {kv_len}")
+        self._caches[slot].seq_len = kv_len
+        self._sync_len[slot] = kv_len
+
+    def copy_prefix(self, source_slot: int, target_slot: int, kv_len: int) -> None:
+        """Copy a retained causal MTP prefix into another slot.
+
+        The target backbone/GDN restore is only valid when this second causal
+        cache follows it.  This uses the same page-table-aware whole-page
+        copy discipline as ``Qwen36SlotPool.copy_prefix_kv``; the next MTP
+        sync writes the suffix tail before it can be consumed.
+        """
+        if not self.can_restore_prefix(source_slot, kv_len):
+            raise RuntimeError(
+                f"source slot {source_slot} has no retained MTP prefix of length {kv_len}"
+            )
+        if source_slot == target_slot:
+            self.restore_prefix(target_slot, kv_len)
+            return
+        source = self._caches[source_slot]
+        target = self._caches[target_slot]
+        pages = (kv_len + source.page_size - 1) // source.page_size
+        source_pages = source.page_table[0, :pages].to(dtype=torch.long)
+        target_pages = target.page_table[0, :pages].to(dtype=torch.long)
+        target.k_cache[target_pages] = source.k_cache[source_pages]
+        target.v_cache[target_pages] = source.v_cache[source_pages]
+        target.seq_len = kv_len
+        self._sync_len[target_slot] = kv_len
+        # This is a live request's restored state, not a retained snapshot.
+        # Its cache becomes reusable only when Qwen36Backend.reset_slot calls
+        # preserve_prefix after the request has finished.
+        self._cached_prefix_sync_len[target_slot] = 0
+        if self._spec_rows is not None:
+            self._spec_rows.reset_slot(target_slot)
+        self._spec_state_col[target_slot] = 0
+
+    def drop_prefix(self, slot: int) -> None:
+        self._cached_prefix_sync_len[slot] = 0
+
+    def snapshot_prefix_to_scratch(
+        self,
+        source_slot: int,
+        kv_len: int,
+        *,
+        scratch_pages: tuple[int, ...] | None = None,
+    ) -> bool:
+        """Copy a real MTP causal prefix into the pooled scratch cache.
+
+        The backbone prefix arena lives in ``Qwen36SlotPool.scratch_row``.
+        A persistent restore is valid only when this second causal cache has
+        the same boundary, so expose the matching bounded snapshot here
+        instead of letting the backend reach into MTP private buffers.  CPU
+        / eager MTP intentionally has no scratch row and returns ``False``;
+        callers then retain the existing same-slot cache behaviour.
+        """
+        if self.scratch_row is None or self.mtp_page_size is None:
+            return False
+        if self._sync_len[source_slot] < kv_len:
+            return False
+        source = self._caches[source_slot]
+        scratch = self._caches[self.scratch_row]
+        pages = (kv_len + source.page_size - 1) // source.page_size
+        if scratch_pages is None:
+            scratch_pages = tuple(range(pages))
+        if len(scratch_pages) != pages or len(set(scratch_pages)) != pages:
+            raise ValueError("MTP scratch prefix needs one distinct page per logical page")
+        if any(page < 0 or page >= scratch.k_cache.shape[0] for page in scratch_pages):
+            raise ValueError("MTP scratch prefix page is outside the scratch arena")
+        source_pages = source.page_table[0, :pages].to(dtype=torch.long)
+        scratch_page_tensor = torch.tensor(scratch_pages, dtype=torch.long, device=self.device)
+        scratch.k_cache[scratch_page_tensor] = source.k_cache[source_pages]
+        scratch.v_cache[scratch_page_tensor] = source.v_cache[source_pages]
+        scratch.seq_len = kv_len
+        return True
+
+    def restore_prefix_from_scratch(
+        self,
+        target_slot: int,
+        kv_len: int,
+        *,
+        scratch_pages: tuple[int, ...] | None = None,
+    ) -> bool:
+        """Restore the pooled scratch snapshot into a real MTP cache row."""
+        if self.scratch_row is None or self.mtp_page_size is None:
+            return False
+        scratch = self._caches[self.scratch_row]
+        if scratch.seq_len < kv_len:
+            return False
+        target = self._caches[target_slot]
+        pages = (kv_len + target.page_size - 1) // target.page_size
+        if scratch_pages is None:
+            scratch_pages = tuple(range(pages))
+        if len(scratch_pages) != pages or len(set(scratch_pages)) != pages:
+            raise ValueError("MTP scratch prefix needs one distinct page per logical page")
+        if any(page < 0 or page >= scratch.k_cache.shape[0] for page in scratch_pages):
+            raise ValueError("MTP scratch prefix page is outside the scratch arena")
+        scratch_page_tensor = torch.tensor(scratch_pages, dtype=torch.long, device=self.device)
+        target_pages = target.page_table[0, :pages].to(dtype=torch.long)
+        target.k_cache[target_pages] = scratch.k_cache[scratch_page_tensor]
+        target.v_cache[target_pages] = scratch.v_cache[scratch_page_tensor]
+        target.seq_len = kv_len
+        self._sync_len[target_slot] = kv_len
+        self._cached_prefix_sync_len[target_slot] = 0
+        if self._spec_rows is not None:
+            self._spec_rows.reset_slot(target_slot)
+        self._spec_state_col[target_slot] = 0
+        return True
+
     # -- drafting --------------------------------------------------------
 
-    def _draft_loop(self, slot: int, seed_token: int, seed_hidden: torch.Tensor) -> list[int]:
-        """Draft ``self.k`` tokens, chained, starting from ``seed_token``
-        (already committed) paired with ``seed_hidden`` -- the hidden state
-        that PREDICTED ``seed_token``, one position before it (the fix this
-        module exists for; see module docstring). Steps 1..k-1 chain the
-        head's own previous output, unaffected by that fix (see module
-        docstring's "chained continuation steps... NOT affected").
+    def _sync_real_suffix(
+        self, slot: int, shifted_token_ids: list[int], target_hidden: torch.Tensor
+    ) -> tuple[int, torch.Tensor]:
+        """Write real target context into the MTP cache and return step 0.
+
+        This is the native equivalent of the historical
+        ``_mtp_sync_and_propose_batch`` step-0 forward.  It deliberately
+        rewinds the physical cache to ``_sync_len`` first: rows beyond that
+        point are speculative and must never become context merely because
+        they happened to be accepted by the target later.
         """
+        if not shifted_token_ids:
+            raise ValueError("MTP synchronisation requires at least one real position")
+        if target_hidden.dim() != 3 or target_hidden.shape[:2] != (1, len(shifted_token_ids)):
+            raise ValueError("MTP target hidden must have shape [1, q, hidden_size]")
+        cache = self._caches[slot]
+        sync_len = self._sync_len[slot]
+        cache.seq_len = sync_len
+        inputs = torch.tensor([shifted_token_ids], dtype=torch.long, device=self.device)
+        # Teacher-forcing needs every MTP hidden row to populate its causal
+        # KV, but only the final row predicts draft step 0.  Projecting all
+        # ``q`` rows through the 248k-vocabulary head is otherwise pure
+        # work; the batched CUDA-graph path follows the same rule below.
+        logits, mtp_hidden = self.model.mtp_forward(
+            inputs,
+            target_hidden,
+            sync_len,
+            cache,
+            logits_last_position_only=True,
+        )
+        expected = sync_len + len(shifted_token_ids)
+        if cache.seq_len != expected:
+            raise RuntimeError(
+                f"MTP sync for slot {slot} wrote {cache.seq_len - sync_len} rows; "
+                f"expected {len(shifted_token_ids)}"
+            )
+        self._sync_len[slot] = expected
+        return int(logits[0, -1].argmax(dim=-1).item()), mtp_hidden[:, -1:]
+
+    def _sync_real_suffix_batch(
+        self,
+        slots: list[int],
+        shifted_token_ids: list[list[int]],
+        target_hidden_rows: list[torch.Tensor],
+    ) -> dict[int, tuple[int, torch.Tensor]]:
+        """Synchronise one equal-length acceptance group B-wide.
+
+        A target verify is always uniform ``K+1``, but MTP's newly-real
+        suffix is ``m+1`` and therefore ragged across slots.  Grouping equal
+        lengths mirrors the historical batch driver without padding a real
+        prefix with fake tokens.  CPU/stub and B=1 paths retain the proven
+        per-slot primitive; pooled CUDA caches take the B-wide fast path.
+        """
+        if not slots or self._batched_sync is None:
+            return {
+                slot: self._sync_real_suffix(slot, tokens, target_hidden_rows[index])
+                for index, (slot, tokens) in enumerate(zip(slots, shifted_token_ids, strict=True))
+            }
+        query_len = len(shifted_token_ids[0])
+        if query_len <= 0 or any(len(tokens) != query_len for tokens in shifted_token_ids):
+            raise ValueError("batched MTP synchronisation requires non-empty equal-length suffixes")
+        if len(target_hidden_rows) != len(slots):
+            raise ValueError("batched MTP target hidden requires one row-major tensor per slot")
+        if any(
+            row.dim() != 3 or tuple(row.shape[:2]) != (1, query_len) for row in target_hidden_rows
+        ):
+            raise ValueError(
+                "batched MTP target hidden must have shape [1, q, hidden_size] per slot"
+            )
+        target_hidden = torch.cat(target_hidden_rows, dim=0)
+        starts = [self._sync_len[slot] for slot in slots]
+        for slot, start in zip(slots, starts, strict=True):
+            self._caches[slot].seq_len = start
+        first_drafts, mtp_hidden = self._batched_sync.replay(
+            slots, shifted_token_ids, target_hidden, starts
+        )
+        first_draft_values = first_drafts.tolist()
+        expected = [start + query_len for start in starts]
+        result: dict[int, tuple[int, torch.Tensor]] = {}
+        for index, (slot, end) in enumerate(zip(slots, expected, strict=True)):
+            self._caches[slot].seq_len = end
+            self._sync_len[slot] = end
+            result[slot] = (
+                int(first_draft_values[index]),
+                mtp_hidden[index : index + 1, -1:],
+            )
+        self.stats["batched_sync_replays"] += 1
+        self.stats["batched_sync_slots"] += len(slots)
+        self.backend.stats["mtp_batched_sync_replays"] += 1
+        self.backend.stats["mtp_batched_sync_slots"] += len(slots)
+        return result
+
+    def _sync_real_suffix_batch_ragged(
+        self,
+        slots: list[int],
+        shifted_token_ids: list[list[int]],
+        target_hidden_rows: list[torch.Tensor],
+    ) -> dict[int, tuple[int, torch.Tensor]]:
+        """Synchronise one all-slot ragged real suffix body when available.
+
+        The historical fast path pads every slot to one fixed ``max_q`` MTP
+        body, then picks each slot's own last valid logits/hidden instead of
+        splitting by accepted length first.  This engine mirrors that shape
+        when the pooled helper exposes ``replay_ragged`` and otherwise falls
+        back to the previous equal-length grouping/per-slot implementation.
+        """
+        if not (
+            len(slots) == len(shifted_token_ids) == len(target_hidden_rows)
+        ):
+            raise ValueError("ragged MTP sync requires equal slot/token/hidden list lengths")
+        if not slots:
+            return {}
+        if any(
+            not tokens
+            or hidden.dim() != 3
+            or hidden.shape[0] != 1
+            or hidden.shape[1] != len(tokens)
+            for tokens, hidden in zip(shifted_token_ids, target_hidden_rows, strict=True)
+        ):
+            raise ValueError(
+                "ragged MTP sync requires one non-empty [1, q, hidden_size] tensor per slot"
+            )
+        if not slots or self._batched_sync is None:
+            return {
+                slot: self._sync_real_suffix(slot, tokens, target_hidden_rows[index])
+                for index, (slot, tokens) in enumerate(zip(slots, shifted_token_ids, strict=True))
+            }
+
+        replay_ragged = getattr(self._batched_sync, "replay_ragged", None)
+        if replay_ragged is None:
+            grouped: dict[int, list[tuple[int, list[int], torch.Tensor]]] = {}
+            for slot, tokens, hidden in zip(
+                slots, shifted_token_ids, target_hidden_rows, strict=True
+            ):
+                grouped.setdefault(len(tokens), []).append((slot, tokens, hidden))
+            result: dict[int, tuple[int, torch.Tensor]] = {}
+            for group in grouped.values():
+                if len(group) == 1:
+                    # A legacy helper without `replay_ragged` only promised
+                    # the old B>=2 equal-length entrypoint.  Preserve its
+                    # singleton eager fallback rather than treating the
+                    # absence of ragged support as permission to call an
+                    # incompatible one-row `replay` method.  The real graph
+                    # helper implements `replay_ragged`, so production B=1
+                    # still takes the unified graph path below.
+                    slot, tokens, hidden = group[0]
+                    result[slot] = self._sync_real_suffix(slot, tokens, hidden)
+                    continue
+                result.update(
+                    self._sync_real_suffix_batch(
+                        [entry[0] for entry in group],
+                        [entry[1] for entry in group],
+                        [entry[2] for entry in group],
+                    )
+                )
+            return result
+
+        starts = [self._sync_len[slot] for slot in slots]
+        for slot, start in zip(slots, starts, strict=True):
+            self._caches[slot].seq_len = start
+        first_drafts, mtp_hidden = replay_ragged(
+            slots, shifted_token_ids, target_hidden_rows, starts
+        )
+        first_draft_values = first_drafts.tolist()
+        result: dict[int, tuple[int, torch.Tensor]] = {}
+        for index, (slot, start, tokens) in enumerate(
+            zip(slots, starts, shifted_token_ids, strict=True)
+        ):
+            end = start + len(tokens)
+            self._caches[slot].seq_len = end
+            self._sync_len[slot] = end
+            result[slot] = (
+                int(first_draft_values[index]),
+                mtp_hidden[index : index + 1],
+            )
+        self.stats["batched_sync_replays"] += 1
+        self.stats["batched_sync_slots"] += len(slots)
+        self.backend.stats["mtp_batched_sync_replays"] += 1
+        self.backend.stats["mtp_batched_sync_slots"] += len(slots)
+        return result
+
+    def _continue_draft(
+        self, slot: int, first_draft: int, first_hidden: torch.Tensor
+    ) -> list[int]:
+        """Produce the remaining ``K-1`` autoregressive draft tokens.
+
+        Step 0 is emitted by :meth:`_sync_real_suffix` from real target
+        context.  Only these continuation steps are speculative and eligible
+        for the fixed-shape draft CUDA Graph.
+        """
+        if self.k <= 1:
+            return [first_draft]
         cache = self._caches[slot]
         if self._draft_cg is not None:
-            # 2026-08-03 CUDA-Graph follow-up (runtime.backends.
-            # qwen36_mtp_cudagraph): replaces the eager K-step loop below
-            # with one captured-graph replay, bit-exact by construction
-            # (same ops, same weights, same cache -- see
-            # scripts/verify_qwen36_mtp_cuda_graph_bit_exact.py). Advances
-            # cache.seq_len itself (module docstring on Qwen36MTPDraftCudaGraph
-            # .replay: bypasses Qwen36PagedAttentionCache.append entirely).
-            return self._draft_cg.replay(slot, seed_token, seed_hidden, cache.seq_len)
-        mtp_hidden = seed_hidden
-        next_input = torch.tensor([[seed_token]], dtype=torch.long, device=self.device)
-        drafts: list[int] = []
-        for _ in range(self.k):
+            tail = self._draft_cg.replay(slot, first_draft, first_hidden, cache.seq_len)
+            expected_tail = self.k - 1
+            if len(tail) != expected_tail:
+                raise RuntimeError(
+                    f"MTP draft graph returned {len(tail)} continuation tokens for slot {slot}; "
+                    f"expected K-1={expected_tail} after teacher-forced step 0"
+                )
+            self._record_draft_graph_replay(1)
+            return [first_draft, *tail]
+        drafts = [first_draft]
+        next_input = torch.tensor([[first_draft]], dtype=torch.long, device=self.device)
+        mtp_hidden = first_hidden
+        for _ in range(1, self.k):
             draft_token, mtp_hidden = self.model.mtp_step(
                 next_input, mtp_hidden, cache.seq_len, cache
             )
@@ -487,35 +790,66 @@ class Qwen36MTPEngine:
             next_input = draft_token.view(1, 1)
         return drafts
 
-    def draft_after_prefill(
-        self, slot: int, *, first_token: int, pred_hidden: torch.Tensor
+    def _continue_draft_batch(
+        self, slots: list[int], first_drafts: list[int], first_hiddens: torch.Tensor
+    ) -> dict[int, list[int]]:
+        """Batch MTP's K-1 speculative continuation steps across slots."""
+        if len(slots) != len(first_drafts):
+            raise ValueError("MTP draft slots and first draft tokens must have equal length")
+        if self.k <= 1:
+            return {slot: [token] for slot, token in zip(slots, first_drafts, strict=True)}
+        if self._draft_cg is not None:
+            starts = [self._caches[slot].seq_len for slot in slots]
+            tails = self._draft_cg.replay_batch(slots, first_drafts, first_hiddens, starts)
+            expected_tail = self.k - 1
+            for slot in slots:
+                tail = tails[slot]
+                if len(tail) != expected_tail:
+                    raise RuntimeError(
+                        "MTP draft graph returned "
+                        f"{len(tail)} continuation tokens for slot {slot}; expected "
+                        f"K-1={expected_tail} after teacher-forced step 0"
+                    )
+            self._record_draft_graph_replay(len(slots))
+            return {
+                slot: [first_draft, *tails[slot]]
+                for slot, first_draft in zip(slots, first_drafts, strict=True)
+            }
+        return {
+            slot: self._continue_draft(slot, first_draft, first_hiddens[index : index + 1])
+            for index, (slot, first_draft) in enumerate(zip(slots, first_drafts, strict=True))
+        }
+
+    def sync_prefill_chunk(
+        self, slot: int, *, shifted_token_ids: list[int], target_hidden: torch.Tensor, final: bool
     ) -> list[int]:
-        """Seed the very first round's drafts right after a (cold or
-        prefix-cache-hit) prefill.
-
-        ``pred_hidden``: the hidden state at the LAST prompt/suffix
-        position -- i.e. the same hidden whose argmax IS ``first_token``
-        (``Qwen36Backend._prefill_forward``'s own last-position output,
-        which every existing caller already discards after taking its
-        argmax; MTP is the first caller that needs it kept). This is
-        already the correctly-shifted seed the module docstring describes
-        -- no extra forward needed, unlike every prior script's bootstrap
-        (which discarded exactly this value and recomputed a
-        WRONG one instead -- see module docstring).
-
-        Caller must have reset this slot's MTP cache first (a fresh
-        ``prefill_chunked_begin`` admission always does, via
-        ``Qwen36Backend.reset_slot``).
-        """
-        if self._caches[slot].seq_len != 0:
-            raise RuntimeError(
-                f"draft_after_prefill: slot {slot} mtp cache is not fresh "
-                f"(seq_len={self._caches[slot].seq_len}); caller must reset_slot first"
-            )
+        """Synchronise one prefill chunk; propose only after its final chunk."""
+        first_draft, first_hidden = self._sync_real_suffix(slot, shifted_token_ids, target_hidden)
+        if not final:
+            return []
         if self._spec_rows is not None:
             self._spec_rows.sync_from_live(slot)
             self._spec_state_col[slot] = 0
-        return self._draft_loop(slot, first_token, pred_hidden)
+        return self._continue_draft(slot, first_draft, first_hidden)
+
+    def resync_prefix_tail(
+        self, slot: int, *, shifted_token_ids: list[int], target_hidden: torch.Tensor
+    ) -> list[int]:
+        """Re-teacher-force the final prefix row after a full-prompt restore.
+
+        The scratch snapshot already holds every row the cold prefill
+        synced -- including this suffix's -- so the restore must back up
+        one row before re-syncing it, or the MTP cache ends up one row
+        ahead of the backbone KV and ``preserve_prefix``'s lockstep
+        invariant breaks at reset.
+        """
+        if self._sync_len[slot] < 1:
+            raise RuntimeError("full-prompt restore needs at least one synced MTP row")
+        self._sync_len[slot] -= 1
+        self._caches[slot].seq_len = self._sync_len[slot]
+        return self.sync_prefill_chunk(
+            slot, shifted_token_ids=shifted_token_ids, target_hidden=target_hidden, final=True
+        )
 
     # -- verify + commit + re-draft (the hot path) ------------------------
 
@@ -538,30 +872,23 @@ class Qwen36MTPEngine:
         recovery/bonus token), ``num_accepted``, ``next_anchor``,
         ``next_draft_tokens``[, ``logprobs``].
 
-        Every quantity needed to seed the NEXT round's draft-loop step 0
-        (:meth:`_draft_loop`'s ``seed_hidden``) comes from THIS round's own
-        anchor-advance + verify forward -- see the module docstring: the
-        target hidden that predicted ``anchor_token`` (from THIS round's
-        own bootstrap or the previous round's own such value) is combined
-        with ``verify_hidden`` into one ``[1, k+1, H]`` tensor
-        (``all_hiddens``) where row ``m`` (``m`` = accepted count) is
-        exactly the hidden state that predicted ``next_anchor`` -- no extra
-        forward pass beyond the one every round already needs to advance
-        ``state`` through ``anchor_token`` before ``verify_forward`` can
-        run (``Qwen36TextModelSelfBuilt.verify_forward``'s own precondition:
-        "state already reflects having processed the anchor").
+        Every target hidden row needed to synchronise the newly real span is
+        produced by this round's ``anchor + K`` verify forward.  No extra
+        target forward is needed: the accepted prefix plus the recovery/bonus
+        token becomes MTP's teacher-forced suffix, and only its later draft
+        continuation remains speculative.
         """
         pool = self.backend.pool
         state = pool.slot_state(slot)
-        cache = self._caches[slot]
         k = len(drafts)
-        entering_seq_len = cache.seq_len
-        round_mtp_start = entering_seq_len - k
-        if round_mtp_start < 0:
+        if k != self.k:
+            raise ValueError(f"round received {k} drafts; engine requires K={self.k}")
+        cache = self._caches[slot]
+        expected_speculative_len = self._sync_len[slot] + max(k - 1, 0)
+        if cache.seq_len != expected_speculative_len:
             raise RuntimeError(
-                f"round: slot {slot} mtp cache (seq_len={entering_seq_len}) is shorter "
-                f"than k={k} drafts -- draft_after_prefill/round must have written "
-                "exactly k rows before this call"
+                f"round: slot {slot} MTP cache has seq_len={cache.seq_len}; expected "
+                f"real prefix {self._sync_len[slot]} + K-1={max(k - 1, 0)} continuation rows"
             )
 
         # -- (a) ONE forward over [anchor] + drafts, qo_len = k+1.
@@ -576,28 +903,28 @@ class Qwen36MTPEngine:
         # measured at ~35 ms of the ~137 ms round
         # (notes/2026-08-03-mtp-verify-mode.md).
         #
-        # `all_hiddens` means exactly what it meant before, row for row:
-        # row 0 is the hidden AFTER the anchor (it predicted drafts[0]), and
-        # row i is the hidden after drafts[i-1]. It is now produced directly
-        # instead of being torch.cat'd from two forwards' outputs, so every
-        # downstream index (pred_hidden_next, _resync) is unchanged.
+        # `all_hiddens` is row-for-row aligned with `verify_tokens`: row 0
+        # was produced while consuming the anchor and predicts drafts[0]; row
+        # `m` predicts the recovery/bonus token after `m` accepted drafts.
         #
         # `past_len` is now the length BEFORE the anchor, so the commit below
         # keeps `m + 1` positions (the anchor is always accepted), not `m`.
         past_len = state.num_tokens_seen
         verify_tokens = [anchor_token, *drafts]
-        verify_input = torch.tensor([verify_tokens], dtype=torch.long, device=self.device)
         if self._verify_cg is not None:
-            all_hiddens = self._verify_cg.replay(slot, verify_tokens, past_len)
+            all_hiddens = self._verify_cg.replay([slot], [verify_tokens], [past_len])
+            self._record_verify_graph_replay(1)
             gdn_snapshots = None
-        elif self._spec_rows is not None:
-            all_hiddens, gdn_snapshots = self.model.verify_forward(
-                verify_input,
-                state,
-                spec_state_rows=self._spec_rows.rows_for_slot(slot),
-            )
         else:
-            all_hiddens, gdn_snapshots = self.model.verify_forward(verify_input, state)
+            verify_input = torch.tensor([verify_tokens], dtype=torch.long, device=self.device)
+            if self._spec_rows is not None:
+                all_hiddens, gdn_snapshots = self.model.verify_forward(
+                    verify_input,
+                    state,
+                    spec_state_rows=self._spec_rows.rows_for_slot(slot),
+                )
+            else:
+                all_hiddens, gdn_snapshots = self.model.verify_forward(verify_input, state)
         all_logits = self.model.compute_logits(all_hiddens)[0]  # [k+1, vocab]
 
         sampled = params is not None and not params.is_greedy
@@ -627,16 +954,13 @@ class Qwen36MTPEngine:
         # round's forward started at the anchor, and the anchor is committed
         # unconditionally (accept/reject only ever rejects DRAFTS). past_len
         # is correspondingly the length before the anchor.
-        self.model.commit_verify(
-            state, gdn_snapshots, past_len=past_len, accepted_count=m + 1
-        )
+        self.model.commit_verify(state, gdn_snapshots, past_len=past_len, accepted_count=m + 1)
         if self._spec_rows is not None:
-            # m + 1 for the same reason accepted_count is: this round's
-            # forward began at the anchor, so the committed state sits one
-            # column past the accepted-draft count. Column 0 holds the state
-            # this round STARTED from, which is never the one to commit.
-            self._spec_rows.activate(slot, m + 1)
-            self._spec_state_col[slot] = m + 1
+            # Column m is the state after position m: anchor plus m accepted
+            # drafts.  The incoming state occupied column zero only before
+            # this verify and has just been overwritten by the anchor result.
+            self._spec_rows.activate(slot, m)
+            self._spec_state_col[slot] = m
 
         # -- KV/committed-token bookkeeping, "committed ahead of kv by one"
         # (the same invariant DFlash's own round already keeps for Laguna
@@ -652,22 +976,18 @@ class Qwen36MTPEngine:
         pool.slot_committed_tokens[slot].extend(committed)
         self.backend._maybe_checkpoint(slot)  # noqa: SLF001 -- friend-class access, same pattern DFlash uses
 
-        # -- (c) truncate mtp_cache's exploratory tail; optionally resync
-        # the interior accepted positions first.
-        cache.seq_len = round_mtp_start + m
-        if self.enable_resync and m >= 2:
-            self._resync(cache, round_mtp_start, drafts, all_hiddens, m)
-            self.stats["resync_rounds"] += 1
-
-        # -- (d) draft the NEXT round, correctly-shifted seed (module
-        # docstring's fix): row `m` of all_hiddens is exactly the hidden
-        # state that predicted new_anchor (row 0 = hidden after the anchor,
-        # used when m==0; rows 1..k = hidden after drafts[0..k-1], used when
-        # m>=1 -- the SAME row verify_argmax[m-1] was read from to decide new_anchor's
-        # own identity, so this is never a fresh computation, only a kept
-        # reference to one already made).
-        pred_hidden_next = all_hiddens[:, m : m + 1, :]
-        next_drafts = self._draft_loop(slot, new_anchor, pred_hidden_next)
+        # -- (c) re-synchronise the MTP head with every newly real target
+        # position.  The target verify already produced exactly these hidden
+        # rows, so this is no extra backbone forward.  It replaces the old
+        # tail-only cache rewind (and its optional interior-only resync),
+        # restoring the historical invariant ``mtp_sync_len == target KV
+        # length`` before adding the next speculative tail.
+        real_new_tokens = [anchor_token, *committed[:-1]]
+        shifted = [*real_new_tokens[1:], new_anchor]
+        first_draft, first_hidden = self._sync_real_suffix(
+            slot, shifted, all_hiddens[:, : m + 1, :]
+        )
+        next_drafts = self._continue_draft(slot, first_draft, first_hidden)
 
         self.stats["rounds"] += 1
 
@@ -684,50 +1004,122 @@ class Qwen36MTPEngine:
             ]
         return result
 
-    # -- optional per-round resync (QSR_SERVER_MTP_RESYNC) ----------------
-
-    def _resync(
+    def round_batch(
         self,
-        cache: Qwen36PagedAttentionCache,
-        round_mtp_start: int,
-        drafts: list[int],
-        all_hiddens: torch.Tensor,
-        m: int,
-    ) -> None:
-        """Re-ground mtp_cache rows ``round_mtp_start+1 .. round_mtp_start+
-        m-1`` (the ``m-1`` INTERIOR accepted draft positions) with the
-        target's own real hidden states from this round's verify forward,
-        overwriting the draft head's self-chained (possibly drifted)
-        hidden state from the exploratory loop that first drafted them.
+        slots: list[int],
+        anchors: dict[int, int],
+        drafts_by_slot: dict[int, list[int]],
+        *,
+        params_per_slot: dict[int, SamplingParams] | None = None,
+        return_logprobs: bool = False,
+        top_logprobs: int = 0,
+    ) -> dict[int, dict[str, Any]]:
+        """Run one uniform ``anchor + K`` verify for every active slot.
 
-        Row ``round_mtp_start`` (``drafts[0]``) is never touched -- it was
-        already written using the correctly-shifted seed in the PREVIOUS
-        round's draft loop (:meth:`_draft_loop`'s ``seed_hidden``), so it
-        is already grounded in real target data, not drifted. The row for
-        ``new_anchor`` (position ``round_mtp_start+m``) does not exist yet
-        at all -- it is written by THIS round's own re-draft step (e),
-        using ``pred_hidden_next`` as its seed, which is itself real target
-        data (row ``m`` of ``all_hiddens``). So exactly ``m-1`` rows -- the
-        accepted drafts strictly between the first and the last -- ever
-        need rewriting.
-
-        Uses the correctly-shifted pairing throughout (module docstring):
-        row ``round_mtp_start+j`` (``j=1..m-1``) is re-written with
-        ``(token=drafts[j], hidden=verify_hidden[j-1])`` -- the hidden
-        state that PREDICTED ``drafts[j]``, one position before it, not
-        the hidden state produced BY processing it. This differs from
-        ``work/mtp-resync-20260802``'s port (``aed0e2d``,
-        ``scripts/mtp_resync_ab_sweep.py``), which pairs
-        ``(drafts[i], verify_hidden[i])`` for ``i=0..m-2`` starting at
-        ``round_mtp_start+1`` -- same starting row, but the unshifted
-        pairing that port's own commit message names explicitly. Not a
-        byte-for-byte reuse of that port on purpose.
+        M-2's graph has a fixed query length but a variable request count.
+        The target verify and greedy acceptance batch across slots; M-4 also
+        batches each position of the intrinsically chained MTP draft head.
+        Sampling remains on the proven single-slot path until its probability
+        tensors are made batched too.
         """
-        resync_tokens = torch.tensor([drafts[1:m]], dtype=torch.long, device=self.device)
-        resync_hidden = all_hiddens[:, 1:m, :]  # verify_hidden[0 .. m-2]
-        cache.seq_len = round_mtp_start + 1
-        self.model.mtp_resync_step(resync_tokens, resync_hidden, round_mtp_start + 1, cache)
-        if cache.seq_len != round_mtp_start + m:
-            raise RuntimeError(
-                f"resync: mtp cache landed at {cache.seq_len}, expected {round_mtp_start + m}"
+        if not slots:
+            return {}
+        if (
+            self._verify_cg is None
+            or any(
+                params_per_slot is not None
+                and params_per_slot.get(slot) is not None
+                and not params_per_slot[slot].is_greedy
+                for slot in slots
             )
+        ):
+            return {
+                slot: self.round(
+                    slot,
+                    anchors[slot],
+                    drafts_by_slot[slot],
+                    params=(params_per_slot.get(slot) if params_per_slot else None),
+                    return_logprobs=return_logprobs,
+                    top_logprobs=top_logprobs,
+                )
+                for slot in slots
+            }
+
+        if any(len(drafts_by_slot[slot]) != self.k for slot in slots):
+            raise ValueError("batched MTP verify requires the engine's uniform K drafts per slot")
+
+        pool = self.backend.pool
+        states = [pool.slot_state(slot) for slot in slots]
+        caches = [self._caches[slot] for slot in slots]
+        past_lens = [state.num_tokens_seen for state in states]
+        if any(
+            cache.seq_len != self._sync_len[slot] + max(self.k - 1, 0)
+            for slot, cache in zip(slots, caches)
+        ):
+            raise RuntimeError(
+                "batched MTP verify received a cache without its K-1-row continuation tail"
+            )
+
+        verify_tokens = [[anchors[slot], *drafts_by_slot[slot]] for slot in slots]
+        all_hiddens = self._verify_cg.replay(slots, verify_tokens, past_lens)
+        self._record_verify_graph_replay(len(slots))
+        all_logits = self.model.compute_logits(all_hiddens)
+        decisions = determine_accept_reject_batch(
+            slots,
+            {slot: [anchors[slot], *drafts_by_slot[slot]] for slot in slots},
+            all_logits.reshape(-1, all_logits.shape[-1]),
+            self.k,
+        )
+
+        results: dict[int, dict[str, Any]] = {}
+        sync_slots: list[int] = []
+        sync_tokens: list[list[int]] = []
+        sync_hidden_rows: list[torch.Tensor] = []
+        for request, slot in enumerate(slots):
+            state = states[request]
+            decision = decisions[slot]
+            m = decision["num_accepted"]
+            committed: list[int] = decision["committed"]
+            new_anchor = committed[-1]
+            self.model.commit_verify(state, None, past_len=past_lens[request], accepted_count=m + 1)
+            if self._spec_rows is not None:
+                self._spec_rows.activate(slot, m)
+                self._spec_state_col[slot] = m
+            pool.slot_kv_len[slot] = state.num_tokens_seen
+            pool.slot_committed_tokens[slot].extend(committed)
+            self.backend._maybe_checkpoint(slot)  # noqa: SLF001 - backend owns checkpoint policy
+            real_new_tokens = [anchors[slot], *committed[:-1]]
+            shifted = [*real_new_tokens[1:], new_anchor]
+            sync_slots.append(slot)
+            sync_tokens.append(shifted)
+            sync_hidden_rows.append(all_hiddens[request : request + 1, : m + 1])
+            result: dict[str, Any] = {
+                "committed": committed,
+                "num_accepted": m,
+                "next_anchor": new_anchor,
+            }
+            if return_logprobs:
+                result["logprobs"] = [
+                    compute_logprobs(
+                        all_logits[request, position : position + 1],
+                        [committed[position]],
+                        top_k=top_logprobs,
+                    )[0]
+                    for position in range(len(committed))
+                ]
+            results[slot] = result
+
+        first_by_slot = self._sync_real_suffix_batch_ragged(
+            sync_slots, sync_tokens, sync_hidden_rows
+        )
+        first_drafts = [first_by_slot[slot][0] for slot in slots]
+        first_hiddens = [first_by_slot[slot][1] for slot in slots]
+
+        next_drafts_by_slot = self._continue_draft_batch(
+            slots, first_drafts, torch.cat(first_hiddens, dim=0)
+        )
+        for slot in slots:
+            results[slot]["next_draft_tokens"] = next_drafts_by_slot[slot]
+
+        self.stats["rounds"] += len(slots)
+        return results

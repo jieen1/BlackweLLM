@@ -74,26 +74,29 @@ the (token, hidden) pairing bug found and fixed while wiring this in --
 every prior standalone B3 script measured acceptance far below what the
 model API's own documented contract implies, because every one of them
 violated that contract the same way.
-``runtime/recurrent_state_pool.py``'s ``spec_row`` addressing (built for a
-BATCHED multi-slot GDN spec verify, matching the historical vLLM-based
-runner's ``verify_batch_spec``) still has no caller here: this backend's
-model graph is batch=1 by construction, so MTP rounds are driven
-sequentially per slot (matching DFlash's own documented precedent), not
-through a fused batched verify. A real future throughput lever, not
-attempted in this landing.
+``runtime/recurrent_state_pool.py``'s ``spec_row`` addressing backs the
+batched MTP verify.  Each active slot contributes the same ``K+1``
+anchor-plus-draft query, while graph-owned source and destination row-id
+buffers select that slot's GDN state without baking a particular slot address
+into capture.  The target verify and greedy acceptance therefore batch across
+slots; only the intrinsically chained MTP draft head remains per-slot.
 
 Still deliberately out of scope, stated rather than implied
 --------------------------------------------------------------
 * **Warm continue.** ``capabilities.warm_continue`` is ``False`` -- the same
   honest ``False`` that ``protocol.py``'s docstring says the Laguna path
   should have been carrying all along (N8).
-* **Cross-slot KV sharing.** Static per-slot pages, per §8 decision 5.
+* **General-purpose BlockPool/LRU eviction.** Cross-slot backbone KV now
+  shares fixed-capacity pages with refcounts and copy-on-write; GDN and the
+  one-layer MTP causal cache still restore explicitly. Content-addressed
+  global eviction remains a separate allocator step.
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -154,6 +157,29 @@ class Qwen36SlotStateView:
         return self.kv_len == 0 and not self.committed_tokens
 
 
+@dataclass
+class _PersistentPrefixEntry:
+    """One bounded, slot-independent Qwen prefix snapshot.
+
+    Its KV bytes occupy the already-allocated scratch row, while the token
+    identity, recurrent checkpoint, and (when enabled) MTP causal snapshot
+    are deliberately co-owned here.  ``scratch_page_offsets`` comes from the
+    fixed scratch row, so an LRU of entries consumes no extra GPU allocation.
+    """
+
+    token_ids: tuple[int, ...]
+    kv_len: int
+    hash_value: str
+    checkpoint: list[torch.Tensor]
+    checkpoint_key: tuple[str, str]
+    has_mtp_snapshot: bool
+    scratch_page_offsets: tuple[int, ...]
+    # Anchor-row hidden of a full-prompt entry.  An exact-length hit would
+    # otherwise leave no token to recompute and therefore no logits; the
+    # stored row reproduces them without any forward.
+    final_hidden: torch.Tensor | None = None
+
+
 #: int32's positive range -- the width of the element count in the cutlass DSL
 #: memref descriptor sparkinfer's w4a16 fused MoE builds. Exceeding it raises
 #: OverflowError from inside the kernel launch, not from anything we control.
@@ -183,6 +209,7 @@ class Qwen36Backend:
         device: torch.device | str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
         enable_prefix_cache: bool = True,
+        enable_persistent_prefix_cache: bool | None = None,
         checkpoint_byte_budget: int | None = None,
         batched_decode: bool = True,
     ) -> None:
@@ -192,6 +219,15 @@ class Qwen36Backend:
         self.device = torch.device(device)
         self.dtype = dtype
         self.enable_prefix_cache = enable_prefix_cache
+        # The scratch-arena cache is a CUDA production feature.  Keeping the
+        # CPU/stub default on the established rolling-slot model avoids making
+        # its deliberately tiny checkpoint-budget tests accidentally exercise
+        # a second allocator; those tests opt in when they target this arena.
+        self.enable_persistent_prefix_cache = (
+            self.device.type == "cuda"
+            if enable_persistent_prefix_cache is None
+            else enable_persistent_prefix_cache
+        )
         self.batched_decode = batched_decode
 
         self.pool = Qwen36SlotPool(
@@ -229,6 +265,9 @@ class Qwen36Backend:
         self._prefix_cache_tokens: list[list[int] | None] = [None] * num_slots
         self._prefix_cache_kv_len: list[int] = [0] * num_slots
         self._pending_prefix_hits: dict[int, PrefixHit] = {}
+        self._pending_cached_hidden: dict[int, torch.Tensor] = {}
+        self._persistent_prefixes: OrderedDict[str, _PersistentPrefixEntry] = OrderedDict()
+        self._persistent_free_scratch_pages = set(range(self.pool.pages_per_slot))
 
         # -- second cache family -------------------------------------------
         ckpt_bytes = self.pool.recurrent_checkpoint_nbytes()
@@ -251,12 +290,29 @@ class Qwen36Backend:
             "prefix_kv_hit_tokens": 0,
             "prefix_state_hit_tokens": 0,
             "prefix_hit_split_events": 0,
+            "prefix_cross_slot_restores": 0,
+            "prefix_persistent_restores": 0,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
             "checkpoints_taken": 0,
             "checkpoints_evicted_by_budget": 0,
             "checkpoints_evicted_by_kv": 0,
             "decode_rounds": 0,
             "decode_tokens": 0,
             "decode_graph_replays": 0,
+            "prefill_batched_forwards": 0,
+            # MTP owns the graph object, but the backend stats are what
+            # /debug/stats exposes.  These counters prove a live c>1 round
+            # actually used the fused verify graph rather than merely having
+            # captured one at startup.
+            "mtp_verify_graph_replays": 0,
+            "mtp_verify_graph_slots": 0,
+            "mtp_batched_verify_replays": 0,
+            "mtp_draft_graph_replays": 0,
+            "mtp_draft_graph_slots": 0,
+            "mtp_batched_draft_replays": 0,
+            "mtp_batched_sync_replays": 0,
+            "mtp_batched_sync_slots": 0,
         }
 
         self._decode_graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -314,6 +370,12 @@ class Qwen36Backend:
         """
         if self._mtp is not None:
             return
+        if self._decode_graphs:
+            raise RuntimeError(
+                "enable MTP before capture_decode_cuda_graph(): MTP extends the pooled GDN "
+                "state allocation so column zero aliases ordinary decode state; enabling it after "
+                "capture would leave decode graphs bound to stale addresses"
+            )
         from runtime.backends.qwen36_mtp import Qwen36MTPEngine
 
         self._mtp = Qwen36MTPEngine(
@@ -344,8 +406,23 @@ class Qwen36Backend:
             )
             for s in range(self.num_slots)
         )
+        # The shared snapshot field is the server's only CUDA-Graph health
+        # surface.  Include MTP's independently-captured draft/verify graphs
+        # under unambiguous names; ``anchor=unused`` is lifecycle metadata,
+        # not a graph attempt, and therefore intentionally omitted.
+        cg_status = dict(self.cg_status)
+        if self._mtp is not None:
+            cg_status.update(
+                {
+                    f"mtp_{name}": status
+                    for name, status in self._mtp.cg_status.items()
+                    if status != "unused"
+                }
+            )
         return BackendSnapshot(
-            slots=slots, prefix=prefix, dflash_cg_status=tuple(sorted(self.cg_status.items()))
+            slots=slots,
+            prefix=prefix,
+            dflash_cg_status=tuple(sorted(cg_status.items())),
         )
 
     def reset_slot(self, slot: int) -> None:
@@ -364,8 +441,12 @@ class Qwen36Backend:
         if self.pool.slot_committed_tokens[slot] and self.pool.slot_kv_len[slot] > 0:
             self._prefix_cache_tokens[slot] = list(self.pool.slot_committed_tokens[slot])
             self._prefix_cache_kv_len[slot] = self.pool.slot_kv_len[slot]
+            if self._mtp is not None:
+                self._mtp.preserve_prefix(slot, self.pool.slot_kv_len[slot])
+            self._store_persistent_prefix(slot)
         self.pool.reset_slot(slot)
         self._pending_prefix_hits.pop(slot, None)
+        self._pending_cached_hidden.pop(slot, None)
         if self._mtp is not None:
             self._mtp.reset_slot(slot)
 
@@ -382,6 +463,8 @@ class Qwen36Backend:
         """
         self._prefix_cache_tokens[slot] = None
         self._prefix_cache_kv_len[slot] = 0
+        if self._mtp is not None:
+            self._mtp.drop_prefix(slot)
         if slot in self._checkpoint_tensors:
             self.stats["checkpoints_evicted_by_kv"] += 1
         self._evict_checkpoint(slot)
@@ -463,6 +546,13 @@ class Qwen36Backend:
                 f"(prefix_hit={prefix_hit} == len(prompt)); the caller must leave "
                 "at least one token so there are logits to sample from"
             )
+        # The production pool owns page aliases and must detach before a
+        # write.  A few torch-free chunking tests deliberately use a minimal
+        # state-only pool double with no KV storage at all; it cannot contain
+        # an alias, so its absence is correctly a no-op.
+        prepare_kv_writes = getattr(self.pool, "prepare_kv_writes", None)
+        if prepare_kv_writes is not None:
+            prepare_kv_writes(slot, prefix_hit, len(suffix))
         # Chunked, and NOT optional. A single forward over the whole suffix
         # overflows int32 inside sparkinfer's w4a16 fused MoE: it builds a
         # memref whose element count is `m * fc1_cols`, and with
@@ -576,11 +666,12 @@ class Qwen36Backend:
                     f"continues from {hit}; the caller must reset_slot first"
                 )
             suffix = list(prompt[hit:])
-            if not suffix:
+            if not suffix and slot not in self._pending_cached_hidden:
                 raise ValueError(
                     f"prefill for slot {slot} has nothing to compute "
-                    f"(prefix_hit={hit} == len(prompt)); the caller must leave "
-                    "at least one token so there are logits to sample from"
+                    f"(prefix_hit={hit} == len(prompt)) and no stored anchor "
+                    "hidden exists; the caller must leave at least one token "
+                    "so there are logits to sample from"
                 )
             suffixes.append(suffix)
 
@@ -637,37 +728,135 @@ class Qwen36Backend:
         chunk = state.chunk_size
         finished = True
 
-        for slot, prompt, suffix in zip(
-            state.slots, state.prompts_per_slot, state.suffix_per_slot
-        ):
-            if start >= len(suffix):
-                continue  # shorter prompt: already committed on an earlier call
-            end = min(start + chunk, len(suffix))
-            is_last = end >= len(suffix)
-            if not is_last:
-                finished = False
+        # Historical no-vLLM serving batched every equal-length prefill into
+        # one extend forward.  Keep that fast path deliberately narrow here:
+        # a one-shot homogeneous admission has no ragged padding and no
+        # cross-chunk host-length ambiguity, so the pooled BxQ implementation
+        # is semantically identical to the B1 loop.  Mixed/ragged/chunked
+        # admissions remain on the proven per-slot path below.
+        batched_hidden: dict[int, torch.Tensor] = {}
+        # A prefill needs logits only at each request's final position.  The
+        # historical batched runner explicitly gathered those rows before
+        # the vocab projection: projecting every prompt position into the
+        # 248k-token vocabulary is both unnecessary and prohibitive at long
+        # context.  Keep the full hidden sequence for MTP's shifted GDN
+        # sync, but materialize exactly B vocab rows for the anchors.
+        batched_anchor_logits: dict[int, torch.Tensor] = {}
+        pending = [
+            (slot, suffix)
+            for slot, suffix in zip(state.slots, state.suffix_per_slot)
+            if start < len(suffix)
+        ]
+        if pending and len(pending) > 1 and start == 0:
+            pending_lengths = {len(suffix) for _slot, suffix in pending}
+            if len(pending_lengths) == 1 and next(iter(pending_lengths)) <= chunk:
+                batch_slots = [slot for slot, _suffix in pending]
+                batch_tokens = [suffix for _slot, suffix in pending]
+                try:
+                    prefill_batch = self.pool.build_prefill_batch(batch_slots, batch_tokens)
+                except ValueError:
+                    # The pool documents the exact safe subset (uniform
+                    # recurrent regime and ordinary live rows).  A request
+                    # outside it is not an error; it simply has no batched
+                    # equivalent yet.
+                    pass
+                else:
+                    hidden_batch = self.model.prefill_batch(prefill_batch)
+                    self.pool.commit_prefill_batch(batch_slots, batch_tokens)
+                    self.stats["prefill_batched_forwards"] += 1
+                    anchor_logits = self.model.compute_logits(hidden_batch[:, -1, :])
+                    batched_hidden = {
+                        slot: hidden_batch[index : index + 1]
+                        for index, slot in enumerate(batch_slots)
+                    }
+                    batched_anchor_logits = {
+                        slot: anchor_logits[index : index + 1]
+                        for index, slot in enumerate(batch_slots)
+                    }
 
-            input_ids = torch.tensor([suffix[start:end]], dtype=torch.long, device=self.device)
-            hidden = self.model(input_ids, self.pool.slot_state(slot))
+        for slot, prompt, suffix in zip(state.slots, state.prompts_per_slot, state.suffix_per_slot):
+            cached_hidden = (
+                self._pending_cached_hidden.pop(slot, None) if start == 0 else None
+            )
+            if start >= len(suffix):
+                if cached_hidden is None:
+                    continue  # shorter prompt: already committed on an earlier call
+                # Full-prompt persistent hit: the restored KV/GDN/MTP state
+                # plus the stored anchor row replace the forward entirely.
+                # The kept row is [1, 1, hidden], exactly the shape a
+                # one-token suffix forward would have produced.
+                hidden = cached_hidden
+                end = len(suffix)
+                is_last = True
+            else:
+                hidden = batched_hidden.get(slot)
+            if start < len(suffix):
+                end = min(start + chunk, len(suffix))
+                is_last = end >= len(suffix)
+                if not is_last:
+                    finished = False
+
+                if hidden is None:
+                    input_ids = torch.tensor(
+                        [suffix[start:end]], dtype=torch.long, device=self.device
+                    )
+                    hidden = self.model(input_ids, self.pool.slot_state(slot))
+            draft_tokens: list[int] = []
+            if self._mtp is not None:
+                # MTP's own attention must see the SAME real prefix as the
+                # target.  The shifted input for a non-final chunk reaches
+                # one token into the next chunk; the full prompt is already
+                # resident on the host, so this costs no target forward.
+                if is_last:
+                    logits = batched_anchor_logits.get(slot)
+                    if logits is None:
+                        logits = self.model.compute_logits(hidden[0, -1:])
+                    params = params_per_slot.get(slot)
+                    if params is None or params.is_greedy:
+                        token = int(logits[-1].argmax(dim=-1).item())
+                    else:
+                        gen = make_generator(params.seed)
+                        token = int(
+                            sample_from_logits(
+                                logits[-1].unsqueeze(0), params, generator=gen
+                            ).item()
+                        )
+                    shifted = [*suffix[start + 1 : end], token]
+                else:
+                    shifted = list(suffix[start + 1 : end + 1])
+                if cached_hidden is not None:
+                    # The restored snapshot already contains this row; back
+                    # up one before re-syncing it (see resync_prefix_tail).
+                    draft_tokens = self._mtp.resync_prefix_tail(
+                        slot, shifted_token_ids=shifted, target_hidden=hidden
+                    )
+                else:
+                    draft_tokens = self._mtp.sync_prefill_chunk(
+                        slot,
+                        shifted_token_ids=shifted,
+                        target_hidden=hidden,
+                        final=is_last,
+                    )
             if not is_last:
                 continue
 
-            logits = self.model.compute_logits(hidden[0])
-            params = params_per_slot.get(slot)
-            if params is None or params.is_greedy:
-                token = int(logits[-1].argmax(dim=-1).item())
-            else:
-                gen = make_generator(params.seed)
-                token = int(
-                    sample_from_logits(logits[-1].unsqueeze(0), params, generator=gen).item()
-                )
+            if self._mtp is None:
+                logits = batched_anchor_logits.get(slot)
+                if logits is None:
+                    logits = self.model.compute_logits(hidden[0, -1:])
+                params = params_per_slot.get(slot)
+                if params is None or params.is_greedy:
+                    token = int(logits[-1].argmax(dim=-1).item())
+                else:
+                    gen = make_generator(params.seed)
+                    token = int(
+                        sample_from_logits(logits[-1].unsqueeze(0), params, generator=gen).item()
+                    )
             self._commit_prefill(slot, prompt, token)
-            draft_tokens: list[int] = []
-            if self._mtp is not None:
-                pred_hidden = hidden[0][-1:].unsqueeze(0)  # [1, 1, H]
-                draft_tokens = self._mtp.draft_after_prefill(
-                    slot, first_token=token, pred_hidden=pred_hidden
-                )
+            # Publish the exact prompt boundary before decode drifts the
+            # rolling checkpoint past it -- this is the entry a same-prompt
+            # repeat restores from without any prefill forward.
+            self._store_persistent_prefix(slot, prompt_hidden=hidden[:, -1:, :])
             state.result[slot] = {"anchor": token, "draft_tokens": draft_tokens}
 
         state.chunk_start = start + chunk
@@ -777,11 +966,10 @@ class Qwen36Backend:
         (``classify_decode_slots`` routes here once ``self.has_speculative_decode``
         is true, i.e. once :meth:`enable_mtp` has been called).
 
-        Sequential per slot, not a fused batched verify -- see
-        ``runtime.backends.qwen36_mtp.Qwen36MTPEngine``'s class docstring
-        for why (this backend's whole model graph is batch=1 by
-        construction; DFlash's own docstring documents the identical
-        choice for the same structural reason).
+        The target verify is fused across the active slots whenever the MTP
+        verify CUDA Graph is healthy. Draft-head chaining remains per-slot;
+        sampled requests and the explicit eager fallback retain the proven
+        single-slot path.
 
         ``params_per_slot``: optional per-slot ``SamplingParams``, forwarded
         to :meth:`Qwen36MTPEngine.round`. A missing entry (or ``None``
@@ -789,19 +977,210 @@ class Qwen36Backend:
         """
         if self._mtp is None:
             raise RuntimeError("mtp_verify_and_commit_batch called without enable_mtp()")
-        return {
-            slot: self._mtp.round(
-                slot,
-                anchors[slot],
-                drafts[slot],
-                params=(params_per_slot.get(slot) if params_per_slot else None),
-                return_logprobs=return_logprobs,
-                top_logprobs=top_logprobs,
-            )
-            for slot in slots
-        }
+        return self._mtp.round_batch(
+            slots,
+            anchors,
+            drafts,
+            params_per_slot=params_per_slot,
+            return_logprobs=return_logprobs,
+            top_logprobs=top_logprobs,
+        )
 
     # -- protocol: prefix cache --------------------------------------------
+
+    def _persistent_prefix_entry(self, token_ids: list[int]) -> _PersistentPrefixEntry | None:
+        """Find the deepest scratch-arena entry authenticated by ``token_ids``."""
+        if not self.enable_persistent_prefix_cache:
+            return None
+        best: _PersistentPrefixEntry | None = None
+        for entry in self._persistent_prefixes.values():
+            if (
+                len(token_ids) < entry.kv_len
+                or (
+                    len(token_ids) == entry.kv_len
+                    and entry.final_hidden is None
+                )
+                or tuple(token_ids[: entry.kv_len]) != entry.token_ids
+            ):
+                continue
+            if entry.checkpoint_key not in self.checkpoint_pool:
+                continue
+            if self.checkpoint_pool.get_by_hash(_prefix_hash(token_ids, entry.kv_len)) != (
+                entry.checkpoint_key
+            ):
+                continue
+            if self._mtp is not None and not entry.has_mtp_snapshot:
+                continue
+            if best is None or entry.kv_len > best.kv_len:
+                best = entry
+        return best
+
+    def _persistent_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
+        """Return the scratch-arena hit, if all three cache families agree."""
+        entry = self._persistent_prefix_entry(token_ids)
+        if entry is None:
+            return PrefixHit(kv_hit=0, state_hit=0)
+        return PrefixHit(kv_hit=entry.kv_len, state_hit=entry.kv_len)
+
+    def _evict_persistent_until(self, pages: int) -> bool:
+        """Make ``pages`` scratch pages available without touching live aliases."""
+        while len(self._persistent_free_scratch_pages) < pages:
+            evictable = next(
+                (
+                    entry
+                    for entry in self._persistent_prefixes.values()
+                    if all(
+                        self.pool._page_refcounts[  # noqa: SLF001 - allocator invariant
+                            self.pool.scratch_row * self.pool.pages_per_slot + page
+                        ]
+                        == 1
+                        for page in entry.scratch_page_offsets
+                    )
+                ),
+                None,
+            )
+            if evictable is None:
+                return False
+            self.checkpoint_pool.evict(evictable.checkpoint_key)
+        return True
+
+    def _clear_persistent_prefixes(self) -> None:
+        """Invalidate scratch-arena metadata before a new graph capture.
+
+        Capture-time warmup is allowed to write the scratch row.  Re-capture
+        after serving is unusual but supported by the backend API, so cached
+        identities must be dropped before those writes rather than leaving a
+        valid-looking token hash over replaced bytes.
+        """
+        for entry in list(self._persistent_prefixes.values()):
+            self.checkpoint_pool.evict(entry.checkpoint_key)
+
+    def _store_persistent_prefix(
+        self, slot: int, *, prompt_hidden: torch.Tensor | None = None
+    ) -> None:
+        """Publish the latest safe boundary into the fixed scratch arena.
+
+        Called on ``reset_slot`` (the drifted generation boundary) and on
+        prefill commit (``prompt_hidden`` given, the exact prompt boundary):
+        a rolling checkpoint moves past the prompt end as soon as decode
+        starts, so the exact-length entry a same-prompt repeat needs must be
+        published while the boundary is still the prompt itself.  An
+        in-flight request owns its live pages and state, while an idle
+        completed request can be copied once into the bounded arena and
+        subsequently reused by any destination slot.  If an MTP scratch
+        snapshot is unavailable we retain the proven same-slot cache instead
+        of creating a target/GDN-only entry.
+        """
+        if not self.enable_prefix_cache or not self.enable_persistent_prefix_cache:
+            return
+        kv_len = self._checkpoint_len.get(slot, 0)
+        tensors = self._checkpoint_tensors.get(slot)
+        tokens = self.pool.slot_committed_tokens[slot]
+        if prompt_hidden is not None:
+            # The prefill-commit boundary must still be the slot's own
+            # checkpoint; a prompt length off a block boundary has no stored
+            # state and stays on the old reset-time behaviour.
+            if self.pool.slot_kv_len[slot] != kv_len or kv_len > len(tokens) - 1:
+                return
+        if kv_len <= 0 or tensors is None or len(tokens) < kv_len:
+            return
+        hash_value = _prefix_hash(tokens, kv_len)
+        current = self._persistent_prefixes.get(hash_value)
+        if current is not None:
+            self.checkpoint_pool.touch(current.checkpoint_key)
+            self._persistent_prefixes.move_to_end(hash_value)
+            return
+        if prompt_hidden is None:
+            # A drifted reset-time entry extends a prompt the arena already
+            # keeps at its prompt boundary.  Publishing it anyway costs
+            # scratch pages the prompt entries need to survive the next
+            # admission wave -- and it is only reachable by an exact
+            # prompt-plus-generation replay.  Keep the prompt entry instead.
+            for entry in self._persistent_prefixes.values():
+                if entry.final_hidden is not None and kv_len > entry.kv_len and (
+                    tuple(tokens[: entry.kv_len]) == entry.token_ids
+                ):
+                    return
+        pages = (kv_len + self.pool.page_size - 1) // self.pool.page_size
+        if not self._evict_persistent_until(pages):
+            return
+        scratch_page_offsets = tuple(sorted(self._persistent_free_scratch_pages)[:pages])
+        scratch_physical_pages = [
+            self.pool.scratch_row * self.pool.pages_per_slot + page
+            for page in scratch_page_offsets
+        ]
+        has_mtp_snapshot = self._mtp is None
+        if self._mtp is not None:
+            has_mtp_snapshot = self._mtp.snapshot_prefix_to_scratch(
+                slot, kv_len, scratch_pages=scratch_page_offsets
+            )
+            if not has_mtp_snapshot:
+                return
+
+        # RecurrentStatePool's hash index is one-to-one by design.  Transfer
+        # the source checkpoint identity after all allocation checks pass;
+        # the local ``tensors`` reference keeps the D2D clone valid.
+        self._evict_checkpoint(slot)
+        # Budget pressure now sees the transferred source as one pending
+        # persistent checkpoint rather than two copies of the same state.
+        # Its callback clears any older KV identity before its scratch pages
+        # can be reused.
+        self.checkpoint_pool.evict_for_budget(self._checkpoint_bytes)
+        key = ("persistent", hash_value)
+        self.pool.copy_prefix_to_scratch(slot, kv_len, scratch_pages=scratch_physical_pages)
+        self.checkpoint_pool.register(
+            key,
+            hash_value=hash_value,
+            num_tokens=kv_len,
+            nbytes=self._checkpoint_bytes,
+        )
+        self._persistent_prefixes[hash_value] = _PersistentPrefixEntry(
+            token_ids=tuple(tokens[:kv_len]),
+            kv_len=kv_len,
+            hash_value=hash_value,
+            checkpoint=[tensor.clone() for tensor in tensors],
+            checkpoint_key=key,
+            has_mtp_snapshot=has_mtp_snapshot,
+            scratch_page_offsets=scratch_page_offsets,
+            final_hidden=(
+                prompt_hidden.detach().clone() if prompt_hidden is not None else None
+            ),
+        )
+        self._persistent_free_scratch_pages.difference_update(scratch_page_offsets)
+        self.stats["prefix_persistent_stores"] += 1
+
+    def _restore_persistent_prefix(self, slot: int, token_ids: list[int]) -> int:
+        entry = self._persistent_prefix_entry(token_ids)
+        if entry is None:
+            return 0
+        if entry.kv_len == len(token_ids) and entry.final_hidden is None:
+            # Full-prompt hits need the stored anchor hidden; the matcher
+            # already filters them, and this keeps the invariant local.
+            return 0
+        # A destination may still retain a different idle prefix.  Remove its
+        # checkpoint before changing page ownership, exactly as the existing
+        # cross-slot path does, so it cannot later authenticate unrelated KV.
+        self.drop_prefix_cache(slot)
+        scratch_physical_pages = [
+            self.pool.scratch_row * self.pool.pages_per_slot + page
+            for page in entry.scratch_page_offsets
+        ]
+        self.pool.share_scratch_prefix(slot, entry.kv_len, scratch_pages=scratch_physical_pages)
+        self.pool.restore_recurrent_state(slot, entry.checkpoint)
+        self.pool.rewind_slot(slot, entry.kv_len)
+        if self._mtp is not None and not self._mtp.restore_prefix_from_scratch(
+            slot, entry.kv_len, scratch_pages=entry.scratch_page_offsets
+        ):
+            # The normal call site is fresh and this cannot fail after a
+            # successful store.  Preserve the hard invariant anyway: undoing
+            # a remap is more error-prone than a safe refusal before it.
+            raise RuntimeError("persistent MTP prefix disappeared after a validated cache hit")
+        self.checkpoint_pool.touch(entry.checkpoint_key)
+        self._persistent_prefixes.move_to_end(entry.hash_value)
+        self.stats["prefix_persistent_restores"] += 1
+        if entry.kv_len == len(token_ids) and entry.final_hidden is not None:
+            self._pending_cached_hidden[slot] = entry.final_hidden
+        return entry.kv_len
 
     def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
         """Deepest reusable prefix across all slots, as ``(kv_hit, state_hit)``.
@@ -813,10 +1192,10 @@ class Qwen36Backend:
         oracle, both forced by this runtime's addressing rather than
         chosen:
 
-        * ``A`` comes from a same-slot linear token comparison, not a
-          chained block hash, because this backend uses static per-slot
-          pages and never shares KV across slots
-          (``docs/a3-cache-coordinator-design.md`` §8 decision 5).
+        * ``A`` comes from a linear token comparison rather than a chained
+          block hash.  The current allocator may copy a matching retained
+          prefix into another free slot, but it still has no shared-page
+          hash/refcount table.
         * The downward search has at most one candidate to consider,
           because the checkpoint policy keeps one rolling boundary per
           slot (module docstring).
@@ -827,13 +1206,11 @@ class Qwen36Backend:
         """
         if not self.enable_prefix_cache or not token_ids:
             return PrefixHit(kv_hit=0, state_hit=0)
-        best = PrefixHit(kv_hit=0, state_hit=0)
-        best_slot = -1
-        for slot in range(self.num_slots):
-            hit = self._prefix_hit_for_slot(token_ids, slot)
-            if (hit.effective, hit.kv_hit) > (best.effective, best.kv_hit):
-                best = hit
-                best_slot = slot
+        best_slot, best = self._best_prefix_source(token_ids)
+        persistent = self._persistent_prefix_hit(token_ids)
+        if (persistent.effective, persistent.kv_hit) > (best.effective, best.kv_hit):
+            best = persistent
+            best_slot = -1
         if best.effective > 0 and best_slot >= 0:
             self._pending_prefix_hits[best_slot] = best
         self.stats["prefix_kv_hit_tokens"] += best.kv_hit
@@ -865,7 +1242,7 @@ class Qwen36Backend:
         best_slot = free_slots[0]
         best = PrefixHit(kv_hit=0, state_hit=0)
         for slot in free_slots:
-            hit = self._prefix_hit_for_slot(token_ids, slot)
+            hit = self.prefix_hit_for_slot(token_ids, slot)
             if (hit.effective, hit.kv_hit) > (best.effective, best.kv_hit):
                 best = hit
                 best_slot = slot
@@ -879,7 +1256,59 @@ class Qwen36Backend:
         ``.effective`` rather than by whatever a backend's own
         ``find_best_slot_for_prompt`` happens to rank by.
         """
-        return self._prefix_hit_for_slot(token_ids, slot)
+        local = self._prefix_hit_for_slot(token_ids, slot)
+        persistent = self._persistent_prefix_hit(token_ids)
+        return (
+            persistent
+            if (persistent.effective, persistent.kv_hit) > (local.effective, local.kv_hit)
+            else local
+        )
+
+    def cross_slot_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
+        """Best retained source usable by a different fresh destination.
+
+        Kept separate from :meth:`prefix_hit_for_slot` so the coordinator
+        first consumes ordinary same-slot affinity.  It calls this only once
+        the matching source has already been reserved for an earlier request
+        in the admission batch, where shared backbone pages let duplicate
+        prompts fan out safely before copy-on-write detaches a suffix.
+        """
+        _source, hit = self._best_prefix_source(token_ids)
+        persistent = self._persistent_prefix_hit(token_ids)
+        return (
+            persistent
+            if (persistent.effective, persistent.kv_hit) > (hit.effective, hit.kv_hit)
+            else hit
+        )
+
+    def _best_prefix_source(
+        self, token_ids: list[int], *, preferred_slot: int | None = None
+    ) -> tuple[int, PrefixHit]:
+        """Return the best *physically retained* source for ``token_ids``.
+
+        A source must be fresh.  Once a new request starts writing a slot,
+        its old prefix metadata is intentionally left for observability until
+        the next reset, but its page bytes no longer describe that metadata.
+        Treating such a live slot as a source would be a silent corruption.
+        """
+        best_slot = -1
+        best = PrefixHit(kv_hit=0, state_hit=0)
+        for source_slot in range(self.num_slots):
+            if self.pool.slot_kv_len[source_slot] != 0:
+                continue
+            hit = self._prefix_hit_for_slot(token_ids, source_slot)
+            if self._mtp is not None and hit.effective > 0:
+                if not self._mtp.can_restore_prefix(source_slot, hit.effective):
+                    # Target/GDN state cannot be restored without the MTP
+                    # causal context.  Continue searching: another source
+                    # may carry an intact copy of the same prefix.
+                    continue
+            key = (hit.effective, hit.kv_hit, source_slot == preferred_slot)
+            best_key = (best.effective, best.kv_hit, best_slot == preferred_slot)
+            if key > best_key:
+                best = hit
+                best_slot = source_slot
+        return best_slot, best
 
     def _prefix_hit_for_slot(self, token_ids: list[int], slot: int) -> PrefixHit:
         cached = self._prefix_cache_tokens[slot]
@@ -920,7 +1349,7 @@ class Qwen36Backend:
         return PrefixHit(kv_hit=kv_hit, state_hit=state_hit)
 
     def _apply_prefix_hit(self, slot: int, prompt_ids: list[int]) -> int:
-        """Consume the pending hit for ``slot``; return tokens to skip.
+        """Restore the best retained prefix into ``slot``; return its length.
 
         Restores the recurrent checkpoint **before** returning, so the
         caller's forward starts from a state that genuinely corresponds to
@@ -929,18 +1358,58 @@ class Qwen36Backend:
         available and always correct, which is why every failure here
         degrades to it rather than raising.
         """
-        hit = self._pending_prefix_hits.pop(slot, None)
+        persistent = self._persistent_prefix_hit(prompt_ids)
+        pending = self._pending_prefix_hits.pop(slot, None)
+        source_slot = slot
+        hit = pending
+        # ``reconcile_prefix_hit`` predates cross-slot restore and keys its
+        # advisory entry by source slot.  A target different from that source
+        # therefore discovers the same match here, after admission selected
+        # its actual slot.  This also makes direct backend callers correct
+        # without needing a scheduler-only side channel.
         if hit is None or hit.effective <= 0:
+            source_slot, hit = self._best_prefix_source(prompt_ids, preferred_slot=slot)
+        if persistent.effective > 0 and persistent.effective >= (
+            hit.effective if hit is not None else 0
+        ):
+            return self._restore_persistent_prefix(slot, prompt_ids)
+        if hit is None or hit.effective <= 0 or source_slot < 0:
+            return 0
+        if hit.effective >= len(prompt_ids):
+            # A same-length hit from the non-persistent families carries no
+            # anchor hidden, so nothing remains to produce logits from.
+            # Only the scratch arena stores it; degrade to a compute miss.
             return 0
         length = hit.effective
-        tensors = self._checkpoint_tensors.get(slot)
-        if tensors is None or self._checkpoint_len.get(slot) != length:
+        tensors = self._checkpoint_tensors.get(source_slot)
+        if tensors is None or self._checkpoint_len.get(source_slot) != length:
             return 0
-        if self.checkpoint_pool.get_by_hash(_prefix_hash(prompt_ids, length)) != (slot, length):
+        if self.checkpoint_pool.get_by_hash(_prefix_hash(prompt_ids, length)) != (
+            source_slot,
+            length,
+        ):
             return 0
+        if self._mtp is not None and not self._mtp.can_restore_prefix(source_slot, length):
+            # The MTP head is a second causal KV cache.  Reusing target/GDN
+            # state without its same-prefix MTP rows would silently turn a
+            # prefix hit into tail-only MTP context, so this is deliberately
+            # a safe compute miss instead.
+            return 0
+        if source_slot != slot:
+            # The destination's previous retained prefix is about to be
+            # overwritten.  Its checkpoint must disappear in lockstep;
+            # otherwise a later token comparison could bless unrelated KV.
+            self.drop_prefix_cache(slot)
+            self.pool.share_prefix_kv(source_slot, slot, length)
+            self.stats["prefix_cross_slot_restores"] += 1
         self.pool.restore_recurrent_state(slot, tensors)
         self.pool.rewind_slot(slot, length)
-        self.checkpoint_pool.touch((slot, length))
+        if self._mtp is not None:
+            if source_slot == slot:
+                self._mtp.restore_prefix(slot, length)
+            else:
+                self._mtp.copy_prefix(source_slot, slot, length)
+        self.checkpoint_pool.touch((source_slot, length))
         return length
 
     # -- second cache family: checkpoints ----------------------------------
@@ -1001,15 +1470,29 @@ class Qwen36Backend:
         live slot's KV would be the symmetric version this asymmetry
         exists to forbid.
         """
+        if isinstance(key, tuple) and len(key) == 2 and key[0] == "persistent":
+            # A persistent entry only serves an idle scratch snapshot.  A
+            # restore immediately COW-detaches before its suffix forward, so
+            # cache-budget eviction never reclaims a live request's KV.
+            return True
         slot = key[0] if isinstance(key, tuple) else key
         return self.pool.slot_kv_len[slot] == 0
 
     def _drop_kv_for_checkpoint(self, key: object) -> None:
+        if isinstance(key, tuple) and len(key) == 2 and key[0] == "persistent":
+            hash_value = key[1]
+            entry = self._persistent_prefixes.pop(hash_value, None)
+            if entry is not None and entry.checkpoint_key == key:
+                self._persistent_free_scratch_pages.update(entry.scratch_page_offsets)
+                self.stats["prefix_persistent_evictions"] += 1
+            return
         slot = key[0] if isinstance(key, tuple) else key
         self._checkpoint_tensors.pop(slot, None)
         self._checkpoint_len.pop(slot, None)
         self._prefix_cache_tokens[slot] = None
         self._prefix_cache_kv_len[slot] = 0
+        if self._mtp is not None:
+            self._mtp.drop_prefix(slot)
         self.stats["checkpoints_evicted_by_budget"] += 1
 
     # -- protocol: CUDA Graph ----------------------------------------------
@@ -1050,6 +1533,7 @@ class Qwen36Backend:
             return None
         finally:
             self.pool.reset_all()
+            self._clear_persistent_prefixes()
             for slot in range(self.num_slots):
                 self._prefix_cache_tokens[slot] = None
                 self._prefix_cache_kv_len[slot] = 0
