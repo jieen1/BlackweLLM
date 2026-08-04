@@ -222,3 +222,16 @@ combo (prefill 17.9 vs 16.4, decode 17.6 vs 16.9) and acceptance shifted
 72.3->67.8 (prefill numerics change flips the greedy trajectory).
 REVERTED. Microbench-to-e2e extrapolation keeps failing on this box
 (co-tenant + allocator state); only e2e-proven changes are kept.
+
+## Fused silu*mul*quant attempts: CLOSED as dead end (2026-08-04)
+
+Two attempts to fuse ``F.silu(gate)*up + NVFP4 quantize`` for the W4A4 MLP
+path: (1) fp32 silu*mul variant -- 2.2% of e4m3 scale bytes flip (fp32 vs
+bf16 silu semantics), cascading to 3.6 value-grid diffs, not acceptable;
+(2) "bit-safe" variant replicating torch's op chain (libdevice exact exp +
+bf16 rounding at each step) -- still NOT bit-identical (torch's exact silu
+op chain not reproduced; chasing further ulp-level op-order parity has
+negative expected value vs the ~0.4-0.6 s potential e2e gain). Both
+reverted; the torch chain stays. The prefill elementwise zoo (~33% of
+prefill GPU) remains open but requires op-fusion work that preserves torch
+semantics bit-exactly -- scoped as days-scale, not incremental.
