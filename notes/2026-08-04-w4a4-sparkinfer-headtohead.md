@@ -235,3 +235,18 @@ negative expected value vs the ~0.4-0.6 s potential e2e gain). Both
 reverted; the torch chain stays. The prefill elementwise zoo (~33% of
 prefill GPU) remains open but requires op-fusion work that preserves torch
 semantics bit-exactly -- scoped as days-scale, not incremental.
+
+## Triton zero-centered RMSNorm for prefill: prefill -1.7s but anchor break, REVERTED (2026-08-04)
+
+Qwen36RMSNorm rows>=128 (prefill-only; decode/verify rows<=16 keep the
+torch chain so captured graphs are untouched) routed to the existing Triton
+rms_norm with (1+w) precomputed. Numerics vs torch chain: cos 0.99999988,
+1-2 bf16 ulp. E2E W1-S: prefill 14.7 s vs 15.8-16.4 ref (-1.7 s real),
+decode per-round unchanged (13.4 vs 13.0 ms), BUT acceptance collapsed to
+57.1% vs the 72.3% arms (historical anchor 70.29%): the ulp-level norm
+delta cascades through 64 layers into a systematically different greedy
+trajectory. Quality-anchor regression -> REVERTED per the anchors-first
+discipline. Confirms the general wall: every op-level change that is not
+bit-exact moves the acceptance anchor unpredictably; prefill zoo fusion
+needs bit-exact semantics (accumulation-order-exact variance), which the
+current Triton kernel does not provide.
