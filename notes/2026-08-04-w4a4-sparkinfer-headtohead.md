@@ -263,3 +263,28 @@ E2E W1-S with the fusion wired: anchor held exactly (72.3%, committed
 decode +4.7 s (one-program-per-row kernel with BLOCK_K=8192 massively
 under-utilizes at rows<=16). Wiring REVERTED; kernel + bit-parity tests
 kept as tooling (a 2-D-grid variant would be needed before any rewire).
+
+## Reframe: the e2e gap is (almost) entirely prefill (2026-08-04)
+
+Profile run (HIST_KERNELS, W1-S c=4, --profile-rounds 5, wall 32.8 s,
+anchor held 72.3%/4120):
+
+- Decode-only committed rate: (4120-16)/16.9 s = **243 committed tok/s**;
+  historical decode-only estimate ~267 committed tok/s (4116/15.4 s) --
+  our decode engine is within ~10% of historical.
+- Prefill wall is 16.2 s of the 32.8 s total (49%); historical prefill
+  estimate ~5 s. The remaining e2e gap decomposes to ~11 s prefill +
+  ~2 s decode rounds (13.0 vs ~11.6 ms/round).
+- Round host-side phases (per round): verify_graph 6.34 ms CUDA + draft
+  1.84 + sync 0.62 + lm_head 0.16; self-CPU dominated by
+  cudaStreamSynchronize wait + cudaMemcpyAsync + cudaGraphLaunch (graph
+  node count drives launch CPU); accept/reject already single-roundtrip
+  vectorized (runtime/mtp_accept.py), _fill metadata copies are small.
+
+Implication: closing the e2e gap is ~85% a PREFILL kernel-suite problem:
+prefill GPU is 95% busy with GEMM at 121-400 TFLOPS (vs 900+ FP8 peak),
+33% elementwise zoo, unfused quant/norm/cast chains. Every bit-exact
+fusion available today has been applied and measured (quant chain: no e2e
+win); the rest need new kernels (per-row-alpha FP8 epilogue for large-M
+dynamic W8A8 in sparkinfer; accumulation-order-exact norm fusion) --
+days-scale kernel development, not config/routing work.
