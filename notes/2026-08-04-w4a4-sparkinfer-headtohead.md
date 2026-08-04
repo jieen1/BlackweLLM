@@ -306,3 +306,16 @@ path 3.693 ms (same tile -- within box noise), (64,128)/(64,64) 6.8-7.0 ms
 (2x worse). Large-M FP4 MLP GEMM runs ~790 TFLOPS (gate, 3.467 ms) --
 near the practical ceiling of the current CuTe DSL kernel; the remaining
 prefill GEMM headroom needs kernel-code work, not tile policy.
+
+## Dense GEMM raster swizzle for FP4 large-M: NEGATIVE (2026-08-04)
+
+Hypothesis: tile (128,128,128) runs with swizzle_size=1 (the swizzle is
+gated to tile_k=64), so weight panels re-read from DRAM per M-tile pass.
+Patched sparkinfer branch fp4-swizzle-20260804 (worktree
+/tmp/sparkinfer-fp4-swizzle-20260804, NOT merged): SPARKINFER_DENSE_
+SWIZZLE_128=1 extends swizzle_size=16 to 128x128 tiles. Separate-process
+M=16384 microbench: gate 3.963 -> 4.480 ms (+13% WORSE), down 4.727 ->
+4.981 ms (+5% worse). L2 evidently already captures enough reuse; the
+swizzle pattern hurts. Lever closed; FP4 large-M GEMM sits at its practical
+ceiling (~730-790 TFLOPS). All config-level levers for the prefill gap are
+now exhaustively measured and closed; the remainder is kernel-code work.
