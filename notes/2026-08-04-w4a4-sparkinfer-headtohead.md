@@ -151,7 +151,11 @@ baseline arms:
   two-residency variants (88-89 GiB).
 
 Remaining gap to historical (~20.4 s wall): decode rounds are still 28-30 s
-(21.6->~23 ms/round; historical ~11.6 ms) -- closing it needs the
-sparkinfer FP4 dense kernel to grow an M<=16 tile regime (M-tile 64 is the
-smallest supported today; measured tile sweep shows no supported config
-beats the default at small M). That is the next kernel-development item.
+(21.6->~23 ms/round; historical ~11.6 ms). Measured 2026-08-04: the FP4
+dense kernel's small-M ceiling is NOT fixable by config -- swap_ab variants
+((64,16)/(64,32), tma and cpasync, all bit-exact) measured 152-354 GB/s,
+SLOWER than the default tile's 435-532 GB/s; M-tile 64 is the smallest
+supported and (16,*) is structurally rejected by can_implement. The decode
+fix must therefore come from the FP8 dense side (attention/GDN/lm_head via
+torch._scaled_mm stream at ~450 GB/s vs the ~1.5 TB/s roofline), not the
+FP4 MLP side.
