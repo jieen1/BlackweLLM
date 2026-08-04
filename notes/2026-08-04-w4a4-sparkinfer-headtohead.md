@@ -155,7 +155,13 @@ Remaining gap to historical (~20.4 s wall): decode rounds are still 28-30 s
 dense kernel's small-M ceiling is NOT fixable by config -- swap_ab variants
 ((64,16)/(64,32), tma and cpasync, all bit-exact) measured 152-354 GB/s,
 SLOWER than the default tile's 435-532 GB/s; M-tile 64 is the smallest
-supported and (16,*) is structurally rejected by can_implement. The decode
-fix must therefore come from the FP8 dense side (attention/GDN/lm_head via
-torch._scaled_mm stream at ~450 GB/s vs the ~1.5 TB/s roofline), not the
-FP4 MLP side.
+supported and (16,*) is structurally rejected by can_implement. Final config-level attempts on the FP4 side (sparkinfer branch
+``fp4-splitk-20260804``, commit ``f4213aa``, 2026-08-04): (a) split-K wired
+for FP4 -- M=4 gate 383 GB/s (slower) AND numerically wrong (max_rel
+2.4e4; the FP4 partial-accumulation path is not wired correctly), reverted;
+(b) M-tile 16 allowed by ``can_implement`` -- (16,128)/(16,64) compile and
+are BIT-EXACT (maxdiff=0) but 508-648 GB/s, no better than the default
+586-667 GB/s. **The small-M ceiling is kernel pipeline structure, not tile
+configuration; the remaining decode-side work is days-scale kernel
+development (FP4 load pipeline; FP8 per-token-x-per-channel epilogue for
+the torch._scaled_mm shapes).**
