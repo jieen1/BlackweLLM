@@ -212,3 +212,13 @@ W1-S (n16, c=4, K=3), two repeats per arm:
   historical CUTLASS kernel, M=1 bit-exact vs it), NOT sparkinfer yet; the
   sparkinfer-native replacement is extending ``tensor_fp8_channel_linear``
   (M=1-only today) to M<=16 with a per-token row-scale epilogue.
+
+## Per-shape large-M FP8 routing: NEGATIVE at e2e (2026-08-04)
+
+Microbench said: M=4096 torch._scaled_mm 40-60% faster on narrow-output
+shapes, native faster on N>=16384. Implemented rows>1024 && N<16384 ->
+torch routing on top of the combo mode. E2E W1-S: wall 35.5 s vs 33.3 s
+combo (prefill 17.9 vs 16.4, decode 17.6 vs 16.9) and acceptance shifted
+72.3->67.8 (prefill numerics change flips the greedy trajectory).
+REVERTED. Microbench-to-e2e extrapolation keeps failing on this box
+(co-tenant + allocator state); only e2e-proven changes are kept.
