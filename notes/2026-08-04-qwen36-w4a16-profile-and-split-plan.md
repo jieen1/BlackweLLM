@@ -52,7 +52,18 @@ The follow-up profile reduced W4A16 CUDA self time from 37.775 ms to 37.156 ms
 over two verify rounds.  This is a small confirmed launch-overhead removal, not
 a claim of end-to-end performance parity.
 
-## Rejected experiment: opt-in split W4A16 decode
+## Unreached experiment: opt-in modelopt split W4A16 decode
+
+> **2026-08-04 correction (supersedes the initial result below):** path
+> inspection plus Nsight Compute established that the Unsloth checkpoint uses
+> `weight_layout="packed"`. Its real M=4 execution is
+> `W4A16FusedMoeKernel` / packed TC-decode, whereas this experimental switch
+> only gates the `weight_layout="modelopt"` direct micro kernel. Therefore the
+> split code was never reached by this checkpoint. The reported 43.148→48.612
+> ms cross-process difference must **not** be attributed to the switch and is
+> not an A/B result. The branch remains unmerged because it is irrelevant to
+> this model's active packed path, not because that invalid A/B established a
+> regression.
 
 The current direct small-M kernel is a 188-CTA cooperative launch: it computes
 FC1, writes the existing BF16 intermediate, crosses a resident-grid barrier,
@@ -69,23 +80,22 @@ pass, in order:
 2. CUDA-graph replay correctness; and
 3. one locked W1-S A/B trace with identical workload settings.
 
-### Result
+### Invalid result (retained for audit)
 
 The real-checkpoint single-layer oracle passed for M=1, 2, 4, 8, 32, 128 and
 512 (cosine 0.999983–0.999990), and the full W1-S CUDA-graph run captured all
-three MTP graphs. It nevertheless failed the performance gate:
+three MTP graphs. Those checks only validate the existing packed path; they do
+not validate or time the modelopt split code.
 
 | W1-S two-round profile | fused direct | split phase 1 + phase 2 |
 |---|---:|---:|
 | verify graph wall time / round | 43.148 ms | **48.612 ms** |
 | W4A16 CUDA self time / round | 18.887 ms | **20.691 ms** |
 
-The split launch is about 12.7% slower in verify. Stream ordering correctly
-replaces the grid barrier, but the two standalone phase bodies lose enough
-locality/launch efficiency to outweigh that benefit. The branch is retained as
-a documented experiment at SparkInfer commit `23fb17a`, **not merged and not
-enabled by default**. Do not retry the same FC1/FC2 split without a new
-kernel-level reason to believe phase locality has changed.
+The table is an uncontrolled cross-process observation, not a split-launch
+comparison. The branch is retained as SparkInfer commit `23fb17a`, **not
+merged and not enabled by default**. Do not spend further Qwen effort on its
+modelopt-only FC1/FC2 split; the relevant target is the packed kernel.
 
 Reproduction of the rejected full-model run:
 
@@ -99,5 +109,22 @@ SPARKINFER_W4A16_SPLIT_DECODE=1 \
   --result-path /tmp/qwen_w1s_split_w4a16_result.json
 ```
 
-A raw-FP8 QKV fusion remains a separate, later candidate; it does not rely on
-this rejected scheduling experiment.
+## Actual packed-kernel root cause, profiled
+
+Nsight Compute sampled the real layer-5 M=4 packed `W4A16FusedMoeKernel`:
+
+| metric | measured |
+|---|---:|
+| dynamic shared memory / CTA | 54.27 KiB |
+| blocks per SM | 1 |
+| achieved occupancy | 16.67% (8 warps / SM) |
+| active warps / scheduler | 1.97 |
+| cycles with no eligible warp | 54.30% |
+| DRAM throughput | 41.33% of peak |
+| SM compute throughput | 38.39% of peak |
+
+This is the actual optimization target: reduce the packed kernel's shared
+memory/CTA footprint enough to admit a second resident block, or otherwise
+raise eligible-warp availability while preserving raw packed W4A16 weights and
+BF16 activations. Any candidate must first demonstrate `>= 2` blocks/SM in the
+same M=4 Nsight profile, then pass the oracle and W1-S graph gates.
