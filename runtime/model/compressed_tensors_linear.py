@@ -56,10 +56,121 @@ from runtime.model._weight_loading import default_weight_loader
 #: immediately, matching this codebase's existing ``QSR_*`` flag idiom (e.g.
 #: ``runtime/backends/laguna.py``'s ``QSR_PROFILE_MOE_PHASES``).
 QSR_EMULATE_FP8_ACTIVATION_ENV = "QSR_EMULATE_FP8_ACTIVATION"
+QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV = "QSR_TORCH_SCALED_MM_FP8_CHANNEL"
+QSR_NATIVE_W8A8_FP8_CHANNEL_ENV = "QSR_NATIVE_W8A8_FP8_CHANNEL"
+QSR_NATIVE_W8A8_QUANT_ENV = "QSR_NATIVE_W8A8_QUANT"
+
+_native_w8a8_library: object | None = None
+_native_w8a8_quantizer_unavailable = False
 
 
 def _fp8_activation_emulation_enabled() -> bool:
     return os.environ.get(QSR_EMULATE_FP8_ACTIVATION_ENV) == "1"
+
+
+def _torch_scaled_mm_fp8_channel_enabled() -> bool:
+    # Qwen3.6 declares this dynamic per-token / per-channel E4M3 contract.
+    # CUDA serving therefore uses raw W8A8 by default. ``0`` remains solely
+    # for CPU tests and explicit fallback diagnostics.
+    return os.environ.get(QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV, "all") in {"1", "all"}
+
+
+def _native_w8a8_fp8_channel_enabled() -> bool:
+    # QSR_QWEN36_HIST_KERNELS=1 is the combined historical-kernel mode:
+    # W4A4 NVFP4 MLP (sparkinfer) + native W8A8 FP8 dense (historical
+    # CUTLASS port). Measured 2026-08-04 W1-S c=4 twice: wall 33.3/33.2 s
+    # vs 58.7-60.2 s baseline, acceptance 72.3% (historical anchor 70.29%).
+    if os.environ.get("QSR_QWEN36_HIST_KERNELS") == "1":
+        return True
+    return os.environ.get(QSR_NATIVE_W8A8_FP8_CHANNEL_ENV) in {"1", "all"}
+
+
+def _native_w8a8_lm_head_enabled() -> bool:
+    """Per-shape native routing for the 248,320-wide lm_head only.
+
+    Measured 2026-08-04 (RTX PRO 6000 Blackwell, M=4/16, real-shape
+    microbench): the self-owned kernel streams lm_head's 2.54 GiB weights in
+    3.1 ms vs torch._scaled_mm's 3.8-4.7 ms, while the blanket all-shapes
+    native switch measured slightly worse e2e -- hence shape-scoped.
+    """
+    return os.environ.get("QSR_NATIVE_W8A8_LM_HEAD") == "1"
+
+
+def _native_w8a8_quantization_enabled() -> bool:
+    """Return whether to trial the self-owned quantizer before Torch's GEMM.
+
+    This remains diagnostic-only until full-model agreement is established.
+    It must never select a BF16 weight materialization.
+    """
+    return os.environ.get(QSR_NATIVE_W8A8_QUANT_ENV) == "1"
+
+
+def fp8_channel_raw_execution_uses_all_layers() -> bool:
+    """Return whether the experimental W8A8 route owns every FP8 Linear.
+
+    ``1`` is the original narrow MLP-only experiment. ``all`` is the full
+    historical W8A8 contract: all FP8-channel modules consume raw E4M3
+    weights, so model loading must not create BF16 caches for any of them.
+    """
+    return (
+        _torch_scaled_mm_fp8_channel_enabled()
+        and os.environ.get(QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV, "all") != "1"
+    ) or os.environ.get(QSR_NATIVE_W8A8_FP8_CHANNEL_ENV) == "all"
+
+
+def _native_w8a8_library_for_cuda() -> object:
+    """Load the explicit self-owned W8A8 artifact exactly once per process."""
+    global _native_w8a8_library
+    if _native_w8a8_library is None:
+        from runtime.fp8_w8a8 import NativeFP8W8A8Library
+
+        _native_w8a8_library = NativeFP8W8A8Library.load()
+    return _native_w8a8_library
+
+
+def _native_w8a8_quantizer_for_cuda() -> object | None:
+    """Return the self-owned fused quantizer when its optional artifact exists.
+
+    The default GEMM path intentionally remains ``torch._scaled_mm`` because
+    it is materially more accurate than the current self-owned GEMM for
+    multi-token rows.  Its input quantizer is independent, bit-compatible
+    with the historical per-token E4M3 contract, and can therefore be used
+    whenever the separately built raw-pointer artifact is present.  A source
+    checkout remains runnable before that optional build by using the pure
+    Torch quantizer below; it never falls back to a BF16 weight cache.
+    """
+    global _native_w8a8_quantizer_unavailable
+    if _native_w8a8_quantizer_unavailable:
+        return None
+    try:
+        return _native_w8a8_library_for_cuda()
+    except RuntimeError:
+        _native_w8a8_quantizer_unavailable = True
+        return None
+
+
+def _quantize_fp8_activation_for_torch_scaled_mm(
+    x: torch.Tensor, input_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize one CUDA W8A8 activation with the historical fused contract.
+
+    The self-owned quantizer writes E4M3 codes and FP32 per-token scales in
+    one launch.  It is an explicit diagnostic candidate only: full-model
+    agreement must be established before it can replace the default pure-
+    Torch quantizer.  Either branch preserves the same raw-FP8 route.
+    """
+    x_2d = x.reshape(-1, input_size).contiguous()
+    if not _native_w8a8_quantization_enabled():
+        return quantize_fp8_activation_per_token(x_2d)
+    library = _native_w8a8_quantizer_for_cuda()
+    if library is None:
+        return quantize_fp8_activation_per_token(x_2d)
+    x_fp8 = torch.empty_like(x_2d, dtype=torch.float8_e4m3fn)
+    activation_scale = torch.empty(
+        (x_2d.shape[0], 1), dtype=torch.float32, device=x.device
+    )
+    library.quantize_per_token(x_2d, x_fp8, activation_scale)
+    return x_fp8, activation_scale
 
 
 def emulate_fp8_activation_round_trip(x: torch.Tensor) -> torch.Tensor:
@@ -95,17 +206,32 @@ def emulate_fp8_activation_round_trip(x: torch.Tensor) -> torch.Tensor:
     what this is being used to decide (a B1-R gap-error gate) and why a
     lower bound is sufficient for a negative verdict there.
     """
-    fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)  # 448.0
-    x32 = x.to(torch.float32)
-    amax = x32.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
-    scale = amax / fp8_max
-    x_fp8 = (x32 / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    x_fp8, scale = quantize_fp8_activation_per_token(x)
     return (x_fp8.to(torch.float32) * scale).to(x.dtype)
 
 
+def quantize_fp8_activation_per_token(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return E4M3 activation codes and their per-token dequant scales.
+
+    The split form is deliberately public because an actual W8A8 GEMM needs
+    the codes as its left operand while applying the scale after the raw dot
+    product.  Keeping this calculation shared with
+    :func:`emulate_fp8_activation_round_trip` prevents the diagnostic and
+    kernel-preflight paths from silently using different quantization rules.
+    """
+    fp8_max = float(torch.finfo(torch.float8_e4m3fn).max)  # 448.0
+    x32 = x.to(torch.float32)
+    amax = x32.abs().amax(dim=-1, keepdim=True)
+    # Match the historical dynamic-FP8 quantizer's nonzero lower scale
+    # bound.  It prevents tiny rows from underflowing their reciprocal scale
+    # while leaving normal token rows unchanged.
+    scale = (amax / fp8_max).clamp_min(1.0 / (fp8_max * 512.0))
+    x_fp8 = (x32 / scale).clamp(-fp8_max, fp8_max).to(torch.float8_e4m3fn)
+    return x_fp8, scale
+
+
 class CompressedTensorsFP8ChannelLinear(nn.Module):
-    """Per-output-channel FP8 (E4M3) weight-quantized Linear, dequantized to
-    BF16 on first use.
+    """Per-output-channel E4M3 Linear with raw W8A8 CUDA serving.
 
     Checkpoint shape (verified against real safetensors headers,
     2026-08-02): ``weight`` is ``[out, in]`` ``float8_e4m3fn`` (unpacked, one
@@ -118,13 +244,14 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
     implementation does not perform), so there is nothing to ignore here the
     way modelopt's ``.input_scale`` is.
 
-    **FP8 W8A8 pre-flight (2026-08-03,** ``QSR_EMULATE_FP8_ACTIVATION``
-    **env flag, default OFF)**: :meth:`forward` optionally round-trips the
+    **Legacy BF16 fallback / FP8 W8A8 pre-flight (2026-08-03,**
+    ``QSR_EMULATE_FP8_ACTIVATION`` **env flag, default OFF)**: the fallback
+    optionally round-trips the
     activation through :func:`emulate_fp8_activation_round_trip` before
     ``F.linear`` -- a cheap way to measure a genuine W8A8 GEMM's *dominant*
     new error source (activation quantization) without building an FP8xFP8
-    kernel, since the weight side is already dequantized exactly from the
-    checkpoint's real FP8 values either way. See
+    kernel. CUDA serving uses the checkpoint's fused W8A8 arithmetic and
+    preserves raw FP8 matrices instead. See
     :func:`emulate_fp8_activation_round_trip`'s docstring for the scheme
     and why it is a lower, not exact, bound, and
     ``scripts/verify_fp8_w8a8_activation_emulation_full_model_gap.py`` for
@@ -156,6 +283,24 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
             self.bias.weight_loader = default_weight_loader
 
         self._weight_bf16: torch.Tensor | None = None
+        # Deliberately separate from the production BF16 cache.  This pack is
+        # only built by the explicit single-layer W8A8 preflight below; the
+        # normal model never pays its memory or compilation cost.
+        self._fp8_channel_packed_weight: object | None = None
+        self._fp8_channel_fused_packed_weight: object | None = None
+        self._fp8_channel_kernel_weight_scale: torch.Tensor | None = None
+        # ``torch._scaled_mm`` uses the same immutable FP32 channel-scale
+        # ABI as the native kernel. Do not recast this BF16 vector for every
+        # one of Qwen's 233 FP8 projections on every decode/verify replay.
+        self._torch_w8a8_weight_scale: torch.Tensor | None = None
+        # FP32 is the native epilogue ABI.  This is one scalar per output
+        # channel, not a materialized BF16 copy of the E4M3 weight matrix.
+        self._native_w8a8_weight_scale: torch.Tensor | None = None
+        # The raw ABI deliberately takes caller-owned workspace.  Keying it
+        # by stream and launch geometry keeps a graph's workspace address
+        # stable and prevents two streams from racing on a process-global
+        # scratch allocation.
+        self._native_w8a8_workspaces: dict[tuple[int, int, int, int, bool], torch.Tensor] = {}
 
     def _ensure_ready(self) -> None:
         if self._weight_bf16 is None:
@@ -192,8 +337,208 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
         """
         self._ensure_ready()
         self.weight.data = self.weight.data.new_empty(0)
+        self.release_fp8_channel_kernel()
+
+    def release_fp8_channel_kernel(self) -> None:
+        """Release the opt-in raw-FP8 GEMM preflight cache, if materialized."""
+        self._fp8_channel_packed_weight = None
+        self._fp8_channel_fused_packed_weight = None
+        self._fp8_channel_kernel_weight_scale = None
+
+    def prepare_fp8_channel_kernel(self) -> None:
+        """Pack raw FP8 weights for the explicit dynamic-W8A8 preflight.
+
+        ``tensor_fp8_linear`` normally applies one static scalar in its
+        epilogue.  Passing a unit scalar exposes its raw FP8 dot product;
+        :meth:`forward_fp8_channel_kernel` then applies this checkpoint's
+        dynamic per-token activation scale and per-output-channel weight
+        scale outside that operation.  This is *not* wired into
+        :meth:`forward`: it exists solely to establish numerical and
+        performance evidence before changing the serving route.
+        """
+        if self.weight.data.numel() == 0:
+            raise RuntimeError(
+                "raw FP8 weight was released; prepare the experimental kernel before "
+                "free_fp8_raw_weight()"
+            )
+        if self.weight.device.type != "cuda":
+            raise RuntimeError("FP8-channel kernel preflight requires CUDA-resident weights")
+        if self._fp8_channel_packed_weight is not None:
+            return
+
+        from sparkinfer.gemm import tensor_fp8_linear
+
+        unit_output_scale = torch.ones(1, dtype=torch.float32, device=self.weight.device)
+        self._fp8_channel_packed_weight = tensor_fp8_linear.pack_weight(
+            self.weight.data, unit_output_scale
+        )
+        weight_scale = self.weight_scale.data.to(torch.float32)
+        self._fp8_channel_kernel_weight_scale = weight_scale.reshape(1, self.output_size)
+        try:
+            from sparkinfer.gemm import tensor_fp8_channel_linear
+        except ImportError:
+            self._fp8_channel_fused_packed_weight = None
+        else:
+            self._fp8_channel_fused_packed_weight = tensor_fp8_channel_linear.pack_weight(
+                self.weight.data,
+                weight_scale.reshape(self.output_size),
+            )
+
+    def forward_fp8_channel_kernel(
+        self,
+        x: torch.Tensor,
+        *,
+        expected_m: int | None = None,
+    ) -> torch.Tensor:
+        """Run the explicit raw-FP8 GEMM composition for one preflight call.
+
+        The intended checkpoint arithmetic is ``(round(x / a) @ W_fp8.T) *
+        a * w`` where ``a`` is dynamic per token and ``w`` is static per
+        output channel.  For single-row ``M=1`` inputs, the optional fused
+        SparkInfer channel-scale epilogue applies ``w`` in-kernel.  Larger
+        ``M`` falls back to the existing raw-dot-product preflight and
+        preserves both scales as explicit post-GEMM multiplies.  This
+        remains intentionally unsuitable for graph replay or production
+        until a direct full-model correctness gate accepts it.
+        """
+        if x.device != self.weight.device:
+            raise ValueError("activation and FP8-channel weight must share a device")
+        if x.shape[-1] != self.input_size:
+            raise ValueError(
+                f"activation K={x.shape[-1]} does not match weight K={self.input_size}"
+            )
+        self.prepare_fp8_channel_kernel()
+        assert self._fp8_channel_packed_weight is not None
+        assert self._fp8_channel_kernel_weight_scale is not None
+
+        x_shape = x.shape
+        x_2d = x.reshape(-1, self.input_size).contiguous()
+        x_fp8, activation_scale = quantize_fp8_activation_per_token(x_2d)
+        if x_fp8.shape[0] == 1 and self._fp8_channel_fused_packed_weight is not None:
+            from sparkinfer.gemm import tensor_fp8_channel_linear
+
+            output = tensor_fp8_channel_linear.mm(
+                x_fp8,
+                self._fp8_channel_fused_packed_weight,
+                activation_scale.reshape(1),
+                out_dtype=torch.bfloat16,
+                expected_m=expected_m,
+            ).to(x.dtype)
+        else:
+            from sparkinfer.gemm import tensor_fp8_linear
+
+            raw_output = tensor_fp8_linear.mm(
+                x_fp8,
+                self._fp8_channel_packed_weight,
+                out_dtype=torch.bfloat16,
+                expected_m=expected_m,
+            )
+            output = (
+                raw_output.float()
+                * activation_scale
+                * self._fp8_channel_kernel_weight_scale
+            ).to(x.dtype)
+        output = output.view(*x_shape[:-1], self.output_size)
+        if self.bias is not None:
+            output = output + self.bias
+        return output
+
+    def forward_torch_scaled_mm(self, x: torch.Tensor) -> torch.Tensor:
+        """Run CUDA's fused per-token/per-channel FP8 scaled GEMM.
+
+        The GEMM consumes original E4M3 checkpoint storage directly.  Its
+        default activation quantizer is pure Torch; the self-owned fused
+        implementation is an explicit diagnostic candidate that preserves
+        the same raw-FP8 contract but is not default until full-model
+        agreement is established.
+        """
+        if x.device != self.weight.device or x.device.type != "cuda":
+            raise RuntimeError("torch scaled_mm FP8-channel path requires CUDA co-resident tensors")
+        if self.weight.data.numel() == 0:
+            raise RuntimeError("raw FP8 weight was released; scaled_mm path is unavailable")
+        x_fp8, activation_scale = _quantize_fp8_activation_for_torch_scaled_mm(
+            x, self.input_size
+        )
+        if self._torch_w8a8_weight_scale is None:
+            self._torch_w8a8_weight_scale = self.weight_scale.data.t().to(torch.float32)
+        output = torch._scaled_mm(
+            x_fp8,
+            self.weight.data.t(),
+            scale_a=activation_scale,
+            scale_b=self._torch_w8a8_weight_scale,
+            out_dtype=x.dtype,
+        )
+        if isinstance(output, tuple):
+            output = output[0]
+        output = output.view(*x.shape[:-1], self.output_size)
+        return output if self.bias is None else output + self.bias
+
+    def forward_native_w8a8(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the self-owned SM120 W8A8 E4M3 path without BF16 weights.
+
+        Scratch is caller-owned rather than extension-global.  An eager
+        warmup keeps it outside graph capture; if PyTorch switches to its
+        private capture stream, creating the stream-specific tensor during
+        capture is also safe because the graph owns that allocation for all
+        replays.
+        """
+        if x.device != self.weight.device or x.device.type != "cuda":
+            raise RuntimeError("native W8A8 FP8-channel path requires CUDA co-resident tensors")
+        if self.weight.data.numel() == 0:
+            raise RuntimeError("raw FP8 weight was released; native W8A8 path is unavailable")
+        library = _native_w8a8_library_for_cuda()
+        x_shape = x.shape
+        x_2d = x.reshape(-1, self.input_size).contiguous()
+        x_fp8 = torch.empty_like(x_2d, dtype=torch.float8_e4m3fn)
+        activation_scale = torch.empty((x_2d.shape[0], 1), dtype=torch.float32, device=x.device)
+        library.quantize_per_token(x_2d, x_fp8, activation_scale)
+        if self._native_w8a8_weight_scale is None:
+            self._native_w8a8_weight_scale = self.weight_scale.data.t().to(torch.float32)
+        output = torch.empty(
+            (x_2d.shape[0], self.output_size), dtype=x.dtype, device=x.device
+        )
+        geometry = (x_2d.shape[0], self.output_size, self.input_size, False)
+        stream_id = torch.cuda.current_stream(x.device).cuda_stream
+        workspace_key = (stream_id, *geometry)
+        workspace = self._native_w8a8_workspaces.get(workspace_key)
+        if workspace is None:
+            workspace_bytes = library.workspace_bytes(
+                m=geometry[0], n=geometry[1], k=geometry[2], batch_invariant=False
+            )
+            workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=x.device)
+            self._native_w8a8_workspaces[workspace_key] = workspace
+        library.launch(
+            x_fp8,
+            self.weight.data.t(),
+            activation_scale,
+            self._native_w8a8_weight_scale,
+            output,
+            workspace,
+            batch_invariant=False,
+        )
+        output = output.view(*x_shape[:-1], self.output_size)
+        return output if self.bias is None else output + self.bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # ``1`` preserves the original narrow 17,408-wide MLP experiment.
+        # ``all`` is the complete historical W8A8 candidate and remains
+        # opt-in until every small attention/GDN geometry is qualified.
+        # Per-shape routing exception: ``QSR_NATIVE_W8A8_LM_HEAD=1`` sends
+        # ONLY the 248,320-wide lm_head through the self-owned kernel --
+        # measured 2026-08-04 at M=4/16 (decode/verify shapes): 3.1 ms vs
+        # torch._scaled_mm 3.8-4.7 ms, while the blanket all-shapes native
+        # switch measured slightly WORSE e2e. lm_head M=1 numerics were
+        # previously verified max_abs=0 vs the historical cutlass_scaled_mm.
+        if _native_w8a8_lm_head_enabled() and self.output_size == 248320:
+            return self.forward_native_w8a8(x)
+        if _native_w8a8_fp8_channel_enabled() and (
+            self.output_size == 17408 or fp8_channel_raw_execution_uses_all_layers()
+        ):
+            return self.forward_native_w8a8(x)
+        if x.device.type == "cuda" and _torch_scaled_mm_fp8_channel_enabled() and (
+            self.output_size == 17408 or fp8_channel_raw_execution_uses_all_layers()
+        ):
+            return self.forward_torch_scaled_mm(x)
         self._ensure_ready()
         if _fp8_activation_emulation_enabled():
             x = emulate_fp8_activation_round_trip(x)

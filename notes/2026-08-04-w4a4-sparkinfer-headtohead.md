@@ -250,3 +250,16 @@ discipline. Confirms the general wall: every op-level change that is not
 bit-exact moves the acceptance anchor unpredictably; prefill zoo fusion
 needs bit-exact semantics (accumulation-order-exact variance), which the
 current Triton kernel does not provide.
+
+## Bit-exact fused FP8 per-token quantizer: anchor held, e2e WORSE, wiring reverted (2026-08-04)
+
+runtime/kernels/fp8_per_token_quant.py: fused Triton replacement of the
+6-op torch quant chain, BIT-EXACT (needed div.rn.f32 inline asm -- triton
+div.full and fdiv(ieee_rounding=True) both measure +-1ulp off and flip
+e4m3 subnormal-midpoint ties; tests/test_fp8_per_token_quant.py 6/6).
+E2E W1-S with the fusion wired: anchor held exactly (72.3%, committed
+4120 -- bit-exact as designed) BUT wall 37.9 s vs 33.3 s ref: prefill flat
+(16.2 vs 16.4 -- torch's vectorized chain is not dispatch-bound) and
+decode +4.7 s (one-program-per-row kernel with BLOCK_K=8192 massively
+under-utilizes at rows<=16). Wiring REVERTED; kernel + bit-parity tests
+kept as tooling (a 2-D-grid variant would be needed before any rewire).
