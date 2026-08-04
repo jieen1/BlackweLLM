@@ -189,3 +189,26 @@ through ``torch._scaled_mm`` (~400 GB/s class) and in per-round
 orchestration; the sparkinfer-native fix is extending
 ``gemm.tensor_fp8_channel_linear`` (in progress upstream, M=1-only today)
 to M<=16 with a per-token scale epilogue.
+
+## Combined historical-kernel mode: 1.77x e2e, confirmed twice (2026-08-04)
+
+`QSR_QWEN36_HIST_KERNELS=1` (single switch) = all-M W4A4 NVFP4 MLP via
+sparkinfer blockscaled + all FP8 dense layers via the self-owned
+``fp8_w8a8_sm120.so`` (historical CUTLASS port). Interleaved same-caliber
+W1-S (n16, c=4, K=3), two repeats per arm:
+
+| arm | wall | committed/s | prefill | decode | accept% | committed |
+|---|---:|---:|---:|---:|---:|---:|
+| combo run 1 | **33.3 s** | **123.7** | 15.8 s | 17.4 s | 72.3 | 4120 |
+| combo run 2 | **33.2 s** | **124.1** | 16.1 s | 17.1 s | 72.3 | 4120 |
+| W4A4 + torch FP8 | 42.0 / 39.0 s | 98.0 / 105.6 | 19.7 / 17.8 s | 22.3 / 21.1 s | 71.2 | 4115 |
+| W4A16 baseline (typical) | 58.7 / 60.2 s | 68.2 / 69.9 | 31.8 / 33.1 s | 26.9 / 27.0 s | 70.8 / 74.7 | ~4116 |
+
+- 1.77x faster than baseline; accepted ~85 tok/s (up from 40.3 at session
+  start = 2.1x); decode round ~13.3 ms vs historical ~11.6 ms.
+- Quality anchors: acceptance 72.3% (historical 70.29%), committed 4120
+  (historical 4116) -- AT the historical quality level.
+- The FP8-dense half of the combo is the self-owned .so (a port of the
+  historical CUTLASS kernel, M=1 bit-exact vs it), NOT sparkinfer yet; the
+  sparkinfer-native replacement is extending ``tensor_fp8_channel_linear``
+  (M=1-only today) to M<=16 with a per-token row-scale epilogue.
