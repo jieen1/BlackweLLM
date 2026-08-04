@@ -2796,11 +2796,13 @@ class Qwen36Attention(nn.Module):
 
 
 def _mlp_w4a4_prefill_enabled() -> bool:
-    """``QSR_QWEN36_MLP_W4A4=1`` routes large-M (prefill) MLP forwards
-    through the true W4A4 ``blockscaled.mm`` path. Default OFF: pending
-    full-model acceptance under the historical quality bar (see
-    ``notes/2026-08-04-w4a4-sparkinfer-headtohead.md``)."""
-    return os.environ.get("QSR_QWEN36_MLP_W4A4") == "1" or os.environ.get(
+    """Routes large-M (prefill) MLP forwards through the true W4A4
+    ``blockscaled.mm`` path. Default ON as part of the combined
+    historical-kernel mode -- measured 2026-08-04 W1-S c=4 twice: wall
+    33.3/33.2 s vs 58.7-60.2 s baseline, acceptance 72.3% (historical
+    anchor 70.29%) (see ``notes/2026-08-04-w4a4-sparkinfer-headtohead.md``).
+    ``QSR_QWEN36_MLP_W4A4=0`` stays the diagnostic fallback."""
+    return os.environ.get("QSR_QWEN36_MLP_W4A4", "1") != "0" or os.environ.get(
         "QSR_QWEN36_HIST_KERNELS"
     ) == "1"
 
@@ -2815,13 +2817,15 @@ _W4A4_PREFILL_MIN_ROWS = 64
 
 
 def _w4a4_all_rows_enabled() -> bool:
-    """``QSR_QWEN36_MLP_W4A4_ALL=1`` routes EVERY MLP forward (decode and
-    verify included) through the W4A4 blockscaled path -- the historical
-    single-kernel-family / single-weight-residency layout. Default OFF:
-    blockscaled small-M bandwidth (~330-440 GB/s measured) is below the
-    W4A16 fused kernel's ~830 GB/s, so this trades decode speed for the
-    prefill FP4-MMA win until sparkinfer grows an M<=16 FP4 tile."""
-    return os.environ.get("QSR_QWEN36_MLP_W4A4_ALL") == "1" or os.environ.get(
+    """Routes EVERY MLP forward (decode and verify included) through the
+    W4A4 blockscaled path -- the historical single-kernel-family /
+    single-weight-residency layout. Default ON inside the combined
+    historical-kernel mode (see ``_mlp_w4a4_prefill_enabled``): the e2e
+    win includes the raw packed-weight residency, and the measured
+    small-M bandwidth deficit (~330-440 vs ~830 GB/s) does not survive
+    the fused-round accounting. ``QSR_QWEN36_MLP_W4A4_ALL=0`` stays the
+    diagnostic fallback."""
+    return os.environ.get("QSR_QWEN36_MLP_W4A4_ALL", "1") != "0" or os.environ.get(
         "QSR_QWEN36_HIST_KERNELS"
     ) == "1"
 

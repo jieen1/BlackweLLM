@@ -76,13 +76,14 @@ def _torch_scaled_mm_fp8_channel_enabled() -> bool:
 
 
 def _native_w8a8_fp8_channel_enabled() -> bool:
-    # QSR_QWEN36_HIST_KERNELS=1 is the combined historical-kernel mode:
-    # W4A4 NVFP4 MLP (sparkinfer) + native W8A8 FP8 dense (historical
-    # CUTLASS port). Measured 2026-08-04 W1-S c=4 twice: wall 33.3/33.2 s
-    # vs 58.7-60.2 s baseline, acceptance 72.3% (historical anchor 70.29%).
-    if os.environ.get("QSR_QWEN36_HIST_KERNELS") == "1":
-        return True
-    return os.environ.get(QSR_NATIVE_W8A8_FP8_CHANNEL_ENV) in {"1", "all"}
+    # Combined historical-kernel mode: W4A4 NVFP4 MLP (sparkinfer) + native
+    # W8A8 FP8 dense (historical CUTLASS port). Measured 2026-08-04 W1-S
+    # c=4 twice: wall 33.3/33.2 s vs 58.7-60.2 s baseline, acceptance
+    # 72.3% (historical anchor 70.29%) -- default ON since then. ``0``
+    # stays the diagnostic fallback back to the torch._scaled_mm path.
+    if os.environ.get("QSR_NATIVE_W8A8_FP8_CHANNEL", "1") not in {"1", "all"}:
+        return False
+    return _native_w8a8_artifact_usable()
 
 
 def _native_w8a8_lm_head_enabled() -> bool:
@@ -116,6 +117,19 @@ def fp8_channel_raw_execution_uses_all_layers() -> bool:
         _torch_scaled_mm_fp8_channel_enabled()
         and os.environ.get(QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV, "all") != "1"
     ) or os.environ.get(QSR_NATIVE_W8A8_FP8_CHANNEL_ENV) == "all"
+
+
+def _native_w8a8_artifact_usable() -> bool:
+    """Whether the self-owned W8A8 artifact can load on this machine.
+
+    A default-ON native route must degrade to the torch._scaled_mm path on
+    an unbuilt checkout instead of crashing at the first CUDA forward.
+    """
+    try:
+        _native_w8a8_library_for_cuda()
+        return True
+    except RuntimeError:
+        return False
 
 
 def _native_w8a8_library_for_cuda() -> object:

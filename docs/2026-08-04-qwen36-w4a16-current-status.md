@@ -32,11 +32,14 @@ oracle、A/B 数字与复现命令）见
 **同日后续进展（2026-08-04 晚）**：按用户裁定"质量基准=历史方案"，全 M W4A4
 （单一 kernel 家族、单一权重驻留，历史布局）已接线并两次重复验证：**e2e 墙钟
 50.2/51.8 s vs 基线典型 58.7/60.2 s（约 +14%），prefill -32%**；接受率 71.2%
-（历史锚 70.29%）、committed 4115（历史锚 4116）。开关
-`QSR_QWEN36_MLP_W4A4=1 QSR_QWEN36_MLP_W4A4_ALL=1`，默认关。证据与负结果链：
+（历史锚 70.29%）、committed 4115（历史锚 4116）。随后接上自有 W8A8 FP8 dense
+kernel（历史 CUTLASS 移植）组成完整历史 kernel 组合：**33.3/33.2 s（1.77×）、
+接受率 72.3%、committed 4120，双双达到历史质量锚**。该组合模式现已**改为生产
+默认**（`QSR_QWEN36_MLP_W4A4` / `QSR_QWEN36_MLP_W4A4_ALL` /
+`QSR_NATIVE_W8A8_FP8_CHANNEL` 默认开，`=0` 为诊断回退；自有 `.so` 缺失时自动
+降级回 torch._scaled_mm）。证据与负结果链：
 [`notes/2026-08-04-w4a4-sparkinfer-headtohead.md`](../notes/2026-08-04-w4a4-sparkinfer-headtohead.md)、
 [`notes/2026-08-04-w1s-same-caliber-gap-decomposition.md`](../notes/2026-08-04-w1s-same-caliber-gap-decomposition.md)。
-剩余差距（50.2 s vs 历史 20.4 s）集中在 decode 轮：FP4 dense kernel 小 M 带宽
-天花板（swap_ab 实测更慢，M-tile 16 需 kernel 开发）与 FP8 dense GEMM
-（torch._scaled_mm ~450 GB/s vs 屋顶线 ~1.5 TB/s，需 per-token×per-channel
-epilogue kernel 开发）。Laguna-X-2.1 路径不变。
+剩余差距（33.3 s vs 历史 ~20.4 s）几乎全在 prefill（16.2 vs ~5 s），decode 引擎
+已在历史 10% 以内；prefill 侧的配置级杠杆已全部测完关闭，剩余是 kernel 开发
+（per-row-alpha FP8 epilogue、累加序精确的 norm 融合）。Laguna-X-2.1 路径不变。
