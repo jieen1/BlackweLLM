@@ -20,6 +20,23 @@
 
 ## 下一道性能门禁
 
-只评估保持 packed W4A16 数值契约的低 shared-memory / 更高驻留度候选，先做单
-GPU、单并发、同一 warm-engine 配置的 correctness 和 Nsight 对照，再决定是否
-进入生产。Laguna-X-2.1 路径不变。
+~~只评估保持 packed W4A16 数值契约的低 shared-memory / 更高驻留度候选~~
+**已评估，2026-08-04 结案：occupancy 不是主导杠杆（负结果，有完整实测）。**
+放开 1-block/SM pin 的 opt-in 候选做到了 3 blocks/SM、单层 kernel 快 18%，
+但全模型 W1-S 门禁下 verify 图相位反而慢 6%——fused 常驻轮的 grid-barrier
+参与者翻倍与 tile_k 减半把隔离环境的收益全部吃掉。原始记录（含 ncu 表、
+oracle、A/B 数字与复现命令）见
+[`notes/2026-08-04-qwen36-w4a16-profile-and-split-plan.md`](../notes/2026-08-04-qwen36-w4a16-profile-and-split-plan.md)
+末节；候选分支 `qwen-w4a16-occupancy-20260804` 保留不合并。
+
+**同日后续进展（2026-08-04 晚）**：按用户裁定"质量基准=历史方案"，全 M W4A4
+（单一 kernel 家族、单一权重驻留，历史布局）已接线并两次重复验证：**e2e 墙钟
+50.2/51.8 s vs 基线典型 58.7/60.2 s（约 +14%），prefill -32%**；接受率 71.2%
+（历史锚 70.29%）、committed 4115（历史锚 4116）。开关
+`QSR_QWEN36_MLP_W4A4=1 QSR_QWEN36_MLP_W4A4_ALL=1`，默认关。证据与负结果链：
+[`notes/2026-08-04-w4a4-sparkinfer-headtohead.md`](../notes/2026-08-04-w4a4-sparkinfer-headtohead.md)、
+[`notes/2026-08-04-w1s-same-caliber-gap-decomposition.md`](../notes/2026-08-04-w1s-same-caliber-gap-decomposition.md)。
+剩余差距（50.2 s vs 历史 20.4 s）集中在 decode 轮：FP4 dense kernel 小 M 带宽
+天花板（swap_ab 实测更慢，M-tile 16 需 kernel 开发）与 FP8 dense GEMM
+（torch._scaled_mm ~450 GB/s vs 屋顶线 ~1.5 TB/s，需 per-token×per-channel
+epilogue kernel 开发）。Laguna-X-2.1 路径不变。
