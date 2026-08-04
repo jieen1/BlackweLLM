@@ -165,3 +165,27 @@ are BIT-EXACT (maxdiff=0) but 508-648 GB/s, no better than the default
 configuration; the remaining decode-side work is days-scale kernel
 development (FP4 load pipeline; FP8 per-token-x-per-channel epilogue for
 the torch._scaled_mm shapes).**
+
+## FlashInfer B12x reference: sparkinfer is AT PARITY, not behind (2026-08-04)
+
+Direct same-shape speed comparison on real layer-5 operands (activation
+quantized by flashinfer's own quantizer, weights from the checkpoint via
+exact dequant->requant; needed a tvm_ffi make_kwargs_wrapper shim for the
+cutlass-dsl 4.6.0 drift):
+
+| shape | M | sparkinfer blockscaled | flashinfer b12x |
+|---|---:|---:|---:|
+| gate_proj (N=17408, K=5120) | 4 | 491-667 GB/s | 411 GB/s |
+| gate_proj | 16 | 435-586 GB/s | 352 GB/s |
+| down_proj (N=5120, K=17408) | 4 | (same class) | 491 GB/s |
+| down_proj | 16 | (same class) | 675 GB/s |
+
+The historical implementation's NVFP4 kernel WAS flashinfer B12x (vLLM
+priority-list patch in ``oracle/qwen36_vllm/nvfp4_b12x_patch.py``). It
+streams small-M decode shapes at the same 350-675 GB/s as sparkinfer --
+the standalone small-M FP4 GEMM ceiling is shared, sparkinfer is NOT the
+decode gap. The decode-side deficit lives in the FP8 dense layers routed
+through ``torch._scaled_mm`` (~400 GB/s class) and in per-round
+orchestration; the sparkinfer-native fix is extending
+``gemm.tensor_fp8_channel_linear`` (in progress upstream, M=1-only today)
+to M<=16 with a per-token scale epilogue.
