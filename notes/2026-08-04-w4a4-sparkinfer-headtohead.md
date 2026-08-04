@@ -288,3 +288,21 @@ fusion available today has been applied and measured (quant chain: no e2e
 win); the rest need new kernels (per-row-alpha FP8 epilogue for large-M
 dynamic W8A8 in sparkinfer; accumulation-order-exact norm fusion) --
 days-scale kernel development, not config/routing work.
+
+## Bit-exact RMSNorm tail fusion: landed (2026-08-04)
+
+runtime/kernels/fused_rms_norm.py rms_norm_tail: fuses the two final fp32
+multiplies + bf16 round of Qwen36RMSNorm (variance stays in torch --
+reduction order is anchor-sensitive). Bit-identical to the torch chain
+(tests/test_norm_tail_bit_parity.py 4/4). E2E W1-S c=4: anchor EXACT
+(72.3%, committed 4120), prefill 15.4 s (best measured vs typical 16.4).
+Commit c52a74c.
+
+## FP4 dense_gemm large-M tile sweep: no win (2026-08-04)
+
+M=16384, real layer-5 operands: default policy already resolves to the
+(128,128) coarse tile; explicit (128,128) measured 3.467 ms vs default
+path 3.693 ms (same tile -- within box noise), (64,128)/(64,64) 6.8-7.0 ms
+(2x worse). Large-M FP4 MLP GEMM runs ~790 TFLOPS (gate, 3.467 ms) --
+near the practical ceiling of the current CuTe DSL kernel; the remaining
+prefill GEMM headroom needs kernel-code work, not tile policy.
