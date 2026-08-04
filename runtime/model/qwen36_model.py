@@ -99,13 +99,17 @@ B1's layer-by-layer cosine gate exists to catch:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-from sparkinfer.attention.gated_delta_rule import fused_recurrent_gated_delta_rule_multistep
+from sparkinfer.attention.gated_delta_rule import (
+    fused_recurrent_gated_delta_rule_multistep,
+    fused_recurrent_gated_delta_rule_multistep_indexed,
+)
 from sparkinfer.attention.paged._forward import paged_attention_forward
 from sparkinfer.attention.paged._scratch import build_paged_attention_binding
 from sparkinfer.attention.paged.planner import (
@@ -132,6 +136,7 @@ from runtime.model._weight_loading import default_weight_loader
 from runtime.model.compressed_tensors_linear import (
     CompressedTensorsFP8ChannelLinear,
     CompressedTensorsNVFP4Linear,
+    fp8_channel_raw_execution_uses_all_layers,
 )
 from runtime.model.modelopt_linear import ModelOptFP8Linear, ModelOptNVFP4Linear
 from runtime.model.plain_linear import PlainLinear
@@ -148,6 +153,7 @@ from runtime.model.plain_linear import PlainLinear
 #: params_dict: continue`` check below, same as it always has for any
 #: checkpoint tensor with no matching Parameter.
 _IGNORED_WEIGHT_SUFFIXES: tuple[str, ...] = ()
+
 
 #: Which ``nn.Module`` factory each classifier's algo string maps to.
 #: Deliberately the single place that knows about every quantization format
@@ -182,7 +188,29 @@ def _make_linear(
     quantizes something differently fails loud at construction time instead
     of silently loading raw bytes as BF16.
     """
-    algo = quantized.get(dotted_name, QUANT_ALGO_UNQUANTIZED)
+    return _make_linear_for_algorithm(
+        quantized.get(dotted_name, QUANT_ALGO_UNQUANTIZED),
+        dotted_name,
+        in_features,
+        out_features,
+    )
+
+
+def _make_linear_for_algorithm(
+    algo: str,
+    dotted_name: str,
+    in_features: int,
+    out_features: int,
+) -> nn.Module:
+    """Build a Linear from a known checkpoint quantization algorithm.
+
+    Most projections call :func:`_make_linear`, because their module name is
+    also their checkpoint name.  Qwen GDN's historical execution contract is
+    the important exception: the checkpoint stores qkv/z separately, while
+    the execution matrix is one concatenated qkvz projection.  Keeping the
+    algorithm dispatch here makes that fixed-layout exception use the exact
+    same raw-FP8 factory as every ordinary projection.
+    """
     if algo == QUANT_ALGO_UNQUANTIZED:
         return PlainLinear(in_features, out_features, bias=False)
     factory = _LINEAR_FACTORY_FOR_ALGO.get(algo)
@@ -224,6 +252,21 @@ def _bmm_project(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
     exact sequential-call result while still costing ONE kernel launch
     instead of ``seq_len``.
     """
+    # The historical W8A8 verify path projected its complete ``B * (K + 1)``
+    # query matrix through the channel-scaled FP8 GEMM.  Do that before the
+    # old BF16 ``bmm`` compatibility fallback: invoking ``_ensure_ready``
+    # here would materialize an otherwise avoidable full BF16 copy of every
+    # GDN ``in_proj_a``/``in_proj_b`` weight.  This is intentionally limited
+    # to CUDA's all-layer raw-FP8 contract.  CPU tests and the explicit
+    # legacy fallback retain the independently-rounded BF16 ``bmm`` path
+    # documented above.
+    if (
+        x.device.type == "cuda"
+        and isinstance(module, CompressedTensorsFP8ChannelLinear)
+        and fp8_channel_raw_execution_uses_all_layers()
+    ):
+        return module(x)
+
     if hasattr(module, "_ensure_ready"):
         module._ensure_ready()  # ModelOptFP8Linear / ModelOptNVFP4Linear
         weight = module._weight_bf16  # [out, in], BF16 (dequantized once, cached)
@@ -232,11 +275,60 @@ def _bmm_project(module: nn.Module, x: torch.Tensor) -> torch.Tensor:
     bias = getattr(module, "bias", None)
     assert bias is None, "_bmm_project: every GDN projection is bias=False; bias path untested"
 
-    seq_len = x.shape[1]
-    x2d = x.reshape(seq_len, -1)  # [seq_len, in]
-    weight_batched = weight.t().unsqueeze(0).expand(seq_len, -1, -1)  # [seq_len, in, out], no copy
-    out = torch.bmm(x2d.unsqueeze(1), weight_batched).squeeze(1)  # [seq_len, out]
-    return out.unsqueeze(0)  # [1, seq_len, out]
+    batch_size, seq_len, _ = x.shape
+    rows = batch_size * seq_len
+    x2d = x.reshape(rows, -1)  # [B * seq_len, in]
+    weight_batched = weight.t().unsqueeze(0).expand(rows, -1, -1)  # [B * seq_len, in, out]
+    out = torch.bmm(x2d.unsqueeze(1), weight_batched).squeeze(1)  # [B * seq_len, out]
+    return out.reshape(batch_size, seq_len, -1)
+
+
+def _gdn_fused_checkpoint_slice(
+    mapped_name: str,
+    tensor: torch.Tensor,
+    params: dict[str, nn.Parameter],
+) -> tuple[str, str] | None:
+    """Copy one legacy Qwen GDN checkpoint tensor into a fused parameter.
+
+    Qwen3.6 saves four independent tensors (``qkv``, ``z``, ``b``, ``a``),
+    but historical production deliberately executed two physical matrices in
+    ``[qkv, z]`` and ``[b, a]`` output-row order.  Both FP8 values and their
+    per-channel scale tensors have their output channel on dimension zero,
+    so direct row copies preserve the checkpoint bytes exactly.
+
+    The second returned value is the legacy source name used by
+    :meth:`Qwen36ForCausalLMSelfBuilt.load_weights` to prove both slices of
+    each fused Parameter arrived before marking it loaded.
+    """
+    source_to_fused = (
+        (".linear_attn.in_proj_qkv.", ".linear_attn.in_proj_qkvz.", True),
+        (".linear_attn.in_proj_z.", ".linear_attn.in_proj_qkvz.", False),
+        (".linear_attn.in_proj_b.", ".linear_attn.in_proj_ba.", True),
+        (".linear_attn.in_proj_a.", ".linear_attn.in_proj_ba.", False),
+    )
+    for source, fused, first_shard in source_to_fused:
+        if source not in mapped_name:
+            continue
+        fused_name = mapped_name.replace(source, fused)
+        param = params.get(fused_name)
+        if param is None:
+            return None
+        if tensor.ndim != param.ndim or tensor.shape[1:] != param.shape[1:]:
+            raise RuntimeError(
+                f"GDN fused load shape mismatch for {mapped_name!r}: checkpoint "
+                f"{tuple(tensor.shape)} cannot fill {fused_name!r} with shape "
+                f"{tuple(param.shape)}"
+            )
+        offset = 0 if first_shard else param.shape[0] - tensor.shape[0]
+        destination = param.data.narrow(0, offset, tensor.shape[0])
+        if destination.shape != tensor.shape:
+            raise RuntimeError(
+                f"GDN fused load row mismatch for {mapped_name!r}: destination "
+                f"{tuple(destination.shape)} vs checkpoint {tuple(tensor.shape)}"
+            )
+        destination.copy_(tensor)
+        return fused_name, mapped_name
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -258,14 +350,47 @@ class Qwen36RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim))
         self.weight.weight_loader = default_weight_loader
+        self._w_plus_one: torch.Tensor | None = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        input_dtype = x.dtype
-        x_f32 = x.to(torch.float32)
-        variance = x_f32.pow(2).mean(-1, keepdim=True)
-        out = x_f32 * torch.rsqrt(variance + self.eps)
-        out = out * (1.0 + self.weight.float())
-        return out.to(input_dtype)
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Run Qwen's zero-centred RMSNorm, optionally carrying the residual.
+
+        Keeping the residual as a separate return value lets all decoder
+        entry points share one control-flow shape.  The actual add remains
+        the original BF16 operation before normalisation: the historical
+        Triton fused-add variant was correct, but its controlled W1-S A/B was
+        slower in this self-built graph and is therefore deliberately not the
+        production default.
+        """
+        combined = x if residual is None else x + residual
+        input_dtype = combined.dtype
+        combined_f32 = combined.to(torch.float32)
+        variance = combined_f32.pow(2).mean(-1, keepdim=True)
+        if combined.is_cuda:
+            # Bit-exact tail fusion (tests/test_norm_tail_bit_parity.py):
+            # variance keeps torch's reduction order; only the two final fp32
+            # multiplies + bf16 round move into one kernel -- deterministic
+            # RN ops, so the acceptance anchor cannot move.
+            if self._w_plus_one is None:
+                self._w_plus_one = (1.0 + self.weight.float()).contiguous()
+            from runtime.kernels.fused_rms_norm import rms_norm_tail
+
+            rstd = torch.rsqrt(variance + self.eps)
+            orig_shape = combined_f32.shape
+            out = rms_norm_tail(
+                combined_f32.reshape(-1, orig_shape[-1]),
+                rstd.reshape(-1),
+                self._w_plus_one,
+            ).view(orig_shape)
+        else:
+            out = combined_f32 * torch.rsqrt(variance + self.eps)
+            out = out * (1.0 + self.weight.float())
+            out = out.to(input_dtype)
+        if residual is None:
+            return out
+        return out, combined
 
 
 class Qwen36RMSNormGated(nn.Module):
@@ -343,10 +468,11 @@ class Qwen36PagedAttentionCache:
     ``page_size`` other than 64/128 (confirmed directly; see the constant
     above), so a single page sized to the whole sequence only works by
     accident when ``max_seq_len`` happens to equal 64 or 128. The page
-    *table* itself is still trivial at batch=1 (one sequence, physical
-    pages 0..num_pages-1 in order) -- the complexity this class still
-    avoids is B2's real slot manager (sharing/evicting physical pages
-    across concurrent sequences), not paging itself.
+    *table* itself may map logical pages onto a shared physical pool.  The
+    B1-owned constructor keeps the trivial identity mapping; the serving
+    slot pool supplies its fixed logical-to-physical row explicitly.  This
+    makes batch=1, batched decode, and eventual prefix-cache sharing use the
+    exact same addressing contract.
     """
 
     def __init__(
@@ -360,6 +486,7 @@ class Qwen36PagedAttentionCache:
     ) -> None:
         self.page_size = _PAGED_ATTENTION_PAGE_SIZE
         self.num_pages = (max_seq_len + self.page_size - 1) // self.page_size
+        self.physical_num_pages = self.num_pages
         self.max_seq_len = self.num_pages * self.page_size
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -381,20 +508,16 @@ class Qwen36PagedAttentionCache:
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         page_size: int,
+        page_table: torch.Tensor | None = None,
     ) -> Qwen36PagedAttentionCache:
         """Build a cache **over storage someone else owns** (B2's slot pool).
 
-        ``k_cache``/``v_cache`` are ``[num_pages, page_size, num_kv_heads,
-        head_dim]`` slices of a per-layer pool -- for slot ``s`` with
-        ``P`` pages each, ``pool[s*P:(s+1)*P]``, which is contiguous, so
-        this view's *local* page ids ``0..P-1`` address exactly slot
-        ``s``'s own pages and nothing else. That is what lets B2's
-        single-slot path (prefill, and eager per-slot decode) be the
-        **same code** ``__init__``-allocated caches run in B1: identical
-        page table, identical ``append`` arithmetic, identical kernel
-        call. The batched decode path addresses the same bytes through
-        the *global* page table instead (``slot*P + local``); both views
-        are over one allocation, so they never disagree.
+        When ``page_table`` is omitted, the storage is interpreted as this
+        cache's complete local page range and the identity mapping is used.
+        The slot pool instead passes its whole per-layer physical allocation
+        plus one ``[1, logical_pages]`` table row.  That keeps a slot's B=1
+        prefill/decode on the same page ids that batched decode and CUDA
+        graphs consume, rather than relying on a hidden contiguous slice.
 
         Deliberately a second constructor rather than an ``__init__``
         keyword: ``__init__`` allocating is the invariant B1's callers
@@ -404,7 +527,16 @@ class Qwen36PagedAttentionCache:
         """
         obj = cls.__new__(cls)
         obj.page_size = page_size
-        obj.num_pages = int(k_cache.shape[0])
+        if k_cache.shape != v_cache.shape:
+            raise ValueError("wrapped Qwen KV caches must have the same shape")
+        if page_table is not None and (
+            page_table.ndim != 2 or page_table.shape[0] != 1 or page_table.shape[1] < 1
+        ):
+            raise ValueError("wrapped Qwen page_table must have shape [1, logical_pages]")
+        obj.num_pages = (
+            int(page_table.shape[1]) if page_table is not None else int(k_cache.shape[0])
+        )
+        obj.physical_num_pages = int(k_cache.shape[0])
         obj.max_seq_len = obj.num_pages * page_size
         obj.num_kv_heads = int(k_cache.shape[2])
         obj.head_dim = int(k_cache.shape[3])
@@ -412,9 +544,11 @@ class Qwen36PagedAttentionCache:
         obj.device = k_cache.device
         obj.k_cache = k_cache
         obj.v_cache = v_cache
-        obj.page_table = torch.arange(
-            obj.num_pages, dtype=torch.int32, device=k_cache.device
-        ).unsqueeze(0)
+        obj.page_table = (
+            page_table
+            if page_table is not None
+            else torch.arange(obj.num_pages, dtype=torch.int32, device=k_cache.device).unsqueeze(0)
+        )
         obj.seq_len = 0
         return obj
 
@@ -433,8 +567,9 @@ class Qwen36PagedAttentionCache:
         positions = torch.arange(past_len, new_total, device=self.device)
         page_ids = positions // self.page_size
         offsets = positions % self.page_size
-        self.k_cache[page_ids, offsets] = new_k.to(self.dtype)
-        self.v_cache[page_ids, offsets] = new_v.to(self.dtype)
+        physical_page_ids = self.page_table[0, page_ids]
+        self.k_cache[physical_page_ids, offsets] = new_k.to(self.dtype)
+        self.v_cache[physical_page_ids, offsets] = new_v.to(self.dtype)
         self.seq_len = new_total
         return past_len, new_total
 
@@ -487,6 +622,31 @@ class Qwen36DecodeBatch:
 
 
 @dataclass
+class Qwen36PrefillBatch:
+    """One uniform ``B x Q`` extend forward over slot-owned pools.
+
+    This deliberately describes only the homogeneous prefill shape: every
+    request contributes the same number of new tokens and enters with the
+    same recurrent-state regime.  That is the high-throughput admission
+    shape used by W1-S.  Ragged/prefix-mismatched admissions retain the
+    established B=1 path rather than padding real GDN recurrence with fake
+    tokens (which would be silently wrong).
+    """
+
+    input_ids: torch.Tensor  # [B, Q]
+    positions: torch.Tensor  # [B * Q], request-major
+    write_index: torch.Tensor  # [B * Q], flat rows into each KV pool
+    slot_index: torch.Tensor  # [B], pooled GDN row per request
+    attn: Any
+    k_pools: list[torch.Tensor | None]
+    v_pools: list[torch.Tensor | None]
+    conv_pools: list[torch.Tensor | None]
+    recurrent_pools: list[torch.Tensor | None]
+    attn_outputs: list[torch.Tensor | None]
+    has_previous_state: bool
+
+
+@dataclass
 class Qwen36VerifyBatch:
     """Persistent inputs for one captured K-token target verify.
 
@@ -506,9 +666,15 @@ class Qwen36VerifyBatch:
     attn_drivers: list[Any | None]
     attn_outputs: list[torch.Tensor | None]
     gdn_source_index: torch.Tensor
+    #: Request-major ``[B, qo_len]`` global row ids.  This is the graph
+    #: safe form of ``gdn_state_rows``: replay updates ids, while the captured
+    #: body keeps reading and writing the same pooled storage addresses.
+    gdn_destination_index: torch.Tensor | None
     gdn_conv_pools: list[torch.Tensor | None]
     gdn_recurrent_pools: list[torch.Tensor | None]
-    gdn_state_rows: dict[int, list[GdnLayerState]]
+    #: Eager compatibility path.  CUDA graphs use ``gdn_destination_index``
+    #: instead, so slot identity remains data rather than captured addresses.
+    gdn_state_rows: dict[int, list[list[GdnLayerState]]] | None
 
 
 @dataclass
@@ -583,22 +749,51 @@ class Qwen36GatedDeltaNet(nn.Module):
         self.norm = Qwen36RMSNormGated(self.head_v_dim, eps=self.eps)
 
         prefix = f"model.language_model.layers.{layer_idx}.linear_attn"
-        self.in_proj_qkv = _make_linear(
-            quantized, f"{prefix}.in_proj_qkv", self.hidden_size, self.key_dim * 2 + self.value_dim
-        )
-        self.in_proj_z = _make_linear(
-            quantized, f"{prefix}.in_proj_z", self.hidden_size, self.value_dim
+        # The checkpoint stores qkv and z as two tensors, but the historical
+        # production path joins their *output rows* into one qkvz matrix and
+        # executes exactly one input projection.  This is a storage-layout
+        # fusion only: load_weights below copies the original E4M3 rows and
+        # their original per-channel scales directly into the two slices --
+        # no BF16 materialization and no re-quantization.
+        qkv_name = f"{prefix}.in_proj_qkv"
+        z_name = f"{prefix}.in_proj_z"
+        qkv_algo = quantized.get(qkv_name, QUANT_ALGO_UNQUANTIZED)
+        z_algo = quantized.get(z_name, QUANT_ALGO_UNQUANTIZED)
+        if qkv_algo != z_algo:
+            raise ValueError(
+                f"GDN layer {layer_idx}: in_proj_qkv uses {qkv_algo!r}, but "
+                f"in_proj_z uses {z_algo!r}; historical qkvz fusion requires "
+                "one physical projection format"
+            )
+        self.in_proj_qkvz = _make_linear_for_algorithm(
+            qkv_algo,
+            f"{prefix}.in_proj_qkvz",
+            self.hidden_size,
+            self.conv_dim + self.value_dim,
         )
         self.out_proj = _make_linear(
             quantized, f"{prefix}.out_proj", self.value_dim, self.hidden_size
         )
-        # in_proj_a/in_proj_b are never in quantized_layers (verified, B0-2)
-        # -- plain BF16 Linears, small (hidden_size -> num_v_heads).
-        self.in_proj_b = PlainLinear(self.hidden_size, self.num_v_heads, bias=False)
-        self.in_proj_a = PlainLinear(self.hidden_size, self.num_v_heads, bias=False)
+        # b/a are plain BF16 in this checkpoint.  Like qkv/z, historical
+        # execution concatenates their output rows in [b, a] order; the
+        # shard-aware loader records the original two checkpoint tensors.
+        for projection_name in (f"{prefix}.in_proj_b", f"{prefix}.in_proj_a"):
+            algo = quantized.get(projection_name, QUANT_ALGO_UNQUANTIZED)
+            if algo != QUANT_ALGO_UNQUANTIZED:
+                raise ValueError(
+                    f"GDN layer {layer_idx}: {projection_name} uses unexpected "
+                    f"quantization {algo!r}; the verified [b, a] fusion is BF16-only"
+                )
+        self.in_proj_ba = PlainLinear(
+            self.hidden_size,
+            self.num_v_heads * 2,
+            shard_sizes=[self.num_v_heads, self.num_v_heads],
+            bias=False,
+        )
 
     def new_state(self, *, batch: int, device: torch.device, dtype: torch.dtype) -> GdnLayerState:
-        assert batch == 1, "Qwen36GatedDeltaNet (B1) only supports batch=1"
+        if batch < 1:
+            raise ValueError(f"GDN state batch must be positive, got {batch}")
         return GdnLayerState(
             # NOTE: length is the FULL kernel size (4), not kernel_size-1.
             # Derived (not guessed) from transformers/cache_utils.py's
@@ -651,12 +846,11 @@ class Qwen36GatedDeltaNet(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, state: GdnLayerState) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-        assert batch_size == 1
 
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)  # [b, conv_dim, seq]
-        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
+        mixed_qkvz = self.in_proj_qkvz(hidden_states)
+        mixed_qkv = mixed_qkvz[..., : self.conv_dim].transpose(1, 2)  # [b, conv_dim, seq]
+        z = mixed_qkvz[..., self.conv_dim :].reshape(batch_size, seq_len, -1, self.head_v_dim)
+        b, a = self.in_proj_ba(hidden_states).split(self.num_v_heads, dim=-1)
 
         if state.has_previous_state and seq_len == 1:
             # Single-token decode: torch_causal_conv1d_update equivalent.
@@ -772,10 +966,10 @@ class Qwen36GatedDeltaNet(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
         assert seq_len == 1, "decode_batch is the single-token continuation path"
 
-        mixed_qkv = self.in_proj_qkv(hidden_states).transpose(1, 2)  # [b, conv_dim, 1]
-        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
+        mixed_qkvz = self.in_proj_qkvz(hidden_states)
+        mixed_qkv = mixed_qkvz[..., : self.conv_dim].transpose(1, 2)  # [b, conv_dim, 1]
+        z = mixed_qkvz[..., self.conv_dim :].reshape(batch_size, seq_len, -1, self.head_v_dim)
+        b, a = self.in_proj_ba(hidden_states).split(self.num_v_heads, dim=-1)
 
         state_len = conv_state.shape[-1]
         catted = torch.cat([conv_state, mixed_qkv], dim=-1).to(self.conv1d.weight.dtype)
@@ -816,12 +1010,41 @@ class Qwen36GatedDeltaNet(nn.Module):
 
         return self.out_proj(core_attn_out)
 
+    def prefill_batch(
+        self,
+        hidden_states: torch.Tensor,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        *,
+        has_previous_state: bool,
+    ) -> torch.Tensor:
+        """Uniform ``B x Q`` GDN extend over pooled states.
+
+        ``forward`` already implements independent batch elements; its state
+        container only has a scalar ``has_previous_state`` because B1 owned
+        one sequence.  The prefill scheduler calls this only when every row
+        has the same regime, so one scalar remains exact.  The explicit
+        wrapper keeps that admission invariant at the batch boundary instead
+        of silently applying one row's recurrence mode to another.
+        """
+        state = GdnLayerState(
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            has_previous_state=has_previous_state,
+        )
+        return self.forward(hidden_states, state)
+
     def spec_forward(
         self,
         hidden_states: torch.Tensor,
         state: GdnLayerState,
         *,
-        spec_state_rows: list[GdnLayerState] | None = None,
+        spec_state_rows: list[GdnLayerState] | list[list[GdnLayerState]] | None = None,
+        spec_source_index: torch.Tensor | None = None,
+        spec_destination_index: torch.Tensor | None = None,
+        spec_conv_pool: torch.Tensor | None = None,
+        spec_recurrent_pool: torch.Tensor | None = None,
+        batch_large_projections: bool = False,
     ) -> tuple[torch.Tensor, list[GdnLayerState] | None]:
         """B3: MTP verify's GDN forward -- K candidate positions, K+1
         materialized state snapshots, no chunk algorithm involved.
@@ -913,18 +1136,11 @@ class Qwen36GatedDeltaNet(nn.Module):
           bit-for-bit (BF16 GEMM's reduction order depends on row count on
           this stack).
         - ``in_proj_qkv``/``in_proj_z``/``out_proj`` (output dims in the
-          thousands -- ``conv_dim``/``value_dim``/``hidden_size``) are
-          NOT safe to batch by EITHER method: measured directly that
-          ``_bmm_project``'s bit-exactness itself breaks down somewhere
-          between output dim 512 and 2048 (independent of quantization --
-          reproduced with plain unquantized BF16 weights at those sizes
-          too), and every one of these three projections' output dim
-          exceeds that. These three stay in the ``for t in
-          range(seq_len)`` loop, unchanged from the original
-          implementation -- this is real, measured cost this batching
-          pass could NOT remove while keeping the bit-exact guarantee
-          (see ``notes/2026-08-02-gdn-spec-forward-batching.md`` for the
-          measurement and the exact breakpoint search).
+          thousands -- ``conv_dim``/``value_dim``/``hidden_size``) do not
+          preserve bit-exactness when batched. ``batch_large_projections``
+          exposes that faster experimental form for the B3 quality gate;
+          it remains off until the gate also measures its NLL and full-logit
+          cosine legs. The exact sequential form is the production default.
 
         The legacy snapshot mode never touches ``state`` and operates on
         clones throughout, preserving crash-safety. The row-addressed mode
@@ -943,7 +1159,10 @@ class Qwen36GatedDeltaNet(nn.Module):
         because the rows themselves are the committed-state candidates.
         """
         batch_size, seq_len, _ = hidden_states.shape
-        assert batch_size == 1
+        if spec_state_rows is None and spec_destination_index is None and batch_size != 1:
+            raise ValueError(
+                "snapshot verify only supports one sequence; use fixed GDN rows for batches"
+            )
         if not state.has_previous_state:
             raise ValueError(
                 "spec_forward continues from a committed anchor (the token "
@@ -954,28 +1173,29 @@ class Qwen36GatedDeltaNet(nn.Module):
                 "bug, not a case this method degrades gracefully for."
             )
 
-        # ---- in_proj_qkv / in_proj_z stay per-position, sequential:
-        # their output dims (conv_dim, value_dim) are past the point where
-        # even `_bmm_project` stops being bit-exact (see docstring above
-        # and that function's own docstring) -- this loop is structurally
-        # identical to what the original implementation's `self.forward()`
-        # calls did for these two projections, just extracted so conv1d
-        # and norm below can still batch across the results. ---------------
-        mixed_qkv_steps: list[torch.Tensor] = []
-        z_steps: list[torch.Tensor] = []
-        for t in range(seq_len):
-            h_t = hidden_states[:, t : t + 1, :]
-            mixed_qkv_steps.append(self.in_proj_qkv(h_t).transpose(1, 2))  # [1, conv_dim, 1]
-            z_steps.append(self.in_proj_z(h_t))  # [1, 1, value_dim]
-        mixed_qkv = torch.cat(mixed_qkv_steps, dim=-1)  # [1, conv_dim, seq_len]
-        z = torch.cat(z_steps, dim=1).reshape(batch_size, seq_len, -1, self.head_v_dim)
+        # ---- The exact sequential form is the production default. The
+        # batched branch exists solely for the full-model B3 quality gate.
+        # A single-token qkvz call is deliberately retained here: it keeps
+        # the old per-position arithmetic while matching historical storage
+        # and eliminating the former qkv-plus-z duplicate FP8 launch. ------
+        if batch_large_projections:
+            mixed_qkvz = self.in_proj_qkvz(hidden_states)
+            mixed_qkv = mixed_qkvz[..., : self.conv_dim].transpose(1, 2)
+            z = mixed_qkvz[..., self.conv_dim :].reshape(batch_size, seq_len, -1, self.head_v_dim)
+        else:
+            mixed_qkv_steps: list[torch.Tensor] = []
+            z_steps: list[torch.Tensor] = []
+            for t in range(seq_len):
+                h_t = hidden_states[:, t : t + 1, :]
+                qkvz_t = self.in_proj_qkvz(h_t)
+                mixed_qkv_steps.append(qkvz_t[..., : self.conv_dim].transpose(1, 2))
+                z_steps.append(qkvz_t[..., self.conv_dim :])
+            mixed_qkv = torch.cat(mixed_qkv_steps, dim=-1)  # [1, conv_dim, seq_len]
+            z = torch.cat(z_steps, dim=1).reshape(batch_size, seq_len, -1, self.head_v_dim)
 
-        # ---- in_proj_a/in_proj_b: safe to batch (output dim =
-        # num_v_heads, well under the threshold above) -- via
-        # `_bmm_project`, NOT `self.in_proj_b(hidden_states)` directly
-        # (plain batched Linear is not bit-exact even at this size). ------
-        b = _bmm_project(self.in_proj_b, hidden_states)
-        a = _bmm_project(self.in_proj_a, hidden_states)
+        # ---- The historical [b, a] matrix stays on bmm's independent-row
+        # execution path, then splits without a copy. ----------------------
+        b, a = _bmm_project(self.in_proj_ba, hidden_states).split(self.num_v_heads, dim=-1)
 
         # ---- one causal conv1d call covers every position's state
         # update, fed the bit-exact per-position `mixed_qkv` collected
@@ -1008,11 +1228,35 @@ class Qwen36GatedDeltaNet(nn.Module):
         # This removes the per-token recurrent-state copies from the graph path
         # while preserving the exact K+1 row contract used for rollback-free
         # verification.
-        if spec_state_rows is not None and len(spec_state_rows) != seq_len + 1:
-            raise ValueError(
-                f"spec_state_rows has {len(spec_state_rows)} rows for seq_len={seq_len}; "
-                "expected K+1 rows"
-            )
+        if spec_state_rows is not None and spec_destination_index is not None:
+            raise ValueError("spec verify accepts row views or row indices, not both")
+        if spec_destination_index is not None:
+            if (
+                spec_destination_index.shape != (batch_size, seq_len)
+                or spec_conv_pool is None
+                or spec_recurrent_pool is None
+            ):
+                raise ValueError(
+                    "indexed spec verify requires [B, qo_len] row ids and both recurrent pools"
+                )
+            spec_rows_by_request = None
+        elif spec_state_rows is not None:
+            # Preserve the original single-request public shape while letting
+            # the captured batch descriptor carry one row list per request.
+            # Normalising once here keeps every write below request-major.
+            if spec_state_rows and isinstance(spec_state_rows[0], GdnLayerState):
+                spec_rows_by_request = [spec_state_rows]
+            else:
+                spec_rows_by_request = spec_state_rows
+            if len(spec_rows_by_request) != batch_size or any(
+                len(rows) != seq_len for rows in spec_rows_by_request
+            ):
+                raise ValueError(
+                    "spec_state_rows must provide one row per verify position "
+                    f"(batch={batch_size}, seq_len={seq_len})"
+                )
+        else:
+            spec_rows_by_request = None
         # The multistep kernel is CUDA + BF16 only. Production is exactly
         # that, so it is the fast path -- but `spec_forward`'s own CPU
         # equivalence gate builds a float32 layer on purpose (the layer's
@@ -1023,6 +1267,12 @@ class Qwen36GatedDeltaNet(nn.Module):
         # this exact code. Fall back to K sequential calls instead: same
         # contract, same K+1 states, just without the fusion.
         use_multistep = query.is_cuda and query.dtype == torch.bfloat16
+        use_indexed_multistep = (
+            use_multistep
+            and spec_destination_index is not None
+            and spec_source_index is not None
+            and spec_source_index.shape == (batch_size,)
+        )
         if use_multistep:
             # The multistep kernel requires an innermost-contiguous layout;
             # FLA's sequential entry point does not, which is why this never
@@ -1030,15 +1280,29 @@ class Qwen36GatedDeltaNet(nn.Module):
             # `torch.split`, so these are strided views. Cheap to fix here:
             # q/k/v are [1, K, H, 128] with K=4, orders of magnitude smaller
             # than the K+1 recurrent-state clones this path exists to delete.
-            core_attn_out, recurrent_states = fused_recurrent_gated_delta_rule_multistep(
-                query.contiguous(),
-                key.contiguous(),
-                value.contiguous(),
-                g=g.contiguous(),
-                beta=beta.contiguous(),
-                initial_state=state.recurrent_state.contiguous(),
-                output_all_states=True,
-            )
+            if use_indexed_multistep:
+                assert spec_recurrent_pool is not None and spec_source_index is not None
+                core_attn_out = fused_recurrent_gated_delta_rule_multistep_indexed(
+                    query.contiguous(),
+                    key.contiguous(),
+                    value.contiguous(),
+                    g=g.contiguous(),
+                    beta=beta.contiguous(),
+                    state_pool=spec_recurrent_pool,
+                    source_index=spec_source_index,
+                    destination_index=spec_destination_index,
+                )
+                recurrent_states = None
+            else:
+                core_attn_out, recurrent_states = fused_recurrent_gated_delta_rule_multistep(
+                    query.contiguous(),
+                    key.contiguous(),
+                    value.contiguous(),
+                    g=g.contiguous(),
+                    beta=beta.contiguous(),
+                    initial_state=state.recurrent_state.contiguous(),
+                    output_all_states=True,
+                )
         else:
             outs = []
             states = [state.recurrent_state]
@@ -1058,13 +1322,30 @@ class Qwen36GatedDeltaNet(nn.Module):
                 states.append(running)
             core_attn_out = torch.cat(outs, dim=1)
             recurrent_states = torch.stack(states, dim=1)
-        if spec_state_rows is None:
+        if spec_rows_by_request is None and spec_destination_index is None:
+            assert recurrent_states is not None
             recurrent_snapshots = [recurrent_states[:, j].clone() for j in range(seq_len + 1)]
         else:
-            # Column zero is the live pre-verify state. Keep it untouched;
-            # only candidate results belong in the permanent destination rows.
-            for j in range(1, seq_len + 1):
-                spec_state_rows[j].recurrent_state.copy_(recurrent_states[:, j])
+            # The source was gathered before this loop, so row zero can be
+            # overwritten with the anchor result.  Every verify position has
+            # exactly one candidate row -- no separate incoming-state row.
+            for j in range(seq_len):
+                if spec_destination_index is not None:
+                    # The indexed Triton recurrence has already performed
+                    # this exact row-addressed write.  Retaining a separate
+                    # gather/snapshot/index_copy here would recreate the
+                    # historical bottleneck this path removes.
+                    if recurrent_states is not None:
+                        spec_recurrent_pool.index_copy_(
+                            0, spec_destination_index[:, j], recurrent_states[:, j + 1]
+                        )
+                else:
+                    assert spec_rows_by_request is not None
+                    assert recurrent_states is not None
+                    for batch_idx, rows in enumerate(spec_rows_by_request):
+                        rows[j].recurrent_state.copy_(
+                            recurrent_states[batch_idx : batch_idx + 1, j + 1]
+                        )
 
         # ---- batched norm, once over all `seq_len` positions' recurrent
         # outputs (was: once per position, inside the loop). RMSNormGated
@@ -1077,16 +1358,19 @@ class Qwen36GatedDeltaNet(nn.Module):
         # ---- out_proj stays per-position, sequential: output dim is
         # hidden_size, past the `_bmm_project` bit-exactness threshold
         # (same reasoning as in_proj_qkv/in_proj_z above). ------------------
-        output = torch.cat(
-            [self.out_proj(core_attn_out[:, t : t + 1, :]) for t in range(seq_len)], dim=1
-        )
+        if batch_large_projections:
+            output = self.out_proj(core_attn_out)
+        else:
+            output = torch.cat(
+                [self.out_proj(core_attn_out[:, t : t + 1, :]) for t in range(seq_len)], dim=1
+            )
 
         # ---- assemble the `seq_len + 1` snapshots: conv_state via pure
         # slicing of `catted` (position j's window is
         # ``catted[:, :, j : j + state_len]`` -- j=0 is the untouched
         # anchor, j=seq_len is the state after all candidates), recurrent
         # state from the multistep kernel above. -------------------------
-        if spec_state_rows is None:
+        if spec_rows_by_request is None and spec_destination_index is None:
             assert recurrent_snapshots is not None
             snapshots: list[GdnLayerState] = [
                 GdnLayerState(
@@ -1098,9 +1382,18 @@ class Qwen36GatedDeltaNet(nn.Module):
             ]
             return output, snapshots
 
-        for j in range(1, seq_len + 1):
-            spec_state_rows[j].conv_state.copy_(catted[:, :, j : j + state_len])
-            spec_state_rows[j].has_previous_state = True
+        for j in range(seq_len):
+            if spec_destination_index is not None:
+                spec_conv_pool.index_copy_(
+                    0, spec_destination_index[:, j], catted[:, :, j + 1 : j + 1 + state_len]
+                )
+            else:
+                assert spec_rows_by_request is not None
+                for batch_idx, rows in enumerate(spec_rows_by_request):
+                    rows[j].conv_state.copy_(
+                        catted[batch_idx : batch_idx + 1, :, j + 1 : j + 1 + state_len]
+                    )
+                    rows[j].has_previous_state = True
         return output, None
 
 
@@ -1427,9 +1720,7 @@ class Qwen36AttentionWorkspace:
         page_size = int(k_cache.shape[1])
         max_kv = max(num_cache_pages * page_size - 1, 1)
         worst_plan = create_paged_plan(
-            torch.empty(
-                max_verify_query_len, num_q_heads, head_dim, dtype=dtype, device=device
-            ),
+            torch.empty(max_verify_query_len, num_q_heads, head_dim, dtype=dtype, device=device),
             k_cache,
             v_cache,
             torch.arange(num_cache_pages, dtype=torch.int32, device=device).unsqueeze(0),
@@ -1641,6 +1932,119 @@ class Qwen36BatchedDecodeAttention:
         paged_attention_forward(binding=binding)
 
 
+class Qwen36BatchedExtendAttention:
+    """Shared paged-attention driver for a uniform batched prefill.
+
+    Unlike decode, prefill is not CUDA-graph replayed: the scheduler may
+    submit a different prompt length on every admission.  It is still worth
+    sharing the driver across all full-attention layers in a single forward:
+    the 16 layers have identical attention geometry, while the page table,
+    sequence lengths, and query offsets are also identical.  This is the
+    no-vLLM counterpart of the historical ``_forward_batch(...,
+    is_decode=False)`` metadata construction.
+    """
+
+    def __init__(
+        self,
+        *,
+        batch: int,
+        tokens_per_slot: int,
+        num_q_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        pages_per_slot: int,
+        num_cache_pages: int,
+        dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        if batch < 1 or tokens_per_slot < 1:
+            raise ValueError("batched extend requires positive batch and tokens_per_slot")
+        self.batch = batch
+        self.tokens_per_slot = tokens_per_slot
+        self.device = device
+        self._default_descale = torch.ones(1, dtype=torch.float32, device=device)
+        self.page_table = torch.zeros(batch, pages_per_slot, dtype=torch.int32, device=device)
+        self.cache_seqlens = torch.zeros(batch, dtype=torch.int32, device=device)
+        self.cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=device).mul_(
+            tokens_per_slot
+        )
+        total_q = batch * tokens_per_slot
+        # Decoder layers execute sequentially, so one output scratch is
+        # sufficient for every full-attention layer in this prefill. Keeping
+        # one per layer would retain 16 copies of a BxQxH tensor and turn a
+        # throughput optimisation into a long-context OOM.
+        self.output = torch.empty(total_q, num_q_heads, head_dim, dtype=dtype, device=device)
+        max_work_items = PagedAttentionWorkspace.eager_extend_work_items_capacity(
+            max_total_q=total_q, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
+        )
+        self._workspace = PagedAttentionWorkspace.for_fixed_capacity(
+            mode="extend",
+            device=device,
+            dtype=dtype,
+            kv_dtype=kv_dtype,
+            num_q_heads=num_q_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            page_size=page_size,
+            max_total_q=total_q,
+            max_batch=batch,
+            max_page_table_width=pages_per_slot,
+            max_work_items=max_work_items,
+            max_partial_rows=0,
+            num_cache_pages=num_cache_pages,
+            use_cuda_graph=False,
+        )
+        self._plan_budget = PagedPlanBudget(
+            max_total_q=total_q,
+            max_batch=batch,
+            max_page_table_width=pages_per_slot,
+        )
+
+    def forward(
+        self,
+        *,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        output: torch.Tensor,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
+    ) -> None:
+        total_q = self.batch * self.tokens_per_slot
+        if q.shape[0] != total_q:
+            raise ValueError(f"batched extend expected {total_q} query rows, got {q.shape[0]}")
+        plan = create_paged_plan(
+            q,
+            k_cache,
+            v_cache,
+            self.page_table,
+            self.cache_seqlens,
+            self.cu_seqlens_q,
+            mode="extend",
+            enable_cuda_graph=False,
+            window_left=-1,
+            plan_budget=self._plan_budget,
+        )
+        ws = self._workspace
+        ws._ensure_capacity(plan)
+        ws._copy_runtime_metadata(self.page_table, self.cache_seqlens, self.cu_seqlens_q)
+        ws._copy_plan_metadata(plan)
+        ws._plan = plan
+        binding = build_paged_attention_binding(
+            scratch=ws,
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=output,
+            k_descale=k_descale if k_descale is not None else self._default_descale,
+            v_descale=v_descale if v_descale is not None else self._default_descale,
+        )
+        paged_attention_forward(binding=binding)
+
+
 class Qwen36DecodeGraphAttention:
     """The same driver, in sparkinfer's CUDA-Graph replay mode (B2).
 
@@ -1781,11 +2185,13 @@ class Qwen36VerifyGraphAttention:
         num_cache_pages: int,
         max_seq_len: int,
         verify_tokens: int,
+        batch: int = 1,
         dtype: torch.dtype,
         kv_dtype: torch.dtype,
         device: torch.device,
     ) -> None:
         self.verify_tokens = verify_tokens
+        self.batch = batch
         self.device = device
         self._default_descale = torch.ones(1, dtype=torch.float32, device=device)
         self._workspace = PagedAttentionWorkspace.for_contract(
@@ -1798,14 +2204,22 @@ class Qwen36VerifyGraphAttention:
             head_dim_qk=head_dim,
             head_dim_vo=head_dim,
             page_size=page_size,
-            max_total_q=verify_tokens,
+            max_total_q=batch * verify_tokens,
             num_cache_pages=num_cache_pages,
             use_cuda_graph=True,
         )
-        self._cu_seqlens_q = torch.tensor([0, verify_tokens], dtype=torch.int32, device=device)
+        # arange(B+1) * qo_len -- every slot in one spec-decode verify submits
+        # the SAME k+1 tokens, so the query offsets are uniform and this is not
+        # a ragged batch. That is the historical contract verbatim
+        # (`spec_query_start_loc` in oracle/.../metadata_builders.py:524's
+        # build_gdn_metadata_spec_batch, which states qo_len "is always
+        # num_spec + 1" and is "NOT generalized to a ragged per-request list").
+        self._cu_seqlens_q = (
+            torch.arange(batch + 1, dtype=torch.int32, device=device) * verify_tokens
+        )
         self._workspace.prepare_prefill_graph_replay_state(
-            batch=1,
-            total_q_capacity=verify_tokens,
+            batch=batch,
+            total_q_capacity=batch * verify_tokens,
             max_page_table_width=pages_per_slot,
             max_cache_seqlen=max_seq_len,
             cu_seqlens_q=self._cu_seqlens_q,
@@ -2048,7 +2462,7 @@ class Qwen36Attention(nn.Module):
             page_size=cache.page_size,
             max_total_q=self.max_seq_len,
             max_page_table_width=cache.num_pages,
-            num_cache_pages=cache.num_pages,
+            num_cache_pages=cache.physical_num_pages,
             dtype=dtype,
             kv_dtype=cache.k_cache.dtype,
             device=device,
@@ -2253,6 +2667,63 @@ class Qwen36Attention(nn.Module):
         attn_out = attn_out * torch.sigmoid(gate)
         return self.o_proj(attn_out)
 
+    def prefill_batch(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        *,
+        k_pool: torch.Tensor,
+        v_pool: torch.Tensor,
+        write_index: torch.Tensor,
+        attn: Qwen36BatchedExtendAttention,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Batched extend attention over globally addressed slot pages."""
+        batch_size, seq_len, _ = hidden_states.shape
+        if batch_size != attn.batch or seq_len != attn.tokens_per_slot:
+            raise ValueError(
+                "prefill batch shape does not match its attention driver: "
+                f"got [{batch_size}, {seq_len}], expected [{attn.batch}, {attn.tokens_per_slot}]"
+            )
+        total_q = batch_size * seq_len
+        q_and_gate = self.q_proj(hidden_states).view(
+            batch_size, seq_len, self.num_heads, self.head_dim * 2
+        )
+        query, gate = torch.chunk(q_and_gate, 2, dim=-1)
+        gate = gate.reshape(batch_size, seq_len, -1)
+        kv_shape = (batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        query = self.q_norm(query).reshape(total_q, self.num_heads, self.head_dim)
+        key = self.k_norm(self.k_proj(hidden_states).view(*kv_shape)).reshape(
+            total_q, self.num_kv_heads, self.head_dim
+        )
+        value = (
+            self.v_proj(hidden_states)
+            .view(*kv_shape)
+            .reshape(total_q, self.num_kv_heads, self.head_dim)
+        )
+        query_flat = query.reshape(total_q, self.num_heads * self.head_dim).contiguous()
+        key_flat = key.reshape(total_q, self.num_kv_heads * self.head_dim).contiguous()
+        apply_rotary_embedding_inplace(positions, query_flat, self.head_dim, cos_sin_cache)
+        apply_rotary_embedding_inplace(positions, key_flat, self.head_dim, cos_sin_cache)
+        query = query_flat.view(total_q, self.num_heads, self.head_dim)
+        key = key_flat.view(total_q, self.num_kv_heads, self.head_dim)
+        k_to_store, v_to_store = _kv_to_cache_dtype(
+            key, value, cache_dtype=k_pool.dtype, k_scale=self.k_scale, v_scale=self.v_scale
+        )
+        k_pool.view(-1, self.num_kv_heads, self.head_dim)[write_index] = k_to_store
+        v_pool.view(-1, self.num_kv_heads, self.head_dim)[write_index] = v_to_store
+        attn.forward(
+            q=query,
+            k_cache=k_pool,
+            v_cache=v_pool,
+            output=output,
+            k_descale=self.k_scale,
+            v_descale=self.v_scale,
+        )
+        attn_out = output.reshape(batch_size, seq_len, -1) * torch.sigmoid(gate)
+        return self.o_proj(attn_out)
+
     def verify_batch(
         self,
         hidden_states: torch.Tensor,
@@ -2274,7 +2745,7 @@ class Qwen36Attention(nn.Module):
         layers finish.
         """
         batch_size, seq_len, _ = hidden_states.shape
-        assert batch_size == 1 and seq_len == attn.verify_tokens
+        assert batch_size == attn.batch and seq_len == attn.verify_tokens
 
         q_and_gate = self.q_proj(hidden_states).view(
             batch_size, seq_len, self.num_heads, self.head_dim * 2
@@ -2285,16 +2756,20 @@ class Qwen36Attention(nn.Module):
         query = self.q_norm(query)
         key = self.k_norm(self.k_proj(hidden_states).view(*kv_shape))
         value = self.v_proj(hidden_states).view(*kv_shape)
-        query = query.reshape(seq_len, self.num_heads, self.head_dim)
-        key = key.reshape(seq_len, self.num_kv_heads, self.head_dim)
-        value = value.reshape(seq_len, self.num_kv_heads, self.head_dim)
+        total_q = batch_size * seq_len
+        query = query.reshape(total_q, self.num_heads, self.head_dim)
+        key = key.reshape(total_q, self.num_kv_heads, self.head_dim)
+        value = value.reshape(total_q, self.num_kv_heads, self.head_dim)
 
-        query_flat = query.reshape(seq_len, self.num_heads * self.head_dim).contiguous()
-        key_flat = key.reshape(seq_len, self.num_kv_heads * self.head_dim).contiguous()
+        # ``verify_batch`` is request-major ``[B, qo_len]``.  RoPE and the
+        # paged-attention binding are token-major, so flatten *all* requests
+        # rather than retaining the old B=1 ``seq_len`` shape here.
+        query_flat = query.reshape(total_q, self.num_heads * self.head_dim).contiguous()
+        key_flat = key.reshape(total_q, self.num_kv_heads * self.head_dim).contiguous()
         apply_rotary_embedding_inplace(positions, query_flat, self.head_dim, cos_sin_cache)
         apply_rotary_embedding_inplace(positions, key_flat, self.head_dim, cos_sin_cache)
-        query = query_flat.view(seq_len, self.num_heads, self.head_dim)
-        key = key_flat.view(seq_len, self.num_kv_heads, self.head_dim)
+        query = query_flat.view(total_q, self.num_heads, self.head_dim)
+        key = key_flat.view(total_q, self.num_kv_heads, self.head_dim)
 
         k_to_store, v_to_store = _kv_to_cache_dtype(
             key, value, cache_dtype=k_pool.dtype, k_scale=self.k_scale, v_scale=self.v_scale
@@ -2318,6 +2793,37 @@ class Qwen36Attention(nn.Module):
 # ---------------------------------------------------------------------------
 # Dense SwiGLU MLP.
 # ---------------------------------------------------------------------------
+
+
+def _mlp_w4a4_prefill_enabled() -> bool:
+    """``QSR_QWEN36_MLP_W4A4=1`` routes large-M (prefill) MLP forwards
+    through the true W4A4 ``blockscaled.mm`` path. Default OFF: pending
+    full-model acceptance under the historical quality bar (see
+    ``notes/2026-08-04-w4a4-sparkinfer-headtohead.md``)."""
+    return os.environ.get("QSR_QWEN36_MLP_W4A4") == "1" or os.environ.get(
+        "QSR_QWEN36_HIST_KERNELS"
+    ) == "1"
+
+
+#: Smallest row count routed to the W4A4 prefill path. Decode (M<=4 per
+#: slot batch) and MTP verify (M=16 at c=4) stay on the W4A16 fused kernel
+#: -- they are CUDA-graph-captured and bandwidth-bound, where W4A16 holds
+#: its own (measured 2026-08-04: decode GEMM bandwidth parity, and the
+#: fused FC1->activation->FC2 launch structure beats three separate dense
+#: launches there).
+_W4A4_PREFILL_MIN_ROWS = 64
+
+
+def _w4a4_all_rows_enabled() -> bool:
+    """``QSR_QWEN36_MLP_W4A4_ALL=1`` routes EVERY MLP forward (decode and
+    verify included) through the W4A4 blockscaled path -- the historical
+    single-kernel-family / single-weight-residency layout. Default OFF:
+    blockscaled small-M bandwidth (~330-440 GB/s measured) is below the
+    W4A16 fused kernel's ~830 GB/s, so this trades decode speed for the
+    prefill FP4-MMA win until sparkinfer grows an M<=16 FP4 tile."""
+    return os.environ.get("QSR_QWEN36_MLP_W4A4_ALL") == "1" or os.environ.get(
+        "QSR_QWEN36_HIST_KERNELS"
+    ) == "1"
 
 
 class Qwen36MLP(nn.Module):
@@ -2387,7 +2893,7 @@ class Qwen36MLP(nn.Module):
     ``[[0]]``, ``topk_weights`` is always ``[[1.0]]``) -- exactly the
     untested-on-GPU path B0 already flagged
     (``notes/2026-08-02-trackB-b0-facts.md`` references
-    ``prepare_w4a16_modelopt_nvfp4_weights`` + ``num_experts=1``).
+    ``prepare_w4a16_modelopt_native_weights`` + ``num_experts=1``).
 
     ``gate_proj``/``up_proj``/``down_proj`` stay real NVFP4 Linear
     submodules (unchanged Parameter shapes, unchanged ``weight_loader``
@@ -2426,6 +2932,12 @@ class Qwen36MLP(nn.Module):
     that attribute for exactly which diagnostic/verification scripts need
     this and why.
     """
+
+    # The production graph matrix never has more than four slots and its
+    # longest backbone verify is anchor + K (K defaults to 3). Keep some
+    # headroom for MTP's ragged-sync buckets, while deliberately not caching
+    # arbitrary prefill chunk sizes as resident scratch.
+    _W4A16_GRAPH_BUFFER_MAX_M = 32
 
     def __init__(
         self,
@@ -2481,6 +2993,14 @@ class Qwen36MLP(nn.Module):
             and isinstance(self.down_proj, (ModelOptNVFP4Linear, CompressedTensorsNVFP4Linear))
         )
         self._w4a16_prepared = None  # built lazily, once, on first fused forward
+        self._w4a4_prepared = None  # W4A4 blockscaled operands (opt-in, prefill)
+        self._w4a4_unavailable = False  # checkpoint lacks activation global scales
+        self._w4a4_share_gate_up_quant = False
+        # ``run_w4a16_moe`` takes caller-owned route, output, and GEMM scratch.
+        # Decode/verify used to recreate all of them for every NVFP4 layer on
+        # every replay. Cache only CUDA-graph-sized M values so each captured
+        # shape has stable addresses without retaining prefill-sized scratch.
+        self._w4a16_graph_runtime: dict[int, tuple[torch.Tensor, torch.Tensor, Any]] = {}
 
         # Memory-audit follow-up (2026-08-03, notes/2026-08-03-nvfp4-gemm-
         # memory-audit.md "What was not verified"): once `_w4a16_prepared`
@@ -2591,7 +3111,13 @@ class Qwen36MLP(nn.Module):
         # even after `_free_raw_nvfp4_weights` reassigns the owning
         # Parameter's `.data` to a fresh empty tensor.
         del gate_w, up_w, down_w, gate_scale, up_scale, down_scale
-        if not self._keep_raw_nvfp4_weights:
+        if _mlp_w4a4_prefill_enabled():
+            # Build the W4A4 operand set while the raw Parameters are still
+            # live; the operands ALIAS the raw packed weights (no copy, one
+            # weight residency -- the historical layout), so the free below
+            # must be skipped whenever the aliasing path is active.
+            self._ensure_w4a4_ready()
+        if not self._keep_raw_nvfp4_weights and self._w4a4_prepared is None:
             self._free_raw_nvfp4_weights()
 
     def _free_raw_nvfp4_weights(self) -> None:
@@ -2634,6 +3160,120 @@ class Qwen36MLP(nn.Module):
         if device_type == "cuda":
             torch.cuda.empty_cache()
 
+    def _ensure_w4a4_ready(self) -> None:
+        """Build per-projection W4A4 ``blockscaled.mm`` operands (packed
+        values + swizzled e4m3 scale view + alpha) from the three NVFP4
+        submodules' checkpoint tensors. Opt-in prefill path
+        (``QSR_QWEN36_MLP_W4A4=1``); silently marks the path unavailable
+        when the checkpoint format does not ship activation global scales
+        (nvidia modelopt). Measured 2026-08-04 vs the W4A16 fused path on
+        real layer-5 weights: single-layer cosine 0.9955 (the genuine
+        scheme-level W4A4 activation-quantization delta -- numerically
+        validated against the historical NVFP4 recipe, see
+        ``notes/2026-08-04-w4a4-sparkinfer-headtohead.md``), GEMM speed
+        within 20% of flashinfer b12x at M=16 and ~4x faster at prefill M.
+        The operand tensors are independent copies (the raw Parameters are
+        freed right after this returns), +one packed-weight copy resident
+        while the path is enabled."""
+        if self._w4a4_prepared is not None or self._w4a4_unavailable:
+            return
+        from runtime.backends._sparkinfer_import import ensure_sparkinfer_path
+
+        ensure_sparkinfer_path()
+        from sparkinfer._lib.intrinsics import (
+            as_grouped_scale_view,
+            swizzle_block_scale,
+        )
+
+        prepared: dict[str, tuple] = {}
+        for name in ("gate", "up", "down"):
+            lin = getattr(self, f"{name}_proj")
+            comps = getattr(lin, "nvfp4_w4a4_components_for_fuse", None)
+            if comps is None:
+                self._w4a4_unavailable = True
+                return
+            w_packed, w_scale, w_gs, igs = comps()
+            if igs.numel() == 0 or not torch.isfinite(igs.float()).all():
+                self._w4a4_unavailable = True
+                return
+            out_dim, in_dim = w_packed.shape[0], w_packed.shape[1] * 2
+            # NO weight copy: the historical implementation kept exactly one
+            # NVFP4 weight residency. ``unsqueeze(-1)`` on a contiguous
+            # ``[N, K/2]`` tensor is a no-op view, so alias the raw packed
+            # weights and keep them resident (this method's caller then skips
+            # ``_free_raw_nvfp4_weights`` while the W4A4 path is enabled).
+            # Cost: the ~8.65 GiB raw weights stay up; a cloned operand set
+            # was measured to push this box into allocator pressure and slow
+            # BOTH phases of the full-model W1-S run.
+            b_p = w_packed.unsqueeze(-1)
+            b_sf = as_grouped_scale_view(
+                swizzle_block_scale(w_scale.unsqueeze(0).contiguous()).view(torch.uint8),
+                out_dim,
+                in_dim,
+            )
+            alpha = (1.0 / (igs.to(torch.float32) * w_gs.to(torch.float32))).reshape(1)
+            prepared[name] = (b_p, b_sf, alpha, igs.to(torch.float32).reshape(1))
+        self._w4a4_share_gate_up_quant = bool(
+            prepared["gate"][3].item() == prepared["up"][3].item()
+        )
+        self._w4a4_prepared = prepared
+
+    def _forward_w4a4_blockscaled(self, x: torch.Tensor) -> torch.Tensor:
+        """True W4A4 NVFP4 MLP (both operands quantized, FP4 tensor-core
+        GEMM) via ``sparkinfer.gemm.blockscaled.mm`` -- the prefill fast
+        path (measured ~4x faster than the W4A16 fused kernel at M=16384).
+        Decode/verify shapes stay on ``_forward_w4a16_fused``: see
+        ``forward``'s dispatch. Activation quantization is the bit-exact
+        Triton kernel (``runtime/kernels/nvfp4_quant.py``, gated by
+        ``tests/test_nvfp4_quant_triton.py``), NOT the pure-Torch oracle."""
+        from sparkinfer._lib.intrinsics import (
+            as_grouped_scale_view,
+            swizzle_block_scale,
+        )
+        from sparkinfer.gemm import blockscaled
+
+        from runtime.kernels.nvfp4_quant import quantize_nvfp4_activation
+
+        orig_shape = x.shape
+        x2d = x.reshape(-1, self.hidden_size)
+        if not x2d.is_contiguous():
+            x2d = x2d.contiguous()
+        m = x2d.shape[0]
+        prepared = self._w4a4_prepared
+        assert prepared is not None, "_forward_w4a4_blockscaled before _ensure_w4a4_ready"
+
+        def quant_operand(t2d: torch.Tensor, gs: torch.Tensor):
+            a_packed, sf_linear = quantize_nvfp4_activation(t2d, gs)
+            sw = swizzle_block_scale(sf_linear.view(torch.float8_e4m3fn).unsqueeze(0))
+            a_sf = as_grouped_scale_view(sw.view(torch.uint8), m, t2d.shape[1])
+            # dense_gemm takes [M, K, L] group-major operands; num_groups=1
+            return a_packed.unsqueeze(-1), a_sf
+
+        def gemm(name: str, a_packed: torch.Tensor, a_sf: torch.Tensor) -> torch.Tensor:
+            b_p, b_sf, alpha, _igs = prepared[name]
+            return blockscaled.mm(
+                (a_packed, a_sf),
+                (b_p, b_sf),
+                alpha=alpha,
+                ab_dtype="float4_e2m1fn",
+                sf_dtype="float8_e4m3fn",
+                c_dtype="bfloat16",
+                sf_vec_size=16,
+                expected_m=m,
+            )[:, :, 0]
+
+        a_gate_p, a_gate_sf = quant_operand(x2d, prepared["gate"][3])
+        gate = gemm("gate", a_gate_p, a_gate_sf)
+        if self._w4a4_share_gate_up_quant:
+            up = gemm("up", a_gate_p, a_gate_sf)
+        else:
+            a_up_p, a_up_sf = quant_operand(x2d, prepared["up"][3])
+            up = gemm("up", a_up_p, a_up_sf)
+        inter = F.silu(gate) * up
+        a_down_p, a_down_sf = quant_operand(inter.contiguous(), prepared["down"][3])
+        out = gemm("down", a_down_p, a_down_sf)
+        return out.reshape(*orig_shape[:-1], self.hidden_size)
+
     def _forward_w4a16_fused(self, x: torch.Tensor) -> torch.Tensor:
         self._ensure_w4a16_fused_ready()
         from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
@@ -2647,12 +3287,6 @@ class Qwen36MLP(nn.Module):
         x2d = x.reshape(-1, self.hidden_size).contiguous()
         m = x2d.shape[0]
         device = x2d.device
-
-        # Degenerate 1-expert/top-1 MoE: every row routes to expert 0 with
-        # router weight 1.0 -- see class docstring for why this is the
-        # shape run_w4a16_moe requires.
-        topk_ids = torch.zeros((m, 1), dtype=torch.int32, device=device)
-        topk_weights = torch.ones((m, 1), dtype=torch.float32, device=device)
 
         # NVFP4-standard-model follow-up (2026-08-03, notes/2026-08-03-std-
         # model-serving-acceptance.md section 3): decode CUDA Graph capture
@@ -2683,13 +3317,24 @@ class Qwen36MLP(nn.Module):
         # workaround). The workaround is gone; buffers.fc1_c_tmp/fc2_c_tmp
         # are passed straight through again, same as every other buffer
         # here.
-        buffers = make_w4a16_packed_buffers(
-            self._w4a16_prepared,
-            m=m,
-            topk=1,
-            dtype=torch.bfloat16,
-            device=device,
-        )
+        cached = self._w4a16_graph_runtime.get(m)
+        if cached is None:
+            # Degenerate 1-expert/top-1 MoE: every row routes to expert 0
+            # with router weight 1.0. Those values are immutable for dense
+            # Qwen MLPs, so they are valid graph replay inputs.
+            topk_ids = torch.zeros((m, 1), dtype=torch.int32, device=device)
+            topk_weights = torch.ones((m, 1), dtype=torch.float32, device=device)
+            buffers = make_w4a16_packed_buffers(
+                self._w4a16_prepared,
+                m=m,
+                topk=1,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            if m <= self._W4A16_GRAPH_BUFFER_MAX_M:
+                self._w4a16_graph_runtime[m] = (topk_ids, topk_weights, buffers)
+        else:
+            topk_ids, topk_weights, buffers = cached
         out = run_w4a16_moe(
             x2d,
             self._w4a16_prepared,
@@ -2711,6 +3356,10 @@ class Qwen36MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._nvfp4_fused:
+            if _mlp_w4a4_prefill_enabled() and self._w4a4_prepared is not None:
+                rows = x.reshape(-1, x.shape[-1]).shape[0]
+                if _w4a4_all_rows_enabled() or rows >= _W4A4_PREFILL_MIN_ROWS:
+                    return self._forward_w4a4_blockscaled(x)
             return self._forward_w4a16_fused(x)
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
@@ -2756,13 +3405,17 @@ class Qwen36DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         gdn_state: GdnLayerState | None,
         attn_cache: Qwen36PagedAttentionCache | None,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         if self.layer_type == "linear_attention":
             assert gdn_state is not None
@@ -2771,19 +3424,17 @@ class Qwen36DecoderLayer(nn.Module):
             assert attn_cache is not None
             hidden_states = self.self_attn(hidden_states, positions, cos_sin_cache, attn_cache)
 
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        return residual + hidden_states
+        return hidden_states, residual
 
     def decode_batch(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
         cos_sin_cache: torch.Tensor,
         batch: Qwen36DecodeBatch,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """:meth:`forward`'s structure with the batched, globally addressed
         decode kernels substituted for the single-sequence ones.
 
@@ -2794,8 +3445,11 @@ class Qwen36DecoderLayer(nn.Module):
         ``slot_index[i]``" is known.
         """
         i = self.layer_idx
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         if self.layer_type == "linear_attention":
             slot_index = batch.slot_index
@@ -2816,12 +3470,50 @@ class Qwen36DecoderLayer(nn.Module):
                 output=batch.attn_outputs[i],
             )
 
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        return residual + hidden_states
+        return hidden_states, residual
+
+    def prefill_batch(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        cos_sin_cache: torch.Tensor,
+        batch: Qwen36PrefillBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One homogeneous multi-slot extend layer over pooled state."""
+        i = self.layer_idx
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        if self.layer_type == "linear_attention":
+            slot_index = batch.slot_index
+            conv = batch.conv_pools[i].index_select(0, slot_index)
+            recurrent = batch.recurrent_pools[i].index_select(0, slot_index)
+            hidden_states = self.linear_attn.prefill_batch(
+                hidden_states,
+                conv,
+                recurrent,
+                has_previous_state=batch.has_previous_state,
+            )
+            batch.conv_pools[i].index_copy_(0, slot_index, conv)
+            batch.recurrent_pools[i].index_copy_(0, slot_index, recurrent)
+        else:
+            hidden_states = self.self_attn.prefill_batch(
+                hidden_states,
+                batch.positions,
+                cos_sin_cache,
+                k_pool=batch.k_pools[i],
+                v_pool=batch.v_pools[i],
+                write_index=batch.write_index,
+                attn=batch.attn,
+                output=batch.attn_outputs[i],
+            )
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
 
 
 # ---------------------------------------------------------------------------
@@ -2867,9 +3559,10 @@ class Qwen36DecoderLayer(nn.Module):
 # i.e. the SAME hidden state ``compute_logits`` reads for the target's own
 # prediction, not a pre-norm intermediate.
 class Qwen36MTPLayer(nn.Module):
-    """One MTP decoder layer: input_layernorm -> self_attn -> residual ->
-    post_attention_layernorm -> mlp -> residual. Byte-for-byte the same op
-    sequence as :meth:`Qwen36DecoderLayer.forward`'s full-attention branch
+    """One MTP decoder layer with the historical carried residual stream.
+
+    Its numerical sequence is byte-for-byte the same as
+    :meth:`Qwen36DecoderLayer.forward`'s full-attention branch
     (deliberately not shared code with that method -- see this class's
     module-level docstring for why instantiating ``Qwen36DecoderLayer``
     itself is wrong here: it picks GDN vs attention from
@@ -2904,19 +3597,20 @@ class Qwen36MTPLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
         positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         attn_cache: Qwen36PagedAttentionCache,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(hidden_states, positions, cos_sin_cache, attn_cache)
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        return residual + hidden_states
+        return hidden_states, residual
 
 
 class Qwen36MTPHead(nn.Module):
@@ -2996,8 +3690,11 @@ class Qwen36MTPHead(nn.Module):
             dim=-1,
         )
         hidden_states = self.fc(fused)
-        hidden_states = self.layers[layer_idx](hidden_states, positions, cos_sin_cache, attn_cache)
-        return self.norm(hidden_states)
+        hidden_states, residual = self.layers[layer_idx](
+            hidden_states, None, positions, cos_sin_cache, attn_cache
+        )
+        normed, _ = self.norm(hidden_states, residual)
+        return normed
 
 
 class Qwen36TextModelSelfBuilt(nn.Module):
@@ -3090,9 +3787,11 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         cos_sin_cache = self.cos_sin_cache.to(hidden_states.device)
 
         per_layer_hidden: list[torch.Tensor] = []
+        residual: torch.Tensor | None = None
         for layer in self.layers:
-            hidden_states = layer(
+            hidden_states, residual = layer(
                 hidden_states,
+                residual,
                 positions,
                 cos_sin_cache,
                 state.gdn_states[layer.layer_idx],
@@ -3101,11 +3800,30 @@ class Qwen36TextModelSelfBuilt(nn.Module):
             if capture_hidden_states:
                 per_layer_hidden.append(hidden_states)
 
-        hidden_states = self.norm(hidden_states)
+        assert residual is not None
+        hidden_states, _ = self.norm(hidden_states, residual)
         state.num_tokens_seen = past_len + seq_len
 
         if capture_hidden_states:
             return hidden_states, per_layer_hidden
+        return hidden_states
+
+    def prefill_batch(self, batch: Qwen36PrefillBatch) -> torch.Tensor:
+        """Run the pool-backed uniform batched prefill body.
+
+        State-length bookkeeping remains in :class:`Qwen36SlotPool`: this
+        graph only consumes explicit device metadata and mutates the pooled
+        KV/GDN tensors, mirroring the existing batched decode split.
+        """
+        hidden_states = self.embed_tokens(batch.input_ids)
+        cos_sin_cache = self.cos_sin_cache
+        residual: torch.Tensor | None = None
+        for layer in self.layers:
+            hidden_states, residual = layer.prefill_batch(
+                hidden_states, residual, cos_sin_cache, batch
+            )
+        assert residual is not None
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
     def verify_forward(
@@ -3113,7 +3831,7 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         draft_token_ids: torch.Tensor,
         state: Qwen36GenerationState,
         *,
-        spec_state_rows: dict[int, list[GdnLayerState]] | None = None,
+        spec_state_rows: dict[int, list[GdnLayerState] | list[list[GdnLayerState]]] | None = None,
     ) -> tuple[torch.Tensor, dict[int, list[GdnLayerState]] | None]:
         """B3: run ``K`` draft tokens through every layer in ONE pass,
         WITHOUT committing ``state`` -- the target-model half of MTP verify.
@@ -3168,9 +3886,13 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         gdn_snapshots: dict[int, list[GdnLayerState]] | None = (
             {} if spec_state_rows is None else None
         )
+        residual: torch.Tensor | None = None
         for layer in self.layers:
-            residual = hidden_states
-            hidden_states = layer.input_layernorm(hidden_states)
+            if residual is None:
+                residual = hidden_states
+                hidden_states = layer.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = layer.input_layernorm(hidden_states, residual)
 
             if layer.layer_type == "linear_attention":
                 gdn_state = state.gdn_states[layer.layer_idx]
@@ -3181,6 +3903,7 @@ class Qwen36TextModelSelfBuilt(nn.Module):
                     spec_state_rows=(
                         None if spec_state_rows is None else spec_state_rows[layer.layer_idx]
                     ),
+                    batch_large_projections=fp8_channel_raw_execution_uses_all_layers(),
                 )
                 if gdn_snapshots is not None:
                     assert snapshots is not None
@@ -3194,16 +3917,19 @@ class Qwen36TextModelSelfBuilt(nn.Module):
                     hidden_states, positions, cos_sin_cache, attn_cache, paged_mode="verify"
                 )
 
-            hidden_states = residual + hidden_states
-
-            residual = hidden_states
-            hidden_states = layer.post_attention_layernorm(hidden_states)
+            hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
             hidden_states = layer.mlp(hidden_states)
-            hidden_states = residual + hidden_states
 
-        return self.norm(hidden_states), gdn_snapshots
+        assert residual is not None
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states, gdn_snapshots
 
-    def verify_batch(self, batch: Qwen36VerifyBatch) -> torch.Tensor:
+    def verify_batch(
+        self,
+        batch: Qwen36VerifyBatch,
+        *,
+        capture_hidden_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Run the graph-safe K-token target verify forward.
 
         GDN rows and full-attention metadata are supplied by the persistent
@@ -3213,21 +3939,50 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         """
         hidden_states = self.embed_tokens(batch.input_ids)
         cos_sin_cache = self.cos_sin_cache.to(hidden_states.device)
+        residual: torch.Tensor | None = None
+        # This is deliberately an eager-only diagnostic seam.  CUDA-graph
+        # capture always takes the default, tensor-only return path; the
+        # optional list lets the historical/current comparison capture the
+        # exact pooled K+1 verify body without substituting ``verify_forward``
+        # (whose cache/GDN addressing is a different execution form).
+        per_layer_hidden: list[torch.Tensor] = []
         for layer in self.layers:
-            residual = hidden_states
-            hidden_states = layer.input_layernorm(hidden_states)
+            if residual is None:
+                residual = hidden_states
+                hidden_states = layer.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = layer.input_layernorm(hidden_states, residual)
             if layer.layer_type == "linear_attention":
                 conv_pool = batch.gdn_conv_pools[layer.layer_idx]
                 recurrent_pool = batch.gdn_recurrent_pools[layer.layer_idx]
                 assert conv_pool is not None and recurrent_pool is not None
                 source = GdnLayerState(
                     conv_state=conv_pool.index_select(0, batch.gdn_source_index),
-                    recurrent_state=recurrent_pool.index_select(0, batch.gdn_source_index),
+                    # The indexed recurrence reads its actual incoming row
+                    # inside the Triton kernel.  This stable view is only a
+                    # compatibility placeholder for the CPU/legacy branch;
+                    # do not gather the large recurrent state before every
+                    # graph replay.
+                    recurrent_state=recurrent_pool[: hidden_states.shape[0]],
                     has_previous_state=True,
                 )
-                rows = batch.gdn_state_rows[layer.layer_idx]
+                rows = (
+                    None if batch.gdn_state_rows is None else batch.gdn_state_rows[layer.layer_idx]
+                )
                 hidden_states, snapshots = layer.linear_attn.spec_forward(
-                    hidden_states, source, spec_state_rows=rows
+                    hidden_states,
+                    source,
+                    spec_state_rows=rows,
+                    spec_source_index=batch.gdn_source_index,
+                    spec_destination_index=batch.gdn_destination_index,
+                    spec_conv_pool=conv_pool,
+                    spec_recurrent_pool=recurrent_pool,
+                    # Historical production used one qkvz/ba projection on
+                    # the complete request-major B*(K+1) verify matrix. The
+                    # raw-FP8 all-layer contract is the only format we have
+                    # validated for that physical layout; legacy BF16 paths
+                    # retain their exact single-position compatibility form.
+                    batch_large_projections=fp8_channel_raw_execution_uses_all_layers(),
                 )
                 assert snapshots is None
             else:
@@ -3247,12 +4002,15 @@ class Qwen36TextModelSelfBuilt(nn.Module):
                     attn=driver,
                     output=output,
                 )
-            hidden_states = residual + hidden_states
-            residual = hidden_states
-            hidden_states = layer.post_attention_layernorm(hidden_states)
+            hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
             hidden_states = layer.mlp(hidden_states)
-            hidden_states = residual + hidden_states
-        return self.norm(hidden_states)
+            if capture_hidden_states:
+                per_layer_hidden.append(hidden_states)
+        assert residual is not None
+        hidden_states, _ = self.norm(hidden_states, residual)
+        if capture_hidden_states:
+            return hidden_states, per_layer_hidden
+        return hidden_states
 
     def commit_verify(
         self,
@@ -3316,9 +4074,14 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         """
         hidden_states = self.embed_tokens(batch.input_ids)
         cos_sin_cache = self.cos_sin_cache
+        residual: torch.Tensor | None = None
         for layer in self.layers:
-            hidden_states = layer.decode_batch(hidden_states, cos_sin_cache, batch)
-        return self.norm(hidden_states)
+            hidden_states, residual = layer.decode_batch(
+                hidden_states, residual, cos_sin_cache, batch
+            )
+        assert residual is not None
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
 
 
 def _quantized_layers_map_for_checkpoint(config: dict[str, Any]) -> dict[str, str]:
@@ -3399,8 +4162,8 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
     ) -> Qwen36GenerationState:
         return self.model.new_generation_state(device=device, dtype=dtype)
 
-    def free_fp8_raw_weights(self) -> int:
-        """Drop every FP8 Linear's raw ``.weight`` once its BF16 cache exists.
+    def free_fp8_raw_weights(self, *, keep_all_raw: bool = False) -> int:
+        """Release raw FP8 weights only for the explicit BF16 fallback.
 
         The FP8 counterpart to :meth:`Qwen36MLP._free_raw_nvfp4_weights`,
         which freed the NVFP4 MLP layers' raw parameters and took the resident
@@ -3417,15 +4180,39 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         going to happen regardless. Peak stays bounded: one extra tensor at a
         time, not a second full copy of the model.
 
+        Normal CUDA serving is a raw W8A8 executor and therefore leaves every
+        checkpoint-native FP8 tensor untouched, without materializing a BF16
+        cache. ``keep_all_raw`` exists for callers that need the same
+        guarantee independently of the selected backend.
+
         Returns the number of Linears freed, so callers can log it and a test
         can assert the sweep actually reached something rather than silently
         matching nothing.
         """
-        from runtime.model.compressed_tensors_linear import CompressedTensorsFP8ChannelLinear
+        from runtime.model.compressed_tensors_linear import (
+            QSR_NATIVE_W8A8_FP8_CHANNEL_ENV,
+            QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV,
+            CompressedTensorsFP8ChannelLinear,
+            fp8_channel_raw_execution_uses_all_layers,
+        )
+
+        if keep_all_raw:
+            return 0
 
         freed = 0
+        keep_scaled_mm_mlp_raw = os.environ.get(QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV) == "1"
+        keep_native_w8a8_mlp_raw = os.environ.get(QSR_NATIVE_W8A8_FP8_CHANNEL_ENV) == "1"
+        keep_scaled_mm_all_raw = fp8_channel_raw_execution_uses_all_layers()
         for module in self.modules():
             if isinstance(module, CompressedTensorsFP8ChannelLinear):
+                # Raw W8A8 needs its checkpoint-native FP8 matrix. The
+                # retained narrow ``1`` diagnostic keeps only gate/up; the
+                # default/all contract retains every FP8 tensor.
+                if keep_scaled_mm_all_raw or (
+                    (keep_scaled_mm_mlp_raw or keep_native_w8a8_mlp_raw)
+                    and module.output_size == 17408
+                ):
+                    continue
                 module.free_fp8_raw_weight()
                 freed += 1
         if freed and next(self.parameters()).device.type == "cuda":
@@ -3502,6 +4289,10 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         hidden_states = self.model.decode_batch(batch)
         return self.lm_head(hidden_states.reshape(hidden_states.shape[0], -1))
 
+    def prefill_batch(self, batch: Qwen36PrefillBatch) -> torch.Tensor:
+        """Pool-backed homogeneous prefill -> post-norm ``[B, Q, H]``."""
+        return self.model.prefill_batch(batch)
+
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
 
@@ -3512,7 +4303,7 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         draft_token_ids: torch.Tensor,
         state: Qwen36GenerationState,
         *,
-        spec_state_rows: dict[int, list[GdnLayerState]] | None = None,
+        spec_state_rows: dict[int, list[GdnLayerState] | list[list[GdnLayerState]]] | None = None,
     ) -> tuple[torch.Tensor, dict[int, list[GdnLayerState]] | None]:
         """See :meth:`Qwen36TextModelSelfBuilt.verify_forward`."""
         return self.model.verify_forward(draft_token_ids, state, spec_state_rows=spec_state_rows)
@@ -3578,17 +4369,66 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         draft_token = logits[:, -1, :].argmax(dim=-1)
         return draft_token, hidden
 
+    def mtp_forward(
+        self,
+        next_token_ids: torch.Tensor,
+        prev_hidden: torch.Tensor,
+        start_position: int,
+        mtp_cache: Qwen36PagedAttentionCache,
+        *,
+        logits_last_position_only: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Teacher-force one contiguous MTP suffix.
+
+        Unlike :meth:`mtp_step`, this is the state-synchronisation primitive:
+        every row pairs a shifted real token with the target hidden state from
+        the immediately preceding target position.  It is used to build and
+        refresh the MTP head's *real-prefix* KV before the cheap
+        autoregressive continuation steps propose speculative tokens.
+
+        Both tensors are ``[1, q, ...]`` and ``start_position`` must equal
+        the cache's live length.  Keeping that equality explicit prevents a
+        speculative tail from being accidentally treated as committed MTP
+        context after a partial accept.
+        """
+        assert self.mtp is not None, "mtp_forward called but enable_mtp=False at construction"
+        if next_token_ids.dim() != 2 or next_token_ids.shape[0] != 1:
+            raise ValueError("mtp_forward next_token_ids must have shape [1, q]")
+        if (
+            prev_hidden.dim() != 3
+            or prev_hidden.shape[0] != 1
+            or prev_hidden.shape[1] != next_token_ids.shape[1]
+        ):
+            raise ValueError("mtp_forward prev_hidden must have shape [1, q, hidden_size]")
+        if start_position != mtp_cache.seq_len:
+            raise RuntimeError(
+                "mtp_forward start_position must equal the MTP cache's live length "
+                f"({start_position} != {mtp_cache.seq_len})"
+            )
+        embeds = self.model.embed_tokens(next_token_ids)
+        positions = torch.arange(
+            start_position,
+            start_position + next_token_ids.shape[1],
+            device=next_token_ids.device,
+            dtype=torch.long,
+        )
+        cos_sin_cache = self.model.cos_sin_cache.to(embeds.device)
+        hidden = self.mtp(embeds, prev_hidden, positions, cos_sin_cache, mtp_cache)
+        logits_hidden = hidden[:, -1:] if logits_last_position_only else hidden
+        return self.lm_head(logits_hidden), hidden
+
     # -- Weight loading ------------------------------------------------
 
     def load_weights(self, weights) -> set[str]:
         """Route every checkpoint tensor by its own dotted name.
 
-        No stacked_params_mapping needed (Track A/Laguna's own
-        docstrings flag this as needed for *fused* checkpoint tensors --
-        this checkpoint has none: every projection this graph constructs
-        (q/k/v/o_proj, in_proj_qkv/z/a/b, out_proj, gate/up/down_proj) is
-        already a 1:1 checkpoint tensor, verified against the real
-        safetensors index, B0-2/B1). Top-level prefixes recognized:
+        Most tensors remain 1:1.  GDN input projections are the deliberate
+        fixed exception inherited from the historical production path: the
+        checkpoint has separate ``qkv``/``z`` and ``b``/``a`` tensors, while
+        this graph owns fused ``qkvz``/``ba`` parameters.  Their rows are
+        copied directly by :func:`_gdn_fused_checkpoint_slice`; raw E4M3
+        bytes and their channel scales are never converted or requantized.
+        Top-level prefixes recognized:
         ``model.language_model.`` (backbone), ``lm_head.`` (head),
         ``mtp.`` (B3: loaded into :attr:`mtp` when ``enable_mtp=True`` was
         passed at construction -- the checkpoint's ``mtp.*`` names map
@@ -3604,6 +4444,7 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         """
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
+        fused_sources: dict[str, set[str]] = {}
         self.skipped_mtp_count = 0
         unrecognized: list[str] = []
 
@@ -3637,6 +4478,11 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
                 unrecognized.append(name)
                 continue
 
+            fused = _gdn_fused_checkpoint_slice(mapped, tensor, params_dict)
+            if fused is not None:
+                fused_name, source_name = fused
+                fused_sources.setdefault(fused_name, set()).add(source_name)
+                continue
             if mapped not in params_dict:
                 continue
             param = params_dict[mapped]
@@ -3651,4 +4497,24 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
                 "checkpoint key to start with 'model.language_model.', 'lm_head.', 'mtp.', "
                 "or 'model.visual.'."
             )
+        for fused_name, sources in fused_sources.items():
+            if ".in_proj_qkvz." in fused_name:
+                expected = {
+                    fused_name.replace(".in_proj_qkvz.", ".in_proj_qkv."),
+                    fused_name.replace(".in_proj_qkvz.", ".in_proj_z."),
+                }
+            else:
+                assert ".in_proj_ba." in fused_name
+                expected = {
+                    fused_name.replace(".in_proj_ba.", ".in_proj_b."),
+                    fused_name.replace(".in_proj_ba.", ".in_proj_a."),
+                }
+            missing = expected - sources
+            if missing:
+                raise RuntimeError(
+                    f"Qwen36 fused GDN parameter {fused_name!r} is missing checkpoint "
+                    f"slice(s) {sorted(missing)!r}; refusing to run with a partially "
+                    "initialized input projection"
+                )
+            loaded.add(fused_name)
         return loaded

@@ -185,3 +185,54 @@ class TritonRMSNorm(torch.nn.Module):
         if residual is None:
             return rms_norm(x, self.weight, self.eps)
         return fused_add_rms_norm(x, residual, self.weight, self.eps)
+
+
+@triton.jit
+def _rms_norm_tail_kernel(
+    X_ptr,
+    RSTD_ptr,
+    W_ptr,
+    OUT_ptr,
+    stride_x_row,
+    stride_out_row,
+    N: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Bit-exact norm tail: ``out = bf16(x_f32 * rstd * w1)``.
+
+    The variance/rsqrt prefix stays in torch (reduction order must stay
+    torch's); this fuses only the two final fp32 multiplies and the bf16
+    round, which are deterministic RN ops -- bit-identical to the torch
+    chain (tests/test_norm_tail_bit_parity.py).
+    """
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+    x = tl.load(X_ptr + row * stride_x_row + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    rstd = tl.load(RSTD_ptr + row)
+    w = tl.load(W_ptr + cols, mask=mask, other=1.0)
+    out = x * rstd * w
+    tl.store(OUT_ptr + row * stride_out_row + cols, out.to(tl.bfloat16), mask=mask)
+
+
+def rms_norm_tail(
+    x_f32: torch.Tensor, rstd: torch.Tensor, weight_plus_one: torch.Tensor
+) -> torch.Tensor:
+    """Fused tail of the zero-centred RMSNorm; returns bf16 ``[M, N]``."""
+    m, n = x_f32.shape
+    out = torch.empty(m, n, dtype=torch.bfloat16, device=x_f32.device)
+    block_n = triton.next_power_of_2(n)
+    _rms_norm_tail_kernel[(m,)](
+        x_f32,
+        rstd,
+        weight_plus_one,
+        out,
+        x_f32.stride(0),
+        out.stride(0),
+        N=n,
+        BLOCK_SIZE=block_n,
+        num_warps=4 if block_n <= 4096 else 8,
+    )
+    return out
