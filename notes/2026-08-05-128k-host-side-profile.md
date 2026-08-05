@@ -168,3 +168,79 @@ device tensor；eager 与旧 stub 路径不受影响。新增
 * `/tmp/qwen128k_c3_warm.sqlite` —— nsys 原始 trace（30 MB）。
 * [`2026-08-05-server-perf-grid-mtp-cg-prefix.md`](2026-08-05-server-perf-grid-mtp-cg-prefix.md)
   —— 同一服务的完整网格（含 prefix cache 命中修复）。
+
+## 9. 2026-08-06：完整 4K/32K/64K/128K × c1-4 网格重跑（水位 bug 修复后全通）
+
+### 9.1 发现并修复：MTP scratch 水位 bug
+
+补跑完整网格（exact repeat、warm_rounds=2、max_tokens=256，
+`server_perf_grid_opt1_exact_20260806.json`）时，4K/32K 全部成功，但
+**64K/128K 的 12 个 cell（c1-c4 × 每档 3 波）全部失败**，统一报
+`RuntimeError: persistent MTP prefix disappeared after a validated cache hit`
+（服务日志同步可见，2026-08-05 23:xx 起）。
+
+根因：`Qwen36MTPEngine.snapshot_prefix_to_scratch` 存完快照后执行
+`scratch.seq_len = kv_len`，把**整个 scratch arena 的合法性水位**误当成
+“最后一条条目长度”。persistent 条目位于 arena 的不同页偏移，逐出前互不
+覆盖；网格按 4K→32K→64K→128K 顺序填充时，后存短条目（1/2 页）把水位拉低，
+`restore_prefix_from_scratch` 的 `scratch.seq_len < kv_len` 检查随后拒绝
+恢复仍在 arena 里的长条目。
+
+修复（`runtime/backends/qwen36_mtp.py`）：水位只升不降——
+`scratch.seq_len = max(scratch.seq_len, kv_len)`。回归测试
+`test_scratch_watermark_survives_a_later_shorter_store`：先存 129 token
+（页 0-1）、再存 64 token（页 2）、长条目仍可完整恢复（旧代码下该测试
+红：restore 返回 False）。相关 78 个单测全绿，ruff 通过。
+
+### 9.2 重跑结果（`server_perf_grid_opt1_exact_v2_20260806.json`，修复后）
+
+命令与上一版逐字节一致（`--endpoint completions --contexts 4k,32k,64k,128k
+--concurrency 1,2,3,4 --max-tokens 256 --warm-rounds 2`，exact repeat、
+无 suffix）。16/16 cell 全部完成，每波 WARM `restores == c`，无错误。
+以下为 WARM 两波的服务端 aggregate e2e tok/s（每请求 e2e 在其后的括号）：
+
+| 上下文 | c | WARM1 e2e (per-req) | WARM2 e2e (per-req) | WARM decode tok/s | WARM TTFT s |
+|---|---:|---:|---:|---:|---:|
+| 4K | 1 | 93.75 (93.90) | 91.85 (91.98) | 99.08/92.20 | 0.153/0.018 |
+| 4K | 2 | 175.63 (88.63) | 190.16 (96.09) | 89.94/97.34 | 0.053/0.044 |
+| 4K | 3 | 261.55 (87.43) | 279.81 (93.53) | 90.60/96.60 | 0.114/0.097 |
+| 4K | 4 | 195.45 (75.24) | 189.97 (72.66) | 96.74/93.42 | 0.767/0.793 |
+| 32K | 1 | 96.17 (96.86) | 97.53 (98.23) | 97.71/100.36 | 0.033/0.065 |
+| 32K | 2 | 164.46 (83.51) | 160.15 (80.76) | 84.86/82.68 | 0.060/0.086 |
+| 32K | 3 | 160.15 (53.99) | 179.65 (60.57) | 55.45/62.07 | 0.143/0.118 |
+| 32K | 4 | 132.13 (46.21) | 137.02 (47.13) | 60.20/61.51 | 1.304/1.286 |
+| 64K | 1 | 90.63 (91.72) | 89.54 (90.62) | 93.38/92.25 | 0.060/0.061 |
+| 64K | 2 | 133.74 (68.11) | 127.69 (65.19) | 70.32/67.71 | 0.133/0.161 |
+| 64K | 3 | 136.38 (45.93) | 151.99 (51.29) | 47.87/53.98 | 0.247/0.268 |
+| 64K | 4 | 123.79 (43.82) | 116.88 (40.25) | 57.54/53.11 | 1.410/1.558 |
+| 128K | 1 | 72.09 (73.42) | 81.74 (83.44) | 75.99/86.81 | 0.132/0.130 |
+| 128K | 2 | 113.72 (58.05) | 95.53 (48.86) | 61.71/51.22 | 0.279/0.261 |
+| 128K | 3 | 126.84 (43.25) | 121.64 (41.25) | 46.03/44.60 | 0.378/0.489 |
+| 128K | 4 | 107.45 (36.14) | 103.49 (34.83) | 48.95/47.23 | 1.874/1.952 |
+
+### 9.3 与历史锚点的差距（同协议、不折算）
+
+历史 README 的 222/267 tok/s 出自 **DirectModelRunner 直连协议**（无 HTTP、
+精确重复前缀 + warm，`docs/archive/2026-07-20-PROGRESS.md`：128K/c4 warm
+**222.44**、64K/c4 warm **236.69**；4K W1-S 同进程锚点为 **227.5 committed
+tok/s**，commit `46d5652`）。本网格是 HTTP 服务路径 + exact repeat 前缀命中，
+在 c=4 上与历史的比值：
+
+| 上下文/c4 | 历史锚点（DirectModelRunner warm） | 今天 WARM1/WARM2 | 比值 |
+|---|---:|---:|---:|
+| 4K | 227.5 committed tok/s（W1-S 同进程） | 195.45 / 189.97 | ~0.84× |
+| 64K | 236.69 | 123.79 / 116.88 | ~0.52× / ~0.49× |
+| 128K | 222.44 | 107.45 / 103.49 | ~0.48× / ~0.47× |
+
+注意 4K 行是**不同 harness**（W1-S 同进程 committed vs HTTP 服务端），其余
+两行才是同一 warm exact-repeat 协议下的服务端 vs 直连差距。128K/64K 的
+~0.5× 差距已由 §3-§4 的 nsys + 阶段剖析定位：优化前是主机侧（D2H 回传 +
+checkpoint 克隆尖峰 + draft seed 中转），优化后（commit `94e4f59` +
+`4d239ff`）主机侧降到 ~76 ms/轮，剩余瓶颈是 GPU verify 图 42 ms +
+accept_decision 的固有等待——要再追平需改 split-KV/KWIDE 数值路径，按
+§7.3 约定单独过质量锚点，本轮不动。
+
+fixture：`benchmarks/fixtures/server_perf_grid_opt1_exact_v2_20260806.json`
+（全量逐波 JSON）、`server_perf_grid_opt1_exact_20260806.json`（修复前，
+64K/128K 全失败，保留作对照）、`server_perf_grid_opt1_{64k_c4,128k_c3,
+128k_c4}_exact_20260806.json`（优化前后逐格探针）。

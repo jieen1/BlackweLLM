@@ -1,0 +1,207 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8300",
+    "model": "qwen3.6",
+    "endpoint": "completions",
+    "context_labels": [
+      "64k"
+    ],
+    "context_targets": [
+      65536
+    ],
+    "concurrency": [
+      4
+    ],
+    "max_tokens": 128,
+    "warm_rounds": 2,
+    "warm_suffix_tokens": 0,
+    "filler_prefix": "0123456789 ",
+    "filler_suffix": "1357902468 ",
+    "tokenizer": "/home/bot/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/ccdaab7e68af2409599b8949a8f2685703c9bae5",
+    "server": "qwen36 best profile (MTP K=3 + CUDA Graph + prefix cache + 3x256K)",
+    "template_overhead_tokens": {
+      "64k": 0
+    },
+    "served_context_tokens": {
+      "64k": 65536
+    }
+  },
+  "cells": {
+    "65536": {
+      "4": {
+        "context_tokens": 65536,
+        "served_context_tokens": 65536,
+        "concurrency": 4,
+        "cold": {
+          "wall_s": 44.8647,
+          "requests_sent": 4,
+          "requests_ok": 4,
+          "requests_completed_delta": 4,
+          "errors": [],
+          "prompt_tokens_total": 262144,
+          "generation_tokens_total": 512,
+          "expected_prompt_tokens": 262144,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": 41.605,
+          "server_mean_decode_tok_per_s": 59.66,
+          "server_e2e_tok_per_s": 2.93,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 11.41,
+          "stats_delta": {
+            "requests_completed": 4,
+            "prefix_cache_hits": 3,
+            "prefix_cache_misses": 1,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 64,
+            "mtp_draft_graph_replays": 68,
+            "mtp_batched_sync_replays": 64,
+            "prefix_persistent_stores": 1,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 3,
+            "checkpoints_taken": 33
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 262144.0,
+            "generation_tokens_total": 512.0,
+            "e2e_request_latency_seconds_sum": 174.93,
+            "e2e_request_latency_seconds_count": 4.0,
+            "time_to_first_token_seconds_sum": 166.42,
+            "time_to_first_token_seconds_count": 4.0,
+            "request_time_per_output_token_seconds_sum": 0.067046,
+            "request_time_per_output_token_seconds_count": 4.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 3.8709,
+            "requests_sent": 4,
+            "requests_ok": 4,
+            "requests_completed_delta": 4,
+            "errors": [],
+            "prompt_tokens_total": 262144,
+            "generation_tokens_total": 512,
+            "expected_prompt_tokens": 262144,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.785,
+            "server_mean_decode_tok_per_s": 61.83,
+            "server_e2e_tok_per_s": 45.07,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 132.27,
+            "stats_delta": {
+              "requests_completed": 4,
+              "prefix_cache_hits": 4,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 64,
+              "mtp_draft_graph_replays": 68,
+              "mtp_batched_sync_replays": 64,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 4,
+              "checkpoints_taken": 32
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 262144.0,
+              "generation_tokens_total": 512.0,
+              "e2e_request_latency_seconds_sum": 11.36,
+              "e2e_request_latency_seconds_count": 4.0,
+              "time_to_first_token_seconds_sum": 3.14,
+              "time_to_first_token_seconds_count": 4.0,
+              "request_time_per_output_token_seconds_sum": 0.064698,
+              "request_time_per_output_token_seconds_count": 4.0
+            }
+          },
+          {
+            "wall_s": 4.3084,
+            "requests_sent": 4,
+            "requests_ok": 4,
+            "requests_completed_delta": 4,
+            "errors": [],
+            "prompt_tokens_total": 262144,
+            "generation_tokens_total": 512,
+            "expected_prompt_tokens": 262144,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.8625,
+            "server_mean_decode_tok_per_s": 54.79,
+            "server_e2e_tok_per_s": 40.25,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 118.84,
+            "stats_delta": {
+              "requests_completed": 4,
+              "prefix_cache_hits": 4,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 64,
+              "mtp_draft_graph_replays": 68,
+              "mtp_batched_sync_replays": 64,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 4,
+              "checkpoints_taken": 32
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 262144.0,
+              "generation_tokens_total": 512.0,
+              "e2e_request_latency_seconds_sum": 12.72,
+              "e2e_request_latency_seconds_count": 4.0,
+              "time_to_first_token_seconds_sum": 3.45,
+              "time_to_first_token_seconds_count": 4.0,
+              "request_time_per_output_token_seconds_sum": 0.073007,
+              "request_time_per_output_token_seconds_count": 4.0
+            }
+          }
+        ],
+        "warm_prefix_hit": true
+      }
+    }
+  },
+  "started_at": "2026-08-05T16:38:43.691957+00:00",
+  "server_stats_before": {
+    "requests_completed": 27,
+    "prefix_cache_hits": 23,
+    "prefix_cache_misses": 4,
+    "prefix_cache_hit_tokens_saved": 0,
+    "decode_rounds": 0,
+    "decode_tokens": 0,
+    "decode_graph_replays": 0,
+    "mtp_verify_graph_replays": 354,
+    "mtp_draft_graph_replays": 381,
+    "mtp_batched_sync_replays": 354,
+    "prefix_persistent_stores": 3,
+    "prefix_persistent_evictions": 2,
+    "prefix_persistent_restores": 23,
+    "checkpoints_taken": 219
+  },
+  "server_stats_after": {
+    "requests_completed": 0,
+    "prefix_cache_hits": 0,
+    "prefix_cache_misses": 0,
+    "prefix_cache_hit_tokens_saved": 0,
+    "decode_rounds": 0,
+    "decode_tokens": 0,
+    "decode_graph_replays": 0,
+    "mtp_verify_graph_replays": 0,
+    "mtp_draft_graph_replays": 0,
+    "mtp_batched_sync_replays": 0,
+    "prefix_persistent_stores": 0,
+    "prefix_persistent_evictions": 0,
+    "prefix_persistent_restores": 0,
+    "checkpoints_taken": 0
+  },
+  "finished_at": "2026-08-05T16:39:31.859353+00:00"
+}

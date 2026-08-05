@@ -143,6 +143,19 @@ harness: [`benchmarks/server_perf_grid.py`](benchmarks/server_perf_grid.py)
 results: [`benchmarks/fixtures/server_perf_grid_20260805_v2.json`](benchmarks/fixtures/server_perf_grid_20260805_v2.json)
 (pre-fix failure kept as `server_perf_grid_20260805.json`).
 
+**2026-08-06 rerun** (`server_perf_grid_opt1_exact_v2_20260806.json`): the
+4K/32K/64K/128K × c1-4 exact-repeat grid (same parameters as the historical
+server-path runs) now completes 16/16 cells; a third stacked persistent-cache
+bug found during the rerun — the MTP scratch arena watermark was lowered by
+later shorter stores, making every 64K/128K restore fail with
+"persistent MTP prefix disappeared" — is fixed with a regression test
+(`test_scratch_watermark_survives_a_later_shorter_store`). Warm aggregate e2e
+at c=4: 4K ~190-195, 32K ~132-137, 64K ~117-124, 128K ~103-107 tok/s.
+Historical DirectModelRunner anchors are 227.5 (4K W1-S, different harness),
+236.69 (64K), 222.44 (128K); the 64K/128K gap is the documented GPU
+verify-path cost, not host-side overhead —
+[`notes/2026-08-05-128k-host-side-profile.md`](notes/2026-08-05-128k-host-side-profile.md) §9.
+
 For **Laguna-S-2.1**, the live gates are the DFlash acceptance regression,
 the production CUDA Graph gate, and a bit-level router oracle — all run through
 `bfdiag`.

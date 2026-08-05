@@ -537,7 +537,16 @@ class Qwen36MTPEngine:
         scratch_page_tensor = torch.tensor(scratch_pages, dtype=torch.long, device=self.device)
         scratch.k_cache[scratch_page_tensor] = source.k_cache[source_pages]
         scratch.v_cache[scratch_page_tensor] = source.v_cache[source_pages]
-        scratch.seq_len = kv_len
+        # The scratch row hosts one snapshot per persistent entry at
+        # disjoint page offsets.  ``seq_len`` is a validity WATERMARK for
+        # the whole arena, not the last-stored entry's length: a later
+        # shorter store must not make an earlier longer entry un-restorable
+        # (measured 2026-08-06: storing 4K/32K after 64K/128K dropped the
+        # watermark below the long entries and every 64K/128K restore
+        # failed with "persistent MTP prefix disappeared").  Reachable
+        # entries keep their bytes because their page offsets are disjoint
+        # and only freed at eviction, which removes the entry itself.
+        scratch.seq_len = max(scratch.seq_len, kv_len)
         return True
 
     def restore_prefix_from_scratch(

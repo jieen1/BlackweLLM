@@ -1157,6 +1157,57 @@ class TestPrefillSync:
         assert spec.activations == [(1, 0)]
         assert engine._spec_state_col == [0, 0]
 
+    def test_scratch_watermark_survives_a_later_shorter_store(self) -> None:
+        """A shorter later snapshot must not lower the scratch watermark.
+
+        ``scratch.seq_len`` guards the whole persistent arena, but its
+        entries live at disjoint page offsets.  Measured 2026-08-06 in the
+        real 256K grid: after 64K/128K entries were stored, the 4K/32K
+        stores dropped the watermark below the long entries and every
+        64K/128K restore failed with "persistent MTP prefix disappeared".
+        The long entry's bytes are still in the arena, so the watermark
+        must only ever rise.
+        """
+        engine = Qwen36MTPEngine.__new__(Qwen36MTPEngine)
+        caches = [
+            SimpleNamespace(
+                page_size=128,
+                page_table=torch.tensor([[0, 1]], dtype=torch.int32),
+                k_cache=torch.zeros(4, 128, 1, 1),
+                v_cache=torch.zeros(4, 128, 1, 1),
+                seq_len=0,
+            )
+            for _ in range(3)
+        ]
+        caches[0].k_cache[0].fill_(5.0)
+        caches[0].k_cache[1].fill_(6.0)
+        caches[0].k_cache[2].fill_(9.0)
+        caches[0].v_cache[0].fill_(7.0)
+        caches[0].v_cache[1].fill_(8.0)
+        caches[0].v_cache[2].fill_(10.0)
+        engine._caches = caches
+        engine.device = torch.device("cpu")
+        engine.scratch_row = 2
+        engine.mtp_page_size = 128
+        engine._sync_len = [129, 0]
+        engine._cached_prefix_sync_len = [0, 0]
+        engine._spec_rows = None
+        engine._spec_state_col = [0, 0]
+
+        # Long entry first: pages 0-1 of the scratch arena.
+        assert engine.snapshot_prefix_to_scratch(0, 129, scratch_pages=(0, 1))
+        # Shorter entry afterwards: disjoint page 2.  The pre-fix code set
+        # scratch.seq_len = 64 here and permanently hid the 129 entry.
+        assert engine.snapshot_prefix_to_scratch(0, 64, scratch_pages=(2,))
+        caches[0].k_cache[0].zero_()
+        caches[0].k_cache[1].zero_()
+        assert engine.restore_prefix_from_scratch(1, 129)
+        assert torch.all(caches[1].k_cache[0] == 5.0)
+        assert torch.all(caches[1].k_cache[1] == 6.0)
+        assert torch.all(caches[1].v_cache[0] == 7.0)
+        assert torch.all(caches[1].v_cache[1] == 8.0)
+        assert engine._sync_len[1] == 129
+
 
 class TestHistoricalSync:
     """Every round synchronises the full accepted suffix; no optional

@@ -1,0 +1,2532 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8300",
+    "model": "qwen3.6",
+    "endpoint": "completions",
+    "context_labels": [
+      "4k",
+      "32k",
+      "64k",
+      "128k"
+    ],
+    "context_targets": [
+      4096,
+      32768,
+      65536,
+      131072
+    ],
+    "concurrency": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "max_tokens": 256,
+    "warm_rounds": 2,
+    "warm_suffix_tokens": 0,
+    "filler_prefix": "0123456789 ",
+    "filler_suffix": "1357902468 ",
+    "tokenizer": "/home/bot/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/ccdaab7e68af2409599b8949a8f2685703c9bae5",
+    "server": "qwen36 best profile (MTP K=3 + CUDA Graph + prefix cache + 3x256K)",
+    "template_overhead_tokens": {
+      "4k": 0,
+      "32k": 0,
+      "64k": 0,
+      "128k": 0
+    },
+    "served_context_tokens": {
+      "4k": 4096,
+      "32k": 32768,
+      "64k": 65536,
+      "128k": 131072
+    }
+  },
+  "cells": {
+    "4096": {
+      "1": {
+        "context_tokens": 4096,
+        "served_context_tokens": 4096,
+        "concurrency": 1,
+        "cold": {
+          "wall_s": 4.2474,
+          "requests_sent": 1,
+          "requests_ok": 1,
+          "requests_completed_delta": 1,
+          "errors": [],
+          "prompt_tokens_total": 4096,
+          "generation_tokens_total": 256,
+          "expected_prompt_tokens": 4096,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": 1.7,
+          "server_mean_decode_tok_per_s": 100.16,
+          "server_e2e_tok_per_s": 60.38,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 60.27,
+          "stats_delta": {
+            "requests_completed": 1,
+            "prefix_cache_hits": 0,
+            "prefix_cache_misses": 1,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 64,
+            "mtp_draft_graph_replays": 65,
+            "mtp_batched_sync_replays": 64,
+            "prefix_persistent_stores": 1,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 0,
+            "checkpoints_taken": 17
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 4096.0,
+            "generation_tokens_total": 256.0,
+            "e2e_request_latency_seconds_sum": 4.24,
+            "e2e_request_latency_seconds_count": 1.0,
+            "time_to_first_token_seconds_sum": 1.7,
+            "time_to_first_token_seconds_count": 1.0,
+            "request_time_per_output_token_seconds_sum": 0.009984,
+            "request_time_per_output_token_seconds_count": 1.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 2.9345,
+            "requests_sent": 1,
+            "requests_ok": 1,
+            "requests_completed_delta": 1,
+            "errors": [],
+            "prompt_tokens_total": 4096,
+            "generation_tokens_total": 256,
+            "expected_prompt_tokens": 4096,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.02,
+            "server_mean_decode_tok_per_s": 87.62,
+            "server_e2e_tok_per_s": 87.37,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 87.24,
+            "stats_delta": {
+              "requests_completed": 1,
+              "prefix_cache_hits": 1,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 64,
+              "mtp_draft_graph_replays": 65,
+              "mtp_batched_sync_replays": 64,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 1,
+              "checkpoints_taken": 16
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 4096.0,
+              "generation_tokens_total": 256.0,
+              "e2e_request_latency_seconds_sum": 2.93,
+              "e2e_request_latency_seconds_count": 1.0,
+              "time_to_first_token_seconds_sum": 0.02,
+              "time_to_first_token_seconds_count": 1.0,
+              "request_time_per_output_token_seconds_sum": 0.011413,
+              "request_time_per_output_token_seconds_count": 1.0
+            }
+          },
+          {
+            "wall_s": 2.8234,
+            "requests_sent": 1,
+            "requests_ok": 1,
+            "requests_completed_delta": 1,
+            "errors": [],
+            "prompt_tokens_total": 4096,
+            "generation_tokens_total": 256,
+            "expected_prompt_tokens": 4096,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.04,
+            "server_mean_decode_tok_per_s": 91.97,
+            "server_e2e_tok_per_s": 90.78,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 90.67,
+            "stats_delta": {
+              "requests_completed": 1,
+              "prefix_cache_hits": 1,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 64,
+              "mtp_draft_graph_replays": 65,
+              "mtp_batched_sync_replays": 64,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 1,
+              "checkpoints_taken": 16
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 4096.0,
+              "generation_tokens_total": 256.0,
+              "e2e_request_latency_seconds_sum": 2.82,
+              "e2e_request_latency_seconds_count": 1.0,
+              "time_to_first_token_seconds_sum": 0.04,
+              "time_to_first_token_seconds_count": 1.0,
+              "request_time_per_output_token_seconds_sum": 0.010873,
+              "request_time_per_output_token_seconds_count": 1.0
+            }
+          }
+        ],
+        "warm_prefix_hit": true
+      },
+      "2": {
+        "context_tokens": 4096,
+        "served_context_tokens": 4096,
+        "concurrency": 2,
+        "cold": {
+          "wall_s": 3.0646,
+          "requests_sent": 2,
+          "requests_ok": 2,
+          "requests_completed_delta": 2,
+          "errors": [],
+          "prompt_tokens_total": 8192,
+          "generation_tokens_total": 512,
+          "expected_prompt_tokens": 8192,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": 0.095,
+          "server_mean_decode_tok_per_s": 86.67,
+          "server_e2e_tok_per_s": 84.21,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 167.07,
+          "stats_delta": {
+            "requests_completed": 2,
+            "prefix_cache_hits": 2,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 65,
+            "mtp_draft_graph_replays": 67,
+            "mtp_batched_sync_replays": 65,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 2,
+            "checkpoints_taken": 32
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 8192.0,
+            "generation_tokens_total": 512.0,
+            "e2e_request_latency_seconds_sum": 6.08,
+            "e2e_request_latency_seconds_count": 2.0,
+            "time_to_first_token_seconds_sum": 0.19,
+            "time_to_first_token_seconds_count": 2.0,
+            "request_time_per_output_token_seconds_sum": 0.023075,
+            "request_time_per_output_token_seconds_count": 2.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 2.7965,
+            "requests_sent": 2,
+            "requests_ok": 2,
+            "requests_completed_delta": 2,
+            "errors": [],
+            "prompt_tokens_total": 8192,
+            "generation_tokens_total": 512,
+            "expected_prompt_tokens": 8192,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.085,
+            "server_mean_decode_tok_per_s": 94.8,
+            "server_e2e_tok_per_s": 92.42,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 183.09,
+            "stats_delta": {
+              "requests_completed": 2,
+              "prefix_cache_hits": 2,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 65,
+              "mtp_draft_graph_replays": 67,
+              "mtp_batched_sync_replays": 65,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 2,
+              "checkpoints_taken": 32
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 8192.0,
+              "generation_tokens_total": 512.0,
+              "e2e_request_latency_seconds_sum": 5.54,
+              "e2e_request_latency_seconds_count": 2.0,
+              "time_to_first_token_seconds_sum": 0.17,
+              "time_to_first_token_seconds_count": 2.0,
+              "request_time_per_output_token_seconds_sum": 0.021098,
+              "request_time_per_output_token_seconds_count": 2.0
+            }
+          },
+          {
+            "wall_s": 2.7944,
+            "requests_sent": 2,
+            "requests_ok": 2,
+            "requests_completed_delta": 2,
+            "errors": [],
+            "prompt_tokens_total": 8192,
+            "generation_tokens_total": 512,
+            "expected_prompt_tokens": 8192,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.06,
+            "server_mean_decode_tok_per_s": 94.24,
+            "server_e2e_tok_per_s": 92.42,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 183.22,
+            "stats_delta": {
+              "requests_completed": 2,
+              "prefix_cache_hits": 2,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 65,
+              "mtp_draft_graph_replays": 67,
+              "mtp_batched_sync_replays": 65,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 2,
+              "checkpoints_taken": 32
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 8192.0,
+              "generation_tokens_total": 512.0,
+              "e2e_request_latency_seconds_sum": 5.54,
+              "e2e_request_latency_seconds_count": 2.0,
+              "time_to_first_token_seconds_sum": 0.12,
+              "time_to_first_token_seconds_count": 2.0,
+              "request_time_per_output_token_seconds_sum": 0.021223,
+              "request_time_per_output_token_seconds_count": 2.0
+            }
+          }
+        ],
+        "warm_prefix_hit": true
+      },
+      "3": {
+        "context_tokens": 4096,
+        "served_context_tokens": 4096,
+        "concurrency": 3,
+        "cold": {
+          "wall_s": 3.0831,
+          "requests_sent": 3,
+          "requests_ok": 3,
+          "requests_completed_delta": 3,
+          "errors": [],
+          "prompt_tokens_total": 12288,
+          "generation_tokens_total": 768,
+          "expected_prompt_tokens": 12288,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": 0.07,
+          "server_mean_decode_tok_per_s": 85.32,
+          "server_e2e_tok_per_s": 83.75,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 249.1,
+          "stats_delta": {
+            "requests_completed": 3,
+            "prefix_cache_hits": 3,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 65,
+            "mtp_draft_graph_replays": 68,
+            "mtp_batched_sync_replays": 65,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 3,
+            "checkpoints_taken": 48
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 12288.0,
+            "generation_tokens_total": 768.0,
+            "e2e_request_latency_seconds_sum": 9.17,
+            "e2e_request_latency_seconds_count": 3.0,
+            "time_to_first_token_seconds_sum": 0.21,
+            "time_to_first_token_seconds_count": 3.0,
+            "request_time_per_output_token_seconds_sum": 0.035162,
+            "request_time_per_output_token_seconds_count": 3.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 2.9793,
+            "requests_sent": 3,
+            "requests_ok": 3,
+            "requests_completed_delta": 3,
+            "errors": [],
+            "prompt_tokens_total": 12288,
+            "generation_tokens_total": 768,
+            "expected_prompt_tokens": 12288,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.0733,
+            "server_mean_decode_tok_per_s": 88.77,
+            "server_e2e_tok_per_s": 86.88,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 257.78,
+            "stats_delta": {
+              "requests_completed": 3,
+              "prefix_cache_hits": 3,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 65,
+              "mtp_draft_graph_replays": 68,
+              "mtp_batched_sync_replays": 65,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 3,
+              "checkpoints_taken": 48
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 12288.0,
+              "generation_tokens_total": 768.0,
+              "e2e_request_latency_seconds_sum": 8.84,
+              "e2e_request_latency_seconds_count": 3.0,
+              "time_to_first_token_seconds_sum": 0.22,
+              "time_to_first_token_seconds_count": 3.0,
+              "request_time_per_output_token_seconds_sum": 0.033794,
+              "request_time_per_output_token_seconds_count": 3.0
+            }
+          },
+          {
+            "wall_s": 2.983,
+            "requests_sent": 3,
+            "requests_ok": 3,
+            "requests_completed_delta": 3,
+            "errors": [],
+            "prompt_tokens_total": 12288,
+            "generation_tokens_total": 768,
+            "expected_prompt_tokens": 12288,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.0633,
+            "server_mean_decode_tok_per_s": 88.27,
+            "server_e2e_tok_per_s": 86.78,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 257.46,
+            "stats_delta": {
+              "requests_completed": 3,
+              "prefix_cache_hits": 3,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 65,
+              "mtp_draft_graph_replays": 68,
+              "mtp_batched_sync_replays": 65,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 3,
+              "checkpoints_taken": 48
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 12288.0,
+              "generation_tokens_total": 768.0,
+              "e2e_request_latency_seconds_sum": 8.85,
+              "e2e_request_latency_seconds_count": 3.0,
+              "time_to_first_token_seconds_sum": 0.19,
+              "time_to_first_token_seconds_count": 3.0,
+              "request_time_per_output_token_seconds_sum": 0.033986,
+              "request_time_per_output_token_seconds_count": 3.0
+            }
+          }
+        ],
+        "warm_prefix_hit": true
+      },
+      "4": {
+        "context_tokens": 4096,
+        "served_context_tokens": 4096,
+        "concurrency": 4,
+        "cold": {
+          "wall_s": 5.4304,
+          "requests_sent": 4,
+          "requests_ok": 4,
+          "requests_completed_delta": 4,
+          "errors": [],
+          "prompt_tokens_total": 16384,
+          "generation_tokens_total": 1024,
+          "expected_prompt_tokens": 16384,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": 0.795,
+          "server_mean_decode_tok_per_s": 93.09,
+          "server_e2e_tok_per_s": 72.37,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 188.57,
+          "stats_delta": {
+            "requests_completed": 4,
+            "prefix_cache_hits": 4,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 128,
+            "mtp_draft_graph_replays": 132,
+            "mtp_batched_sync_replays": 128,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 4,
+            "checkpoints_taken": 64
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 16384.0,
+            "generation_tokens_total": 1024.0,
+            "e2e_request_latency_seconds_sum": 14.15,
+            "e2e_request_latency_seconds_count": 4.0,
+            "time_to_first_token_seconds_sum": 3.18,
+            "time_to_first_token_seconds_count": 4.0,
+            "request_time_per_output_token_seconds_sum": 0.042971,
+            "request_time_per_output_token_seconds_count": 4.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 5.6608,
+            "requests_sent": 4,
+            "requests_ok": 4,
+            "requests_completed_delta": 4,
+            "errors": [],
+            "prompt_tokens_total": 16384,
+            "generation_tokens_total": 1024,
+            "expected_prompt_tokens": 16384,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.8475,
+            "server_mean_decode_tok_per_s": 87.22,
+            "server_e2e_tok_per_s": 67.9,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 180.89,
+            "stats_delta": {
+              "requests_completed": 4,
+              "prefix_cache_hits": 4,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 128,
+              "mtp_draft_graph_replays": 132,
+              "mtp_batched_sync_replays": 128,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 4,
+              "checkpoints_taken": 64
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 16384.0,
+              "generation_tokens_total": 1024.0,
+              "e2e_request_latency_seconds_sum": 15.08,
+              "e2e_request_latency_seconds_count": 4.0,
+              "time_to_first_token_seconds_sum": 3.39,
+              "time_to_first_token_seconds_count": 4.0,
+              "request_time_per_output_token_seconds_sum": 0.04586,
+              "request_time_per_output_token_seconds_count": 4.0
+            }
+          },
+          {
+            "wall_s": 5.6053,
+            "requests_sent": 4,
+            "requests_ok": 4,
+            "requests_completed_delta": 4,
+            "errors": [],
+            "prompt_tokens_total": 16384,
+            "generation_tokens_total": 1024,
+            "expected_prompt_tokens": 16384,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.8475,
+            "server_mean_decode_tok_per_s": 88.05,
+            "server_e2e_tok_per_s": 68.36,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 182.68,
+            "stats_delta": {
+              "requests_completed": 4,
+              "prefix_cache_hits": 4,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 128,
+              "mtp_draft_graph_replays": 132,
+              "mtp_batched_sync_replays": 128,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 4,
+              "checkpoints_taken": 64
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 16384.0,
+              "generation_tokens_total": 1024.0,
+              "e2e_request_latency_seconds_sum": 14.98,
+              "e2e_request_latency_seconds_count": 4.0,
+              "time_to_first_token_seconds_sum": 3.39,
+              "time_to_first_token_seconds_count": 4.0,
+              "request_time_per_output_token_seconds_sum": 0.04543,
+              "request_time_per_output_token_seconds_count": 4.0
+            }
+          }
+        ],
+        "warm_prefix_hit": true
+      }
+    },
+    "32768": {
+      "1": {
+        "context_tokens": 32768,
+        "served_context_tokens": 32768,
+        "concurrency": 1,
+        "cold": {
+          "wall_s": 18.926,
+          "requests_sent": 1,
+          "requests_ok": 1,
+          "requests_completed_delta": 1,
+          "errors": [],
+          "prompt_tokens_total": 32768,
+          "generation_tokens_total": 256,
+          "expected_prompt_tokens": 32768,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": 16.22,
+          "server_mean_decode_tok_per_s": 94.79,
+          "server_e2e_tok_per_s": 13.54,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 13.53,
+          "stats_delta": {
+            "requests_completed": 1,
+            "prefix_cache_hits": 1,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 64,
+            "mtp_draft_graph_replays": 65,
+            "mtp_batched_sync_replays": 64,
+            "prefix_persistent_stores": 1,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 0,
+            "checkpoints_taken": 17
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 32768.0,
+            "generation_tokens_total": 256.0,
+            "e2e_request_latency_seconds_sum": 18.91,
+            "e2e_request_latency_seconds_count": 1.0,
+            "time_to_first_token_seconds_sum": 16.22,
+            "time_to_first_token_seconds_count": 1.0,
+            "request_time_per_output_token_seconds_sum": 0.01055,
+            "request_time_per_output_token_seconds_count": 1.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 2.959,
+            "requests_sent": 1,
+            "requests_ok": 1,
+            "requests_completed_delta": 1,
+            "errors": [],
+            "prompt_tokens_total": 32768,
+            "generation_tokens_total": 256,
+            "expected_prompt_tokens": 32768,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.07,
+            "server_mean_decode_tok_per_s": 88.73,
+            "server_e2e_tok_per_s": 87.07,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 86.52,
+            "stats_delta": {
+              "requests_completed": 1,
+              "prefix_cache_hits": 1,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 64,
+              "mtp_draft_graph_replays": 65,
+              "mtp_batched_sync_replays": 64,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 1,
+              "checkpoints_taken": 16
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 32768.0,
+              "generation_tokens_total": 256.0,
+              "e2e_request_latency_seconds_sum": 2.94,
+              "e2e_request_latency_seconds_count": 1.0,
+              "time_to_first_token_seconds_sum": 0.07,
+              "time_to_first_token_seconds_count": 1.0,
+              "request_time_per_output_token_seconds_sum": 0.01127,
+              "request_time_per_output_token_seconds_count": 1.0
+            }
+          },
+          {
+            "wall_s": 3.1215,
+            "requests_sent": 1,
+            "requests_ok": 1,
+            "requests_completed_delta": 1,
+            "errors": [],
+            "prompt_tokens_total": 32768,
+            "generation_tokens_total": 256,
+            "expected_prompt_tokens": 32768,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.05,
+            "server_mean_decode_tok_per_s": 83.54,
+            "server_e2e_tok_per_s": 82.58,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 82.01,
+            "stats_delta": {
+              "requests_completed": 1,
+              "prefix_cache_hits": 1,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 64,
+              "mtp_draft_graph_replays": 65,
+              "mtp_batched_sync_replays": 64,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 1,
+              "checkpoints_taken": 16
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 32768.0,
+              "generation_tokens_total": 256.0,
+              "e2e_request_latency_seconds_sum": 3.1,
+              "e2e_request_latency_seconds_count": 1.0,
+              "time_to_first_token_seconds_sum": 0.05,
+              "time_to_first_token_seconds_count": 1.0,
+              "request_time_per_output_token_seconds_sum": 0.01197,
+              "request_time_per_output_token_seconds_count": 1.0
+            }
+          }
+        ],
+        "warm_prefix_hit": true
+      },
+      "2": {
+        "context_tokens": 32768,
+        "served_context_tokens": 32768,
+        "concurrency": 2,
+        "cold": {
+          "wall_s": 3.1584,
+          "requests_sent": 2,
+          "requests_ok": 2,
+          "requests_completed_delta": 2,
+          "errors": [],
+          "prompt_tokens_total": 65536,
+          "generation_tokens_total": 512,
+          "expected_prompt_tokens": 65536,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": 0.12,
+          "server_mean_decode_tok_per_s": 84.64,
+          "server_e2e_tok_per_s": 81.66,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 162.11,
+          "stats_delta": {
+            "requests_completed": 2,
+            "prefix_cache_hits": 2,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 64,
+            "mtp_draft_graph_replays": 66,
+            "mtp_batched_sync_replays": 64,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 2,
+            "checkpoints_taken": 32
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 65536.0,
+            "generation_tokens_total": 512.0,
+            "e2e_request_latency_seconds_sum": 6.27,
+            "e2e_request_latency_seconds_count": 2.0,
+            "time_to_first_token_seconds_sum": 0.24,
+            "time_to_first_token_seconds_count": 2.0,
+            "request_time_per_output_token_seconds_sum": 0.02363,
+            "request_time_per_output_token_seconds_count": 2.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 3.1392,
+            "requests_sent": 2,
+            "requests_ok": 2,
+            "requests_completed_delta": 2,
+            "errors": [],
+            "prompt_tokens_total": 65536,
+            "generation_tokens_total": 512,
+            "expected_prompt_tokens": 65536,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.095,
+            "server_mean_decode_tok_per_s": 84.93,
+            "server_e2e_tok_per_s": 82.71,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 163.1,
+            "stats_delta": {
+              "requests_completed": 2,
+              "prefix_cache_hits": 2,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 65,
+              "mtp_draft_graph_replays": 67,
+              "mtp_batched_sync_replays": 65,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 2,
+              "checkpoints_taken": 32
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 65536.0,
+              "generation_tokens_total": 512.0,
+              "e2e_request_latency_seconds_sum": 6.19,
+              "e2e_request_latency_seconds_count": 2.0,
+              "time_to_first_token_seconds_sum": 0.19,
+              "time_to_first_token_seconds_count": 2.0,
+              "request_time_per_output_token_seconds_sum": 0.02355,
+              "request_time_per_output_token_seconds_count": 2.0
+            }
+          },
+          {
+            "wall_s": 3.0282,
+            "requests_sent": 2,
+            "requests_ok": 2,
+            "requests_completed_delta": 2,
+            "errors": [],
+            "prompt_tokens_total": 65536,
+            "generation_tokens_total": 512,
+            "expected_prompt_tokens": 65536,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.165,
+            "server_mean_decode_tok_per_s": 89.81,
+            "server_e2e_tok_per_s": 85.19,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 169.08,
+            "stats_delta": {
+              "requests_completed": 2,
+              "prefix_cache_hits": 2,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 64,
+              "mtp_draft_graph_replays": 66,
+              "mtp_batched_sync_replays": 64,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 2,
+              "checkpoints_taken": 32
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 65536.0,
+              "generation_tokens_total": 512.0,
+              "e2e_request_latency_seconds_sum": 6.01,
+              "e2e_request_latency_seconds_count": 2.0,
+              "time_to_first_token_seconds_sum": 0.33,
+              "time_to_first_token_seconds_count": 2.0,
+              "request_time_per_output_token_seconds_sum": 0.02227,
+              "request_time_per_output_token_seconds_count": 2.0
+            }
+          }
+        ],
+        "warm_prefix_hit": true
+      },
+      "3": {
+        "context_tokens": 32768,
+        "served_context_tokens": 32768,
+        "concurrency": 3,
+        "cold": {
+          "wall_s": 4.2677,
+          "requests_sent": 3,
+          "requests_ok": 3,
+          "requests_completed_delta": 3,
+          "errors": [],
+          "prompt_tokens_total": 98304,
+          "generation_tokens_total": 768,
+          "expected_prompt_tokens": 98304,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": 0.17,
+          "server_mean_decode_tok_per_s": 63.08,
+          "server_e2e_tok_per_s": 60.76,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 179.96,
+          "stats_delta": {
+            "requests_completed": 3,
+            "prefix_cache_hits": 3,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 65,
+            "mtp_draft_graph_replays": 68,
+            "mtp_batched_sync_replays": 65,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 3,
+            "checkpoints_taken": 48
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 98304.0,
+            "generation_tokens_total": 768.0,
+            "e2e_request_latency_seconds_sum": 12.64,
+            "e2e_request_latency_seconds_count": 3.0,
+            "time_to_first_token_seconds_sum": 0.51,
+            "time_to_first_token_seconds_count": 3.0,
+            "request_time_per_output_token_seconds_sum": 0.04756,
+            "request_time_per_output_token_seconds_count": 3.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 4.1768,
+            "requests_sent": 3,
+            "requests_ok": 3,
+            "requests_completed_delta": 3,
+            "errors": [],
+            "prompt_tokens_total": 98304,
+            "generation_tokens_total": 768,
+            "expected_prompt_tokens": 98304,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.1967,
+            "server_mean_decode_tok_per_s": 64.59,
+            "server_e2e_tok_per_s": 61.79,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 183.87,
+            "stats_delta": {
+              "requests_completed": 3,
+              "prefix_cache_hits": 3,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 64,
+              "mtp_draft_graph_replays": 67,
+              "mtp_batched_sync_replays": 64,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 3,
+              "checkpoints_taken": 48
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 98304.0,
+              "generation_tokens_total": 768.0,
+              "e2e_request_latency_seconds_sum": 12.43,
+              "e2e_request_latency_seconds_count": 3.0,
+              "time_to_first_token_seconds_sum": 0.59,
+              "time_to_first_token_seconds_count": 3.0,
+              "request_time_per_output_token_seconds_sum": 0.04645,
+              "request_time_per_output_token_seconds_count": 3.0
+            }
+          },
+          {
+            "wall_s": 3.9895,
+            "requests_sent": 3,
+            "requests_ok": 3,
+            "requests_completed_delta": 3,
+            "errors": [],
+            "prompt_tokens_total": 98304,
+            "generation_tokens_total": 768,
+            "expected_prompt_tokens": 98304,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.1867,
+            "server_mean_decode_tok_per_s": 67.6,
+            "server_e2e_tok_per_s": 64.65,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 192.51,
+            "stats_delta": {
+              "requests_completed": 3,
+              "prefix_cache_hits": 3,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 64,
+              "mtp_draft_graph_replays": 67,
+              "mtp_batched_sync_replays": 64,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 3,
+              "checkpoints_taken": 48
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 98304.0,
+              "generation_tokens_total": 768.0,
+              "e2e_request_latency_seconds_sum": 11.88,
+              "e2e_request_latency_seconds_count": 3.0,
+              "time_to_first_token_seconds_sum": 0.56,
+              "time_to_first_token_seconds_count": 3.0,
+              "request_time_per_output_token_seconds_sum": 0.04438,
+              "request_time_per_output_token_seconds_count": 3.0
+            }
+          }
+        ],
+        "warm_prefix_hit": true
+      },
+      "4": {
+        "context_tokens": 32768,
+        "served_context_tokens": 32768,
+        "concurrency": 4,
+        "cold": {
+          "wall_s": 8.9545,
+          "requests_sent": 4,
+          "requests_ok": 4,
+          "requests_completed_delta": 4,
+          "errors": [],
+          "prompt_tokens_total": 131072,
+          "generation_tokens_total": 1024,
+          "expected_prompt_tokens": 131072,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": 1.685,
+          "server_mean_decode_tok_per_s": 48.78,
+          "server_e2e_tok_per_s": 37.03,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 114.36,
+          "stats_delta": {
+            "requests_completed": 4,
+            "prefix_cache_hits": 4,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 128,
+            "mtp_draft_graph_replays": 132,
+            "mtp_batched_sync_replays": 128,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 4,
+            "checkpoints_taken": 64
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 131072.0,
+            "generation_tokens_total": 1024.0,
+            "e2e_request_latency_seconds_sum": 27.65,
+            "e2e_request_latency_seconds_count": 4.0,
+            "time_to_first_token_seconds_sum": 6.74,
+            "time_to_first_token_seconds_count": 4.0,
+            "request_time_per_output_token_seconds_sum": 0.082,
+            "request_time_per_output_token_seconds_count": 4.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 9.8609,
+            "requests_sent": 4,
+            "requests_ok": 4,
+            "requests_completed_delta": 4,
+            "errors": [],
+            "prompt_tokens_total": 131072,
+            "generation_tokens_total": 1024,
+            "expected_prompt_tokens": 131072,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 1.8575,
+            "server_mean_decode_tok_per_s": 44.46,
+            "server_e2e_tok_per_s": 33.72,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 103.84,
+            "stats_delta": {
+              "requests_completed": 4,
+              "prefix_cache_hits": 4,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 128,
+              "mtp_draft_graph_replays": 132,
+              "mtp_batched_sync_replays": 128,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 4,
+              "checkpoints_taken": 64
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 131072.0,
+              "generation_tokens_total": 1024.0,
+              "e2e_request_latency_seconds_sum": 30.37,
+              "e2e_request_latency_seconds_count": 4.0,
+              "time_to_first_token_seconds_sum": 7.43,
+              "time_to_first_token_seconds_count": 4.0,
+              "request_time_per_output_token_seconds_sum": 0.08996,
+              "request_time_per_output_token_seconds_count": 4.0
+            }
+          },
+          {
+            "wall_s": 7.2374,
+            "requests_sent": 4,
+            "requests_ok": 4,
+            "requests_completed_delta": 4,
+            "errors": [],
+            "prompt_tokens_total": 131072,
+            "generation_tokens_total": 1024,
+            "expected_prompt_tokens": 131072,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 1.225,
+            "server_mean_decode_tok_per_s": 67.83,
+            "server_e2e_tok_per_s": 51.38,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 141.49,
+            "stats_delta": {
+              "requests_completed": 4,
+              "prefix_cache_hits": 4,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 128,
+              "mtp_draft_graph_replays": 132,
+              "mtp_batched_sync_replays": 128,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 4,
+              "checkpoints_taken": 64
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 131072.0,
+              "generation_tokens_total": 1024.0,
+              "e2e_request_latency_seconds_sum": 19.93,
+              "e2e_request_latency_seconds_count": 4.0,
+              "time_to_first_token_seconds_sum": 4.9,
+              "time_to_first_token_seconds_count": 4.0,
+              "request_time_per_output_token_seconds_sum": 0.05897,
+              "request_time_per_output_token_seconds_count": 4.0
+            }
+          }
+        ],
+        "warm_prefix_hit": true
+      }
+    },
+    "65536": {
+      "1": {
+        "context_tokens": 65536,
+        "served_context_tokens": 65536,
+        "concurrency": 1,
+        "cold": {
+          "wall_s": 0.0802,
+          "requests_sent": 1,
+          "requests_ok": 0,
+          "requests_completed_delta": 0,
+          "errors": [
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            }
+          ],
+          "prompt_tokens_total": 0,
+          "generation_tokens_total": 0,
+          "expected_prompt_tokens": 65536,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": null,
+          "server_mean_decode_tok_per_s": null,
+          "server_e2e_tok_per_s": null,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 0.0,
+          "stats_delta": {
+            "requests_completed": 0,
+            "prefix_cache_hits": 0,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 0,
+            "mtp_draft_graph_replays": 0,
+            "mtp_batched_sync_replays": 0,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 0,
+            "checkpoints_taken": 0
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 0.0,
+            "generation_tokens_total": 0.0,
+            "e2e_request_latency_seconds_sum": 0.0,
+            "e2e_request_latency_seconds_count": 0.0,
+            "time_to_first_token_seconds_sum": 0.0,
+            "time_to_first_token_seconds_count": 0.0,
+            "request_time_per_output_token_seconds_sum": 0.0,
+            "request_time_per_output_token_seconds_count": 0.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 0.0549,
+            "requests_sent": 1,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 65536,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          },
+          {
+            "wall_s": 0.0541,
+            "requests_sent": 1,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 65536,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          }
+        ],
+        "warm_prefix_hit": false
+      },
+      "2": {
+        "context_tokens": 65536,
+        "served_context_tokens": 65536,
+        "concurrency": 2,
+        "cold": {
+          "wall_s": 0.0755,
+          "requests_sent": 2,
+          "requests_ok": 0,
+          "requests_completed_delta": 0,
+          "errors": [
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            },
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            }
+          ],
+          "prompt_tokens_total": 0,
+          "generation_tokens_total": 0,
+          "expected_prompt_tokens": 131072,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": null,
+          "server_mean_decode_tok_per_s": null,
+          "server_e2e_tok_per_s": null,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 0.0,
+          "stats_delta": {
+            "requests_completed": 0,
+            "prefix_cache_hits": 0,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 0,
+            "mtp_draft_graph_replays": 0,
+            "mtp_batched_sync_replays": 0,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 0,
+            "checkpoints_taken": 0
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 0.0,
+            "generation_tokens_total": 0.0,
+            "e2e_request_latency_seconds_sum": 0.0,
+            "e2e_request_latency_seconds_count": 0.0,
+            "time_to_first_token_seconds_sum": 0.0,
+            "time_to_first_token_seconds_count": 0.0,
+            "request_time_per_output_token_seconds_sum": 0.0,
+            "request_time_per_output_token_seconds_count": 0.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 0.0824,
+            "requests_sent": 2,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 131072,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          },
+          {
+            "wall_s": 0.0719,
+            "requests_sent": 2,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 131072,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          }
+        ],
+        "warm_prefix_hit": false
+      },
+      "3": {
+        "context_tokens": 65536,
+        "served_context_tokens": 65536,
+        "concurrency": 3,
+        "cold": {
+          "wall_s": 0.0853,
+          "requests_sent": 3,
+          "requests_ok": 0,
+          "requests_completed_delta": 0,
+          "errors": [
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            },
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            },
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            }
+          ],
+          "prompt_tokens_total": 0,
+          "generation_tokens_total": 0,
+          "expected_prompt_tokens": 196608,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": null,
+          "server_mean_decode_tok_per_s": null,
+          "server_e2e_tok_per_s": null,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 0.0,
+          "stats_delta": {
+            "requests_completed": 0,
+            "prefix_cache_hits": 0,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 0,
+            "mtp_draft_graph_replays": 0,
+            "mtp_batched_sync_replays": 0,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 0,
+            "checkpoints_taken": 0
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 0.0,
+            "generation_tokens_total": 0.0,
+            "e2e_request_latency_seconds_sum": 0.0,
+            "e2e_request_latency_seconds_count": 0.0,
+            "time_to_first_token_seconds_sum": 0.0,
+            "time_to_first_token_seconds_count": 0.0,
+            "request_time_per_output_token_seconds_sum": 0.0,
+            "request_time_per_output_token_seconds_count": 0.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 0.0887,
+            "requests_sent": 3,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 196608,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          },
+          {
+            "wall_s": 0.0871,
+            "requests_sent": 3,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 196608,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          }
+        ],
+        "warm_prefix_hit": false
+      },
+      "4": {
+        "context_tokens": 65536,
+        "served_context_tokens": 65536,
+        "concurrency": 4,
+        "cold": {
+          "wall_s": 0.1035,
+          "requests_sent": 4,
+          "requests_ok": 0,
+          "requests_completed_delta": 0,
+          "errors": [
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            },
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            },
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            },
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            }
+          ],
+          "prompt_tokens_total": 0,
+          "generation_tokens_total": 0,
+          "expected_prompt_tokens": 262144,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": null,
+          "server_mean_decode_tok_per_s": null,
+          "server_e2e_tok_per_s": null,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 0.0,
+          "stats_delta": {
+            "requests_completed": 0,
+            "prefix_cache_hits": 0,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 0,
+            "mtp_draft_graph_replays": 0,
+            "mtp_batched_sync_replays": 0,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 0,
+            "checkpoints_taken": 0
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 0.0,
+            "generation_tokens_total": 0.0,
+            "e2e_request_latency_seconds_sum": 0.0,
+            "e2e_request_latency_seconds_count": 0.0,
+            "time_to_first_token_seconds_sum": 0.0,
+            "time_to_first_token_seconds_count": 0.0,
+            "request_time_per_output_token_seconds_sum": 0.0,
+            "request_time_per_output_token_seconds_count": 0.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 0.1035,
+            "requests_sent": 4,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 262144,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          },
+          {
+            "wall_s": 0.0989,
+            "requests_sent": 4,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 262144,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          }
+        ],
+        "warm_prefix_hit": false
+      }
+    },
+    "131072": {
+      "1": {
+        "context_tokens": 131072,
+        "served_context_tokens": 131072,
+        "concurrency": 1,
+        "cold": {
+          "wall_s": 0.1164,
+          "requests_sent": 1,
+          "requests_ok": 0,
+          "requests_completed_delta": 0,
+          "errors": [
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            }
+          ],
+          "prompt_tokens_total": 0,
+          "generation_tokens_total": 0,
+          "expected_prompt_tokens": 131072,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": null,
+          "server_mean_decode_tok_per_s": null,
+          "server_e2e_tok_per_s": null,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 0.0,
+          "stats_delta": {
+            "requests_completed": 0,
+            "prefix_cache_hits": 0,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 0,
+            "mtp_draft_graph_replays": 0,
+            "mtp_batched_sync_replays": 0,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 0,
+            "checkpoints_taken": 0
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 0.0,
+            "generation_tokens_total": 0.0,
+            "e2e_request_latency_seconds_sum": 0.0,
+            "e2e_request_latency_seconds_count": 0.0,
+            "time_to_first_token_seconds_sum": 0.0,
+            "time_to_first_token_seconds_count": 0.0,
+            "request_time_per_output_token_seconds_sum": 0.0,
+            "request_time_per_output_token_seconds_count": 0.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 0.105,
+            "requests_sent": 1,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 131072,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          },
+          {
+            "wall_s": 0.1098,
+            "requests_sent": 1,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 131072,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          }
+        ],
+        "warm_prefix_hit": false
+      },
+      "2": {
+        "context_tokens": 131072,
+        "served_context_tokens": 131072,
+        "concurrency": 2,
+        "cold": {
+          "wall_s": 0.1347,
+          "requests_sent": 2,
+          "requests_ok": 0,
+          "requests_completed_delta": 0,
+          "errors": [
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            },
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            }
+          ],
+          "prompt_tokens_total": 0,
+          "generation_tokens_total": 0,
+          "expected_prompt_tokens": 262144,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": null,
+          "server_mean_decode_tok_per_s": null,
+          "server_e2e_tok_per_s": null,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 0.0,
+          "stats_delta": {
+            "requests_completed": 0,
+            "prefix_cache_hits": 0,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 0,
+            "mtp_draft_graph_replays": 0,
+            "mtp_batched_sync_replays": 0,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 0,
+            "checkpoints_taken": 0
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 0.0,
+            "generation_tokens_total": 0.0,
+            "e2e_request_latency_seconds_sum": 0.0,
+            "e2e_request_latency_seconds_count": 0.0,
+            "time_to_first_token_seconds_sum": 0.0,
+            "time_to_first_token_seconds_count": 0.0,
+            "request_time_per_output_token_seconds_sum": 0.0,
+            "request_time_per_output_token_seconds_count": 0.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 0.1498,
+            "requests_sent": 2,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 262144,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          },
+          {
+            "wall_s": 0.1322,
+            "requests_sent": 2,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 262144,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          }
+        ],
+        "warm_prefix_hit": false
+      },
+      "3": {
+        "context_tokens": 131072,
+        "served_context_tokens": 131072,
+        "concurrency": 3,
+        "cold": {
+          "wall_s": 0.1621,
+          "requests_sent": 3,
+          "requests_ok": 0,
+          "requests_completed_delta": 0,
+          "errors": [
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            },
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            },
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            }
+          ],
+          "prompt_tokens_total": 0,
+          "generation_tokens_total": 0,
+          "expected_prompt_tokens": 393216,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": null,
+          "server_mean_decode_tok_per_s": null,
+          "server_e2e_tok_per_s": null,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 0.0,
+          "stats_delta": {
+            "requests_completed": 0,
+            "prefix_cache_hits": 0,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 0,
+            "mtp_draft_graph_replays": 0,
+            "mtp_batched_sync_replays": 0,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 0,
+            "checkpoints_taken": 0
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 0.0,
+            "generation_tokens_total": 0.0,
+            "e2e_request_latency_seconds_sum": 0.0,
+            "e2e_request_latency_seconds_count": 0.0,
+            "time_to_first_token_seconds_sum": 0.0,
+            "time_to_first_token_seconds_count": 0.0,
+            "request_time_per_output_token_seconds_sum": 0.0,
+            "request_time_per_output_token_seconds_count": 0.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 0.2866,
+            "requests_sent": 3,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 393216,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          },
+          {
+            "wall_s": 0.1567,
+            "requests_sent": 3,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 393216,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          }
+        ],
+        "warm_prefix_hit": false
+      },
+      "4": {
+        "context_tokens": 131072,
+        "served_context_tokens": 131072,
+        "concurrency": 4,
+        "cold": {
+          "wall_s": 0.1855,
+          "requests_sent": 4,
+          "requests_ok": 0,
+          "requests_completed_delta": 0,
+          "errors": [
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            },
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            },
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            },
+            {
+              "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+            }
+          ],
+          "prompt_tokens_total": 0,
+          "generation_tokens_total": 0,
+          "expected_prompt_tokens": 524288,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": null,
+          "server_mean_decode_tok_per_s": null,
+          "server_e2e_tok_per_s": null,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 0.0,
+          "stats_delta": {
+            "requests_completed": 0,
+            "prefix_cache_hits": 0,
+            "prefix_cache_misses": 0,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 0,
+            "mtp_draft_graph_replays": 0,
+            "mtp_batched_sync_replays": 0,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 0,
+            "checkpoints_taken": 0
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 0.0,
+            "generation_tokens_total": 0.0,
+            "e2e_request_latency_seconds_sum": 0.0,
+            "e2e_request_latency_seconds_count": 0.0,
+            "time_to_first_token_seconds_sum": 0.0,
+            "time_to_first_token_seconds_count": 0.0,
+            "request_time_per_output_token_seconds_sum": 0.0,
+            "request_time_per_output_token_seconds_count": 0.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 0.178,
+            "requests_sent": 4,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 524288,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          },
+          {
+            "wall_s": 0.1861,
+            "requests_sent": 4,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              },
+              {
+                "error": "http 500: {\"error\":{\"message\":\"persistent MTP prefix disappeared after a validated cache hit\",\"type\":\"internal_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 524288,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          }
+        ],
+        "warm_prefix_hit": false
+      }
+    }
+  },
+  "started_at": "2026-08-05T16:40:22.779003+00:00",
+  "server_stats_before": {
+    "requests_completed": 39,
+    "prefix_cache_hits": 34,
+    "prefix_cache_misses": 5,
+    "prefix_cache_hit_tokens_saved": 0,
+    "decode_rounds": 0,
+    "decode_tokens": 0,
+    "decode_graph_replays": 0,
+    "mtp_verify_graph_replays": 546,
+    "mtp_draft_graph_replays": 585,
+    "mtp_batched_sync_replays": 546,
+    "prefix_persistent_stores": 4,
+    "prefix_persistent_evictions": 2,
+    "prefix_persistent_restores": 34,
+    "checkpoints_taken": 316
+  },
+  "server_stats_after": {
+    "requests_completed": 0,
+    "prefix_cache_hits": 0,
+    "prefix_cache_misses": 0,
+    "prefix_cache_hit_tokens_saved": 0,
+    "decode_rounds": 0,
+    "decode_tokens": 0,
+    "decode_graph_replays": 0,
+    "mtp_verify_graph_replays": 0,
+    "mtp_draft_graph_replays": 0,
+    "mtp_batched_sync_replays": 0,
+    "prefix_persistent_stores": 0,
+    "prefix_persistent_evictions": 0,
+    "prefix_persistent_restores": 0,
+    "checkpoints_taken": 0
+  },
+  "finished_at": "2026-08-05T16:42:13.703430+00:00"
+}
