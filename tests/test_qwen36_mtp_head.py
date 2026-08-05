@@ -25,6 +25,7 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("fla")
 pytest.importorskip("sparkinfer")
 
+import runtime.model.qwen36_model as qwen36_model_module  # noqa: E402
 from runtime.model.qwen36_model import (  # noqa: E402
     Qwen36Attention,
     Qwen36ForCausalLMSelfBuilt,
@@ -137,6 +138,48 @@ def _weights_for(model: Qwen36ForCausalLMSelfBuilt) -> list[tuple[str, torch.Ten
     weights: list[tuple[str, torch.Tensor]] = []
     gen = torch.Generator().manual_seed(0)
     for name, param in model.named_parameters():
+        if ".linear_attn.in_proj_qkvz." in name:
+            layer = model.get_submodule(name.rsplit(".in_proj_qkvz.", 1)[0])
+            assert isinstance(layer, qwen36_model_module.Qwen36GatedDeltaNet)
+            suffix = name.rsplit(".in_proj_qkvz.", 1)[1]
+            qkv, z = param.split((layer.conv_dim, layer.value_dim), dim=0)
+            checkpoint_prefix = (
+                "model.language_model." + name[len("model.") :].rsplit(".in_proj_qkvz.", 1)[0]
+            )
+            weights.extend(
+                [
+                    (
+                        f"{checkpoint_prefix}.in_proj_qkv.{suffix}",
+                        torch.randn(qkv.shape, generator=gen),
+                    ),
+                    (
+                        f"{checkpoint_prefix}.in_proj_z.{suffix}",
+                        torch.randn(z.shape, generator=gen),
+                    ),
+                ]
+            )
+            continue
+        if ".linear_attn.in_proj_ba." in name:
+            layer = model.get_submodule(name.rsplit(".in_proj_ba.", 1)[0])
+            assert isinstance(layer, qwen36_model_module.Qwen36GatedDeltaNet)
+            suffix = name.rsplit(".in_proj_ba.", 1)[1]
+            b, a = param.split(layer.num_v_heads, dim=0)
+            checkpoint_prefix = (
+                "model.language_model." + name[len("model.") :].rsplit(".in_proj_ba.", 1)[0]
+            )
+            weights.extend(
+                [
+                    (
+                        f"{checkpoint_prefix}.in_proj_b.{suffix}",
+                        torch.randn(b.shape, generator=gen),
+                    ),
+                    (
+                        f"{checkpoint_prefix}.in_proj_a.{suffix}",
+                        torch.randn(a.shape, generator=gen),
+                    ),
+                ]
+            )
+            continue
         if name.startswith("model."):
             ckpt_name = "model.language_model." + name[len("model.") :]
         elif name.startswith("lm_head.") or name.startswith("mtp."):
@@ -148,6 +191,39 @@ def _weights_for(model: Qwen36ForCausalLMSelfBuilt) -> list[tuple[str, torch.Ten
 
 
 class TestQwen36MTPHeadWeightLoading:
+    def test_legacy_gdn_input_tensors_fill_historical_fused_layout(self) -> None:
+        """The physical qkvz/ba parameters must preserve checkpoint row order.
+
+        This is deliberately a loader-level test: it proves fusion is a
+        direct byte-preserving concatenation of real checkpoint tensor
+        families, not a later BF16 conversion or a guessed permutation.
+        """
+        donor = Qwen36ForCausalLMSelfBuilt(_tiny_config(), max_seq_len=64)
+        weights = _weights_for(donor)
+        by_name = dict(weights)
+        model = Qwen36ForCausalLMSelfBuilt(_tiny_config(), max_seq_len=64)
+        model.load_weights(weights)
+
+        gdn = model.model.layers[0].linear_attn
+        assert isinstance(gdn, qwen36_model_module.Qwen36GatedDeltaNet)
+        checkpoint_prefix = "model.language_model.layers.0.linear_attn"
+        assert torch.equal(
+            gdn.in_proj_qkvz.weight[: gdn.conv_dim],
+            by_name[f"{checkpoint_prefix}.in_proj_qkv.weight"],
+        )
+        assert torch.equal(
+            gdn.in_proj_qkvz.weight[gdn.conv_dim :],
+            by_name[f"{checkpoint_prefix}.in_proj_z.weight"],
+        )
+        assert torch.equal(
+            gdn.in_proj_ba.weight[: gdn.num_v_heads],
+            by_name[f"{checkpoint_prefix}.in_proj_b.weight"],
+        )
+        assert torch.equal(
+            gdn.in_proj_ba.weight[gdn.num_v_heads :],
+            by_name[f"{checkpoint_prefix}.in_proj_a.weight"],
+        )
+
     def test_enable_mtp_true_loads_every_mtp_tensor(self) -> None:
         donor = Qwen36ForCausalLMSelfBuilt(_tiny_config(), max_seq_len=64, enable_mtp=True)
         weights = _weights_for(donor)
@@ -204,6 +280,55 @@ class TestQwen36MTPHeadWeightLoading:
 
         all_param_names = {name for name, _ in model.named_parameters()}
         assert loaded == all_param_names
+
+
+class TestQwen36BatchedVerifyAttention:
+    def test_flattens_all_requests_for_rope_kv_write_and_paged_attention(self, monkeypatch) -> None:
+        """M-2's B>1 verify must use ``B * qo_len`` token rows throughout.
+
+        The real paged-attention driver is CUDA-only.  This CPU test retains
+        its input/output contract with a tiny recording driver, specifically
+        catching the old B=1 reshape that discarded the batch dimension after
+        Q/K/V had already been flattened.
+        """
+        attn = Qwen36Attention(_tiny_config(), 1, {}, max_seq_len=64)
+        batch, qo_len = 2, 3
+
+        class _VerifyDriver:
+            batch = 2
+            verify_tokens = 3
+
+            def __init__(self) -> None:
+                self.q_shape: tuple[int, ...] | None = None
+
+            def forward(self, *, q, output, **kwargs) -> None:
+                del kwargs
+                self.q_shape = tuple(q.shape)
+                output.copy_(q)
+
+        driver = _VerifyDriver()
+        monkeypatch.setattr(
+            qwen36_model_module, "apply_rotary_embedding_inplace", lambda *args: None
+        )
+        hidden = torch.randn(batch, qo_len, 32)
+        positions = torch.arange(batch * qo_len)
+        k_pool = torch.zeros(2, 8, 2, 8)
+        v_pool = torch.zeros_like(k_pool)
+        output = torch.empty(batch * qo_len, 4, 8)
+
+        result = attn.verify_batch(
+            hidden,
+            positions,
+            torch.empty(1),
+            k_pool=k_pool,
+            v_pool=v_pool,
+            write_index=torch.arange(batch * qo_len),
+            attn=driver,
+            output=output,
+        )
+
+        assert driver.q_shape == (batch * qo_len, 4, 8)
+        assert result.shape == (batch, qo_len, 32)
 
 
 class TestWeightPrefixOverride:

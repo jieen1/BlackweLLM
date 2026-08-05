@@ -21,8 +21,10 @@ different**: DFlash's draft model predicts all 15 tokens in ONE parallel
 step conditions on the PREVIOUS step's own sampled token and hidden state
 (see ``runtime.backends.qwen36_mtp``'s module docstring) -- so there is no
 parallel-mask equivalent here. :class:`Qwen36MTPDraftCudaGraph` instead
-captures ``K`` chained ``decode``-mode (M=1) steps as ONE graph, unrolled
-at capture time; that shape already exists in this codebase
+captures the remaining ``K-1`` chained ``decode``-mode (M=1) continuation
+steps as ONE graph, unrolled at capture time; step 0 is emitted by the
+teacher-forced sync that writes the real target suffix. That shape already
+exists in this codebase
 (``Qwen36DecodeGraphAttention``, built for
 ``Qwen36Backend.capture_decode_cuda_graph``'s M=1 batched decode), so this
 module reuses it rather than inventing a new sparkinfer graph-replay mode.
@@ -30,32 +32,17 @@ module reuses it rather than inventing a new sparkinfer graph-replay mode.
 **What is captured, and what is not (say so explicitly, per the B3
 follow-up brief)**:
 
-* :class:`Qwen36MTPAnchorCudaGraph` -- the anchor-advance step
-  (``Qwen36MTPEngine.round``'s ``self.model(anchor_input, state)``): one
-  M=1 forward through the full 64-layer backbone. This is EXACTLY the
-  shape ``Qwen36Backend``'s own decode graph already solves, so this class
-  reuses the backend's pooled KV/GDN storage
-  (``Qwen36SlotPool.k_pools``/``v_pools``/``conv_pools``/``recurrent_pools``
-  -- the same physical bytes ``Qwen36GenerationState.attn_caches``/
-  ``gdn_states`` read via a per-slot VIEW, see that class's module
-  docstring's "one allocation, two addressings") through a SEPARATE,
-  dedicated M=1 graph rather than the backend's own shared
-  ``_decode_graphs[1]`` -- reusing that graph directly is not safe: it is
-  captured to also stamp ``slot_committed_tokens``/``slot_kv_len``
-  (``Qwen36SlotPool.build_decode_batch``), and the anchor token this graph
-  processes was ALREADY committed by the previous round (see
-  ``runtime.backends.qwen36_mtp.Qwen36MTPEngine.round``'s "committed ahead
-  of kv by one" comment) -- reusing the shared graph's bookkeeping would
-  double-count it. This mirrors DFlash's OWN precedent exactly:
-  ``DFlashEngine._ensure_decode_cg``/``LagunaCudaGraphDecode`` is ALSO a
-  separate M=1 decode graph from ``LagunaBackend``'s own, because DFlash
-  needs ``aux_hidden_states`` the shared graph does not expose -- here MTP
-  needs the post-norm hidden state (pre-``lm_head``) the shared graph
-  does not expose either.
+* :class:`Qwen36MTPAnchorCudaGraph` is kept only as the reference
+  implementation for a single-token MTP backbone step over the pooled
+  KV/GDN storage. It is NOT captured by production anymore: M-3 folded the
+  anchor into the ``K+1`` verify body, so replaying a dedicated anchor graph
+  would only duplicate capture cost and reintroduce bookkeeping hazards
+  around an already-committed token. ``Qwen36MTPEngine.capture_cuda_graphs``
+  therefore marks ``anchor=unused`` instead of attempting this graph.
 
-* :class:`Qwen36MTPDraftCudaGraph` -- the ``K`` chained
-  ``Qwen36MTPEngine._draft_loop`` steps: one self-attention layer, M=1
-  each, chained. Its own dedicated pooled KV cache
+* :class:`Qwen36MTPDraftCudaGraph` -- the ``K-1`` chained continuation
+  steps after teacher-forced step 0: one self-attention layer, M=1 each,
+  chained. Its own dedicated pooled KV cache
   (:func:`build_pooled_mtp_caches`) is required, not merely convenient:
   each real slot's ``mtp_step`` calls must reach a SINGLE captured graph
   (there are no spare graphs per slot -- capturing ``num_slots`` separate
@@ -76,9 +63,10 @@ follow-up brief)**:
   captured once while page ids, cache length, query positions, and K/V write
   rows stay replay inputs. GDN's ``spec_forward`` writes fixed ``spec_row``
   destinations instead of allocating snapshots. One graph is captured for
-  each physical slot; a device source-row index selects the accepted column
-  before replay. This is the captured equivalent of ``verify_forward`` -- the
-  old eager method remains the fallback and the bit-exact oracle.
+  each request-count bucket; device source and destination row-id buffers
+  select the live slots and accepted columns before replay. This is the
+  captured equivalent of ``verify_forward`` -- the old eager method remains
+  the fallback and the bit-exact oracle.
 
 **Discipline**: every capture site goes through
 :func:`attempt_mtp_cg_capture`, the same "record status, log loud, degrade
@@ -134,7 +122,7 @@ def attempt_mtp_cg_capture(name: str, capture_fn: Callable[[], None], *, strict:
             "refusing to finish enable_mtp() (QSR_QWEN36_MTP_REQUIRE_CG=1)"
             if strict
             else "degrading to eager (QSR_QWEN36_MTP_REQUIRE_CG=0, the default) -- "
-            "the same round()/_draft_loop path scripts/b3_mtp_e2e_acceptance_"
+            "the same round()/teacher-forced-sync path scripts/b3_mtp_e2e_acceptance_"
             "throughput.py already token-matches against non-speculative decode"
         )
         logger.error(
@@ -273,11 +261,10 @@ class Qwen36MTPAnchorCudaGraph:
         )
 
     def _fill(self, slot: int, token: int, kv_len: int, *, state_col: int = 0) -> None:
+        self.pool.prepare_kv_writes(slot, kv_len, 1)
         self._input_ids[0, 0] = token
         self._positions[0] = kv_len
-        self._write_index[0] = decode_write_index(
-            slot, kv_len, self.pool.page_size, self.pool.pages_per_slot
-        )
+        self._write_index[0] = self.pool.write_index(slot, kv_len)
         self._slot_index[0] = slot if self._state_row is None else self._state_row(slot, state_col)
         self._attn.page_table[0].copy_(self.pool._global_page_table[slot])  # noqa: SLF001
         self._attn.cache_seqlens[0] = kv_len + 1
@@ -346,11 +333,11 @@ class Qwen36MTPVerifyCudaGraph:
     accepted, ``num_accepted = m + 1``, so the read column is ``m`` -- which
     is why ``Qwen36MTPGDNRows.activate(slot, m)`` is unchanged by this.
 
-    One graph is captured for each physical slot. The recurrent source row is
-    selected through a device index that is updated before replay, so the
-    source address set remains fixed while the accepted column changes. This
-    removes the old K+1 graph variants and makes the graph agree with the
-    fixed pooled-row mechanism used by the eager path.
+    One graph is captured for every request-count bucket. Replays update
+    device source and destination row ids, so slot identity and the accepted
+    column remain data rather than graph-captured addresses. This is what lets
+    a batch-2 graph safely serve any two live slots, not only the pair used
+    during warmup.
     """
 
     def __init__(self, engine: Qwen36MTPEngine) -> None:
@@ -367,16 +354,51 @@ class Qwen36MTPVerifyCudaGraph:
         # oracle direct_model_runner.py::verify_batch_spec). Every
         # query-length quantity below is k+1, not k.
         self.qo_len = engine.k + 1
-        self.scratch = self.pool.scratch_row
-        self._draft_ids = torch.zeros(1, self.qo_len, dtype=torch.long, device=self.device)
-        self._positions = torch.zeros(self.qo_len, dtype=torch.long, device=self.device)
-        self._write_index = torch.zeros(self.qo_len, dtype=torch.long, device=self.device)
-        self._page_table_input = torch.zeros(
-            1, self.pool.pages_per_slot, dtype=torch.int32, device=self.device
-        )
-        self._cache_seqlens_input = torch.zeros(1, dtype=torch.int32, device=self.device)
-        self._cu_seqlens_q = torch.tensor([0, self.qo_len], dtype=torch.int32, device=self.device)
+        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._hidden: dict[int, torch.Tensor] = {}
+        self._batches: dict[int, Qwen36VerifyBatch] = {}
+        self._inputs: dict[
+            int,
+            tuple[
+                torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+            ],
+        ] = {}
+        self._host_inputs: dict[
+            int,
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
+        ] = {}
+        self._host_input_views: dict[
+            int, tuple[object, object, object, object, object, object]
+        ] = {}
+        for batch in range(1, self.pool.num_slots + 1):
+            self._batches[batch] = self._new_batch(batch)
+        # The target pool's page table is a pure function of a physical slot
+        # id.  It never grows or rebinds after construction, unlike a
+        # prefix-cache block table.  Avoid repeating the same D2D copies for
+        # the common stable active-slot set while retaining arbitrary order
+        # on the first replay after membership changes.
+        self._page_table_slots: dict[int, tuple[int, ...] | None] = {
+            batch: None for batch in self._batches
+        }
+        self._captured = False
 
+    def _new_batch(self, batch: int) -> Qwen36VerifyBatch:
+        input_ids = torch.zeros(batch, self.qo_len, dtype=torch.long, device=self.device)
+        positions = torch.zeros(batch * self.qo_len, dtype=torch.long, device=self.device)
+        write_index = torch.zeros(batch * self.qo_len, dtype=torch.long, device=self.device)
+        page_table = torch.zeros(
+            batch, self.pool.pages_per_slot, dtype=torch.int32, device=self.device
+        )
+        cache_seqlens = torch.zeros(batch, dtype=torch.int32, device=self.device)
+        source_index = torch.zeros(batch, dtype=torch.long, device=self.device)
+        destination_index = torch.zeros(batch, self.qo_len, dtype=torch.long, device=self.device)
         attn_drivers: list[Qwen36VerifyGraphAttention | None] = [None] * self.pool.num_layers
         attn_outputs: list[torch.Tensor | None] = [None] * self.pool.num_layers
         for layer in self.pool.model.model.layers:
@@ -386,6 +408,7 @@ class Qwen36MTPVerifyCudaGraph:
             assert k_pool is not None
             attn = layer.self_attn
             attn_drivers[layer.layer_idx] = Qwen36VerifyGraphAttention(
+                batch=batch,
                 num_q_heads=attn.num_heads,
                 num_kv_heads=attn.num_kv_heads,
                 head_dim=attn.head_dim,
@@ -399,176 +422,267 @@ class Qwen36MTPVerifyCudaGraph:
                 device=self.device,
             )
             attn_outputs[layer.layer_idx] = torch.zeros(
-                self.qo_len,
+                batch * self.qo_len,
                 attn.num_heads,
                 attn.head_dim,
                 dtype=self.dtype,
                 device=self.device,
             )
-        self._attn_drivers = attn_drivers
-        self._attn_outputs = attn_outputs
-        self._gdn_source_index = torch.zeros(1, dtype=torch.long, device=self.device)
-        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
-        self._hidden: dict[int, torch.Tensor] = {}
-        self._batches: dict[int, Qwen36VerifyBatch] = {}
-        # The graph captures this index tensor's address, not a particular
-        # source row. Replay changes its value to select the accepted row from
-        # the fixed GDN pools, just as the anchor graph does.
-        for slot in range(self.pool.num_slots + 1):
-            rows = engine._spec_rows.rows_for_slot(slot)
-            destinations = {
-                layer_idx: [states[0], *states[1:]] for layer_idx, states in rows.items()
-            }
-            self._batches[slot] = Qwen36VerifyBatch(
-                input_ids=self._draft_ids,
-                positions=self._positions,
-                write_index=self._write_index,
-                k_pools=self.pool.k_pools,
-                v_pools=self.pool.v_pools,
-                attn_drivers=self._attn_drivers,
-                attn_outputs=self._attn_outputs,
-                gdn_source_index=self._gdn_source_index,
-                gdn_conv_pools=engine._spec_rows.conv_pools,
-                gdn_recurrent_pools=engine._spec_rows.recurrent_pools,
-                gdn_state_rows=destinations,
-            )
-        self._captured = False
+        self._inputs[batch] = (
+            input_ids,
+            positions,
+            write_index,
+            page_table,
+            cache_seqlens,
+            destination_index,
+        )
+        host_inputs = (
+            torch.zeros(batch, dtype=torch.long, device="cpu", pin_memory=True),
+            torch.zeros(batch, self.qo_len, dtype=torch.long, device="cpu", pin_memory=True),
+            torch.zeros(batch * self.qo_len, dtype=torch.long, device="cpu", pin_memory=True),
+            torch.zeros(batch * self.qo_len, dtype=torch.long, device="cpu", pin_memory=True),
+            torch.zeros(batch, dtype=torch.int32, device="cpu", pin_memory=True),
+            torch.zeros(batch, self.qo_len, dtype=torch.long, device="cpu", pin_memory=True),
+        )
+        self._host_inputs[batch] = host_inputs
+        self._host_input_views[batch] = tuple(tensor.numpy() for tensor in host_inputs)
+        return Qwen36VerifyBatch(
+            input_ids=input_ids,
+            positions=positions,
+            write_index=write_index,
+            k_pools=self.pool.k_pools,
+            v_pools=self.pool.v_pools,
+            attn_drivers=attn_drivers,
+            attn_outputs=attn_outputs,
+            gdn_source_index=source_index,
+            gdn_destination_index=destination_index,
+            gdn_conv_pools=self.engine._spec_rows.conv_pools,  # noqa: SLF001
+            gdn_recurrent_pools=self.engine._spec_rows.recurrent_pools,  # noqa: SLF001
+            gdn_state_rows=None,
+        )
 
-    def _fill(
-        self, slot: int, tokens: list[int], past_len: int, *, state_col: int | None = None
-    ) -> None:
-        if state_col is None:
-            state_col = self.engine._spec_state_col[slot]  # noqa: SLF001
-        self._gdn_source_index[0] = self.engine._spec_rows.row_for_slot(  # noqa: SLF001
-            slot, state_col
+    def _fill(self, slots: list[int], tokens: list[list[int]], past_lens: list[int]) -> None:
+        batch = len(slots)
+        descriptor = self._batches[batch]
+        input_ids, positions, write_index, page_table, cache_seqlens, destination_index = (
+            self._inputs[batch]
         )
-        self._draft_ids[0].copy_(torch.tensor(tokens, dtype=torch.long, device=self.device))
-        self._positions.copy_(
-            torch.arange(past_len, past_len + self.qo_len, dtype=torch.long, device=self.device)
-        )
-        self._page_table_input[0].copy_(self.pool._global_page_table[slot])  # noqa: SLF001
-        self._cache_seqlens_input[0] = past_len + self.qo_len
-        rows = [
-            decode_write_index(slot, past_len + i, self.pool.page_size, self.pool.pages_per_slot)
-            for i in range(self.qo_len)
+        (
+            source_host,
+            tokens_host,
+            positions_host,
+            write_index_host,
+            cache_seqlens_host,
+            destination_host,
+        ) = self._host_inputs[batch]
+        (
+            source_view,
+            tokens_view,
+            positions_view,
+            write_index_view,
+            cache_seqlens_view,
+            destination_view,
+        ) = self._host_input_views[batch]
+        if any(len(row) != self.qo_len for row in tokens):
+            raise ValueError(f"verify graph expects anchor+K={self.qo_len} tokens per slot")
+        for slot, past_len in zip(slots, past_lens, strict=True):
+            self.pool.prepare_kv_writes(slot, past_len, self.qo_len)
+        source_cols = [self.engine._spec_state_col[slot] for slot in slots]  # noqa: SLF001
+        source_view[:] = [
+            self.engine._spec_rows.row_for_slot(slot, col)  # noqa: SLF001
+            for slot, col in zip(slots, source_cols, strict=True)
         ]
-        self._write_index.copy_(torch.tensor(rows, dtype=torch.long, device=self.device))
-        for driver in self._attn_drivers:
+        destination_view[:] = [
+            [
+                self.engine._spec_rows.row_for_slot(slot, col)  # noqa: SLF001
+                for col in range(self.qo_len)
+            ]
+            for slot in slots
+        ]
+        tokens_view[:] = tokens
+        positions_view[:] = [
+            position
+            for past_len in past_lens
+            for position in range(past_len, past_len + self.qo_len)
+        ]
+        cache_seqlens_view[:] = [past_len + self.qo_len for past_len in past_lens]
+        write_index_view[:] = [
+            self.pool.write_index(slot, past_len + offset)
+            for slot, past_len in zip(slots, past_lens, strict=True)
+            for offset in range(self.qo_len)
+        ]
+        descriptor.gdn_source_index.copy_(source_host, non_blocking=True)
+        destination_index.copy_(destination_host, non_blocking=True)
+        input_ids.copy_(tokens_host, non_blocking=True)
+        positions.copy_(positions_host, non_blocking=True)
+        cache_seqlens.copy_(cache_seqlens_host, non_blocking=True)
+        write_index.copy_(write_index_host, non_blocking=True)
+        slot_key = tuple((slot, self.pool.page_table_version(slot)) for slot in slots)
+        if self._page_table_slots[batch] != slot_key:
+            for row, slot in enumerate(slots):
+                page_table[row].copy_(self.pool._global_page_table[slot])  # noqa: SLF001
+            self._page_table_slots[batch] = slot_key
+        for driver in descriptor.attn_drivers:
             if driver is not None:
                 driver.update_metadata(
-                    self._page_table_input,
-                    self._cache_seqlens_input,
-                    self._cu_seqlens_q,
+                    page_table,
+                    cache_seqlens,
+                    driver._cu_seqlens_q,  # noqa: SLF001 - graph-owned metadata buffer
                 )
 
     def capture(self) -> None:
         if self._captured:
             return
         try:
-            for slot, batch in self._batches.items():
-                self.engine._spec_rows.reset_slot(slot)  # noqa: SLF001
+            for batch_size, batch in self._batches.items():
+                slots = list(range(batch_size))
+                for slot in slots:
+                    self.engine._spec_rows.reset_slot(slot)  # noqa: SLF001
                 side = torch.cuda.Stream()
                 side.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(side):
                     for _ in range(3):
-                        self._fill(slot, [0] * self.qo_len, 0, state_col=0)
+                        self._fill(slots, [[0] * self.qo_len for _ in slots], [0] * batch_size)
                         self.model.verify_batch(batch)
                 torch.cuda.current_stream().wait_stream(side)
 
-                self._fill(slot, [0] * self.qo_len, 0, state_col=0)
+                self._fill(slots, [[0] * self.qo_len for _ in slots], [0] * batch_size)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     hidden = self.model.verify_batch(batch)
-                self._graphs[slot] = graph
-                self._hidden[slot] = hidden
+                self._graphs[batch_size] = graph
+                self._hidden[batch_size] = hidden
         finally:
             for slot in range(self.pool.num_slots + 1):
                 self.engine._spec_rows.reset_slot(slot)  # noqa: SLF001
         self._captured = True
 
-    def replay(self, slot: int, tokens: list[int], past_len: int) -> torch.Tensor:
+    def replay(
+        self, slots: list[int], tokens: list[list[int]], past_lens: list[int]
+    ) -> torch.Tensor:
         if not self._captured:
             raise RuntimeError("verify CUDA Graph replay requested before capture")
-        if len(tokens) != self.qo_len:
-            raise ValueError(f"verify graph expects anchor+K={self.qo_len} tokens, got {len(tokens)}")
-        self._fill(slot, tokens, past_len)
-        self._graphs[slot].replay()
-        return self._hidden[slot]
+        batch = len(slots)
+        self._fill(slots, tokens, past_lens)
+        self._graphs[batch].replay()
+        return self._hidden[batch]
 
 
 class Qwen36MTPDraftCudaGraph:
-    """CUDA Graph for ``Qwen36MTPEngine._draft_loop``: ``K`` chained M=1
-    forwards through the (1-layer) MTP head, unrolled at capture time.
+    """CUDA Graphs for ``K-1`` speculative MTP continuation steps.
 
-    Requires the pooled MTP cache (:func:`build_pooled_mtp_caches`), not
-    the per-slot standalone allocation -- see module docstring.
+    A draft is autoregressive *within* a slot, but step ``j`` is independent
+    across slots once step ``j - 1`` has completed.  Historical Qwen3.6
+    therefore ran one B-wide MTP-head forward per chained step, rather than
+    replaying B separate B=1 graphs.  Capture one unrolled graph for each
+    B=1..num_slots and retain pooled KV addressing so any live slot subset
+    can use the matching graph.
     """
 
     def __init__(self, engine: Qwen36MTPEngine) -> None:
         self.engine = engine
         self.device = engine.device
         self.dtype = engine.dtype
-        self.k = engine.k
+        # The teacher-forced MTP sync emits draft step 0 while writing the
+        # real prefix.  Graph only the remaining speculative continuation;
+        # otherwise replay would append an extra token and reintroduce the
+        # tail-only state model this class is meant to accelerate.
+        self.steps = max(engine.k - 1, 0)
         model = engine.model
         self.mtp_head = model.mtp
         self.mtp_layer = model.mtp.layers[0]
         attn = self.mtp_layer.self_attn
         hidden_size = model.model.hidden_size
 
-        self._seed_token = torch.zeros(1, 1, dtype=torch.long, device=self.device)
-        self._seed_hidden = torch.zeros(1, 1, hidden_size, dtype=self.dtype, device=self.device)
-        self._slot_buf = torch.zeros(1, dtype=torch.long, device=self.device)
-        self._start_pos = torch.zeros(1, dtype=torch.long, device=self.device)
-
         pages_per_slot = engine.mtp_pages_per_slot
-        page_size = engine.mtp_page_size
-        self._driver = Qwen36DecodeGraphAttention(
-            batch=1,
-            num_q_heads=attn.num_heads,
-            num_kv_heads=attn.num_kv_heads,
-            head_dim=attn.head_dim,
-            page_size=page_size,
-            pages_per_slot=pages_per_slot,
-            num_cache_pages=engine.mtp_k_pool.shape[0],
-            max_seq_len=pages_per_slot * page_size,
-            dtype=self.dtype,
-            kv_dtype=attn.kv_cache_dtype,
+        page_ids = torch.arange(
+            (engine.backend.num_slots + 1) * pages_per_slot,
+            dtype=torch.int32,
             device=self.device,
         )
-        self._attn_output = torch.zeros(
-            1, attn.num_heads, attn.head_dim, dtype=self.dtype, device=self.device
-        )
-
-        self._graph: torch.cuda.CUDAGraph | None = None
-        self._draft_tokens: torch.Tensor | None = None  # [k], captured output
+        self._page_table_by_slot = page_ids.reshape(engine.backend.num_slots + 1, pages_per_slot)
+        self._inputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._host_inputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._host_input_views: dict[int, tuple[object, object, object]] = {}
+        self._drivers: dict[int, Qwen36DecodeGraphAttention] = {}
+        self._attn_outputs: dict[int, torch.Tensor] = {}
+        self._page_table_slots: dict[int, tuple[int, ...] | None] = {}
+        for batch in range(1, engine.backend.num_slots + 1):
+            self._inputs[batch] = (
+                torch.zeros(batch, 1, dtype=torch.long, device=self.device),
+                torch.zeros(batch, 1, hidden_size, dtype=self.dtype, device=self.device),
+                torch.zeros(batch, dtype=torch.long, device=self.device),
+                torch.zeros(batch, dtype=torch.long, device=self.device),
+            )
+            host_inputs = (
+                torch.zeros(batch, dtype=torch.long, device="cpu", pin_memory=True),
+                torch.zeros(batch, dtype=torch.long, device="cpu", pin_memory=True),
+                torch.zeros(batch, dtype=torch.long, device="cpu", pin_memory=True),
+            )
+            self._host_inputs[batch] = host_inputs
+            self._host_input_views[batch] = tuple(tensor.numpy() for tensor in host_inputs)
+            self._drivers[batch] = Qwen36DecodeGraphAttention(
+                batch=batch,
+                num_q_heads=attn.num_heads,
+                num_kv_heads=attn.num_kv_heads,
+                head_dim=attn.head_dim,
+                page_size=engine.mtp_page_size,
+                pages_per_slot=pages_per_slot,
+                num_cache_pages=engine.mtp_k_pool.shape[0],
+                max_seq_len=pages_per_slot * engine.mtp_page_size,
+                dtype=self.dtype,
+                kv_dtype=attn.kv_cache_dtype,
+                device=self.device,
+            )
+            self._attn_outputs[batch] = torch.zeros(
+                batch, attn.num_heads, attn.head_dim, dtype=self.dtype, device=self.device
+            )
+            self._page_table_slots[batch] = None
+        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._draft_tokens: dict[int, torch.Tensor] = {}  # B -> [B, K-1]
         self._captured = False
 
-    def _rebind_before_replay(self, slot: int, start_pos: int) -> None:
-        """Rebind the buffers that stay CONSTANT across all ``K`` steps of
-        one replay (slot identity, round start position). The per-step
-        position/write_index/cache_seqlens values are computed INSIDE the
-        captured graph itself from ``self._slot_buf``/``self._start_pos``
-        (see :meth:`_forward_all_steps`) -- only these two need a
-        host->device write before each replay.
-        """
-        self._slot_buf.fill_(slot)
-        self._start_pos.fill_(start_pos)
-        pages_per_slot = self.engine.mtp_pages_per_slot
-        base = slot * pages_per_slot
-        self._driver.page_table[0, :pages_per_slot].copy_(
-            torch.arange(base, base + pages_per_slot, dtype=torch.int32, device=self.device)
-        )
+    def _fill(
+        self,
+        slots: list[int],
+        seed_tokens: list[int],
+        seed_hiddens: torch.Tensor,
+        start_positions: list[int],
+    ) -> None:
+        batch = len(slots)
+        input_ids, prev_hidden, slot_buf, start_pos = self._inputs[batch]
+        if not (len(seed_tokens) == len(start_positions) == batch):
+            raise ValueError("MTP draft graph slots/tokens/start positions must have equal length")
+        if tuple(seed_hiddens.shape[:2]) != (batch, 1):
+            raise ValueError("MTP draft graph seed hidden must have shape [B, 1, H]")
+        seed_tokens_host, slots_host, start_positions_host = self._host_inputs[batch]
+        seed_tokens_view, slots_view, start_positions_view = self._host_input_views[batch]
+        seed_tokens_view[:] = seed_tokens
+        slots_view[:] = slots
+        start_positions_view[:] = start_positions
+        input_ids[:, 0].copy_(seed_tokens_host, non_blocking=True)
+        prev_hidden.copy_(seed_hiddens)
+        slot_buf.copy_(slots_host, non_blocking=True)
+        start_pos.copy_(start_positions_host, non_blocking=True)
+        driver = self._drivers[batch]
+        slot_key = tuple(slots)
+        if self._page_table_slots[batch] != slot_key:
+            for row, slot in enumerate(slots):
+                driver.page_table[row].copy_(self._page_table_by_slot[slot])
+            self._page_table_slots[batch] = slot_key
 
-    def _forward_all_steps(self) -> torch.Tensor:
+    def _forward_all_steps(self, batch: int) -> torch.Tensor:
         cos_sin_cache = self.engine.model.model.cos_sin_cache
         page_size = self.engine.mtp_page_size
         pages_per_slot = self.engine.mtp_pages_per_slot
-        next_input = self._seed_token
-        prev_hidden = self._seed_hidden
+        next_input, prev_hidden, slot_buf, start_pos = self._inputs[batch]
+        driver = self._drivers[batch]
+        attn_output = self._attn_outputs[batch]
         draft_tokens: list[torch.Tensor] = []
-        for step in range(self.k):
-            pos = self._start_pos + step  # [1] int64, LOCAL position (module docstring)
-            embeds = self.engine.model.model.embed_tokens(next_input)  # [1, 1, H]
+        driver.cache_seqlens.copy_(start_pos)
+        for step in range(self.steps):
+            pos = start_pos + step
+            embeds = self.engine.model.model.embed_tokens(next_input)
             fused = torch.cat(
                 [
                     self.mtp_head.pre_fc_norm_embedding(embeds),
@@ -580,10 +694,10 @@ class Qwen36MTPDraftCudaGraph:
 
             residual = hidden
             hidden = self.mtp_layer.input_layernorm(hidden)
-            write_index = (self._slot_buf * pages_per_slot + pos // page_size) * page_size + (
+            write_index = (slot_buf * pages_per_slot + pos // page_size) * page_size + (
                 pos % page_size
             )
-            self._driver.cache_seqlens.copy_((pos + 1).to(torch.int32))
+            driver.cache_seqlens.add_(1)
             hidden = self.mtp_layer.self_attn.decode_batch(
                 hidden,
                 pos,
@@ -591,8 +705,8 @@ class Qwen36MTPDraftCudaGraph:
                 k_pool=self.engine.mtp_k_pool,
                 v_pool=self.engine.mtp_v_pool,
                 write_index=write_index,
-                attn=self._driver,
-                output=self._attn_output,
+                attn=driver,
+                output=attn_output,
             )
             hidden = residual + hidden
 
@@ -603,55 +717,600 @@ class Qwen36MTPDraftCudaGraph:
 
             post_norm = self.mtp_head.norm(hidden)
             logits = self.engine.model.lm_head(post_norm)
-            draft_token = logits[:, -1, :].argmax(dim=-1)  # [1]
+            draft_token = logits[:, -1, :].argmax(dim=-1)
             draft_tokens.append(draft_token)
 
-            next_input = draft_token.view(1, 1)
+            next_input = draft_token.unsqueeze(1)
             prev_hidden = post_norm
 
-        return torch.cat(draft_tokens, dim=0)  # [k]
+        if not draft_tokens:
+            return torch.empty(batch, 0, dtype=torch.long, device=self.device)
+        return torch.stack(draft_tokens, dim=1)  # [B, K-1]
 
     def capture(self) -> None:
         if self._captured:
             return
-        scratch = self.engine.scratch_row
-        self.engine._caches[scratch].seq_len = 0  # noqa: SLF001 -- same object, own class
+        for batch in range(1, self.engine.backend.num_slots + 1):
+            slots = list(range(batch))
+            zeros = torch.zeros(
+                batch,
+                1,
+                self.engine.model.model.hidden_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    self._fill(slots, [0] * batch, zeros, [0] * batch)
+                    self._forward_all_steps(batch)
+            torch.cuda.current_stream().wait_stream(side)
 
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            for _ in range(3):
-                self._seed_token.zero_()
-                self._seed_hidden.zero_()
-                self._rebind_before_replay(scratch, 0)
-                self._forward_all_steps()
-        torch.cuda.current_stream().wait_stream(side)
-
-        self._seed_token.zero_()
-        self._seed_hidden.zero_()
-        self._rebind_before_replay(scratch, 0)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            self._draft_tokens = self._forward_all_steps()
-        self._graph = graph
+            self._fill(slots, [0] * batch, zeros, [0] * batch)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                self._draft_tokens[batch] = self._forward_all_steps(batch)
+            self._graphs[batch] = graph
         self._captured = True
-        self.engine._caches[scratch].seq_len = 0  # noqa: SLF001
+        for cache in self.engine._caches:
+            cache.seq_len = 0
+
+    def replay_batch(
+        self,
+        slots: list[int],
+        seed_tokens: list[int],
+        seed_hiddens: torch.Tensor,
+        start_positions: list[int],
+    ) -> dict[int, list[int]]:
+        """Replay one B-wide chained draft graph and advance each cache."""
+        if not self._captured:
+            raise RuntimeError("MTP draft CUDA Graph replay requested before capture")
+        batch = len(slots)
+        self._fill(slots, seed_tokens, seed_hiddens, start_positions)
+        self._graphs[batch].replay()
+        for slot, start_pos in zip(slots, start_positions, strict=True):
+            self.engine._caches[slot].seq_len = start_pos + self.steps
+        # One device-to-host transfer for the whole B-wide graph result.
+        # Calling ``tolist`` on one indexed row at a time makes every slot
+        # wait on its own synchronisation point, recreating the historical
+        # per-request host gap this batched graph was introduced to remove.
+        draft_rows = self._draft_tokens[batch].tolist()
+        return {slot: draft_rows[index] for index, slot in enumerate(slots)}
 
     def replay(
         self, slot: int, seed_token: int, seed_hidden: torch.Tensor, start_pos: int
     ) -> list[int]:
-        """Draft ``self.k`` tokens for ``slot``, chained, starting from
-        ``seed_token``/``seed_hidden`` at cache position ``start_pos``
-        (``Qwen36MTPEngine._draft_loop``'s own contract). Advances
-        ``slot``'s MTP cache's ``seq_len`` by ``self.k`` -- the same side
-        effect the eager ``mtp_step`` loop produces one step at a time via
-        ``Qwen36PagedAttentionCache.append``, replicated here in one shot
-        since this graph bypasses ``.append`` entirely (writes happen via
-        the pooled ``write_index`` mechanism instead).
+        """Single-slot compatibility wrapper around :meth:`replay_batch`."""
+        return self.replay_batch([slot], [seed_token], seed_hidden, [start_pos])[slot]
+
+
+class Qwen36MTPBatchedSync:
+    """B-wide teacher-forced MTP synchronisation over the pooled draft KV.
+
+    Target verify has one fixed ``K+1`` shape, but each request accepts a
+    different number of drafts.  The historical runner's batched step-0 path
+    therefore padded every slot to one fixed ``max_q`` body, then chose each
+    request's own last valid logits/hidden row and rewound the physical MTP
+    cache lengths back to the real boundary.  This adapter mirrors that
+    contract: it executes its one-layer MTP forward as ``q`` B-wide decode
+    steps over the pooled KV ownership and reuses the same small ``(B, q)``
+    CUDA-graph buckets for both equal-length and ragged suffixes.
+    """
+
+    def __init__(self, engine: Qwen36MTPEngine) -> None:
+        self.engine = engine
+        self.device = engine.device
+        self.dtype = engine.dtype
+        self.mtp_head = engine.model.mtp
+        self.mtp_layer = engine.model.mtp.layers[0]
+        attn = self.mtp_layer.self_attn
+        self._page_table_by_slot = torch.arange(
+            (engine.backend.num_slots + 1) * engine.mtp_pages_per_slot,
+            dtype=torch.int32,
+            device=self.device,
+        ).reshape(engine.backend.num_slots + 1, engine.mtp_pages_per_slot)
+        self._inputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._host_inputs: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        self._host_input_views: dict[int, tuple[object, object, object, object]] = {}
+        self._tokens: dict[int, torch.Tensor] = {}
+        self._target_hidden: dict[int, torch.Tensor] = {}
+        self._lengths: dict[int, torch.Tensor] = {}
+        self._row_index: dict[int, torch.Tensor] = {}
+        self._drivers: dict[int, Qwen36DecodeGraphAttention] = {}
+        self._attn_outputs: dict[int, torch.Tensor] = {}
+        self._decode_page_table_slots: dict[int, tuple[int, ...] | None] = {}
+        self._graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self._verify_inputs: dict[
+            tuple[int, int],
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+        ] = {}
+        self._verify_host_inputs: dict[
+            tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        self._verify_host_input_views: dict[tuple[int, int], tuple[object, object, object]] = {}
+        self._verify_drivers: dict[tuple[int, int], Qwen36VerifyGraphAttention] = {}
+        self._verify_attn_outputs: dict[tuple[int, int], torch.Tensor] = {}
+        self._verify_page_table_slots: dict[tuple[int, int], tuple[int, ...] | None] = {}
+        self._verify_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self._step_tokens: dict[int, torch.Tensor] = {}
+        self._step_hidden: dict[int, torch.Tensor] = {}
+        self._verify_supported = hasattr(self.mtp_layer.self_attn, "verify_batch")
+        hidden_size = engine.model.model.hidden_size
+        for batch in range(1, engine.backend.num_slots + 1):
+            self._inputs[batch] = (
+                torch.zeros(batch, 1, dtype=torch.long, device=self.device),
+                torch.zeros(batch, 1, hidden_size, dtype=self.dtype, device=self.device),
+                torch.zeros(batch, dtype=torch.long, device=self.device),
+                torch.zeros(batch, dtype=torch.long, device=self.device),
+            )
+            self._tokens[batch] = torch.zeros(
+                batch, engine.k + 1, dtype=torch.long, device=self.device
+            )
+            self._target_hidden[batch] = torch.zeros(
+                batch,
+                engine.k + 1,
+                hidden_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self._lengths[batch] = torch.zeros(batch, dtype=torch.long, device=self.device)
+            self._row_index[batch] = torch.arange(batch, dtype=torch.long, device=self.device)
+            host_inputs = (
+                torch.zeros(batch, engine.k + 1, dtype=torch.long, device="cpu", pin_memory=True),
+                torch.zeros(batch, dtype=torch.long, device="cpu", pin_memory=True),
+                torch.zeros(batch, dtype=torch.long, device="cpu", pin_memory=True),
+                torch.zeros(batch, dtype=torch.long, device="cpu", pin_memory=True),
+            )
+            self._host_inputs[batch] = host_inputs
+            self._host_input_views[batch] = tuple(tensor.numpy() for tensor in host_inputs)
+            self._drivers[batch] = Qwen36DecodeGraphAttention(
+                batch=batch,
+                num_q_heads=attn.num_heads,
+                num_kv_heads=attn.num_kv_heads,
+                head_dim=attn.head_dim,
+                page_size=engine.mtp_page_size,
+                pages_per_slot=engine.mtp_pages_per_slot,
+                num_cache_pages=engine.mtp_k_pool.shape[0],
+                max_seq_len=engine.mtp_pages_per_slot * engine.mtp_page_size,
+                dtype=self.dtype,
+                kv_dtype=attn.kv_cache_dtype,
+                device=self.device,
+            )
+            self._attn_outputs[batch] = torch.zeros(
+                batch, attn.num_heads, attn.head_dim, dtype=self.dtype, device=self.device
+            )
+            self._decode_page_table_slots[batch] = None
+            self._step_tokens[batch] = torch.zeros(
+                batch, engine.k + 1, dtype=torch.long, device=self.device
+            )
+            self._step_hidden[batch] = torch.zeros(
+                batch,
+                engine.k + 1,
+                hidden_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            if self._verify_supported:
+                # ``q=1`` is exactly the decode shape and shares sparkinfer's
+                # workspace cache key with the decode driver above.  It has no
+                # multi-token work to collapse, so keep that case on the
+                # proven decode fallback instead of creating an incompatible
+                # verify-mode workspace for the same geometry.
+                for query_len in range(2, engine.k + 2):
+                    key = (batch, query_len)
+                    self._verify_inputs[key] = (
+                        torch.zeros(batch, query_len, dtype=torch.long, device=self.device),
+                        torch.zeros(batch * query_len, dtype=torch.long, device=self.device),
+                        torch.zeros(batch * query_len, dtype=torch.long, device=self.device),
+                        torch.zeros(
+                            batch, engine.mtp_pages_per_slot, dtype=torch.int32, device=self.device
+                        ),
+                        torch.zeros(batch, dtype=torch.int32, device=self.device),
+                    )
+                    verify_host_inputs = (
+                        torch.zeros(
+                            batch * query_len, dtype=torch.long, device="cpu", pin_memory=True
+                        ),
+                        torch.zeros(
+                            batch * query_len, dtype=torch.long, device="cpu", pin_memory=True
+                        ),
+                        torch.zeros(batch, dtype=torch.int32, device="cpu", pin_memory=True),
+                    )
+                    self._verify_host_inputs[key] = verify_host_inputs
+                    self._verify_host_input_views[key] = tuple(
+                        tensor.numpy() for tensor in verify_host_inputs
+                    )
+                    self._verify_drivers[key] = Qwen36VerifyGraphAttention(
+                        batch=batch,
+                        num_q_heads=attn.num_heads,
+                        num_kv_heads=attn.num_kv_heads,
+                        head_dim=attn.head_dim,
+                        page_size=engine.mtp_page_size,
+                        pages_per_slot=engine.mtp_pages_per_slot,
+                        num_cache_pages=engine.mtp_k_pool.shape[0],
+                        max_seq_len=engine.mtp_pages_per_slot * engine.mtp_page_size,
+                        verify_tokens=query_len,
+                        dtype=self.dtype,
+                        kv_dtype=attn.kv_cache_dtype,
+                        device=self.device,
+                    )
+                    self._verify_attn_outputs[key] = torch.zeros(
+                        batch * query_len,
+                        attn.num_heads,
+                        attn.head_dim,
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                    self._verify_page_table_slots[key] = None
+
+        self._captured = False
+
+    def _fill(
+        self,
+        slots: list[int],
+        shifted_token_ids: list[list[int]],
+        target_hidden: torch.Tensor,
+        start_positions: list[int],
+    ) -> int:
+        batch = len(slots)
+        if batch < 1 or batch not in self._inputs:
+            raise ValueError("batched MTP sync requires 1..num_slots slots")
+        if len(shifted_token_ids) != batch or len(start_positions) != batch:
+            raise ValueError("MTP sync slots/tokens/start positions must have equal length")
+        query_len = len(shifted_token_ids[0])
+        if query_len <= 0 or query_len > self.engine.k + 1:
+            raise ValueError(f"MTP sync query length must be in 1..{self.engine.k + 1}")
+        if any(len(tokens) != query_len for tokens in shifted_token_ids):
+            raise ValueError("batched MTP sync requires one uniform query length")
+        if tuple(target_hidden.shape[:2]) != (batch, query_len):
+            raise ValueError("batched MTP sync target hidden must have shape [B, q, H]")
+
+        input_ids, prev_hidden, slot_buf, start_pos = self._inputs[batch]
+        del input_ids, prev_hidden
+        tokens_host, slots_host, starts_host, _ = self._host_inputs[batch]
+        tokens_view, slots_view, starts_view, _ = self._host_input_views[batch]
+        tokens_view[:, :query_len] = shifted_token_ids
+        slots_view[:] = slots
+        starts_view[:] = start_positions
+        self._tokens[batch][:, :query_len].copy_(tokens_host[:, :query_len], non_blocking=True)
+        self._target_hidden[batch][:, :query_len].copy_(target_hidden)
+        slot_buf.copy_(slots_host, non_blocking=True)
+        start_pos.copy_(starts_host, non_blocking=True)
+        driver = self._drivers[batch]
+        slot_key = tuple(slots)
+        if self._decode_page_table_slots[batch] != slot_key:
+            for row, slot in enumerate(slots):
+                driver.page_table[row].copy_(self._page_table_by_slot[slot])
+            self._decode_page_table_slots[batch] = slot_key
+        self._lengths[batch].fill_(query_len)
+        return query_len
+
+    def _fill_ragged(
+        self,
+        slots: list[int],
+        shifted_token_ids: list[list[int]],
+        target_hidden_rows: list[torch.Tensor],
+        start_positions: list[int],
+    ) -> int:
+        batch = len(slots)
+        if batch < 1 or batch not in self._inputs:
+            raise ValueError("batched MTP sync requires 1..num_slots slots")
+        if (
+            len(shifted_token_ids) != batch
+            or len(target_hidden_rows) != batch
+            or len(start_positions) != batch
+        ):
+            raise ValueError("MTP sync slots/tokens/hidden/start positions must have equal length")
+        lengths = [len(tokens) for tokens in shifted_token_ids]
+        query_len = max(lengths)
+        if query_len <= 0 or query_len > self.engine.k + 1:
+            raise ValueError(f"MTP sync query length must be in 1..{self.engine.k + 1}")
+
+        input_ids, prev_hidden, slot_buf, start_pos = self._inputs[batch]
+        del input_ids, prev_hidden
+        tokens_host, slots_host, starts_host, lengths_host = self._host_inputs[batch]
+        tokens_view, slots_view, starts_view, lengths_view = self._host_input_views[batch]
+        slots_view[:] = slots
+        starts_view[:] = start_positions
+        lengths_view[:] = lengths
+        slot_buf.copy_(slots_host, non_blocking=True)
+        start_pos.copy_(starts_host, non_blocking=True)
+        self._lengths[batch].copy_(lengths_host, non_blocking=True)
+        driver = self._drivers[batch]
+        for row, slot in enumerate(slots):
+            row_hidden = target_hidden_rows[row]
+            if (
+                row_hidden.dim() != 3
+                or row_hidden.shape[0] != 1
+                or row_hidden.shape[1] != lengths[row]
+            ):
+                raise ValueError("ragged MTP sync target hidden must have shape [1, q, H] per slot")
+            row_tokens = shifted_token_ids[row]
+            tokens_view[row, : lengths[row]] = row_tokens
+            self._tokens[batch][row, : lengths[row]].copy_(
+                tokens_host[row, : lengths[row]], non_blocking=True
+            )
+            self._target_hidden[batch][row, : lengths[row]].copy_(row_hidden[0])
+            if lengths[row] < query_len:
+                pad_len = query_len - lengths[row]
+                self._tokens[batch][row, lengths[row] : query_len].fill_(row_tokens[-1])
+                self._target_hidden[batch][row, lengths[row] : query_len].copy_(
+                    row_hidden[0, -1:].expand(pad_len, -1)
+                )
+        slot_key = tuple(slots)
+        if self._decode_page_table_slots[batch] != slot_key:
+            for row, slot in enumerate(slots):
+                driver.page_table[row].copy_(self._page_table_by_slot[slot])
+            self._decode_page_table_slots[batch] = slot_key
+        return query_len
+
+    def _fill_verify_ragged(
+        self,
+        slots: list[int],
+        shifted_token_ids: list[list[int]],
+        target_hidden_rows: list[torch.Tensor],
+        start_positions: list[int],
+    ) -> int:
+        query_len = self._fill_ragged(slots, shifted_token_ids, target_hidden_rows, start_positions)
+        key = (len(slots), query_len)
+        input_ids, positions, write_index, page_table, cache_seqlens = self._verify_inputs[key]
+        positions_host, write_index_host, cache_seqlens_host = self._verify_host_inputs[key]
+        positions_view, write_index_view, cache_seqlens_view = self._verify_host_input_views[key]
+        driver = self._verify_drivers[key]
+        input_ids.copy_(self._tokens[len(slots)][:, :query_len])
+        positions_view[:] = [
+            position for start in start_positions for position in range(start, start + query_len)
+        ]
+        write_index_view[:] = [
+            decode_write_index(
+                slot,
+                start + offset,
+                self.engine.mtp_page_size,
+                self.engine.mtp_pages_per_slot,
+            )
+            for slot, start in zip(slots, start_positions, strict=True)
+            for offset in range(query_len)
+        ]
+        cache_seqlens_view[:] = [start + query_len for start in start_positions]
+        positions.copy_(positions_host, non_blocking=True)
+        write_index.copy_(write_index_host, non_blocking=True)
+        cache_seqlens.copy_(cache_seqlens_host, non_blocking=True)
+        slot_key = tuple(slots)
+        if self._verify_page_table_slots[key] != slot_key:
+            for row, slot in enumerate(slots):
+                page_table[row].copy_(self._page_table_by_slot[slot])
+            self._verify_page_table_slots[key] = slot_key
+        driver.update_metadata(
+            page_table,
+            cache_seqlens,
+            driver._cu_seqlens_q,  # noqa: SLF001 - graph-owned uniform-q metadata
+        )
+        return query_len
+
+    def _forward_all_steps(self, batch: int, query_len: int) -> None:
+        input_ids, prev_hidden, slot_buf, start_pos = self._inputs[batch]
+        tokens = self._tokens[batch]
+        target_hidden = self._target_hidden[batch]
+        driver = self._drivers[batch]
+        cos_sin_cache = self.engine.model.model.cos_sin_cache
+        page_size = self.engine.mtp_page_size
+        pages_per_slot = self.engine.mtp_pages_per_slot
+        driver.cache_seqlens.copy_(start_pos)
+        for step in range(query_len):
+            input_ids.copy_(tokens[:, step : step + 1])
+            prev_hidden.copy_(target_hidden[:, step : step + 1])
+            positions = start_pos + step
+            embeds = self.engine.model.model.embed_tokens(input_ids)
+            fused = torch.cat(
+                [
+                    self.mtp_head.pre_fc_norm_embedding(embeds),
+                    self.mtp_head.pre_fc_norm_hidden(prev_hidden),
+                ],
+                dim=-1,
+            )
+            hidden = self.mtp_head.fc(fused)
+            residual = hidden
+            hidden = self.mtp_layer.input_layernorm(hidden)
+            write_index = (slot_buf * pages_per_slot + positions // page_size) * page_size + (
+                positions % page_size
+            )
+            driver.cache_seqlens.add_(1)
+            hidden = self.mtp_layer.self_attn.decode_batch(
+                hidden,
+                positions,
+                cos_sin_cache,
+                k_pool=self.engine.mtp_k_pool,
+                v_pool=self.engine.mtp_v_pool,
+                write_index=write_index,
+                attn=driver,
+                output=self._attn_outputs[batch],
+            )
+            hidden = residual + hidden
+            residual = hidden
+            hidden = self.mtp_layer.post_attention_layernorm(hidden)
+            hidden = self.mtp_layer.mlp(hidden)
+            post_norm = self.mtp_head.norm(residual + hidden)
+            self._step_hidden[batch][:, step : step + 1].copy_(post_norm)
+        # The shifted teacher-forced tokens are supplied by the target; only
+        # its final MTP row is consumed as draft step 0.  Avoid projecting
+        # the preceding rows through the 248k-vocabulary head.
+        self._step_tokens[batch][:, 0].copy_(
+            self.engine.model.lm_head(post_norm).argmax(dim=-1).reshape(batch)
+        )
+
+    def _forward_verify_body(self, batch: int, query_len: int) -> None:
+        key = (batch, query_len)
+        input_ids, positions, write_index, _, _ = self._verify_inputs[key]
+        driver = self._verify_drivers[key]
+        output = self._verify_attn_outputs[key]
+        hidden_states = self._target_hidden[batch][:, :query_len]
+        cos_sin_cache = self.engine.model.model.cos_sin_cache
+
+        embeds = self.engine.model.model.embed_tokens(input_ids)
+        fused = torch.cat(
+            [
+                self.mtp_head.pre_fc_norm_embedding(embeds),
+                self.mtp_head.pre_fc_norm_hidden(hidden_states),
+            ],
+            dim=-1,
+        )
+        hidden = self.mtp_head.fc(fused)
+        residual = hidden
+        hidden = self.mtp_layer.input_layernorm(hidden)
+        hidden = self.mtp_layer.self_attn.verify_batch(
+            hidden,
+            positions,
+            cos_sin_cache,
+            k_pool=self.engine.mtp_k_pool,
+            v_pool=self.engine.mtp_v_pool,
+            write_index=write_index,
+            attn=driver,
+            output=output,
+        )
+        hidden = residual + hidden
+        residual = hidden
+        hidden = self.mtp_layer.post_attention_layernorm(hidden)
+        hidden = self.mtp_layer.mlp(hidden)
+        post_norm = self.mtp_head.norm(residual + hidden)
+        self._step_hidden[batch][:, :query_len].copy_(post_norm)
+        # Ragged rows have different real last positions.  The static graph
+        # still receives one fixed ``query_len`` body, but its only required
+        # vocab projections are the B dynamically selected final rows.
+        last_post_norm = post_norm[self._row_index[batch], self._lengths[batch] - 1]
+        self._step_tokens[batch][:, 0].copy_(
+            self.engine.model.lm_head(last_post_norm).argmax(dim=-1)
+        )
+
+    def _gather_last(self, batch: int) -> tuple[torch.Tensor, torch.Tensor]:
+        last_index = self._lengths[batch] - 1
+        row_index = self._row_index[batch]
+        last_tokens = self._step_tokens[batch][:, 0]
+        last_hidden = self._step_hidden[batch][row_index, last_index].unsqueeze(1)
+        return last_tokens, last_hidden
+
+    def capture(self) -> None:
+        if self._captured:
+            return
+        try:
+            for batch in self._inputs:
+                slots = list(range(batch))
+                zeros = torch.zeros(
+                    batch,
+                    self.engine.k + 1,
+                    self.engine.model.model.hidden_size,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                for query_len in range(1, self.engine.k + 2):
+                    self._fill(
+                        slots,
+                        [[0] * query_len for _ in slots],
+                        zeros[:, :query_len],
+                        [0] * batch,
+                    )
+                    side = torch.cuda.Stream()
+                    side.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(side):
+                        for _ in range(3):
+                            self._forward_all_steps(batch, query_len)
+                    torch.cuda.current_stream().wait_stream(side)
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph):
+                        self._forward_all_steps(batch, query_len)
+                    self._graphs[(batch, query_len)] = graph
+                    if self._verify_supported and query_len > 1:
+                        zero_rows = [zeros[row : row + 1, :query_len] for row in range(batch)]
+                        self._fill_verify_ragged(
+                            slots,
+                            [[0] * query_len for _ in slots],
+                            zero_rows,
+                            [0] * batch,
+                        )
+                        verify_graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(verify_graph):
+                            self._forward_verify_body(batch, query_len)
+                        self._verify_graphs[(batch, query_len)] = verify_graph
+        except Exception:
+            # Do not replay an arbitrary successful prefix of the bucket
+            # matrix after a later capture failed.  The caller retains this
+            # object and uses its all-eager B-wide fallback instead.
+            self._graphs.clear()
+            self._verify_graphs.clear()
+            raise
+        finally:
+            for cache in self.engine._caches:
+                cache.seq_len = 0
+        self._captured = True
+
+    def replay(
+        self,
+        slots: list[int],
+        shifted_token_ids: list[list[int]],
+        target_hidden: torch.Tensor,
+        start_positions: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Synchronise one equal-length group and return its last token/hidden.
+
+        ``target_hidden`` is request-major ``[B, q, H]`` and every shifted
+        token row has that same ``q``.  The caller owns cache-length and
+        real-boundary bookkeeping after this returns.
         """
-        self._seed_token[0, 0] = seed_token
-        self._seed_hidden.copy_(seed_hidden)
-        self._rebind_before_replay(slot, start_pos)
-        self._graph.replay()
-        self.engine._caches[slot].seq_len = start_pos + self.k
-        return self._draft_tokens.tolist()
+        query_len = self._fill(slots, shifted_token_ids, target_hidden, start_positions)
+        graph = self._graphs.get((len(slots), query_len))
+        if graph is None:
+            self._forward_all_steps(len(slots), query_len)
+            return self._gather_last(len(slots))
+        graph.replay()
+        return self._gather_last(len(slots))
+
+    def replay_ragged(
+        self,
+        slots: list[int],
+        shifted_token_ids: list[list[int]],
+        target_hidden_rows: list[torch.Tensor],
+        start_positions: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Synchronise one ragged all-slot body and gather each real last row."""
+        batch = len(slots)
+        max_query_len = max((len(tokens) for tokens in shifted_token_ids), default=0)
+        # q=1 is the pre-existing decode geometry (and deliberately has no
+        # verify workspace because sparkinfer caches that geometry by shape).
+        # There is no multi-token work to fuse in this case.
+        if self._verify_supported and max_query_len > 1:
+            query_len = self._fill_verify_ragged(
+                slots, shifted_token_ids, target_hidden_rows, start_positions
+            )
+            graph = self._verify_graphs.get((batch, query_len))
+            if graph is None:
+                self._forward_verify_body(batch, query_len)
+            else:
+                graph.replay()
+            return self._gather_last(batch)
+        query_len = self._fill_ragged(slots, shifted_token_ids, target_hidden_rows, start_positions)
+        graph = self._graphs.get((batch, query_len))
+        if graph is None:
+            self._forward_all_steps(batch, query_len)
+        else:
+            graph.replay()
+        return self._gather_last(batch)
+
+    def replay_eager(
+        self,
+        slots: list[int],
+        shifted_token_ids: list[list[int]],
+        target_hidden: torch.Tensor,
+        start_positions: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the same grouped sync body without a CUDA Graph.
+
+        Capture failure must retain the existing B-wide eager path rather
+        than silently turning a multi-slot group back into serial work.  The
+        method is also the direct correctness reference for the graph smoke.
+        """
+        batch = len(slots)
+        query_len = self._fill(slots, shifted_token_ids, target_hidden, start_positions)
+        self._forward_all_steps(batch, query_len)
+        return self._gather_last(batch)

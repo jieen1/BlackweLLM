@@ -38,6 +38,7 @@ pytest.importorskip("sparkinfer")
 
 from runtime.backends.qwen36 import Qwen36Backend  # noqa: E402
 from runtime.backends.qwen36_mtp import Qwen36MTPEngine, Qwen36MTPGDNRows  # noqa: E402
+from runtime.backends.qwen36_mtp_cudagraph import Qwen36MTPBatchedSync  # noqa: E402
 from runtime.sampling import SamplingParams  # noqa: E402
 
 _VOCAB = 1000
@@ -102,6 +103,8 @@ class _StubMTPModel:
         self.config = {"vocab_size": _VOCAB, "intermediate_size": 17408}
 
         self.mtp_step_calls: list[dict] = []
+        self.mtp_forward_calls: list[dict] = []
+        self.mtp_forward_last_logits_only_calls: list[bool] = []
         self.mtp_resync_calls: list[dict] = []
         self.verify_forward_calls: list[dict] = []
 
@@ -151,6 +154,30 @@ class _StubMTPModel:
         draft_token = torch.tensor([(int(next_token_ids.item()) + 1) % _VOCAB])
         hidden = next_token_ids.to(torch.float32).view(1, 1, 1)
         return draft_token, hidden
+
+    def mtp_forward(
+        self,
+        next_token_ids,
+        prev_hidden,
+        start_position: int,
+        cache: _MTPCache,
+        *,
+        logits_last_position_only: bool = False,
+    ):
+        tokens = next_token_ids[0].tolist()
+        self.mtp_forward_calls.append(
+            {
+                "tokens": tokens,
+                "hiddens": prev_hidden.reshape(-1).tolist(),
+                "start_position": start_position,
+            }
+        )
+        assert cache.seq_len == start_position
+        cache.seq_len += len(tokens)
+        hidden = next_token_ids.to(torch.float32).unsqueeze(-1)
+        self.mtp_forward_last_logits_only_calls.append(logits_last_position_only)
+        logits_hidden = hidden[:, -1:] if logits_last_position_only else hidden
+        return self.compute_logits(logits_hidden), hidden
 
     def mtp_resync_step(self, next_token_ids, prev_hidden, start_pos: int, cache: _MTPCache):
         tokens = next_token_ids[0].tolist()
@@ -245,47 +272,189 @@ class TestBackendWiring:
         assert engine._draft_cg is None
         assert engine.cuda_graphs_healthy() is True  # vacuous: nothing attempted
 
+    def test_unused_anchor_does_not_hide_a_healthy_verify_graph_pair(self) -> None:
+        """The anchor is folded into verify, so ``unused`` is not failure."""
+        backend, _ = _backend()
+        backend.enable_mtp(num_speculative_tokens=2, enable_resync=False)
+        engine: Qwen36MTPEngine = backend._mtp
+        engine.cg_status = {"anchor": "unused", "draft": "captured", "verify": "captured"}
+        assert engine.cuda_graphs_healthy() is True
+        engine.cg_status["verify"] = "failed"
+        assert engine.cuda_graphs_healthy() is False
+
+    def test_snapshot_exposes_mtp_capture_outcome_to_metrics(self) -> None:
+        """A successful capture is not useful if production cannot observe it."""
+        backend, _ = _backend()
+        backend.cg_status["decode"] = "captured"
+        backend.enable_mtp(num_speculative_tokens=2, enable_resync=False)
+        backend._mtp.cg_status = {  # noqa: SLF001 - asserts public snapshot result
+            "anchor": "unused",
+            "draft": "captured",
+            "verify": "failed",
+        }
+        assert backend.snapshot().dflash_cg_status == (
+            ("decode", "captured"),
+            ("mtp_draft", "captured"),
+            ("mtp_verify", "failed"),
+        )
+
     def test_spec_rows_are_fixed_and_disjoint_from_the_live_pool(self) -> None:
-        """MTP state must have a stable K+2 address for every slot/column.
+        """MTP state must have a stable K+1 address for every slot/column.
 
         A shape-only test would miss the dangerous regression: reusing the
         live row for a candidate makes rejection overwrite the state that the
         next round must continue from, while copying snapshots back hides the
         mistake behind large ``aten::copy_`` costs. This checks the actual
-        pool views and the column-zero bootstrap copy without a CUDA kernel.
+        pool views and the column-zero alias without a CUDA kernel.
 
-        K+2 columns, not K+1, since the round folded the anchor into the
-        verify forward: that forward runs k+1 positions and ``spec_forward``
-        requires ``seq_len + 1`` rows. Column 0 is the incoming state;
-        columns 1..k+1 hold the state after each position, and accepting
-        ``m`` drafts commits column ``m + 1``. See ``Qwen36MTPGDNRows``.
+        The anchor-plus-K verify owns K+1 output rows.  Before the first
+        verify, column 0 IS the ordinary prefill state; the forward gathers
+        it then overwrites column 0 with the anchor result. Thereafter,
+        accepting ``m`` drafts selects column ``m``. See ``Qwen36MTPGDNRows``.
         """
         backend, _ = _backend()
         live_before = backend.pool.slot_state(0).gdn_states[1].conv_state
+        live_before.fill_(7)
         rows = Qwen36MTPGDNRows(backend, num_speculative_tokens=3)
         rows.sync_from_live(0)
         columns = rows.rows_for_slot(0)[1]
-        assert int(columns[0].conv_state.data_ptr()) != int(live_before.data_ptr())
-        assert backend.pool.slot_state(0).gdn_states[1] is columns[0]
-        assert len(columns) == 5  # K+2 for K=3
-        assert len({int(state.conv_state.data_ptr()) for state in columns}) == 5
-        assert len({int(state.recurrent_state.data_ptr()) for state in columns}) == 5
+        live_after = backend.pool.slot_state(0).gdn_states[1]
+        assert live_after is columns[0]
+        assert int(live_after.conv_state.data_ptr()) == int(columns[0].conv_state.data_ptr())
+        assert torch.equal(columns[0].conv_state, live_before)
+        assert len(columns) == 4  # K+1 for K=3
+        assert len({int(state.conv_state.data_ptr()) for state in columns}) == 4
+        assert len({int(state.recurrent_state.data_ptr()) for state in columns}) == 4
         assert rows.row_for_slot(0, 0) == 0
         assert rows.row_for_slot(0, 1) > backend.pool.num_slots
 
+    def test_enable_mtp_after_decode_graph_is_refused(self) -> None:
+        """A graph cannot survive MTP's aliased GDN-pool extension."""
+        backend, _ = _backend()
+        backend._decode_graphs[1] = object()  # noqa: SLF001 - lifecycle gate
+        with pytest.raises(RuntimeError, match="before capture_decode_cuda_graph"):
+            backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
 
-class TestPairingFix:
-    """The core claim: the NEXT round's draft loop is seeded with the
-    hidden state that PREDICTED the new anchor, not the hidden state
-    produced by processing it. See module docstring."""
 
-    def test_full_accept_seeds_from_verify_hidden_at_m_minus_1(self) -> None:
-        """K=3, every draft accepted (m=k=3): the historically-correct
-        seed is ``verify_hidden[m-1] == verify_hidden[2]`` (the hidden
-        that predicted the bonus token), never ``anchor_hidden`` of the
-        NEW anchor itself (which is what every prior B3 script used --
-        see module docstring) and never any other row.
-        """
+class TestBatchedSyncDispatch:
+    def test_ragged_sync_prefers_the_one_pass_verify_body(self) -> None:
+        helper = object.__new__(Qwen36MTPBatchedSync)
+        helper._verify_supported = True
+        helper._verify_graphs = {}
+        helper._graphs = {}
+        helper._fill_verify_ragged = (
+            lambda slots, tokens, hidden_rows, starts: 4  # noqa: ARG005
+        )
+        helper._fill_ragged = lambda *args, **kwargs: (_ for _ in ()).throw(  # noqa: ARG005
+            AssertionError("ragged verify path must not fall back to decode-step fill")
+        )
+        helper._forward_all_steps = lambda *args, **kwargs: (_ for _ in ()).throw(  # noqa: ARG005
+            AssertionError("ragged verify path must not use the q-step decode loop")
+        )
+        calls: list[tuple[int, int]] = []
+
+        def _forward_verify_body(batch: int, query_len: int) -> None:
+            calls.append((batch, query_len))
+
+        helper._forward_verify_body = _forward_verify_body
+        helper._gather_last = lambda batch: (  # noqa: ARG005
+            torch.tensor([15, 22], dtype=torch.long),
+            torch.tensor([[[115.0]], [[221.0]]], dtype=torch.float32),
+        )
+
+        first_drafts, first_hidden = helper.replay_ragged(
+            [0, 1],
+            [[11, 12, 13, 14], [21]],
+            [torch.tensor([[[10.0], [11.0], [12.0], [13.0]]]), torch.tensor([[[20.0]]])],
+            [0, 0],
+        )
+
+        assert calls == [(2, 4)]
+        assert first_drafts.tolist() == [15, 22]
+        assert first_hidden.reshape(-1).tolist() == [115.0, 221.0]
+
+    def test_ragged_sync_falls_back_to_q_step_loop_when_verify_support_is_unavailable(
+        self,
+    ) -> None:
+        helper = object.__new__(Qwen36MTPBatchedSync)
+        helper._verify_supported = False
+        helper._verify_graphs = {}
+        helper._graphs = {}
+        helper._fill_verify_ragged = lambda *args, **kwargs: (_ for _ in ()).throw(  # noqa: ARG005
+            AssertionError("legacy fallback must not touch verify-fill state")
+        )
+        helper._fill_ragged = (
+            lambda slots, tokens, hidden_rows, starts: 4  # noqa: ARG005
+        )
+        calls: list[tuple[int, int]] = []
+
+        def _forward_all_steps(batch: int, query_len: int) -> None:
+            calls.append((batch, query_len))
+
+        helper._forward_all_steps = _forward_all_steps
+        helper._forward_verify_body = lambda *args, **kwargs: (_ for _ in ()).throw(  # noqa: ARG005
+            AssertionError("legacy fallback must not use verify body")
+        )
+        helper._gather_last = lambda batch: (  # noqa: ARG005
+            torch.tensor([15, 22], dtype=torch.long),
+            torch.tensor([[[115.0]], [[221.0]]], dtype=torch.float32),
+        )
+
+        first_drafts, first_hidden = helper.replay_ragged(
+            [0, 1],
+            [[11, 12, 13, 14], [21]],
+            [torch.tensor([[[10.0], [11.0], [12.0], [13.0]]]), torch.tensor([[[20.0]]])],
+            [0, 0],
+        )
+
+        assert calls == [(2, 4)]
+        assert first_drafts.tolist() == [15, 22]
+        assert first_hidden.reshape(-1).tolist() == [115.0, 221.0]
+
+    def test_ragged_sync_uses_decode_body_for_q1_even_when_verify_is_available(
+        self,
+    ) -> None:
+        """q=1 shares decode's attention workspace and must not use verify."""
+        helper = object.__new__(Qwen36MTPBatchedSync)
+        helper._verify_supported = True
+        helper._verify_graphs = {}
+        helper._graphs = {}
+        helper._fill_verify_ragged = lambda *args, **kwargs: (_ for _ in ()).throw(  # noqa: ARG005
+            AssertionError("q=1 must not allocate or dispatch verify attention")
+        )
+        helper._forward_verify_body = lambda *args, **kwargs: (_ for _ in ()).throw(  # noqa: ARG005
+            AssertionError("q=1 must not dispatch the verify body")
+        )
+        helper._fill_ragged = (
+            lambda slots, tokens, hidden_rows, starts: 1  # noqa: ARG005
+        )
+        calls: list[tuple[int, int]] = []
+
+        def _forward_all_steps(batch: int, query_len: int) -> None:
+            calls.append((batch, query_len))
+
+        helper._forward_all_steps = _forward_all_steps
+        helper._gather_last = lambda batch: (  # noqa: ARG005
+            torch.tensor([15, 22], dtype=torch.long),
+            torch.tensor([[[115.0]], [[221.0]]], dtype=torch.float32),
+        )
+
+        first_drafts, first_hidden = helper.replay_ragged(
+            [0, 1],
+            [[11], [21]],
+            [torch.tensor([[[10.0]]]), torch.tensor([[[20.0]]])],
+            [0, 0],
+        )
+
+        assert calls == [(2, 1)]
+        assert first_drafts.tolist() == [15, 22]
+        assert first_hidden.reshape(-1).tolist() == [115.0, 221.0]
+
+
+class TestTeacherForcedSync:
+    """The MTP cache mirrors real target context before each draft tail."""
+
+    def test_full_accept_teacher_forces_every_real_verify_position(self) -> None:
         backend, model = _backend()
         backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
         engine: Qwen36MTPEngine = backend._mtp
@@ -293,7 +462,7 @@ class TestPairingFix:
         anchor_token = 10
         drafts = [11, 12, 13]  # each one more than the last: designed to
         # all be accepted under the stub's (value+1)%vocab argmax rule.
-        engine._caches[0].seq_len = 3  # simulate the prior draft_after_prefill/round call
+        engine._caches[0].seq_len = 2  # K=3 means two physical continuation rows
 
         model.mtp_step_calls.clear()
         result = engine.round(0, anchor_token, drafts)
@@ -302,30 +471,367 @@ class TestPairingFix:
         assert result["committed"] == [11, 12, 13, 14]
         assert result["next_anchor"] == 14
 
-        # The re-draft step's FIRST mtp_step call is what matters here.
+        assert model.mtp_forward_calls == [
+            {"tokens": [11, 12, 13, 14], "hiddens": [10.0, 11.0, 12.0, 13.0], "start_position": 0}
+        ]
+        assert model.mtp_forward_last_logits_only_calls == [True]
+        # The continuation starts *after* the MTP step-0 output.  The old
+        # tail-only implementation instead began with new_anchor=14 and
+        # never wrote the real [anchor, accepted, bonus] suffix.
         first_call = model.mtp_step_calls[0]
-        assert first_call["token"] == 14  # new_anchor
-        assert first_call["prev_hidden"] == 13.0  # verify_hidden[m-1] = verify_hidden[2]
-        # The bug this fix replaces would have used anchor_hidden of the
-        # NEW anchor (14.0, from re-forwarding new_anchor through the
-        # target) -- explicitly NOT what was used.
-        assert first_call["prev_hidden"] != 14.0
+        assert first_call["token"] == 15
+        assert first_call["prev_hidden"] == 14.0
 
-    def test_immediate_reject_seeds_from_this_rounds_own_anchor_hidden(self) -> None:
-        """m=0 (first draft already wrong): the correct seed is THIS
-        round's own anchor_hidden (the hidden that predicted new_anchor,
-        since new_anchor == the target's own recovery prediction from
-        that exact hidden) -- row 0 of ``all_hiddens``, never
-        ``verify_hidden`` at all (there is no accepted draft to source a
-        verify row from).
+    def test_multi_slot_round_uses_one_batched_verify_replay(self) -> None:
+        """M-2 must batch the target verify without cross-slot state reuse."""
+        backend, model = _backend(num_slots=2)
+        backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
+        engine: Qwen36MTPEngine = backend._mtp
+
+        class _BatchedVerify:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list[int], list[list[int]], list[int]]] = []
+
+            def replay(self, slots, tokens, past_lens):
+                self.calls.append((slots, tokens, past_lens))
+                return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+
+        verify = _BatchedVerify()
+        engine._verify_cg = verify
+        for slot in (0, 1):
+            engine._caches[slot].seq_len = 2
+            backend.pool.slot_kv_len[slot] = 7
+            backend.pool.slot_state(slot).num_tokens_seen = 7
+
+        model.mtp_step_calls.clear()
+        result = engine.round_batch(
+            [0, 1],
+            {0: 10, 1: 20},
+            {0: [11, 12, 13], 1: [21, 22, 23]},
+        )
+
+        assert verify.calls == [([0, 1], [[10, 11, 12, 13], [20, 21, 22, 23]], [7, 7])]
+        assert result[0]["committed"] == [11, 12, 13, 14]
+        assert result[1]["committed"] == [21, 22, 23, 24]
+        assert backend.pool.slot_kv_len[:2] == [11, 11]
+        assert [call["tokens"] for call in model.mtp_forward_calls] == [
+            [11, 12, 13, 14],
+            [21, 22, 23, 24],
+        ]
+        assert [model.mtp_step_calls[index]["token"] for index in (0, 2)] == [15, 25]
+        assert engine.stats["batched_verify_replays"] == 1
+        assert backend.stats["mtp_verify_graph_slots"] == 2
+
+    def test_multi_slot_round_batches_the_chained_draft_replay_too(self) -> None:
+        """M-4 follows the historical draft funnel: B-wide at each K step.
+
+        A correct target verify alone still leaves a serial B=1 graph replay
+        per slot.  This test pins the handoff after accept/reject: one
+        batched draft replay sees both new anchors and exactly the hidden row
+        that predicted each one.
         """
+        backend, model = _backend(num_slots=2)
+        backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
+        engine: Qwen36MTPEngine = backend._mtp
+
+        class _BatchedVerify:
+            def replay(self, slots, tokens, past_lens):
+                del slots, past_lens
+                return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+
+        class _BatchedDraft:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list[int], list[int], torch.Tensor, list[int]]] = []
+
+            def replay_batch(self, slots, seed_tokens, seed_hiddens, start_positions):
+                self.calls.append(
+                    (list(slots), list(seed_tokens), seed_hiddens.clone(), list(start_positions))
+                )
+                return {slot: [token + 1, token + 2] for slot, token in zip(slots, seed_tokens)}
+
+        engine._verify_cg = _BatchedVerify()
+        draft = _BatchedDraft()
+        engine._draft_cg = draft
+        for slot in (0, 1):
+            engine._caches[slot].seq_len = 2
+            backend.pool.slot_kv_len[slot] = 7
+            backend.pool.slot_state(slot).num_tokens_seen = 7
+
+        result = engine.round_batch(
+            [0, 1],
+            {0: 10, 1: 20},
+            {0: [11, 12, 13], 1: [21, 22, 23]},
+        )
+
+        assert len(draft.calls) == 1
+        slots, tokens, hiddens, starts = draft.calls[0]
+        assert slots == [0, 1]
+        assert tokens == [15, 25]
+        assert hiddens.reshape(-1).tolist() == [14.0, 24.0]
+        assert starts == [4, 4]
+        assert result[0]["next_draft_tokens"] == [15, 16, 17]
+        assert result[1]["next_draft_tokens"] == [25, 26, 27]
+        assert len(result[0]["next_draft_tokens"]) == engine.k
+        assert len(result[1]["next_draft_tokens"]) == engine.k
+        assert engine.stats["batched_draft_replays"] == 1
+        assert backend.stats["mtp_draft_graph_slots"] == 2
+
+    def test_equal_acceptance_lengths_fall_back_to_one_grouped_batched_sync(self) -> None:
+        """The pre-ragged grouped fast path remains a valid fallback."""
+        backend, model = _backend(num_slots=2)
+        backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
+        engine: Qwen36MTPEngine = backend._mtp
+
+        class _BatchedVerify:
+            def replay(self, slots, tokens, past_lens):
+                del slots, past_lens
+                return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+
+        class _BatchedSync:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list[int], list[list[int]], torch.Tensor, list[int]]] = []
+
+            def replay(self, slots, tokens, hiddens, starts):
+                self.calls.append((list(slots), list(tokens), hiddens.clone(), list(starts)))
+                first_drafts = torch.tensor(
+                    [(token_ids[-1] + 1) % _VOCAB for token_ids in tokens], dtype=torch.long
+                )
+                return first_drafts, hiddens[:, -1:]
+
+        engine._verify_cg = _BatchedVerify()
+        sync = _BatchedSync()
+        engine._batched_sync = sync
+        for slot in (0, 1):
+            engine._caches[slot].seq_len = 2
+
+        result = engine.round_batch(
+            [0, 1],
+            {0: 10, 1: 20},
+            {0: [11, 12, 13], 1: [21, 22, 23]},
+        )
+
+        assert len(sync.calls) == 1
+        slots, tokens, hiddens, starts = sync.calls[0]
+        assert slots == [0, 1]
+        assert tokens == [[11, 12, 13, 14], [21, 22, 23, 24]]
+        assert hiddens.reshape(-1).tolist() == [10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0]
+        assert starts == [0, 0]
+        assert model.mtp_forward_calls == []
+        assert result[0]["next_draft_tokens"] == [15, 16, 17]
+        assert result[1]["next_draft_tokens"] == [25, 26, 27]
+        assert engine.stats["batched_sync_replays"] == 1
+        assert backend.stats["mtp_batched_sync_slots"] == 2
+
+    def test_ragged_acceptance_lengths_use_one_all_slot_batched_sync_and_rewind_real_boundaries(
+        self,
+    ) -> None:
+        """The ragged fast path pads once, then resumes each slot at its real end."""
+        backend, model = _backend(num_slots=2)
+        backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
+        engine: Qwen36MTPEngine = backend._mtp
+
+        class _BatchedVerify:
+            def replay(self, slots, tokens, past_lens):
+                del slots, past_lens
+                return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+
+        class _RaggedSync:
+            def __init__(self) -> None:
+                self.calls: list[
+                    tuple[list[int], list[list[int]], list[torch.Tensor], list[int]]
+                ] = []
+
+            def replay_ragged(self, slots, tokens, hidden_rows, starts):
+                self.calls.append(
+                    (list(slots), list(tokens), [row.clone() for row in hidden_rows], list(starts))
+                )
+                first_drafts = torch.tensor([15, 22], dtype=torch.long)
+                first_hidden = torch.tensor([[[115.0]], [[221.0]]], dtype=torch.float32)
+                return first_drafts, first_hidden
+
+        class _BatchedDraft:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list[int], list[int], torch.Tensor, list[int]]] = []
+
+            def replay_batch(self, slots, seed_tokens, seed_hiddens, start_positions):
+                self.calls.append(
+                    (list(slots), list(seed_tokens), seed_hiddens.clone(), list(start_positions))
+                )
+                return {
+                    slot: [token + 1, token + 2]
+                    for slot, token in zip(slots, seed_tokens, strict=True)
+                }
+
+        engine._verify_cg = _BatchedVerify()
+        sync = _RaggedSync()
+        draft = _BatchedDraft()
+        engine._batched_sync = sync
+        engine._draft_cg = draft
+        for slot in (0, 1):
+            engine._caches[slot].seq_len = 2
+
+        result = engine.round_batch(
+            [0, 1],
+            {0: 10, 1: 20},
+            {0: [11, 12, 13], 1: [99, 98, 97]},
+        )
+
+        assert result[0]["num_accepted"] == 3
+        assert result[1]["num_accepted"] == 0
+        assert len(sync.calls) == 1
+        slots, tokens, hidden_rows, starts = sync.calls[0]
+        assert slots == [0, 1]
+        assert tokens == [[11, 12, 13, 14], [21]]
+        assert [row.reshape(-1).tolist() for row in hidden_rows] == [
+            [10.0, 11.0, 12.0, 13.0],
+            [20.0],
+        ]
+        assert starts == [0, 0]
+        assert model.mtp_forward_calls == []
+        assert len(draft.calls) == 1
+        draft_slots, seed_tokens, seed_hiddens, draft_starts = draft.calls[0]
+        assert draft_slots == [0, 1]
+        assert seed_tokens == [15, 22]
+        assert seed_hiddens.reshape(-1).tolist() == [115.0, 221.0]
+        assert draft_starts == [4, 1]
+        assert result[0]["next_draft_tokens"] == [15, 16, 17]
+        assert result[1]["next_draft_tokens"] == [22, 23, 24]
+        assert engine.stats["batched_sync_replays"] == 1
+
+    def test_ragged_lengths_fall_back_to_per_slot_sync_when_all_slot_helper_is_missing(
+        self,
+    ) -> None:
+        """Missing ragged support must preserve the old per-slot-correct path."""
+        backend, model = _backend(num_slots=2)
+        backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
+        engine: Qwen36MTPEngine = backend._mtp
+
+        class _BatchedVerify:
+            def replay(self, slots, tokens, past_lens):
+                del slots, past_lens
+                return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+
+        class _LegacyOnly:
+            def replay(self, *args, **kwargs):
+                raise AssertionError("singleton fallback must not try the grouped helper")
+
+        engine._verify_cg = _BatchedVerify()
+        engine._batched_sync = _LegacyOnly()
+        for slot in (0, 1):
+            engine._caches[slot].seq_len = 2
+
+        result = engine.round_batch(
+            [0, 1],
+            {0: 10, 1: 20},
+            {0: [11, 12, 13], 1: [99, 98, 97]},
+        )
+
+        assert result[0]["num_accepted"] == 3
+        assert result[1]["num_accepted"] == 0
+        assert [call["tokens"] for call in model.mtp_forward_calls] == [
+            [11, 12, 13, 14],
+            [21],
+        ]
+        assert engine.stats["batched_sync_replays"] == 0
+
+    def test_multi_slot_round_rejects_a_graph_that_reemits_step0(self) -> None:
+        """Teacher-forced sync owns step 0, so graph replay must return only K-1 tail tokens."""
+        backend, _ = _backend(num_slots=2)
+        backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
+        engine: Qwen36MTPEngine = backend._mtp
+
+        class _BatchedVerify:
+            def replay(self, slots, tokens, past_lens):
+                del slots, past_lens
+                return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+
+        class _TooLongDraft:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list[int], list[int], torch.Tensor, list[int]]] = []
+
+            def replay_batch(self, slots, seed_tokens, seed_hiddens, start_positions):
+                self.calls.append(
+                    (list(slots), list(seed_tokens), seed_hiddens.clone(), list(start_positions))
+                )
+                return {
+                    slot: [token, token + 1, token + 2]
+                    for slot, token in zip(slots, seed_tokens, strict=True)
+                }
+
+        engine._verify_cg = _BatchedVerify()
+        draft = _TooLongDraft()
+        engine._draft_cg = draft
+        for slot in (0, 1):
+            engine._caches[slot].seq_len = 2
+            backend.pool.slot_kv_len[slot] = 7
+            backend.pool.slot_state(slot).num_tokens_seen = 7
+
+        with pytest.raises(RuntimeError, match="expected K-1=2"):
+            engine.round_batch(
+                [0, 1],
+                {0: 10, 1: 20},
+                {0: [11, 12, 13], 1: [21, 22, 23]},
+            )
+
+        assert len(draft.calls) == 1
+        slots, tokens, hiddens, starts = draft.calls[0]
+        assert slots == [0, 1]
+        assert tokens == [15, 25]
+        assert hiddens.reshape(-1).tolist() == [14.0, 24.0]
+        assert starts == [4, 4]
+
+    def test_single_slot_round_uses_the_same_batched_verify_entrypoint(self) -> None:
+        """Historical verify and suffix-sync batches also own the B=1 call."""
+        backend, model = _backend(num_slots=1)
+        backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
+        engine: Qwen36MTPEngine = backend._mtp
+
+        class _BatchedVerify:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list[int], list[list[int]], list[int]]] = []
+
+            def replay(self, slots, tokens, past_lens):
+                self.calls.append((slots, tokens, past_lens))
+                return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+
+        verify = _BatchedVerify()
+
+        class _BatchedSync:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list[int], list[list[int]], torch.Tensor, list[int]]] = []
+
+            def replay_ragged(self, slots, tokens, hidden_rows, starts):
+                hiddens = torch.cat(hidden_rows, dim=0)
+                self.calls.append((list(slots), list(tokens), hiddens.clone(), list(starts)))
+                return torch.tensor([tokens[0][-1] + 1]), hiddens[:, -1:]
+
+        sync = _BatchedSync()
+        engine._verify_cg = verify
+        engine._batched_sync = sync
+        engine._caches[0].seq_len = 2
+        backend.pool.slot_kv_len[0] = 7
+        backend.pool.slot_state(0).num_tokens_seen = 7
+
+        result = backend.mtp_verify_and_commit_batch([0], {0: 10}, {0: [11, 12, 13]})
+
+        assert verify.calls == [([0], [[10, 11, 12, 13]], [7])]
+        assert sync.calls[0][0] == [0]
+        assert sync.calls[0][1] == [[11, 12, 13, 14]]
+        assert model.mtp_forward_calls == []
+        assert result[0]["committed"] == [11, 12, 13, 14]
+        assert engine.stats["verify_graph_replays"] == 1
+        assert engine.stats["batched_verify_replays"] == 0
+        assert engine.stats["batched_sync_replays"] == 1
+        assert engine.stats["batched_sync_slots"] == 1
+
+    def test_immediate_reject_syncs_anchor_and_recovery_before_redraft(self) -> None:
         backend, model = _backend()
         backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
         engine: Qwen36MTPEngine = backend._mtp
 
         anchor_token = 20
         drafts = [99, 98, 97]  # deliberately NOT anchor_argmax (21) at position 0
-        engine._caches[0].seq_len = 3
+        engine._caches[0].seq_len = 2
 
         model.mtp_step_calls.clear()
         result = engine.round(0, anchor_token, drafts)
@@ -335,16 +841,15 @@ class TestPairingFix:
         assert result["next_anchor"] == 21
 
         first_call = model.mtp_step_calls[0]
-        assert first_call["token"] == 21
-        assert first_call["prev_hidden"] == 20.0  # THIS round's own anchor_hidden
-        # The bug this replaces would have re-forwarded new_anchor (21)
-        # through the target and used ITS hidden (21.0) instead.
-        assert first_call["prev_hidden"] != 21.0
+        assert model.mtp_forward_calls[-1] == {
+            "tokens": [21],
+            "hiddens": [20.0],
+            "start_position": 0,
+        }
+        assert first_call["token"] == 22
+        assert first_call["prev_hidden"] == 21.0
 
-    def test_partial_accept_seeds_from_verify_hidden_at_m_minus_1(self) -> None:
-        """m=1 (one accepted, then a mismatch): exercises the general
-        ``verify_hidden[m-1]`` branch with ``m`` strictly between 0 and k.
-        """
+    def test_partial_accept_syncs_accepted_prefix_and_recovery(self) -> None:
         backend, model = _backend()
         backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
         engine: Qwen36MTPEngine = backend._mtp
@@ -354,7 +859,7 @@ class TestPairingFix:
         # verify_hidden[0] (from drafts[0]=31) argmax = 32, but drafts[1]=50
         # does not match -> reject at p=1, m=1.
         drafts = [31, 50, 51]
-        engine._caches[0].seq_len = 3
+        engine._caches[0].seq_len = 2
 
         model.mtp_step_calls.clear()
         result = engine.round(0, anchor_token, drafts)
@@ -364,9 +869,13 @@ class TestPairingFix:
         assert result["next_anchor"] == 32
 
         first_call = model.mtp_step_calls[0]
-        assert first_call["token"] == 32
-        assert first_call["prev_hidden"] == 31.0  # verify_hidden[m-1] = verify_hidden[0]
-        assert first_call["prev_hidden"] != 32.0
+        assert model.mtp_forward_calls[-1] == {
+            "tokens": [31, 32],
+            "hiddens": [30.0, 31.0],
+            "start_position": 0,
+        }
+        assert first_call["token"] == 33
+        assert first_call["prev_hidden"] == 32.0
 
     def test_kv_bookkeeping_matches_committed_ahead_of_kv_by_one(self) -> None:
         """Same invariant DFlash's own round already keeps for Laguna
@@ -380,7 +889,7 @@ class TestPairingFix:
         backend.pool.slot_kv_len[0] = 7
         backend.pool.slot_committed_tokens[0] = [1, 2, 3, 4, 5, 6, 10]
         backend.pool.slot_state(0).num_tokens_seen = 7
-        engine._caches[0].seq_len = 3
+        engine._caches[0].seq_len = 2
 
         result = engine.round(0, 10, [11, 12, 13])
 
@@ -391,14 +900,8 @@ class TestPairingFix:
         )
 
 
-class TestPrefillSeed:
-    def test_draft_after_prefill_seeds_from_last_prompt_position_hidden(self) -> None:
-        """``Qwen36Backend.prefill_chunked_begin`` -> ``draft_after_prefill``:
-        the seed must be the hidden at the LAST prompt position (the one
-        whose argmax IS ``first_token``), not a hidden produced by
-        forwarding ``first_token`` itself (which prefill never even
-        computes -- there is no such value to mistakenly reuse here,
-        unlike the round-to-round case ``TestPairingFix`` covers)."""
+class TestPrefillSync:
+    def test_prefill_teacher_forces_the_whole_prompt_plus_anchor(self) -> None:
         backend, model = _backend()
         backend.enable_mtp(num_speculative_tokens=2, enable_resync=False)
         model.mtp_step_calls.clear()
@@ -408,61 +911,157 @@ class TestPrefillSeed:
         anchor = state.result[0]["anchor"]
         assert anchor == 8  # (7 + 1) % vocab, the stub's own argmax rule
 
+        assert model.mtp_forward_calls == [
+            {"tokens": [6, 7, 8], "hiddens": [5.0, 6.0, 7.0], "start_position": 0}
+        ]
+        engine: Qwen36MTPEngine = backend._mtp
+        assert engine._sync_len[0] == len(prompt)
+        # The final sync row conditions on the anchor and emits draft 0;
+        # only the remaining K-1 drafts have physical cache rows.
+        assert engine._caches[0].seq_len == len(prompt) + engine.k - 1
         first_call = model.mtp_step_calls[0]
-        assert first_call["token"] == anchor
-        assert first_call["prev_hidden"] == 7.0  # hidden at the LAST prompt position
+        assert first_call["token"] == 9
+        assert first_call["prev_hidden"] == 8.0
 
-    def test_draft_after_prefill_requires_a_freshly_reset_slot(self) -> None:
+    def test_sync_rewinds_an_old_speculative_tail_to_the_real_boundary(self) -> None:
+        backend, model = _backend()
+        backend.enable_mtp(num_speculative_tokens=2, enable_resync=False)
+        engine: Qwen36MTPEngine = backend._mtp
+        engine._caches[0].seq_len = 5
+        engine.sync_prefill_chunk(
+            0,
+            shifted_token_ids=[2, 3],
+            target_hidden=torch.tensor([[[1.0], [2.0]]]),
+            final=False,
+        )
+        assert model.mtp_forward_calls[-1]["start_position"] == 0
+        assert engine._sync_len[0] == 2
+        assert engine._caches[0].seq_len == 2
+
+    def test_same_slot_prefix_restore_reinstates_the_mtp_real_boundary(self) -> None:
         backend, _ = _backend()
         backend.enable_mtp(num_speculative_tokens=2, enable_resync=False)
         engine: Qwen36MTPEngine = backend._mtp
-        engine._caches[0].seq_len = 5  # not fresh
-        with pytest.raises(RuntimeError, match="must reset_slot first"):
-            engine.draft_after_prefill(0, first_token=1, pred_hidden=torch.zeros(1, 1, 1))
+        engine._sync_len[0] = 64
+        engine._caches[0].seq_len = 65  # one K-1 continuation row
+
+        engine.preserve_prefix(0, 64)
+        engine.reset_slot(0)
+        assert engine.can_restore_prefix(0, 64)
+
+        engine.restore_prefix(0, 64)
+        assert engine._sync_len[0] == 64
+        assert engine._caches[0].seq_len == 64
+
+    def test_cross_slot_prefix_copy_moves_mtp_kv_without_aliasing_source(self) -> None:
+        # Keep this at the MTP-engine boundary rather than relying only on
+        # Qwen36Backend's facade: a future cache-layout change can otherwise
+        # leave target/GDN copies correct while the MTP causal context stays
+        # stale.  The non-contiguous tables mirror pooled CUDA-graph storage.
+        engine = Qwen36MTPEngine.__new__(Qwen36MTPEngine)
+        source = SimpleNamespace(
+            page_size=128,
+            page_table=torch.tensor([[1, 0]], dtype=torch.int32),
+            k_cache=torch.zeros(4, 128, 1, 1),
+            v_cache=torch.zeros(4, 128, 1, 1),
+            seq_len=0,
+        )
+        target = SimpleNamespace(
+            page_size=128,
+            page_table=torch.tensor([[3, 2]], dtype=torch.int32),
+            k_cache=torch.zeros(4, 128, 1, 1),
+            v_cache=torch.zeros(4, 128, 1, 1),
+            seq_len=0,
+        )
+        source.k_cache[1].fill_(5.0)
+        source.k_cache[0].fill_(6.0)
+        source.v_cache[1].fill_(7.0)
+        source.v_cache[0].fill_(8.0)
+        engine._caches = [source, target]
+        engine._cached_prefix_sync_len = [129, 0]
+        engine._sync_len = [0, 0]
+        engine._spec_rows = None
+        engine._spec_state_col = [0, 0]
+
+        engine.copy_prefix(0, 1, 129)
+
+        assert torch.all(target.k_cache[3] == 5.0)
+        assert torch.all(target.k_cache[2] == 6.0)
+        assert torch.all(target.v_cache[3] == 7.0)
+        assert torch.all(target.v_cache[2] == 8.0)
+        target.k_cache[3].fill_(9.0)
+        assert torch.all(source.k_cache[1] == 5.0)
+        assert engine._sync_len[1] == 129
+        assert target.seq_len == 129
+
+    def test_scratch_prefix_snapshot_restores_mtp_context_after_source_reuse(self) -> None:
+        engine = Qwen36MTPEngine.__new__(Qwen36MTPEngine)
+        caches = [
+            SimpleNamespace(
+                page_size=128,
+                page_table=torch.tensor([[0, 1]], dtype=torch.int32),
+                k_cache=torch.zeros(2, 128, 1, 1),
+                v_cache=torch.zeros(2, 128, 1, 1),
+                seq_len=0,
+            )
+            for _ in range(3)
+        ]
+        caches[0].k_cache[0].fill_(5.0)
+        caches[0].k_cache[1].fill_(6.0)
+        caches[0].v_cache[0].fill_(7.0)
+        caches[0].v_cache[1].fill_(8.0)
+        engine._caches = caches
+        engine.device = torch.device("cpu")
+        engine.scratch_row = 2
+        engine.mtp_page_size = 128
+        engine._sync_len = [129, 0]
+        engine._cached_prefix_sync_len = [0, 0]
+        engine._spec_rows = None
+        engine._spec_state_col = [0, 0]
+
+        assert engine.snapshot_prefix_to_scratch(0, 129)
+        caches[0].k_cache[0].zero_()
+        assert engine.restore_prefix_from_scratch(1, 129)
+        assert torch.all(caches[1].k_cache[0] == 5.0)
+        assert torch.all(caches[1].k_cache[1] == 6.0)
+        assert torch.all(caches[1].v_cache[0] == 7.0)
+        assert torch.all(caches[1].v_cache[1] == 8.0)
+        assert engine._sync_len[1] == 129
 
 
-class TestResync:
-    """QSR_SERVER_MTP_RESYNC (default off): re-grounds the m-1 interior
-    accepted positions with real verify_hidden. Indexing-only test (the
-    stub cannot say anything about whether this improves acceptance on
-    real weights -- that is a GPU/A-B question the coordinator schedules
-    separately)."""
+class TestHistoricalSync:
+    """Every round synchronises the full accepted suffix; no optional
+    interior-only repair is needed for the real-prefix state contract."""
 
     def test_resync_off_by_default_does_not_call_mtp_resync_step(self) -> None:
         backend, model = _backend()
         backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
         engine: Qwen36MTPEngine = backend._mtp
-        engine._caches[0].seq_len = 3
+        engine._caches[0].seq_len = 2
         engine.round(0, 10, [11, 12, 13])
         assert model.mtp_resync_calls == []
+        assert model.mtp_forward_calls[-1]["tokens"] == [11, 12, 13, 14]
 
-    def test_resync_on_rewrites_interior_positions_with_shifted_pairing(self) -> None:
+    def test_sync_preserves_a_nonzero_real_prefix_boundary(self) -> None:
         backend, model = _backend()
-        backend.enable_mtp(num_speculative_tokens=3, enable_resync=True)
+        backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
         engine: Qwen36MTPEngine = backend._mtp
-        round_mtp_start = 5
-        engine._caches[0].seq_len = round_mtp_start + 3  # as if 3 draft steps already ran
+        engine._sync_len[0] = 5
+        engine._caches[0].seq_len = 7
 
         result = engine.round(0, 10, [11, 12, 13])
-        assert result["num_accepted"] == 3  # m=3 >= 2, resync should have fired
+        assert result["num_accepted"] == 3
+        assert model.mtp_forward_calls[-1]["start_position"] == 5
+        assert engine._sync_len[0] == 9
 
-        assert len(model.mtp_resync_calls) == 1
-        call = model.mtp_resync_calls[0]
-        # drafts[1:m] = drafts[1:3] = [12, 13]; verify_hidden[0:m-1] =
-        # verify_hidden[0:2], whose values equal drafts[0:2] = [11, 12]
-        # under this stub's convention (hidden(token) == token).
-        assert call["tokens"] == [12, 13]
-        assert call["hiddens"] == [11.0, 12.0]
-        assert call["start_pos"] == round_mtp_start + 1
-
-    def test_resync_does_not_fire_for_m_below_2(self) -> None:
+    def test_partial_accept_still_uses_full_sync_without_legacy_resync(self) -> None:
         backend, model = _backend()
-        backend.enable_mtp(num_speculative_tokens=3, enable_resync=True)
+        backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
         engine: Qwen36MTPEngine = backend._mtp
-        engine._caches[0].seq_len = 3
-        # m=1 case from TestPairingFix.
+        engine._caches[0].seq_len = 2
         engine.round(0, 30, [31, 50, 51])
         assert model.mtp_resync_calls == []
+        assert model.mtp_forward_calls[-1]["tokens"] == [31, 32]
 
 
 class TestSampledRoundStaysCorrect:
@@ -482,7 +1081,7 @@ class TestSampledRoundStaysCorrect:
         backend, _ = _backend()
         backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
         engine: Qwen36MTPEngine = backend._mtp
-        engine._caches[0].seq_len = 3
+        engine._caches[0].seq_len = 2
         params = SamplingParams(temperature=1.0, seed=0)
 
         result = engine.round(0, 10, [11, 12, 13], params=params)
@@ -494,48 +1093,21 @@ class TestSampledRoundStaysCorrect:
 
 
 class TestResyncFlagRefusesWithoutAnImplementation:
-    """`QSR_SERVER_MTP_RESYNC=1` used to be a flag that could only crash.
-
-    `Qwen36MTPEngine._resync` calls `self.model.mtp_resync_step(...)`. On the
-    real model that method does not exist -- it was written only on the
-    unmerged branch `work/mtp-resync-20260802` (@ aed0e2d). So setting the flag
-    brought the server up normally, answered requests, and then raised
-    AttributeError partway through the first round that accepted more than one
-    draft token: as far from the cause as a failure can get, on a path a
-    startup config flag had opted into.
-
-    Note the stub in this file DOES define `mtp_resync_step`, which is exactly
-    why nothing here caught it -- every other test in this file constructs the
-    engine against a model more capable than the real one. These tests use a
-    model without the method, i.e. the shape production actually has.
-
-    The engine now refuses at construction. That is the right trade for a flag
-    with no implementation behind it: porting it means ~166 lines that also
-    reimplement `mtp_step` in terms of themselves, on the MTP hot path, for an
-    optimization with no A/B measurement behind it.
-    """
+    """`QSR_SERVER_MTP_RESYNC` is retired now that every committed suffix is teacher-forced."""
 
     def _engine(self, *, enable_resync: bool) -> Qwen36MTPEngine:
         backend, _ = _backend()
         backend.model.mtp = object()
         return Qwen36MTPEngine(backend, num_speculative_tokens=4, enable_resync=enable_resync)
 
-    def test_it_refuses_when_the_model_cannot_resync(self):
-        """The real model has no `mtp_resync_step`; the stub in this file does,
-        which is precisely why nothing here caught the flag being unusable."""
-        saved = _StubMTPModel.mtp_resync_step
-        try:
-            del _StubMTPModel.mtp_resync_step  # type: ignore[attr-defined]
-            with pytest.raises(RuntimeError, match="mtp_resync_step"):
-                self._engine(enable_resync=True)
-        finally:
-            _StubMTPModel.mtp_resync_step = saved  # type: ignore[attr-defined]
+    def test_it_refuses_when_resync_is_requested(self) -> None:
+        with pytest.raises(ValueError, match="retired"):
+            self._engine(enable_resync=True)
 
-    def test_the_default_path_is_unaffected(self):
-        """Resync off must construct exactly as before -- the guard is scoped."""
-        self._engine(enable_resync=False)
+    def test_the_default_path_is_unaffected(self) -> None:
+        engine = self._engine(enable_resync=False)
+        assert engine.enable_resync is False
 
-    def test_a_model_that_can_resync_is_accepted(self):
-        """The guard checks capability, not a version string, so a real port of
-        `mtp_resync_step` turns the flag on without touching this code."""
-        self._engine(enable_resync=True)
+    def test_retirement_is_independent_of_model_capability(self) -> None:
+        with pytest.raises(ValueError, match="teacher-forces every newly committed target suffix"):
+            self._engine(enable_resync=True)

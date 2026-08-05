@@ -607,18 +607,12 @@ class ServerEngine:
         real recurrent state, and a recurrent state left behind is read by
         the next sequence rather than ignored (B0-5).
         ``capture_decode_cuda_graph`` zeroes every slot on the way out for
-        exactly that reason. MTP is wired AFTER capture, for the identical
-        reason DFlash is wired after Laguna's own capture call
-        (``_load_laguna_model`` below) -- capture must run while every slot
-        is still definitionally empty, and MTP's own per-slot draft cache
-        allocation has nothing to do with the decode CUDA graph at all (MTP
-        rounds never go through ``decode_batch_sampled``/the captured
-        graph -- ``classify_decode_slots`` routes them to
-        ``mtp_verify_and_commit_batch`` instead, the same split DFlash+
-        Laguna's decode CG already established), so the two features do not
-        interact and this ordering is not load-bearing for correctness, only
-        for keeping the "capture before real slot use" invariant obviously
-        true by inspection.
+        exactly that reason. Qwen3.6 MTP is wired BEFORE capture: its
+        historical K+1 GDN rows extend the same pooled storage and column
+        zero must alias the ordinary prefill/decode row. Capturing first
+        would bake the old state addresses into the decode graph. Both MTP's
+        own graphs and the ordinary decode graphs therefore still capture
+        while every slot is definitionally empty.
         """
         import torch  # local: this module stays importable without torch
 
@@ -688,6 +682,21 @@ class ServerEngine:
             enable_prefix_cache=self.enable_prefix_cache,
         )
         self._warmup_qwen36_full_forward()
+        # MTP extends the shared GDN state allocation so its column zero is
+        # the exact ordinary decode/prefill row.  This must precede decode
+        # CUDA Graph capture: a graph captured against the pre-MTP pool would
+        # retain stale recurrent-state addresses after the extension.
+        if self.enable_mtp:
+            self.runner.enable_mtp(
+                num_speculative_tokens=self.mtp_num_speculative_tokens,
+                enable_resync=self.mtp_resync,
+            )
+            logger.info(
+                "Qwen3.6 MTP speculative decode wired: K=%d, resync=%s, cg_status=%s",
+                self.mtp_num_speculative_tokens,
+                self.runner._mtp.enable_resync,  # noqa: SLF001 -- log-only introspection
+                self.runner._mtp.cg_status,  # noqa: SLF001 -- log-only introspection
+            )
         if self._enable_cudagraph:
             graph_batch_size = self.runner.capture_decode_cuda_graph()
             if graph_batch_size is not None:
@@ -700,23 +709,6 @@ class ServerEngine:
                     "Qwen3.6 decode CUDA Graph capture failed or unavailable; "
                     "falling back to eager batched decode"
                 )
-        if self.enable_mtp:
-            self.runner.enable_mtp(
-                num_speculative_tokens=self.mtp_num_speculative_tokens,
-                enable_resync=self.mtp_resync,
-            )
-            logger.info(
-                "Qwen3.6 MTP speculative decode wired: K=%d, resync=%s, cg_status=%s",
-                self.mtp_num_speculative_tokens,
-                self.runner._mtp.enable_resync,  # noqa: SLF001 -- log-only introspection
-                # 2026-08-03 CUDA-Graph follow-up: this is the ONLY log line
-                # that would ever surface a degraded (eager-fallback) anchor
-                # or draft graph -- see runtime.backends.qwen36_mtp_cudagraph's
-                # module docstring on why silent degradation is exactly the
-                # failure mode to avoid here (same lesson as C7-2/the w4a16
-                # scratch bug).
-                self.runner._mtp.cg_status,  # noqa: SLF001 -- log-only introspection
-            )
         logger.info(
             "Qwen3.6 model loaded on engine thread: num_slots=%d max_context=%d tokens/slot, "
             "recurrent state %.1f MiB/slot, KV %.1f MiB/slot",

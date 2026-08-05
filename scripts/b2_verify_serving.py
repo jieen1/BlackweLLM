@@ -32,6 +32,11 @@ Plus a throughput measurement for the concurrency claim, because "并发 >= 2"
 with no number attached is not a result.
 
 Run: ~/.venvs/vllm/bin/python scripts/b2_verify_serving.py [--slots N]
+
+``--uniform-prefill`` additionally makes the first two B2 prompts equal in
+length but different in their final token.  That is the exact shape required
+to exercise the production B×Q prefill fast path; ordinary serving remains
+ragged and intentionally uses the serial fallback today.
 """
 
 from __future__ import annotations
@@ -243,6 +248,12 @@ def check_concurrency(model, prompts, steps, args) -> None:
     params = SamplingParams()
     slots = list(range(len(use)))
     state = backend.prefill_chunked_begin(slots, list(use))
+    if args.uniform_prefill:
+        record(
+            "uniform multi-slot prefill used one B×Q forward",
+            backend.stats["prefill_batched_forwards"] == 1,
+            f"forwards={backend.stats['prefill_batched_forwards']}",
+        )
     cur = [state.result[s]["anchor"] for s in slots]
     together = [[t] for t in cur]
     step_times = []
@@ -340,6 +351,35 @@ def check_prefix_cache(model, prompts, steps, args, tokenizer) -> None:
         same,
         "" if same else f"first divergence at step {first_div}",
     )
+    if args.slots >= 2:
+        # A retained source must be reusable by a different fresh slot before
+        # either request writes its suffix.  This is deliberately a single
+        # process / single model instance: duplicating the service would hide
+        # allocator ownership bugs and exceed the shared-card budget.
+        backend.reset_slot(0)
+        remote_hit = backend.reconcile_prefix_hit(follow_up)
+        remote = backend.prefill_chunked_begin([1], [follow_up]).result[1]["anchor"]
+        remote_tokens = [remote]
+        tok = remote
+        for _ in range(steps):
+            tok = backend.decode_batch_sampled(
+                [1], [tok], [backend.slot_state(1).kv_len], [params]
+            )[0]
+            remote_tokens.append(tok)
+        record(
+            "cross-slot prefix resume == cold B1 eager",
+            remote_hit.effective > 0 and remote_tokens == cold_ref,
+            (
+                ""
+                if remote_tokens == cold_ref
+                else f"kv_hit={remote_hit.kv_hit} state_hit={remote_hit.state_hit}"
+            ),
+        )
+        record(
+            "cross-slot prefix path performed one restore",
+            backend.stats["prefix_cross_slot_restores"] == 1,
+            f"restores={backend.stats['prefix_cross_slot_restores']}",
+        )
     print(f"  stats: {backend.stats}")
     _ = tokenizer
     return backend
@@ -406,6 +446,10 @@ def check_cuda_graph(model, prompts, steps, args) -> None:
             same,
             "" if same else f"first divergence at step {first_div}",
         )
+    # Same captured backend, prompt, slot and timing discipline as the
+    # ordinary serving path.  Keeping this beside the graph correctness
+    # gate makes the non-MTP control available without a second model load.
+    check_solo_throughput(backend, prompts, steps)
     print(f"  graph replays used: {backend.stats['decode_graph_replays']}")
     return backend
 
@@ -427,6 +471,11 @@ def main() -> None:
         default="",
         help="comma-separated subset of: serial,batched,concurrency,graph,prefix",
     )
+    ap.add_argument(
+        "--uniform-prefill",
+        action="store_true",
+        help="make the first two B2 prompts same-length to exercise B×Q prefill",
+    )
     ap.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
     args = ap.parse_args()
     only = {s for s in args.only.split(",") if s}
@@ -436,6 +485,14 @@ def main() -> None:
     print("model_path:", model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     prompts = [tokenizer(p).input_ids for p in PROMPTS]
+    if args.uniform_prefill:
+        if args.slots < 2:
+            ap.error("--uniform-prefill requires --slots >= 2")
+        # Keep one prompt meaningfully different without adding a new token
+        # dependency.  The ids are only a serving equivalence fixture.
+        variant = list(prompts[0])
+        variant[-1] = (variant[-1] + 1) % tokenizer.vocab_size
+        prompts[1] = variant
     print("prompt lengths:", [len(p) for p in prompts])
 
     t0 = time.time()

@@ -201,18 +201,165 @@ class TestSpecRowAddressing:
                 recurrent_state=torch.zeros_like(source.recurrent_state),
                 has_previous_state=False,
             )
-            for _ in range(hidden.shape[1] + 1)
+            for _ in range(hidden.shape[1])
         ]
-        rows[0].conv_state.copy_(source.conv_state)
-        rows[0].recurrent_state.copy_(source.recurrent_state)
-        rows[0].has_previous_state = True
         row_output, row_snapshots = layer.spec_forward(hidden, source, spec_state_rows=rows)
 
         assert row_snapshots is None
         assert torch.equal(row_output, snapshot_output)
-        assert torch.equal(source.conv_state, rows[0].conv_state)
-        assert torch.equal(source.recurrent_state, rows[0].recurrent_state)
-        for row, expected in zip(rows, snapshots, strict=True):
+        for row, expected in zip(rows, snapshots[1:], strict=True):
             assert torch.equal(row.conv_state, expected.conv_state)
             assert torch.equal(row.recurrent_state, expected.recurrent_state)
             assert row.has_previous_state == expected.has_previous_state
+
+        batched_snapshot_output, batched_snapshots = layer.spec_forward(
+            hidden, source, batch_large_projections=True
+        )
+        assert batched_snapshots is not None
+        batched_rows = [
+            GdnLayerState(
+                conv_state=torch.zeros_like(source.conv_state),
+                recurrent_state=torch.zeros_like(source.recurrent_state),
+                has_previous_state=False,
+            )
+            for _ in range(hidden.shape[1])
+        ]
+        batched_row_output, batched_row_snapshots = layer.spec_forward(
+            hidden,
+            source,
+            spec_state_rows=batched_rows,
+            batch_large_projections=True,
+        )
+
+        assert batched_row_snapshots is None
+        assert torch.equal(batched_row_output, batched_snapshot_output)
+        for row, expected in zip(batched_rows, batched_snapshots[1:], strict=True):
+            assert torch.equal(row.conv_state, expected.conv_state)
+            assert torch.equal(row.recurrent_state, expected.recurrent_state)
+            assert row.has_previous_state == expected.has_previous_state
+
+    def test_batch_rows_keep_verify_requests_disjoint(self, monkeypatch) -> None:
+        """M-2 writes each request's candidate states to its own rows."""
+        config = {
+            "hidden_size": 4,
+            "linear_num_value_heads": 2,
+            "linear_num_key_heads": 1,
+            "linear_key_head_dim": 2,
+            "linear_value_head_dim": 2,
+            "linear_conv_kernel_dim": 3,
+            "rms_norm_eps": 1e-6,
+            "hidden_act": "silu",
+        }
+        layer = Qwen36GatedDeltaNet(config, layer_idx=0, quantized={}).float()
+        gen = torch.Generator().manual_seed(11)
+        with torch.no_grad():
+            for param in layer.parameters():
+                param.copy_(torch.empty_like(param).uniform_(-0.5, 0.5, generator=gen))
+
+        source = layer.new_state(batch=2, device=torch.device("cpu"), dtype=torch.float32)
+        source.conv_state.copy_(
+            torch.arange(source.conv_state.numel()).reshape_as(source.conv_state)
+        )
+        source.recurrent_state.copy_(
+            torch.arange(source.recurrent_state.numel()).reshape_as(source.recurrent_state)
+        )
+        source.has_previous_state = True
+        hidden = torch.randn(2, 3, config["hidden_size"])
+
+        def fake_recurrent(query, key, value, *, initial_state, **kwargs):
+            del query, key, kwargs
+            last_state = initial_state + value[:, 0].unsqueeze(1)
+            return value, last_state
+
+        monkeypatch.setattr(qwen36_model_module, "fused_recurrent_gated_delta_rule", fake_recurrent)
+        expected_output = torch.cat(
+            [
+                layer.spec_forward(
+                    hidden[request : request + 1],
+                    GdnLayerState(
+                        conv_state=source.conv_state[request : request + 1],
+                        recurrent_state=source.recurrent_state[request : request + 1],
+                        has_previous_state=True,
+                    ),
+                )[0]
+                for request in range(hidden.shape[0])
+            ],
+            dim=0,
+        )
+        rows = [
+            [
+                GdnLayerState(
+                    conv_state=torch.zeros_like(source.conv_state[:1]),
+                    recurrent_state=torch.zeros_like(source.recurrent_state[:1]),
+                    has_previous_state=False,
+                )
+                for _ in range(hidden.shape[1])
+            ]
+            for _ in range(hidden.shape[0])
+        ]
+
+        output, snapshots = layer.spec_forward(hidden, source, spec_state_rows=rows)
+
+        assert snapshots is None
+        assert torch.equal(output, expected_output)
+        assert not torch.equal(rows[0][-1].recurrent_state, rows[1][-1].recurrent_state)
+
+    def test_indexed_rows_match_snapshot_oracle_with_permuted_destinations(
+        self, monkeypatch
+    ) -> None:
+        """The graph-safe indexed write path must not depend on row order."""
+        config = {
+            "hidden_size": 4,
+            "linear_num_value_heads": 2,
+            "linear_num_key_heads": 1,
+            "linear_key_head_dim": 2,
+            "linear_value_head_dim": 2,
+            "linear_conv_kernel_dim": 3,
+            "rms_norm_eps": 1e-6,
+            "hidden_act": "silu",
+        }
+        layer = Qwen36GatedDeltaNet(config, layer_idx=0, quantized={}).float()
+        gen = torch.Generator().manual_seed(19)
+        with torch.no_grad():
+            for param in layer.parameters():
+                param.copy_(torch.empty_like(param).uniform_(-0.5, 0.5, generator=gen))
+        source = layer.new_state(batch=1, device=torch.device("cpu"), dtype=torch.float32)
+        source.conv_state.fill_(0.25)
+        source.recurrent_state.fill_(0.5)
+        source.has_previous_state = True
+        hidden = torch.randn(1, 3, config["hidden_size"])
+
+        def fake_recurrent(query, key, value, *, initial_state, **kwargs):
+            del query, key, kwargs
+            last_state = initial_state + value[:, 0].unsqueeze(1)
+            return value, last_state
+
+        monkeypatch.setattr(qwen36_model_module, "fused_recurrent_gated_delta_rule", fake_recurrent)
+        expected_output, snapshots = layer.spec_forward(hidden, source)
+        assert snapshots is not None
+
+        destination = torch.tensor([[4, 1, 3]], dtype=torch.long)
+        conv_pool = torch.full((5, *source.conv_state.shape[1:]), -7.0)
+        recurrent_pool = torch.full((5, *source.recurrent_state.shape[1:]), -11.0)
+        output, returned_snapshots = layer.spec_forward(
+            hidden,
+            source,
+            spec_destination_index=destination,
+            spec_conv_pool=conv_pool,
+            spec_recurrent_pool=recurrent_pool,
+        )
+
+        assert returned_snapshots is None
+        assert torch.equal(output, expected_output)
+        for step, destination_row in enumerate(destination[0].tolist(), start=1):
+            assert torch.equal(
+                conv_pool[destination_row : destination_row + 1], snapshots[step].conv_state
+            )
+            assert torch.equal(
+                recurrent_pool[destination_row : destination_row + 1],
+                snapshots[step].recurrent_state,
+            )
+        assert torch.all(conv_pool[0] == -7.0)
+        assert torch.all(conv_pool[2] == -7.0)
+        assert torch.all(recurrent_pool[0] == -11.0)
+        assert torch.all(recurrent_pool[2] == -11.0)

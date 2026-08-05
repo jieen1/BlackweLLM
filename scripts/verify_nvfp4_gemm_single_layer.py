@@ -263,7 +263,8 @@ def main() -> None:
     print(f"=== layer {args.layer} MLP (fused gate/up/down_proj) ===")
     mlp, hidden_size, intermediate_size = build_mlp(ckpt, args.layer)
     print(f"  hidden_size={hidden_size} intermediate_size={intermediate_size}")
-    for m in (1, 2, 8, 32, 128, 512):
+    # M=4 is Qwen3.6's MTP target verify shape: anchor plus K=3 drafts.
+    for m in (1, 2, 4, 8, 32, 128, 512):
         run_case(mlp, hidden_size, m, seed=1234 + m)
     del mlp
     torch.cuda.empty_cache()

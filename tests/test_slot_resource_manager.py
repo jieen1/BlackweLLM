@@ -164,6 +164,17 @@ class _FakeTwoFamilyBackend(_FakeBackend):
         return best
 
 
+class _FakeCrossSlotBackend(_FakeTwoFamilyBackend):
+    def __init__(self, marker: str, per_slot: dict[int, tuple[int, int]], remote: tuple[int, int]):
+        super().__init__(marker, per_slot)
+        self._remote = remote
+        self.cross_slot_calls: list[list[int]] = []
+
+    def cross_slot_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
+        self.cross_slot_calls.append(list(token_ids))
+        return PrefixHit(kv_hit=self._remote[0], state_hit=self._remote[1])
+
+
 class TestSecondCacheFamily:
     """§7 row 7-h, landed by Track B / B2: the branch that used to raise.
 
@@ -211,6 +222,18 @@ class TestSecondCacheFamily:
         with pytest.raises(NotImplementedError, match="prefix_hit_for_slot"):
             mgr.find_best_slot_for_prompt([1, 2, 3], [0, 1])
         assert backend.find_best_slot_calls == []
+
+    def test_cross_slot_copy_is_only_considered_after_same_slot_affinity(self) -> None:
+        backend = _FakeCrossSlotBackend("q", {0: (0, 0), 1: (128, 128)}, (64, 64))
+        mgr = SlotResourceManager(backend, _spec(needs_two_cache_families=True), block_size=64)
+        assert mgr.find_best_slot_for_prompt([1, 2, 3], [0, 1]) == (1, 128)
+        assert backend.cross_slot_calls == []
+
+    def test_cross_slot_copy_can_fan_out_after_the_source_is_reserved(self) -> None:
+        backend = _FakeCrossSlotBackend("q", {0: (0, 0), 1: (0, 0)}, (64, 64))
+        mgr = SlotResourceManager(backend, _spec(needs_two_cache_families=True), block_size=64)
+        assert mgr.find_best_slot_for_prompt([1, 2, 3], [0]) == (0, 64)
+        assert backend.cross_slot_calls == [[1, 2, 3]]
 
     def test_no_free_slots_is_a_value_error_not_an_index_error(self) -> None:
         backend = _FakeTwoFamilyBackend("q", {0: (0, 0)})
@@ -298,9 +321,7 @@ class TestAdmissionUnderPressure:
 
     def test_many_interleaved_calls_stay_correct(self) -> None:
         backends = [_FakeBackend(f"backend-{i}") for i in range(4)]
-        managers = [
-            SlotResourceManager(b, _spec(needs_two_cache_families=False)) for b in backends
-        ]
+        managers = [SlotResourceManager(b, _spec(needs_two_cache_families=False)) for b in backends]
 
         for round_num in range(200):
             idx = round_num % len(managers)

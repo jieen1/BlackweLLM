@@ -142,9 +142,7 @@ class SlotResourceManager:
             return self._backend.find_best_slot_for_prompt(token_ids, free_slots)
         per_slot = getattr(self._backend, "prefix_hit_for_slot", None)
         if per_slot is None:
-            raise NotImplementedError(
-                _MISSING_PER_SLOT.format(cls=type(self._backend).__name__)
-            )
+            raise NotImplementedError(_MISSING_PER_SLOT.format(cls=type(self._backend).__name__))
         if not free_slots:
             raise ValueError("find_best_slot_for_prompt requires at least one free slot")
         best_slot = free_slots[0]
@@ -158,6 +156,22 @@ class SlotResourceManager:
             if (hit.effective, hit.kv_hit) > (best.effective, best.kv_hit):
                 best = hit
                 best_slot = slot
+        if best.effective > 0:
+            return best_slot, best.effective
+
+        # Qwen3.6's fixed-slot backend can clone an idle retained prefix into
+        # another destination.  Keep this optional surface out of the common
+        # backend protocol: the ordinary per-slot query above remains the
+        # compatibility contract, while a backend that owns a safe D2D copy
+        # path may expose this extra candidate after no same-slot affinity is
+        # available.  This exact ordering matters for duplicate admissions:
+        # request one reserves the warm source locally; request two then fans
+        # out from it before either prefill writes a page.
+        cross_slot = getattr(self._backend, "cross_slot_prefix_hit", None)
+        if cross_slot is not None:
+            remote = self._aligned(cross_slot(token_ids))
+            if remote.effective > 0:
+                return free_slots[0], remote.effective
         return best_slot, best.effective
 
     def _aligned(self, hit: PrefixHit) -> PrefixHit:

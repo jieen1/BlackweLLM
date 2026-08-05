@@ -41,6 +41,8 @@ of keeping kernel-touching proofs out of the CPU suite.
 
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -52,6 +54,9 @@ pytest.importorskip("fla")
 pytest.importorskip("sparkinfer")
 
 from runtime.backends.qwen36_mtp_cudagraph import (  # noqa: E402
+    Qwen36MTPBatchedSync,
+    Qwen36MTPDraftCudaGraph,
+    Qwen36MTPVerifyCudaGraph,
     attempt_mtp_cg_capture,
     decode_write_index,
 )
@@ -147,3 +152,28 @@ class TestAttemptMtpCgCapture:
         status = attempt_mtp_cg_capture("verify", _boom, strict=False)
         assert status == "failed"
         assert any("verify" in record.message for record in caplog.records)
+
+
+class TestReplayFillDiscipline:
+    """Hot-path replay helpers should keep reusing their static staging buffers."""
+
+    def test_fill_paths_use_cached_host_views_instead_of_per_call_numpy_lookups(self) -> None:
+        sources = (
+            inspect.getsource(Qwen36MTPVerifyCudaGraph._fill),
+            inspect.getsource(Qwen36MTPDraftCudaGraph._fill),
+            inspect.getsource(Qwen36MTPBatchedSync._fill),
+            inspect.getsource(Qwen36MTPBatchedSync._fill_ragged),
+            inspect.getsource(Qwen36MTPBatchedSync._fill_verify_ragged),
+        )
+        for source in sources:
+            assert ".numpy()" not in source
+
+    def test_step_loops_reuse_graph_owned_cache_seqlens_buffer(self) -> None:
+        sources = (
+            inspect.getsource(Qwen36MTPDraftCudaGraph._forward_all_steps),
+            inspect.getsource(Qwen36MTPBatchedSync._forward_all_steps),
+        )
+        for source in sources:
+            assert ".to(torch.int32)" not in source
+            assert "cache_seqlens.copy_(start_pos)" in source
+            assert "cache_seqlens.add_(1)" in source

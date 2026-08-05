@@ -43,6 +43,7 @@ manually, one shot, under /tmp/gpu_lock.sh, same convention as
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,24 +82,45 @@ import sparkinfer  # noqa: E402
 # decode's direct-topk path -- same contract tests/test_w4a16_scratch_contract.py
 # pins, restated here because this script runs outside pytest.
 from sparkinfer.moe._shared.kernels.w4a16.host import (  # noqa: E402
-    max_packed_route_slots,
+    packed_gemm_scratch_elements,
     plan_w4a16_buffers,
 )
 
+_probe_prepared = SimpleNamespace(
+    num_experts=1,
+    hidden_size=5120,
+    intermediate_size=17408,
+    is_gated=True,
+)
 _probe_plan = plan_w4a16_buffers(
-    SimpleNamespace(num_experts=1, hidden_size=5120, intermediate_size=17408, is_gated=True),
+    _probe_prepared,
     m=2,
     topk=1,
     route_num_experts=1,
     sms=128,
 )
-assert _probe_plan.route_slots >= 2 * 1 * _probe_plan.block_size_m, (
-    f"sparkinfer at {sparkinfer.__file__} sizes w4a16 scratch for the packed "
-    f"route path only (route_slots={_probe_plan.route_slots}, packed bound="
-    f"{max_packed_route_slots(2, _probe_plan.block_size_m, 1)}), so decode's "
-    f"direct-topk path needs {2 * _probe_plan.block_size_m} and CUDA Graph "
-    "capture of Qwen36MLP will fail -- this checkout predates the scratch "
-    "union fix (sparkinfer 8242340). Point BF_SPARKINFER_PATH at a fixed one."
+_probe_direct_slots = 2 * _probe_plan.block_size_m
+_probe_fc1_needed = packed_gemm_scratch_elements(
+    size_n=2 * _probe_prepared.intermediate_size,
+    route_slots=_probe_direct_slots,
+    moe_block_size=_probe_plan.block_size_m,
+    sms=128,
+)
+_probe_fc2_needed = packed_gemm_scratch_elements(
+    size_n=_probe_prepared.hidden_size,
+    route_slots=_probe_direct_slots,
+    moe_block_size=_probe_plan.block_size_m,
+    sms=128,
+)
+_probe_scratch_covers_direct = (
+    _probe_plan.fc1_c_tmp_elements >= _probe_fc1_needed
+    and _probe_plan.fc2_c_tmp_elements >= _probe_fc2_needed
+)
+assert _probe_scratch_covers_direct, (
+    f"sparkinfer at {sparkinfer.__file__} does not size W4A16 c_tmp scratch "
+    f"for direct-topk decode (fc1={_probe_plan.fc1_c_tmp_elements}/"
+    f"{_probe_fc1_needed}, fc2={_probe_plan.fc2_c_tmp_elements}/"
+    f"{_probe_fc2_needed}); this checkout predates scratch-union fix 8242340."
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -121,6 +143,17 @@ def fused_forward_no_workaround(mlp, x: torch.Tensor) -> torch.Tensor:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--rows",
+        type=int,
+        default=2,
+        help="static decode rows to capture (MTP target verify is anchor + K = 4)",
+    )
+    args = parser.parse_args()
+    if args.rows < 1:
+        parser.error("--rows must be positive")
+
     ckpt = _find_ckpt(DEFAULT_CKPT_GLOB)
     print(f"checkpoint: {ckpt}")
     print(f"=== layer {LAYER} MLP (fused gate/up/down_proj) ===")
@@ -128,8 +161,9 @@ def main() -> None:
     mlp._ensure_w4a16_fused_ready()
     print(f"  hidden_size={hidden_size} intermediate_size={intermediate_size}")
 
-    # The exact production repro shape (notes/2026-08-03-std-model-serving-acceptance.md).
-    decode_m = 2
+    # M=2 is the historical scratch repro; M=4 is Qwen's target verify
+    # shape (anchor plus K=3 drafted continuations).
+    decode_m = args.rows
     torch.manual_seed(20260803)
     x = (
         torch.randn(decode_m, hidden_size, device=DEVICE, dtype=torch.bfloat16) * 0.02

@@ -61,11 +61,13 @@ from runtime.model.qwen36_model import (
     _PAGED_ATTENTION_PAGE_SIZE,
     GdnLayerState,
     Qwen36BatchedDecodeAttention,
+    Qwen36BatchedExtendAttention,
     Qwen36DecodeBatch,
     Qwen36DecodeGraphAttention,
     Qwen36ForCausalLMSelfBuilt,
     Qwen36GenerationState,
     Qwen36PagedAttentionCache,
+    Qwen36PrefillBatch,
 )
 
 
@@ -154,6 +156,10 @@ class Qwen36SlotPool:
         #: the eager one for a batch size only once its graph is captured.
         self.decode_attn: dict[int, Qwen36BatchedDecodeAttention] = {}
         self.graph_attn: dict[int, Qwen36DecodeGraphAttention] = {}
+        # Prefill has a variable Q axis and is not graph-replayed. Keep only
+        # the most recently used exact-shape driver rather than accumulating
+        # one large sparkinfer workspace per prompt length.
+        self._prefill_attn: Qwen36BatchedExtendAttention | None = None
         self._attn_geometry: dict[str, int] | None = None
         #: The KV pools' own storage dtype -- read off each full-attention
         #: layer's ``kv_cache_dtype`` (FP8 KV, 2026-08-03 follow-up: BF16
@@ -220,13 +226,19 @@ class Qwen36SlotPool:
                 v = torch.zeros(shape, device=self.device, dtype=kv_dtype)
                 self.k_pools[i] = _mark_static(k)
                 self.v_pools[i] = _mark_static(v)
-                kv_bytes += 2 * self.pages_per_slot * self.page_size * (
-                    attn.num_kv_heads * attn.head_dim * k.element_size()
+                kv_bytes += (
+                    2
+                    * self.pages_per_slot
+                    * self.page_size
+                    * (attn.num_kv_heads * attn.head_dim * k.element_size())
                 )
                 self.attn_outputs[i] = _mark_static(
                     torch.zeros(
-                        self._num_rows, attn.num_heads, attn.head_dim,
-                        device=self.device, dtype=dtype,
+                        self._num_rows,
+                        attn.num_heads,
+                        attn.head_dim,
+                        device=self.device,
+                        dtype=dtype,
                     )
                 )
                 layer_max = getattr(attn, "max_seq_len", None)
@@ -279,34 +291,91 @@ class Qwen36SlotPool:
             kv_bytes_per_slot=kv_bytes,
         )
 
+        # One logical-to-physical page-table row per slot.  The initial
+        # mapping is the historical contiguous ownership, but *every* Qwen
+        # attention path reads this table now: B=1, B×1 decode, B×Q prefill,
+        # MTP graph metadata.  Future prefix-cache allocation can therefore
+        # replace entries without changing the model's addressing contract.
+        self._global_page_table = _mark_static(
+            torch.arange(
+                self._num_rows * self.pages_per_slot, dtype=torch.int32, device=self.device
+            ).view(self._num_rows, self.pages_per_slot)
+        )
+        # Host-side mirror for write-index construction.  Attention metadata
+        # consumes the device table, while decode/prefill must know the same
+        # physical page ids before their kernels run.  Keeping a small Python
+        # mirror avoids a device-to-host synchronisation on every decode
+        # round; all future remapping goes through ``set_page_table_row`` so
+        # the two representations change atomically.
+        self._page_table_host = [
+            [slot * self.pages_per_slot + page for page in range(self.pages_per_slot)]
+            for slot in range(self._num_rows)
+        ]
+        # Graph wrappers cache a copied page-table row by slot identity.  A
+        # monotonic version makes that cache safe once a logical row is
+        # remapped for prefix sharing without forcing every stable replay to
+        # copy its whole table again.
+        self._page_table_versions = [0] * self._num_rows
+        # Every physical page starts owned by exactly one logical row.  A
+        # cross-slot prefix restore can replace a target's prefix pages with
+        # aliases of a retained source; the displaced pages become the small
+        # free reserve used for copy-on-write before either sharer writes.
+        # This is intentionally fixed-capacity: it reuses the allocation the
+        # backend already owns and never asks a shared single GPU for more
+        # KV memory at admission time.
+        self._page_refcounts = [1] * (self._num_rows * self.pages_per_slot)
+        self._free_physical_pages: set[int] = set()
+
         # -- per-slot single-sequence views (the B1-identical path) --------
         self._slot_states: list[Qwen36GenerationState] = [
             self._build_slot_state(row) for row in range(self._num_rows)
         ]
+        #: Populated exactly once, before CUDA Graph capture, when MTP is
+        #: enabled.  Each entry has ``K + 1`` views per physical slot: column
+        #: zero aliases the ordinary live row and columns ``1..K`` are the
+        #: persistent speculative candidates.  Keeping the base rows in the
+        #: same allocation is the historical ``spec_row`` contract; a copied
+        #: private column zero would add both D2D work and one unnecessary
+        #: GDN-state row per slot.
+        self._mtp_gdn_columns: dict[int, list[list[GdnLayerState]]] | None = None
+        self._mtp_num_speculative_tokens: int | None = None
 
         # -- persistent batched-decode buffers -----------------------------
         b = self._num_rows
         self._batch_input_ids = _mark_static(
             torch.zeros(b, 1, dtype=torch.long, device=self.device)
         )
-        self._batch_positions = _mark_static(
-            torch.zeros(b, dtype=torch.long, device=self.device)
+        self._batch_positions = _mark_static(torch.zeros(b, dtype=torch.long, device=self.device))
+        self._batch_write_index = _mark_static(torch.zeros(b, dtype=torch.long, device=self.device))
+        self._batch_slot_index = _mark_static(torch.arange(b, dtype=torch.long, device=self.device))
+        # Historical CUDA-graph replay used pinned CPU staging for every
+        # per-round scalar/vector input.  Keep the decode path under the
+        # same discipline: building a fresh CPU tensor for token ids,
+        # positions, lengths, write rows, and slots costs host allocations
+        # on precisely the one-token hot path graphs are meant to trim.
+        # CPU-backed unit-test pools cannot allocate pinned memory, so pin
+        # only when this pool actually feeds CUDA.
+        pin_memory = self.device.type == "cuda"
+        self._batch_input_ids_host = torch.zeros(
+            b, 1, dtype=torch.long, device="cpu", pin_memory=pin_memory
         )
-        self._batch_write_index = _mark_static(
-            torch.zeros(b, dtype=torch.long, device=self.device)
+        self._batch_positions_host = torch.zeros(
+            b, dtype=torch.long, device="cpu", pin_memory=pin_memory
         )
-        self._batch_slot_index = _mark_static(
-            torch.arange(b, dtype=torch.long, device=self.device)
+        self._batch_cache_seqlens_host = torch.zeros(
+            b, dtype=torch.int32, device="cpu", pin_memory=pin_memory
         )
-        # Global page table rows are a pure function of the slot id and never
-        # change (static per-slot assignment), so fill them once here rather
-        # than rebuilding them every step.
-        self._global_page_table = _mark_static(
-            torch.arange(
-                self._num_rows * self.pages_per_slot, dtype=torch.int32, device=self.device
-            ).view(self._num_rows, self.pages_per_slot)
+        self._batch_write_index_host = torch.zeros(
+            b, dtype=torch.long, device="cpu", pin_memory=pin_memory
         )
-
+        self._batch_slot_index_host = torch.zeros(
+            b, dtype=torch.long, device="cpu", pin_memory=pin_memory
+        )
+        self._np_batch_input_ids = self._batch_input_ids_host.numpy()
+        self._np_batch_positions = self._batch_positions_host.numpy()
+        self._np_batch_cache_seqlens = self._batch_cache_seqlens_host.numpy()
+        self._np_batch_write_index = self._batch_write_index_host.numpy()
+        self._np_batch_slot_index = self._batch_slot_index_host.numpy()
         # Host mirrors: the scheduler reads these every round, and reading
         # them off the device would put a sync in the decode loop.
         self.slot_kv_len = [0] * self._num_rows
@@ -317,8 +386,6 @@ class Qwen36SlotPool:
     def _build_slot_state(self, row: int) -> Qwen36GenerationState:
         gdn_states: list[GdnLayerState | None] = []
         attn_caches: list[Qwen36PagedAttentionCache | None] = []
-        lo = row * self.pages_per_slot
-        hi = lo + self.pages_per_slot
         for i in range(self.num_layers):
             if self.conv_pools[i] is not None:
                 gdn_states.append(
@@ -333,9 +400,10 @@ class Qwen36SlotPool:
                 gdn_states.append(None)
                 attn_caches.append(
                     Qwen36PagedAttentionCache.wrap(
-                        k_cache=self.k_pools[i][lo:hi],
-                        v_cache=self.v_pools[i][lo:hi],
+                        k_cache=self.k_pools[i],
+                        v_cache=self.v_pools[i],
                         page_size=self.page_size,
+                        page_table=self._global_page_table[row : row + 1],
                     )
                 )
         return Qwen36GenerationState(gdn_states=gdn_states, attn_caches=attn_caches)
@@ -350,6 +418,316 @@ class Qwen36SlotPool:
         rather than replacing it.
         """
         return self._slot_states[slot]
+
+    def set_page_table_row(self, slot: int, physical_pages: list[int]) -> None:
+        """Replace one slot's logical-to-physical page row atomically.
+
+        This is deliberately the sole remapping primitive.  The static
+        allocator initially gives every slot a contiguous row, but prefix
+        sharing/COW will not.  Batched attention reads the device table while
+        decode/prefill construct write rows from the host mirror; updating
+        only one of those two would produce a valid-looking but corrupted KV
+        cache.
+        """
+        if not 0 <= slot < self._num_rows:
+            raise ValueError(f"slot {slot} is outside the pool")
+        if len(physical_pages) != self.pages_per_slot:
+            raise ValueError(
+                f"slot {slot} needs {self.pages_per_slot} physical pages, got {len(physical_pages)}"
+            )
+        total_pages = self._num_rows * self.pages_per_slot
+        if len(set(physical_pages)) != len(physical_pages) or any(
+            page < 0 or page >= total_pages for page in physical_pages
+        ):
+            raise ValueError("a page-table row must contain distinct in-range physical pages")
+        old_pages = self._page_table_host[slot]
+        for page in old_pages:
+            self._page_refcounts[page] -= 1
+            if self._page_refcounts[page] == 0:
+                self._free_physical_pages.add(page)
+        for page in physical_pages:
+            self._page_refcounts[page] += 1
+            self._free_physical_pages.discard(page)
+        self._page_table_host[slot] = list(physical_pages)
+        self._global_page_table[slot].copy_(
+            torch.tensor(physical_pages, dtype=torch.int32, device=self.device)
+        )
+        self._page_table_versions[slot] += 1
+
+    def page_table_version(self, slot: int) -> int:
+        """Return the generation for graph metadata cached for ``slot``."""
+        return self._page_table_versions[slot]
+
+    def write_index(self, slot: int, kv_len: int) -> int:
+        """Return the physical flattened KV row for one logical token."""
+        if not 0 <= kv_len < self.max_seq_len:
+            raise ValueError(f"KV position {kv_len} is outside pool capacity {self.max_seq_len}")
+        physical_page = self._page_table_host[slot][kv_len // self.page_size]
+        return physical_page * self.page_size + kv_len % self.page_size
+
+    def prepare_kv_writes(self, slot: int, start: int, length: int) -> None:
+        """Make every page touched by a pending write private to ``slot``.
+
+        Prefix aliases are read-only by construction.  The first target
+        decode/prefill/verify write that reaches an aliased page clones the
+        whole physical page into a previously displaced fixed-capacity page,
+        remaps the logical entry, then lets the normal write proceed.  Whole
+        page copies deliberately cover a 64-token GDN checkpoint that lies
+        inside one 128-token attention page: the untouched prefix half stays
+        byte-identical while the suffix overwrites its own page.
+        """
+        if length < 0 or start < 0 or start + length > self.max_seq_len:
+            raise ValueError(
+                f"KV write [{start}, {start + length}) is outside pool capacity {self.max_seq_len}"
+            )
+        if length == 0:
+            return
+        logical_pages = range(
+            start // self.page_size,
+            (start + length - 1) // self.page_size + 1,
+        )
+        row = list(self._page_table_host[slot])
+        replacements: list[tuple[int, int, int]] = []
+        for logical_page in logical_pages:
+            source_page = row[logical_page]
+            if self._page_refcounts[source_page] <= 1:
+                continue
+            if not self._free_physical_pages:
+                raise RuntimeError(
+                    "Qwen3.6 KV copy-on-write exhausted the fixed page pool; "
+                    "a shared prefix still has no displaced page to privatize"
+                )
+            target_page = min(self._free_physical_pages)
+            self._free_physical_pages.remove(target_page)
+            replacements.append((logical_page, source_page, target_page))
+            row[logical_page] = target_page
+        if not replacements:
+            return
+        for _logical_page, source_page, target_page in replacements:
+            for k_pool, v_pool in zip(self.k_pools, self.v_pools, strict=True):
+                if k_pool is None:
+                    continue
+                assert v_pool is not None
+                k_pool[target_page].copy_(k_pool[source_page])
+                v_pool[target_page].copy_(v_pool[source_page])
+        self.set_page_table_row(slot, row)
+
+    def copy_prefix_kv(self, source_slot: int, target_slot: int, kv_len: int) -> None:
+        """Copy a reusable paged-KV prefix between two real slots.
+
+        The page-table indirection introduced for prefix caching means the
+        source and destination need not own contiguous physical pages.  Copy
+        whole logical pages so a block-aligned GDN checkpoint that falls in
+        the middle of a 128-token attention page remains valid; the target's
+        subsequent suffix prefill overwrites the unused tail before it can be
+        read.
+
+        This is intentionally a copy, not page-table aliasing.  The current
+        fixed slot allocator has no page refcount/LRU ownership yet, and
+        aliasing here would let a target request overwrite a retained source
+        prefix.  Keeping the operation at this boundary gives the future
+        BlockPool allocator one place to replace with retain/release logic.
+        """
+        if not 0 <= source_slot < self.num_slots:
+            raise ValueError(f"source slot {source_slot} is not a live slot")
+        if not 0 <= target_slot < self.num_slots:
+            raise ValueError(f"target slot {target_slot} is not a live slot")
+        if source_slot == target_slot or kv_len == 0:
+            return
+        if not 0 < kv_len <= self.max_seq_len:
+            raise ValueError(f"prefix length {kv_len} is outside pool capacity {self.max_seq_len}")
+
+        pages = (kv_len + self.page_size - 1) // self.page_size
+        source_pages = self._global_page_table[source_slot, :pages].to(dtype=torch.long)
+        target_pages = self._global_page_table[target_slot, :pages].to(dtype=torch.long)
+        for k_pool, v_pool in zip(self.k_pools, self.v_pools, strict=True):
+            if k_pool is None:
+                continue
+            assert v_pool is not None
+            # Advanced-index assignment is deliberately used instead of a
+            # view slice: page tables may be non-contiguous once a dynamic
+            # BlockPool starts recycling physical pages.
+            k_pool[target_pages] = k_pool[source_pages]
+            v_pool[target_pages] = v_pool[source_pages]
+
+    def share_prefix_kv(self, source_slot: int, target_slot: int, kv_len: int) -> None:
+        """Alias a retained prefix; later writes detach through COW.
+
+        This replaces the old cross-slot D2D copy on the target backbone KV.
+        It aliases whole 128-token attention pages, including a final partial
+        page; :meth:`prepare_kv_writes` privatizes that final page before a
+        suffix write.  GDN and MTP state retain their independent explicit
+        restore paths because neither has page-composable recurrent state.
+        """
+        if not 0 <= source_slot < self.num_slots:
+            raise ValueError(f"source slot {source_slot} is not a live slot")
+        if not 0 <= target_slot < self.num_slots:
+            raise ValueError(f"target slot {target_slot} is not a live slot")
+        if source_slot == target_slot or kv_len == 0:
+            return
+        if not 0 < kv_len <= self.max_seq_len:
+            raise ValueError(f"prefix length {kv_len} is outside pool capacity {self.max_seq_len}")
+        shared_pages = (kv_len + self.page_size - 1) // self.page_size
+        target_row = list(self._page_table_host[target_slot])
+        target_row[:shared_pages] = self._page_table_host[source_slot][:shared_pages]
+        self.set_page_table_row(target_slot, target_row)
+
+    def copy_prefix_to_scratch(
+        self, source_slot: int, kv_len: int, *, scratch_pages: list[int] | None = None
+    ) -> None:
+        """Snapshot a reusable prefix into the pre-allocated scratch row.
+
+        CUDA-graph capture needs the scratch row only while warming/capturing;
+        production replay addresses real rows directly.  It is therefore the
+        one bounded KV arena that can retain a prefix after its originating
+        request is assigned a new prompt, without reserving extra GPU memory.
+        The backend owns the corresponding token identity and GDN checkpoint;
+        this method deliberately owns bytes only.
+        """
+        if not 0 <= source_slot < self.num_slots:
+            raise ValueError(f"source slot {source_slot} is not a live slot")
+        if not 0 < kv_len <= self.max_seq_len:
+            raise ValueError(f"prefix length {kv_len} is outside pool capacity {self.max_seq_len}")
+        pages = (kv_len + self.page_size - 1) // self.page_size
+        if scratch_pages is None:
+            scratch_pages = self._page_table_host[self.scratch_row][:pages]
+        if len(scratch_pages) != pages or len(set(scratch_pages)) != pages:
+            raise ValueError("scratch prefix needs one distinct physical page per logical page")
+        scratch_lo = self.scratch_row * self.pages_per_slot
+        scratch_hi = scratch_lo + self.pages_per_slot
+        if any(page < scratch_lo or page >= scratch_hi for page in scratch_pages):
+            raise ValueError("scratch prefix pages must belong to the scratch arena")
+        source_pages = self._global_page_table[source_slot, :pages].to(dtype=torch.long)
+        scratch_page_tensor = torch.tensor(scratch_pages, dtype=torch.long, device=self.device)
+        for k_pool, v_pool in zip(self.k_pools, self.v_pools, strict=True):
+            if k_pool is None:
+                continue
+            assert v_pool is not None
+            k_pool[scratch_page_tensor] = k_pool[source_pages]
+            v_pool[scratch_page_tensor] = v_pool[source_pages]
+
+    def share_scratch_prefix(
+        self, target_slot: int, kv_len: int, *, scratch_pages: list[int] | None = None
+    ) -> None:
+        """Alias a scratch-arena prefix into a real slot.
+
+        ``prepare_kv_writes`` already implements the required copy-on-write
+        detach before the first suffix token is written, so a cached partial
+        128-token page is safe even when the GDN checkpoint is at its 64-token
+        midpoint.
+        """
+        if not 0 <= target_slot < self.num_slots:
+            raise ValueError(f"target slot {target_slot} is not a live slot")
+        if not 0 < kv_len <= self.max_seq_len:
+            raise ValueError(f"prefix length {kv_len} is outside pool capacity {self.max_seq_len}")
+        shared_pages = (kv_len + self.page_size - 1) // self.page_size
+        if scratch_pages is None:
+            scratch_pages = self._page_table_host[self.scratch_row][:shared_pages]
+        if len(scratch_pages) != shared_pages or len(set(scratch_pages)) != shared_pages:
+            raise ValueError("scratch prefix needs one distinct physical page per logical page")
+        scratch_lo = self.scratch_row * self.pages_per_slot
+        scratch_hi = scratch_lo + self.pages_per_slot
+        if any(page < scratch_lo or page >= scratch_hi for page in scratch_pages):
+            raise ValueError("scratch prefix pages must belong to the scratch arena")
+        target_row = list(self._page_table_host[target_slot])
+        target_row[:shared_pages] = scratch_pages
+        self.set_page_table_row(target_slot, target_row)
+
+    def enable_mtp_gdn_rows(self, num_speculative_tokens: int) -> None:
+        """Extend each GDN pool with MTP's ``K`` candidate rows.
+
+        This is intentionally a one-time, pre-capture operation.  Column
+        zero remains the ordinary per-slot row, while ``spec_row`` maps the
+        candidate columns into the appended range.  Replacing a pool after a
+        decode CUDA Graph has captured its address would make replay use stale
+        state, so callers must configure MTP before graph capture.
+        """
+        if num_speculative_tokens < 1:
+            raise ValueError("MTP requires at least one speculative token")
+        if self._mtp_num_speculative_tokens is not None:
+            if self._mtp_num_speculative_tokens != num_speculative_tokens:
+                raise ValueError(
+                    "MTP GDN rows already configured for "
+                    f"K={self._mtp_num_speculative_tokens}, not K={num_speculative_tokens}"
+                )
+            return
+        if any(self.slot_kv_len):
+            raise RuntimeError("enable MTP before any Qwen3.6 slot has processed tokens")
+
+        total_gdn_rows = self._num_rows * (num_speculative_tokens + 1)
+        columns_by_layer: dict[int, list[list[GdnLayerState]]] = {}
+        for layer in self.model.model.layers:
+            if layer.layer_type != "linear_attention":
+                continue
+            layer_idx = layer.layer_idx
+            old_conv = self.conv_pools[layer_idx]
+            old_recurrent = self.recurrent_pools[layer_idx]
+            assert old_conv is not None and old_recurrent is not None
+            gdn = layer.linear_attn
+            conv = _mark_static(
+                torch.zeros(
+                    total_gdn_rows,
+                    gdn.conv_dim,
+                    gdn.conv_kernel_size,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+            )
+            recurrent = _mark_static(
+                torch.zeros(
+                    total_gdn_rows,
+                    gdn.num_v_heads,
+                    gdn.head_k_dim,
+                    gdn.head_v_dim,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+            )
+            conv[: self._num_rows].copy_(old_conv)
+            recurrent[: self._num_rows].copy_(old_recurrent)
+            self.conv_pools[layer_idx] = conv
+            self.recurrent_pools[layer_idx] = recurrent
+            columns_by_layer[layer_idx] = [
+                [
+                    GdnLayerState(
+                        conv_state=conv[row : row + 1],
+                        recurrent_state=recurrent[row : row + 1],
+                        has_previous_state=False,
+                    )
+                    for row in (
+                        physical_slot,
+                        *range(
+                            self._num_rows + physical_slot * num_speculative_tokens,
+                            self._num_rows + (physical_slot + 1) * num_speculative_tokens,
+                        ),
+                    )
+                ]
+                for physical_slot in range(self._num_rows)
+            ]
+
+        self._mtp_gdn_columns = columns_by_layer
+        self._mtp_num_speculative_tokens = num_speculative_tokens
+        for slot in range(self._num_rows):
+            self.activate_mtp_gdn_state(slot, 0)
+
+    @property
+    def mtp_num_speculative_tokens(self) -> int | None:
+        return self._mtp_num_speculative_tokens
+
+    def mtp_gdn_columns(self, layer_idx: int, slot: int) -> list[GdnLayerState]:
+        if self._mtp_gdn_columns is None:
+            raise RuntimeError("MTP GDN rows have not been configured")
+        return self._mtp_gdn_columns[layer_idx][slot]
+
+    def activate_mtp_gdn_state(self, slot: int, col: int) -> None:
+        """Make a slot's live GDN views point at its selected MTP column."""
+        if self._mtp_gdn_columns is None:
+            raise RuntimeError("MTP GDN rows have not been configured")
+        if col < 0 or col > self._mtp_num_speculative_tokens:
+            raise ValueError(f"MTP GDN column {col} is out of range")
+        state = self._slot_states[slot]
+        for layer_idx, per_slot in self._mtp_gdn_columns.items():
+            state.gdn_states[layer_idx] = per_slot[slot][col]
 
     def reset_slot(self, slot: int) -> None:
         """Return ``slot`` to the fresh state a new sequence needs.
@@ -481,8 +859,8 @@ class Qwen36SlotPool:
                     f"slot {slot} is at capacity ({self.max_seq_len} tokens); "
                     "the scheduler must retire it before decoding further"
                 )
-            global_page = slot * self.pages_per_slot + past // self.page_size
-            write_rows.append(global_page * self.page_size + past % self.page_size)
+            self.prepare_kv_writes(slot, past, 1)
+            write_rows.append(self.write_index(slot, past))
             seqlens.append(past + 1)
             self.slot_kv_len[slot] = past + 1
             self.slot_committed_tokens[slot].append(int(token))
@@ -493,26 +871,25 @@ class Qwen36SlotPool:
                     cache.seq_len = past + 1
 
         attn = self.attention_driver(b)
-        self._batch_input_ids[:b, 0].copy_(
-            torch.tensor(token_ids, dtype=torch.long, device="cpu"), non_blocking=True
-        )
-        self._batch_positions[:b].copy_(
-            torch.tensor([s - 1 for s in seqlens], dtype=torch.long, device="cpu"),
-            non_blocking=True,
-        )
-        attn.cache_seqlens.copy_(
-            torch.tensor(seqlens, dtype=torch.int32, device="cpu"), non_blocking=True
-        )
-        self._batch_write_index[:b].copy_(
-            torch.tensor(write_rows, dtype=torch.long, device="cpu"), non_blocking=True
-        )
-        self._batch_slot_index[:b].copy_(
-            torch.tensor(slots, dtype=torch.long, device="cpu"), non_blocking=True
-        )
-        attn.page_table.copy_(
-            self._global_page_table.index_select(
-                0, torch.tensor(slots, dtype=torch.long, device=self.device)
-            )
+        self._np_batch_input_ids[:b, 0] = token_ids
+        self._np_batch_positions[:b] = [s - 1 for s in seqlens]
+        self._np_batch_cache_seqlens[:b] = seqlens
+        self._np_batch_write_index[:b] = write_rows
+        self._np_batch_slot_index[:b] = slots
+        self._batch_input_ids[:b].copy_(self._batch_input_ids_host[:b], non_blocking=True)
+        self._batch_positions[:b].copy_(self._batch_positions_host[:b], non_blocking=True)
+        attn.cache_seqlens.copy_(self._batch_cache_seqlens_host[:b], non_blocking=True)
+        self._batch_write_index[:b].copy_(self._batch_write_index_host[:b], non_blocking=True)
+        self._batch_slot_index[:b].copy_(self._batch_slot_index_host[:b], non_blocking=True)
+        # ``out=`` fills the graph-owned page table without the temporary
+        # result allocation that ``index_select(...)`` creates.  The source
+        # table itself is a fixed slot-id mapping, while the staged slot ids
+        # remain replay inputs, so this also preserves arbitrary batch order.
+        torch.index_select(
+            self._global_page_table,
+            0,
+            self._batch_slot_index[:b],
+            out=attn.page_table,
         )
 
         batch = Qwen36DecodeBatch(
@@ -525,11 +902,144 @@ class Qwen36SlotPool:
             v_pools=self.v_pools,
             conv_pools=self.conv_pools,
             recurrent_pools=self.recurrent_pools,
-            attn_outputs=[
-                None if out is None else out[:b] for out in self.attn_outputs
-            ],
+            attn_outputs=[None if out is None else out[:b] for out in self.attn_outputs],
         )
         return batch, b
+
+    def build_prefill_batch(
+        self, slots: list[int], token_ids_per_slot: list[list[int]]
+    ) -> Qwen36PrefillBatch:
+        """Build a safe uniform multi-slot extend descriptor.
+
+        This is intentionally narrower than the historical vLLM metadata
+        builder: it accepts only equal Q lengths and identical entering GDN
+        regimes.  The backend selects it only for that shape; other requests
+        keep using the B1-compatible serial path.  Refusing a mixed state is
+        essential because GDN's ``has_previous_state`` is part of the
+        recurrence contract, not padding metadata.
+        """
+        b = len(slots)
+        if b < 1 or b != len(token_ids_per_slot):
+            raise ValueError("slots and token_ids_per_slot must be non-empty and equal length")
+        if len(set(slots)) != b:
+            raise ValueError("prefill batch slots must be distinct")
+        lengths = {len(tokens) for tokens in token_ids_per_slot}
+        if len(lengths) != 1 or not lengths or next(iter(lengths)) < 1:
+            raise ValueError("batched prefill requires one positive, uniform token count")
+        q = next(iter(lengths))
+        if any(slot < 0 or slot >= self.num_slots for slot in slots):
+            raise ValueError("prefill batch contains an invalid real slot")
+
+        prior_lens = [self.slot_kv_len[slot] for slot in slots]
+        if len(set(prior_lens)) != 1:
+            raise ValueError("batched prefill requires equal prior KV lengths")
+        past = prior_lens[0]
+        if past + q > self.max_seq_len:
+            raise RuntimeError(
+                f"batched prefill would reach {past + q} tokens, capacity is {self.max_seq_len}"
+            )
+        has_previous_values: set[bool] = set()
+        for slot in slots:
+            state = self._slot_states[slot]
+            if state.num_tokens_seen != past:
+                raise RuntimeError(
+                    f"slot {slot} state length {state.num_tokens_seen} != pooled KV length {past}"
+                )
+            for layer_idx, gdn in enumerate(state.gdn_states):
+                if gdn is None:
+                    continue
+                # A post-verify MTP slot can point at a candidate row instead
+                # of its ordinary row.  It must not be gathered using the raw
+                # slot id; the serial path remains exact for that uncommon
+                # admission shape until generalized row ids are explicit.
+                pool = self.conv_pools[layer_idx]
+                assert pool is not None
+                if gdn.conv_state.data_ptr() != pool[slot : slot + 1].data_ptr():
+                    raise ValueError("batched prefill requires ordinary live GDN rows")
+                has_previous_values.add(gdn.has_previous_state)
+        if len(has_previous_values) > 1:
+            raise ValueError("batched prefill requires matching GDN state regimes")
+        has_previous_state = next(iter(has_previous_values), False)
+
+        for slot in slots:
+            self.prepare_kv_writes(slot, past, q)
+        attn = self.prefill_attention_driver(b, q)
+        slot_index = torch.tensor(slots, dtype=torch.long, device=self.device)
+        input_ids = torch.tensor(token_ids_per_slot, dtype=torch.long, device=self.device)
+        positions = (
+            torch.arange(past, past + q, dtype=torch.long, device=self.device)
+            .unsqueeze(0)
+            .expand(b, q)
+            .reshape(-1)
+        )
+        offsets = torch.arange(q, dtype=torch.long, device=self.device).unsqueeze(0)
+        # Page ids are scheduler metadata, so construct the physical rows
+        # from the host mirror directly.  Deriving ``logical_pages`` on the
+        # device and calling ``.tolist()`` would synchronize every BxQ
+        # prefill merely to reconstruct this same tiny list on the host.
+        global_pages = torch.tensor(
+            [
+                [
+                    self._page_table_host[slot][(past + offset) // self.page_size]
+                    for offset in range(q)
+                ]
+                for slot in slots
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
+        write_index = (global_pages * self.page_size + (past + offsets) % self.page_size).reshape(
+            -1
+        )
+        attn.cache_seqlens.fill_(past + q)
+        torch.index_select(self._global_page_table, 0, slot_index, out=attn.page_table)
+        # All full-attention layers run serially and share this one scratch
+        # buffer.  See Qwen36BatchedExtendAttention.output for the memory
+        # accounting; allocating one output per layer would retain 16 large
+        # BxQ tensors until the whole model forward returns.
+        outputs: list[torch.Tensor | None] = [
+            None if layer.layer_type == "linear_attention" else attn.output
+            for layer in self.model.model.layers
+        ]
+        return Qwen36PrefillBatch(
+            input_ids=input_ids,
+            positions=positions,
+            write_index=write_index,
+            slot_index=slot_index,
+            attn=attn,
+            k_pools=self.k_pools,
+            v_pools=self.v_pools,
+            conv_pools=self.conv_pools,
+            recurrent_pools=self.recurrent_pools,
+            attn_outputs=outputs,
+            has_previous_state=has_previous_state,
+        )
+
+    def commit_prefill_batch(self, slots: list[int], token_ids_per_slot: list[list[int]]) -> None:
+        """Commit host-side lengths only after the batched forward succeeds."""
+        if len(slots) != len(token_ids_per_slot):
+            raise ValueError("slots and token_ids_per_slot must have equal length")
+        for slot, tokens in zip(slots, token_ids_per_slot):
+            new_len = self.slot_kv_len[slot] + len(tokens)
+            state = self._slot_states[slot]
+            self.slot_kv_len[slot] = new_len
+            state.num_tokens_seen = new_len
+            for gdn in state.gdn_states:
+                if gdn is not None:
+                    gdn.has_previous_state = True
+            for cache in state.attn_caches:
+                if cache is not None:
+                    cache.seq_len = new_len
+
+    def prefill_attention_driver(
+        self, batch: int, tokens_per_slot: int
+    ) -> Qwen36BatchedExtendAttention:
+        driver = self._prefill_attn
+        if driver is None or driver.batch != batch or driver.tokens_per_slot != tokens_per_slot:
+            self._prefill_attn = Qwen36BatchedExtendAttention(
+                batch=batch, tokens_per_slot=tokens_per_slot, **self._driver_kwargs()
+            )
+        return self._prefill_attn
 
     def attention_driver(self, batch: int):
         """The shared attention driver for a decode step of size ``batch``.
@@ -545,9 +1055,7 @@ class Qwen36SlotPool:
             return graph
         existing = self.decode_attn.get(batch)
         if existing is None:
-            existing = Qwen36BatchedDecodeAttention(
-                batch=batch, **self._driver_kwargs()
-            )
+            existing = Qwen36BatchedDecodeAttention(batch=batch, **self._driver_kwargs())
             self.decode_attn[batch] = existing
         return existing
 

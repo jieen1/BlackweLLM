@@ -4,9 +4,10 @@ projections batched -- measured against **our own non-speculative path**.
 ``docs/b1-correctness-criterion.md`` §7 sets B3's reference frame
 explicitly: "参照系应当是我们自己的非投机路径", not HF. This script is
 that comparison, run with the criterion's own R1 metric
-(:func:`bfdiag.divergence.logit_agreement.compare_step`) and judged
-against its own calibrated bars, so the numbers are directly readable
-against §6.1's table.
+(:func:`bfdiag.divergence.logit_agreement.compare_step`). The sequential
+pairings are informational baselines because verify already uses an
+approximate batched execution form; only the batched-vs-shipped pairing
+is judged as the candidate's incremental footprint.
 
 Three logit trajectories over the SAME token sequence, one model load:
 
@@ -76,8 +77,6 @@ from runtime.model.qwen36_model import Qwen36GatedDeltaNet  # noqa: E402
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 
 sys.path.insert(0, str(Path(_ROOT) / "scripts"))
-from b3_probe_batching_bar import spec_forward_batched  # noqa: E402
-
 MODEL_PATH = standard_checkpoint_path()
 DEVICE = torch.device("cuda")
 torch.set_grad_enabled(False)
@@ -86,12 +85,11 @@ torch.set_grad_enabled(False)
 #: land in the same units as docs/b1-correctness-criterion.md §6.1.
 CAPTURE_TOP_K = 64
 GAP_TOP_K = 8
-#: Per-step logits are kept as a top-``STORE_TOP_K`` slice rather than the
-#: full 248320-wide row: three trajectories x 600+ steps of full FP32
-#: logits is gigabytes, and any token in one side's top-64 that is not in
-#: the other's top-1024 would be a rank shift of 960+ places, which is
-#: three orders of magnitude past anything measured here. Asserted, not
-#: assumed -- see ``_row_map``.
+#: Top-k remains the compact representation for gap/KL reporting. The
+#: candidate-vs-shipped full-logit check additionally retains FP32 CPU rows
+#: for one prompt's three trajectories, then releases them before the next
+#: prompt. That costs roughly 672 MiB at the default workload, but avoids
+#: BF16 host-rounding dominating a cosine whose calibrated bar is 0.9995.
 STORE_TOP_K = 1024
 
 PROMPTS = {
@@ -105,9 +103,9 @@ PROMPTS = {
 
 
 class TopKRow:
-    """One step's logits, stored as its top-``STORE_TOP_K`` slice."""
+    """One step's logits, with a compact top-k view and FP32 CPU row."""
 
-    __slots__ = ("indices", "values", "logsumexp")
+    __slots__ = ("indices", "values", "logsumexp", "full")
 
     def __init__(self, logits: torch.Tensor) -> None:
         row = logits.float()
@@ -115,6 +113,7 @@ class TopKRow:
         self.indices = top.indices.cpu()
         self.values = top.values.cpu()
         self.logsumexp = float(torch.logsumexp(row, dim=-1).item())
+        self.full = logits.detach().to(device="cpu", dtype=torch.float32)
 
     def top(self, k: int) -> list[int]:
         return self.indices[:k].tolist()
@@ -155,6 +154,31 @@ def agreement(name: str, mine: list[TopKRow], oracle: list[TopKRow], tokens: lis
             )
         )
     return WorkloadAgreement(workload_name=name, prompt_token_ids=(), steps=tuple(records))
+
+
+def full_logit_metrics(
+    mine: list[TopKRow], oracle: list[TopKRow], tokens: list[int]
+) -> tuple[float, float]:
+    """Return forced-token NLL excess and worst full-vocabulary cosine.
+
+    The token sequence is locked to the sequential oracle, so this measures
+    exactly the extra likelihood cost and logit-vector drift caused by the
+    verify form. It intentionally uses full rows rather than the top-k slices
+    used by :func:`agreement`.
+    """
+    mine_nll = 0.0
+    oracle_nll = 0.0
+    min_cosine = 1.0
+    for mine_row, oracle_row, token in zip(mine, oracle, tokens, strict=True):
+        mine_values = mine_row.full.float()
+        oracle_values = oracle_row.full.float()
+        mine_nll += mine_row.logsumexp - float(mine_values[token].item())
+        oracle_nll += oracle_row.logsumexp - float(oracle_values[token].item())
+        min_cosine = min(
+            min_cosine,
+            float(torch.nn.functional.cosine_similarity(mine_values, oracle_values, dim=0).item()),
+        )
+    return (mine_nll / oracle_nll - 1.0, min_cosine)
 
 
 # ---------------------------------------------------------------------------
@@ -230,13 +254,36 @@ def main() -> None:
     )
     print(f"model loaded in {time.perf_counter() - t0:.1f}s")
 
-    shipped = Qwen36GatedDeltaNet.spec_forward
+    production = Qwen36GatedDeltaNet.spec_forward
+
+    def spec_forward_shipped(self, hidden_states, state, **kwargs):
+        return production(
+            self,
+            hidden_states,
+            state,
+            batch_large_projections=False,
+            **kwargs,
+        )
+
+    def spec_forward_batched(self, hidden_states, state, **kwargs):
+        return production(
+            self,
+            hidden_states,
+            state,
+            batch_large_projections=True,
+            **kwargs,
+        )
     results: dict[str, object] = {
         "k": args.k,
         "steps_requested": args.steps,
         "workloads": {},
     }
     per_pairing: dict[str, list[WorkloadAgreement]] = {
+        "verify_shipped_vs_sequential": [],
+        "verify_batched_vs_sequential": [],
+        "verify_batched_vs_verify_shipped": [],
+    }
+    full_metrics: dict[str, list[tuple[float, float]]] = {
         "verify_shipped_vs_sequential": [],
         "verify_batched_vs_sequential": [],
         "verify_batched_vs_verify_shipped": [],
@@ -249,7 +296,7 @@ def main() -> None:
         seq_rows, tokens = sequential_trajectory(model, prompt_ids, args.steps)
         print(f"  sequential: {len(seq_rows)} steps in {time.perf_counter() - t:.1f}s")
 
-        Qwen36GatedDeltaNet.spec_forward = shipped
+        Qwen36GatedDeltaNet.spec_forward = spec_forward_shipped
         t = time.perf_counter()
         ship_rows, positions = verify_trajectory(model, prompt_ids, tokens, args.k)
         print(f"  verify (shipped): {len(ship_rows)} positions in {time.perf_counter() - t:.1f}s")
@@ -258,7 +305,7 @@ def main() -> None:
         t = time.perf_counter()
         batch_rows, positions_b = verify_trajectory(model, prompt_ids, tokens, args.k)
         print(f"  verify (batched): {len(batch_rows)} positions in {time.perf_counter() - t:.1f}s")
-        Qwen36GatedDeltaNet.spec_forward = shipped
+        Qwen36GatedDeltaNet.spec_forward = production
         assert positions == positions_b
 
         oracle_rows = [seq_rows[p] for p in positions]
@@ -272,7 +319,11 @@ def main() -> None:
         for pairing, (mine, oracle) in pairs.items():
             w = agreement(label, mine, oracle, oracle_tokens)
             per_pairing[pairing].append(w)
+            nll_excess, min_cosine = full_logit_metrics(mine, oracle, oracle_tokens)
+            full_metrics[pairing].append((nll_excess, min_cosine))
             entry[pairing] = w.to_dict()["summary"]
+            entry[pairing]["nll_relative_excess"] = nll_excess
+            entry[pairing]["min_logits_cosine"] = min_cosine
             print(
                 f"  {pairing:<34} p90={w.p90_gap_error:.4f} p99={w.p99_gap_error:.4f} "
                 f"med={w.median_gap_error:.4f} maxKL={w.mean_kl_topk:.3e} "
@@ -280,12 +331,20 @@ def main() -> None:
             )
         results["workloads"][label] = entry
 
-    print("\n=== combined, judged against CALIBRATED_THRESHOLDS (B1-R §6.1) ===")
+    print("\n=== combined ===")
     summary: dict[str, object] = {}
     for pairing, workloads in per_pairing.items():
-        report = AgreementReport(workloads=tuple(workloads))
+        nll_excess, min_cosine = zip(*full_metrics[pairing], strict=True)
+        report = AgreementReport(
+            workloads=tuple(workloads),
+            nll_relative_excess=max(nll_excess),
+            min_logits_cosine=min(min_cosine),
+        )
         metrics = report.summary_metrics()
-        passed, reasons = evaluate_summary(metrics, CALIBRATED_THRESHOLDS)
+        if pairing == "verify_batched_vs_verify_shipped":
+            passed, reasons = evaluate_summary(metrics, CALIBRATED_THRESHOLDS)
+        else:
+            passed, reasons = None, ("informational baseline comparison; not a candidate gate",)
         summary[pairing] = {
             "metrics": metrics,
             "passes_calibrated_bars": passed,

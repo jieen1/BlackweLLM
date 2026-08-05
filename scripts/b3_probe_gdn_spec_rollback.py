@@ -36,6 +36,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 _ROOT = str(Path(__file__).resolve().parent.parent)
 sys.path.insert(0, _ROOT)
@@ -54,6 +55,7 @@ from runtime.model.qwen36_model import (  # noqa: E402
     Qwen36GatedDeltaNet,
     commit_spec_snapshot,
 )
+from runtime.model.qwen36_slots import Qwen36SlotPool  # noqa: E402
 from runtime.model_loading import _build_qwen36_model_config  # noqa: E402
 
 # Deliberately modelopt (nvidia), not the standard checkpoint: this script
@@ -173,6 +175,95 @@ def main() -> None:
         "snapshot[0] equals the anchor",
         torch.equal(snapshots[0].conv_state, anchor_conv_before)
         and torch.equal(snapshots[0].recurrent_state, anchor_rec_before),
+    )
+
+    # M-3's permanent-row layout has exactly K candidate rows, not K+1
+    # candidates plus a separately materialized input row.  The incoming
+    # anchor is read before the forward, then row 0 is overwritten by the
+    # state after position 0.  Verify this against the snapshot oracle using
+    # the same real FP8 layer and GPU kernel as the checks below.
+    candidate_rows = [
+        GdnLayerState(
+            conv_state=torch.empty_like(anchor_state.conv_state),
+            recurrent_state=torch.empty_like(anchor_state.recurrent_state),
+            has_previous_state=False,
+        )
+        for _ in range(K)
+    ]
+    row_out, row_snapshots = layer.spec_forward(
+        x_candidates, anchor_state, spec_state_rows=candidate_rows
+    )
+    record("K-row state-addressed verify returns no snapshots", row_snapshots is None)
+    record(
+        "K-row state-addressed verify output matches snapshot verify",
+        torch.equal(row_out, spec_out),
+    )
+    record(
+        "K-row state-addressed verify maps every position to snapshot[position + 1]",
+        all(
+            torch.equal(row.conv_state, snapshots[position + 1].conv_state)
+            and torch.equal(row.recurrent_state, snapshots[position + 1].recurrent_state)
+            and row.has_previous_state == snapshots[position + 1].has_previous_state
+            for position, row in enumerate(candidate_rows)
+        ),
+    )
+
+    # The production MTP graph has qo_len=K+1 (anchor plus K drafts), and
+    # column zero must be the slot pool's ordinary prefill row rather than a
+    # copied private bootstrap state. Exercise that exact pool layout without
+    # loading any layer other than this real GDN one.
+    pool_model = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[
+                SimpleNamespace(
+                    layer_idx=LAYER_IDX,
+                    layer_type="linear_attention",
+                    linear_attn=layer,
+                    self_attn=None,
+                )
+            ]
+        )
+    )
+    pool = Qwen36SlotPool(
+        pool_model,
+        num_slots=1,
+        max_seq_len=64,
+        device=DEVICE,
+        dtype=torch.bfloat16,
+    )
+    pool.enable_mtp_gdn_rows(K)
+    pooled_anchor = pool.slot_state(0).gdn_states[LAYER_IDX]
+    assert pooled_anchor is not None
+    pooled_anchor.conv_state.copy_(anchor_state.conv_state)
+    pooled_anchor.recurrent_state.copy_(anchor_state.recurrent_state)
+    pooled_anchor.has_previous_state = True
+    pooled_columns = pool.mtp_gdn_columns(LAYER_IDX, 0)
+    record(
+        "MTP column zero aliases the ordinary slot-pool prefill state",
+        pooled_anchor is pooled_columns[0]
+        and pooled_anchor.conv_state.data_ptr() == pooled_columns[0].conv_state.data_ptr()
+        and pooled_anchor.recurrent_state.data_ptr()
+        == pooled_columns[0].recurrent_state.data_ptr(),
+    )
+    x_verify = torch.randn(1, K + 1, hidden_size, device=DEVICE, dtype=torch.bfloat16) * 0.1
+    pooled_ref_out, pooled_snapshots = layer.spec_forward(x_verify, anchor_state)
+    pooled_out, pooled_rows = layer.spec_forward(
+        x_verify,
+        pooled_anchor,
+        spec_state_rows=pooled_columns,
+    )
+    record("slot-pool K+1-row verify returns no snapshots", pooled_rows is None)
+    record(
+        "slot-pool K+1-row verify output matches snapshot verify",
+        torch.equal(pooled_out, pooled_ref_out),
+    )
+    record(
+        "slot-pool columns map every K+1 verify position to snapshot[position + 1]",
+        all(
+            torch.equal(row.conv_state, pooled_snapshots[position + 1].conv_state)
+            and torch.equal(row.recurrent_state, pooled_snapshots[position + 1].recurrent_state)
+            for position, row in enumerate(pooled_columns)
+        ),
     )
 
     # -- The core claim: for every m in [0, K], commit_spec_snapshot(m)
