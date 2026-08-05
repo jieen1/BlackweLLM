@@ -633,6 +633,80 @@ class Qwen36SlotPool:
         target_row[:shared_pages] = scratch_pages
         self.set_page_table_row(target_slot, target_row)
 
+    def detach_scratch_aliases(
+        self, slot: int, kv_len: int, *, scratch_pages: set[int]
+    ) -> bool:
+        """Copy an idle slot's aliased scratch pages back into its own row.
+
+        A restored (full-prompt) request keeps its page-table alias on the
+        persistent entry's scratch pages after ``reset_slot`` -- that alias
+        is what makes same-slot reuse cheap, but it also pins the entry's
+        refcount above 1 forever, so the persistent arena can never evict
+        that entry to make room for a larger one (measured 2026-08-05: the
+        five-context grid stored 4K..128K, then the 250K store silently
+        failed because every candidate still had an idle-slot alias).
+        Before evicting such an entry, copy its pages back into the idle
+        slot's own row (the same per-page COW discipline
+        :meth:`prepare_kv_writes` uses) and remap; the KV bytes stay valid
+        for that slot's retained prefix, and the scratch pages return to
+        refcount 1 where the eviction path can reclaim them.
+
+        A LIVE slot is also allowed, but only its *committed* range is
+        detached: pages below ``slot_kv_len`` were already written and are
+        read-only for the rest of the sequence, so privatizing them changes
+        nothing observable while releasing the scratch pin.  Pages at or
+        beyond ``slot_kv_len`` are pages the slot will still write and are
+        left aliased for ``prepare_kv_writes`` to COW-detach on the first
+        write.  This is what lets ``_evict_persistent_until`` make room at
+        a prefill-commit store even when the just-prefilled slot restored a
+        shorter cached prefix (measured 2026-08-05: the 250K prefill slot
+        still aliased the 128K entry, the detach loop skipped it as live,
+        and the 250K store failed with the entry pinned at refcount 2).
+        Returns True when at least one page was remapped.
+        """
+        if not 0 <= slot < self.num_slots:
+            raise ValueError(f"slot {slot} is not a live slot")
+        if not 0 < kv_len <= self.max_seq_len:
+            raise ValueError(f"prefix length {kv_len} is outside pool capacity {self.max_seq_len}")
+        scratch_lo = self.scratch_row * self.pages_per_slot
+        scratch_hi = scratch_lo + self.pages_per_slot
+        if any(not 0 <= page < self.pages_per_slot for page in scratch_pages):
+            raise ValueError("scratch pages must be logical pages of the scratch arena")
+        logical_pages = range((kv_len + self.page_size - 1) // self.page_size)
+        committed_pages = (self.slot_kv_len[slot] + self.page_size - 1) // self.page_size
+        row = list(self._page_table_host[slot])
+        replacements: list[tuple[int, int, int]] = []
+        for logical_page in logical_pages:
+            if committed_pages and logical_page >= committed_pages:
+                break
+            source_page = row[logical_page]
+            if not scratch_lo <= source_page < scratch_hi:
+                continue
+            if (source_page - scratch_lo) not in scratch_pages:
+                continue
+            if self._page_refcounts[source_page] <= 1:
+                continue
+            if not self._free_physical_pages:
+                raise RuntimeError(
+                    "Qwen3.6 scratch detach exhausted the fixed page pool; "
+                    "no displaced page is available to privatize an alias"
+                )
+            target_page = min(self._free_physical_pages)
+            self._free_physical_pages.remove(target_page)
+            replacements.append((logical_page, source_page, target_page))
+            row[logical_page] = target_page
+        if not replacements:
+            return False
+        for _logical_page, source_page, target_page in replacements:
+            for k_pool, v_pool in zip(self.k_pools, self.v_pools, strict=True):
+                if k_pool is None:
+                    continue
+                assert v_pool is not None
+                k_pool[target_page].copy_(k_pool[source_page])
+                v_pool[target_page].copy_(v_pool[source_page])
+        self.set_page_table_row(slot, row)
+        return True
+
     def enable_mtp_gdn_rows(self, num_speculative_tokens: int) -> None:
         """Extend each GDN pool with MTP's ``K`` candidate rows.
 

@@ -542,6 +542,100 @@ class TestPrefixCacheTwoFamilies:
         assert backend.pool.slot_kv_len[2] == 65
         assert backend.stats["prefix_persistent_restores"] == 2
 
+    def test_per_slot_chunked_prefill_cow_detaches_aliased_page(self) -> None:
+        """A single-slot prefill must not write through a shared scratch page.
+
+        The per-slot chunked path forwards through ``Qwen36GenerationState``
+        attention caches whose page table is a view of the pool row.  After a
+        persistent restore that row aliases the scratch arena, so the forward
+        used to scatter its KV straight into the shared pages -- silently
+        corrupting the persistent entry's bytes while keeping the alias
+        (measured 2026-08-05: the 250K c=1 COLD overwrote the 128K entry's
+        KV in place).  The batched path already COW-detaches inside
+        ``build_prefill_batch``; the per-slot path must do the same before
+        the model writes.
+        """
+        backend = _backend(
+            num_slots=2,
+            block_size=64,
+            enable_persistent_prefix_cache=True,
+        )
+        entry = list(range(64))
+        _run(backend, 0, entry, steps=0)
+        backend.reset_slot(0)
+        e1 = next(iter(backend._persistent_prefixes.values()))  # noqa: SLF001
+        assert e1.kv_len == 64
+        scratch_page = (
+            backend.pool.scratch_row * backend.pool.pages_per_slot
+            + e1.scratch_page_offsets[0]
+        )
+        kv_before = (
+            [t[scratch_page].clone() for t in backend.pool.k_pools if t is not None],
+            [t[scratch_page].clone() for t in backend.pool.v_pools if t is not None],
+        )
+
+        # Restore into both slots so an idle alias and a live alias both
+        # exist, then prefill a longer prompt whose suffix writes the aliased
+        # page (hit=64 is not page-aligned, so the suffix starts mid-page).
+        backend.prefill_chunked_begin([1], [entry + [777]])
+        backend.reset_slot(1)
+        prompt = entry + list(range(100, 292))  # 256 tokens, hit=64, suffix 192
+        _run(backend, 0, prompt, steps=0)
+
+        # The live slot's row must no longer point at the entry's scratch
+        # page, and the scratch bytes must be untouched.
+        row0 = list(backend.pool._page_table_host[0])  # noqa: SLF001
+        assert row0[0] != scratch_page
+        kv_after = (
+            [t[scratch_page].clone() for t in backend.pool.k_pools if t is not None],
+            [t[scratch_page].clone() for t in backend.pool.v_pools if t is not None],
+        )
+        assert all(torch.equal(a, b) for a, b in zip(kv_before[0], kv_after[0], strict=True))
+        assert all(torch.equal(a, b) for a, b in zip(kv_before[1], kv_after[1], strict=True))
+        # The new prompt's own entry still publishes at its block boundary.
+        assert backend.stats["prefix_persistent_stores"] == 2
+        assert any(e.kv_len == 256 for e in backend._persistent_prefixes.values())  # noqa: SLF001
+
+    def test_prefill_commit_store_evicts_entry_aliased_by_live_slot(self) -> None:
+        """A live slot's committed alias must not deadlock the scratch arena.
+
+        A partial-hit prefill whose hit is page-aligned never writes the
+        aliased pages, so at prefill-commit the live slot still pins the
+        restored entry's scratch pages (refcount > 1).  Evicting that entry
+        to make room for the new prompt used to fail: the detach loop only
+        considered idle slots, so the store silently returned and the next
+        identical request re-ran cold (measured 2026-08-05: the 250K store
+        after a 128K-page-aligned context).  Detaching a live slot's
+        committed (read-only) alias range unblocks it.
+        """
+        backend = _backend(
+            num_slots=2,
+            block_size=64,
+            enable_persistent_prefix_cache=True,
+        )
+        e1 = list(range(128))
+        e2 = list(range(500, 628))
+        _run(backend, 0, e1, steps=0)
+        backend.reset_slot(0)
+        _run(backend, 1, e2, steps=0)
+        backend.reset_slot(1)
+        assert backend.stats["prefix_persistent_stores"] == 2
+
+        # Warm-restore e1 into slot 0, then prefill e1 + 256 suffix tokens:
+        # hit=128 is page-aligned, so the suffix writes page 1 only and page
+        # 0 stays aliased while slot 0 is live at the prefill-commit store.
+        backend.prefill_chunked_begin([0], [e1 + [999]])
+        backend.reset_slot(0)
+        prompt = e1 + list(range(700, 1084))  # 512 tokens -> 4 scratch pages
+        _run(backend, 0, prompt, steps=0)
+
+        assert backend.stats["prefix_persistent_stores"] == 3
+        assert backend.stats["prefix_persistent_evictions"] == 2
+        (entry,) = backend._persistent_prefixes.values()  # noqa: SLF001
+        assert entry.kv_len == 512
+        # The evicted entries must have returned their pages to the arena.
+        assert len(backend._persistent_free_scratch_pages) == backend.pool.pages_per_slot - 4
+
     def test_graph_recapture_invalidation_drops_every_persistent_identity(self) -> None:
         backend = _backend(
             num_slots=2,

@@ -227,6 +227,49 @@ class TestSlotViewsAliasThePool:
         pool.k_pools[0][target_page].fill_(11.0)
         assert torch.all(pool.k_pools[0][scratch_page] == 7.0)
 
+    def test_detach_scratch_aliases_remaps_a_live_slots_committed_range_only(self) -> None:
+        """A live slot may privatize its committed (read-only) aliases.
+
+        The persistent arena's eviction path detaches aliases so an entry
+        becomes evictable.  Idle slots can give up every aliased page; a
+        live slot may only give up pages below its committed ``kv_len`` --
+        those are already written and never written again -- while pages at
+        or beyond the boundary stay shared for ``prepare_kv_writes`` to
+        COW-detach on the first write.
+        """
+        pool = _pool(num_slots=2, max_seq_len=256)
+        scratch_lo = pool.scratch_row * pool.pages_per_slot
+        pool.k_pools[0][0].fill_(7.0)
+        pool.k_pools[0][1].fill_(8.0)
+        pool.v_pools[0][0].fill_(9.0)
+        pool.v_pools[0][1].fill_(10.0)
+
+        pool.copy_prefix_to_scratch(0, 256)
+        pool.share_scratch_prefix(1, 256)
+        assert int(pool._global_page_table[1, 0]) == scratch_lo  # noqa: SLF001
+        assert int(pool._global_page_table[1, 1]) == scratch_lo + 1  # noqa: SLF001
+        assert pool._page_refcounts[scratch_lo] == 2  # noqa: SLF001
+        assert pool._page_refcounts[scratch_lo + 1] == 2  # noqa: SLF001
+
+        # Committed length covers only the first page: the second alias must
+        # survive, and only the first page may be privatized.
+        pool.rewind_slot(1, 64)
+        assert pool.detach_scratch_aliases(1, 256, scratch_pages={0, 1}) is True
+        assert int(pool._global_page_table[1, 0]) != scratch_lo  # noqa: SLF001
+        assert int(pool._global_page_table[1, 1]) == scratch_lo + 1  # noqa: SLF001
+        assert pool._page_refcounts[scratch_lo] == 1  # noqa: SLF001
+        assert pool._page_refcounts[scratch_lo + 1] == 2  # noqa: SLF001
+        assert torch.all(pool.k_pools[0][int(pool._global_page_table[1, 0])] == 7.0)  # noqa: SLF001
+        assert torch.all(pool.k_pools[0][int(pool._global_page_table[1, 1])] == 8.0)  # noqa: SLF001
+
+        # Once committed past the boundary, the second page becomes
+        # detachable too.
+        pool.rewind_slot(1, 256)
+        assert pool.detach_scratch_aliases(1, 256, scratch_pages={0, 1}) is True
+        assert int(pool._global_page_table[1, 1]) != scratch_lo + 1  # noqa: SLF001
+        assert pool._page_refcounts[scratch_lo + 1] == 1  # noqa: SLF001
+        assert torch.all(pool.k_pools[0][int(pool._global_page_table[1, 1])] == 8.0)  # noqa: SLF001
+
 
 class TestResetZeroesRecurrentStateButNotKV:
     """B0-5's one operational requirement, as an executable assertion."""

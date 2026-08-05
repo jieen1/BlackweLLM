@@ -795,6 +795,23 @@ class Qwen36Backend:
                     finished = False
 
                 if hidden is None:
+                    # The per-slot forward writes KV through the slot's
+                    # attention-cache page table (a view of the pool row),
+                    # which may alias the persistent scratch arena after a
+                    # prefix restore.  The batched path COW-detaches inside
+                    # ``build_prefill_batch``; this path must do the same
+                    # before the model writes, or a single-slot prefill
+                    # silently overwrites the shared scratch bytes in place
+                    # and keeps the alias pinned forever (measured
+                    # 2026-08-05: the 250K c=1 COLD overwrote the 128K
+                    # persistent entry's KV and blocked its eviction, so the
+                    # 250K store silently failed and the WARM wave re-ran
+                    # cold).  ``prepare_kv_writes`` is keyed by slot token
+                    # coordinates; ``suffix`` begins at ``hit``.
+                    hit = len(prompt) - len(suffix)
+                    prepare_kv_writes = getattr(self.pool, "prepare_kv_writes", None)
+                    if prepare_kv_writes is not None:
+                        prepare_kv_writes(slot, hit + start, end - start)
                     input_ids = torch.tensor(
                         [suffix[start:end]], dtype=torch.long, device=self.device
                     )
@@ -1035,7 +1052,37 @@ class Qwen36Backend:
                 None,
             )
             if evictable is None:
-                return False
+                # A finished warm request keeps its page-table alias on the
+                # entry's scratch pages (``reset_slot`` leaves it so
+                # same-slot reuse stays cheap), which pins the refcounts
+                # above 1 and makes the entry look live to the test above
+                # forever -- so the arena can never make room for a larger
+                # entry (measured 2026-08-05: the five-context grid stored
+                # 4K..128K, then the 250K store silently failed because
+                # every candidate still had an idle-slot alias).  Detach
+                # idle aliases (copy the pages back into each slot's own
+                # row) so the entry becomes evictable.  A live slot keeps
+                # its aliases only above its committed boundary; the pool
+                # method privatizes exactly the committed (read-only) range,
+                # which is what unblocks the prefill-commit store after a
+                # slot restored a shorter cached prefix.
+                detached = False
+                for entry in self._persistent_prefixes.values():
+                    scratch = set(entry.scratch_page_offsets)
+                    for slot in range(self.num_slots):
+                        detached |= self.pool.detach_scratch_aliases(
+                            slot, entry.kv_len, scratch_pages=scratch
+                        )
+                if not detached:
+                    return False
+                continue
+            # A persistent entry is pinned in the checkpoint pool (see
+            # ``_store_persistent_prefix``) so ordinary decode-time rolling
+            # checkpoints can never evict it; scratch-arena pressure is the
+            # one legitimate reason to drop one, so unpin before the
+            # explicit evict (``RecurrentStatePool.evict`` refuses pinned
+            # keys by contract).
+            self.checkpoint_pool.unpin(evictable.checkpoint_key)
             self.checkpoint_pool.evict(evictable.checkpoint_key)
         return True
 
@@ -1048,6 +1095,7 @@ class Qwen36Backend:
         valid-looking token hash over replaced bytes.
         """
         for entry in list(self._persistent_prefixes.values()):
+            self.checkpoint_pool.unpin(entry.checkpoint_key)
             self.checkpoint_pool.evict(entry.checkpoint_key)
 
     def _store_persistent_prefix(
@@ -1130,6 +1178,18 @@ class Qwen36Backend:
             num_tokens=kv_len,
             nbytes=self._checkpoint_bytes,
         )
+        # Pin the persistent entry in the checkpoint pool: it is the only
+        # cache family that survives across slots and carries the MTP
+        # scratch snapshot + anchor hidden, so decode-time rolling
+        # checkpoints (one per active slot at every block boundary) must
+        # yield to it under byte-budget pressure.  Without this, a repeat
+        # request admitted while another slot is decoding evicts the entry
+        # (persistent + 2 rolling checkpoints > 2x budget) and silently
+        # drops back to a full prefill -- the alternating 1-of-2
+        # persistent-hit corruption measured on 2026-08-05.  The scratch
+        # arena (``_evict_persistent_until``) remains the hard bound on how
+        # many entries can live, so pinning never changes peak memory.
+        self.checkpoint_pool.pin(key)
         self._persistent_prefixes[hash_value] = _PersistentPrefixEntry(
             token_ids=tuple(tokens[:kv_len]),
             kv_len=kv_len,
