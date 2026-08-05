@@ -39,6 +39,13 @@ from __future__ import annotations
 import pytest
 
 torch = pytest.importorskip("torch", reason="torch-free CI job")
+# runtime.backends.qwen36 imports runtime.model.qwen36_model, which imports
+# fla and sparkinfer at module scope.  The cpu-torch CI job deliberately has
+# neither (they are the SM120 kernel stack), so this module self-skips there
+# exactly like its sibling qwen36 tests -- even though the test body itself
+# is CPU-only fake-model logic.
+pytest.importorskip("fla")
+pytest.importorskip("sparkinfer")
 
 from runtime.backends.qwen36 import (  # noqa: E402
     _PREFERRED_PREFILL_CHUNK_TOKENS,
