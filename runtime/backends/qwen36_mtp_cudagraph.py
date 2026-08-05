@@ -645,10 +645,19 @@ class Qwen36MTPDraftCudaGraph:
     def _fill(
         self,
         slots: list[int],
-        seed_tokens: list[int],
+        seed_tokens: list[int] | torch.Tensor,
         seed_hiddens: torch.Tensor,
         start_positions: list[int],
     ) -> None:
+        """Stage one B-wide draft round's inputs.
+
+        ``seed_tokens`` may be a host ``list[int]`` (historical path) or a
+        device tensor ``[B]`` (the ragged-sync fast path: the sync graph's
+        ``_step_tokens`` already lives on device, so copying it D2D into the
+        graph-owned buffer avoids the mid-round D2H ``.tolist()`` + H2D
+        re-upload that made the host block before the draft graph could be
+        enqueued -- measured 2026-08-05 as a 5-15 ms/round host gap at 128K).
+        """
         batch = len(slots)
         input_ids, prev_hidden, slot_buf, start_pos = self._inputs[batch]
         if not (len(seed_tokens) == len(start_positions) == batch):
@@ -657,10 +666,29 @@ class Qwen36MTPDraftCudaGraph:
             raise ValueError("MTP draft graph seed hidden must have shape [B, 1, H]")
         seed_tokens_host, slots_host, start_positions_host = self._host_inputs[batch]
         seed_tokens_view, slots_view, start_positions_view = self._host_input_views[batch]
-        seed_tokens_view[:] = seed_tokens
         slots_view[:] = slots
         start_positions_view[:] = start_positions
-        input_ids[:, 0].copy_(seed_tokens_host, non_blocking=True)
+        if isinstance(seed_tokens, torch.Tensor) or (
+            isinstance(seed_tokens, (list, tuple))
+            and seed_tokens
+            and all(isinstance(token, torch.Tensor) for token in seed_tokens)
+        ):
+            if isinstance(seed_tokens, (list, tuple)):
+                seed_tokens = torch.cat([token.reshape(1) for token in seed_tokens])
+            if tuple(seed_tokens.shape) != (batch,):
+                raise ValueError(
+                    "MTP draft graph device seed tokens must have shape [B]"
+                    f", got {tuple(seed_tokens.shape)}"
+                )
+            if seed_tokens.dtype != torch.long or seed_tokens.device.type != self.device.type:
+                raise ValueError(
+                    "MTP draft graph device seed tokens must be torch.long on "
+                    f"{self.device}, got dtype={seed_tokens.dtype} device={seed_tokens.device}"
+                )
+            input_ids[:, 0].copy_(seed_tokens, non_blocking=True)
+        else:
+            seed_tokens_view[:] = seed_tokens
+            input_ids[:, 0].copy_(seed_tokens_host, non_blocking=True)
         prev_hidden.copy_(seed_hiddens)
         slot_buf.copy_(slots_host, non_blocking=True)
         start_pos.copy_(start_positions_host, non_blocking=True)
@@ -759,11 +787,16 @@ class Qwen36MTPDraftCudaGraph:
     def replay_batch(
         self,
         slots: list[int],
-        seed_tokens: list[int],
+        seed_tokens: list[int] | torch.Tensor,
         seed_hiddens: torch.Tensor,
         start_positions: list[int],
     ) -> dict[int, list[int]]:
-        """Replay one B-wide chained draft graph and advance each cache."""
+        """Replay one B-wide chained draft graph and advance each cache.
+
+        ``seed_tokens`` may be a device tensor (D2D staged by :meth:`_fill`)
+        or a host list (historical H2D staging).  Returns the K-1 tails per
+        slot as Python ints; the caller combines them with the seeds.
+        """
         if not self._captured:
             raise RuntimeError("MTP draft CUDA Graph replay requested before capture")
         batch = len(slots)

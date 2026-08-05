@@ -663,7 +663,7 @@ class Qwen36MTPEngine:
         )
         first_draft_values = first_drafts.tolist()
         expected = [start + query_len for start in starts]
-        result: dict[int, tuple[int, torch.Tensor]] = {}
+        result: dict[int, tuple[int | torch.Tensor, torch.Tensor]] = {}
         for index, (slot, end) in enumerate(zip(slots, expected, strict=True)):
             self._caches[slot].seq_len = end
             self._sync_len[slot] = end
@@ -682,7 +682,7 @@ class Qwen36MTPEngine:
         slots: list[int],
         shifted_token_ids: list[list[int]],
         target_hidden_rows: list[torch.Tensor],
-    ) -> dict[int, tuple[int, torch.Tensor]]:
+    ) -> dict[int, tuple[int | torch.Tensor, torch.Tensor]]:
         """Synchronise one all-slot ragged real suffix body when available.
 
         The historical fast path pads every slot to one fixed ``max_q`` MTP
@@ -690,6 +690,14 @@ class Qwen36MTPEngine:
         splitting by accepted length first.  This engine mirrors that shape
         when the pooled helper exposes ``replay_ragged`` and otherwise falls
         back to the previous equal-length grouping/per-slot implementation.
+
+        On the batched graph path the first element is the **device** first-
+        draft tensor row (``[1]``): converting it to a host int here forces a
+        mid-round D2H sync before the draft graph can be enqueued.  The
+        caller's ``_continue_draft_batch`` stages it D2D and converts after
+        the draft replay has already synchronized the stream, so one round
+        keeps at most one blocking D2H (the draft results).  The eager
+        fallback paths below still return plain ``int``.
         """
         if not (len(slots) == len(shifted_token_ids) == len(target_hidden_rows)):
             raise ValueError("ragged MTP sync requires equal slot/token/hidden list lengths")
@@ -746,7 +754,6 @@ class Qwen36MTPEngine:
         first_drafts, mtp_hidden = replay_ragged(
             slots, shifted_token_ids, target_hidden_rows, starts
         )
-        first_draft_values = first_drafts.tolist()
         result: dict[int, tuple[int, torch.Tensor]] = {}
         for index, (slot, start, tokens) in enumerate(
             zip(slots, starts, shifted_token_ids, strict=True)
@@ -755,7 +762,7 @@ class Qwen36MTPEngine:
             self._caches[slot].seq_len = end
             self._sync_len[slot] = end
             result[slot] = (
-                int(first_draft_values[index]),
+                first_drafts[index],
                 mtp_hidden[index : index + 1],
             )
         self.stats["batched_sync_replays"] += 1
@@ -796,17 +803,35 @@ class Qwen36MTPEngine:
         return drafts
 
     def _continue_draft_batch(
-        self, slots: list[int], first_drafts: list[int], first_hiddens: torch.Tensor
+        self,
+        slots: list[int],
+        first_drafts: list[int | torch.Tensor],
+        first_hiddens: torch.Tensor,
     ) -> dict[int, list[int]]:
-        """Batch MTP's K-1 speculative continuation steps across slots."""
+        """Batch MTP's K-1 speculative continuation steps across slots.
+
+        ``first_drafts`` accepts host ints (eager path) or per-slot device
+        ``[1]`` rows (ragged-sync graph path).  In the graph path the device
+        seeds are staged D2D into the draft graph's owned buffer, and the
+        int conversion happens only after the draft replay has synchronized
+        the stream -- the one blocking D2H per round is the draft rows
+        themselves, never a separate seed round-trip.
+        """
+        def _as_int(value: int | torch.Tensor) -> int:
+            return int(value) if isinstance(value, torch.Tensor) else value
+
         if len(slots) != len(first_drafts):
             raise ValueError("MTP draft slots and first draft tokens must have equal length")
         if self.k <= 1:
-            return {slot: [token] for slot, token in zip(slots, first_drafts, strict=True)}
+            return {
+                slot: [_as_int(token)]
+                for slot, token in zip(slots, first_drafts, strict=True)
+            }
         if self._draft_cg is not None:
             starts = [self._caches[slot].seq_len for slot in slots]
             tails = self._draft_cg.replay_batch(slots, first_drafts, first_hiddens, starts)
             expected_tail = self.k - 1
+            first_values = [_as_int(token) for token in first_drafts]
             for slot in slots:
                 tail = tails[slot]
                 if len(tail) != expected_tail:
@@ -817,11 +842,11 @@ class Qwen36MTPEngine:
                     )
             self._record_draft_graph_replay(len(slots))
             return {
-                slot: [first_draft, *tails[slot]]
-                for slot, first_draft in zip(slots, first_drafts, strict=True)
+                slot: [first_values[index], *tails[slot]]
+                for index, slot in enumerate(slots)
             }
         return {
-            slot: self._continue_draft(slot, first_draft, first_hiddens[index : index + 1])
+            slot: self._continue_draft(slot, _as_int(first_draft), first_hiddens[index : index + 1])
             for index, (slot, first_draft) in enumerate(zip(slots, first_drafts, strict=True))
         }
 

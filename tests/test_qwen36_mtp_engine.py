@@ -576,6 +576,81 @@ class TestTeacherForcedSync:
         assert engine.stats["batched_draft_replays"] == 1
         assert backend.stats["mtp_draft_graph_slots"] == 2
 
+    def test_ragged_sync_hands_device_seeds_to_the_draft_graph_without_tolist(self) -> None:
+        """The ragged-sync graph path must not round-trip first-draft seeds
+        through the host before the draft graph is enqueued.
+
+        Measured 2026-08-05 at 128K: ``first_drafts.tolist()`` between the
+        sync replay and the draft replay blocked the host on a second D2H
+        synchronisation point every round (5-15 ms/round).  The batched
+        ragged path now returns the device ``_step_tokens`` row and
+        ``_continue_draft_batch`` stages it D2D; the int conversion happens
+        only after the draft replay has already synchronized the stream.
+        """
+        backend, _model = _backend(num_slots=2)
+        backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
+        engine: Qwen36MTPEngine = backend._mtp
+
+        class _RaggedSync:
+            def __init__(self) -> None:
+                self.calls: list[list[int]] = []
+
+            def replay_ragged(self, slots, shifted_token_ids, target_hidden_rows, starts):
+                self.calls.append(list(slots))
+                first_drafts = torch.tensor(
+                    [(tokens[-1] + 1) % _VOCAB for tokens in shifted_token_ids],
+                    dtype=torch.long,
+                )
+                mtp_hidden = torch.stack(
+                    [row[:, -1:] for row in target_hidden_rows], dim=0
+                )  # [B, 1, H]
+                return first_drafts, mtp_hidden
+
+        class _DeviceSeedDraft:
+            def __init__(self) -> None:
+                self.seed_kind: list[str] = []
+                self.seed_values: list[int] = []
+
+            def replay_batch(self, slots, seed_tokens, seed_hiddens, start_positions):
+                del seed_hiddens, start_positions
+                self.seed_kind = [
+                    "tensor" if isinstance(seed, torch.Tensor) else "int"
+                    for seed in seed_tokens
+                ]
+                self.seed_values = [int(seed.item()) for seed in seed_tokens]
+                return {
+                    slot: [(value + 1) % _VOCAB, (value + 2) % _VOCAB]
+                    for slot, value in zip(slots, self.seed_values)
+                }
+
+        engine._batched_sync = _RaggedSync()
+        engine._draft_cg = _DeviceSeedDraft()
+        for slot in (0, 1):
+            engine._caches[slot].seq_len = 2
+            engine._sync_len[slot] = 2
+
+        h0 = torch.tensor([[[13.0], [14.0]]], dtype=torch.float32)
+        h1 = torch.tensor([[[23.0], [24.0]]], dtype=torch.float32)
+        first_by_slot = engine._sync_real_suffix_batch_ragged(
+            [0, 1],
+            [[11, 12], [21, 22]],
+            [h0, h1],
+        )
+        # Device seeds, not host ints, leave the sync phase.
+        assert isinstance(first_by_slot[0][0], torch.Tensor)
+        assert first_by_slot[0][0].item() == 13
+        assert isinstance(first_by_slot[1][0], torch.Tensor)
+        assert first_by_slot[1][0].item() == 23
+
+        first_drafts = [first_by_slot[slot][0] for slot in (0, 1)]
+        first_hiddens = torch.cat([first_by_slot[slot][1] for slot in (0, 1)], dim=0)
+        next_drafts = engine._continue_draft_batch(
+            [0, 1], first_drafts, first_hiddens
+        )
+        assert next_drafts == {0: [13, 14, 15], 1: [23, 24, 25]}
+        assert engine._draft_cg.seed_kind == ["tensor", "tensor"]
+        assert engine._draft_cg.seed_values == [13, 23]
+
     def test_equal_acceptance_lengths_fall_back_to_one_grouped_batched_sync(self) -> None:
         """The pre-ragged grouped fast path remains a valid fallback."""
         backend, model = _backend(num_slots=2)

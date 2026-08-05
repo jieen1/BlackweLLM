@@ -168,6 +168,15 @@ class TestReplayFillDiscipline:
         for source in sources:
             assert ".numpy()" not in source
 
+    def test_draft_fill_stages_device_seeds_with_a_direct_copy(self) -> None:
+        """The ragged-sync fast path hands the draft graph device seed rows;
+        staging must be a D2D ``copy_`` from the tensor, not a host
+        ``tolist()`` round-trip (measured host gap 5-15 ms/round at 128K)."""
+        fill_source = inspect.getsource(Qwen36MTPDraftCudaGraph._fill)
+        assert "isinstance(seed_tokens, torch.Tensor)" in fill_source
+        assert "all(isinstance(token, torch.Tensor) for token in seed_tokens)" in fill_source
+        assert "input_ids[:, 0].copy_(seed_tokens, non_blocking=True)" in fill_source
+
     def test_step_loops_reuse_graph_owned_cache_seqlens_buffer(self) -> None:
         sources = (
             inspect.getsource(Qwen36MTPDraftCudaGraph._forward_all_steps),

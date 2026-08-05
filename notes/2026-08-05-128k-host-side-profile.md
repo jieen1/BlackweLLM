@@ -124,7 +124,41 @@ profile 开关外逐字节一致）。因此剖析结论可外推回无 profile 
 每完成一步：重启服务（`setsid` + 环境变量文件）→ 跑 128K c3 warm 一轮
 验证 → 记录阶段分布与端到端数字 → 更新本 note 与 fixture → 提交。
 
-## 7. 相关
+## 7. 已落地优化（2026-08-06 凌晨，提交 `94e4f59` 之后）
+
+### 7.1 `_prefix_hash` 用 `array('I')` 打包（已实现，待实测）
+
+原实现逐 token `buf += int(tok).to_bytes(4, ...)`，128K 时实测 **8.3 ms**；
+改 `array("I", token_ids[:length])` + 一次 `tobytes()` 后 **1.1 ms**（7.5×）。
+这个调用在 decode 热路径上每 block 边界 checkpoint 一次（128K 下约每 2 轮），
+是 commit_loop 20-30 ms 尖峰的主要可确认成分（克隆本身实测只有 0.42 ms，
+不是尖峰来源——与交接时的假设不同，已用微基准排除）。
+
+### 7.2 sync→draft seed token 改 device 直连（已实现，待实测）
+
+`_sync_real_suffix_batch_ragged` 不再对 `first_drafts` 调 `.tolist()`：
+返回 device 行，`_continue_draft_batch` 把 device seed 直接 D2D 拷进 draft
+图自己的 `input_ids`（`Qwen36MTPDraftCudaGraph._fill` 新增 tensor 分支），
+host int 转换推迟到 draft replay 之后（此时流已同步，`.tolist()` 不再引入
+新的阻塞点）。每轮省掉一次 mid-round D2H + H2D 往返（实测 5-15 ms 级主机
+空档，nsys 里表现为 20-80 ms 的 GPU 空闲尖峰）。
+
+兼容性：`replay_batch`/`_continue_draft_batch` 同时接受 `list[int]` 与
+device tensor；eager 与旧 stub 路径不受影响。新增
+`test_ragged_sync_hands_device_seeds_to_the_draft_graph_without_tolist`
+（引擎层）与 `test_draft_fill_stages_device_seeds_with_a_direct_copy`
+（源码纪律层）两个回归测试；相关 125 个单测通过，ruff 通过。
+
+### 7.3 明确的非目标（本轮不做的）
+
+* checkpoint 克隆 arena：实测 32 次 `.clone()` 只要 0.42 ms，不是 30 ms
+  尖峰来源，不做（避免改变 `capture_recurrent_state` 返回语义的风险）。
+* `accept_decision` 的 43 ms 是 verify 图 GPU 执行（42 ms），要动只能改
+  split-KV/KWIDE 数值路径，质量锚点单独验证，不顺手改。
+* verify fill 的 `prepare_kv_writes` 每轮每槽只覆盖 1 个逻辑页，
+  passthrough 时约 0.1-0.3 ms，不是瓶颈。
+
+## 8. 相关
 
 * `runtime/round_profile.py` —— env 门控的阶段计时器（本轮新增）。
 * `runtime/backends/qwen36_mtp.py` / `server/engine.py` —— 阶段计时埋点。
