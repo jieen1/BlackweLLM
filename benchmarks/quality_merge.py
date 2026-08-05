@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Merge multiple quality_regression reports (each possibly holding a subset of
 dimensions) into a single report. Useful when dimensions are run separately
-(e.g. fast dims now, slow code gen later, or our-runtime vs vllm in pieces).
+(e.g. fast dims now, slow code gen later, or separate parallel runs).
 
 Usage:
   python benchmarks/quality_merge.py --label our_runtime \

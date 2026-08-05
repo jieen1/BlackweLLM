@@ -9,10 +9,9 @@ capability (see notes/2026-07-22-quality-baseline-and-official-scores.md):
   agent    -> multi-turn tool-use loop accuracy    (proxy: tau2-bench / Claw-Eval)
   longctx  -> Needle-in-a-Haystack retrieval       (proxy: 262K native context)
 
-Runs against any OpenAI-compatible server. The SAME harness is run on our custom
-runtime and on the original model served by stock vLLM; quality_compare.py then
-enforces non-regression. No network downloads: tool/agent/longctx sets are built
-inline; code uses the already-cached evalplus dataset.
+Runs against any OpenAI-compatible server, targeting our custom runtime.
+No network downloads: tool/agent/longctx sets are built inline; code uses the
+already-cached evalplus dataset.
 
 Usage:
   python benchmarks/quality_regression.py --base-url http://localhost:8000/v1 \
@@ -35,7 +34,42 @@ import urllib.request
 
 DEFAULT_MAX_TOKENS_CODE = 4096
 DEFAULT_MAX_TOKENS = 2048
-REQUEST_TIMEOUT = 600
+REQUEST_TIMEOUT = 3600
+
+
+def _load_ckpt(path):
+    """Load a per-dimension jsonl checkpoint into {item_id: record}."""
+    done = {}
+    if path and os.path.exists(path):
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                rec = json.loads(line)
+                done[rec["id"]] = rec
+    return done
+
+
+def _append_ckpt(path, item_id, record):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps({"id": item_id, **record}) + "\n")
+
+
+def _strip_ckpt(record):
+    return {k: v for k, v in record.items() if k != "id"}
+
+
+def _ckpt_done(record):
+    if record is None or record.get("error"):
+        return False
+    if "content" in record:
+        # A code record whose whole token budget was consumed by thinking
+        # arrives as {"content": ""}; treating it as done silently skips the
+        # problem on resume, so require a non-empty answer here.
+        return bool(record["content"] and str(record["content"]).strip())
+    return "ok" in record or "name_ok" in record
 
 
 def chat(base_url, model, messages, max_tokens=DEFAULT_MAX_TOKENS, temperature=0.0,
@@ -170,9 +204,10 @@ def _args_match(got_json, expected):
     return True
 
 
-def run_tool(base_url, model, concurrency):
+def run_tool(base_url, model, concurrency, ckpt_path=None):
     tools = _build_tools()
     items = list(enumerate(TOOL_SPECS))
+    done = _load_ckpt(ckpt_path)
 
     def one(item):
         idx, (name, _params, query, expected) = item
@@ -196,7 +231,17 @@ def run_tool(base_url, model, concurrency):
             return {"idx": idx, "name_ok": False, "args_ok": False,
                     "expected": name, "got": None, "error": str(e), "query": query}
 
-    results = _parallel(one, items, concurrency)
+    missing = [it for it in items if not _ckpt_done(done.get(it[0]))]
+    if done:
+        print(f"    [tool] checkpoint: {len(done)}/{len(items)} "
+              f"done, generating {len(missing)}", flush=True)
+
+    def _save(r):
+        done[r["idx"]] = r
+        _append_ckpt(ckpt_path, r["idx"], r)
+
+    _parallel(one, missing, concurrency, on_done=_save) if missing else []
+    results = [_strip_ckpt(done[i]) for i, _ in items]
     n = len(results)
     name_acc = sum(r["name_ok"] for r in results) / n
     full_acc = sum(r["name_ok"] and r["args_ok"] for r in results) / n
@@ -243,8 +288,12 @@ AGENT_SCENARIOS = [
 ]
 
 
-def run_agent(base_url, model, concurrency):
-    def one(sc):
+def run_agent(base_url, model, concurrency, ckpt_path=None):
+    items = list(enumerate(AGENT_SCENARIOS))
+    done = _load_ckpt(ckpt_path)
+
+    def one(item):
+        idx, sc = item
         try:
             resp = chat(base_url, model, [{"role": "user", "content": sc["q"]}],
                         max_tokens=DEFAULT_MAX_TOKENS, tools=AGENT_TOOLS)
@@ -253,9 +302,9 @@ def run_agent(base_url, model, concurrency):
             if not tcs:
                 # maybe answered directly
                 content = (msg.get("content") or "")
-                return {"ok": sc["answer"] in re.sub(r"[^\d]", "", content) or
-                        sc["answer"] in content, "called_tool": False,
-                        "q": sc["q"], "final": content[:120]}
+                return idx, {"ok": sc["answer"] in re.sub(r"[^\d]", "", content) or
+                             sc["answer"] in content, "called_tool": False,
+                             "q": sc["q"], "final": content[:120]}
             expr = json.loads(tcs[0]["function"].get("arguments", "{}")).get(
                 "expression", sc["expr_hint"])
             result = _calc(expr)
@@ -267,12 +316,25 @@ def run_agent(base_url, model, concurrency):
             ], max_tokens=DEFAULT_MAX_TOKENS)
             final = message_of(resp2).get("content") or ""
             ok = sc["answer"] in final.replace(",", "")
-            return {"ok": ok, "called_tool": True, "q": sc["q"],
-                    "expr": expr, "tool_result": result, "final": final[:160]}
+            return idx, {"ok": ok, "called_tool": True, "q": sc["q"],
+                         "expr": expr, "tool_result": result,
+                         "final": final[:160]}
         except Exception as e:  # noqa: BLE001
-            return {"ok": False, "called_tool": False, "q": sc["q"], "error": str(e)}
+            return idx, {"ok": False, "called_tool": False, "q": sc["q"],
+                         "error": str(e)}
 
-    results = _parallel(one, AGENT_SCENARIOS, concurrency)
+    missing = [it for it in items if not _ckpt_done(done.get(it[0]))]
+    if done:
+        print(f"    [agent] checkpoint: {len(done)}/{len(items)} "
+              f"done, generating {len(missing)}", flush=True)
+
+    def _save(item):
+        idx, rec = item
+        done[idx] = rec
+        _append_ckpt(ckpt_path, idx, rec)
+
+    _parallel(one, missing, concurrency, on_done=_save) if missing else []
+    results = [_strip_ckpt(done[i]) for i, _ in items]
     n = len(results)
     acc = sum(r["ok"] for r in results) / n
     tool_rate = sum(r["called_tool"] for r in results) / n
@@ -303,8 +365,8 @@ def _build_haystack(approx_tokens, needle, depth_frac):
     return hay[:pos] + f"\n>>> {needle} <<<\n" + hay[pos:]
 
 
-def run_longctx(base_url, model, concurrency, lengths=(8192, 32768, 65536, 131072),
-                depths=(0.0, 0.5, 0.95)):
+def run_longctx(base_url, model, concurrency, ckpt_path=None,
+                lengths=(8192, 32768, 65536, 131072), depths=(0.0, 0.5, 0.95)):
     rng = random.Random(1234)
     cases = []
     for length in lengths:
@@ -313,8 +375,11 @@ def run_longctx(base_url, model, concurrency, lengths=(8192, 32768, 65536, 13107
             needle = f"The magic number is {secret}."
             cases.append({"length": length, "depth": depth, "secret": str(secret),
                           "needle": needle})
+    items = list(enumerate(cases))
+    done = _load_ckpt(ckpt_path)
 
-    def one(c):
+    def one(item):
+        idx, c = item
         try:
             haystack = _build_haystack(c["length"], c["needle"], c["depth"])
             prompt = (
@@ -327,14 +392,26 @@ def run_longctx(base_url, model, concurrency, lengths=(8192, 32768, 65536, 13107
             content = message_of(resp).get("content") or ""
             prompt_tokens = resp.get("usage", {}).get("prompt_tokens", -1)
             ok = c["secret"] in re.sub(r"[^\d]", " ", content)
-            return {"length": c["length"], "depth": c["depth"], "ok": ok,
-                    "secret": c["secret"], "prompt_tokens": prompt_tokens,
-                    "answer": content[:80]}
+            return idx, {"length": c["length"], "depth": c["depth"], "ok": ok,
+                         "secret": c["secret"], "prompt_tokens": prompt_tokens,
+                         "answer": content[:80]}
         except Exception as e:  # noqa: BLE001
-            return {"length": c["length"], "depth": c["depth"], "ok": False,
-                    "error": str(e)}
+            return idx, {"length": c["length"], "depth": c["depth"], "ok": False,
+                         "error": str(e)}
 
-    results = _parallel(one, cases, min(concurrency, 2), progress_every=1)
+    missing = [it for it in items if not _ckpt_done(done.get(it[0]))]
+    if done:
+        print(f"    [longctx] checkpoint: {len(done)}/{len(items)} "
+              f"done, generating {len(missing)}", flush=True)
+
+    def _save(item):
+        idx, rec = item
+        done[idx] = rec
+        _append_ckpt(ckpt_path, idx, rec)
+
+    _parallel(one, missing, min(concurrency, 4), progress_every=1,
+              on_done=_save) if missing else []
+    results = [_strip_ckpt(done[i]) for i, _ in items]
     n = len(results)
     acc = sum(r["ok"] for r in results) / n
     by_length = {}
@@ -350,13 +427,14 @@ def run_longctx(base_url, model, concurrency, lengths=(8192, 32768, 65536, 13107
 # --------------------------------------------------------------------------- #
 # Dimension: code (evalplus HumanEval+, cached dataset)
 # --------------------------------------------------------------------------- #
-def run_code(base_url, model, concurrency, max_tokens, workdir):
+def run_code(base_url, model, concurrency, max_tokens, workdir, ckpt_path=None):
     from evalplus.data import get_human_eval_plus
     from evalplus.sanitize import sanitize
     dataset = get_human_eval_plus()
     prefix = ("Please provide a self-contained Python script that solves the "
               "following problem in a markdown code block:")
     items = list(dataset.items())
+    done = _load_ckpt(ckpt_path)
 
     def one(kv):
         task_id, task = kv
@@ -365,15 +443,37 @@ def run_code(base_url, model, concurrency, max_tokens, workdir):
         try:
             resp = chat(base_url, model, [{"role": "user", "content": msg}],
                         max_tokens=max_tokens)
-            content = message_of(resp).get("content") or ""
-            return task_id, content
+            m = message_of(resp)
+            content = m.get("content") or ""
+            reasoning = m.get("reasoning_content") or ""
+            # Reconstruct the raw generation (thinking + final answer) so
+            # sanitize() sees exactly what the 07-21 HumanEval harness saw:
+            # that server returned the full generation as ``content``. The
+            # current server splits it into reasoning_content/content; with
+            # thinking-mode code tasks the code often lives in the reasoning
+            # span while ``content`` is empty (max_tokens hit mid-think).
+            return task_id, reasoning + content
         except Exception as e:  # noqa: BLE001
             print(f"    [code] {task_id} error: {e}", flush=True)
             return task_id, None
 
+    missing = [kv for kv in items if not _ckpt_done(done.get(kv[0]))]
+    if done:
+        print(f"    [code] checkpoint: {len(done)}/{len(items)} "
+              f"done, generating {len(missing)}", flush=True)
     t0 = time.time()
-    results = _parallel(one, items, concurrency, progress_every=20)
-    solutions = {tid: c for tid, c in results if c is not None}
+
+    def _save(kv):
+        task_id, content = kv
+        if content is None:
+            return
+        done[task_id] = {"content": content}
+        _append_ckpt(ckpt_path, task_id, {"content": content})
+
+    _parallel(one, missing, concurrency, progress_every=20,
+              on_done=_save) if missing else []
+    solutions = {tid: rec.get("content") for tid, rec in done.items()
+                 if rec.get("content") is not None}
     os.makedirs(workdir, exist_ok=True)
     samples = os.path.join(workdir, "humaneval_plus_samples.jsonl")
     with open(samples, "w") as f:
@@ -384,6 +484,11 @@ def run_code(base_url, model, concurrency, max_tokens, workdir):
             f.write(json.dumps({"task_id": task_id, "solution": san}) + "\n")
     print(f"  [code] generated {len(solutions)}/{len(dataset)} in "
           f"{time.time()-t0:.0f}s; evaluating pass@1 ...", flush=True)
+    if len(solutions) < len(dataset):
+        print(f"  [code] INCOMPLETE ({len(solutions)}/{len(dataset)}) -- "
+              f"evaluation deferred; rerun the same command to resume "
+              f"(checkpoint {ckpt_path})", flush=True)
+        raise SystemExit(2)
     eval_json = _evalplus_evaluate(samples)
     base_acc, plus_acc = _parse_evalplus(eval_json)
     print(f"  [code] HumanEval pass@1={base_acc:.3f} HumanEval+ pass@1={plus_acc:.3f}")
@@ -398,7 +503,10 @@ def _evalplus_evaluate(samples_path):
         [sys.executable, "-m", "evalplus.evaluate",
          "--dataset", "humaneval", "--samples", samples_path],
         check=True, capture_output=True, text=True)
-    return samples_path + "_eval_results.json"
+    # evalplus strips the .jsonl suffix before appending _eval_results.json,
+    # so "x.jsonl" becomes "x_eval_results.json".
+    stem = samples_path[:-len(".jsonl")] if samples_path.endswith(".jsonl") else samples_path
+    return stem + "_eval_results.json"
 
 
 def _parse_evalplus(path):
@@ -417,14 +525,17 @@ def _parse_evalplus(path):
 
 
 # --------------------------------------------------------------------------- #
-def _parallel(fn, items, concurrency, progress_every=0):
+def _parallel(fn, items, concurrency, progress_every=0, on_done=None):
     results = []
     done = 0
     t0 = time.time()
     with cf.ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
         futs = [ex.submit(fn, it) for it in items]
         for fut in cf.as_completed(futs):
-            results.append(fut.result())
+            r = fut.result()
+            results.append(r)
+            if on_done is not None:
+                on_done(r)
             done += 1
             if progress_every and (done % progress_every == 0 or done == len(items)):
                 rate = done / max(1e-6, time.time() - t0)
@@ -443,25 +554,37 @@ def main():
     p.add_argument("--concurrency", type=int, default=4)
     p.add_argument("--max-tokens-code", type=int, default=DEFAULT_MAX_TOKENS_CODE)
     p.add_argument("--code-workdir", default="evalplus_results/quality")
+    p.add_argument("--workdir", default="",
+                   help="checkpoint dir for incremental resume "
+                        "(default: <out>.work)")
     args = p.parse_args()
 
     dims = [d.strip() for d in args.dims.split(",") if d.strip()]
     print(f"Quality regression: label={args.label} model={args.model} "
           f"url={args.base_url} dims={dims}", flush=True)
+    workdir = args.workdir or (os.path.splitext(args.out)[0] + ".work")
+    os.makedirs(workdir, exist_ok=True)
+    code_workdir = args.code_workdir or workdir
     report = {"label": args.label, "model": args.model, "base_url": args.base_url,
               "date": datetime.datetime.now().isoformat(), "dims": {}}
 
     if "tool" in dims:
-        report["dims"]["tool"] = run_tool(args.base_url, args.model, args.concurrency)
+        report["dims"]["tool"] = run_tool(
+            args.base_url, args.model, args.concurrency,
+            os.path.join(workdir, "tool.jsonl"))
     if "agent" in dims:
-        report["dims"]["agent"] = run_agent(args.base_url, args.model, args.concurrency)
+        report["dims"]["agent"] = run_agent(
+            args.base_url, args.model, args.concurrency,
+            os.path.join(workdir, "agent.jsonl"))
     if "longctx" in dims:
         report["dims"]["longctx"] = run_longctx(args.base_url, args.model,
-                                                args.concurrency)
+                                                args.concurrency,
+                                                os.path.join(workdir, "longctx.jsonl"))
     if "code" in dims:
         report["dims"]["code"] = run_code(args.base_url, args.model,
                                           args.concurrency, args.max_tokens_code,
-                                          args.code_workdir)
+                                          code_workdir,
+                                          os.path.join(workdir, "code_raw.jsonl"))
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
@@ -474,8 +597,13 @@ def _print_summary(report):
     print("\n=== SUMMARY ===")
     d = report["dims"]
     if "code" in d:
-        print(f"  code    HumanEval={d['code']['humaneval_pass_at_1']:.3f} "
-              f"HumanEval+={d['code']['humaneval_plus_pass_at_1']:.3f}")
+        code = d["code"]
+        base = code.get("humaneval_pass_at_1")
+        plus = code.get("humaneval_plus_pass_at_1")
+        if base is None or plus is None:
+            print(f"  code    incomplete ({code.get('generated')}/{code.get('n')})")
+        else:
+            print(f"  code    HumanEval={base:.3f} HumanEval+={plus:.3f}")
     if "tool" in d:
         print(f"  tool    full_acc={d['tool']['accuracy']:.3f} "
               f"name_acc={d['tool']['name_accuracy']:.3f}")

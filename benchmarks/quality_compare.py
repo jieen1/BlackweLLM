@@ -3,7 +3,7 @@
 
 Exits non-zero if any dimension regresses beyond its tolerance. Used to ensure
 large changes do not silently degrade inference quality of the custom runtime
-relative to the original model (served by stock vLLM) on the identical harness.
+relative to an earlier baseline on the identical harness.
 
 Tolerances are absolute fractions and intentionally small-but-forgiving because
 greedy decoding on tiny self-contained sets has run-to-run noise:
@@ -15,7 +15,7 @@ greedy decoding on tiny self-contained sets has run-to-run noise:
 Usage:
   python benchmarks/quality_compare.py \
       --candidate evalplus_results/quality/our_runtime.json \
-      --baseline  evalplus_results/quality/vllm_baseline.json
+      --baseline  evalplus_results/quality/baseline.json
 """
 import argparse
 import json

@@ -169,6 +169,8 @@ SERVER_MTP_K = int(os.environ.get("QSR_SERVER_MTP_K", "4"))
 # back to its own QSR_SERVER_MTP_RESYNC-driven default (also off).
 _mtp_resync_env = os.environ.get("QSR_SERVER_MTP_RESYNC")
 SERVER_MTP_RESYNC = None if _mtp_resync_env is None else _mtp_resync_env != "0"
+SERVER_REQUEST_TIMEOUT_S = float(
+    os.environ.get("QSR_SERVER_REQUEST_TIMEOUT_S", "600"))
 # T0-3/E4 (docs/roadmap.md §7 D1): reasoning/thinking contract. "expose"
 # (default) surfaces a <think> block as OpenAI message.reasoning_content /
 # delta.reasoning_content, and Anthropic's non-standard top-level
@@ -424,6 +426,7 @@ async def lifespan(app: FastAPI):
         enable_mtp=SERVER_ENABLE_MTP,
         mtp_num_speculative_tokens=SERVER_MTP_K,
         mtp_resync=SERVER_MTP_RESYNC,
+        request_timeout_s=SERVER_REQUEST_TIMEOUT_S,
         gpu_memory_utilization=SERVER_GPU_MEM_UTIL,
         production=SERVER_PRODUCTION,
     )

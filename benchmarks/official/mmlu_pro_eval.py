@@ -12,7 +12,7 @@ Methodology (matches the original MMLU-Pro paper / lm-eval `mmlu_pro` task):
     reasoning_content, then last standalone "(X)").
 
 The model is queried through an OpenAI-compatible chat endpoint, so this runs
-against either our custom runtime or stock vLLM unchanged.
+against our custom runtime unchanged.
 
 Usage:
   python benchmarks/official/mmlu_pro_eval.py --base-url http://localhost:8000/v1 \
@@ -23,6 +23,7 @@ Usage:
 import argparse
 import concurrent.futures as cf
 import datetime
+import glob
 import json
 import os
 import re
@@ -34,7 +35,7 @@ ANS_RE = re.compile(r"answer\s*is\s*\(?([A-J])\)?", re.I)
 PAREN_RE = re.compile(r"\(([A-J])\)")
 
 
-def chat(base_url, model, prompt, max_tokens, temperature=0.0, timeout=600,
+def chat(base_url, model, prompt, max_tokens, temperature=0.0, timeout=3600,
          chat_template_kwargs=None):
     body = {
         "model": model,
@@ -96,6 +97,31 @@ def extract_answer(content, reasoning):
     return None
 
 
+def build_report(records, model, base_url, limit, max_tokens, thinking):
+    n = len(records)
+    overall = sum(r["correct"] for r in records) / n if n else 0.0
+    per_cat = {}
+    cats = sorted({r["category"] for r in records})
+    for c in cats:
+        sub = [r for r in records if r["category"] == c]
+        per_cat[c] = {"acc": round(sum(r["correct"] for r in sub) / len(sub), 4),
+                      "n": len(sub)}
+    trunc = sum(1 for r in records if r["finish_reason"] == "length")
+    noans = sum(1 for r in records if r["pred"] is None)
+    return {
+        "benchmark": "MMLU-Pro", "official_qwen36_27b": 86.2,
+        "model": model, "base_url": base_url,
+        "date": datetime.datetime.now().isoformat(),
+        "n": n, "subset": "full" if not limit else f"stratified-{n}",
+        "methodology": "5-shot CoT, category-matched, greedy, last 'answer is (X)'",
+        "thinking": "off" if not thinking else "on",
+        "max_tokens": max_tokens,
+        "accuracy": round(overall * 100, 2),
+        "per_category": per_cat,
+        "truncated": trunc, "no_answer_extracted": noans,
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--base-url", required=True)
@@ -109,7 +135,36 @@ def main():
                    help="send chat_template_kwargs={enable_thinking:False} (needs server fix)")
     p.add_argument("--checkpoint", default="",
                    help="jsonl path for incremental results (auto if empty)")
+    p.add_argument("--shards", type=int, default=1,
+                   help="run as shard N of --shards parallel workers")
+    p.add_argument("--shard-idx", type=int, default=0)
+    p.add_argument("--merge", action="store_true",
+                   help="merge <out>.shard*.jsonl into the final report (no eval)")
     args = p.parse_args()
+
+    if args.merge:
+        shard_glob = args.out.replace(".json", ".shard*.jsonl")
+        paths = sorted(glob.glob(shard_glob))
+        if not paths:
+            print(f"merge: no shard checkpoints found for {shard_glob}", flush=True)
+            raise SystemExit(2)
+        records = []
+        for path in paths:
+            with open(path) as f:
+                records.extend(json.loads(line) for line in f if line.strip())
+        print(f"merge: loaded {len(records)} records from {len(paths)} shard(s)",
+              flush=True)
+        report = build_report(records, args.model, args.base_url, args.limit,
+                              args.max_tokens, not args.no_thinking)
+        os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+        with open(args.out, "w") as f:
+            json.dump(report, f, indent=2)
+        print(f"\n=== MMLU-Pro accuracy = {report['accuracy']} "
+              f"(official Qwen3.6-27B = 86.2) ===", flush=True)
+        print(f"truncated={report['truncated']} "
+              f"no_answer={report['no_answer_extracted']}", flush=True)
+        print(f"Saved -> {args.out}", flush=True)
+        return
 
     from datasets import load_dataset
     print("Loading TIGER-Lab/MMLU-Pro ...", flush=True)
@@ -127,17 +182,38 @@ def main():
         per = defaultdict(list)
         for ex in items:
             per[ex["category"]].append(ex)
-        ratio = args.limit / len(items)
+        # Largest-remainder apportionment: floor quotas first, then give the
+        # remaining seats to the categories with the largest fractional parts.
+        # This reproduces the historical 414-question subset exactly (the
+        # plain int() truncation only yields 408 and is NOT comparable to the
+        # 2026-07-22 baseline: e.g. math 47, physics 45, chemistry 39, ...).
+        total = args.limit
+        quota = {cat: len(exs) * total / len(items) for cat, exs in per.items()}
+        alloc = {cat: int(q) for cat, q in quota.items()}
+        remain = total - sum(alloc.values())
+        frac_order = sorted(
+            quota, key=lambda c: (quota[c] - int(quota[c]), len(per[c])),
+            reverse=True)
+        for cat in frac_order[:remain]:
+            alloc[cat] += 1
         items = []
         for cat, exs in per.items():
-            items.extend(exs[:max(1, int(len(exs) * ratio))])
-        items = items[:args.limit]
+            items.extend(exs[:alloc[cat]])
+    if args.shards > 1:
+        if not (0 <= args.shard_idx < args.shards):
+            raise SystemExit(f"--shard-idx {args.shard_idx} out of range "
+                             f"0..{args.shards - 1}")
+        items = [ex for i, ex in enumerate(items) if i % args.shards == args.shard_idx]
     print(f"Evaluating {len(items)} questions "
           f"({'full set' if not args.limit else 'stratified subset'}), "
-          f"concurrency={args.concurrency}, max_tokens={args.max_tokens}", flush=True)
+          f"concurrency={args.concurrency}, max_tokens={args.max_tokens}, "
+          f"shard={args.shard_idx}/{args.shards}", flush=True)
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    ckpt = args.checkpoint or (args.out.replace(".json", ".jsonl"))
+    suffix = f".shard{args.shard_idx}" if args.shards > 1 else ""
+    ckpt = args.checkpoint or (args.out.replace(".json", f"{suffix}.jsonl"))
+    report_out = args.out.replace(".json", f"{suffix}.json") if args.shards > 1 \
+        else args.out
     done = {}
     if os.path.exists(ckpt):
         with open(ckpt) as f:
@@ -194,35 +270,16 @@ def main():
                       f"({rate:.2f} q/s, ETA {eta/60:.1f}m)", flush=True)
     ckpt_f.close()
 
-    n = len(results)
-    overall = sum(r["correct"] for r in results) / n
-    per_cat = {}
-    cats = sorted({r["category"] for r in results})
-    for c in cats:
-        sub = [r for r in results if r["category"] == c]
-        per_cat[c] = {"acc": round(sum(r["correct"] for r in sub) / len(sub), 4),
-                      "n": len(sub)}
-    trunc = sum(1 for r in results if r["finish_reason"] == "length")
-    noans = sum(1 for r in results if r["pred"] is None)
-    report = {
-        "benchmark": "MMLU-Pro", "official_qwen36_27b": 86.2,
-        "model": args.model, "base_url": args.base_url,
-        "date": datetime.datetime.now().isoformat(),
-        "n": n, "subset": "full" if not args.limit else f"stratified-{n}",
-        "methodology": "5-shot CoT, category-matched, greedy, last 'answer is (X)'",
-        "thinking": "off" if args.no_thinking else "on",
-        "max_tokens": args.max_tokens,
-        "accuracy": round(overall * 100, 2),
-        "per_category": per_cat,
-        "truncated": trunc, "no_answer_extracted": noans,
-    }
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    with open(args.out, "w") as f:
+    report = build_report(results, args.model, args.base_url, args.limit,
+                          args.max_tokens, not args.no_thinking)
+    os.makedirs(os.path.dirname(report_out) or ".", exist_ok=True)
+    with open(report_out, "w") as f:
         json.dump(report, f, indent=2)
     print(f"\n=== MMLU-Pro accuracy = {report['accuracy']} "
           f"(official Qwen3.6-27B = 86.2) ===", flush=True)
-    print(f"truncated={trunc} no_answer={noans}", flush=True)
-    print(f"Saved -> {args.out}", flush=True)
+    print(f"truncated={report['truncated']} "
+          f"no_answer={report['no_answer_extracted']}", flush=True)
+    print(f"Saved -> {report_out}", flush=True)
 
 
 if __name__ == "__main__":
