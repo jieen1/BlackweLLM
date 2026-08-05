@@ -120,6 +120,29 @@ passes, 18 new, 20 regressions; raw length distributions equivalent), not
 truncation. Historical methodology:
 [`notes/2026-07-22-quality-baseline-and-official-scores.md`](notes/2026-07-22-quality-baseline-and-official-scores.md).
 
+### Qwen3.6 server performance grid (2026-08-05)
+
+Full server-side context × concurrency grid on the best serving profile
+(MTP K=3, decode + MTP CUDA Graphs, persistent prefix cache, FP8 e4m3 KV,
+GPU util 0.92, 3×256K; parameters identical to the historical runs): 5 strict
+context lengths (4K/32K/64K/128K/250K served tokens, block-aligned) × 3
+concurrencies, 15/15 cells complete with no errors. Every WARM wave hit the
+persistent cache (`restores == concurrency`); the 250K cold→warm TTFT dropped
+~316 s → ~0.48 s (~656×). Decode throughput with MTP on is no longer a
+regression vs the MTP-off CG anchor (4K: 67.9/64.7/65.8 tok/s at c=1/2/3 vs
+28.56/47.71/68.59 at c=1/2/4).
+
+Running the grid uncovered and fixed two stacked persistent-cache bugs
+(per-slot chunked prefill bypassed COW and overwrote shared scratch KV bytes;
+live-slot committed aliases could not be evicted, so the 250K store silently
+failed). Both are covered by new regression tests; full suite green.
+
+Evidence: [`notes/2026-08-05-server-perf-grid-mtp-cg-prefix.md`](notes/2026-08-05-server-perf-grid-mtp-cg-prefix.md) ·
+harness: [`benchmarks/server_perf_grid.py`](benchmarks/server_perf_grid.py)
+(per-cell resumable) ·
+results: [`benchmarks/fixtures/server_perf_grid_20260805_v2.json`](benchmarks/fixtures/server_perf_grid_20260805_v2.json)
+(pre-fix failure kept as `server_perf_grid_20260805.json`).
+
 For **Laguna-S-2.1**, the live gates are the DFlash acceptance regression,
 the production CUDA Graph gate, and a bit-level router oracle — all run through
 `bfdiag`.
