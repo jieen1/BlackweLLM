@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -66,8 +67,10 @@ assert runtime.__file__.startswith(_REPO_ROOT), (
 )
 
 import torch  # noqa: E402
+from torch import nn  # noqa: E402
 
 from bfdiag.divergence.logit_agreement import (  # noqa: E402
+    CALIBRATED_THRESHOLDS,
     UNCALIBRATED_THRESHOLDS,
     AgreementReport,
     WorkloadAgreement,
@@ -78,6 +81,13 @@ from bfdiag.divergence.logit_agreement import (  # noqa: E402
 from bfdiag.divergence.qwen36_bug_injection import injected, parse_injection  # noqa: E402
 from bfdiag.divergence.qwen36_capture import Qwen36EngineCaptureSource  # noqa: E402
 from bfdiag.divergence.scan import scan_layers  # noqa: E402
+from runtime.model.compressed_tensors_linear import (  # noqa: E402
+    QSR_EMULATE_FP8_ACTIVATION_ENV,
+    QSR_NATIVE_W8A8_FP8_CHANNEL_ENV,
+    QSR_NATIVE_W8A8_QUANT_ENV,
+    QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV,
+    CompressedTensorsFP8ChannelLinear,
+)
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 
 DEVICE = torch.device("cuda")
@@ -110,6 +120,196 @@ DEFAULT_CONFIGS: tuple[str, ...] = (
     "gdn-state-decay:1e-3",
     "gdn-state-decay:1e-4",
 )
+
+
+class _MarlinW8A16Layer(nn.Module):
+    """Offline-only holder for a checkpoint-native FP8 linear.
+
+    vLLM's Marlin source is used here only as a numerical/performance oracle
+    while a no-vLLM kernel is being ported.  This object owns all packed
+    copies, so mutating it cannot modify the runtime module before that
+    module is replaced by the candidate closure below.
+    """
+
+    def __init__(self, linear: CompressedTensorsFP8ChannelLinear) -> None:
+        super().__init__()
+        self.input_size_per_partition = linear.input_size
+        self.output_size_per_partition = linear.output_size
+        self.orig_dtype = torch.bfloat16
+        self.weight_block_size = None
+        self.logical_widths = [linear.output_size]
+        self.weight = nn.Parameter(linear.weight.detach().clone(), requires_grad=False)
+        self.weight_scale = nn.Parameter(
+            linear.weight_scale.detach().clone(), requires_grad=False
+        )
+        self.register_parameter(
+            "bias",
+            None
+            if linear.bias is None
+            else nn.Parameter(linear.bias.detach().clone(), requires_grad=False),
+        )
+        self.register_parameter("input_scale", None)
+
+
+def install_marlin_w8a16_oracle(model) -> int:
+    """Replace FP8 linears with an offline BF16-activation/FP8-weight oracle.
+
+    This deliberately lives in a diagnostic script, not ``runtime/``.  It
+    validates the exact packing, scale and accumulation contract of the
+    eventual native backend against the saved HF trajectory, while keeping
+    the production no-vLLM import boundary intact.  The candidate never
+    builds ``_weight_bf16``; once each private packed copy exists, the model's
+    original raw FP8 storage is dropped to keep this single-GPU experiment
+    below the card's memory budget.
+    """
+    try:
+        from vllm.model_executor.layers.quantization.utils.marlin_utils_fp8 import (
+            apply_fp8_marlin_linear,
+            prepare_fp8_layer_for_marlin,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "--marlin-w8a16-oracle needs the local vLLM oracle environment; "
+            "it is not a runtime dependency"
+        ) from exc
+
+    replaced = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, CompressedTensorsFP8ChannelLinear):
+            continue
+        if module.weight.data.numel() == 0:
+            raise RuntimeError(
+                f"{name}: raw FP8 weight was already released; reload with "
+                "keep_fp8_raw_weights=True"
+            )
+        if module._weight_bf16 is not None:
+            raise RuntimeError(
+                f"{name}: BF16 FP8 cache already exists; oracle setup must run before a forward"
+            )
+
+        packed = _MarlinW8A16Layer(module)
+        prepare_fp8_layer_for_marlin(packed, size_k_first=False)
+
+        def marlin_forward(x, *, _packed=packed, _apply=apply_fp8_marlin_linear):
+            return _apply(
+                input=x,
+                weight=_packed.weight,
+                weight_scale=_packed.weight_scale,
+                workspace=_packed.workspace,
+                size_n=_packed.output_size_per_partition,
+                size_k=_packed.input_size_per_partition,
+                input_dtype=None,
+                bias=_packed.bias,
+            )
+
+        # _call_impl invokes an instance attribute as ``forward(*args)``;
+        # unlike a class method this closure intentionally receives no self.
+        module.forward = marlin_forward
+        module.weight.data = module.weight.data.new_empty(0)
+        # Retain the packed tensor strongly without registering it as a child
+        # module (which would make a diagnostic implementation look like a
+        # production model component in state_dict walks).
+        object.__setattr__(module, "_marlin_w8a16_oracle", packed)
+        replaced += 1
+
+    if not replaced:
+        raise RuntimeError("Marlin oracle found no FP8-channel Linears")
+    torch.cuda.empty_cache()
+    print(f"installed offline Marlin W8A16 oracle on {replaced} FP8 Linears")
+    return replaced
+
+
+def install_cutlass_w8a8_oracle(model) -> int:
+    """Install the historical FP8xFP8 CUTLASS arithmetic as an offline oracle.
+
+    Qwen3.6's standard checkpoint declares dynamic per-token E4M3
+    activations and channel-wise E4M3 weights.  This is the contract used by
+    the pre-removal vLLM path, not the BF16-dequant compatibility fallback.
+    The oracle keeps the checkpoint weight storage in its required column
+    major ``[K, N]`` view and expands only its small per-output scale vector
+    to FP32, as CUTLASS requires.  It never constructs ``_weight_bf16``.
+
+    It is intentionally diagnostic-only: importing vLLM here lets the full
+    B1 trajectory prove the historical arithmetic before its CUDA source is
+    re-homed behind the runtime's own extension.
+    """
+    try:
+        from vllm import _custom_ops as ops
+    except ImportError as exc:
+        raise RuntimeError(
+            "--cutlass-w8a8-oracle needs the local vLLM oracle environment; "
+            "it is not a runtime dependency"
+        ) from exc
+
+    replaced = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, CompressedTensorsFP8ChannelLinear):
+            continue
+        if module.weight.data.numel() == 0:
+            raise RuntimeError(
+                f"{name}: raw FP8 weight was already released; reload with "
+                "keep_fp8_raw_weights=True"
+            )
+        if module._weight_bf16 is not None:
+            raise RuntimeError(
+                f"{name}: BF16 FP8 cache already exists; oracle setup must run before a forward"
+            )
+
+        # CUTLASS consumes B as column-major [K, N].  Do not make this
+        # transpose contiguous: stride(0)==1 is the kernel's physical-layout
+        # contract.  The scale conversion is exact for checkpoint BF16 values
+        # and costs only O(N), not O(K*N) persistent BF16 weight memory.
+        weight_kn = module.weight.detach().t()
+        scale_n = module.weight_scale.detach().t().to(torch.float32).contiguous()
+        bias = module.bias
+        input_size = module.input_size
+        output_size = module.output_size
+
+        def cutlass_forward(
+            x,
+            *,
+            _ops=ops,
+            _weight_kn=weight_kn,
+            _scale_n=scale_n,
+            _bias=bias,
+            _input_size=input_size,
+            _output_size=output_size,
+        ):
+            if x.shape[-1] != _input_size:
+                raise RuntimeError(
+                    f"CUTLASS W8A8 oracle input width {x.shape[-1]} != {_input_size}"
+                )
+            flat_x = x.reshape(-1, _input_size).contiguous()
+            x_fp8, x_scale = _ops.scaled_fp8_quant(
+                flat_x, None, use_per_token_if_dynamic=True
+            )
+            out = _ops.cutlass_scaled_mm(
+                x_fp8,
+                _weight_kn,
+                scale_a=x_scale,
+                scale_b=_scale_n,
+                out_dtype=x.dtype,
+                bias=_bias,
+            )
+            return out.reshape(*x.shape[:-1], _output_size)
+
+        # A transpose view keeps the original raw storage alive after the
+        # registered parameter is released.  This mirrors production's future
+        # ownership model without adding a second full-matrix copy.
+        module.forward = cutlass_forward
+        module.weight.data = module.weight.data.new_empty(0)
+        object.__setattr__(
+            module,
+            "_cutlass_w8a8_oracle",
+            (weight_kn, scale_n),
+        )
+        replaced += 1
+
+    if not replaced:
+        raise RuntimeError("CUTLASS oracle found no FP8-channel Linears")
+    torch.cuda.empty_cache()
+    print(f"installed offline CUTLASS W8A8 oracle on {replaced} FP8 Linears")
+    return replaced
 
 
 def _logits_for(model, token_ids: torch.Tensor, state) -> torch.Tensor:
@@ -256,23 +456,43 @@ def measure_nll(model, token_ids: list[int]) -> tuple[float, int]:
 
 
 def run_config(
-    model, reference: dict, spec, workloads: list[str], steps: int | None, output_dir: Path
+    model,
+    reference: dict,
+    spec,
+    workloads: list[str],
+    steps: int | None,
+    output_dir: Path,
+    *,
+    emulate_fp8_activation: bool = False,
+    marlin_w8a16_oracle: bool = False,
+    cutlass_w8a8_oracle: bool = False,
+    torch_w8a8_oracle: bool = False,
+    native_w8a8_oracle: bool = False,
+    native_w8a8_quant_oracle: bool = False,
 ) -> dict:
     started = time.time()
     with injected(model, spec):
-        agreements = []
-        capture_gaps: list[int] = []
-        scans = []
-        for name in workloads:
-            entry = reference["workloads"][name]
-            agreement, gaps = measure_workload(model, name, entry, steps)
-            agreements.append(agreement)
-            capture_gaps.extend(gaps)
-            scans.append(layer_scan(model, name, entry))
-        nll_total, nll_count = measure_nll(model, list(reference["nll"]["token_ids"]))
+        if emulate_fp8_activation:
+            os.environ[QSR_EMULATE_FP8_ACTIVATION_ENV] = "1"
+        try:
+            agreements = []
+            capture_gaps: list[int] = []
+            scans = []
+            for name in workloads:
+                entry = reference["workloads"][name]
+                agreement, gaps = measure_workload(model, name, entry, steps)
+                agreements.append(agreement)
+                capture_gaps.extend(gaps)
+                scans.append(layer_scan(model, name, entry))
+            nll_total, nll_count = measure_nll(model, list(reference["nll"]["token_ids"]))
+        finally:
+            if emulate_fp8_activation:
+                os.environ.pop(QSR_EMULATE_FP8_ACTIVATION_ENV, None)
 
     hf_nll_mean = float(reference["nll"]["mean"])
     our_nll_mean = nll_total / nll_count
+    nll_relative_excess = (our_nll_mean - hf_nll_mean) / hf_nll_mean
+    min_logits_cosine = min(s["logits_cosine"] for s in scans)
     report = AgreementReport(
         workloads=tuple(agreements),
         metadata={
@@ -280,19 +500,32 @@ def run_config(
             "steps_per_workload": steps,
             "capture_top_k": CAPTURE_TOP_K,
             "gap_top_k": GAP_TOP_K,
+            "emulate_fp8_activation": emulate_fp8_activation,
+            "marlin_w8a16_oracle": marlin_w8a16_oracle,
+            "cutlass_w8a8_oracle": cutlass_w8a8_oracle,
+            "torch_w8a8_oracle": torch_w8a8_oracle,
+            "native_w8a8_oracle": native_w8a8_oracle,
+            "native_w8a8_quant_oracle": native_w8a8_quant_oracle,
             "tokens_outside_capture": capture_gaps,
             "layer_scan": scans,
             "nll_mean_ours": our_nll_mean,
             "nll_mean_hf": hf_nll_mean,
-            "nll_relative_excess": (our_nll_mean - hf_nll_mean) / hf_nll_mean,
+            "nll_relative_excess": nll_relative_excess,
             "ppl_ours": float(torch.tensor(our_nll_mean).exp()),
             "ppl_hf": float(torch.tensor(hf_nll_mean).exp()),
             "elapsed_s": time.time() - started,
         },
+        nll_relative_excess=nll_relative_excess,
+        min_logits_cosine=min_logits_cosine,
     )
-    passed, reasons = passes_b1r_gate(report, UNCALIBRATED_THRESHOLDS)
-    report.metadata["uncalibrated_gate_passed"] = passed
-    report.metadata["uncalibrated_gate_reasons"] = list(reasons)
+    calibrated_passed, calibrated_reasons = passes_b1r_gate(report, CALIBRATED_THRESHOLDS)
+    report.metadata["calibrated_gate_passed"] = calibrated_passed
+    report.metadata["calibrated_gate_reasons"] = list(calibrated_reasons)
+    uncalibrated_passed, uncalibrated_reasons = passes_b1r_gate(
+        report, UNCALIBRATED_THRESHOLDS
+    )
+    report.metadata["uncalibrated_gate_passed"] = uncalibrated_passed
+    report.metadata["uncalibrated_gate_reasons"] = list(uncalibrated_reasons)
 
     safe = str(spec).replace(":", "_").replace(".", "p")
     report.save(output_dir / f"{safe}.json")
@@ -311,6 +544,8 @@ def run_config(
         "min_hidden_cosine": min(s["min_hidden_cosine"] for s in scans),
         "logits_cosine": min(s["logits_cosine"] for s in scans),
         "tokens_outside_capture": len(capture_gaps),
+        "calibrated_gate_passed": calibrated_passed,
+        "calibrated_gate_reasons": list(calibrated_reasons),
         "elapsed_s": report.metadata["elapsed_s"],
     }
 
@@ -348,7 +583,90 @@ def main() -> None:
     parser.add_argument("--configs", type=str, default=None)
     parser.add_argument("--selfcheck", action="store_true")
     parser.add_argument("--selfcheck-steps", type=int, default=32)
+    parser.add_argument(
+        "--emulate-fp8-activation",
+        action="store_true",
+        help=(
+            "evaluate the FP8 W8A8 activation-round-trip lower-bound candidate against "
+            "the HF reference; production remains unchanged"
+        ),
+    )
+    parser.add_argument(
+        "--marlin-w8a16-oracle",
+        action="store_true",
+        help=(
+            "offline-only BF16-activation/native-FP8 Marlin oracle; validates the "
+            "future no-vLLM W8A16 backend against the HF trajectory"
+        ),
+    )
+    parser.add_argument(
+        "--cutlass-w8a8-oracle",
+        action="store_true",
+        help=(
+            "offline-only historical FP8-activation/FP8-weight CUTLASS oracle; "
+            "validates the future no-vLLM W8A8 backend against the HF trajectory"
+        ),
+    )
+    parser.add_argument(
+        "--torch-w8a8-oracle",
+        action="store_true",
+        help=(
+            "exercise the runtime's all-layer raw-FP8 torch._scaled_mm candidate; "
+            "no vLLM import or BF16 FP8 weight cache"
+        ),
+    )
+    parser.add_argument(
+        "--native-w8a8-oracle",
+        action="store_true",
+        help=(
+            "exercise the self-owned SM120 all-layer raw-FP8 W8A8 candidate; "
+            "no vLLM import or BF16 FP8 weight cache"
+        ),
+    )
+    parser.add_argument(
+        "--native-w8a8-quant-oracle",
+        action="store_true",
+        help=(
+            "exercise the self-owned fused activation quantizer followed by the "
+            "runtime's raw-FP8 torch._scaled_mm GEMM; no BF16 FP8 weight cache"
+        ),
+    )
     args = parser.parse_args()
+
+    candidates = (
+        args.emulate_fp8_activation,
+        args.marlin_w8a16_oracle,
+        args.cutlass_w8a8_oracle,
+        args.torch_w8a8_oracle,
+        args.native_w8a8_oracle,
+        args.native_w8a8_quant_oracle,
+    )
+    if sum(candidates) > 1:
+        parser.error("FP8 candidate oracle flags are mutually exclusive")
+
+    assert QSR_EMULATE_FP8_ACTIVATION_ENV not in os.environ, (
+        f"{QSR_EMULATE_FP8_ACTIVATION_ENV} is already set; this script owns the candidate "
+        "switch so the reference meaning cannot be silently inverted"
+    )
+    assert QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV not in os.environ, (
+        f"{QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV} is already set; use "
+        "--torch-w8a8-oracle so this report records the selected path"
+    )
+    assert QSR_NATIVE_W8A8_FP8_CHANNEL_ENV not in os.environ, (
+        f"{QSR_NATIVE_W8A8_FP8_CHANNEL_ENV} is already set; use --native-w8a8-oracle "
+        "so this report records the selected path"
+    )
+    assert QSR_NATIVE_W8A8_QUANT_ENV not in os.environ, (
+        f"{QSR_NATIVE_W8A8_QUANT_ENV} is already set; use "
+        "--native-w8a8-quant-oracle so this report records the selected path"
+    )
+    if args.torch_w8a8_oracle:
+        os.environ[QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV] = "all"
+    if args.native_w8a8_oracle:
+        os.environ[QSR_NATIVE_W8A8_FP8_CHANNEL_ENV] = "all"
+    if args.native_w8a8_quant_oracle:
+        os.environ[QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV] = "all"
+        os.environ[QSR_NATIVE_W8A8_QUANT_ENV] = "1"
 
     print("torch:", torch.__version__, "device:", torch.cuda.get_device_name(0))
     torch.set_grad_enabled(False)
@@ -363,9 +681,28 @@ def main() -> None:
 
     t0 = time.time()
     model = load_qwen36_model(
-        reference["model_path"], device="cuda", dtype=torch.bfloat16, max_seq_len=MAX_SEQ_LEN
+        reference["model_path"],
+        device="cuda",
+        dtype=torch.bfloat16,
+        max_seq_len=MAX_SEQ_LEN,
+        keep_fp8_raw_weights=(
+            args.marlin_w8a16_oracle
+            or args.cutlass_w8a8_oracle
+            or args.torch_w8a8_oracle
+            or args.native_w8a8_oracle
+            or args.native_w8a8_quant_oracle
+        ),
     )
     print(f"load_qwen36_model: {time.time() - t0:.1f}s")
+
+    if args.marlin_w8a16_oracle:
+        t0 = time.time()
+        install_marlin_w8a16_oracle(model)
+        print(f"prepare Marlin W8A16 oracle: {time.time() - t0:.1f}s")
+    elif args.cutlass_w8a8_oracle:
+        t0 = time.time()
+        install_cutlass_w8a8_oracle(model)
+        print(f"prepare CUTLASS W8A8 oracle: {time.time() - t0:.1f}s")
 
     if args.selfcheck:
         print("\n-- selfcheck: forced-with-own-tokens must equal free-running --")
@@ -374,7 +711,20 @@ def main() -> None:
     rows = []
     for spec in specs:
         print(f"\n-- {spec} --")
-        row = run_config(model, reference, spec, workloads, args.steps, args.output_dir)
+        row = run_config(
+            model,
+            reference,
+            spec,
+            workloads,
+            args.steps,
+            args.output_dir,
+            emulate_fp8_activation=args.emulate_fp8_activation,
+            marlin_w8a16_oracle=args.marlin_w8a16_oracle,
+            cutlass_w8a8_oracle=args.cutlass_w8a8_oracle,
+            torch_w8a8_oracle=args.torch_w8a8_oracle,
+            native_w8a8_oracle=args.native_w8a8_oracle,
+            native_w8a8_quant_oracle=args.native_w8a8_quant_oracle,
+        )
         rows.append(row)
         print(
             f"  gap_max={row['max_gap_error']:.4g} p99={row['p99_gap_error']:.4g} "

@@ -111,30 +111,6 @@ from bfdiag.divergence.scan import scan_layers  # noqa: E402
 from runtime.checkpoints import standard_checkpoint_path  # noqa: E402
 from runtime.model_loading import _build_qwen36_model_config, load_qwen36_model  # noqa: E402
 
-# checkpoint-unify-20260803 KNOWN GAP -- read before trusting a run against
-# this default: this script's disk-staging path (``_NEVER_STAGED_SUFFIXES``/
-# ``stage_dequantized_weights_to_disk`` below) hardcodes modelopt's suffix
-# set (``.weight``/``.weight_scale``/``.weight_scale_2``/``.input_scale``).
-# The standard checkpoint's NVFP4 MLP parameters use compressed-tensors'
-# different suffixes instead (``.weight_packed``/``.weight_scale``/
-# ``.weight_global_scale``) -- ``.weight_packed`` does not end with
-# ``".weight"`` so it skips the dequant-cache branch, and neither it nor
-# ``.weight_global_scale`` is in ``_NEVER_STAGED_SUFFIXES``, so both get
-# staged as raw (non-dequantized) tensors under names HF's plain
-# ``nn.Linear`` does not have. ``load_staged_weights_into_hf`` then reports
-# them ``missing`` and leaves every NVFP4-quantized HF Linear (i.e. every
-# MLP gate/up/down_proj) at random init -- NOT a crash, a silently
-# meaningless comparison.
-#
-# ``stage_dequantized_weights_to_disk`` now REFUSES this case outright
-# (raises ``NotImplementedError`` on any ``.weight_packed`` parameter)
-# rather than relying on whoever runs it next having read this comment.
-# So the gap is contained, not merely documented: the script cannot
-# silently produce a meaningless PASS/FAIL. It still needs the real fix --
-# extending the staging suffix set for compressed-tensors NVFP4 -- before
-# B1 can grade the standard checkpoint at all; that is a staging-logic
-# change, out of scope for a checkpoint-*path* migration. Until then, run
-# against ``runtime.checkpoints.modelopt_checkpoint_path()``.
 MODEL_PATH = standard_checkpoint_path()
 MAX_NEW_TOKENS = 512
 DEVICE = torch.device("cuda")
@@ -153,19 +129,21 @@ WORKLOADS: tuple[tuple[str, str], ...] = (
     ),
 )
 
-#: Real parameter suffixes that only exist on this runtime's side (the
-#: quantized-scale metadata) -- never staged, never expected on HF's side.
-#: ``.input_scale`` joined this list 2026-08-03: ``ModelOptFP8Linear`` grew
-#: a real ``input_scale`` Parameter (see its docstring) that this runtime's
-#: own FP8 kernel path reads directly, but HF's plain ``nn.Linear`` has no
-#: activation-scale equivalent to load it into, same as the other two.
-#:
-#: MODELOPT-ONLY -- see the "checkpoint-unify-20260803 KNOWN GAP" comment
-#: above ``MODEL_PATH``: this suffix set does not cover compressed-tensors'
-#: ``.weight_packed``/``.weight_global_scale``, so staging against the
-#: standard checkpoint currently drops every NVFP4 MLP weight silently
-#: rather than erroring.
-_NEVER_STAGED_SUFFIXES = (".weight_scale", ".weight_scale_2", ".input_scale")
+#: Quantization metadata has no matching HF ``nn.Linear`` Parameter.  The
+#: two NVFP4 formats differ: modelopt uses ``weight``/``weight_scale_2``;
+#: compressed-tensors uses ``weight_packed``/``weight_global_scale``.  The
+#: logical BF16 value of the latter is staged as ``.weight`` below.
+_NEVER_STAGED_SUFFIXES = (
+    ".weight_scale",
+    ".weight_scale_2",
+    ".weight_global_scale",
+    ".input_global_scale",
+    ".input_scale",
+    # Runtime-only FP8 KV-cache descales.  HF keeps K/V in its own cache
+    # representation and exposes no matching model Parameters.
+    ".k_scale",
+    ".v_scale",
+)
 
 
 def _staged_filename(param_name: str) -> str:
@@ -191,40 +169,16 @@ def stage_dequantized_weights_to_disk(mine: torch.nn.Module, scratch_dir: Path) 
     against a CPU-scale 2-layer toy model (28/28 parameters, exact value
     match) before ever running at the real 27B scale.
 
-    Returns the list of staged parameter names (``.weight_scale``/
-    ``.weight_scale_2`` excluded -- HF has no quantized-scale equivalent
-    to load them into).
+    Returns HF-compatible staged parameter names.  In particular, a
+    compressed-tensors ``.weight_packed`` parameter becomes the dequantized
+    ``.weight`` of the matching HF ``nn.Linear``.  The runtime module's own
+    ``_ensure_ready`` remains the only implementation of the checkpoint's
+    format-specific dequantization convention.
     """
     modules_by_path = dict(mine.named_modules())
 
-    # Refuse rather than stage a comparison we know is meaningless. See the
-    # KNOWN GAP note above MODEL_PATH: this function's suffix set is
-    # modelopt's, so a compressed-tensors checkpoint's `.weight_packed`
-    # would be staged raw under a name HF's plain nn.Linear does not have,
-    # `load_staged_weights_into_hf` would report it missing, and every
-    # NVFP4 MLP Linear in the reference model would stay at random init --
-    # producing a PASS/FAIL that means nothing, without crashing.
-    #
-    # A comment alone does not stop that; whoever runs this next will not
-    # have read it. This repo's own precedent for "the runtime cannot
-    # honor this request" is to fail loudly rather than proceed silently
-    # (see N1: json_schema is rejected with a 400 instead of being accepted
-    # and left unconstrained). Same choice here.
-    packed = sorted(n for n, _ in mine.named_parameters() if n.endswith(".weight_packed"))
-    if packed:
-        raise NotImplementedError(
-            f"{len(packed)} compressed-tensors parameter(s) end with '.weight_packed' "
-            f"(e.g. {packed[0]}), which this script's disk-staging path cannot handle: "
-            f"_NEVER_STAGED_SUFFIXES and the dequant-cache branch below both encode "
-            f"modelopt's naming ('.weight'/'.weight_scale'/'.weight_scale_2'/"
-            f"'.input_scale'). Staging anyway would leave every NVFP4 MLP Linear in "
-            f"the HF reference model at random init and yield a silently meaningless "
-            f"result. Extend the staging suffix set for compressed-tensors NVFP4 "
-            f"first, or run this script against the modelopt checkpoint "
-            f"(runtime.checkpoints.modelopt_checkpoint_path) while that is pending."
-        )
-
     staged: list[str] = []
+    staged_set: set[str] = set()
     for name, param in mine.named_parameters():
         if name.endswith(_NEVER_STAGED_SUFFIXES):
             continue
@@ -233,15 +187,25 @@ def stage_dequantized_weights_to_disk(mine: torch.nn.Module, scratch_dir: Path) 
         ensure_ready = getattr(module, "_ensure_ready", None) if module is not None else None
 
         value = param.data
-        if name.endswith(".weight") and ensure_ready is not None:
+        staged_name = name
+        if name.endswith((".weight", ".weight_packed")) and ensure_ready is not None:
             ensure_ready()
             cached = getattr(module, "_weight_bf16", None)
             if cached is not None:
                 value = cached
+                staged_name = f"{module_path}.weight"
+        if name.endswith(".weight_packed") and staged_name == name:
+            raise RuntimeError(
+                f"{name} is packed but its module did not provide a BF16 cache "
+                "after _ensure_ready()"
+            )
+        if staged_name in staged_set:
+            raise RuntimeError(f"duplicate staged HF parameter name: {staged_name}")
 
         cpu_value = value.detach().to("cpu", torch.bfloat16).clone()
-        torch.save(cpu_value, scratch_dir / _staged_filename(name))
-        staged.append(name)
+        torch.save(cpu_value, scratch_dir / _staged_filename(staged_name))
+        staged.append(staged_name)
+        staged_set.add(staged_name)
         del cpu_value
 
         # Release immediately -- this is the memory this function exists
@@ -421,11 +385,10 @@ def main() -> None:
             f"build_hf_reference_on_device + load: {time.time() - t0:.1f}s, "
             f"loaded={len(loaded)} missing={len(missing)}"
         )
-        if missing:
-            print(
-                f"WARNING: {len(missing)} staged weight(s) not matched into HF, "
-                f"e.g. {missing[:5]!r}"
-            )
+        assert not missing, (
+            f"{len(missing)} staged weight(s) not matched into HF, "
+            f"e.g. {missing[:5]!r}; refusing a partial-reference comparison"
+        )
 
         # -- Step 7: run HF's side's generation + capture for every workload --
         token_results = []
