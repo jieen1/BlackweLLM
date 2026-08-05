@@ -236,12 +236,20 @@ Both Codex CLI and Claude Code can drive this runtime directly, no proxy:
 - **Claude Code** — project `.claude/settings.json` sets
   `ANTHROPIC_BASE_URL = http://127.0.0.1:8300`, `ANTHROPIC_MODEL = qwen3.6`.
   Run `claude -p "<task>"` from the repo root.
+- **Laguna backend** — `.codex/laguna.config.toml` defines profile `laguna`
+  (`base_url = http://127.0.0.1:8100/v1`), and
+  `.claude/settings.laguna.json` points `ANTHROPIC_BASE_URL` at the same port
+  (`ANTHROPIC_MODEL = laguna-s-2.1`). Run
+  `CODEX_HOME="$PWD/.codex" codex exec -p laguna "<task>"` or
+  `claude -p --settings .claude/settings.laguna.json "<task>"`.
 
 Both files are local tooling state and gitignored on purpose; the exact
 contents and end-to-end verification are recorded in
 [`notes/2026-08-05-persistent-prefix-full-hit-fix-and-codex-integration.md`](notes/2026-08-05-persistent-prefix-full-hit-fix-and-codex-integration.md)
 and
-[`notes/2026-08-05-claude-code-via-local-runtime.md`](notes/2026-08-05-claude-code-via-local-runtime.md).
+[`notes/2026-08-05-claude-code-via-local-runtime.md`](notes/2026-08-05-claude-code-via-local-runtime.md),
+plus the Laguna run in
+[`notes/2026-08-05-laguna-codex-cc-e2e.md`](notes/2026-08-05-laguna-codex-cc-e2e.md).
 
 ## Configuration
 
