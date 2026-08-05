@@ -1064,6 +1064,7 @@ async def completions(req: CompletionRequest, request: Request):
         result["completion_tokens"],
         result["finish_reason"],
         time.perf_counter() - t0,
+        ttft_seconds=result.get("prefill_elapsed_s"),
     )
     _debug_log_output(
         "OPENAI /v1/completions",

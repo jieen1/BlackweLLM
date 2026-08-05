@@ -32,6 +32,7 @@ from typing import Any
 from runtime.architecture import ArchitectureSpec, parse_architecture
 from runtime.backends.dflash_constants import NUM_SPECULATIVE_TOKENS
 from runtime.model_registry import IMPLEMENTED_BACKENDS
+from runtime.round_profile import round_profile
 from runtime.sampling import SamplingParams
 from runtime.slot_resource_manager import SlotResourceManager
 from server import metrics
@@ -870,6 +871,7 @@ class ServerEngine:
             logprobs=logprobs,
             top_logprobs=top_logprobs,
         )
+        req._admitted_at = time.perf_counter()
         self._req_deque.append(req)
         try:
             os.write(self._req_pipe_w, b"\x00")
@@ -909,6 +911,7 @@ class ServerEngine:
             logprobs=logprobs,
             top_logprobs=top_logprobs,
         )
+        req._admitted_at = time.perf_counter()
         self._req_deque.append(req)
         try:
             os.write(self._req_pipe_w, b"\x00")
@@ -1049,6 +1052,7 @@ class ServerEngine:
     def _activate_slot(
         self, slot: int, req: GenerationRequest, anchor: int, drafts: list[int]
     ) -> None:
+        req._prefill_done_at = time.perf_counter()
         if not self.production and req.sampling_params.is_greedy:
             self._admission_bootstrap_check(slot, req, anchor)
 
@@ -1207,6 +1211,10 @@ class ServerEngine:
         matched_stop_sequence: str | None = None,
     ) -> None:
         tracer.request_finished(req.request_id, finish_reason)
+        prefill_elapsed = max(
+            0.0,
+            getattr(req, "_prefill_done_at", 0.0) - getattr(req, "_admitted_at", 0.0),
+        )
         result = {
             "committed_token_ids": committed_tokens,
             "finish_reason": finish_reason,
@@ -1214,6 +1222,7 @@ class ServerEngine:
             "prompt_tokens": len(req.prompt_ids),
             "completion_tokens": len(committed_tokens),
             "prefix_cache_hit_tokens": getattr(req, "_prefix_cache_hit_tokens", 0),
+            "prefill_elapsed_s": prefill_elapsed,
         }
         if logprobs_data is not None:
             result["logprobs"] = logprobs_data
@@ -1682,6 +1691,7 @@ class ServerEngine:
                 top_logprobs=top_lp_g,
             )
             _round_ms = (time.perf_counter() - _round_t0) * 1000
+            _bookkeep_t0 = time.perf_counter()
 
             for s in mtp_slots:
                 st = self.active[s]
@@ -1756,6 +1766,10 @@ class ServerEngine:
                     matched_stop_sequence=matched_stop,
                 )
                 newly_finished.append(s)
+
+            round_profile.engine_step(
+                _round_ms, (time.perf_counter() - _bookkeep_t0) * 1000
+            )
 
         for s in newly_finished:
             del self.active[s]

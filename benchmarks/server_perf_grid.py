@@ -47,6 +47,14 @@ Usage:
         --contexts 4k,32k,64k,128k,250k --concurrency 1,2,3 \
         --max-tokens 256 --warm-rounds 1
 
+    # Historical Pattern-B protocol (cached prefix + 10240 fresh suffix,
+    # raw tokenization, no chat template -- matches native_warm_compare):
+    /home/bot/.venvs/vllm/bin/python benchmarks/server_perf_grid.py \
+        --base-url http://127.0.0.1:8300 --model qwen3.6 \
+        --endpoint completions --contexts 64k,128k,200k \
+        --concurrency 1 --max-tokens 256 --warm-rounds 1 \
+        --warm-suffix-tokens 10240 --filler-prefix '9876543210 '
+
 Output: ``benchmarks/fixtures/server_perf_grid_<ts>.json`` (full per-wave
 records: server metric deltas, per-request timestamps, prefix/MTP/CG
 counter deltas).
@@ -76,9 +84,14 @@ from transformers import AutoTokenizer  # noqa: E402
 from runtime.checkpoints import standard_checkpoint_path  # noqa: E402
 
 # Chosen so decode -> re-encode round-trips EXACTLY at any length (verified
-# against the served tokenizer: repeated "0123456789 " tokenizes 1:1, unlike
-# prose fillers which collapse whitespace during decode).
+# against the served tokenizer: repeated digit+space fillers tokenize 1:1,
+# unlike prose fillers which collapse whitespace during decode).
+# ``FILLER`` is the prefix filler; ``SUFFIX_FILLER`` is only used for the
+# optional historical-protocol warm suffix (--warm-suffix-tokens), and is a
+# DIFFERENT digit string so the suffix is genuinely fresh content that is
+# not part of the cached prefix.
 FILLER = "0123456789 "
+SUFFIX_FILLER = "1357902468 "
 
 COUNTER_KEYS = [
     "requests_completed",
@@ -118,9 +131,28 @@ def parse_ctx(value: str) -> int:
     return int(value) * mult
 
 
-def make_prompt(tokenizer, n_tokens: int) -> str:
+def make_prompt(tokenizer, n_tokens: int, filler: str = FILLER) -> str:
     """Return a decoded prompt whose raw tokenization is exactly n_tokens."""
-    chunk = tokenizer.encode(FILLER, add_special_tokens=False)
+    chunk = tokenizer.encode(filler, add_special_tokens=False)
+    ids = (chunk * (n_tokens // len(chunk) + 1))[:n_tokens]
+    assert len(ids) == n_tokens
+    text = tokenizer.decode(ids, skip_special_tokens=True)
+    again = tokenizer.encode(text, add_special_tokens=False)
+    assert len(again) == n_tokens, (len(again), n_tokens)
+    return text
+
+
+def make_suffix(tokenizer, n_tokens: int, filler: str = SUFFIX_FILLER) -> str:
+    """Return fresh suffix text whose raw tokenization is exactly n_tokens.
+
+    The suffix is appended to the prefix on the WARM wave (historical
+    Pattern-B protocol: re-send the cached prefix + a 10240-token NEW
+    suffix, so only the suffix + one partial block is re-prefilled).
+    ``n_tokens == 0`` returns "".
+    """
+    if n_tokens <= 0:
+        return ""
+    chunk = tokenizer.encode(filler, add_special_tokens=False)
     ids = (chunk * (n_tokens // len(chunk) + 1))[:n_tokens]
     assert len(ids) == n_tokens
     text = tokenizer.decode(ids, skip_special_tokens=True)
@@ -145,7 +177,7 @@ def chat_token_count(tokenizer, text: str) -> int:
     return len(ids)
 
 
-def find_raw_for_served(tokenizer, served: int) -> int | None:
+def find_raw_for_served(tokenizer, served: int, filler: str = FILLER) -> int | None:
     """Exact raw prompt length whose served (chat) token count is ``served``.
 
     The chat template's overhead is NOT a constant: at some lengths the
@@ -156,13 +188,15 @@ def find_raw_for_served(tokenizer, served: int) -> int | None:
     exact match.  Returns ``None`` when no raw length maps to ``served``.
     """
     for raw_n in range(max(1, served - 32), served):
-        text = make_prompt(tokenizer, raw_n)
+        text = make_prompt(tokenizer, raw_n, filler)
         if chat_token_count(tokenizer, text) == served:
             return raw_n
     return None
 
 
-def find_prompt_for_target(tokenizer, target: int) -> tuple[int, int]:
+def find_prompt_for_target(
+    tokenizer, target: int, filler: str = FILLER
+) -> tuple[int, int]:
     """``(raw_n, served)`` for the largest reachable block-aligned served
     context at or below ``target``.
 
@@ -173,7 +207,7 @@ def find_prompt_for_target(tokenizer, target: int) -> tuple[int, int]:
     match, so every grid cell is strictly aligned and actually cachable.
     """
     for served in range(target & ~15, max(16, target - 1024), -16):
-        raw_n = find_raw_for_served(tokenizer, served)
+        raw_n = find_raw_for_served(tokenizer, served, filler)
         if raw_n is not None:
             return raw_n, served
     raise RuntimeError(f"no reachable block-aligned served context <= {target}")
@@ -192,18 +226,23 @@ def diff_stats(before: dict, after: dict) -> dict:
     return {k: int(after.get(k, 0)) - int(before.get(k, 0)) for k in before}
 
 
-_METRIC_RE = re.compile(
-    r'^blackwellm:(?P<name>[a-z0-9_]+)\{model_name="[^"]*",endpoint="chat"\} (?P<value>\S+)$'
-)
+def _metric_re_for(endpoint: str) -> re.Pattern[str]:
+    return re.compile(
+        rf'^blackwellm:(?P<name>[a-z0-9_]+)\{{model_name="[^"]*",'
+        rf'endpoint="{endpoint}"\}} (?P<value>\S+)$'
+    )
 
 
-async def scrape_metrics(session: aiohttp.ClientSession, base_url: str) -> dict:
+async def scrape_metrics(
+    session: aiohttp.ClientSession, base_url: str, endpoint: str
+) -> dict:
     out = {k: 0.0 for k in METRIC_KEYS}
     try:
         async with session.get(f"{base_url}/metrics") as resp:
             text = await resp.text()
+        pattern = _metric_re_for(endpoint)
         for line in text.splitlines():
-            m = _METRIC_RE.match(line.strip())
+            m = pattern.match(line.strip())
             if m and m.group("name") in out:
                 out[m.group("name")] = float(m.group("value"))
     except Exception:  # noqa: BLE001
@@ -230,26 +269,57 @@ async def stream_one(
     model: str,
     prompt: str,
     max_tokens: int,
+    endpoint: str = "chat",
 ) -> dict:
-    """Send one streaming chat request; record event timestamps only."""
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "temperature": 0.0,
-        "stream": True,
-    }
+    """Send one request; record event timestamps only.
+
+    ``endpoint="chat"`` uses streaming chat/completions (SSE). 
+    ``endpoint="completions"`` uses the legacy text-completions endpoint
+    (non-streaming JSON): the raw prompt is tokenized WITHOUT the chat
+    template, which is the exact token-array protocol the historical
+    native_warm_compare benchmark used, so a warm P+10240 request shares
+    its first P tokens bit-for-bit with the cold P request.
+    """
+    if endpoint == "completions":
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+        }
+    else:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "stream": True,
+        }
     t0 = time.perf_counter()
     first_t = None
     last_t = None
     error = None
     try:
-        async with session.post(
-            f"{base_url}/v1/chat/completions", json=payload
-        ) as resp:
+        url = (
+            f"{base_url}/v1/completions"
+            if endpoint == "completions"
+            else f"{base_url}/v1/chat/completions"
+        )
+        async with session.post(url, json=payload) as resp:
             if resp.status != 200:
                 body = (await resp.text())[:500]
                 return {"error": f"http {resp.status}: {body}"}
+            if endpoint == "completions":
+                body = await resp.json()
+                wall = time.perf_counter() - t0
+                return {
+                    "error": None,
+                    "ttft_s": None,  # non-streaming: server metrics own TTFT
+                    "last_event_s": round(wall, 4),
+                    "wall_s": round(wall, 4),
+                    "usage_prompt": (body.get("usage") or {}).get("prompt_tokens"),
+                    "usage_completion": (body.get("usage") or {}).get("completion_tokens"),
+                }
             async for line in resp.content:
                 line = line.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data: "):
@@ -339,19 +409,20 @@ async def run_wave(
     max_tokens: int,
     concurrency: int,
     expected_prompt_tokens: int,
+    endpoint: str = "chat",
 ) -> dict:
     before_stats = await get_stats(session, base_url)
-    before_metrics = await scrape_metrics(session, base_url)
+    before_metrics = await scrape_metrics(session, base_url, endpoint)
     t0 = time.perf_counter()
     reqs = await asyncio.gather(
         *[
-            stream_one(session, base_url, model, prompt, max_tokens)
+            stream_one(session, base_url, model, prompt, max_tokens, endpoint)
             for _ in range(concurrency)
         ]
     )
     wall = time.perf_counter() - t0
     after_stats = await get_stats(session, base_url)
-    after_metrics = await scrape_metrics(session, base_url)
+    after_metrics = await scrape_metrics(session, base_url, endpoint)
     summary = wave_summary(
         reqs,
         wall,
@@ -366,11 +437,26 @@ async def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--base-url", default="http://127.0.0.1:8300")
     p.add_argument("--model", default="qwen3.6")
+    p.add_argument("--endpoint", choices=["chat", "completions"], default="chat",
+                   help="chat/completions (SSE, chat template) or the legacy "
+                        "text-completions endpoint (raw tokenization, no "
+                        "template -- the historical token-array protocol)")
     p.add_argument("--contexts", default="4k,32k,64k,128k,250k")
     p.add_argument("--concurrency", default="1,2,3")
     p.add_argument("--max-tokens", type=int, default=256)
     p.add_argument("--warm-rounds", type=int, default=1,
                    help="WARM waves per cell after the COLD populate wave")
+    p.add_argument("--warm-suffix-tokens", type=int, default=0,
+                   help="append this many FRESH tokens to the prompt on WARM "
+                        "waves (historical Pattern-B protocol: cached prefix "
+                        "+ 10240-token new suffix, only the suffix is "
+                        "re-prefilled)")
+    p.add_argument("--filler-prefix", default=FILLER,
+                   help="filler text for the prefix prompt (must tokenize "
+                        "1:1; different fillers isolate cache content)")
+    p.add_argument("--filler-suffix", default=SUFFIX_FILLER,
+                   help="filler text for the warm suffix (must tokenize 1:1 "
+                        "and differ from the prefix filler)")
     p.add_argument("--out", default=None)
     p.add_argument("--resume", action="store_true",
                    help="load a previous partial run from --out (or the "
@@ -394,11 +480,15 @@ async def main() -> None:
         "config": {
             "base_url": args.base_url,
             "model": args.model,
+            "endpoint": args.endpoint,
             "context_labels": context_labels,
             "context_targets": contexts,
             "concurrency": concurrencies,
             "max_tokens": args.max_tokens,
             "warm_rounds": args.warm_rounds,
+            "warm_suffix_tokens": args.warm_suffix_tokens,
+            "filler_prefix": args.filler_prefix,
+            "filler_suffix": args.filler_suffix,
             "tokenizer": standard_checkpoint_path(),
             "server": "qwen36 best profile (MTP K=3 + CUDA Graph + prefix cache + 3x256K)",
         },
@@ -413,13 +503,64 @@ async def main() -> None:
         # length that produces it.
         prompts = {}
         served_ctx = {}
+        suffix_text = make_suffix(
+            tokenizer, args.warm_suffix_tokens, args.filler_suffix
+        )
         for label, target in zip(context_labels, contexts):
-            raw_n, served = find_prompt_for_target(tokenizer, target)
-            prompts[target] = make_prompt(tokenizer, raw_n)
-            served_ctx[target] = served
+            if args.endpoint == "completions":
+                # Raw text-completions protocol: tokenized WITHOUT the chat
+                # template, so the served length IS the target (no template
+                # overhead, no end-of-message token merge). This mirrors the
+                # historical token-array fixtures exactly.
+                prompts[target] = make_prompt(
+                    tokenizer, target, args.filler_prefix
+                )
+                served_ctx[target] = target
+                raw_ids = tokenizer.encode(
+                    prompts[target], add_special_tokens=True
+                )
+                assert len(raw_ids) == target, (label, len(raw_ids), target)
+            else:
+                raw_n, served = find_prompt_for_target(
+                    tokenizer, target, args.filler_prefix
+                )
+                prompts[target] = make_prompt(
+                    tokenizer, raw_n, args.filler_prefix
+                )
+                served_ctx[target] = served
+            if args.warm_suffix_tokens:
+                if args.endpoint == "completions":
+                    pfx_ids = tokenizer.encode(
+                        prompts[target], add_special_tokens=True
+                    )
+                    warm_ids = tokenizer.encode(
+                        prompts[target] + suffix_text, add_special_tokens=True
+                    )
+                    assert len(warm_ids) == len(pfx_ids) + args.warm_suffix_tokens
+                    # The warm request must share its first P tokens with the
+                    # cold request BIT-FOR-BIT, or the persistent cache cannot
+                    # hit (this is exactly what the historical token-array
+                    # protocol guaranteed by construction).
+                    assert warm_ids[: len(pfx_ids)] == pfx_ids, label
+                else:
+                    warm_served = chat_token_count(
+                        tokenizer, prompts[target] + suffix_text
+                    )
+                    assert warm_served == served_ctx[target] + args.warm_suffix_tokens, (
+                        f"{label}: warm served {warm_served} != "
+                        f"prefix {served_ctx[target]} + "
+                        f"suffix {args.warm_suffix_tokens}"
+                    )
         results["config"]["template_overhead_tokens"] = {
-            label: served_ctx[target] - len(
-                tokenizer.encode(prompts[target], add_special_tokens=False)
+            label: (
+                0
+                if args.endpoint == "completions"
+                else served_ctx[target]
+                - len(
+                    tokenizer.encode(
+                        prompts[target], add_special_tokens=False
+                    )
+                )
             )
             for label, target in zip(context_labels, contexts)
         }
@@ -455,7 +596,7 @@ async def main() -> None:
                 expected = served_ctx[ctx] * c
                 cold = await run_wave(
                     session, args.base_url, args.model, prompts[ctx],
-                    args.max_tokens, c, expected,
+                    args.max_tokens, c, expected, args.endpoint,
                 )
                 print(f"  COLD : wall={cold['wall_s']}s "
                       f"prompt={cold['prompt_tokens_total']}/{expected} "
@@ -469,8 +610,11 @@ async def main() -> None:
                 warms = []
                 for _ in range(args.warm_rounds):
                     warm = await run_wave(
-                        session, args.base_url, args.model, prompts[ctx],
-                        args.max_tokens, c, expected,
+                        session, args.base_url, args.model,
+                        prompts[ctx] + suffix_text,
+                        args.max_tokens, c,
+                        (served_ctx[ctx] + args.warm_suffix_tokens) * c,
+                        args.endpoint,
                     )
                     warms.append(warm)
                     print(f"  WARM : wall={warm['wall_s']}s "

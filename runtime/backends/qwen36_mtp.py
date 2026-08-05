@@ -91,6 +91,7 @@ from runtime.mtp_accept import (
     sample_accept_reject,
 )
 from runtime.recurrent_state_pool import spec_row
+from runtime.round_profile import round_profile
 from runtime.sampling import SamplingParams, compute_sampling_distribution, make_generator
 
 if TYPE_CHECKING:
@@ -1049,10 +1050,12 @@ class Qwen36MTPEngine:
         if any(len(drafts_by_slot[slot]) != self.k for slot in slots):
             raise ValueError("batched MTP verify requires the engine's uniform K drafts per slot")
 
+        round_profile.begin_round()
         pool = self.backend.pool
         states = [pool.slot_state(slot) for slot in slots]
         caches = [self._caches[slot] for slot in slots]
         past_lens = [state.num_tokens_seen for state in states]
+        round_profile.phase("setup")
         if any(
             cache.seq_len != self._sync_len[slot] + max(self.k - 1, 0)
             for slot, cache in zip(slots, caches)
@@ -1063,14 +1066,17 @@ class Qwen36MTPEngine:
 
         verify_tokens = [[anchors[slot], *drafts_by_slot[slot]] for slot in slots]
         all_hiddens = self._verify_cg.replay(slots, verify_tokens, past_lens)
+        round_profile.phase("verify_replay")
         self._record_verify_graph_replay(len(slots))
         all_logits = self.model.compute_logits(all_hiddens)
+        round_profile.phase("compute_logits")
         decisions = determine_accept_reject_batch(
             slots,
             {slot: [anchors[slot], *drafts_by_slot[slot]] for slot in slots},
             all_logits.reshape(-1, all_logits.shape[-1]),
             self.k,
         )
+        round_profile.phase("accept_decision")
         results: dict[int, dict[str, Any]] = {}
         sync_slots: list[int] = []
         sync_tokens: list[list[int]] = []
@@ -1109,17 +1115,21 @@ class Qwen36MTPEngine:
                 ]
             results[slot] = result
 
+        round_profile.phase("commit_loop")
         first_by_slot = self._sync_real_suffix_batch_ragged(
             sync_slots, sync_tokens, sync_hidden_rows
         )
+        round_profile.phase("sync_ragged")
         first_drafts = [first_by_slot[slot][0] for slot in slots]
         first_hiddens = [first_by_slot[slot][1] for slot in slots]
 
         next_drafts_by_slot = self._continue_draft_batch(
             slots, first_drafts, torch.cat(first_hiddens, dim=0)
         )
+        round_profile.phase("draft_batch")
         for slot in slots:
             results[slot]["next_draft_tokens"] = next_drafts_by_slot[slot]
 
         self.stats["rounds"] += len(slots)
+        round_profile.end_round(label=f"mtp_round_b{len(slots)}")
         return results

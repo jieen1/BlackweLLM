@@ -1,0 +1,480 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8300",
+    "model": "qwen3.6",
+    "endpoint": "completions",
+    "context_labels": [
+      "64k",
+      "128k"
+    ],
+    "context_targets": [
+      65536,
+      131072
+    ],
+    "concurrency": [
+      4
+    ],
+    "max_tokens": 256,
+    "warm_rounds": 3,
+    "warm_suffix_tokens": 10240,
+    "filler_prefix": "3141592653 ",
+    "filler_suffix": "1357902468 ",
+    "tokenizer": "/home/bot/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/ccdaab7e68af2409599b8949a8f2685703c9bae5",
+    "server": "qwen36 best profile (MTP K=3 + CUDA Graph + prefix cache + 3x256K)",
+    "template_overhead_tokens": {
+      "64k": 0,
+      "128k": 0
+    },
+    "served_context_tokens": {
+      "64k": 65536,
+      "128k": 131072
+    }
+  },
+  "cells": {
+    "65536": {
+      "4": {
+        "context_tokens": 65536,
+        "served_context_tokens": 65536,
+        "concurrency": 4,
+        "cold": {
+          "wall_s": 192.5595,
+          "requests_sent": 4,
+          "requests_ok": 4,
+          "requests_completed_delta": 4,
+          "errors": [],
+          "prompt_tokens_total": 262144,
+          "generation_tokens_total": 1024,
+          "expected_prompt_tokens": 262144,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": 186.6163,
+          "server_mean_decode_tok_per_s": 43.52,
+          "server_e2e_tok_per_s": 1.33,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 5.32,
+          "stats_delta": {
+            "requests_completed": 4,
+            "prefix_cache_hits": 0,
+            "prefix_cache_misses": 4,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 64,
+            "mtp_draft_graph_replays": 68,
+            "mtp_batched_sync_replays": 64,
+            "prefix_persistent_stores": 1,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 0,
+            "checkpoints_taken": 65
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 262144.0,
+            "generation_tokens_total": 1024.0,
+            "e2e_request_latency_seconds_sum": 769.904,
+            "e2e_request_latency_seconds_count": 4.0,
+            "time_to_first_token_seconds_sum": 746.465,
+            "time_to_first_token_seconds_count": 4.0,
+            "request_time_per_output_token_seconds_sum": 0.091919,
+            "request_time_per_output_token_seconds_count": 4.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 30.7144,
+            "requests_sent": 4,
+            "requests_ok": 4,
+            "requests_completed_delta": 4,
+            "errors": [],
+            "prompt_tokens_total": 303104,
+            "generation_tokens_total": 1024,
+            "expected_prompt_tokens": 303104,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 20.724,
+            "server_mean_decode_tok_per_s": 25.76,
+            "server_e2e_tok_per_s": 8.36,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 33.34,
+            "stats_delta": {
+              "requests_completed": 4,
+              "prefix_cache_hits": 4,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 64,
+              "mtp_draft_graph_replays": 68,
+              "mtp_batched_sync_replays": 64,
+              "prefix_persistent_stores": 1,
+              "prefix_persistent_evictions": 1,
+              "prefix_persistent_restores": 4,
+              "checkpoints_taken": 65
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 303104.0,
+              "generation_tokens_total": 1024.0,
+              "e2e_request_latency_seconds_sum": 122.495,
+              "e2e_request_latency_seconds_count": 4.0,
+              "time_to_first_token_seconds_sum": 82.896,
+              "time_to_first_token_seconds_count": 4.0,
+              "request_time_per_output_token_seconds_sum": 0.155288,
+              "request_time_per_output_token_seconds_count": 4.0
+            }
+          },
+          {
+            "wall_s": 6.6788,
+            "requests_sent": 4,
+            "requests_ok": 4,
+            "requests_completed_delta": 4,
+            "errors": [],
+            "prompt_tokens_total": 303104,
+            "generation_tokens_total": 1024,
+            "expected_prompt_tokens": 303104,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.337,
+            "server_mean_decode_tok_per_s": 40.92,
+            "server_e2e_tok_per_s": 38.98,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 153.32,
+            "stats_delta": {
+              "requests_completed": 4,
+              "prefix_cache_hits": 4,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 65,
+              "mtp_draft_graph_replays": 69,
+              "mtp_batched_sync_replays": 65,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 4,
+              "checkpoints_taken": 64
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 303104.0,
+              "generation_tokens_total": 1024.0,
+              "e2e_request_latency_seconds_sum": 26.273,
+              "e2e_request_latency_seconds_count": 4.0,
+              "time_to_first_token_seconds_sum": 1.348,
+              "time_to_first_token_seconds_count": 4.0,
+              "request_time_per_output_token_seconds_sum": 0.097747,
+              "request_time_per_output_token_seconds_count": 4.0
+            }
+          },
+          {
+            "wall_s": 6.1793,
+            "requests_sent": 4,
+            "requests_ok": 4,
+            "requests_completed_delta": 4,
+            "errors": [],
+            "prompt_tokens_total": 303104,
+            "generation_tokens_total": 1024,
+            "expected_prompt_tokens": 303104,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": 0.3197,
+            "server_mean_decode_tok_per_s": 44.74,
+            "server_e2e_tok_per_s": 42.53,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 165.71,
+            "stats_delta": {
+              "requests_completed": 4,
+              "prefix_cache_hits": 4,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 65,
+              "mtp_draft_graph_replays": 69,
+              "mtp_batched_sync_replays": 65,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 4,
+              "checkpoints_taken": 64
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 303104.0,
+              "generation_tokens_total": 1024.0,
+              "e2e_request_latency_seconds_sum": 24.078,
+              "e2e_request_latency_seconds_count": 4.0,
+              "time_to_first_token_seconds_sum": 1.279,
+              "time_to_first_token_seconds_count": 4.0,
+              "request_time_per_output_token_seconds_sum": 0.089408,
+              "request_time_per_output_token_seconds_count": 4.0
+            }
+          }
+        ],
+        "warm_prefix_hit": true
+      }
+    },
+    "131072": {
+      "4": {
+        "context_tokens": 131072,
+        "served_context_tokens": 131072,
+        "concurrency": 4,
+        "cold": {
+          "wall_s": 505.6653,
+          "requests_sent": 4,
+          "requests_ok": 4,
+          "requests_completed_delta": 4,
+          "errors": [],
+          "prompt_tokens_total": 524288,
+          "generation_tokens_total": 1024,
+          "expected_prompt_tokens": 524288,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": 498.678,
+          "server_mean_decode_tok_per_s": 37.28,
+          "server_e2e_tok_per_s": 0.51,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 2.03,
+          "stats_delta": {
+            "requests_completed": 4,
+            "prefix_cache_hits": 0,
+            "prefix_cache_misses": 4,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 64,
+            "mtp_draft_graph_replays": 68,
+            "mtp_batched_sync_replays": 64,
+            "prefix_persistent_stores": 1,
+            "prefix_persistent_evictions": 1,
+            "prefix_persistent_restores": 0,
+            "checkpoints_taken": 65
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 524288.0,
+            "generation_tokens_total": 1024.0,
+            "e2e_request_latency_seconds_sum": 2022.07,
+            "e2e_request_latency_seconds_count": 4.0,
+            "time_to_first_token_seconds_sum": 1994.712,
+            "time_to_first_token_seconds_count": 4.0,
+            "request_time_per_output_token_seconds_sum": 0.107282,
+            "request_time_per_output_token_seconds_count": 4.0
+          }
+        },
+        "warm": [
+          {
+            "wall_s": 0.1568,
+            "requests_sent": 4,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 400: {\"error\":{\"message\":\"prompt_tokens(141312) + max_tokens(256) = 141568 exceeds this runtime's per-slot capacity of 139264 tokens (blocks_per_slot * block_size). Reduce the prompt length or max_tokens and retry.\",\"type\":\"invalid_request_error\"}}"
+              },
+              {
+                "error": "http 400: {\"error\":{\"message\":\"prompt_tokens(141312) + max_tokens(256) = 141568 exceeds this runtime's per-slot capacity of 139264 tokens (blocks_per_slot * block_size). Reduce the prompt length or max_tokens and retry.\",\"type\":\"invalid_request_error\"}}"
+              },
+              {
+                "error": "http 400: {\"error\":{\"message\":\"prompt_tokens(141312) + max_tokens(256) = 141568 exceeds this runtime's per-slot capacity of 139264 tokens (blocks_per_slot * block_size). Reduce the prompt length or max_tokens and retry.\",\"type\":\"invalid_request_error\"}}"
+              },
+              {
+                "error": "http 400: {\"error\":{\"message\":\"prompt_tokens(141312) + max_tokens(256) = 141568 exceeds this runtime's per-slot capacity of 139264 tokens (blocks_per_slot * block_size). Reduce the prompt length or max_tokens and retry.\",\"type\":\"invalid_request_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 565248,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          },
+          {
+            "wall_s": 0.1446,
+            "requests_sent": 4,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 400: {\"error\":{\"message\":\"prompt_tokens(141312) + max_tokens(256) = 141568 exceeds this runtime's per-slot capacity of 139264 tokens (blocks_per_slot * block_size). Reduce the prompt length or max_tokens and retry.\",\"type\":\"invalid_request_error\"}}"
+              },
+              {
+                "error": "http 400: {\"error\":{\"message\":\"prompt_tokens(141312) + max_tokens(256) = 141568 exceeds this runtime's per-slot capacity of 139264 tokens (blocks_per_slot * block_size). Reduce the prompt length or max_tokens and retry.\",\"type\":\"invalid_request_error\"}}"
+              },
+              {
+                "error": "http 400: {\"error\":{\"message\":\"prompt_tokens(141312) + max_tokens(256) = 141568 exceeds this runtime's per-slot capacity of 139264 tokens (blocks_per_slot * block_size). Reduce the prompt length or max_tokens and retry.\",\"type\":\"invalid_request_error\"}}"
+              },
+              {
+                "error": "http 400: {\"error\":{\"message\":\"prompt_tokens(141312) + max_tokens(256) = 141568 exceeds this runtime's per-slot capacity of 139264 tokens (blocks_per_slot * block_size). Reduce the prompt length or max_tokens and retry.\",\"type\":\"invalid_request_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 565248,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          },
+          {
+            "wall_s": 0.1486,
+            "requests_sent": 4,
+            "requests_ok": 0,
+            "requests_completed_delta": 0,
+            "errors": [
+              {
+                "error": "http 400: {\"error\":{\"message\":\"prompt_tokens(141312) + max_tokens(256) = 141568 exceeds this runtime's per-slot capacity of 139264 tokens (blocks_per_slot * block_size). Reduce the prompt length or max_tokens and retry.\",\"type\":\"invalid_request_error\"}}"
+              },
+              {
+                "error": "http 400: {\"error\":{\"message\":\"prompt_tokens(141312) + max_tokens(256) = 141568 exceeds this runtime's per-slot capacity of 139264 tokens (blocks_per_slot * block_size). Reduce the prompt length or max_tokens and retry.\",\"type\":\"invalid_request_error\"}}"
+              },
+              {
+                "error": "http 400: {\"error\":{\"message\":\"prompt_tokens(141312) + max_tokens(256) = 141568 exceeds this runtime's per-slot capacity of 139264 tokens (blocks_per_slot * block_size). Reduce the prompt length or max_tokens and retry.\",\"type\":\"invalid_request_error\"}}"
+              },
+              {
+                "error": "http 400: {\"error\":{\"message\":\"prompt_tokens(141312) + max_tokens(256) = 141568 exceeds this runtime's per-slot capacity of 139264 tokens (blocks_per_slot * block_size). Reduce the prompt length or max_tokens and retry.\",\"type\":\"invalid_request_error\"}}"
+              }
+            ],
+            "prompt_tokens_total": 0,
+            "generation_tokens_total": 0,
+            "expected_prompt_tokens": 565248,
+            "ttft_s_per_request": [],
+            "ttft_median_s": null,
+            "server_mean_ttft_s": null,
+            "server_mean_decode_tok_per_s": null,
+            "server_e2e_tok_per_s": null,
+            "aggregate_decode_window_s": null,
+            "aggregate_decode_tok_per_s": null,
+            "aggregate_e2e_tok_per_s": 0.0,
+            "stats_delta": {
+              "requests_completed": 0,
+              "prefix_cache_hits": 0,
+              "prefix_cache_misses": 0,
+              "prefix_cache_hit_tokens_saved": 0,
+              "decode_rounds": 0,
+              "decode_tokens": 0,
+              "decode_graph_replays": 0,
+              "mtp_verify_graph_replays": 0,
+              "mtp_draft_graph_replays": 0,
+              "mtp_batched_sync_replays": 0,
+              "prefix_persistent_stores": 0,
+              "prefix_persistent_evictions": 0,
+              "prefix_persistent_restores": 0,
+              "checkpoints_taken": 0
+            },
+            "metric_delta": {
+              "prompt_tokens_total": 0.0,
+              "generation_tokens_total": 0.0,
+              "e2e_request_latency_seconds_sum": 0.0,
+              "e2e_request_latency_seconds_count": 0.0,
+              "time_to_first_token_seconds_sum": 0.0,
+              "time_to_first_token_seconds_count": 0.0,
+              "request_time_per_output_token_seconds_sum": 0.0,
+              "request_time_per_output_token_seconds_count": 0.0
+            }
+          }
+        ],
+        "warm_prefix_hit": false
+      }
+    }
+  },
+  "started_at": "2026-08-05T14:03:18.737740+00:00",
+  "server_stats_before": {
+    "requests_completed": 0,
+    "prefix_cache_hits": 0,
+    "prefix_cache_misses": 0,
+    "prefix_cache_hit_tokens_saved": 0,
+    "decode_rounds": 0,
+    "decode_tokens": 0,
+    "decode_graph_replays": 0,
+    "mtp_verify_graph_replays": 0,
+    "mtp_draft_graph_replays": 0,
+    "mtp_batched_sync_replays": 0,
+    "prefix_persistent_stores": 0,
+    "prefix_persistent_evictions": 0,
+    "prefix_persistent_restores": 0,
+    "checkpoints_taken": 0
+  },
+  "server_stats_after": {
+    "requests_completed": 0,
+    "prefix_cache_hits": 0,
+    "prefix_cache_misses": 0,
+    "prefix_cache_hit_tokens_saved": 0,
+    "decode_rounds": 0,
+    "decode_tokens": 0,
+    "decode_graph_replays": 0,
+    "mtp_verify_graph_replays": 0,
+    "mtp_draft_graph_replays": 0,
+    "mtp_batched_sync_replays": 0,
+    "prefix_persistent_stores": 0,
+    "prefix_persistent_evictions": 0,
+    "prefix_persistent_restores": 0,
+    "checkpoints_taken": 0
+  },
+  "finished_at": "2026-08-05T14:14:46.577579+00:00"
+}
