@@ -89,6 +89,29 @@ verify-laguna-router: ## Verify the generated router ABI and dynamic dependencie
 	@! readelf -d $(ROUTER_LIBRARY) | grep -Ei 'libtorch|vllm'
 	@! ldd $(ROUTER_LIBRARY) | grep -Ei 'libtorch|vllm'
 
+FP8_W8A8_SOURCE = runtime/kernels/fp8_w8a8_sm120.cu
+FP8_W8A8_EXPORTS = runtime/kernels/fp8_w8a8_sm120.exports
+FP8_W8A8_GENERATED_DIR = runtime/kernels/_generated
+FP8_W8A8_LIBRARY = $(FP8_W8A8_GENERATED_DIR)/fp8_w8a8_sm120.so
+FP8_W8A8_MANIFEST = $(FP8_W8A8_GENERATED_DIR)/fp8_w8a8_sm120.manifest.json
+CUTLASS_ROOT ?= /home/bot/project/cutlass-4.6.1
+FP8_W8A8_FLAGS = -std=c++17 -O3 --shared -Xcompiler -fPIC -Xcompiler -fvisibility=hidden -diag-suppress=20012,20013,20015 -gencode arch=compute_120f,code=sm_120f -cudart static -Xlinker --version-script=$(FP8_W8A8_EXPORTS) -I$(CUTLASS_ROOT)/include -I$(CUTLASS_ROOT)/tools/util/include
+
+build-fp8-w8a8: ## Build the self-owned SM120 E4M3 W8A8 scaled-GEMM artifact
+	@mkdir -p $(FP8_W8A8_GENERATED_DIR)
+	@set -eu; tmp_library="$(FP8_W8A8_LIBRARY).tmp"; \
+	$(NVCC) $(FP8_W8A8_FLAGS) $(FP8_W8A8_SOURCE) -o "$$tmp_library"; \
+	mv "$$tmp_library" "$(FP8_W8A8_LIBRARY)"
+	@$(PYTHON) -c 'import hashlib,json,subprocess,sys; from pathlib import Path; library=Path(sys.argv[1]); manifest=Path(sys.argv[2]); source=Path(sys.argv[3]); flags=sys.argv[4]; payload={"abi_version":2,"target_sm":"sm_120f","nvcc":subprocess.check_output([sys.argv[5],"--version"],text=True).strip(),"ptxas":subprocess.check_output(["ptxas","--version"],text=True).strip(),"compile_flags":flags,"source_sha256":hashlib.sha256(source.read_bytes()).hexdigest(),"runtime_git_sha":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"library_sha256":hashlib.sha256(library.read_bytes()).hexdigest(),"provenance":{"license":"Apache-2.0","upstream":"vLLM csrc/libtorch_stable/quantization/w8a8/cutlass/c3x","specialization":"Qwen FP8-channel no-bias E4M3 W8A8 per-token/per-channel scaled GEMM"}}; temporary=manifest.with_suffix(".tmp"); temporary.write_text(json.dumps(payload,indent=2,sort_keys=True)+"\n"); temporary.replace(manifest)' "$(FP8_W8A8_LIBRARY)" "$(FP8_W8A8_MANIFEST)" "$(FP8_W8A8_SOURCE)" "$(FP8_W8A8_FLAGS)" "$(NVCC)"
+	@$(MAKE) verify-fp8-w8a8
+
+verify-fp8-w8a8: ## Verify the generated W8A8 ABI and dynamic dependencies
+	@test -f $(FP8_W8A8_LIBRARY)
+	@test -f $(FP8_W8A8_MANIFEST)
+	@nm -D --defined-only $(FP8_W8A8_LIBRARY) | awk '{print $$3}' | grep -Ex 'qsr_fp8_w8a8_(abi_version|dynamic_per_token_quant_sm120|workspace_size_sm120|scaled_mm_sm120)' | wc -l | grep -qx 4
+	@! readelf -d $(FP8_W8A8_LIBRARY) | grep -Ei 'libtorch|vllm'
+	@! ldd $(FP8_W8A8_LIBRARY) | grep -Ei 'libtorch|vllm'
+
 serve: ## Start the OpenAI/Anthropic-compatible server (tune via QSR_* env)
 	$(PYTHON) -m server.app --host $(HOST) --port $(PORT)
 
@@ -99,4 +122,4 @@ clean: ## Remove build and test caches
 	rm -rf .pytest_cache .ruff_cache build dist *.egg-info
 	find . -type d -name __pycache__ -not -path './.venv/*' -exec rm -rf {} + 2>/dev/null || true
 
-.PHONY: help install install-cuda lint format format-check test verify-cuda smoke workloads build-laguna-router verify-laguna-router serve verify-sparkinfer clean
+.PHONY: help install install-cuda lint format format-check test verify-cuda smoke workloads build-laguna-router verify-laguna-router build-fp8-w8a8 verify-fp8-w8a8 serve verify-sparkinfer clean

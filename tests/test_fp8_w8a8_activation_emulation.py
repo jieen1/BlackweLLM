@@ -32,6 +32,10 @@ own convention.
 
 from __future__ import annotations
 
+import os
+import sys
+import types
+
 import pytest
 
 pytest.importorskip("torch")
@@ -43,6 +47,7 @@ from runtime.model.compressed_tensors_linear import (  # noqa: E402
     QSR_EMULATE_FP8_ACTIVATION_ENV,
     CompressedTensorsFP8ChannelLinear,
     emulate_fp8_activation_round_trip,
+    quantize_fp8_activation_per_token,
 )
 
 ENV = QSR_EMULATE_FP8_ACTIVATION_ENV
@@ -129,6 +134,15 @@ class TestFlagOnActuallyChangesForward:
 
 
 class TestRoundTripFunction:
+    def test_split_quantizer_reconstructs_the_round_trip(self):
+        x = _activation(m=3, in_features=16)
+        x_fp8, scale = quantize_fp8_activation_per_token(x)
+
+        reconstructed = (x_fp8.float() * scale).to(x.dtype)
+        assert torch.equal(reconstructed, emulate_fp8_activation_round_trip(x))
+        assert x_fp8.dtype == torch.float8_e4m3fn
+        assert scale.shape == (3, 1)
+
     def test_the_round_trip_actually_changes_a_real_activation(self):
         """A no-op emulation (e.g. a scale computed as 1.0 everywhere, or a
         dtype bug that casts to fp8 and immediately back without ever
@@ -181,3 +195,121 @@ class TestRoundTripFunction:
         x_rt = emulate_fp8_activation_round_trip(x)
         assert x_rt.dtype == x.dtype
         assert x_rt.shape == x.shape
+
+
+class TestExplicitKernelPreflightBoundary:
+    def test_kernel_preflight_rejects_cpu_weights(self):
+        """The experimental GEMM must not become an accidental CPU fallback."""
+        lin = _linear()
+        with pytest.raises(RuntimeError, match="requires CUDA-resident weights"):
+            lin.prepare_fp8_channel_kernel()
+
+    def test_kernel_preflight_rejects_released_raw_weight(self):
+        lin = _linear()
+        lin.free_fp8_raw_weight()
+        with pytest.raises(RuntimeError, match="raw FP8 weight was released"):
+            lin.prepare_fp8_channel_kernel()
+
+
+class TestExplicitKernelPreflightRouting:
+    def test_m1_prefers_fused_channel_epilogue_when_available(self, monkeypatch):
+        lin = _linear(in_features=32, out_features=8)
+        lin._fp8_channel_packed_weight = object()
+        lin._fp8_channel_fused_packed_weight = object()
+        lin._fp8_channel_kernel_weight_scale = torch.ones((1, 8), dtype=torch.float32)
+        monkeypatch.setattr(lin, "prepare_fp8_channel_kernel", lambda: None)
+
+        calls: list[tuple[str, tuple[int, ...]]] = []
+
+        def fake_fused_mm(x_fp8, packed_weight, activation_scale, **kwargs):
+            assert packed_weight is lin._fp8_channel_fused_packed_weight
+            assert activation_scale.shape == (1,)
+            calls.append(("fused", tuple(x_fp8.shape)))
+            return torch.full((x_fp8.shape[0], 8), 5, dtype=torch.bfloat16)
+
+        def fake_linear_mm(*args, **kwargs):
+            calls.append(("fallback", ()))
+            raise AssertionError("M=1 should not hit the fallback path")
+
+        sparkinfer_mod = types.ModuleType("sparkinfer")
+        gemm_mod = types.ModuleType("sparkinfer.gemm")
+        gemm_mod.tensor_fp8_channel_linear = types.SimpleNamespace(mm=fake_fused_mm)
+        gemm_mod.tensor_fp8_linear = types.SimpleNamespace(mm=fake_linear_mm)
+        monkeypatch.setitem(sys.modules, "sparkinfer", sparkinfer_mod)
+        monkeypatch.setitem(sys.modules, "sparkinfer.gemm", gemm_mod)
+
+        x = _activation(m=1, in_features=32)
+        actual = lin.forward_fp8_channel_kernel(x, expected_m=1)
+
+        assert calls == [("fused", (1, 32))]
+        assert torch.equal(actual, torch.full((1, 8), 5, dtype=torch.bfloat16))
+
+    def test_multi_row_preflight_keeps_scalar_fallback(self, monkeypatch):
+        lin = _linear(in_features=32, out_features=4)
+        lin._fp8_channel_packed_weight = object()
+        lin._fp8_channel_fused_packed_weight = object()
+        lin._fp8_channel_kernel_weight_scale = torch.full((1, 4), 0.5, dtype=torch.float32)
+        monkeypatch.setattr(lin, "prepare_fp8_channel_kernel", lambda: None)
+
+        calls: list[tuple[str, tuple[int, ...]]] = []
+
+        def fake_fused_mm(*args, **kwargs):
+            calls.append(("fused", ()))
+            raise AssertionError("M>1 must stay on the existing fallback path")
+
+        def fake_linear_mm(x_fp8, packed_weight, **kwargs):
+            assert packed_weight is lin._fp8_channel_packed_weight
+            calls.append(("fallback", tuple(x_fp8.shape)))
+            return torch.ones((x_fp8.shape[0], 4), dtype=torch.bfloat16)
+
+        sparkinfer_mod = types.ModuleType("sparkinfer")
+        gemm_mod = types.ModuleType("sparkinfer.gemm")
+        gemm_mod.tensor_fp8_channel_linear = types.SimpleNamespace(mm=fake_fused_mm)
+        gemm_mod.tensor_fp8_linear = types.SimpleNamespace(mm=fake_linear_mm)
+        monkeypatch.setitem(sys.modules, "sparkinfer", sparkinfer_mod)
+        monkeypatch.setitem(sys.modules, "sparkinfer.gemm", gemm_mod)
+
+        x = _activation(m=2, in_features=32)
+        _, activation_scale = quantize_fp8_activation_per_token(x)
+        actual = lin.forward_fp8_channel_kernel(x, expected_m=2)
+        expected = (torch.ones((2, 4), dtype=torch.float32) * activation_scale * 0.5).to(
+            torch.bfloat16
+        )
+
+        assert calls == [("fallback", (2, 32))]
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(
+    os.environ.get("QSR_RUN_FP8_CHANNEL_KERNEL_TEST") != "1",
+    reason="explicit single-GPU FP8-channel kernel preflight only",
+)
+def test_fp8_channel_kernel_matches_emulated_checkpoint_arithmetic():
+    """Check the raw-FP8 composition, not the unquantized BF16 default.
+
+    This is opt-in because the first invocation can compile a SparkInfer
+    kernel.  The reference has the same per-token activation round-trip and
+    per-output-channel weight dequantization, so a failure localizes the
+    wrapper's scale/layout composition rather than measuring W8A8's intended
+    quantization error against the legacy BF16 serving route.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+
+    lin = _linear(in_features=256, out_features=256).cuda()
+    lin.weight_scale.data.copy_(torch.linspace(0.01, 0.5, 256, device="cuda").reshape(256, 1))
+    x = (torch.randn(4, 256, device="cuda", dtype=torch.bfloat16) * 0.5).contiguous()
+
+    lin._ensure_ready()
+    reference = F.linear(emulate_fp8_activation_round_trip(x), lin._weight_bf16, lin.bias)
+    actual = lin.forward_fp8_channel_kernel(x, expected_m=4)
+    torch.cuda.synchronize()
+
+    cosine = F.cosine_similarity(
+        actual.float().reshape(1, -1), reference.float().reshape(1, -1)
+    ).item()
+    rel_max_error = (actual.float() - reference.float()).abs().max().item() / (
+        reference.float().abs().max().item() + 1e-12
+    )
+    assert cosine > 0.999, f"cosine={cosine:.7f}"
+    assert rel_max_error < 0.05, f"relative max error={rel_max_error:.5f}"

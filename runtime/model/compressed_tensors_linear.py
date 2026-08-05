@@ -180,9 +180,7 @@ def _quantize_fp8_activation_for_torch_scaled_mm(
     if library is None:
         return quantize_fp8_activation_per_token(x_2d)
     x_fp8 = torch.empty_like(x_2d, dtype=torch.float8_e4m3fn)
-    activation_scale = torch.empty(
-        (x_2d.shape[0], 1), dtype=torch.float32, device=x.device
-    )
+    activation_scale = torch.empty((x_2d.shape[0], 1), dtype=torch.float32, device=x.device)
     library.quantize_per_token(x_2d, x_fp8, activation_scale)
     return x_fp8, activation_scale
 
@@ -448,9 +446,7 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
                 expected_m=expected_m,
             )
             output = (
-                raw_output.float()
-                * activation_scale
-                * self._fp8_channel_kernel_weight_scale
+                raw_output.float() * activation_scale * self._fp8_channel_kernel_weight_scale
             ).to(x.dtype)
         output = output.view(*x_shape[:-1], self.output_size)
         if self.bias is not None:
@@ -470,9 +466,7 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
             raise RuntimeError("torch scaled_mm FP8-channel path requires CUDA co-resident tensors")
         if self.weight.data.numel() == 0:
             raise RuntimeError("raw FP8 weight was released; scaled_mm path is unavailable")
-        x_fp8, activation_scale = _quantize_fp8_activation_for_torch_scaled_mm(
-            x, self.input_size
-        )
+        x_fp8, activation_scale = _quantize_fp8_activation_for_torch_scaled_mm(x, self.input_size)
         if self._torch_w8a8_weight_scale is None:
             self._torch_w8a8_weight_scale = self.weight_scale.data.t().to(torch.float32)
         output = torch._scaled_mm(
@@ -508,9 +502,7 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
         library.quantize_per_token(x_2d, x_fp8, activation_scale)
         if self._native_w8a8_weight_scale is None:
             self._native_w8a8_weight_scale = self.weight_scale.data.t().to(torch.float32)
-        output = torch.empty(
-            (x_2d.shape[0], self.output_size), dtype=x.dtype, device=x.device
-        )
+        output = torch.empty((x_2d.shape[0], self.output_size), dtype=x.dtype, device=x.device)
         geometry = (x_2d.shape[0], self.output_size, self.input_size, False)
         stream_id = torch.cuda.current_stream(x.device).cuda_stream
         workspace_key = (stream_id, *geometry)
@@ -543,14 +535,26 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
         # torch._scaled_mm 3.8-4.7 ms, while the blanket all-shapes native
         # switch measured slightly WORSE e2e. lm_head M=1 numerics were
         # previously verified max_abs=0 vs the historical cutlass_scaled_mm.
-        if _native_w8a8_lm_head_enabled() and self.output_size == 248320:
-            return self.forward_native_w8a8(x)
-        if _native_w8a8_fp8_channel_enabled() and (
-            self.output_size == 17408 or fp8_channel_raw_execution_uses_all_layers()
+        # Both native branches are CUDA-only routes; CPU tensors must fall
+        # through to the BF16 dequant fallback even on a machine where the
+        # self-owned artifact is built (the enabled() gates cannot see the
+        # input device, and CI/fallback diagnostics run CPU-only).
+        if (
+            x.device.type == "cuda"
+            and _native_w8a8_lm_head_enabled()
+            and self.output_size == 248320
         ):
             return self.forward_native_w8a8(x)
-        if x.device.type == "cuda" and _torch_scaled_mm_fp8_channel_enabled() and (
-            self.output_size == 17408 or fp8_channel_raw_execution_uses_all_layers()
+        if (
+            x.device.type == "cuda"
+            and _native_w8a8_fp8_channel_enabled()
+            and (self.output_size == 17408 or fp8_channel_raw_execution_uses_all_layers())
+        ):
+            return self.forward_native_w8a8(x)
+        if (
+            x.device.type == "cuda"
+            and _torch_scaled_mm_fp8_channel_enabled()
+            and (self.output_size == 17408 or fp8_channel_raw_execution_uses_all_layers())
         ):
             return self.forward_torch_scaled_mm(x)
         self._ensure_ready()

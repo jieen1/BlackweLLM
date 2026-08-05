@@ -39,8 +39,16 @@ import pytest
 torch = pytest.importorskip("torch", reason="torch-free CI job")
 
 from runtime.model.compressed_tensors_linear import (  # noqa: E402
+    QSR_NATIVE_W8A8_FP8_CHANNEL_ENV,
+    QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV,
     CompressedTensorsFP8ChannelLinear,
 )
+
+
+@pytest.fixture(autouse=True)
+def _use_explicit_legacy_fallback(monkeypatch):
+    """This file locks the retained BF16 fallback, not CUDA serving."""
+    monkeypatch.setenv(QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV, "0")
 
 
 def _linear(out_features: int = 8, in_features: int = 16) -> CompressedTensorsFP8ChannelLinear:
@@ -101,6 +109,28 @@ class TestStorageIsActuallyReleased:
 
 
 class TestModelLevelSweep:
+    def test_default_cuda_contract_preserves_all_raw_fp8_weights(self, monkeypatch):
+        """Serving must not materialize a BF16 matrix merely during load."""
+
+        class Fake(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = _linear()
+                self.nested = torch.nn.Module()
+                self.nested.b = _linear()
+
+        from runtime.model.qwen36_model import Qwen36ForCausalLMSelfBuilt
+
+        monkeypatch.delenv(QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV)
+        model = Fake()
+        freed = Qwen36ForCausalLMSelfBuilt.free_fp8_raw_weights(model)
+
+        assert freed == 0
+        assert model.a.weight.data.numel() == 8 * 16
+        assert model.nested.b.weight.data.numel() == 8 * 16
+        assert model.a._weight_bf16 is None
+        assert model.nested.b._weight_bf16 is None
+
     def test_the_sweep_reports_how_many_it_freed(self):
         """A sweep that silently matches nothing passes every other test here
         while saving nothing at all -- the count is what makes it checkable."""
@@ -122,3 +152,81 @@ class TestModelLevelSweep:
         assert model.a.weight.data.numel() == 0
         assert model.nested.b.weight.data.numel() == 0
         assert model.unrelated.weight.numel() == 16, "a plain nn.Linear must be untouched"
+
+    def test_scaled_mm_opt_in_keeps_only_the_selected_raw_mlp_weight(self, monkeypatch):
+        class Fake(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.selected = _linear(out_features=17408, in_features=16)
+                self.other = _linear()
+
+        from runtime.model.qwen36_model import Qwen36ForCausalLMSelfBuilt
+
+        monkeypatch.setenv(QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV, "1")
+        model = Fake()
+        freed = Qwen36ForCausalLMSelfBuilt.free_fp8_raw_weights(model)
+
+        assert freed == 1
+        assert model.selected.weight.data.numel() == 17408 * 16
+        assert model.other.weight.data.numel() == 0
+
+    def test_scaled_mm_all_opt_in_keeps_every_raw_fp8_weight(self, monkeypatch):
+        class Fake(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = _linear()
+                self.b = _linear()
+
+        from runtime.model.qwen36_model import Qwen36ForCausalLMSelfBuilt
+
+        monkeypatch.setenv(QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV, "all")
+        model = Fake()
+        freed = Qwen36ForCausalLMSelfBuilt.free_fp8_raw_weights(model)
+
+        assert freed == 0
+        assert model.a.weight.data.numel() == 8 * 16
+        assert model.b.weight.data.numel() == 8 * 16
+        assert model.a._weight_bf16 is None
+        assert model.b._weight_bf16 is None
+
+    def test_native_w8a8_all_opt_in_keeps_every_raw_fp8_weight(self, monkeypatch):
+        """The native route cannot need a BF16 cache just to load a model."""
+
+        class Fake(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = _linear()
+                self.b = _linear()
+
+        from runtime.model.qwen36_model import Qwen36ForCausalLMSelfBuilt
+
+        monkeypatch.setenv(QSR_NATIVE_W8A8_FP8_CHANNEL_ENV, "all")
+        model = Fake()
+        freed = Qwen36ForCausalLMSelfBuilt.free_fp8_raw_weights(model)
+
+        assert freed == 0
+        assert model.a.weight.data.numel() == 8 * 16
+        assert model.b.weight.data.numel() == 8 * 16
+        assert model.a._weight_bf16 is None
+        assert model.b._weight_bf16 is None
+
+    def test_weight_only_executor_can_preserve_every_raw_weight(self):
+        """A raw-FP8 executor must not create a BF16 cache simply to load."""
+
+        class Fake(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = _linear()
+                self.nested = torch.nn.Module()
+                self.nested.b = _linear()
+
+        from runtime.model.qwen36_model import Qwen36ForCausalLMSelfBuilt
+
+        model = Fake()
+        freed = Qwen36ForCausalLMSelfBuilt.free_fp8_raw_weights(model, keep_all_raw=True)
+
+        assert freed == 0
+        assert model.a.weight.data.numel() == 8 * 16
+        assert model.nested.b.weight.data.numel() == 8 * 16
+        assert model.a._weight_bf16 is None
+        assert model.nested.b._weight_bf16 is None

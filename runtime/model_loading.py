@@ -238,6 +238,7 @@ def load_qwen36_model(
     warmup_attention: bool = True,
     enable_mtp: bool = False,
     enable_fp8_kv: bool | None = None,
+    keep_fp8_raw_weights: bool = False,
 ) -> Qwen36ForCausalLMSelfBuilt:
     """Construct + load a Qwen3.6-27B (``Qwen3_5ForConditionalGeneration``,
     text-only) model instance. Track B / B1 -- see ``runtime/model/
@@ -305,6 +306,13 @@ def load_qwen36_model(
     the quantized Linears in ``modelopt_linear.py`` do), so this is
     process-global, not per-parameter, on purpose -- matching Laguna's
     same choice, for the same reason (this runtime never trains).
+
+    ``keep_fp8_raw_weights`` is an explicit opt-in for a weight-only FP8
+    executor.  The normal B1 path creates a persistent BF16 cache and then
+    releases the original FP8 weight storage; a native FP8 executor instead
+    consumes those checkpoint values directly and must request that residency
+    at its call site.  This is an argument rather than an environment flag
+    because it changes the model's memory contract by roughly 10 GiB.
     """
     torch.set_grad_enabled(False)
     if enable_fp8_kv is None:
@@ -373,7 +381,8 @@ def load_qwen36_model(
         # Linear's BF16 cache to free the originals, which is a real cost to
         # pay eagerly and pointless on a CPU-side construction (a test fixture,
         # a shape probe) that may never run a forward at all.
-        freed = model.free_fp8_raw_weights()
-        if freed:
-            print(f"freed raw FP8 weights on {freed} Linear(s) (BF16 cache retained)")
+        if not keep_fp8_raw_weights:
+            freed = model.free_fp8_raw_weights()
+            if freed:
+                print(f"freed raw FP8 weights on {freed} Linear(s) (BF16 cache retained)")
     return model

@@ -1,0 +1,9 @@
+{
+  global:
+    qsr_fp8_w8a8_abi_version;
+    qsr_fp8_w8a8_dynamic_per_token_quant_sm120;
+    qsr_fp8_w8a8_workspace_size_sm120;
+    qsr_fp8_w8a8_scaled_mm_sm120;
+  local:
+    *;
+};

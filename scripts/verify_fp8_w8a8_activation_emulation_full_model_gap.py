@@ -10,7 +10,8 @@ in_proj_qkv/in_proj_z/out_proj, lm_head, and layers 56-63's MLP -- 233
 calls/decode-step per ``notes/2026-08-03-decode-kernel-profile.md``) still
 clear ``bfdiag.divergence.logit_agreement.CALIBRATED_THRESHOLDS``?
 
-This is a **lower bound** on real W8A8's error, not an equivalent of it --
+For the default activation-emulation candidate this is a **lower bound** on
+real W8A8's error, not an equivalent of it --
 see ``emulate_fp8_activation_round_trip``'s docstring for exactly what error
 source it does and does not model. So the read on this script's result is
 asymmetric: a FAIL here is decisive (a real kernel can only be worse, so
@@ -43,6 +44,13 @@ Oracle: production forward with the flag unset -- today's B1-R-calibrated
 default, free-running greedy decode. Candidate: the SAME loaded model,
 forced through the oracle's own token trajectory, with the flag set to
 ``"1"`` for that trajectory only.
+
+``--torch-scaled-mm-mlp`` is a separate, narrower candidate: it retains raw
+FP8 weights only for the 56--63 MLP gate/up projections and executes those
+M=1 rows with PyTorch's native FP8 ``torch._scaled_mm``.  It is not a lower
+bound experiment -- it includes the real FP8 dot-product rounding -- and is
+kept opt-in because the same calibrated full-logit gate decides whether it is
+safe to promote.
 
 Run: PYTHONPATH=<this worktree> ~/.venvs/vllm/bin/python -u \\
     scripts/verify_fp8_w8a8_activation_emulation_full_model_gap.py [--steps N]
@@ -78,13 +86,17 @@ from bfdiag.divergence.logit_agreement import (  # noqa: E402
     evaluate_summary,
 )
 from runtime.checkpoints import standard_checkpoint_path  # noqa: E402
-from runtime.model.compressed_tensors_linear import QSR_EMULATE_FP8_ACTIVATION_ENV  # noqa: E402
+from runtime.model.compressed_tensors_linear import (  # noqa: E402
+    QSR_EMULATE_FP8_ACTIVATION_ENV,
+    QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV,
+)
 from runtime.model_loading import load_qwen36_model  # noqa: E402
 
 sys.path.insert(0, str(Path(_ROOT) / "scripts"))
 from b3_verify_batching_logit_agreement import (  # noqa: E402
     PROMPTS,
     agreement,
+    full_logit_metrics,
     sequential_trajectory,
 )
 from verify_nvfp4_gemm_full_model_gap import forced_sequential_trajectory  # noqa: E402
@@ -103,6 +115,11 @@ def main() -> None:
         default=".bfdiag/runs/fp8_w8a8_activation_emulation_full_model_gap.json",
     )
     ap.add_argument("--model-path", type=str, default=standard_checkpoint_path())
+    ap.add_argument(
+        "--torch-scaled-mm-mlp",
+        action="store_true",
+        help="candidate: enable only the measured-profitable FP8 MLP gate/up scaled_mm path",
+    )
     args = ap.parse_args()
     model_path = args.model_path
 
@@ -114,19 +131,30 @@ def main() -> None:
         f"{QSR_EMULATE_FP8_ACTIVATION_ENV} is already set in the environment -- unset it "
         "before running this script, which controls it itself"
     )
+    assert QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV not in os.environ, (
+        f"{QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV} is already set; this script controls it"
+    )
 
     print("torch:", torch.__version__, "device:", torch.cuda.get_device_name(0))
     print("model_path:", model_path)
     tok = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
 
     t0 = time.perf_counter()
-    model = load_qwen36_model(
-        model_path, device=DEVICE, max_seq_len=args.max_seq_len, enable_mtp=False
-    )
+    if args.torch_scaled_mm_mlp:
+        # Keep only the selected MLP raw FP8 tensors while model loading
+        # releases all other raw FP8 weights; the candidate needs them.
+        os.environ[QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV] = "1"
+    try:
+        model = load_qwen36_model(
+            model_path, device=DEVICE, max_seq_len=args.max_seq_len, enable_mtp=False
+        )
+    finally:
+        os.environ.pop(QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV, None)
     print(f"model loaded in {time.perf_counter() - t0:.1f}s")
     print(f"allocated after load: {torch.cuda.memory_allocated() / 1024**3:.2f} GiB")
 
     workloads = []
+    full_metrics: list[tuple[float, float]] = []
     results: dict[str, object] = {"steps": args.steps, "workloads": {}}
 
     for label, text in PROMPTS.items():
@@ -134,6 +162,7 @@ def main() -> None:
         print(f"\n=== {label!r} ({len(prompt_ids)} prompt tokens) ===")
 
         os.environ.pop(QSR_EMULATE_FP8_ACTIVATION_ENV, None)
+        os.environ.pop(QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV, None)
         t = time.perf_counter()
         oracle_rows, tokens = sequential_trajectory(model, prompt_ids, args.steps)
         print(
@@ -141,16 +170,26 @@ def main() -> None:
             f"steps in {time.perf_counter() - t:.1f}s"
         )
 
-        os.environ[QSR_EMULATE_FP8_ACTIVATION_ENV] = "1"
+        candidate_env = (
+            QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV
+            if args.torch_scaled_mm_mlp
+            else QSR_EMULATE_FP8_ACTIVATION_ENV
+        )
+        os.environ[candidate_env] = "1"
         try:
             t = time.perf_counter()
             cand_rows = forced_sequential_trajectory(model, prompt_ids, tokens)
+            candidate_name = (
+                "torch scaled_mm selected MLP path"
+                if args.torch_scaled_mm_mlp
+                else "FP8 activation round-trip emulated"
+            )
             print(
-                f"  candidate (FP8 activation round-trip emulated): {len(cand_rows)} "
+                f"  candidate ({candidate_name}): {len(cand_rows)} "
                 f"steps in {time.perf_counter() - t:.1f}s"
             )
         finally:
-            os.environ.pop(QSR_EMULATE_FP8_ACTIVATION_ENV, None)
+            os.environ.pop(candidate_env, None)
 
         try:
             w = agreement(label, cand_rows, oracle_rows, tokens)
@@ -166,19 +205,34 @@ def main() -> None:
             results["workloads"][label] = {"capture_overflow": str(exc)}
             continue
         workloads.append(w)
-        results["workloads"][label] = w.to_dict()["summary"]
+        nll_excess, min_cosine = full_logit_metrics(cand_rows, oracle_rows, tokens)
+        full_metrics.append((nll_excess, min_cosine))
+        results["workloads"][label] = {
+            **w.to_dict()["summary"],
+            "nll_relative_excess": nll_excess,
+            "min_logits_cosine": min_cosine,
+        }
         print(
             f"  gap_error: p50={w.median_gap_error:.4f} p90={w.p90_gap_error:.4f} "
             f"p99={w.p99_gap_error:.4f} max={w.max_gap_error:.4f}  "
             f"flips={w.num_disagreements}/{w.num_steps} "
-            f"tie_slack={w.max_tie_slack_ulps:.1f}ULP meanKL={w.mean_kl_topk:.3e}"
+            f"tie_slack={w.max_tie_slack_ulps:.1f}ULP meanKL={w.mean_kl_topk:.3e} "
+            f"nll_excess={nll_excess:.3e} min_cosine={min_cosine:.8f}"
         )
 
     print(
         "\n=== combined, judged against CALIBRATED_THRESHOLDS "
         "(docs/b1-correctness-criterion.md §6.1) ==="
     )
-    report = AgreementReport(workloads=tuple(workloads))
+    if full_metrics:
+        nll_relative_excess, min_logits_cosine = zip(*full_metrics, strict=True)
+        report = AgreementReport(
+            workloads=tuple(workloads),
+            nll_relative_excess=max(nll_relative_excess),
+            min_logits_cosine=min(min_logits_cosine),
+        )
+    else:
+        report = AgreementReport(workloads=tuple(workloads))
     metrics = report.summary_metrics()
     passed, reasons = evaluate_summary(metrics, CALIBRATED_THRESHOLDS)
 
@@ -213,6 +267,8 @@ def main() -> None:
         "disagreement_rate",
         "p90_logprob_error",
         "max_drift_ratio",
+        "nll_relative_excess",
+        "min_logits_cosine",
     ):
         bar_attr = {
             "median_gap_error": "median_gap_error",
@@ -224,6 +280,8 @@ def main() -> None:
             "disagreement_rate": "max_disagreement_rate",
             "p90_logprob_error": "p90_logprob_error",
             "max_drift_ratio": "max_drift_ratio",
+            "nll_relative_excess": "max_nll_relative_excess",
+            "min_logits_cosine": "min_logits_cosine",
         }[key]
         bar = getattr(CALIBRATED_THRESHOLDS, bar_attr)
         print(f"    {key:<20} measured={metrics.get(key):<12} bar={bar}")
