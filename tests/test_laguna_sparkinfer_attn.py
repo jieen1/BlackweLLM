@@ -287,6 +287,7 @@ def test_prefill_workspace_verify_mode_without_declared_capacity_raises_loud_err
 
 
 def test_declare_verify_capacity_rejects_degenerate_query_len():
+    pytest.importorskip("sparkinfer")
     workspace = SparkinferPrefillWorkspace(
         torch.device("cpu"), max_total_q=8192, max_page_table_width=4096
     )
@@ -297,6 +298,7 @@ def test_declare_verify_capacity_rejects_degenerate_query_len():
 
 
 def test_declare_verify_capacity_is_monotonic():
+    pytest.importorskip("sparkinfer")
     workspace = SparkinferPrefillWorkspace(
         torch.device("cpu"), max_total_q=8192, max_page_table_width=4096
     )

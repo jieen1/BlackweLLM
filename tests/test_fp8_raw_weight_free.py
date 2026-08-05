@@ -108,8 +108,22 @@ class TestStorageIsActuallyReleased:
         assert lin(torch.randn(1, 16, dtype=torch.bfloat16)).shape == (1, 8)
 
 
+def _require_qwen36_model_stack() -> None:
+    """Guard for the model-level sweep below.
+
+    It imports runtime.model.qwen36_model, which imports fla and sparkinfer
+    at module scope.  The Linear-level classes above only need
+    compressed_tensors_linear and must keep running in the cpu-torch CI
+    job, so the guard is per-test, matching
+    tests/test_laguna_sparkinfer_attn.py's function-level convention.
+    """
+    pytest.importorskip("fla")
+    pytest.importorskip("sparkinfer")
+
+
 class TestModelLevelSweep:
     def test_default_cuda_contract_preserves_all_raw_fp8_weights(self, monkeypatch):
+        _require_qwen36_model_stack()
         """Serving must not materialize a BF16 matrix merely during load."""
 
         class Fake(torch.nn.Module):
@@ -132,6 +146,7 @@ class TestModelLevelSweep:
         assert model.nested.b._weight_bf16 is None
 
     def test_the_sweep_reports_how_many_it_freed(self):
+        _require_qwen36_model_stack()
         """A sweep that silently matches nothing passes every other test here
         while saving nothing at all -- the count is what makes it checkable."""
 
@@ -154,6 +169,8 @@ class TestModelLevelSweep:
         assert model.unrelated.weight.numel() == 16, "a plain nn.Linear must be untouched"
 
     def test_scaled_mm_opt_in_keeps_only_the_selected_raw_mlp_weight(self, monkeypatch):
+        _require_qwen36_model_stack()
+
         class Fake(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -171,6 +188,8 @@ class TestModelLevelSweep:
         assert model.other.weight.data.numel() == 0
 
     def test_scaled_mm_all_opt_in_keeps_every_raw_fp8_weight(self, monkeypatch):
+        _require_qwen36_model_stack()
+
         class Fake(torch.nn.Module):
             def __init__(self):
                 super().__init__()
@@ -190,6 +209,7 @@ class TestModelLevelSweep:
         assert model.b._weight_bf16 is None
 
     def test_native_w8a8_all_opt_in_keeps_every_raw_fp8_weight(self, monkeypatch):
+        _require_qwen36_model_stack()
         """The native route cannot need a BF16 cache just to load a model."""
 
         class Fake(torch.nn.Module):
@@ -211,6 +231,7 @@ class TestModelLevelSweep:
         assert model.b._weight_bf16 is None
 
     def test_weight_only_executor_can_preserve_every_raw_weight(self):
+        _require_qwen36_model_stack()
         """A raw-FP8 executor must not create a BF16 cache simply to load."""
 
         class Fake(torch.nn.Module):

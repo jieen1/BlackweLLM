@@ -8,6 +8,11 @@ from pathlib import Path
 import pytest
 
 torch = pytest.importorskip("torch")
+# The staged script imports runtime.model_loading -> qwen36_model, which
+# imports fla and sparkinfer at module scope; the cpu-torch CI job has
+# neither, so self-skip there like the sibling qwen36 tests.
+pytest.importorskip("fla")
+pytest.importorskip("sparkinfer")
 nn = torch.nn
 
 
