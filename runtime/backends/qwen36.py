@@ -1437,9 +1437,24 @@ class Qwen36Backend:
         # it matters (all slots busy), which is the opposite of a budget.
         self.checkpoint_pool.evict_for_budget(self._checkpoint_bytes)
         key = (slot, kv_len)
+        hash_value = _prefix_hash(tokens, kv_len)
+        existing = self.checkpoint_pool.get_by_hash(hash_value)
+        if existing is not None and existing != key:
+            # RecurrentStatePool's hash index is one-to-one.  The persistent
+            # family already publishes this exact boundary (the repeat
+            # restored it from the scratch arena, so the slot-local rolling
+            # checkpoint is a duplicate of the state the persistent entry
+            # owns).  Registering it anyway would overwrite the persistent
+            # key in ``_by_hash`` and make every later persistent lookup a
+            # false miss -- the alternating-hit corruption seen on
+            # 2026-08-05.  The persistent entry is strictly richer (it also
+            # carries the MTP scratch snapshot and the anchor hidden row),
+            # so the redundant duplicate is simply skipped.
+            if isinstance(existing, tuple) and existing[0] == "persistent":
+                return
         self.checkpoint_pool.register(
             key,
-            hash_value=_prefix_hash(tokens, kv_len),
+            hash_value=hash_value,
             num_tokens=kv_len,
             nbytes=self._checkpoint_bytes,
         )

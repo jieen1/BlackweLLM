@@ -482,6 +482,38 @@ class TestPrefixCacheTwoFamilies:
         assert state.result[1]["anchor"] == first[0]
         assert backend.pool.slot_kv_len[1] == len(prompt)
 
+    def test_repeated_full_prompt_hits_stay_persistent_across_generations(self) -> None:
+        """A full-prompt repeat must not orphan the persistent hash index.
+
+        The repeat path re-publishes the same boundary as the slot's own
+        rolling checkpoint immediately after restoring it from the scratch
+        arena.  The checkpoint pool's hash index is one-to-one, so that
+        registration used to overwrite the persistent key and every later
+        repeat silently fell back to a full compute -- the alternating-hit
+        corruption seen on 2026-08-05.
+        """
+        backend = _backend(
+            num_slots=2,
+            block_size=64,
+            enable_persistent_prefix_cache=True,
+        )
+        prompt = list(range(64))
+        first = _run(backend, 0, prompt, steps=2)
+        backend.reset_slot(0)
+        assert backend.stats["prefix_persistent_stores"] == 1
+
+        for slot, expected_restores in ((1, 1), (0, 2)):
+            backend.model.forward_lengths.clear()
+            state = backend.prefill_chunked_begin([slot], [prompt])
+            assert backend.model.forward_lengths == []
+            assert backend.stats["prefix_persistent_restores"] == expected_restores
+            assert state.result[slot]["anchor"] == first[0]
+            backend.reset_slot(slot)
+
+        (entry,) = backend._persistent_prefixes.values()  # noqa: SLF001
+        assert entry.checkpoint_key in backend.checkpoint_pool
+        assert backend.checkpoint_pool.get_by_hash(entry.hash_value) == entry.checkpoint_key
+
     def test_scratch_arena_retains_multiple_lru_entries_within_checkpoint_budget(self) -> None:
         backend = _backend(
             num_slots=3,

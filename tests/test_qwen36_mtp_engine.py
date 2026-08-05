@@ -1028,6 +1028,60 @@ class TestPrefillSync:
         assert torch.all(caches[1].v_cache[1] == 8.0)
         assert engine._sync_len[1] == 129
 
+    def test_restore_from_scratch_never_clears_the_live_gdn_column(self) -> None:
+        """A persistent restore must preserve the target's live GDN state.
+
+        The backend restores the recurrent checkpoint into column zero
+        BEFORE this call, so resetting the spec rows here -- column zero
+        included -- would start the first verify from an empty GDN
+        recurrence and emit wrong logits that nothing downstream can detect
+        (the full-hit corruption seen on 2026-08-05).  Candidate columns are
+        always overwritten by the next verify, so only the source-column
+        pointer needs pinning.
+        """
+        engine = Qwen36MTPEngine.__new__(Qwen36MTPEngine)
+        caches = [
+            SimpleNamespace(
+                page_size=128,
+                page_table=torch.tensor([[0, 1]], dtype=torch.int32),
+                k_cache=torch.zeros(2, 128, 1, 1),
+                v_cache=torch.zeros(2, 128, 1, 1),
+                seq_len=0,
+            )
+            for _ in range(3)
+        ]
+        caches[0].k_cache[0].fill_(5.0)
+        caches[0].k_cache[1].fill_(6.0)
+        caches[0].v_cache[0].fill_(7.0)
+        caches[0].v_cache[1].fill_(8.0)
+        engine._caches = caches
+        engine.device = torch.device("cpu")
+        engine.scratch_row = 2
+        engine.mtp_page_size = 128
+        engine._sync_len = [129, 0]
+        engine._cached_prefix_sync_len = [0, 0]
+        engine._spec_state_col = [0, 0]
+
+        class _SpecRows:
+            def __init__(self) -> None:
+                self.resets = 0
+                self.activations: list[tuple[int, int]] = []
+
+            def reset_slot(self, slot: int) -> None:
+                self.resets += 1
+
+            def activate(self, slot: int, col: int) -> None:
+                self.activations.append((slot, col))
+
+        spec = _SpecRows()
+        engine._spec_rows = spec
+
+        assert engine.snapshot_prefix_to_scratch(0, 129)
+        assert engine.restore_prefix_from_scratch(1, 129)
+        assert spec.resets == 0
+        assert spec.activations == [(1, 0)]
+        assert engine._spec_state_col == [0, 0]
+
 
 class TestHistoricalSync:
     """Every round synchronises the full accepted suffix; no optional

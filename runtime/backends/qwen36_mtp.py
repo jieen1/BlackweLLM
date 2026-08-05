@@ -568,7 +568,17 @@ class Qwen36MTPEngine:
         self._sync_len[target_slot] = kv_len
         self._cached_prefix_sync_len[target_slot] = 0
         if self._spec_rows is not None:
-            self._spec_rows.reset_slot(target_slot)
+            # Column zero IS the target's live GDN state, and the persistent
+            # restore path has already copied the checkpoint into it before
+            # this call.  ``reset_slot`` would zero that state along with the
+            # speculative candidates, so a full prefix hit would resume from
+            # an empty GDN recurrence and emit wrong logits that nothing
+            # downstream can detect (the full-hit corruption seen on
+            # 2026-08-05).  The verify overwrites every candidate column
+            # (destination rows 0..K) before reading them, so stale bytes
+            # there are harmless; only the source-column pointer needs
+            # pinning back to the live row.
+            self._spec_rows.activate(target_slot, 0)
         self._spec_state_col[target_slot] = 0
         return True
 
@@ -1061,7 +1071,6 @@ class Qwen36MTPEngine:
             all_logits.reshape(-1, all_logits.shape[-1]),
             self.k,
         )
-
         results: dict[int, dict[str, Any]] = {}
         sync_slots: list[int] = []
         sync_tokens: list[list[int]] = []
