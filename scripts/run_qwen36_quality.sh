@@ -129,7 +129,7 @@ server_stop_port() {
     local pids
     pids=$(pgrep -f "server\.app.*--port $port" 2>/dev/null | sort -u)
     local f pid
-    for f in "$LOG_DIR"/suite.pid "$LOG_DIR"/mmlu.pid "$LOG_DIR"/longctx.pid; do
+    for f in "$LOG_DIR"/suite.pid "$LOG_DIR"/mmlu.pid "$LOG_DIR"/longctx.pid "$LOG_DIR"/best.pid; do
         if [ -f "$f" ]; then
             pid=$(cat "$f")
             [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && pids="$pids $pid"
@@ -238,6 +238,37 @@ server_start_mmlu() {
     say "mmlu server starting (8 slots x 64K, port $PORT), log: $LOG_DIR/server_mmlu_${RUN_LABEL}.log"
 }
 
+server_start_best() {
+    # "Best" serving profile for the Codex integration (2026-08-05): three
+    # 256K-token slots (capacity 3 + 1 CG warmup slot), MTP K=3, decode CG,
+    # prefix cache, FP8 KV -- the maximum single-node footprint this GPU
+    # fits at gpu_memory_utilization 0.92 (same util the historical 256K
+    # runs used). Request timeout disabled; generations are long-running.
+    QSR_SERVER_MODEL_PATH="$MODEL_SNAPSHOT" \
+    QSR_SERVER_PRODUCTION=1 \
+    QSR_SERVER_CAPACITY=3 \
+    QSR_SERVER_NUM_SLOTS=4 \
+    QSR_SERVER_BLOCK_SIZE=16 \
+    QSR_SERVER_BLOCKS_PER_SLOT=16384 \
+    QSR_SERVER_ENABLE_CUDAGRAPH="$CUDAGRAPH" \
+    QSR_SERVER_ENABLE_PREFIX_CACHE=1 \
+    QSR_SERVER_ENABLE_SESSION_AFFINITY=0 \
+    QSR_SERVER_ENABLE_DFLASH=0 \
+    QSR_SERVER_ENABLE_MTP="$MTP" \
+    QSR_SERVER_MTP_K="$MTP_K" \
+    QSR_SERVER_KV_CACHE_DTYPE=fp8_e4m3 \
+    QSR_SERVER_GPU_MEM_UTIL=0.92 \
+    QSR_SERVER_REQUEST_TIMEOUT_S=0 \
+    QSR_TOOL_CALL_PARSER=qwen3_coder \
+    QSR_SERVED_MODEL_NAME="qwen3.6" \
+    QSR_DEBUG_REQUESTS=0 \
+    HF_HUB_OFFLINE=1 \
+    setsid nohup "$PY" -m server.app --host 127.0.0.1 --port "$PORT" \
+        > "$LOG_DIR/server_best_${RUN_LABEL}.log" 2>&1 < /dev/null &
+    echo $! > "$LOG_DIR/best.pid"
+    say "best server starting (4 slots x 262144 tokens, port $PORT), log: $LOG_DIR/server_best_${RUN_LABEL}.log"
+}
+
 server_wait() {
     local url="$1" tries="$2" what="$3"
     local i=0
@@ -266,7 +297,8 @@ cmd_server() {
                 suite) server_start_suite ;;
                 longctx) server_start_longctx ;;
                 mmlu) server_start_mmlu ;;
-                *) say "usage: $0 server start suite|longctx|mmlu"; exit 2 ;;
+                best) server_start_best ;;
+                *) say "usage: $0 server start suite|longctx|mmlu|best"; exit 2 ;;
             esac
             SERVER_STARTED=1
             server_wait "$ROOT_URL" 120 "$profile server" || return 1
@@ -275,7 +307,7 @@ cmd_server() {
             server_stop_port "$PORT"
             ;;
         *)
-            say "usage: $0 server start|stop suite|mmlu"; exit 2 ;;
+            say "usage: $0 server start|stop suite|longctx|mmlu|best"; exit 2 ;;
     esac
 }
 
@@ -486,7 +518,7 @@ case "${1:-all}" in
         cmd_all
         ;;
     *)
-        echo "usage: $0 {env-check|server start|stop suite|longctx|mmlu|ours-suite|ours-longctx|ours-humaneval|mmlu|compare|all}"
+        echo "usage: $0 {env-check|server start|stop suite|longctx|mmlu|best|ours-suite|ours-longctx|ours-humaneval|mmlu|compare|all}"
         exit 2
         ;;
 esac
