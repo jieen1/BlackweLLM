@@ -114,8 +114,22 @@ import torch
 #: magnitudes negated (sign bit set). Cross-validated against torch's
 #: native ``float4_e2m1fn_x2`` cast on GPU -- see module docstring.
 _FP4_E2M1_LUT: tuple[float, ...] = (
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
 )
 
 #: Block size for NVFP4 per-block scaling in this checkpoint (verified:

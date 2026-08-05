@@ -31,9 +31,7 @@ def _torch_chain(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 def test_bit_parity_codes_and_scales(shape):
     torch.manual_seed(5)
     m, k = shape
-    x = (torch.randn(m, k, device="cuda", dtype=torch.float32) * 0.7).to(
-        torch.bfloat16
-    )
+    x = (torch.randn(m, k, device="cuda", dtype=torch.float32) * 0.7).to(torch.bfloat16)
     # exact zeros, a saturating outlier, and a sub-scale-floor row exercise
     # the subnormal-midpoint rounding decisions that div-mode bugs flip.
     x[0, :32] = 0.0
@@ -42,7 +40,6 @@ def test_bit_parity_codes_and_scales(shape):
     ref_c, ref_s = _torch_chain(x)
     tri_c, tri_s = fp8_per_token_quantize(x)
     assert torch.equal(ref_c.view(torch.uint8), tri_c.view(torch.uint8)), (
-        "codes differ: "
-        f"{(ref_c.view(torch.uint8) != tri_c.view(torch.uint8)).sum().item()}"
+        f"codes differ: {(ref_c.view(torch.uint8) != tri_c.view(torch.uint8)).sum().item()}"
     )
     assert torch.equal(ref_s, tri_s), "scales differ"

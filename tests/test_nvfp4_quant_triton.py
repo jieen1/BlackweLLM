@@ -27,9 +27,7 @@ from runtime.kernels.nvfp4_quant import quantize_nvfp4_activation  # noqa: E402
 def _oracle_operand(x2d: torch.Tensor, gs: torch.Tensor):
     m, k = x2d.shape
     row_counts = torch.full((1,), m, dtype=torch.int32, device=x2d.device)
-    packed, _sf_view = quantize_grouped_nvfp4_torch(
-        x2d.unsqueeze(0), row_counts, gs.reshape(1)
-    )
+    packed, _sf_view = quantize_grouped_nvfp4_torch(x2d.unsqueeze(0), row_counts, gs.reshape(1))
     # rebuild the linear scale from the same recipe to compare bytes: the
     # oracle returns only a swizzled view, so recompute via its internals.
     return packed
@@ -55,7 +53,7 @@ def _triton_operand(x2d: torch.Tensor, gs: torch.Tensor):
 def test_bit_parity_codes_and_scales(shape, gs):
     torch.manual_seed(7)
     m, k = shape
-    x = (torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.5)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.5
     # a few exact zeros and one huge outlier exercise the edge branches
     x[0, :16] = 0.0
     x[3 % m, 33] = 3000.0
@@ -83,6 +81,8 @@ def test_bit_parity_codes_and_scales(shape, gs):
     # zero-pads rows/cols itself, so both land on the same padded shape.
     sw_ref = swizzle_block_scale(sf_linear_ref.unsqueeze(0))
     assert tuple(sw_tri[0].shape) == tuple(sw_ref[0].shape), (
-        tuple(sw_tri[0].shape), tuple(sw_ref[0].shape))
+        tuple(sw_tri[0].shape),
+        tuple(sw_ref[0].shape),
+    )
     ndiff = (sw_tri[0].view(torch.uint8) != sw_ref[0].view(torch.uint8)).sum().item()
     assert ndiff == 0, f"swizzled scale bytes differ: {ndiff}"

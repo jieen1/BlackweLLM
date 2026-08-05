@@ -51,9 +51,7 @@ class TestPassThroughWhenDisabled:
     def test_language_model_only_false_drops_nothing(self):
         stats = LanguageModelOnlyStats()
         weights = _weights(_LANGUAGE_MODEL_NAMES + _VISION_NAMES)
-        result = list(
-            filter_language_model_only(weights, language_model_only=False, stats=stats)
-        )
+        result = list(filter_language_model_only(weights, language_model_only=False, stats=stats))
         assert result == weights
         assert stats.skipped_count == 0
         assert stats.skipped_example_names == ()

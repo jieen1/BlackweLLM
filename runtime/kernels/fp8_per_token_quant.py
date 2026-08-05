@@ -34,9 +34,7 @@ def _fp8_per_token_quant_kernel(
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_K)
     mask = cols < K
-    x = tl.load(
-        X_ptr + row * stride_x_row + cols, mask=mask, other=0.0
-    ).to(tl.float32)
+    x = tl.load(X_ptr + row * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
     amax = tl.max(tl.abs(x), axis=0)
     scale = tl.maximum(amax / 448.0, 1.0 / (448.0 * 512.0))
     # div.rn.f32 via inline asm: torch's CUDA fdiv is div.rn.f32; triton's

@@ -229,6 +229,7 @@ def render(model_name: str) -> list[str]:
 # D2: Runtime-internal metrics (MTP acceptance, prefix cache, KV usage)
 # ---------------------------------------------------------------------------
 
+
 def _accept_buckets() -> tuple[int, ...]:
     """0..K, derived from the real speculative depth rather than written out.
 

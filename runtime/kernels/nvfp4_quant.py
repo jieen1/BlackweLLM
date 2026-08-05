@@ -171,9 +171,7 @@ def quantize_nvfp4_activation(
     gs_t = global_scale.reshape(-1).to(torch.float32).contiguous()
     packed = torch.empty((m, k // 2), dtype=torch.uint8, device=x.device)
     sf_cols = k // 16
-    sf = torch.zeros(
-        (_align_up(m, 128), _align_up(sf_cols, 4)), dtype=torch.uint8, device=x.device
-    )
+    sf = torch.zeros((_align_up(m, 128), _align_up(sf_cols, 4)), dtype=torch.uint8, device=x.device)
     sf_view = sf[:m, :sf_cols]
     nblk = 64
     while nblk > 16 and k // nblk < 4:

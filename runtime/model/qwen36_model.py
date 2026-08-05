@@ -2802,9 +2802,10 @@ def _mlp_w4a4_prefill_enabled() -> bool:
     33.3/33.2 s vs 58.7-60.2 s baseline, acceptance 72.3% (historical
     anchor 70.29%) (see ``notes/2026-08-04-w4a4-sparkinfer-headtohead.md``).
     ``QSR_QWEN36_MLP_W4A4=0`` stays the diagnostic fallback."""
-    return os.environ.get("QSR_QWEN36_MLP_W4A4", "1") != "0" or os.environ.get(
-        "QSR_QWEN36_HIST_KERNELS"
-    ) == "1"
+    return (
+        os.environ.get("QSR_QWEN36_MLP_W4A4", "1") != "0"
+        or os.environ.get("QSR_QWEN36_HIST_KERNELS") == "1"
+    )
 
 
 #: Smallest row count routed to the W4A4 prefill path. Decode (M<=4 per
@@ -2825,9 +2826,10 @@ def _w4a4_all_rows_enabled() -> bool:
     small-M bandwidth deficit (~330-440 vs ~830 GB/s) does not survive
     the fused-round accounting. ``QSR_QWEN36_MLP_W4A4_ALL=0`` stays the
     diagnostic fallback."""
-    return os.environ.get("QSR_QWEN36_MLP_W4A4_ALL", "1") != "0" or os.environ.get(
-        "QSR_QWEN36_HIST_KERNELS"
-    ) == "1"
+    return (
+        os.environ.get("QSR_QWEN36_MLP_W4A4_ALL", "1") != "0"
+        or os.environ.get("QSR_QWEN36_HIST_KERNELS") == "1"
+    )
 
 
 class Qwen36MLP(nn.Module):

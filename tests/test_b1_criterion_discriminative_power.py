@@ -147,9 +147,9 @@ def test_the_nll_leg_is_blind_to_every_recurrent_state_bug(sweep: dict) -> None:
     for name in sweep["configs"]:
         if not name.startswith("gdn-"):
             continue
-        assert _metrics(sweep, name)["nll_relative_excess"] == pytest.approx(
-            control, abs=1e-5
-        ), f"{name} moved the NLL -- update this test's premise"
+        assert _metrics(sweep, name)["nll_relative_excess"] == pytest.approx(control, abs=1e-5), (
+            f"{name} moved the NLL -- update this test's premise"
+        )
 
 
 def test_the_prefill_layer_scan_is_blind_to_every_recurrent_state_bug(sweep: dict) -> None:

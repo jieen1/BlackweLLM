@@ -403,9 +403,7 @@ def test_report_round_trips_through_json(tmp_path) -> None:
 def test_logprob_error_needs_both_logsumexps() -> None:
     logits = {5: 12.0, 7: 11.5}
     assert math.isnan(compare_step(0, 5, logits, dict(logits)).logprob_error)
-    assert math.isnan(
-        compare_step(0, 5, logits, dict(logits), mine_logsumexp=12.5).logprob_error
-    )
+    assert math.isnan(compare_step(0, 5, logits, dict(logits), mine_logsumexp=12.5).logprob_error)
 
 
 def test_logprob_error_is_shift_invariant_like_log_softmax() -> None:
@@ -413,9 +411,7 @@ def test_logprob_error_is_shift_invariant_like_log_softmax() -> None:
     offset on one side must cancel exactly."""
     oracle = {1: 10.0, 2: 9.0}
     mine = {t: v + 3.0 for t, v in oracle.items()}
-    step = compare_step(
-        0, 1, mine, oracle, mine_logsumexp=13.0, oracle_logsumexp=10.0
-    )
+    step = compare_step(0, 1, mine, oracle, mine_logsumexp=13.0, oracle_logsumexp=10.0)
     assert step.logprob_error == pytest.approx(0.0)
 
 

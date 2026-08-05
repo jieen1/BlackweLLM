@@ -427,9 +427,7 @@ class Qwen36MTPEngine:
         # folded into the K+1 verify body.  It is descriptive lifecycle
         # state, not a failed capture, so it must not make a healthy draft +
         # verify pair report unhealthy forever.
-        return all(
-            status == "captured" for status in self.cg_status.values() if status != "unused"
-        )
+        return all(status == "captured" for status in self.cg_status.values() if status != "unused")
 
     # -- slot lifecycle ------------------------------------------------
 
@@ -682,9 +680,7 @@ class Qwen36MTPEngine:
         when the pooled helper exposes ``replay_ragged`` and otherwise falls
         back to the previous equal-length grouping/per-slot implementation.
         """
-        if not (
-            len(slots) == len(shifted_token_ids) == len(target_hidden_rows)
-        ):
+        if not (len(slots) == len(shifted_token_ids) == len(target_hidden_rows)):
             raise ValueError("ragged MTP sync requires equal slot/token/hidden list lengths")
         if not slots:
             return {}
@@ -757,9 +753,7 @@ class Qwen36MTPEngine:
         self.backend.stats["mtp_batched_sync_slots"] += len(slots)
         return result
 
-    def _continue_draft(
-        self, slot: int, first_draft: int, first_hidden: torch.Tensor
-    ) -> list[int]:
+    def _continue_draft(self, slot: int, first_draft: int, first_hidden: torch.Tensor) -> list[int]:
         """Produce the remaining ``K-1`` autoregressive draft tokens.
 
         Step 0 is emitted by :meth:`_sync_real_suffix` from real target
@@ -1024,14 +1018,11 @@ class Qwen36MTPEngine:
         """
         if not slots:
             return {}
-        if (
-            self._verify_cg is None
-            or any(
-                params_per_slot is not None
-                and params_per_slot.get(slot) is not None
-                and not params_per_slot[slot].is_greedy
-                for slot in slots
-            )
+        if self._verify_cg is None or any(
+            params_per_slot is not None
+            and params_per_slot.get(slot) is not None
+            and not params_per_slot[slot].is_greedy
+            for slot in slots
         ):
             return {
                 slot: self.round(

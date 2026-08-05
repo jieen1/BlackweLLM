@@ -302,8 +302,7 @@ def sample_accept_reject(
     k = len(draft_tokens)
     if draft_probs.shape[0] != k:
         raise ValueError(
-            f"draft_probs must have one row per draft token (need {k}, "
-            f"got {draft_probs.shape[0]})"
+            f"draft_probs must have one row per draft token (need {k}, got {draft_probs.shape[0]})"
         )
     if target_probs.shape[0] < k + 1:
         raise ValueError(

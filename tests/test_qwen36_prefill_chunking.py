@@ -115,9 +115,7 @@ class TestTheDerivedCap:
 
         backend = Qwen36Backend.__new__(Qwen36Backend)
         backend.model = _NoConfig()
-        assert (
-            Qwen36Backend._prefill_chunk_tokens(backend) == _PREFERRED_PREFILL_CHUNK_TOKENS
-        )
+        assert Qwen36Backend._prefill_chunk_tokens(backend) == _PREFERRED_PREFILL_CHUNK_TOKENS
 
 
 class TestPrefillActuallyChunks:

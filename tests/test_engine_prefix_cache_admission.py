@@ -187,9 +187,7 @@ class TestCapabilityGatedSlotAssignment:
         # only mean find_best_slot_for_prompt's return value actually drove
         # the assignment (not a coincidence of iteration order).
         prompt_a, prompt_b = (11, 12, 13), (21, 22, 23)
-        runner = _FakeCacheAwareRunner(
-            best_slot_by_prompt={prompt_a: 1, prompt_b: 0}
-        )
+        runner = _FakeCacheAwareRunner(best_slot_by_prompt={prompt_a: 1, prompt_b: 0})
         engine = _bare_admission_engine(runner)
         engine.waiting = [
             _req(engine, list(prompt_a), "req-a"),

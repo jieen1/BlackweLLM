@@ -74,8 +74,7 @@ class TestRecordedValueReachesMetrics:
             "not as a broken recorder"
         )
         assert any(not line.rstrip().endswith(" 0") for line in bucket_lines), (
-            f"MTP series present but every bucket is 0 after recording "
-            f"num_accepted={num_accepted}"
+            f"MTP series present but every bucket is 0 after recording num_accepted={num_accepted}"
         )
 
     def test_slot_kv_usage_is_observable(self, metrics):

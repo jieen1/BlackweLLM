@@ -58,8 +58,7 @@ class TestAddressing:
                 row = spec_row(logical_slot, col, total_physical_slots, num_spec)
                 if row in seen:
                     raise AssertionError(
-                        f"row {row} reused by (slot={logical_slot}, col={col}) "
-                        f"and {seen[row]}"
+                        f"row {row} reused by (slot={logical_slot}, col={col}) and {seen[row]}"
                     )
                 seen[row] = (logical_slot, col)
 

@@ -209,9 +209,7 @@ def _rms_norm_tail_kernel(
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < N
-    x = tl.load(X_ptr + row * stride_x_row + cols, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    x = tl.load(X_ptr + row * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
     rstd = tl.load(RSTD_ptr + row)
     w = tl.load(W_ptr + cols, mask=mask, other=1.0)
     out = x * rstd * w
@@ -263,14 +261,10 @@ def _gated_norm_tail_kernel(
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < N
-    x = tl.load(X_ptr + row * stride_x_row + cols, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    x = tl.load(X_ptr + row * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
     rstd = tl.load(RSTD_ptr + row)
     w = tl.load(W_ptr + cols, mask=mask, other=1.0)
-    g = tl.load(G_ptr + row * stride_x_row + cols, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    g = tl.load(G_ptr + row * stride_x_row + cols, mask=mask, other=0.0).to(tl.float32)
     xn = x * rstd
     # torch promotes weight(f32) * x(bf16) to F32 and does NOT round back to
     # bf16 before the silu multiply -- keep wm in f32 (measured: rounding it

@@ -141,8 +141,7 @@ class TestMixedPrecisionQuantMap:
     def test_fp8_group_classifies_self_attn_and_lm_head(self):
         qmap = MixedPrecisionQuantMap(_UNSLOTH_LIKE_QUANT_CONFIG)
         assert (
-            qmap.get("model.language_model.layers.3.self_attn.q_proj")
-            == QUANT_ALGO_MP_FP8_CHANNEL
+            qmap.get("model.language_model.layers.3.self_attn.q_proj") == QUANT_ALGO_MP_FP8_CHANNEL
         )
         assert qmap.get("lm_head") == QUANT_ALGO_MP_FP8_CHANNEL
 
@@ -157,9 +156,7 @@ class TestMixedPrecisionQuantMap:
     def test_nvfp4_group_classifies_early_layer_mlp(self):
         qmap = MixedPrecisionQuantMap(_UNSLOTH_LIKE_QUANT_CONFIG)
         for proj in ("gate_proj", "up_proj", "down_proj"):
-            assert (
-                qmap.get(f"model.language_model.layers.0.mlp.{proj}") == QUANT_ALGO_MP_NVFP4
-            )
+            assert qmap.get(f"model.language_model.layers.0.mlp.{proj}") == QUANT_ALGO_MP_NVFP4
 
     def test_fp8_wins_the_layer_56_63_mlp_overlap(self):
         # The one real overlap: group_1's blanket mlp regex also matches
@@ -196,9 +193,7 @@ class TestMixedPrecisionQuantMap:
         assert qmap.get("model.language_model.embed_tokens", sentinel) is sentinel
 
     def test_unknown_group_format_raises(self):
-        config = {
-            "config_groups": {"group_0": {"format": "some-future-format", "targets": ["x"]}}
-        }
+        config = {"config_groups": {"group_0": {"format": "some-future-format", "targets": ["x"]}}}
         with pytest.raises(ValueError, match="some-future-format"):
             MixedPrecisionQuantMap(config)
 

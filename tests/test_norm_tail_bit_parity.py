@@ -25,6 +25,4 @@ def test_bit_parity(shape):
     rstd = torch.rsqrt(var + eps)
     ref = (xf * rstd * (1.0 + w)).to(torch.bfloat16)
     out = rms_norm_tail(xf, rstd.squeeze(-1), (1.0 + w).contiguous())
-    assert torch.equal(ref, out), (
-        f"diff elements: {(ref != out).sum().item()} of {ref.numel()}"
-    )
+    assert torch.equal(ref, out), f"diff elements: {(ref != out).sum().item()} of {ref.numel()}"

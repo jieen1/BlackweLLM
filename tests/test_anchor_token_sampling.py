@@ -244,9 +244,7 @@ def _bare_dflash_engine(backend, *, draft_logits_vocab=8):
     engine._use_cuda_graph = False
     engine._cg_captured = True
     engine._draft_forward = lambda slot, anchor, kv_len: [10] * 15
-    engine._draft_forward_logits = lambda slot, anchor, kv_len: torch.zeros(
-        15, draft_logits_vocab
-    )
+    engine._draft_forward_logits = lambda slot, anchor, kv_len: torch.zeros(15, draft_logits_vocab)
     return engine
 
 

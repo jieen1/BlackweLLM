@@ -775,9 +775,7 @@ class Qwen36Backend:
                     }
 
         for slot, prompt, suffix in zip(state.slots, state.prompts_per_slot, state.suffix_per_slot):
-            cached_hidden = (
-                self._pending_cached_hidden.pop(slot, None) if start == 0 else None
-            )
+            cached_hidden = self._pending_cached_hidden.pop(slot, None) if start == 0 else None
             if start >= len(suffix):
                 if cached_hidden is None:
                     continue  # shorter prompt: already committed on an earlier call
@@ -996,10 +994,7 @@ class Qwen36Backend:
         for entry in self._persistent_prefixes.values():
             if (
                 len(token_ids) < entry.kv_len
-                or (
-                    len(token_ids) == entry.kv_len
-                    and entry.final_hidden is None
-                )
+                or (len(token_ids) == entry.kv_len and entry.final_hidden is None)
                 or tuple(token_ids[: entry.kv_len]) != entry.token_ids
             ):
                 continue
@@ -1097,8 +1092,10 @@ class Qwen36Backend:
             # admission wave -- and it is only reachable by an exact
             # prompt-plus-generation replay.  Keep the prompt entry instead.
             for entry in self._persistent_prefixes.values():
-                if entry.final_hidden is not None and kv_len > entry.kv_len and (
-                    tuple(tokens[: entry.kv_len]) == entry.token_ids
+                if (
+                    entry.final_hidden is not None
+                    and kv_len > entry.kv_len
+                    and (tuple(tokens[: entry.kv_len]) == entry.token_ids)
                 ):
                     return
         pages = (kv_len + self.pool.page_size - 1) // self.pool.page_size
@@ -1106,8 +1103,7 @@ class Qwen36Backend:
             return
         scratch_page_offsets = tuple(sorted(self._persistent_free_scratch_pages)[:pages])
         scratch_physical_pages = [
-            self.pool.scratch_row * self.pool.pages_per_slot + page
-            for page in scratch_page_offsets
+            self.pool.scratch_row * self.pool.pages_per_slot + page for page in scratch_page_offsets
         ]
         has_mtp_snapshot = self._mtp is None
         if self._mtp is not None:
@@ -1142,9 +1138,7 @@ class Qwen36Backend:
             checkpoint_key=key,
             has_mtp_snapshot=has_mtp_snapshot,
             scratch_page_offsets=scratch_page_offsets,
-            final_hidden=(
-                prompt_hidden.detach().clone() if prompt_hidden is not None else None
-            ),
+            final_hidden=(prompt_hidden.detach().clone() if prompt_hidden is not None else None),
         )
         self._persistent_free_scratch_pages.difference_update(scratch_page_offsets)
         self.stats["prefix_persistent_stores"] += 1

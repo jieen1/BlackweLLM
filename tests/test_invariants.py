@@ -206,9 +206,7 @@ class TestConcreteChecks:
             key=1, kv_hash_dropped=True, checkpoint_dropped=False, kv_ref_cnt=999
         )
         checks.check_referenced_resource_never_evicted(resource_id=1, ref_cnt=999, was_evicted=True)
-        checks.check_reserved_physical_slots_agree(
-            "x", state_pool_reserved=1, backend_reserved=999
-        )
+        checks.check_reserved_physical_slots_agree("x", state_pool_reserved=1, backend_reserved=999)
 
 
 class TestRealCodeRegression:

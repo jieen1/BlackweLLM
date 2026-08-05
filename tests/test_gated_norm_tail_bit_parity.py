@@ -35,6 +35,4 @@ def test_bit_parity(shape):
     xf = x.to(torch.float32)
     rstd = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
     out = gated_norm_tail(xf, rstd.reshape(-1), w, gate)
-    assert torch.equal(ref, out), (
-        f"diff elements: {(ref != out).sum().item()} of {ref.numel()}"
-    )
+    assert torch.equal(ref, out), f"diff elements: {(ref != out).sum().item()} of {ref.numel()}"

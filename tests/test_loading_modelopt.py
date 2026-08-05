@@ -46,7 +46,8 @@ class TestQuantizedLayersMap:
             "quantization_config": {
                 "quantized_layers": {
                     "model.language_model.layers.0.mlp.gate_proj": {
-                        "quant_algo": "W4A16_NVFP4", "group_size": 16
+                        "quant_algo": "W4A16_NVFP4",
+                        "group_size": 16,
                     },
                     "model.language_model.layers.0.self_attn.q_proj": {"quant_algo": "FP8"},
                 }
@@ -99,7 +100,22 @@ class TestUnpackNvfp4:
     # 0:0, 1:0.5, 2:1, 3:1.5, 4:2, 5:3, 6:4, 7:6, 8:-0, 9:-0.5, 10:-1,
     # 11:-1.5, 12:-2, 13:-3, 14:-4, 15:-6.
     EXPECTED_LUT = [
-        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
     ]
 
     def test_lut_matches_textbook_e2m1_table(self):

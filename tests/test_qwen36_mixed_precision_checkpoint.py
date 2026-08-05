@@ -70,8 +70,9 @@ _KNOWN_SUFFIXES = (
     "v_scale",
 )
 
-_NVFP4_SUFFIXES = frozenset({"weight_packed", "weight_scale", "weight_global_scale",
-                              "input_global_scale"})
+_NVFP4_SUFFIXES = frozenset(
+    {"weight_packed", "weight_scale", "weight_global_scale", "input_global_scale"}
+)
 _FP8_CHANNEL_SUFFIXES = frozenset({"weight", "weight_scale"})
 
 
@@ -141,9 +142,7 @@ class TestZeroMissingZeroExtra:
     def test_every_nvfp4_module_has_exactly_the_four_nvfp4_tensors(
         self, unsloth_module_suffixes, unsloth_quant_map
     ):
-        nvfp4_modules = [
-            m for m, s in unsloth_module_suffixes.items() if "weight_packed" in s
-        ]
+        nvfp4_modules = [m for m, s in unsloth_module_suffixes.items() if "weight_packed" in s]
         assert len(nvfp4_modules) == 168, (
             "expected 168 NVFP4 modules (56 early layers x {gate,up,down}_proj) -- "
             f"found {len(nvfp4_modules)}"
@@ -196,13 +195,14 @@ class TestZeroMissingZeroExtra:
         # classification layer directly, before construction.
         plain_modules = [m for m, s in unsloth_module_suffixes.items() if s == {"weight"}]
         assert len(plain_modules) > 0, "sanity: the checkpoint should have plain-BF16 modules"
-        misclassified = {m: unsloth_quant_map.get(m) for m in plain_modules
-                          if unsloth_quant_map.get(m) is not None}
+        misclassified = {
+            m: unsloth_quant_map.get(m)
+            for m in plain_modules
+            if unsloth_quant_map.get(m) is not None
+        }
         assert misclassified == {}
 
-    def test_total_quantized_tensor_count_matches_the_known_baseline(
-        self, unsloth_module_suffixes
-    ):
+    def test_total_quantized_tensor_count_matches_the_known_baseline(self, unsloth_module_suffixes):
         # 168 weight_packed + 168 weight_scale(nvfp4) + 168 weight_global_scale
         # + 168 input_global_scale + 233 weight(fp8) + 233 weight_scale(fp8)
         # == the real index's counts, LANGUAGE-MODEL-ONLY (model.visual.*
@@ -238,9 +238,7 @@ class TestNoModuleIsMisclassifiedAsTheWrongScheme:
     fp8-tensored module classifies fp8-channel) -- this test restates that
     as a single, explicit "no crossover" assertion for readability."""
 
-    def test_no_crossover_between_the_two_schemes(
-        self, unsloth_module_suffixes, unsloth_quant_map
-    ):
+    def test_no_crossover_between_the_two_schemes(self, unsloth_module_suffixes, unsloth_quant_map):
         for module, suffixes in unsloth_module_suffixes.items():
             algo = unsloth_quant_map.get(module)
             if algo == QUANT_ALGO_MP_NVFP4:
