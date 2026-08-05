@@ -41,6 +41,7 @@ from server.engine import ServerEngine
 from server.formats import anthropic as anthropic_format
 from server.formats import convert_tools_to_chat_template
 from server.formats import openai as openai_format
+from server.formats import responses as responses_format
 from server.formats.stream import StreamProcessor
 from server.tracing import tracer
 
@@ -1808,4 +1809,320 @@ async def anthropic_messages(request: Request):
         cache_read_input_tokens=result.get("prefix_cache_hit_tokens", 0),
         reasoning_content=reasoning_content,
         stop_sequence=result.get("matched_stop_sequence"),
+    )
+
+
+# -- OpenAI Responses API (/v1/responses) ----------------------------------
+# Adapter for Codex CLI 0.146+ (which removed `wire_api = "chat"`): the
+# Responses protocol is translated onto the same engine pipeline as
+# /v1/chat/completions. Request parsing and response building live in
+# server/formats/responses.py; this handler only does parse -> tokenize ->
+# engine.submit -> format, mirroring the Anthropic handler above.
+
+
+@app.post("/v1/responses")
+async def responses_api(request: Request):
+    assert engine is not None
+    body = await request.json()
+    t0 = time.perf_counter()
+
+    max_tokens = _validate_and_resolve_max_tokens(body.get("max_output_tokens"))
+    model_name = body.get("model") or engine.MODEL
+    stream = body.get("stream", False)
+    sampling_params = _build_sampling_params(
+        temperature=body.get("temperature"),
+        top_p=body.get("top_p"),
+        top_k=body.get("top_k"),
+        seed=body.get("seed"),
+    )
+    chat_messages = responses_format.parse_input(body)
+    if not chat_messages:
+        raise _invalid_request("no messages provided")
+    tools = convert_tools_to_chat_template(body.get("tools"))
+    prompt_ids = await _tokenize_chat(engine, chat_messages, tools=tools)
+    await _debug_log_input("OPENAI /v1/responses", body, chat_messages, prompt_ids)
+    _validate_capacity(prompt_ids, max_tokens)
+
+    if stream:
+        import json as _json
+
+        async def _responses_sse():
+            proc = StreamProcessor(
+                engine.tok, thinking_capable=SERVER_THINKING_CAPABLE
+            )
+            final_result = None
+            first_token_t = None
+            resp_id = f"resp_{uuid.uuid4().hex[:24]}"
+            created_at = int(time.time())
+            output_index = 0
+            text_item_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+            in_progress = responses_format.snapshot(
+                resp_id, created_at, model_name, "in_progress", [], None
+            )
+            # Responses lifecycle events carry the full snapshot under a
+            # ``response`` key with a top-level ``type`` (the OpenAI SSE
+            # contract).  Sending the bare snapshot made Codex's client treat
+            # the terminal events as unknown and reconnect ("stream closed
+            # before response.completed").
+            yield (
+                "event: response.created\ndata: "
+                + _json.dumps({"type": "response.created", "response": in_progress})
+                + "\n\n"
+            )
+            yield (
+                "event: response.in_progress\ndata: "
+                + _json.dumps({"type": "response.in_progress", "response": in_progress})
+                + "\n\n"
+            )
+            yield (
+                "event: response.output_item.added\ndata: "
+                + _json.dumps(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": {
+                            "id": text_item_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                        },
+                    }
+                )
+                + "\n\n"
+            )
+            yield (
+                "event: response.content_part.added\ndata: "
+                + _json.dumps(
+                    {
+                        "type": "response.content_part.added",
+                        "item_id": text_item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": "", "annotations": []},
+                    }
+                )
+                + "\n\n"
+            )
+            text_started = False
+            last_send = time.monotonic()
+            _cancel_ref: list[str | None] = [None]
+            async for item in engine.submit_stream(
+                prompt_ids,
+                max_tokens,
+                sampling_params=sampling_params,
+                cancel_ref=_cancel_ref,
+                stop_sequences=None,
+            ):
+                if await request.is_disconnected():
+                    if _cancel_ref[0]:
+                        engine.cancel(_cancel_ref[0])
+                    return
+                if isinstance(item, dict):
+                    final_result = item
+                    break
+                proc.add_tokens(item)
+                if first_token_t is None and item:
+                    first_token_t = time.perf_counter()
+                for delta in proc.drain_content():
+                    text_started = True
+                    ev = {
+                        "type": "response.output_text.delta",
+                        "item_id": text_item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "delta": delta,
+                    }
+                    yield f"event: response.output_text.delta\ndata: {_json.dumps(ev)}\n\n"
+                    last_send = time.monotonic()
+                # Long reasoning-only stretches emit no delta events; an SSE
+                # comment keeps the connection alive for clients with an idle
+                # read timeout (comments are ignored by spec-compliant SSE
+                # parsers, including Codex's).
+                if time.monotonic() - last_send >= 15:
+                    yield ": keepalive\n\n"
+                    last_send = time.monotonic()
+
+            finish = final_result["finish_reason"] if final_result else "stop"
+            visible_text, tool_calls = proc.finalize()
+            output_items = []
+            text = visible_text or ""
+            output_items.append(
+                responses_format.message_item(text_item_id, text)
+            )
+            if text_started:
+                yield (
+                    "event: response.output_text.done\ndata: "
+                    + _json.dumps(
+                        {
+                            "type": "response.output_text.done",
+                            "item_id": text_item_id,
+                            "output_index": output_index,
+                            "content_index": 0,
+                            "text": text,
+                        }
+                    )
+                    + "\n\n"
+                )
+            yield (
+                "event: response.content_part.done\ndata: "
+                + _json.dumps(
+                    {
+                        "type": "response.content_part.done",
+                        "item_id": text_item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": text,
+                            "annotations": [],
+                        },
+                    }
+                )
+                + "\n\n"
+            )
+            yield (
+                "event: response.output_item.done\ndata: "
+                + _json.dumps(
+                    {
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": output_items[-1],
+                    }
+                )
+                + "\n\n"
+            )
+            output_index += 1
+            for tc in tool_calls:
+                fc_id = f"fc_{uuid.uuid4().hex[:24]}"
+                fc_item = responses_format.function_call_item(
+                    fc_id,
+                    tc["name"],
+                    _json.dumps(tc["arguments"], ensure_ascii=False),
+                )
+                output_items.append(fc_item)
+                yield (
+                    "event: response.output_item.added\ndata: "
+                    + _json.dumps(
+                        {
+                            "type": "response.output_item.added",
+                            "output_index": output_index,
+                            "item": {
+                                "id": fc_id,
+                                "type": "function_call",
+                                "call_id": fc_item["call_id"],
+                                "name": tc["name"],
+                                "arguments": "",
+                            },
+                        }
+                    )
+                    + "\n\n"
+                )
+                yield (
+                    "event: response.function_call_arguments.delta\ndata: "
+                    + _json.dumps(
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": fc_id,
+                            "output_index": output_index,
+                            "delta": fc_item["arguments"],
+                        }
+                    )
+                    + "\n\n"
+                )
+                yield (
+                    "event: response.function_call_arguments.done\ndata: "
+                    + _json.dumps(
+                        {
+                            "type": "response.function_call_arguments.done",
+                            "item_id": fc_id,
+                            "output_index": output_index,
+                            "arguments": fc_item["arguments"],
+                        }
+                    )
+                    + "\n\n"
+                )
+                yield (
+                    "event: response.output_item.done\ndata: "
+                    + _json.dumps(
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": output_index,
+                            "item": fc_item,
+                        }
+                    )
+                    + "\n\n"
+                )
+                output_index += 1
+
+            usage = responses_format.build_usage(
+                len(prompt_ids),
+                len(proc.all_ids),
+                final_result.get("prefix_cache_hit_tokens", 0)
+                if final_result
+                else 0,
+            )
+            completed = responses_format.snapshot(
+                resp_id, created_at, model_name, "completed", output_items, usage
+            )
+            metrics.record_request(
+                "responses",
+                len(prompt_ids),
+                len(proc.all_ids),
+                finish,
+                time.perf_counter() - t0,
+                (first_token_t - t0) if first_token_t is not None else None,
+            )
+            await _debug_log_stream_output(
+                "OPENAI /v1/responses", proc, visible_text, tool_calls, finish
+            )
+            yield (
+                "event: response.completed\ndata: "
+                + _json.dumps({"type": "response.completed", "response": completed})
+                + "\n\n"
+            )
+            yield (
+                "event: response.done\ndata: "
+                + _json.dumps({"type": "response.done", "response": completed})
+                + "\n\n"
+            )
+
+        return StreamingResponse(_responses_sse(), media_type="text/event-stream")
+
+    result = await engine.submit(
+        prompt_ids,
+        max_tokens,
+        sampling_params=sampling_params,
+        stop_sequences=None,
+    )
+    raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
+    proc = StreamProcessor(engine.tok, thinking_capable=SERVER_THINKING_CAPABLE)
+    proc.add_tokens(result["committed_token_ids"])
+    text = proc.content_text()
+    reasoning_content = (
+        proc.reasoning_content() if SERVER_REASONING_MODE == "expose" else None
+    )
+    metrics.record_request(
+        "responses",
+        result["prompt_tokens"],
+        result["completion_tokens"],
+        result["finish_reason"],
+        time.perf_counter() - t0,
+    )
+    _debug_log_output(
+        "OPENAI /v1/responses",
+        raw_text,
+        text,
+        result["finish_reason"],
+        result["completion_tokens"],
+    )
+    return responses_format.build_response(
+        model=model_name,
+        text=text,
+        finish_reason=result["finish_reason"],
+        prompt_tokens=result["prompt_tokens"],
+        completion_tokens=result["completion_tokens"],
+        committed_token_ids=result["committed_token_ids"],
+        reasoning_content=reasoning_content,
+        prefix_cache_hit_tokens=result.get("prefix_cache_hit_tokens", 0),
     )
