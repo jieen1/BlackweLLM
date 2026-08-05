@@ -1,6 +1,6 @@
 # BlackweLLM 文档索引
 
-> 最后整理：2026-08-01 · 基线 commit `ce21eb5`
+> 最后整理：2026-08-05 · 基线 commit `8ed33e9`
 
 ## 先读哪一份
 
@@ -12,7 +12,7 @@
 | **E2E 测试 / 兼容性 / 稳定性怎么分期、GPU 窗口怎么排** | [`e2e-and-quality-plan.md`](e2e-and-quality-plan.md) |
 | 了解系统怎么搭的、准备改核心代码 | [`architecture.md`](architecture.md) |
 | 接入一个新模型 / 想知道支持哪些模型 | [`model-support.md`](model-support.md) |
-| **重建 Qwen3.6-27B 支持（Track B）：`oracle/qwen36_vllm/` 哪些能搬、验收基线数字、风险** | [`qwen36-rebuild-spec.md`](qwen36-rebuild-spec.md) |
+| **重建 Qwen3.6-27B 支持（Track B）的历史规格与基线**（重建主体已落地，见 `../notes/2026-08-05-qwen36-quality-rerun.md`） | [`qwen36-rebuild-spec.md`](qwen36-rebuild-spec.md) |
 | **排查任何问题、写任何诊断代码之前** | [`diagnostics-guide.md`](diagnostics-guide.md) |
 | 部署和调参 | [`../README.md`](../README.md) + [`../server/README.md`](../server/README.md) |
 | 查某个指标的定义 | [`../server/README.md`](../server/README.md#metrics) |

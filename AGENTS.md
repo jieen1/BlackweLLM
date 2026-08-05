@@ -1,14 +1,18 @@
 # Repository Guidelines
 
-> Last verified against the tree: 2026-08-01, commit `ce21eb5`.
+> Last verified against the tree: 2026-08-05, commit `8ed33e9` (plus the
+> 2026-08-05 working-tree changes documented in
+> [`notes/2026-08-05-persistent-prefix-full-hit-fix-and-codex-integration.md`](notes/2026-08-05-persistent-prefix-full-hit-fix-and-codex-integration.md)).
 > If something here disagrees with the code, the code wins — and fix this file.
 
 ## What this project is
 
 A single-node inference runtime for **NVIDIA Blackwell SM120 only**. One GPU
 architecture, one machine, one process, `TP = PP = EP = 1` as a premise rather
-than a config option. Currently serves `poolside/Laguna-S-2.1-NVFP4`;
-Qwen3.6 support is the active roadmap priority.
+than a config option. Serves `poolside/Laguna-S-2.1-NVFP4` (LagunaBackend,
+DFlash) and `unsloth/Qwen3.6-27B-NVFP4` (Qwen36Backend, MTP K=3 + MTP/decode
+CUDA Graphs + persistent prefix cache + FP8 KV, servable since 2026-08-05);
+`Qwen3.6-25B-A3B` is the next roadmap target.
 
 **Read before making non-trivial changes:**
 [`docs/roadmap.md`](docs/roadmap.md) (where the project is going and what is
@@ -28,6 +32,9 @@ runtime/                  Core inference engine
     laguna_dflash_cudagraph.py
     laguna_sparkinfer_attn.py SparkInfer paged-attention adapter
     laguna_sparkinfer_moe.py  SparkInfer fused-MoE adapter
+    qwen36.py                 Qwen36Backend — persistent prefix + GDN recurrent
+                              state, dual-cache-family checkpointing, MTP wiring
+    qwen36_mtp.py             MTP speculative engine (draft/sync/verify CUDA Graphs)
     bf_attention.py           KV write (FP8 quant + paged scatter) + attn dispatch
   model/                  Self-built model graph
     laguna_model.py · laguna_decoder.py · laguna_dflash_model.py
@@ -44,7 +51,7 @@ runtime/                  Core inference engine
 server/                   HTTP layer
   app.py                  FastAPI endpoints + /metrics + /debug/*
   engine.py               ServerEngine — admission, fixed slots, continuous batching
-  formats/                openai · anthropic · stream · tools · thinking · content
+  formats/                openai · anthropic · responses · stream · tools · thinking · content
   metrics.py · tracing.py
 
 bfdiag/                   Diagnostics platform, CLI `bf`. Pure stdlib, imported at
@@ -59,11 +66,20 @@ docs/                     Live documentation (see docs/README.md)
 notes/                    Investigation records (see notes/README.md for the index)
 oracle/                   Offline reference only. NOT packaged, NOT importable from
                           production code. Contains the retired Qwen3.6/vLLM path.
+scripts/                  Runbooks — `run_qwen36_quality.sh` (parallel/resumable
+                          quality rerun; server profiles suite/longctx/mmlu/best)
 ```
 
 Keep components small and layer boundaries explicit. **Production code must not
 import `vllm` or anything under `oracle/`** — that boundary is tested, and
 `tools/verify_no_vllm_laguna.py` exists to check it.
+
+Local agent-tooling config (`.codex/blackwellm.config.toml`,
+`.claude/settings.json`) is intentionally gitignored; the contents and the
+Codex/Claude Code end-to-end verification are recorded in
+[`notes/2026-08-05-persistent-prefix-full-hit-fix-and-codex-integration.md`](notes/2026-08-05-persistent-prefix-full-hit-fix-and-codex-integration.md)
+and
+[`notes/2026-08-05-claude-code-via-local-runtime.md`](notes/2026-08-05-claude-code-via-local-runtime.md).
 
 ## Build, test, and development
 
@@ -81,11 +97,10 @@ Lint and format are enforced by `ruff` (config in `pyproject.toml`) and run in C
 on every push and PR. `benchmarks/` and `tests/debug/` are lint-relaxed for style
 rules but keep the bug-catching rules (F821, F811, F401, E9xx) active.
 
-**Current state of the gates (2026-08-02): green.** `ruff check .` passes, the
-torch-free job passes, and the full suite passes. The 4 failures and the red CI
-recorded here on 2026-08-01 were fixed by roadmap T0-1 through T0-6; this line
-outlived them by a day. Re-verify rather than trusting it — that is the point
-of the date stamp.
+**Current state of the gates (2026-08-05): green.** `ruff check .` passes, the
+torch-free CI-sim suite passes (1150 passed, 192 skipped), and the full venv
+suite passes (1871 passed, 3 skipped). Re-verify rather than trusting it — that
+is the point of the date stamp.
 
 ## Diagnostics — read this before debugging anything
 

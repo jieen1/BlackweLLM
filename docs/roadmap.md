@@ -13,6 +13,15 @@
 > 新增风险 RK9（冷启动/首次真实形状路径）。本轮那三条 [待验证] 事项**已全部答完**
 > （B0-8 GDN、KV dtype 选型、torch wheel 是否带 `sm_120`），结论见下方待验证清单与
 > [`investigation-queue.md`](investigation-queue.md) C-1/C-2/C-3。
+>
+> **2026-08-05 修订**：`unsloth/Qwen3.6-27B-NVFP4` 已在自研 `qwen36` 后端上
+> 可服务（MTP K=3 + MTP/decode CUDA Graph + persistent prefix cache + FP8 KV，
+> 生产路径零 vLLM），质量基线在同参数下复现：MMLU-Pro 414 精确复现 84.54%、
+> tool/agent/longctx 均 1.000、HumanEval 768 在 ±3.9pp SE 内。证据：
+> [`../notes/2026-08-05-qwen36-quality-rerun.md`](../notes/2026-08-05-qwen36-quality-rerun.md)、
+> [`../notes/2026-08-05-persistent-prefix-full-hit-fix-and-codex-integration.md`](../notes/2026-08-05-persistent-prefix-full-hit-fix-and-codex-integration.md)。
+> 因此下文 §0.5 阶段 1–4 与里程碑 M2–M4 的"计划"措辞以本修订为准；
+> M4 剩余项为性能调优，M5 的 25B-A3B 尚未开工。
 
 ---
 

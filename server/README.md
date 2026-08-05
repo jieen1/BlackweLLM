@@ -1,10 +1,10 @@
 # Server
 
-The server exposes the fixed-slot Laguna engine (`server/engine.py`'s
+The server exposes the fixed-slot engine (`server/engine.py`'s
 `ServerEngine`, a continuous-batching wrapper around
-`runtime.backends.laguna.LagunaBackend`) through OpenAI- AND
-Anthropic-compatible interfaces. It has no vLLM runtime dependency; do not
-add multi-model or multi-GPU routing here.
+`runtime.backends.laguna.LagunaBackend` / `runtime.backends.qwen36.Qwen36Backend`)
+through OpenAI-, Anthropic- and Responses-compatible interfaces. It has no
+vLLM runtime dependency; do not add multi-model or multi-GPU routing here.
 
 ## Endpoints
 
@@ -17,6 +17,9 @@ add multi-model or multi-GPU routing here.
   SSE) and non-streaming. Thinking is emitted as a `thinking` content block.
 - `POST /v1/messages/count_tokens` — Anthropic token counting (Claude
   Desktop calls this before sending).
+- `POST /v1/responses` — OpenAI Responses API (used by Codex CLI). Streaming
+  lifecycle events (`response.created` / `in_progress` / `output_text.delta` /
+  `completed` / `done`) and non-streaming, with 15s idle keepalive comments.
 - `GET /v1/models` — model card; `max_model_len` reports the live per-slot
   context ceiling (`capacity_tokens_per_slot`).
 - `GET /metrics` — Prometheus exposition in the `blackwellm:*` namespace.
@@ -36,22 +39,27 @@ Non-streaming responses carry non-standard `debug_committed_token_ids` /
 ## Configuration
 
 Set via env (read at import) or `python -m server.app` flags. "Deployed" is
-what `~/vllm_server/vllm_ctl.sh` actually sets for the production runtime.
+the best-quality profile from `scripts/run_qwen36_quality.sh server start best`
+(2026-08-05): 3 × 256K slots on a 96 GB card.
 
 | Env | Flag | Code default | Deployed | Meaning |
 | --- | --- | --- | --- | --- |
-| `QSR_SERVER_CAPACITY` | `--capacity` | 4 | 2 | concurrent production slots |
-| `QSR_SERVER_NUM_SLOTS` | `--num-slots` | 8 | 2 | total physical slots |
+| `QSR_SERVER_CAPACITY` | `--capacity` | 4 | 3 | concurrent production slots |
+| `QSR_SERVER_NUM_SLOTS` | `--num-slots` | 8 | 4 | total physical slots (capacity + 1 CG warmup slot) |
 | `QSR_SERVER_BLOCK_SIZE` | — | 16 (`qwen36`), 64 (`laguna`) | 16 | KV block size (tokens/block); Laguna sparkinfer requires 64 |
 | `QSR_SERVER_BLOCKS_PER_SLOT` | `--blocks-per-slot` | 16384 (`qwen36`), 2048 (`laguna`) | 16384 | per-slot KV ceiling (`× block_size` tokens) ⇒ **256K** for qwen36, **128K** for Laguna |
-| `QSR_SERVER_ENABLE_CUDAGRAPH` | `--no-cudagraph` | 1 | 0 | captured decode graph |
+| `QSR_SERVER_ENABLE_CUDAGRAPH` | `--no-cudagraph` | 1 | 1 | captured decode graph |
 | `QSR_SERVER_ENABLE_PREFIX_CACHE` | `--no-prefix-cache` | 1 | 1 | persistent prefix cache (P4a) |
 | `QSR_SERVER_ENABLE_SESSION_AFFINITY` | `--session-affinity` | 0 | 0 | opt-in warm-slot retention (P4b) |
 | `QSR_SERVER_SESSION_TTL_S` | `--session-ttl-s` | 30.0 | 30.0 | warm-slot retention TTL seconds (P4b) |
+| `QSR_SERVER_ENABLE_MTP` | `--mtp` | 0 | 1 | MTP speculative decoding (Qwen3.6) |
+| `QSR_SERVER_MTP_K` | `--mtp-k` | 4 | 3 | MTP speculative depth (historical K=3) |
+| `QSR_SERVER_ENABLE_DFLASH` | `--dflash` | 0 | 0 | DFlash speculative engine (Laguna) |
 | `QSR_SERVER_KV_CACHE_DTYPE` | — | fp8_e4m3 | fp8_e4m3 | KV cache dtype |
-| `QSR_SERVER_GPU_MEM_UTIL` | — | 0.85 | 0.85 | vLLM `gpu_memory_utilization` |
+| `QSR_SERVER_GPU_MEM_UTIL` | — | 0.85 | 0.92 | `gpu_memory_utilization` |
 | `QSR_SERVER_PRODUCTION` | — | 1 | 1 | production slot layout (vs. diagnostic layout) |
-| `QSR_SERVED_MODEL_NAME` | — | engine MODEL | `qwen3.6-rt` | name(s) reported by `/v1/models` (space-separated list) |
+| `QSR_SERVED_MODEL_NAME` | — | engine MODEL | `qwen3.6` | name(s) reported by `/v1/models` (space-separated list) |
+| `QSR_SERVER_REQUEST_TIMEOUT_S` | — | 600 | 0 | server-side request cap; 0 disables (long generations) |
 | `QSR_DEBUG_REQUESTS` | — | 1 | 1 | log raw request/response (see **Raw I/O logging**); legacy alias `QSR_DEBUG_ANTHROPIC` |
 
 CLI also accepts `--host` / `--port` (default `127.0.0.1:8000`).
@@ -112,11 +120,11 @@ zero-restore signal).
 
 `GET /metrics` returns Prometheus text in the vLLM naming convention
 (`blackwellm:*`, all labelled `model_name`), scraped by the local Prometheus
-(`~/vllm_server` docker `vllm-prometheus`, job `vllm`, 15s interval).
+(legacy `~/vllm_server` docker `vllm-prometheus`, job `vllm`, 15s interval).
 
 **Performance / speed** (the core focus; app-layer, recorded per request in
 `server/metrics.py`, labelled by `endpoint` ∈ {`chat`, `completions`,
-`messages`}):
+`messages`, `responses`}):
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -160,7 +168,8 @@ Useful PromQL:
 ## Raw I/O logging
 
 With `QSR_DEBUG_REQUESTS=1` (default ON) every request logs, to the service
-log (`~/vllm_server/logs/current.log`):
+log (stdout of the server process; the quality runbook keeps it under
+`logs/quality/server_*_<label>.log`):
 
 - `<ENDPOINT> RAW REQUEST (N bytes): <full JSON body>` — the verbatim client
   request (OpenAI and Anthropic alike).

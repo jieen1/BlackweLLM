@@ -1,6 +1,6 @@
 # 模型支持矩阵与接入指南
 
-> 编制日期：2026-08-01 · 基线 commit：`ce21eb5`
+> 编制日期：2026-08-01 · 最后更新：2026-08-05
 >
 > 这份文档回答两个问题：**现在支持哪些模型**，以及**接入一个新模型要做什么**。
 > 排期见 [`roadmap.md`](roadmap.md)，架构设计见 [`architecture.md`](architecture.md)。
@@ -11,8 +11,8 @@
 
 | 模型 | 状态 | 说明 |
 |---|---|---|
-| `poolside/Laguna-S-2.1-NVFP4` | ✅ **生产** | 当前唯一可服务的模型；DFlash 投机、前缀缓存、CUDA Graph 全开 |
-| `Qwen3.6-27B`（NVFP4 文本版） | 🔴 **计划中**（M2→M4） | 曾经支持过，已随 vLLM 剥离被摘除，将走新抽象层重新接入 |
+| `poolside/Laguna-S-2.1-NVFP4` | ✅ **生产** | DFlash 投机、前缀缓存、CUDA Graph 全开 |
+| `Qwen3.6-27B`（NVFP4 文本版，`unsloth/Qwen3.6-27B-NVFP4`） | ✅ **可服务**（2026-08-05） | 自研 `qwen36` 后端；MTP K=3 + MTP/decode CUDA Graph + 持久前缀缓存 + FP8 KV；质量基线已复现 |
 | `Qwen3.6-25B-A3B` | 🔴 **计划中**（M4→M5） | 架构参数尚未确认 |
 | 上述两者的社区微调 / 再量化衍生版 | 🔴 计划中 | 目标是 `config.json` 架构字段一致即自动可用 |
 | 其他一切 | ❌ 不支持 | 见 [`roadmap.md`](roadmap.md) §3「不做清单」 |
@@ -54,7 +54,23 @@ HumanEval+ —— `evalplus_results/official/` 下三份结果的 `model` 字段
 
 ---
 
-## 3. Qwen3.6-27B（目标）
+## 3. Qwen3.6-27B（当前支持）
+
+### 3.0 支持状态（2026-08-05）
+
+`unsloth/Qwen3.6-27B-NVFP4` 已通过自研 `qwen36` 后端可服务（`server.app`，
+生产路径零 vLLM）：MTP K=3、MTP anchor/draft/sync/verify 与 decode CUDA Graph
+全部 capture 并在真实服务路径回放、persistent prefix cache、FP8 e4m3 KV。
+质量基线在同参数下复现（MMLU-Pro 414 精确复现 84.54%；tool/agent/longctx
+均为 1.000；HumanEval 768 在 ±3.9pp SE 内），证据见
+[`notes/2026-08-05-qwen36-quality-rerun.md`](../notes/2026-08-05-qwen36-quality-rerun.md)。
+一条命令启动 best 配置（3 × 256K 槽位）：
+
+```bash
+bash scripts/run_qwen36_quality.sh server start best
+```
+
+历史 vLLM 时代的实现仅保留在 `oracle/qwen36_vllm/` 作离线参考，不再可服务。
 
 ### 3.1 架构事实（读自本地 `nvidia/Qwen3.6-27B-NVFP4` 的 `config.json`）
 
@@ -85,7 +101,9 @@ RoPE          : mrope interleaved · mrope_section [11,11,10]
 | `Qwen/Qwen3.6-27B-FP8` | FP8 | — | 对照/回退 |
 | `cyankiwi/Qwen3.6-27B-AWQ-INT4` | AWQ | — | 格式不在支持范围 |
 
-主线 checkpoint 的选择尚未拍板，见 [`roadmap.md`](roadmap.md) §7 D6。
+主线 checkpoint 已定为 `unsloth/Qwen3.6-27B-NVFP4`
+（`scripts/run_qwen36_quality.sh` 的 `MODEL_SNAPSHOT`；2026-08-03 起
+`resolve_checkpoint` 放行该仓库，质量与 serving 均以其为准）。
 
 ### 3.3 与 Laguna 的差异（= 工作量来源）
 

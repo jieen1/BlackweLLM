@@ -8,28 +8,31 @@ machine, one process, no tensor/pipeline parallelism.** Narrowing is the point �
 it is what lets the engine delete the abstractions that generic frameworks
 must carry, and hand-write the paths that matter.
 
-Production model today: **`poolside/Laguna-S-2.1-NVFP4`**.
-Qwen3.6 series support is the current roadmap priority — see
+Production models today: **`poolside/Laguna-S-2.1-NVFP4`** and
+**`unsloth/Qwen3.6-27B-NVFP4`** — the latter served by the self-built `qwen36`
+backend with MTP speculative decoding, CUDA Graphs, persistent prefix cache and
+FP8 KV. `Qwen3.6-25B-A3B` is the next roadmap target — see
 [`docs/roadmap.md`](docs/roadmap.md).
 
 [中文说明](#中文说明) · [Documentation index](docs/README.md)
 
 ---
 
-## Status (2026-08-01)
+## Status (2026-08-05)
 
 | | |
 |---|---|
-| **Servable models** | `Laguna-S-2.1-NVFP4` (only) |
-| **Planned** | `Qwen3.6-27B`, `Qwen3.6-25B-A3B` and derivatives |
+| **Servable models** | `Laguna-S-2.1-NVFP4`, `Qwen3.6-27B-NVFP4` |
+| **Planned** | `Qwen3.6-25B-A3B` and derivatives |
 | **Hardware** | SM120 only (RTX PRO 6000 Blackwell, RTX 5090), single GPU |
 | **Dependencies** | Zero vLLM in the production path; SparkInfer for SM120 kernels |
 | **Maturity** | Pre-1.0. See [Known issues](#known-issues) before deploying. |
 
-> ⚠️ **Qwen3.6 is not currently servable.** It was supported by an earlier
-> vLLM-based execution path that was retired on 2026-07-30 (that code now
-> lives read-only under `oracle/qwen36_vllm/`). Re-adding it through the new
-> model abstraction layer is the M2→M4 milestone.
+Qwen3.6-27B-NVFP4 became servable on the self-built runtime on 2026-08-05
+(MTP K=3 + CUDA Graph + prefix cache + FP8 KV), and its quality baseline was
+re-established on that path — see [Quality validation](#quality-validation).
+The retired vLLM-era execution path remains read-only under
+`oracle/qwen36_vllm/` as an offline reference.
 
 ## Why
 
@@ -50,10 +53,16 @@ entire distributed abstraction layer simply does not exist.
 - **Fixed-slot continuous batching** — dedicated engine thread owns the CUDA
   context; the asyncio side never blocks
 - **DFlash speculative decoding** — 96.3–100% acceptance on Laguna
-- **CUDA Graph capture** — decode, draft, and verify graphs
+- **MTP speculative decoding (Qwen3.6)** — K=3, anchor/draft/sync/verify CUDA
+  Graphs captured at load and replayed in the live serving path
+- **CUDA Graph capture** — decode, draft, sync, verify graphs (DFlash + MTP)
 - **Prefix caching** — content-addressed, reference-counted, LRU eviction
 - **OpenAI + Anthropic APIs** — `/v1/chat/completions`, `/v1/completions`,
-  `/v1/messages`, `/v1/models`, SSE streaming, tool calling, Prometheus `/metrics`
+  `/v1/messages`, `/v1/responses` (OpenAI Responses, used by Codex CLI),
+  `/v1/models`, SSE streaming, tool calling, Prometheus `/metrics`
+- **Agent CLI integration** — local Codex profile and Claude Code settings talk
+  to the runtime directly with no proxy (see
+  [Agent CLI integration](#agent-cli-integration))
 - **Production hardening** — client-disconnect detection, cancellation,
   request timeout, watchdog for stale slot reclamation
 - **bfdiag diagnostics platform** — flight recorder, run records, run-comparability
@@ -89,30 +98,40 @@ tracked as roadmap item D2 (memory planner).
 
 ## Quality validation
 
-> **Read the model column.** The quality numbers below were measured on
-> **Qwen3.6-27B** in July 2026, on the execution path that has since been
-> retired. They are retained as evidence that the runtime approach does not
-> degrade quality — **they are not current-build numbers, and the current build
-> cannot serve that model.** Re-establishing them on the new path is a
-> Track B verification item.
+Measured on **Qwen3.6-27B-NVFP4**, served by this repo's own runtime
+(`qwen36` backend, MTP K=3 + CUDA Graphs + persistent prefix cache + FP8 KV;
+no external engine). The 2026-08-05 rerun used parameters identical to the
+historical July run and re-established the numbers on the current build —
+orchestrator: [`scripts/run_qwen36_quality.sh`](scripts/run_qwen36_quality.sh)
+(parallel, resumable); full evidence:
+[`notes/2026-08-05-qwen36-quality-rerun.md`](notes/2026-08-05-qwen36-quality-rerun.md).
 
-| Benchmark | Model | Runtime | Score | Reference |
-|---|---|---|---|---|
-| MMLU-Pro (414q, thinking, greedy) | Qwen3.6-27B-NVFP4 | BlackweLLM, 2026-07-22 | 84.54% | official card 86.2 (−1.7pp, within ±3.5% sampling noise) |
-| HumanEval | Qwen3.6-27B-NVFP4 | BlackweLLM vs stock vLLM | 0.445 vs 0.433 | +1.2pp (SE ≈ ±3.9pp) |
-| HumanEval+ | Qwen3.6-27B-NVFP4 | BlackweLLM vs stock vLLM | 0.433 vs 0.427 | +0.6pp |
+| Benchmark | 2026-07 historical | 2026-08-05 current | Verdict |
+|---|---|---|---|
+| MMLU-Pro (414q, thinking, 5-shot CoT, greedy, max_tokens 32768) | 84.54% | **84.54%** (same 414 question_ids, verified 100% overlap) | exact repro |
+| tool (accuracy) | 1.000 (20/20) | 1.000 (20/20) | no regression |
+| agent (final answer / tool invocation) | 1.000 (4/4) | 1.000 (4/4) | no regression |
+| longctx (8K/32K/64K/128K needles) | 1.000 (12/12) | 1.000 (12/12) | no regression |
+| code (HumanEval / HumanEval+, max_tokens 4096) | — | 0.921 / 0.884 | current gate |
+| HumanEval+ 768 (README row) | 0.445 / 0.433 | 0.421 / 0.415 | within ±3.9pp SE |
+
+The HumanEval 768 delta is run-to-run greedy variance (task-level: 50 stable
+passes, 18 new, 20 regressions; raw length distributions equivalent), not
+truncation. Historical methodology:
+[`notes/2026-07-22-quality-baseline-and-official-scores.md`](notes/2026-07-22-quality-baseline-and-official-scores.md).
 
 For **Laguna-S-2.1**, the live gates are the DFlash acceptance regression,
 the production CUDA Graph gate, and a bit-level router oracle — all run through
-`bfdiag`. Methodology: [`notes/2026-07-22-quality-baseline-and-official-scores.md`](notes/2026-07-22-quality-baseline-and-official-scores.md).
+`bfdiag`.
 
 ## Repository layout
 
 ```
 blackwellm/
 ├── runtime/           Core inference engine
-│   ├── backends/          LagunaBackend + SparkInfer attn/MoE adapters,
-│   │                      CUDA Graph lifecycle, DFlash speculative engine
+│   ├── backends/          LagunaBackend (DFlash), Qwen36Backend (MTP K=3,
+│   │                      persistent prefix + GDN recurrent state), CUDA
+│   │                      Graph lifecycle, SparkInfer attn/MoE adapters
 │   ├── model/             Self-built model graph (decoder, linear, embedding, attention)
 │   ├── kernels/           Own SM120 kernels (.cu) + Triton kernels
 │   ├── block_pool.py      Paged KV + prefix cache (refcount, LRU)
@@ -121,11 +140,13 @@ blackwellm/
 ├── server/            HTTP layer
 │   ├── app.py             FastAPI endpoints + /metrics
 │   ├── engine.py          Admission, fixed-slot scheduling, continuous batching
-│   └── formats/           OpenAI / Anthropic / streaming / tools / thinking
+│   └── formats/           OpenAI / Anthropic / Responses / streaming / tools / thinking
 ├── bfdiag/            Diagnostics platform (CLI: `bf`) — pure stdlib
 ├── bfprobe/           Runtime probes
 ├── loader/            Checkpoint inspection utilities
 ├── benchmarks/        Reproducible perf & correctness checks
+├── scripts/           Runbooks — `run_qwen36_quality.sh` (parallel/resumable
+│                      quality rerun; server profiles incl. `best`)
 ├── tests/             Unit tests (CPU-only)
 ├── docs/              Roadmap, architecture, model support, diagnostics
 ├── notes/             Investigation records and evidence archive
@@ -177,6 +198,20 @@ python -m server.app --host 0.0.0.0 --port 8000
 > These four variables are coupled: get them wrong and you either OOM at load
 > time or silently waste VRAM. Automating this is roadmap item D2.
 
+### Serve Qwen3.6-27B (MTP + CUDA Graph + prefix cache)
+
+The quality orchestrator ships a ready "best" profile — 3 × 256K slots,
+MTP K=3, decode + MTP CUDA Graphs, persistent prefix cache, FP8 KV,
+`gpu_memory_utilization=0.92`:
+
+```bash
+bash scripts/run_qwen36_quality.sh server start best   # port 8300
+bash scripts/run_qwen36_quality.sh server stop         # stop
+```
+
+Same self-built server (no vLLM), model id `qwen3.6`, callable through
+`/v1/chat/completions`, `/v1/messages`, or `/v1/responses`.
+
 ### Call
 
 ```bash
@@ -191,6 +226,23 @@ curl http://localhost:8000/v1/messages \
   -d '{"model":"laguna-s-2.1","messages":[{"role":"user","content":"Hello!"}],"max_tokens":256}'
 ```
 
+## Agent CLI integration
+
+Both Codex CLI and Claude Code can drive this runtime directly, no proxy:
+
+- **Codex** — `.codex/blackwellm.config.toml` defines profile `blackwellm`
+  (`base_url = http://127.0.0.1:8300/v1`, `wire_api = "responses"`, 256K
+  context). Run `CODEX_HOME="$PWD/.codex" codex exec -p blackwellm "<task>"`.
+- **Claude Code** — project `.claude/settings.json` sets
+  `ANTHROPIC_BASE_URL = http://127.0.0.1:8300`, `ANTHROPIC_MODEL = qwen3.6`.
+  Run `claude -p "<task>"` from the repo root.
+
+Both files are local tooling state and gitignored on purpose; the exact
+contents and end-to-end verification are recorded in
+[`notes/2026-08-05-persistent-prefix-full-hit-fix-and-codex-integration.md`](notes/2026-08-05-persistent-prefix-full-hit-fix-and-codex-integration.md)
+and
+[`notes/2026-08-05-claude-code-via-local-runtime.md`](notes/2026-08-05-claude-code-via-local-runtime.md).
+
 ## Configuration
 
 | Env variable | Default | Description |
@@ -201,6 +253,10 @@ curl http://localhost:8000/v1/messages \
 | `QSR_SERVER_PRODUCTION` | `1` | Production mode: skip validation slots |
 | `QSR_SERVER_ENABLE_CUDAGRAPH` | `1` | Enable CUDA Graph capture |
 | `QSR_SERVER_ENABLE_PREFIX_CACHE` | `0` | Enable prefix caching |
+| `QSR_SERVER_ENABLE_MTP` | `0` | Enable MTP speculative decoding (Qwen3.6) |
+| `QSR_SERVER_MTP_K` | `4` | MTP speculative depth (quality/historical profile: 3) |
+| `QSR_SERVER_ENABLE_DFLASH` | `0` | Enable DFlash speculative engine (Laguna) |
+| `QSR_SERVER_REQUEST_TIMEOUT_S` | `600` | Server-side request cap; `0` disables (quality/longctx profiles) |
 | `QSR_SERVED_MODEL_NAME` | model ID | Advertised model name(s) |
 | `QSR_DEBUG_REQUESTS` | `0` | Log raw request/response |
 | `QSR_TRACE` | `0` | bfdiag flight recorder |
@@ -238,7 +294,7 @@ numbers; when something fails, read the existing trace instead of re-running.
 
 ## Known issues
 
-Tracked in [`docs/roadmap.md`](docs/roadmap.md) §1.3. As of 2026-08-01, CI, the
+Tracked in [`docs/roadmap.md`](docs/roadmap.md) §1.3. As of 2026-08-05, CI, the
 test suite, the dependency contract and the thinking/reasoning contract have all
 been repaired; what remains open:
 
@@ -246,7 +302,6 @@ been repaired; what remains open:
   `json_schema` is accepted but **does not constrain generation at all** — the
   grammar mask is never applied. Requests silently come back as free text. Do not
   rely on JSON mode.
-- **`stop` sequences are not implemented** on either protocol.
 - **`seed` re-seeds per token** rather than advancing one generator, so it gives
   determinism but not the usual sampling semantics.
 - **Anthropic reasoning is non-standard.** Reasoning is delivered as a
@@ -255,6 +310,13 @@ been repaired; what remains open:
   signature we cannot produce, and a fake one makes Claude Desktop silently drop
   every subsequent content block including `tool_use`
   (see [`docs/roadmap.md`](docs/roadmap.md) §1.4).
+- **Prefix-cache full hits require block-aligned prompts.** Persistent entries
+  are published at `block_size` (16) boundaries; a prompt whose length is not
+  aligned recomputes its tail. Growing agent conversations hit partially when
+  aligned. This is by design, not a correctness issue.
+- **Short `max_tokens` can be consumed by thinking.** Qwen3.6 reasons first;
+  with a very small budget (e.g. 32) the visible answer can be empty. Real
+  workloads (Claude Code / Codex send 32K) are unaffected.
 - **One known flaky test** surfaces only in a full-suite run under machine load
   (`test_bfdiag_record.py::test_cli_ls_labels_an_unfinished_record_running`).
 - **SparkInfer must be this project's fork.** A stock upstream install starts and
@@ -263,7 +325,7 @@ been repaired; what remains open:
 
 ## Limitations
 
-- **Single model** — `Laguna-S-2.1-NVFP4` only, today
+- **Two models** — `Laguna-S-2.1-NVFP4` and `Qwen3.6-27B-NVFP4`; `Qwen3.6-25B-A3B` pending
 - **Single GPU** — no tensor/pipeline/expert parallelism, by design
 - **SM120 only** — compute capability 12.0 required, by design
 - **Sampling disables speculation** — `temperature > 0` falls back to
@@ -275,12 +337,15 @@ been repaired; what remains open:
 Full plan: [`docs/roadmap.md`](docs/roadmap.md).
 
 - **M1 (Aug)** — clear red CI/tests, pin the dependency contract, finalise the
-  model abstraction design
-- **M2 (Sep)** — land the abstraction layer with zero Laguna regression;
-  Qwen3.6 fact baseline
-- **M3 (Oct)** — Qwen3.6-27B correctness + serving; one-command startup
-- **M4 (Nov)** — Qwen3.6-27B performance + MTP speculation; 25B-A3B bring-up
-- **M5 (Dec)** — 25B-A3B serving; usability and compatibility close-out
+  model abstraction design — **done** (2026-08-01/02)
+- **M2/M3** — model abstraction + Qwen3.6-27B correctness and serving —
+  **substantially landed** on the self-built path (2026-08-05): `qwen36`
+  backend, MTP K=3 + CUDA Graphs, persistent prefix cache, quality baseline
+  re-established, one-command `server start best`
+- **M4 (in progress)** — Qwen3.6-27B performance tuning; MTP speculation is
+  already wired (K=3, CUDA-Graph captured); optimization continues per roadmap
+- **M5 (Dec)** — `Qwen3.6-25B-A3B` bring-up and serving
+- **M6 (Jan 2027)** — soak testing, release gates, `0.2.0`
 - **M6 (Jan 2027)** — soak testing, release gates, `0.2.0`
 
 Explicitly out of scope: multi-GPU, multi-node, non-SM120 architectures,
@@ -300,9 +365,10 @@ Apache 2.0 — see [LICENSE](LICENSE).
 （SM120 / CC 12.0）、单机、单进程、无张量/流水线并行。收窄本身就是价值来源——
 它让这个引擎可以删掉通用框架不得不背的抽象，并把关键路径手写出来。
 
-**当前可服务模型**：`poolside/Laguna-S-2.1-NVFP4`。
-**Qwen3.6 系列支持是当前路线图第一优先级**（曾经支持过，随 vLLM 剥离被摘除，
-将走新的模型抽象层重新接入）。
+**当前可服务模型**：`poolside/Laguna-S-2.1-NVFP4` 与
+`unsloth/Qwen3.6-27B-NVFP4`（自研 `qwen36` 后端，MTP K=3 + CUDA Graph +
+持久前缀缓存 + FP8 KV，2026-08-05 起可服务；质量基线已在新路径上复现）。
+**下一个路线图目标**是 `Qwen3.6-25B-A3B`。
 
 完整中文文档见 [`docs/README.md`](docs/README.md)：
 
@@ -312,5 +378,6 @@ Apache 2.0 — see [LICENSE](LICENSE).
 - [`docs/diagnostics-guide.md`](docs/diagnostics-guide.md) — bfdiag 诊断平台使用指南（排查问题前必读）
 
 部署方式、配置项、性能与质量数据见上方英文段落。
-**上线前请先读 [Known issues](#known-issues)**——当前 CI 是红的，
-且有若干已知的行为未定义项。
+**上线前请先读 [Known issues](#known-issues)**——当前门禁（ruff + 两套
+pytest：完整 1871 passed / 3 skipped，CPU 镜像 1150 passed / 192 skipped）
+为绿，但仍有若干已知的行为未定义项。
