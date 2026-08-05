@@ -154,6 +154,69 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       根本没产出数字**——**所以那些"在线下"的 bar 都是排除掉最差负载后算的**。
       与 W4A4 同一失败签名。未测速度。
       详见 [`../notes/2026-08-03-fp8-w8a8-preflight-negative.md`](../notes/2026-08-03-fp8-w8a8-preflight-negative.md)。
+      2026-08-04 补做了更窄的真实 SM120 `torch._scaled_mm` 候选：只保留 56--63 层
+      MLP gate/up 的 16 个原始 FP8 权重，单层 M=1 可快于 BF16 回退，但完整模型短 smoke
+      仍失败（`nll_relative_excess=0.0481 > 0.01`，
+      `min_logits_cosine=0.999112 < 0.9995`）。因此该路径**仅诊断开关、绝不默认服务**；
+      “top-k 未翻转”不能替代完整 logits 门槛。
+      **2026-08-04 再用外部 HF 参考直接复核（不再只相对本运行时）**：
+      `scripts/b1_reference_trajectory.py` 已用标准 unsloth checkpoint 的运行时反量化权重
+      生成 3 个冻结负载、1432 个 decode 点的参考（851/851 HF 参数加载，0 missing，
+      HF NLL=1.396828）。同一轨迹下，FP8 激活往返候选的
+      `max_gap_error=11.953 > 1`、`p99=6.938 > 0.5`、`mean_kl_topk=0.01371 > 0.01`、
+      `max_tie_slack=121 > 8 ULP`；其 NLL 表面上只高 0.28%，但这不足以抵消逐步 logits
+      的严重偏差。这个结果只否决**当前 per-token 往返仿真配方**，不能替代历史 vLLM
+      `FP8ScaledMMLinearKernel` 的逐项复现；它因此禁止把该仿真或现有 `torch._scaled_mm`
+      候选直接设为默认，但不接受“退回长期 BF16 反量化”作为终态。下一项是把历史的
+      输入量化、scale ABI 与 FP8 MMA 累加语义逐项复现后，再用同一 HF 轨迹验收。
+      产物：`.bfdiag/runs/b1_reference_trajectory.pt`、
+      `.bfdiag/runs/b1_agreement_fp8_activation_hf/none.json`。
+      **同日的 W8A16 分支给出了可行的内存方向，但还不是最终 kernel：** 以 vLLM Marlin
+      仅作离线 oracle，233 个 FP8 Linear 保持 BF16 activation + 原始 E4M3 weight，核内
+      处理权重，未构造 FP8→BF16 权重缓存；完整 1432 点 HF 轨迹的显存约 **24.2 GiB**，
+      而现行 BF16-cache 基线在同一 NLL 段峰值约 **71 GiB**。但 Marlin 候选仍比该基线
+      多出 `p99_gap_error` 0.594（6.719 vs 6.125）和 `mean_kl_topk` 0.00380
+      （0.01064 vs 0.00684）。更重要的是，这一轮脚本也暴露出当前基线本身未清零已校准
+      B1 的 p99/tie/KL 本底，故不能把候选的总量直接归因给 W8A16。结论是：**拒绝 BF16
+      全量反量化作为终态，保留 W8A16 作为正确的内核契约；下一步必须按历史缩放与归约
+      语义移植原生实现，并用“候选相对同配置基线”的外部轨迹增量验收。**
+      产物：`.bfdiag/runs/b1_agreement_bf16_base/none.json`、
+      `.bfdiag/runs/b1_agreement_marlin_w8a16_full/none.json`。
+      **2026-08-04 历史代码复核修正了内核方向：实际历史服务路径不是 W8A16，
+      而是 `CompressedTensorsW8A8Fp8` → `CutlassFP8ScaledMMLinearKernel`，即动态
+      per-token E4M3 activation × channel-wise E4M3 weight，FP32 scale、BF16 output。**
+      离线 CUTLASS oracle 已覆盖全部 233 个 FP8 Linear，常驻约 **24 GiB**，完整 HF
+      轨迹为 p99=6.625、KL=0.01212、NLL excess=+0.0006；纯 runtime
+      `torch._scaled_mm` 全层候选同样无 BF16 FP8 权重缓存（常驻约 24--25 GiB，NLL 阶段
+      临时峰值约 60 GiB），得到 p99=6.250、KL=0.01773、NLL excess=+0.0013。
+      两者都证明“**不反量化**”的存储/算子路径可运行；但通用 PyTorch 路径全 B1 用时
+      347s、慢于 CUTLASS oracle 的 273s，不能作为性能终态。下一步是把历史 SM120
+      CUTLASS 的动态量化、FP32 scale epilogue 与小 M 调度移植为本项目自有扩展，禁止把
+      W8A16 或 BF16 反量化回退误写为历史等价实现。
+      **同日已完成这条自有扩展的第一轮活体验证（仍非默认）：** 自有 `.so` 保持原始 E4M3
+      权重、动态 per-token E4M3 activation 与 FP32 scale，调用方持有 workspace，且不链接
+      vLLM/libtorch。其量化结果相对历史 `scaled_fp8_quant` 为 **20,480/20,480 code 与 scale
+      位模式完全一致**；实际 M=1 的 attention(12,288)、GDN(10,240)、FP8 MLP(17,408)、
+      lm_head(248,320) 相对历史 `cutlass_scaled_mm` 皆 **max_abs=0**。B1 短 decode 与 B1
+      CUDA Graph replay 均通过，图路径加载后常驻约 **20.2 GiB**，没有 FP8→BF16 全量缓存。
+      但完整 1,432 点 HF forced trajectory 仍未通过严格 gate（p99=8.25、tie=146 ULP、
+      KL=0.01082，351s）；历史 CUTLASS oracle 在该 HF 基线也未过相同 gate，因此它是
+      **全模型/基线差异待定位**，不是把 BF16 回退重新设为默认的理由。后续必须做同加载
+      同轨迹的 native-vs-history 全模型差分，再决定默认切换。
+      **2026-08-04 随后按“不能接受 FP8→BF16 权重反量化”的服务约束，默认 CUDA 路由已
+      切到全层 runtime `torch._scaled_mm` W8A8；`QSR_TORCH_SCALED_MM_FP8_CHANNEL=0`
+      仅保留给 CPU/回退诊断。** 默认真实 checkpoint B=1 验证：权重常驻 **20.2 GiB**，
+      decode CUDA Graph 捕获/回放、两条 prompt 的 graph/eager 一致性均通过；MTP 的
+      backbone/draft/verify 图也全部 capture/replay，64-token prefix cache 恢复后完成真实
+      verify + re-draft。8 轮单槽 MTP 为 **18.88 committed tok/s**，低于同预算 plain decode
+      的 **21.74 tok/s**，所以“无反量化”的功能门已过，**超历史性能门仍未过**；下一阶段
+      必须 profile 并缩减 W8A8 MTP 热路径开销，不能把此次默认切换描述为性能完成。
+      **同日融合量化候选的完整资格结论：** 自有单核 E4M3 动态量化后接
+      `torch._scaled_mm`（仍全程原始 FP8 权重）在 B1 三负载各 200 步的 600 点检验中得到
+      `p99=2.125`、`KL=0.00225`、`NLL excess=+0.0039`，但校准 gate 仍拒绝：
+      `p90 gap=0.5625 > 0.5`、中位差 `0.3125 > 0.25`、logits cosine
+      `0.997113 < 0.9995`。故 `QSR_NATIVE_W8A8_QUANT=1` 仅为可审计诊断候选，不能默认；
+      这不是 BF16 回退的理由，默认仍保留 raw-FP8 Torch 量化 + GEMM 路由。
 - [ ] 🔴 **阶段四两根杠杆都撞墙了，且撞在同一处：这个模型对激活精度敏感。**
 
       | 杠杆 | 占解码 kernel | 结论 |
@@ -180,29 +243,20 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       但缺口在**当前 kernel 组合本身比历史那套慢**,不在"没有杠杆"。
       见 [`../notes/2026-08-03-performance-gap-vs-historical.md`](../notes/2026-08-03-performance-gap-vs-historical.md)。
       **下一步:在 128K/c=4 同口径实测坐实,然后按历史文档的分解逐项对账。**
-- [x] ~~**MTP 接进服务路径**~~ —— 已接(默认关),但 🔴 **不可上生产,原因是架构不是接受率**:
-      服务路径实测 **MTP 关 28.0 tok/s vs MTP 开 7.80 tok/s = 0.28×,慢 3.6×**。
-      根因:`Qwen36MTPEngine.round` **全程 eager,从不走 `decode_batch_sampled`**
-      ——那是被捕获的 CUDA Graph 唯一重放的路径。MTP 一开,`classify_decode_slots`
-      把每个 slot 都路由过去,**捕获没被关掉,只是不可达**。
-      等于拿 4.71× 的 CG 收益换 1.54/4 的接受率。
-      DFlash 靠自建 draft/verify CUDA Graph 规避了这个,`Qwen36MTPEngine` 没有对应物。
-- [x] ~~MTP 要能用,必须先给 verify/draft 路径做 CUDA Graph 捕获~~ —— **anchor + draft 已捕获**
-      (`fb573bf`,bit-exact 验证通过,`cg_status` 可观测):8.1 → **11.6–11.8 tok/s(1.44×)**,
-      但仍是 **0.42× vs MTP-off**,**不可上生产**。
-- [ ] 🔴 **实测定位:一轮 GPU 只有 31% 忙,瓶颈是主机侧拷贝,不是接受率。**
-      一轮 276.8ms / leaf kernel 仅 87.0ms;`aten::copy_` **113.3ms(占墙钟 41%)**。
-      `verify_forward` 192.8ms **占一轮 70% 且没进图**——每轮原样再付 CG 本该消掉的开销。
-      ⚠️ 反直觉但关键:**verify 4 个 token 只花单次 decode 的 1.2 倍(192.8 vs 160.8),
-      投机的前提在 GPU 侧是成立的。** 接受率翻倍也补不上那 190ms 空转。
-      详见 [`../notes/2026-08-03-mtp-round-profile.md`](../notes/2026-08-03-mtp-round-profile.md)。
-- [ ] 🎯 **① 捕获 `verify_forward`**(一轮 70%)。阻塞点已定位:
-      `qwen36_model.py:1261` 硬编码 `enable_cuda_graph=False`,而 sparkinfer 有
-      `prepare_prefill_graph_replay_state`(`workspace.py:1325`,Laguna verify 图在用);
-      GDN `spec_forward` 的捕获安全性未验证。
-- [ ] 🎯 **② 用 `recurrent_state_pool.spec_row` 的 K+1 行寻址替掉 GDN snapshot/restore**
-      —— 直接冲那 113ms `copy_` 去。历史(M-3)靠这个删掉命中 84.4% 轮次、
-      占 56% 墙钟的重算,值 +18.76%;**今天 `spec_row` 实现了零调用**。
+- [x] ~~MTP 没有可达的 CUDA Graph verify 路径~~ —— M-2 已让生产 B=1 与 B>1
+      统一走 `mtp_verify_and_commit_batch → round_batch`；draft 与 verify 都有图，
+      verify 的固定形状为 `K+1`（anchor + K drafts）。2026-08-03 在同一块卡、单一
+      full-model 进程中以 `unsloth/Qwen3.6-27B-NVFP4` 验证 B=1、B=2 均实际 capture/replay，
+      后者的批量 verify/draft replay 计数均为 1。2026-08-03 又恢复了历史的 real-prefix
+      teacher-forced sync：按实际接受长度 `m+1` 分组做 B-wide MTP 同步，B=2 全模型 smoke
+      已记录 `batched_sync_replays=1`。MTP 仍默认关闭，性能结论须以同口径 A/B 重测为准。
+- [x] ~~GDN 需要 snapshot/restore 的私有 K+2 行布局~~ —— M-3 已改为历史 `spec_row`
+      语义：每槽恰 `K+1` 行，col0 直接别名普通 decode/prefill 的 live state，col `p`
+      存 verify 位置 `p` 后的状态；接受 m 个 draft 后选择 col m。真实 FP8 GDN 单层
+      K=16 rollback/row-alias probe 为 23/23 exact；完整模型 B=1/B=2 图回放也已通过。
+- [ ] 🎯 **同口径性能 A/B** —— 先以单并发短上下文测 MTP-off vs MTP-on，再按历史口径
+      扩展至 128K/c=4；只在完成该比较后判断是否追平或超过历史。旧 eager profile
+      （`mtp-round-profile.md`）不能再作为当前图路径的性能结论。
 - [x] ~~接受长度退化~~ —— (token,hidden) 配对 bug 已修并实测:
       prose 1.20 → **1.54**,code 1.67 → **1.82**。真实改善但幅度有限,
       **远不足以抵消上面那 3.6×**。C-LIVE **66/67**(基线 64/67,无退化)。
@@ -231,8 +285,73 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       **优势随并发收窄但不消失**：CG 消掉的是每步固定的 CPU 侧开销，并发越高越被摊薄，
       所以 eager 能追回一部分——但 cap4 仍差 3.50×，**"并发上来就不需要 CG"是错的**。
       CG 自身扩展次线性（1→2→4 并发只给到 1.67×/2.40×），与"已 kernel-bound"互为印证。
-- [ ] MTP：默认 K 已从 8 改到 4（`f616029`，K 曲线实测 prose 1.11× / code 1.38×）；
-      重同步 A/B 数据待回（代码在 `work/mtp-resync-20260802` 的 `aed0e2d`，无数据）
+- [ ] MTP：默认 K 已从 8 改到 4（`f616029`，K 曲线实测 prose 1.11× / code 1.38×）。
+      旧的可选 interior-only resync 已退役：历史合约要求每次 prefill/verify 都对所有
+      newly-real target positions 做 teacher-forced sync，并维护独立 `sync_len`。2026-08-04
+      已为每个 `(B, m+1)` bucket 捕获同步图；真实 B=2/K=4 八轮短 smoke（56 committed）为
+      **43.77 committed tok/s、1.07× 同进程 plain decode**，同轮只重放了 4 个 equal-`m+1`
+      同步图组（8 个槽行），仍保持 ragged 正确性。同步图对其 B-wide eager body 为逐元素
+      bit-exact；B=1 八轮为 **28.10 tok/s、1.12× plain**。随后以冻结 W1-S（4096 输入 /
+      256 输出 / c=4 / K=3 / n=16）在无 vLLM 的 `Qwen36Backend` 上跑完一重复：**21.27
+      committed tok/s**（4111 committed、71.35% draft acceptance、GPU busy 94.30%、峰值
+      63.55 GiB），draft/verify/sync 图均 `captured`。这不是历史 144.54 tok/s 的可比胜利：
+      当时 prefill 仍逐槽执行，且该结果比历史同工作量的 136.75 tok/s 自研记录慢约 6.43×；
+      它是剥离 vLLM 后的诚实基线，而不是把短 smoke 外推为吞吐结论。
+      **2026-08-04 更新**：已接入同长度、同 GDN 状态、单 chunk 的池化 `B×Q` prefill
+      快路径（历史 `_forward_batch(..., is_decode=False)` 的无 vLLM 对应物），并为它补了
+      request-major KV 寻址与回退边界的 CPU 回归。冻结同一 W1-S 形状的新单进程实测为
+      **46.56 committed tok/s**（4112 committed、74.17% acceptance、GPU busy 93.22%、
+      峰值 49.55 GiB；`prefill_batched_forwards=4`，draft/verify/sync 图均 captured），是
+      21.27 基线的 **2.19×**。随后收窄 prefill vocab projection 到每请求最后一行 hidden 后，
+      同一冻结 W1-S 的单进程复测为 **48.04 committed tok/s**（4111 committed、74.06%
+      acceptance、GPU busy 93.06%、峰值 47.55 GiB；同样 4 次 B×Q prefill 与全套 MTP 图
+      captured），即旧基线的 **2.26×**。这仍只有历史无 vLLM 136.75 tok/s 的约 35%（慢
+      **2.85×**）；真实模型 B=2 门禁现已独立通过（同长度、不同末 token 的 B×Q prefill
+      `forwards=1`，每槽输出与各自串行路径一致，B=2 aggregate decode 为 2.12× B=1）。
+      下一瓶颈是 verify/draft 的
+      58.62 / 82.30 GPU 秒，而不是再把已批化的 prefill 当作主要热路径。
+      同日完成前缀缓存 P0 寻址收敛：单槽 B=1 KV 的读写也通过与 B×1/B×Q/图路径相同的
+      logical→physical page-table 行，而不是固定连续 KV 切片；非连续页表写入已由 CPU 回归覆盖。
+      随后已补上跨槽恢复的安全复制路径：在任何 suffix forward 前，按逻辑页表复制 backbone KV、
+      恢复 GDN checkpoint，并同步复制 MTP causal KV；coordinator 先保留同槽亲和性，再让同批
+      重复前缀 fan-out 到其它 fresh 槽。CPU 回归覆盖非连续页表、复制独立性、MTP/GDN lockstep；
+      单进程真实模型门禁已通过：`b2_verify_serving.py --only prefix --slots 2 --steps 4
+      --max-seq-len 128` 在 `unsloth/Qwen3.6-27B-NVFP4` 上同槽与跨槽恢复均逐 token 等于冷 B1。
+      MTP 组合门禁随后在同一模型、单一受 70% 显存上限约束的双槽进程中通过：backbone B=2
+      decode 图及 MTP draft/sync/verify 图均 captured；跨槽恢复后目标的 target KV、GDN checkpoint
+      与 MTP causal KV 长度一致，并完成了一次真实的 batched verify/re-draft（不是仅检查长度）。
+      性能实验也有一条明确否定：把 target verify 的完整 `lm_head` 搬入 CUDA Graph 虽能 capture
+      且功能通过，却令 B=2/K=4 短测从约 29 降至 22 committed tok/s，已撤回；不可因历史实现
+      将它图化就假定当前 SM120 权重路径同样受益。保留的是语义等价的 sync 末行投影收窄：teacher-
+      forced KV/hidden 仍写全，只有实际会生成 draft step 0 的最后一行经过 vocab head。冻结 W1-S
+      的单重复结果受 acceptance/温度波动影响未证明净提升（47.00 vs 48.04），因此尚不作为性能胜利。
+      **2026-08-04 后续**：跨槽 backbone KV 已改为固定容量内的整页共享与首次写入 COW；
+      64-token checkpoint 落在 128-token attention 页中时，suffix 写入会先私有化整页，
+      因此源槽不被污染。MTP causal KV 与 GDN checkpoint 仍保持显式同步/恢复。CPU 137 项
+      相关回归与真实双槽 prefix 门禁均通过。通用内容寻址 BlockPool/LRU 驱逐仍未接线。
+      同日还复验了历史的 Qwen 零中心 RMSNorm Triton 融合：完整模型 B2、B=2 MTP 图正确性均通过，
+      但受控 W1-S 子形状 A/B 显示 c=1 为 **18.59 → 17.36 tok/s**、c=4 为
+      **32.21 → 31.52 tok/s**（相同 committed token 与 acceptance；变慢集中在 prefill）。
+      因而未保留该路径；历史 vLLM 的收益不能假定可迁移到当前 SM120 自建图。
+      同样地，历史 ``QKVParallelLinear`` 的三投影合并也完成了完整模型验证，但在冻结
+      W1-S 子形状（128 输入 / 32 输出 / c=1 / K=3 / 3 repeats）中，逐 token 输出与
+      acceptance 完全一致而均值吞吐由 **22.16 降至 20.88 committed tok/s**（约 -5.8%，
+      GPU busy 时间约 +6.3%，显存观测约 +0.8 GiB）；已撤回实现，而非留下一个默认关闭的
+      回归开关。该机器当前的 BF16 GEMM 形状并不从更宽的拼接矩阵获益。
+      历史内容寻址同样不能不经测量地迁移页粒度：将当前 128-token attention 页改为与
+      历史 block/GDN checkpoint 一致的 64 token 后，单槽图与 MTP 位一致 smoke 通过，但冻结
+      W1-S 子形状（128 输入 / 32 输出 / c=1 / K=3）只有 **19.19 committed tok/s**，低于
+      128 页同形状三次基线均值 **22.16 tok/s**（约 -13%）。已撤回；在现有 COW 页面上做
+      内容索引时必须保持 128 页热路径，不能为了简化 BlockPool 映射牺牲已验证吞吐。
+      **2026-08-04 persistent-cache 后续**：已将捕获后不再参与生产 replay 的 scratch KV/MTP
+      行改为固定预算的多条目 prefix arena，而不是把缓存绑在空闲源槽上。每个条目以完整前缀哈希、
+      128-token 物理页列表、GDN checkpoint 和 MTP causal snapshot 共同认证；默认的两份 GDN
+      checkpoint byte budget 可保留两条独立前缀，LRU/预算淘汰会同步撤销这三类资源，绝不触碰活跃
+      槽。真实 `unsloth/Qwen3.6-27B-NVFP4` B=2 门禁进一步让源槽先进入无关 prompt，再从 scratch
+      恢复到另一槽，随后完成 B-wide sync、draft、verify 图 replay；两条不同前缀也分别落在
+      scratch 的不同页并各自完成 MTP 恢复（PASS，约 31.48 committed tok/s）。
+      这保留了 128 页热路径与既有显存上限；通用 `BlockPool` 跨请求大容量缓存仍是未来容量扩展，
+      不能与本已验证的 slot/COW 地址契约混用。
 - [x] ~~全部 MTP 接受率数字都测自非标准 checkpoint，需在标准模型上重测~~
       —— **已重测，checkpoint 发布方假说被证伪。**
       标准模型 K=4：prose 接受率 30.0%、每轮平均接受 **1.20**；code 41.7%、**1.67**。
@@ -242,17 +361,9 @@ SM120、只有单机），换取在这个窄面上把**稳定性、易用性、�
       正确性通过（投机与非投机 committed 序列逐 token 相同）。
       详见 [`../notes/2026-08-03-mtp-acceptance-on-standard-checkpoint.md`](../notes/2026-08-03-mtp-acceptance-on-standard-checkpoint.md)。
       ⚠️ code 那一行 K 不同（8 vs 4）**不构成结论**，需同 K 重测。
-- [ ] ⚠️ **MTP 根本没接进服务路径——所以"MTP 在 CG 下的 e2e"不是一次待做的测量，
-      而是一项待做的实现。**（2026-08-03 核实：`Qwen36Backend.capabilities.
-      speculative_decode = False`，`server/engine.py::_load_qwen36_model` 的 docstring
-      也明说了。MTP 只存在于 `scripts/b3*`，从未进过 `server/app.py`。）
-      现有全部 MTP 数字的基线因此都是 eager 的（本次非投机基线 5.97–6.02 tok/s），
-      而服务路径开 CG 是 28.85 tok/s。这对投机**不是无关缩放**：MTP 赚不赚取决于
-      "一次 verify 是否比 K 次顺序 decode 便宜"，CG 恰好把 decode 那一侧变便宜了 4.71×
-      ——**门槛是被抬高而不是降低了**。
-      加上已实测的接受率只有 1.20–1.67 / K=4，**先别投实现**；
-      要评估就先只做一次"verify 成本 vs K 次 CG decode 成本"的对照，再决定。
-      （接受率结论不受影响：那是权重性质，与 CG 无关。）
+- [x] ~~MTP 在 CUDA Graph 下的 e2e 仍缺实现~~ —— M-2/M-3 已完成该实现，并以完整模型
+      B=1、B=2 实测 replay 证实。尚未完成的是性能测量：接受率仍是权重性质，而是否获益
+      必须比较一次 `K+1` verify 图与等效数量的常规 decode 图，不能沿用旧 eager 数字。
       **本 session 第二次踩到同一形状——基线跑 eager，结论当成运行时性质。**
 
 ### 阶段 4 · Kernel 深度适配，压榨 SM120

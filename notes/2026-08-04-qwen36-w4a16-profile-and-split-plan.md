@@ -128,3 +128,66 @@ memory/CTA footprint enough to admit a second resident block, or otherwise
 raise eligible-warp availability while preserving raw packed W4A16 weights and
 BF16 activations. Any candidate must first demonstrate `>= 2` blocks/SM in the
 same M=4 Nsight profile, then pass the oracle and W1-S graph gates.
+
+## Occupancy candidate evaluated, rejected at the e2e gate (2026-08-04)
+
+Candidate: lift the one-block-per-SM TC-decode pin via opt-in
+`SPARKINFER_W4A16_TC_DECODE_BLOCKS_PER_SM=4` (sparkinfer branch
+`qwen-w4a16-occupancy-20260804`, worktree
+`/tmp/sparkinfer-w4a16-occupancy-20260804`, commit `bb52c38`, **not
+merged**). Tile selection then picks (tile_k=64, tile_n=128, 128 threads)
+for both FC1 and FC2 at M=4.
+
+Host-side root cause of the pin, found by code reading before touching
+anything: `_determine_blocks_per_sm` hard-pins `blocks_per_sm_limit = 1`
+for `moe_block_size == 8`, citing grid-barrier atomic serialization; the
+barriers in the fused FC1→activation→FC2 body are per-phase only (2–4 per
+round), so the pin was a hypothesis worth testing, not a proven invariant.
+
+ncu, real layer-5 M=4 fused kernel, RTX PRO 6000 Blackwell (188 SM):
+
+| metric | pinned baseline | occupancy candidate |
+|---|---:|---:|
+| grid x block | 188 x 256 | 544 x 128 |
+| dynamic smem / CTA | 54.27 KiB | 27.65 KiB |
+| smem occupancy limit | 1 block/SM | 3 blocks/SM |
+| register occupancy limit | 2 blocks/SM | 4 blocks/SM |
+| active warps % of peak | 16.67 | 18.01 |
+| kernel duration | 293 / 289 us | 239 / 236 us (**−18%**) |
+
+The baseline row reproduces this note's original 54.27 KiB / 16.67%
+measurement exactly, confirming the profiled launch is the same one.
+
+Single-layer W4A16-vs-BF16-dequant oracle
+(`scripts/verify_nvfp4_gemm_single_layer.py`, both arms, patched
+sparkinfer): **identical to all printed digits** across M=1..512
+(cosine 0.999983–0.999990), as expected for a launch-scheduling-only
+change.
+
+Locked W1-S A/B (same args as the reproduction command at the top of this
+note; both arms on the current runtime tree + patched sparkinfer; env unset
+vs `=4`; results `/tmp/qwen_w1s_occ_{base,cand}_result.json`):
+
+| comparable metric | baseline | candidate |
+|---|---:|---:|
+| `phase_cuda_ms.mtp.verify_graph` | 53.39 ms | **56.57 ms (+6%)** |
+| total self CUDA (2 profile rounds) | 151.7 ms | **162.1 ms** |
+
+The two arms also diverged in greedy tokens (draft acceptance 58.3% vs
+27.8% on different draft counts). That divergence is expected ULP tie-flip
+noise from the changed K-loop tiling and makes every token-level number
+incomparable — but the CUDA-graph phase time above IS comparable, and it
+got worse. (Prefill wall times 9.76 s vs 3.70 s differ for cold-JIT-cache
+reasons and are not evidence in either direction.)
+
+**Conclusion: the isolated −18% kernel win does not survive the fused
+persistent round.** Tripling grid-barrier participants and halving tile_k
+costs more than the extra resident warps buy back. The 1-block-per-SM pin
+stands with measured backing; shared-memory occupancy is **not** the
+dominant lever for this kernel at M=4. Combined with the split-phase and
+W4A4 rejections above, the remaining structural difference versus the
+historical path is the launch structure itself: history ran separate
+non-persistent NVFP4 GEMM launches (implicit inter-phase ordering, no
+grid barrier) while the current fused round pays barrier + right-sized-wave
+overhead. Any further W4A16 work should target that structure, not
+occupancy.
