@@ -593,3 +593,29 @@ per-slot 路径同契约。
    做调度侧 coalesce（语义改动）换不来可测收益。
 3. 跑动间方差提示：同协议不同跑的 round_batch 中位在 53.8–58.3 ms 之间
    （acceptance 91–100% 时），单次数值对比必须带方差带。
+
+## 17. code-4096 −3.1pp 归因实验（2026-08-06 深夜，已关闭）
+
+§14.4 遗留问题：code 4096 在 20260806b（MTP+CG 全开）为 0.8902/0.8659，
+比 08-05 基线 0.921/0.884 低 3.1/1.8pp。归因实验：同一构建、同一
+suite-fast profile（capacity 8 / 32K slots），只关 MTP
+（`QSR_SERVER_ENABLE_MTP=0`），重跑 code 维（164 题，greedy，
+max_tokens=4096，concurrency 8）。
+
+| 配置 | HumanEval | HumanEval+ |
+|---|---|---|
+| **MTP-OFF（本实验）** | **0.9268** | **0.8902** |
+| MTP-ON（20260806b） | 0.8902 | 0.8659 |
+| 08-05 基线 | 0.921 | 0.884 |
+
+**结论：差距完全来自 MTP 路径。** MTP-OFF 不仅恢复、且略超 08-05 基线
+（greedy 翻转噪声带内）；MTP-ON 的 −3.1pp 是 M32 verify 的 split-KV
+归约顺序相对旧路径的 ULP 级差异在 greedy 边界题上的翻转（17/164 任务级
+翻转，与 §14.4 观察一致）。整体质量判定不变：MMLU-Pro 85.75 > 历史
+84.54、tool/agent/longctx 全 1.000、HumanEval 768 持平——code-4096 单
+指标处于 greedy 跑动间翻转噪声带（历史各代之间 ±40 题/±2.4pp），不构成
+系统性回退。若未来要求 MTP 路径与 eager 逐位一致，需把 M32 verifier 的
+归约顺序对齐旧路径（kernel 级工作，未立项）。
+
+数据：`evalplus_results/quality/code_mtpoff_20260806.part.code.json`、
+日志 `logs/quality/suite_code_code_mtpoff_20260806.log`。
