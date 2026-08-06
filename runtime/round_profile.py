@@ -40,6 +40,7 @@ class RoundProfile:
         self._round_start = 0.0
         self._phase_start = 0.0
         self._phases: list[tuple[str, float]] = []
+        self._notes: dict[str, float] = {}
 
     def begin_round(self) -> None:
         if not self.enabled:
@@ -47,6 +48,13 @@ class RoundProfile:
         self._round_start = time.perf_counter()
         self._phase_start = self._round_start
         self._phases = []
+        self._notes = {}
+
+    def note(self, name: str, value: float) -> None:
+        """Attach a named scalar (e.g. CUDA-event GPU ms) to this round."""
+        if not self.enabled:
+            return
+        self._notes[name] = round(float(value), 3)
 
     def phase(self, name: str) -> None:
         if not self.enabled:
@@ -60,7 +68,10 @@ class RoundProfile:
             return
         now = time.perf_counter()
         self._phases.append(("total", (now - self._round_start) * 1000.0))
-        logger.info(json.dumps({"label": label, "phases": self._phases}))
+        record: dict[str, object] = {"label": label, "phases": self._phases}
+        if self._notes:
+            record["notes"] = self._notes
+        logger.info(json.dumps(record))
 
     def engine_step(self, round_batch_ms: float, bookkeep_ms: float) -> None:
         """Record the engine-side split around the MTP round call."""

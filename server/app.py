@@ -170,8 +170,7 @@ SERVER_MTP_K = int(os.environ.get("QSR_SERVER_MTP_K", "4"))
 # back to its own QSR_SERVER_MTP_RESYNC-driven default (also off).
 _mtp_resync_env = os.environ.get("QSR_SERVER_MTP_RESYNC")
 SERVER_MTP_RESYNC = None if _mtp_resync_env is None else _mtp_resync_env != "0"
-SERVER_REQUEST_TIMEOUT_S = float(
-    os.environ.get("QSR_SERVER_REQUEST_TIMEOUT_S", "600"))
+SERVER_REQUEST_TIMEOUT_S = float(os.environ.get("QSR_SERVER_REQUEST_TIMEOUT_S", "600"))
 # T0-3/E4 (docs/roadmap.md §7 D1): reasoning/thinking contract. "expose"
 # (default) surfaces a <think> block as OpenAI message.reasoning_content /
 # delta.reasoning_content, and Anthropic's non-standard top-level
@@ -450,6 +449,21 @@ async def lifespan(app: FastAPI):
         SERVER_MTP_K,
         SERVER_MTP_RESYNC,
     )
+    # Cyclic-GC pauses land in the decode hot loop as 50-150 ms host stalls:
+    # the 2026-08-06 128K/c4 node trace measured 667 GPU-idle gaps >0.5 ms
+    # (33% of steady-state wall) and the round profile's worst rounds put
+    # 100-150 ms inside accept_decision/draft_batch with the GPU idle --
+    # the classic full-heap collection signature on a process holding a
+    # 27B-parameter object graph. vLLM disables GC in its engine core for
+    # the same reason; serving objects here are acyclic (request/response
+    # trees freed by refcount), so the generational collector only costs.
+    # QSR_DISABLE_GC=0 restores the default for comparison runs.
+    if os.environ.get("QSR_DISABLE_GC", "1") == "1":
+        import gc
+
+        gc.collect()
+        gc.disable()
+        logger.info("QSR_DISABLE_GC=1: cyclic garbage collection disabled for the serving loop")
     try:
         yield
     finally:
@@ -512,7 +526,11 @@ class ChatCompletionRequest(BaseModel):
 
 class CompletionRequest(BaseModel):
     model: str | None = None
-    prompt: str
+    # OpenAI-compatible: prompt may be a string OR a list of token ids.
+    # The token-id form exists for exact-workload parity benchmarks (the
+    # historical 128K/c4 numbers were measured on synthetic token-id
+    # fixtures whose text round-trip is not identity-preserving).
+    prompt: str | list[int]
     max_tokens: int | None = None
     temperature: float | None = None
     top_p: float | None = None
@@ -1035,7 +1053,10 @@ async def completions(req: CompletionRequest, request: Request):
     stop_sequences = _normalize_stop(req.stop, max_count=4)
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
     t0 = time.perf_counter()
-    prompt_ids = await _tokenize_encode(engine, req.prompt)
+    if isinstance(req.prompt, list):
+        prompt_ids = list(req.prompt)
+    else:
+        prompt_ids = await _tokenize_encode(engine, req.prompt)
     await _debug_log_input("OPENAI /v1/completions", req.model_dump(), req.prompt, prompt_ids)
     _validate_capacity(prompt_ids, max_tokens)
 
@@ -1848,9 +1869,7 @@ async def responses_api(request: Request):
         import json as _json
 
         async def _responses_sse():
-            proc = StreamProcessor(
-                engine.tok, thinking_capable=SERVER_THINKING_CAPABLE
-            )
+            proc = StreamProcessor(engine.tok, thinking_capable=SERVER_THINKING_CAPABLE)
             final_result = None
             first_token_t = None
             resp_id = f"resp_{uuid.uuid4().hex[:24]}"
@@ -1948,9 +1967,7 @@ async def responses_api(request: Request):
             visible_text, tool_calls = proc.finalize()
             output_items = []
             text = visible_text or ""
-            output_items.append(
-                responses_format.message_item(text_item_id, text)
-            )
+            output_items.append(responses_format.message_item(text_item_id, text))
             if text_started:
                 yield (
                     "event: response.output_text.done\ndata: "
@@ -2059,9 +2076,7 @@ async def responses_api(request: Request):
             usage = responses_format.build_usage(
                 len(prompt_ids),
                 len(proc.all_ids),
-                final_result.get("prefix_cache_hit_tokens", 0)
-                if final_result
-                else 0,
+                final_result.get("prefix_cache_hit_tokens", 0) if final_result else 0,
             )
             completed = responses_format.snapshot(
                 resp_id, created_at, model_name, "completed", output_items, usage
@@ -2100,9 +2115,7 @@ async def responses_api(request: Request):
     proc = StreamProcessor(engine.tok, thinking_capable=SERVER_THINKING_CAPABLE)
     proc.add_tokens(result["committed_token_ids"])
     text = proc.content_text()
-    reasoning_content = (
-        proc.reasoning_content() if SERVER_REASONING_MODE == "expose" else None
-    )
+    reasoning_content = proc.reasoning_content() if SERVER_REASONING_MODE == "expose" else None
     metrics.record_request(
         "responses",
         result["prompt_tokens"],

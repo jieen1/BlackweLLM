@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import torch
 
+from runtime.round_profile import round_profile
+
 
 def determine_accept_reject_from_predictions(
     draft_tokens: list[int],
@@ -129,6 +131,9 @@ def determine_accept_reject_batch(
     # every position's raw prediction (needed to build "committed" below).
     combined = torch.cat([num_accepted.unsqueeze(1), predicted], dim=1)  # [num_reqs, 1 + (k+1)]
     combined_list = combined.tolist()
+    # QSR_PROFILE_ROUNDS sub-phase: everything before this line is the GPU
+    # verify+lmhead queue drain; everything after is pure host decision work.
+    round_profile.phase("accept_gpu_wait")
 
     decisions: dict[int, dict] = {}
     for i, s in enumerate(slots):

@@ -99,6 +99,7 @@ from runtime.model.qwen36_model import (
     Qwen36VerifyBatch,
     Qwen36VerifyGraphAttention,
 )
+from runtime.round_profile import round_profile
 
 if TYPE_CHECKING:
     from runtime.backends.qwen36 import Qwen36Backend
@@ -801,9 +802,11 @@ class Qwen36MTPDraftCudaGraph:
             raise RuntimeError("MTP draft CUDA Graph replay requested before capture")
         batch = len(slots)
         self._fill(slots, seed_tokens, seed_hiddens, start_positions)
+        round_profile.phase("draft_fill")
         self._graphs[batch].replay()
         for slot, start_pos in zip(slots, start_positions, strict=True):
             self.engine._caches[slot].seq_len = start_pos + self.steps
+        round_profile.phase("draft_gpu_wait")
         # One device-to-host transfer for the whole B-wide graph result.
         # Calling ``tolist`` on one indexed row at a time makes every slot
         # wait on its own synchronisation point, recreating the historical

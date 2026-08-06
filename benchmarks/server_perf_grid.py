@@ -194,9 +194,7 @@ def find_raw_for_served(tokenizer, served: int, filler: str = FILLER) -> int | N
     return None
 
 
-def find_prompt_for_target(
-    tokenizer, target: int, filler: str = FILLER
-) -> tuple[int, int]:
+def find_prompt_for_target(tokenizer, target: int, filler: str = FILLER) -> tuple[int, int]:
     """``(raw_n, served)`` for the largest reachable block-aligned served
     context at or below ``target``.
 
@@ -233,9 +231,7 @@ def _metric_re_for(endpoint: str) -> re.Pattern[str]:
     )
 
 
-async def scrape_metrics(
-    session: aiohttp.ClientSession, base_url: str, endpoint: str
-) -> dict:
+async def scrape_metrics(session: aiohttp.ClientSession, base_url: str, endpoint: str) -> dict:
     out = {k: 0.0 for k in METRIC_KEYS}
     try:
         async with session.get(f"{base_url}/metrics") as resp:
@@ -251,8 +247,7 @@ async def scrape_metrics(
 
 
 def diff_metrics(before: dict, after: dict) -> dict:
-    return {k: round(float(after.get(k, 0.0)) - float(before.get(k, 0.0)), 6)
-            for k in before}
+    return {k: round(float(after.get(k, 0.0)) - float(before.get(k, 0.0)), 6) for k in before}
 
 
 async def get_stats(session: aiohttp.ClientSession, base_url: str) -> dict:
@@ -273,7 +268,7 @@ async def stream_one(
 ) -> dict:
     """Send one request; record event timestamps only.
 
-    ``endpoint="chat"`` uses streaming chat/completions (SSE). 
+    ``endpoint="chat"`` uses streaming chat/completions (SSE).
     ``endpoint="completions"`` uses the legacy text-completions endpoint
     (non-streaming JSON): the raw prompt is tokenized WITHOUT the chat
     template, which is the exact token-array protocol the historical
@@ -361,10 +356,8 @@ def wave_summary(
     gen_total = int(metric_delta.get("generation_tokens_total", 0.0))
     ttft_count = int(metric_delta.get("time_to_first_token_seconds_count", 0.0))
     ttft_sum = metric_delta.get("time_to_first_token_seconds_sum", 0.0)
-    tpot_count = int(metric_delta.get(
-        "request_time_per_output_token_seconds_count", 0.0))
-    tpot_sum = metric_delta.get(
-        "request_time_per_output_token_seconds_sum", 0.0)
+    tpot_count = int(metric_delta.get("request_time_per_output_token_seconds_count", 0.0))
+    tpot_sum = metric_delta.get("request_time_per_output_token_seconds_sum", 0.0)
     e2e_sum = metric_delta.get("e2e_request_latency_seconds_sum", 0.0)
 
     ttfts = sorted(r["ttft_s"] for r in ok if r["ttft_s"] is not None)
@@ -385,16 +378,15 @@ def wave_summary(
         "expected_prompt_tokens": None,  # filled by caller
         "ttft_s_per_request": [round(x, 4) for x in ttfts],
         "ttft_median_s": round(ttfts[len(ttfts) // 2], 4) if ttfts else None,
-        "server_mean_ttft_s": round(ttft_sum / ttft_count, 4)
-        if ttft_count else None,
+        "server_mean_ttft_s": round(ttft_sum / ttft_count, 4) if ttft_count else None,
         "server_mean_decode_tok_per_s": round(1.0 / (tpot_sum / tpot_count), 2)
-        if tpot_count and tpot_sum > 0 else None,
-        "server_e2e_tok_per_s": round(gen_total / e2e_sum, 2)
-        if e2e_sum > 0 else None,
+        if tpot_count and tpot_sum > 0
+        else None,
+        "server_e2e_tok_per_s": round(gen_total / e2e_sum, 2) if e2e_sum > 0 else None,
         "aggregate_decode_window_s": agg_decode_window,
-        "aggregate_decode_tok_per_s": round(
-            gen_total / agg_decode_window, 2
-        ) if agg_decode_window else None,
+        "aggregate_decode_tok_per_s": round(gen_total / agg_decode_window, 2)
+        if agg_decode_window
+        else None,
         "aggregate_e2e_tok_per_s": round(gen_total / wall, 2) if wall > 0 else None,
         "stats_delta": stats_delta,
         "metric_delta": metric_delta,
@@ -433,36 +425,168 @@ async def run_wave(
     return summary
 
 
+def load_fixture(name: str) -> dict:
+    """Load a historical token-id fixture (benchmarks/fixtures/<name>_prompts.json).
+
+    These fixtures are the EXACT workloads behind the July 2026 128K/c4
+    headline numbers: per-request arithmetic ramps over non-special token
+    ids (vLLM RandomDataset formula). Their text round-trip is not
+    identity-preserving, so they must be served as token-id lists through
+    /v1/completions, never as decoded text.
+    """
+    path = Path(__file__).resolve().parent / "fixtures" / f"{name}_prompts.json"
+    data = json.loads(path.read_text())
+    ids = data["prompt_token_ids"]
+    assert len(ids) == data["num_requests"], (len(ids), data["num_requests"])
+    assert all(len(x) == data["prompt_len"] for x in ids)
+    return data
+
+
+async def run_fixture_wave(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    model: str,
+    prompt_ids_list: list,
+    max_tokens: int,
+) -> dict:
+    """One wave: every fixture prompt sent once, concurrently.
+
+    The historical protocol ran exactly num_requests distinct prompts (one
+    per slot), so this wave sends each fixture prompt exactly once instead
+    of repeating one prompt c times.
+    """
+    before_stats = await get_stats(session, base_url)
+    before_metrics = await scrape_metrics(session, base_url, "completions")
+    t0 = time.perf_counter()
+    reqs = await asyncio.gather(
+        *[
+            stream_one(session, base_url, model, ids, max_tokens, "completions")
+            for ids in prompt_ids_list
+        ]
+    )
+    wall = time.perf_counter() - t0
+    after_stats = await get_stats(session, base_url)
+    after_metrics = await scrape_metrics(session, base_url, "completions")
+    summary = wave_summary(
+        reqs,
+        wall,
+        diff_stats(before_stats, after_stats),
+        diff_metrics(before_metrics, after_metrics),
+    )
+    summary["expected_prompt_tokens"] = sum(len(x) for x in prompt_ids_list)
+    return summary
+
+
+async def run_fixture_cell(args, session, results) -> None:
+    data = load_fixture(args.fixture)
+    ids_list = data["prompt_token_ids"]
+    if args.fixture_prompts:
+        idx = [int(x) for x in args.fixture_prompts.split(",")]
+        ids_list = [ids_list[i] for i in idx]
+    prompt_len = data["prompt_len"]
+    n_req = len(ids_list)
+    print(
+        f"fixture {args.fixture}: {n_req} prompts x {prompt_len} tokens "
+        f"(generation_formula: {data['generation_formula'][:80]}...)"
+    )
+    cell = {
+        "context_tokens": prompt_len,
+        "served_context_tokens": prompt_len,
+        "concurrency": n_req,
+        "fixture": args.fixture,
+        "generation_formula": data["generation_formula"],
+        "seed": data["seed"],
+    }
+    print(f"=== COLD wave ({n_req} x {prompt_len}) ===")
+    cold = await run_fixture_wave(session, args.base_url, args.model, ids_list, args.max_tokens)
+    cell["cold"] = cold
+    _print_wave("COLD", cold, prompt_len * n_req)
+    warms = []
+    for i in range(args.warm_rounds):
+        w = await run_fixture_wave(session, args.base_url, args.model, ids_list, args.max_tokens)
+        warms.append(w)
+        _print_wave(f"WARM{i + 1}", w, prompt_len * n_req)
+    cell["warm"] = warms
+    results["cells"][str(prompt_len)] = {str(n_req): cell}
+
+
+def _print_wave(kind: str, w: dict, expected_prompt: int) -> None:
+    print(
+        f"  {kind}: wall={w['wall_s']:.4f}s prompt={w['prompt_tokens_total']}/{expected_prompt} "
+        f"gen={w['generation_tokens_total']} mean_ttft={w['server_mean_ttft_s']}s "
+        f"mean_decode={w['server_mean_decode_tok_per_s']} tok/s "
+        f"agg_e2e={w['aggregate_e2e_tok_per_s']} tok/s "
+        f"hits={w['stats_delta'].get('prefix_cache_hits', 0)} "
+        f"restores={w['stats_delta'].get('prefix_persistent_restores', 0)}"
+    )
+
+
 async def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--base-url", default="http://127.0.0.1:8300")
     p.add_argument("--model", default="qwen3.6")
-    p.add_argument("--endpoint", choices=["chat", "completions"], default="chat",
-                   help="chat/completions (SSE, chat template) or the legacy "
-                        "text-completions endpoint (raw tokenization, no "
-                        "template -- the historical token-array protocol)")
+    p.add_argument(
+        "--endpoint",
+        choices=["chat", "completions"],
+        default="chat",
+        help="chat/completions (SSE, chat template) or the legacy "
+        "text-completions endpoint (raw tokenization, no "
+        "template -- the historical token-array protocol)",
+    )
     p.add_argument("--contexts", default="4k,32k,64k,128k,250k")
     p.add_argument("--concurrency", default="1,2,3")
     p.add_argument("--max-tokens", type=int, default=256)
-    p.add_argument("--warm-rounds", type=int, default=1,
-                   help="WARM waves per cell after the COLD populate wave")
-    p.add_argument("--warm-suffix-tokens", type=int, default=0,
-                   help="append this many FRESH tokens to the prompt on WARM "
-                        "waves (historical Pattern-B protocol: cached prefix "
-                        "+ 10240-token new suffix, only the suffix is "
-                        "re-prefilled)")
-    p.add_argument("--filler-prefix", default=FILLER,
-                   help="filler text for the prefix prompt (must tokenize "
-                        "1:1; different fillers isolate cache content)")
-    p.add_argument("--filler-suffix", default=SUFFIX_FILLER,
-                   help="filler text for the warm suffix (must tokenize 1:1 "
-                        "and differ from the prefix filler)")
+    p.add_argument(
+        "--warm-rounds",
+        type=int,
+        default=1,
+        help="WARM waves per cell after the COLD populate wave",
+    )
+    p.add_argument(
+        "--warm-suffix-tokens",
+        type=int,
+        default=0,
+        help="append this many FRESH tokens to the prompt on WARM "
+        "waves (historical Pattern-B protocol: cached prefix "
+        "+ 10240-token new suffix, only the suffix is "
+        "re-prefilled)",
+    )
+    p.add_argument(
+        "--filler-prefix",
+        default=FILLER,
+        help="filler text for the prefix prompt (must tokenize "
+        "1:1; different fillers isolate cache content)",
+    )
+    p.add_argument(
+        "--filler-suffix",
+        default=SUFFIX_FILLER,
+        help="filler text for the warm suffix (must tokenize 1:1 "
+        "and differ from the prefix filler)",
+    )
+    p.add_argument(
+        "--fixture",
+        default=None,
+        help="historical token-id fixture name (ctx64k/ctx128k): "
+        "serve the exact fixture prompts via token-id completions "
+        "instead of generated filler text",
+    )
+    p.add_argument(
+        "--fixture-prompts",
+        default=None,
+        help="comma-separated fixture prompt indices to serve, e.g. "
+        "'0,0,1,1' serves four requests built from two distinct "
+        "fixture prompts (the persistent arena holds two 128K "
+        "entries, so four DISTINCT prompts cannot all stay warm)",
+    )
     p.add_argument("--out", default=None)
-    p.add_argument("--resume", action="store_true",
-                   help="load a previous partial run from --out (or the "
-                        "resume file) and skip completed cells")
-    p.add_argument("--smoke", action="store_true",
-                   help="single 4K x c=1 cell, for validating the harness")
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="load a previous partial run from --out (or the resume file) and skip completed cells",
+    )
+    p.add_argument(
+        "--smoke", action="store_true", help="single 4K x c=1 cell, for validating the harness"
+    )
     args = p.parse_args()
 
     context_labels = [x.strip().lower() for x in args.contexts.split(",")]
@@ -470,12 +594,12 @@ async def main() -> None:
     concurrencies = [int(x) for x in args.concurrency.split(",")]
     if args.smoke:
         context_labels, contexts, concurrencies = (
-            context_labels[:1], contexts[:1], concurrencies[:1]
+            context_labels[:1],
+            contexts[:1],
+            concurrencies[:1],
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        standard_checkpoint_path(), trust_remote_code=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(standard_checkpoint_path(), trust_remote_code=True)
     results = {
         "config": {
             "base_url": args.base_url,
@@ -498,41 +622,46 @@ async def main() -> None:
 
     timeout = aiohttp.ClientTimeout(total=3600)
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        if args.fixture:
+            if args.endpoint != "completions":
+                raise SystemExit("--fixture requires --endpoint completions (token-id protocol)")
+            results["config"]["fixture"] = args.fixture
+            await run_fixture_cell(args, session, results)
+            out_path = (
+                Path(args.out)
+                if args.out
+                else Path(
+                    f"benchmarks/fixtures/server_perf_grid_fixture_{args.fixture}_"
+                    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                )
+            )
+            results["finished_at"] = datetime.now(timezone.utc).isoformat()
+            out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False))
+            print(f"\nresults written to {out_path}")
+            return
         # Block-align the SERVED context (raw + template overhead) down to
         # the largest reachable value <= target, then find the exact raw
         # length that produces it.
         prompts = {}
         served_ctx = {}
-        suffix_text = make_suffix(
-            tokenizer, args.warm_suffix_tokens, args.filler_suffix
-        )
+        suffix_text = make_suffix(tokenizer, args.warm_suffix_tokens, args.filler_suffix)
         for label, target in zip(context_labels, contexts):
             if args.endpoint == "completions":
                 # Raw text-completions protocol: tokenized WITHOUT the chat
                 # template, so the served length IS the target (no template
                 # overhead, no end-of-message token merge). This mirrors the
                 # historical token-array fixtures exactly.
-                prompts[target] = make_prompt(
-                    tokenizer, target, args.filler_prefix
-                )
+                prompts[target] = make_prompt(tokenizer, target, args.filler_prefix)
                 served_ctx[target] = target
-                raw_ids = tokenizer.encode(
-                    prompts[target], add_special_tokens=True
-                )
+                raw_ids = tokenizer.encode(prompts[target], add_special_tokens=True)
                 assert len(raw_ids) == target, (label, len(raw_ids), target)
             else:
-                raw_n, served = find_prompt_for_target(
-                    tokenizer, target, args.filler_prefix
-                )
-                prompts[target] = make_prompt(
-                    tokenizer, raw_n, args.filler_prefix
-                )
+                raw_n, served = find_prompt_for_target(tokenizer, target, args.filler_prefix)
+                prompts[target] = make_prompt(tokenizer, raw_n, args.filler_prefix)
                 served_ctx[target] = served
             if args.warm_suffix_tokens:
                 if args.endpoint == "completions":
-                    pfx_ids = tokenizer.encode(
-                        prompts[target], add_special_tokens=True
-                    )
+                    pfx_ids = tokenizer.encode(prompts[target], add_special_tokens=True)
                     warm_ids = tokenizer.encode(
                         prompts[target] + suffix_text, add_special_tokens=True
                     )
@@ -543,9 +672,7 @@ async def main() -> None:
                     # protocol guaranteed by construction).
                     assert warm_ids[: len(pfx_ids)] == pfx_ids, label
                 else:
-                    warm_served = chat_token_count(
-                        tokenizer, prompts[target] + suffix_text
-                    )
+                    warm_served = chat_token_count(tokenizer, prompts[target] + suffix_text)
                     assert warm_served == served_ctx[target] + args.warm_suffix_tokens, (
                         f"{label}: warm served {warm_served} != "
                         f"prefix {served_ctx[target]} + "
@@ -556,22 +683,19 @@ async def main() -> None:
                 0
                 if args.endpoint == "completions"
                 else served_ctx[target]
-                - len(
-                    tokenizer.encode(
-                        prompts[target], add_special_tokens=False
-                    )
-                )
+                - len(tokenizer.encode(prompts[target], add_special_tokens=False))
             )
             for label, target in zip(context_labels, contexts)
         }
         results["config"]["served_context_tokens"] = {
-            label: served_ctx[target]
-            for label, target in zip(context_labels, contexts)
+            label: served_ctx[target] for label, target in zip(context_labels, contexts)
         }
-        print(f"template_overhead={results['config']['template_overhead_tokens']}; "
-              f"served (block-aligned) contexts: "
-              f"{ {l: served_ctx[t] for l, t in zip(context_labels, contexts)} }",
-              flush=True)
+        print(
+            f"template_overhead={results['config']['template_overhead_tokens']}; "
+            f"served (block-aligned) contexts: "
+            f"{ {l: served_ctx[t] for l, t in zip(context_labels, contexts)} }",
+            flush=True,
+        )
         # Resumability: load a previous partial run and skip completed cells.
         out_path = Path(args.out) if args.out else None
         resume_path = out_path or (
@@ -582,8 +706,7 @@ async def main() -> None:
             old_cells = old.get("cells", {})
             for ctx in contexts:
                 results["cells"].setdefault(ctx, {}).update(old_cells.get(str(ctx), {}))
-            print(f"resumed {len(results['cells'])} context cells from {resume_path}",
-                  flush=True)
+            print(f"resumed {len(results['cells'])} context cells from {resume_path}", flush=True)
         results["server_stats_before"] = await get_stats(session, args.base_url)
         for label, ctx in zip(context_labels, contexts):
             results["cells"].setdefault(ctx, {})
@@ -591,41 +714,57 @@ async def main() -> None:
                 if str(c) in results["cells"][ctx]:
                     print(f"skip completed cell {label} x c={c}", flush=True)
                     continue
-                print(f"\n=== cell {label} (served={served_ctx[ctx]}) "
-                      f"x c={c} (max_tokens={args.max_tokens}) ===", flush=True)
+                print(
+                    f"\n=== cell {label} (served={served_ctx[ctx]}) "
+                    f"x c={c} (max_tokens={args.max_tokens}) ===",
+                    flush=True,
+                )
                 expected = served_ctx[ctx] * c
                 cold = await run_wave(
-                    session, args.base_url, args.model, prompts[ctx],
-                    args.max_tokens, c, expected, args.endpoint,
+                    session,
+                    args.base_url,
+                    args.model,
+                    prompts[ctx],
+                    args.max_tokens,
+                    c,
+                    expected,
+                    args.endpoint,
                 )
-                print(f"  COLD : wall={cold['wall_s']}s "
-                      f"prompt={cold['prompt_tokens_total']}/{expected} "
-                      f"gen={cold['generation_tokens_total']} "
-                      f"mean_ttft={cold['server_mean_ttft_s']}s "
-                      f"mean_decode={cold['server_mean_decode_tok_per_s']} tok/s "
-                      f"agg_e2e={cold['aggregate_e2e_tok_per_s']} tok/s "
-                      f"hits={cold['stats_delta']['prefix_cache_hits']} "
-                      f"restores={cold['stats_delta']['prefix_persistent_restores']}",
-                      flush=True)
+                print(
+                    f"  COLD : wall={cold['wall_s']}s "
+                    f"prompt={cold['prompt_tokens_total']}/{expected} "
+                    f"gen={cold['generation_tokens_total']} "
+                    f"mean_ttft={cold['server_mean_ttft_s']}s "
+                    f"mean_decode={cold['server_mean_decode_tok_per_s']} tok/s "
+                    f"agg_e2e={cold['aggregate_e2e_tok_per_s']} tok/s "
+                    f"hits={cold['stats_delta']['prefix_cache_hits']} "
+                    f"restores={cold['stats_delta']['prefix_persistent_restores']}",
+                    flush=True,
+                )
                 warms = []
                 for _ in range(args.warm_rounds):
                     warm = await run_wave(
-                        session, args.base_url, args.model,
+                        session,
+                        args.base_url,
+                        args.model,
                         prompts[ctx] + suffix_text,
-                        args.max_tokens, c,
+                        args.max_tokens,
+                        c,
                         (served_ctx[ctx] + args.warm_suffix_tokens) * c,
                         args.endpoint,
                     )
                     warms.append(warm)
-                    print(f"  WARM : wall={warm['wall_s']}s "
-                          f"prompt={warm['prompt_tokens_total']}/{expected} "
-                          f"gen={warm['generation_tokens_total']} "
-                          f"mean_ttft={warm['server_mean_ttft_s']}s "
-                          f"mean_decode={warm['server_mean_decode_tok_per_s']} tok/s "
-                          f"agg_e2e={warm['aggregate_e2e_tok_per_s']} tok/s "
-                          f"hits={warm['stats_delta']['prefix_cache_hits']} "
-                          f"restores={warm['stats_delta']['prefix_persistent_restores']}",
-                          flush=True)
+                    print(
+                        f"  WARM : wall={warm['wall_s']}s "
+                        f"prompt={warm['prompt_tokens_total']}/{expected} "
+                        f"gen={warm['generation_tokens_total']} "
+                        f"mean_ttft={warm['server_mean_ttft_s']}s "
+                        f"mean_decode={warm['server_mean_decode_tok_per_s']} tok/s "
+                        f"agg_e2e={warm['aggregate_e2e_tok_per_s']} tok/s "
+                        f"hits={warm['stats_delta']['prefix_cache_hits']} "
+                        f"restores={warm['stats_delta']['prefix_persistent_restores']}",
+                        flush=True,
+                    )
                 cell = {
                     "context_tokens": ctx,
                     "served_context_tokens": served_ctx[ctx],
@@ -643,19 +782,17 @@ async def main() -> None:
                 # Persist after every cell so an interrupted run resumes
                 # from exactly where it stopped.
                 if out_path is not None:
-                    out_path.write_text(
-                        json.dumps(results, indent=2, ensure_ascii=False)
-                    )
+                    out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False))
                 else:
-                    resume_path.write_text(
-                        json.dumps(results, indent=2, ensure_ascii=False)
-                    )
+                    resume_path.write_text(json.dumps(results, indent=2, ensure_ascii=False))
 
     results["server_stats_after"] = await get_stats(session, args.base_url)
     results["finished_at"] = datetime.now(timezone.utc).isoformat()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_path = Path(args.out) if args.out else (
-        _REPO_ROOT / "benchmarks" / "fixtures" / f"server_perf_grid_{ts}.json"
+    out_path = (
+        Path(args.out)
+        if args.out
+        else (_REPO_ROOT / "benchmarks" / "fixtures" / f"server_perf_grid_{ts}.json")
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False))

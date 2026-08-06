@@ -826,16 +826,14 @@ class Qwen36MTPEngine:
         the stream -- the one blocking D2H per round is the draft rows
         themselves, never a separate seed round-trip.
         """
+
         def _as_int(value: int | torch.Tensor) -> int:
             return int(value) if isinstance(value, torch.Tensor) else value
 
         if len(slots) != len(first_drafts):
             raise ValueError("MTP draft slots and first draft tokens must have equal length")
         if self.k <= 1:
-            return {
-                slot: [_as_int(token)]
-                for slot, token in zip(slots, first_drafts, strict=True)
-            }
+            return {slot: [_as_int(token)] for slot, token in zip(slots, first_drafts, strict=True)}
         if self._draft_cg is not None:
             starts = [self._caches[slot].seq_len for slot in slots]
             tails = self._draft_cg.replay_batch(slots, first_drafts, first_hiddens, starts)
@@ -850,10 +848,7 @@ class Qwen36MTPEngine:
                         f"K-1={expected_tail} after teacher-forced step 0"
                     )
             self._record_draft_graph_replay(len(slots))
-            return {
-                slot: [first_values[index], *tails[slot]]
-                for index, slot in enumerate(slots)
-            }
+            return {slot: [first_values[index], *tails[slot]] for index, slot in enumerate(slots)}
         return {
             slot: self._continue_draft(slot, _as_int(first_draft), first_hiddens[index : index + 1])
             for index, (slot, first_draft) in enumerate(zip(slots, first_drafts, strict=True))
@@ -1099,7 +1094,14 @@ class Qwen36MTPEngine:
             )
 
         verify_tokens = [[anchors[slot], *drafts_by_slot[slot]] for slot in slots]
+        _verify_ev0 = _verify_ev1 = None
+        if round_profile.enabled:
+            _verify_ev0 = torch.cuda.Event(enable_timing=True)
+            _verify_ev1 = torch.cuda.Event(enable_timing=True)
+            _verify_ev0.record()
         all_hiddens = self._verify_cg.replay(slots, verify_tokens, past_lens)
+        if round_profile.enabled:
+            _verify_ev1.record()
         round_profile.phase("verify_replay")
         self._record_verify_graph_replay(len(slots))
         all_logits = self.model.compute_logits(all_hiddens)
@@ -1111,6 +1113,8 @@ class Qwen36MTPEngine:
             self.k,
         )
         round_profile.phase("accept_decision")
+        if _verify_ev0 is not None and _verify_ev1 is not None:
+            round_profile.note("verify_gpu_ms", _verify_ev0.elapsed_time(_verify_ev1))
         results: dict[int, dict[str, Any]] = {}
         sync_slots: list[int] = []
         sync_tokens: list[list[int]] = []
