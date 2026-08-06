@@ -279,3 +279,21 @@ fixture：`server_perf_grid_devicedraft_fix_{4k_c4,4k_c4_rerun,64k_c4,128k_c3,
 128k_c2}_20260806.json`。4K 的 per-round 固定开销（anchor H2D + 轮末
 profile sync）在短波下与跑动方差同量级；若全网格复跑仍低 ~10%，再评估
 把 profile sync 移出热路径（QSR_PROFILE_ROUNDS=0 时本就不执行）。
+
+## 12.2 全网格（devicedraft 构建，4K/32K/64K/128K × c1-4）
+
+同一进程连续跑完 16/16 cell，0 error；每 cell COLD + 2 个 WARM 波，WARM
+全部 prefix-cache 命中（restores == concurrency）。warm aggregate e2e
+tok/s（两波）：
+
+| 上下文 | c=1 | c=2 | c=3 | c=4 |
+|---|---:|---:|---:|---:|
+| 4K | 103.8 / 108.3 | 205.8 / 176.6 | 251.6 / 234.2 | 318.6 / 311.5 |
+| 32K | 98.3 / 102.1 | 157.8 / 145.8 | 236.9 / 224.6 | 262.3 / 225.4 |
+| 64K | 97.3 / 92.6 | 154.5 / 163.6 | 178.5 / 197.1 | 200.5 / 210.9 |
+| 128K | 73.8 / 66.3 | 121.8 / 118.1 | 126.0 / 131.7 | 139.9 / 146.3 |
+
+fixture：`server_perf_grid_devicedraft_full_20260806.json`。128K/c4 在本
+轮跑出 139.9/146.3，早前冷启动后的隔离复测为 157.5/165.9——同参数跨进程
+方差 ~±10%（TTFT 0.29-0.68 s、per-request decode 39-45 tok/s），对比历史
+数字时以隔离复测为准并注明方差带。

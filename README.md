@@ -169,6 +169,12 @@ tests assert dict-vs-tensor equality). Evidence:
 [`notes/2026-08-06-128k-c4-parity-profiling.md`](notes/2026-08-06-128k-c4-parity-profiling.md)
 §12 · fixtures `benchmarks/fixtures/server_perf_grid_devicedraft_fix_*.json`.
 
+Full same-parameter grid on this build (`server_perf_grid_devicedraft_full_20260806.json`,
+4K/32K/64K/128K × c1-4, 16/16 cells, 0 errors, every WARM wave a prefix-cache
+hit): warm aggregate e2e at c=4 is 4K ~311–319, 32K ~225–262, 64K ~200–211,
+128K ~140–146 tok/s. Cross-process variance at 128K/c4 is ~±10% (isolated
+rerun 157.5/165.9); see note §12.2 for the full table.
+
 For **Laguna-S-2.1**, the live gates are the DFlash acceptance regression,
 the production CUDA Graph gate, and a bit-level router oracle — all run through
 `bfdiag`.
