@@ -186,5 +186,22 @@
     "prefix_persistent_evictions": 0,
     "prefix_persistent_restores": 0,
     "checkpoints_taken": 0
-  }
+  },
+  "server_stats_after": {
+    "requests_completed": 0,
+    "prefix_cache_hits": 0,
+    "prefix_cache_misses": 0,
+    "prefix_cache_hit_tokens_saved": 0,
+    "decode_rounds": 0,
+    "decode_tokens": 0,
+    "decode_graph_replays": 0,
+    "mtp_verify_graph_replays": 0,
+    "mtp_draft_graph_replays": 0,
+    "mtp_batched_sync_replays": 0,
+    "prefix_persistent_stores": 0,
+    "prefix_persistent_evictions": 0,
+    "prefix_persistent_restores": 0,
+    "checkpoints_taken": 0
+  },
+  "finished_at": "2026-08-06T06:11:16.286389+00:00"
 }

@@ -33,7 +33,7 @@
         "served_context_tokens": 131072,
         "concurrency": 4,
         "cold": {
-          "wall_s": 218.2041,
+          "wall_s": 300.1385,
           "requests_sent": 4,
           "requests_ok": 4,
           "requests_completed_delta": 4,
@@ -43,16 +43,16 @@
           "expected_prompt_tokens": 524288,
           "ttft_s_per_request": [],
           "ttft_median_s": null,
-          "server_mean_ttft_s": 210.9418,
-          "server_mean_decode_tok_per_s": 35.91,
-          "server_e2e_tok_per_s": 1.17,
+          "server_mean_ttft_s": 293.93,
+          "server_mean_decode_tok_per_s": 41.98,
+          "server_e2e_tok_per_s": 0.85,
           "aggregate_decode_window_s": null,
           "aggregate_decode_tok_per_s": null,
-          "aggregate_e2e_tok_per_s": 4.69,
+          "aggregate_e2e_tok_per_s": 3.41,
           "stats_delta": {
             "requests_completed": 4,
-            "prefix_cache_hits": 2,
-            "prefix_cache_misses": 2,
+            "prefix_cache_hits": 1,
+            "prefix_cache_misses": 3,
             "prefix_cache_hit_tokens_saved": 0,
             "decode_rounds": 0,
             "decode_tokens": 0,
@@ -62,23 +62,23 @@
             "mtp_batched_sync_replays": 64,
             "prefix_persistent_stores": 1,
             "prefix_persistent_evictions": 0,
-            "prefix_persistent_restores": 2,
+            "prefix_persistent_restores": 1,
             "checkpoints_taken": 65
           },
           "metric_delta": {
             "prompt_tokens_total": 524288.0,
             "generation_tokens_total": 1024.0,
-            "e2e_request_latency_seconds_sum": 872.174,
+            "e2e_request_latency_seconds_sum": 1200.02,
             "e2e_request_latency_seconds_count": 4.0,
-            "time_to_first_token_seconds_sum": 843.767,
+            "time_to_first_token_seconds_sum": 1175.72,
             "time_to_first_token_seconds_count": 4.0,
-            "request_time_per_output_token_seconds_sum": 0.111401,
+            "request_time_per_output_token_seconds_sum": 0.095294,
             "request_time_per_output_token_seconds_count": 4.0
           }
         },
         "warm": [
           {
-            "wall_s": 7.1193,
+            "wall_s": 6.0282,
             "requests_sent": 4,
             "requests_ok": 4,
             "requests_completed_delta": 4,
@@ -88,12 +88,12 @@
             "expected_prompt_tokens": 524288,
             "ttft_s_per_request": [],
             "ttft_median_s": null,
-            "server_mean_ttft_s": 0.3235,
-            "server_mean_decode_tok_per_s": 39.11,
-            "server_e2e_tok_per_s": 37.41,
+            "server_mean_ttft_s": 0.3425,
+            "server_mean_decode_tok_per_s": 45.95,
+            "server_e2e_tok_per_s": 43.45,
             "aggregate_decode_window_s": null,
             "aggregate_decode_tok_per_s": null,
-            "aggregate_e2e_tok_per_s": 143.83,
+            "aggregate_e2e_tok_per_s": 169.87,
             "stats_delta": {
               "requests_completed": 4,
               "prefix_cache_hits": 4,
@@ -102,9 +102,9 @@
               "decode_rounds": 0,
               "decode_tokens": 0,
               "decode_graph_replays": 0,
-              "mtp_verify_graph_replays": 65,
-              "mtp_draft_graph_replays": 69,
-              "mtp_batched_sync_replays": 65,
+              "mtp_verify_graph_replays": 64,
+              "mtp_draft_graph_replays": 68,
+              "mtp_batched_sync_replays": 64,
               "prefix_persistent_stores": 0,
               "prefix_persistent_evictions": 0,
               "prefix_persistent_restores": 4,
@@ -113,16 +113,16 @@
             "metric_delta": {
               "prompt_tokens_total": 524288.0,
               "generation_tokens_total": 1024.0,
-              "e2e_request_latency_seconds_sum": 27.375,
+              "e2e_request_latency_seconds_sum": 23.57,
               "e2e_request_latency_seconds_count": 4.0,
-              "time_to_first_token_seconds_sum": 1.294,
+              "time_to_first_token_seconds_sum": 1.37,
               "time_to_first_token_seconds_count": 4.0,
-              "request_time_per_output_token_seconds_sum": 0.102276,
+              "request_time_per_output_token_seconds_sum": 0.087047,
               "request_time_per_output_token_seconds_count": 4.0
             }
           },
           {
-            "wall_s": 6.2688,
+            "wall_s": 6.6438,
             "requests_sent": 4,
             "requests_ok": 4,
             "requests_completed_delta": 4,
@@ -132,12 +132,12 @@
             "expected_prompt_tokens": 524288,
             "ttft_s_per_request": [],
             "ttft_median_s": null,
-            "server_mean_ttft_s": 0.3385,
-            "server_mean_decode_tok_per_s": 44.33,
-            "server_e2e_tok_per_s": 42.03,
+            "server_mean_ttft_s": 0.3875,
+            "server_mean_decode_tok_per_s": 41.63,
+            "server_e2e_tok_per_s": 39.31,
             "aggregate_decode_window_s": null,
             "aggregate_decode_tok_per_s": null,
-            "aggregate_e2e_tok_per_s": 163.35,
+            "aggregate_e2e_tok_per_s": 154.13,
             "stats_delta": {
               "requests_completed": 4,
               "prefix_cache_hits": 4,
@@ -146,9 +146,9 @@
               "decode_rounds": 0,
               "decode_tokens": 0,
               "decode_graph_replays": 0,
-              "mtp_verify_graph_replays": 65,
-              "mtp_draft_graph_replays": 69,
-              "mtp_batched_sync_replays": 65,
+              "mtp_verify_graph_replays": 64,
+              "mtp_draft_graph_replays": 68,
+              "mtp_batched_sync_replays": 64,
               "prefix_persistent_stores": 0,
               "prefix_persistent_evictions": 0,
               "prefix_persistent_restores": 4,
@@ -157,11 +157,11 @@
             "metric_delta": {
               "prompt_tokens_total": 524288.0,
               "generation_tokens_total": 1024.0,
-              "e2e_request_latency_seconds_sum": 24.364,
+              "e2e_request_latency_seconds_sum": 26.05,
               "e2e_request_latency_seconds_count": 4.0,
-              "time_to_first_token_seconds_sum": 1.354,
+              "time_to_first_token_seconds_sum": 1.55,
               "time_to_first_token_seconds_count": 4.0,
-              "request_time_per_output_token_seconds_sum": 0.090238,
+              "request_time_per_output_token_seconds_sum": 0.096091,
               "request_time_per_output_token_seconds_count": 4.0
             }
           }
@@ -170,7 +170,7 @@
       }
     }
   },
-  "started_at": "2026-08-06T06:07:37.020068+00:00",
+  "started_at": "2026-08-06T05:18:03.091294+00:00",
   "server_stats_before": {
     "requests_completed": 0,
     "prefix_cache_hits": 0,
@@ -186,5 +186,22 @@
     "prefix_persistent_evictions": 0,
     "prefix_persistent_restores": 0,
     "checkpoints_taken": 0
-  }
+  },
+  "server_stats_after": {
+    "requests_completed": 0,
+    "prefix_cache_hits": 0,
+    "prefix_cache_misses": 0,
+    "prefix_cache_hit_tokens_saved": 0,
+    "decode_rounds": 0,
+    "decode_tokens": 0,
+    "decode_graph_replays": 0,
+    "mtp_verify_graph_replays": 0,
+    "mtp_draft_graph_replays": 0,
+    "mtp_batched_sync_replays": 0,
+    "prefix_persistent_stores": 0,
+    "prefix_persistent_evictions": 0,
+    "prefix_persistent_restores": 0,
+    "checkpoints_taken": 0
+  },
+  "finished_at": "2026-08-06T05:23:01.675052+00:00"
 }

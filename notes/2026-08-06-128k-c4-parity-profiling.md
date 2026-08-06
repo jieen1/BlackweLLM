@@ -197,3 +197,66 @@ fixture：`server_perf_grid_20260806_122813.json`（三档合并跑）、
   （均需过 bit-parity 质量锚，属 roadmap 阶段四工作）。
 * 数值口径警告：两处重切 chunk 都改变 split-KV 归约顺序（ULP 级漂移），
   重跑质量锚（`scripts/run_qwen36_quality.sh`）前不要引用绝对分数。
+
+## 12. 修复三：draft→verify 全设备直连（128K/c4 轮时 −11%，agg e2e 157.5/165.9）
+
+§7 的 host 间隙定位继续追到一处明确的每轮 D2H 往返：batched draft 图
+（`Qwen36MTPDraftCudaGraph.replay_batch`）此前把 `[B, K-1]` 结果
+`.tolist()` 回主机，再由下一轮 verify fill 和 GPU accept 比较重新上传。
+round profile（128K/c4 warm，b4 稳态）里 `draft_batch` host 段中位 12.5 ms，
+其中约 7 ms 是这次 `.tolist()` D2H。
+
+**修复（未提交前为工作区改动，见 commit）：**
+
+1. `replay_batch` 返回 device 行（`[K-1]`，不再 tolist）。
+2. `_continue_draft_batch` 图路径把 first-draft 种子 D2D 拼接并返回
+   device `[K]` 行；`round_batch` 直接 `cat` 成 `[B, K+1]` verify 输入，
+   `determine_accept_reject_batch` 走 device 分支（`committed` 由 verifier
+   自身预测重建，与 host 分支按匹配条件逐值相等，**数值路径不变**）。
+3. 混合来源归一化：prefill/单槽路径仍产出 host `list[int]`，图轮次产出
+   device 行；同一 batch 可能混两类（恰好是初版 devicedraft 实跑炸掉的
+   场景：`TypeError: can't convert cuda tensor to numpy` / `'list' object
+   has no attribute 'shape'`，均已在 live server 复现并修复）。现在任何
+   slot 是 tensor 就整体转 device；单槽 fallback 与 `round()` 统一先
+   `.tolist()` 保持 host 契约。
+4. profile 的 `elapsed_time` 改为轮边界一次性 `_draft_ev1.synchronize()`
+   （旧 `.tolist()` 曾是隐式 drain；device 路径没有天然 drain）。
+
+单测：`tests/test_qwen36_mtp_engine.py test_qwen36_backend.py
+test_mtp_accept_sampling.py` 101 passed；新增 device-vs-host 逐值一致与
+shape 校验测试。
+
+**实测（同口径：capacity 4 / num_slots 5，128K block-aligned，c4，
+max_tokens 256，2 轮 warm，prefix cache 全命中，MTP K=3 + 四图）：**
+
+| 指标 | 修复前基线 | 修复后 |
+|---|---:|---:|
+| 轮时 total（b4 中位） | 82.8 ms | **73.7 ms（−11%）** |
+| draft_batch host 段（中位） | 12.5 ms | **0.1 ms** |
+| draft GPU event（中位） | 15.9 ms | 5.8 ms |
+| verify GPU event（中位） | 39.9 ms | 40.4 ms（GPU 忙，未变） |
+| sync_ragged（中位） | 1.1 ms | 1.1 ms |
+| warm agg e2e（两波） | 143.83 / 163.35 | **157.52 / 165.86** |
+
+fixture：`benchmarks/fixtures/server_perf_grid_devicedraft_fix_20260806.json`；
+基线 fixture：`server_perf_grid_20260806_141116.json`；phase 日志：
+`logs/quality/server_devicedraft_fix_20260806.log`（`mtp_round_b4` 190 条）。
+
+命令（服务端）：
+```bash
+source /tmp/qwen36_server_env.sh
+export QSR_SERVER_CAPACITY=4 QSR_SERVER_NUM_SLOTS=5
+setsid nohup /home/bot/.venvs/vllm/bin/python -m server.app \
+  --host 127.0.0.1 --port 8300 > logs/quality/server_devicedraft_fix_20260806.log 2>&1 &
+```
+
+命令（网格）：
+```bash
+/home/bot/.venvs/vllm/bin/python -u benchmarks/server_perf_grid.py \
+  --base-url http://127.0.0.1:8300 --model qwen3.6 --endpoint completions \
+  --contexts 128k --concurrency 4 --max-tokens 256 --warm-rounds 2 \
+  --out benchmarks/fixtures/server_perf_grid_devicedraft_fix_20260806.json
+```
+
+下一目标：把同一修复的 4K/64K 与 c1-c3 补齐，然后全网格对齐历史
+（README Performance 段同步更新）。

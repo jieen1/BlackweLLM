@@ -462,7 +462,12 @@ class Qwen36MTPVerifyCudaGraph:
             gdn_state_rows=None,
         )
 
-    def _fill(self, slots: list[int], tokens: list[list[int]], past_lens: list[int]) -> None:
+    def _fill(
+        self,
+        slots: list[int],
+        tokens: list[list[int]] | torch.Tensor,
+        past_lens: list[int],
+    ) -> None:
         batch = len(slots)
         descriptor = self._batches[batch]
         input_ids, positions, write_index, page_table, cache_seqlens, destination_index = (
@@ -484,7 +489,12 @@ class Qwen36MTPVerifyCudaGraph:
             cache_seqlens_view,
             destination_view,
         ) = self._host_input_views[batch]
-        if any(len(row) != self.qo_len for row in tokens):
+        if isinstance(tokens, torch.Tensor):
+            if tuple(tokens.shape) != (batch, self.qo_len):
+                raise ValueError(
+                    f"verify graph expects [{batch}, anchor+K={self.qo_len}] device tokens"
+                )
+        elif any(len(row) != self.qo_len for row in tokens):
             raise ValueError(f"verify graph expects anchor+K={self.qo_len} tokens per slot")
         for slot, past_len in zip(slots, past_lens, strict=True):
             self.pool.prepare_kv_writes(slot, past_len, self.qo_len)
@@ -500,7 +510,10 @@ class Qwen36MTPVerifyCudaGraph:
             ]
             for slot in slots
         ]
-        tokens_view[:] = tokens
+        if isinstance(tokens, torch.Tensor):
+            input_ids.copy_(tokens, non_blocking=True)
+        else:
+            tokens_view[:] = tokens
         positions_view[:] = [
             position
             for past_len in past_lens
@@ -514,7 +527,8 @@ class Qwen36MTPVerifyCudaGraph:
         ]
         descriptor.gdn_source_index.copy_(source_host, non_blocking=True)
         destination_index.copy_(destination_host, non_blocking=True)
-        input_ids.copy_(tokens_host, non_blocking=True)
+        if not isinstance(tokens, torch.Tensor):
+            input_ids.copy_(tokens_host, non_blocking=True)
         positions.copy_(positions_host, non_blocking=True)
         cache_seqlens.copy_(cache_seqlens_host, non_blocking=True)
         write_index.copy_(write_index_host, non_blocking=True)
@@ -797,12 +811,16 @@ class Qwen36MTPDraftCudaGraph:
         seed_tokens: list[int] | torch.Tensor,
         seed_hiddens: torch.Tensor,
         start_positions: list[int],
-    ) -> dict[int, list[int]]:
+    ) -> dict[int, torch.Tensor]:
         """Replay one B-wide chained draft graph and advance each cache.
 
         ``seed_tokens`` may be a device tensor (D2D staged by :meth:`_fill`)
         or a host list (historical H2D staging).  Returns the K-1 tails per
-        slot as Python ints; the caller combines them with the seeds.
+        slot as device rows ``[K-1]`` -- the values are consumed only by the
+        next verify fill and by the GPU-side accept comparison, neither of
+        which needs a host round-trip.  The 2026-08-06 128K/c4 phase profile
+        measured the old ``.tolist()`` here as ~7 ms/round of host time that
+        serialised after the draft graph had already finished.
         """
         if not self._captured:
             raise RuntimeError("MTP draft CUDA Graph replay requested before capture")
@@ -813,11 +831,7 @@ class Qwen36MTPDraftCudaGraph:
         for slot, start_pos in zip(slots, start_positions, strict=True):
             self.engine._caches[slot].seq_len = start_pos + self.steps
         round_profile.phase("draft_gpu_wait")
-        # One device-to-host transfer for the whole B-wide graph result.
-        # Calling ``tolist`` on one indexed row at a time makes every slot
-        # wait on its own synchronisation point, recreating the historical
-        # per-request host gap this batched graph was introduced to remove.
-        draft_rows = self._draft_tokens[batch].tolist()
+        draft_rows = self._draft_tokens[batch]
         return {slot: draft_rows[index] for index, slot in enumerate(slots)}
 
     def replay(

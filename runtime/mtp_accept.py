@@ -74,7 +74,10 @@ def determine_accept_reject(draft_tokens: list[int], verify_logits) -> dict:
 
 
 def determine_accept_reject_batch(
-    slots: list[int], drafts: dict[int, list[int]], verify_logits: torch.Tensor, k: int
+    slots: list[int],
+    drafts: dict[int, list[int]] | torch.Tensor,
+    verify_logits: torch.Tensor,
+    k: int,
 ) -> dict[int, dict]:
     """Batched analogue of ``determine_accept_reject`` -- computes the SAME
     greedy accept/reject decision for every slot in ONE vectorized GPU op
@@ -109,13 +112,25 @@ def determine_accept_reject_batch(
     position axis is a second vectorized op that yields ``num_accepted``
     for every slot at once. Only the FINAL small result tensor (shape
     ``[len(slots), k+2]``) is pulled to host via a single ``.tolist()`` --
-    everything upstream of that stays on-GPU.
+    everything upstream of that stays on-GPU.  ``drafts`` may alternatively
+    be a device tensor ``[len(slots), k+1]`` (anchor + K drafts, the
+    graph-path fast form): candidates are then compared entirely on device
+    and ``committed`` is built from the verifier's own predictions, which
+    equal the accepted draft values by the match condition -- no draft host
+    round-trip is needed.
     """
     num_reqs = len(slots)
     predicted = verify_logits.argmax(dim=-1).view(num_reqs, k + 1)  # [num_reqs, k+1], int64
-    draft_next = torch.tensor(
-        [drafts[s][1:] for s in slots], dtype=predicted.dtype, device=predicted.device
-    )  # [num_reqs, k] -- each slot's k candidate continuation tokens (drafts[s][1:])
+    if isinstance(drafts, torch.Tensor):
+        if tuple(drafts.shape) != (num_reqs, k + 1):
+            raise ValueError(
+                "device drafts must have shape [num_reqs, k+1] (anchor + K candidates)"
+            )
+        draft_next = drafts[:, 1 : k + 1]  # [num_reqs, k] -- device slice, no H2D
+    else:
+        draft_next = torch.tensor(
+            [drafts[s][1:] for s in slots], dtype=predicted.dtype, device=predicted.device
+        )  # [num_reqs, k] -- each slot's k candidate continuation tokens (drafts[s][1:])
     matches = predicted[:, :k] == draft_next  # [num_reqs, k] bool
     # True at position p iff every position <= p matched (the greedy
     # "still on the accepted prefix" condition) -- a cumulative product
@@ -140,7 +155,13 @@ def determine_accept_reject_batch(
         row = combined_list[i]
         na = row[0]
         pred_row = row[1:]
-        committed = [drafts[s][p + 1] for p in range(na)] + [pred_row[na]]
+        if isinstance(drafts, torch.Tensor):
+            # Every position p < na matched (predicted[p] == draft[p+1]), so
+            # the verifier's own predictions are exactly the committed draft
+            # values -- read them from the already-synchronised combined row.
+            committed = [pred_row[p] for p in range(na)] + [pred_row[na]]
+        else:
+            committed = [drafts[s][p + 1] for p in range(na)] + [pred_row[na]]
         decisions[s] = {
             "num_accepted": na,
             "committed": committed,

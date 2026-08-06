@@ -605,3 +605,54 @@ class TestSampleAcceptRejectStatistical:
 
         assert pvalue_p > self._ALPHA_PASS, (counts, stat_p, pvalue_p)
         assert pvalue_q_support < self._ALPHA_FAIL, (counts, stat_q_support, pvalue_q_support)
+
+
+class TestDetermineAcceptRejectBatchDeviceDrafts:
+    """The device-tensor drafts fast path must decide byte-for-byte the same
+    as the historical dict-of-lists path (2026-08-06 device-direct draft
+    optimization): the committed list is derived from the verifier's own
+    predictions, which equal the accepted draft values by the match
+    condition, so removing the draft host round-trip cannot change any
+    decision or committed token."""
+
+    def test_tensor_drafts_match_dict_drafts_exactly(self) -> None:
+        torch = pytest.importorskip("torch")
+        from runtime.mtp_accept import determine_accept_reject_batch
+
+        k = 3
+        slots = [0, 1, 2]
+        # Draft rows (anchor + K candidates) deliberately include rejects at
+        # different positions so every branch is exercised.
+        drafts_rows = [
+            [10, 11, 12, 13],  # full accept (bonus 30)
+            [20, 21, 99, 23],  # reject at position 1, recovery 32
+            [30, 31, 32, 99],  # reject at position 2, recovery 33
+        ]
+        drafts_dict = {s: row for s, row in zip(slots, drafts_rows)}
+        drafts_tensor = torch.tensor(drafts_rows)
+        # verify_logits such that argmax == the expected prediction row:
+        # position 0 always accepts, position 1 accepts for rows 0/2, and the
+        # final bonus position is the recovery token.
+        logits = torch.zeros(3, k + 1, 128)
+        for i, pred_row in enumerate(([11, 12, 13, 30], [21, 32, 33, 34], [31, 32, 33, 35])):
+            for p, tok in enumerate(pred_row):
+                logits[i, p, tok] = 2.0
+        out_dict = determine_accept_reject_batch(slots, drafts_dict, logits, k)
+        out_tensor = determine_accept_reject_batch(slots, drafts_tensor, logits, k)
+        for s in slots:
+            assert out_dict[s] == out_tensor[s]
+        assert out_dict[0]["num_accepted"] == 3
+        assert out_dict[1]["num_accepted"] == 1
+        assert out_dict[2]["num_accepted"] == 2
+
+    def test_tensor_drafts_reject_shape_mismatch(self) -> None:
+        torch = pytest.importorskip("torch")
+        from runtime.mtp_accept import determine_accept_reject_batch
+
+        with pytest.raises(ValueError, match="device drafts must have shape"):
+            determine_accept_reject_batch(
+                [0, 1],
+                torch.zeros(2, 3),
+                torch.zeros(2, 4, 16),
+                3,
+            )

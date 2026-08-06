@@ -786,12 +786,19 @@ class Qwen36MTPEngine:
         Step 0 is emitted by :meth:`_sync_real_suffix` from real target
         context.  Only these continuation steps are speculative and eligible
         for the fixed-shape draft CUDA Graph.
+
+        The single-slot graph wrapper returns a device row; this path's
+        contract is a host ``list[int]`` (the caller stores it in request
+        state and single-slot ``round`` consumes it on host), so convert
+        here rather than leaking CUDA scalars into the list.
         """
         if self.k <= 1:
             return [first_draft]
         cache = self._caches[slot]
         if self._draft_cg is not None:
             tail = self._draft_cg.replay(slot, first_draft, first_hidden, cache.seq_len)
+            if isinstance(tail, torch.Tensor):
+                tail = tail.tolist()
             expected_tail = self.k - 1
             if len(tail) != expected_tail:
                 raise RuntimeError(
@@ -816,15 +823,17 @@ class Qwen36MTPEngine:
         slots: list[int],
         first_drafts: list[int | torch.Tensor],
         first_hiddens: torch.Tensor,
-    ) -> dict[int, list[int]]:
+    ) -> dict[int, list[int] | torch.Tensor]:
         """Batch MTP's K-1 speculative continuation steps across slots.
 
         ``first_drafts`` accepts host ints (eager path) or per-slot device
         ``[1]`` rows (ragged-sync graph path).  In the graph path the device
-        seeds are staged D2D into the draft graph's owned buffer, and the
-        int conversion happens only after the draft replay has synchronized
-        the stream -- the one blocking D2H per round is the draft rows
-        themselves, never a separate seed round-trip.
+        seeds are staged D2D into the draft graph's owned buffer and the
+        K-token result is returned as a device row: the next verify fill
+        copies it D2D and the GPU-side accept comparison slices it, so no
+        host round-trip is needed at all.  Host ints remain the contract for
+        the eager path (and for single-slot ``round``), where the values are
+        genuinely consumed on the host.
         """
 
         def _as_int(value: int | torch.Tensor) -> int:
@@ -838,16 +847,37 @@ class Qwen36MTPEngine:
             starts = [self._caches[slot].seq_len for slot in slots]
             tails = self._draft_cg.replay_batch(slots, first_drafts, first_hiddens, starts)
             expected_tail = self.k - 1
-            first_values = [_as_int(token) for token in first_drafts]
             for slot in slots:
                 tail = tails[slot]
-                if len(tail) != expected_tail:
+                tail_len = int(tail.shape[0]) if isinstance(tail, torch.Tensor) else len(tail)
+                if tail_len != expected_tail:
                     raise RuntimeError(
                         "MTP draft graph returned "
-                        f"{len(tail)} continuation tokens for slot {slot}; expected "
+                        f"{tail_len} continuation tokens for slot {slot}; expected "
                         f"K-1={expected_tail} after teacher-forced step 0"
                     )
             self._record_draft_graph_replay(len(slots))
+            if all(isinstance(tails[slot], torch.Tensor) for slot in slots):
+                # Device graph path: combine the seeds and tails on device so
+                # the next verify fill and accept comparison never touch host.
+                if all(isinstance(token, torch.Tensor) for token in first_drafts):
+                    first_rows = torch.cat([token.reshape(1) for token in first_drafts]).reshape(
+                        -1, 1
+                    )
+                else:
+                    # Host-seeded fallback (eager sync path): the seeds are
+                    # already host ints, so one tiny H2D is cheaper than
+                    # forcing per-token syncs inside the graph helper.
+                    first_rows = torch.tensor(
+                        [_as_int(token) for token in first_drafts],
+                        dtype=torch.long,
+                        device=self.device,
+                    ).reshape(-1, 1)
+                return {
+                    slot: torch.cat([first_rows[index], tails[slot]], dim=0)
+                    for index, slot in enumerate(slots)
+                }
+            first_values = [_as_int(token) for token in first_drafts]
             return {slot: [first_values[index], *tails[slot]] for index, slot in enumerate(slots)}
         return {
             slot: self._continue_draft(slot, _as_int(first_draft), first_hiddens[index : index + 1])
@@ -912,6 +942,8 @@ class Qwen36MTPEngine:
         token becomes MTP's teacher-forced suffix, and only its later draft
         continuation remains speculative.
         """
+        if isinstance(drafts, torch.Tensor):
+            drafts = drafts.tolist()
         pool = self.backend.pool
         state = pool.slot_state(slot)
         k = len(drafts)
@@ -1042,7 +1074,7 @@ class Qwen36MTPEngine:
         self,
         slots: list[int],
         anchors: dict[int, int],
-        drafts_by_slot: dict[int, list[int]],
+        drafts_by_slot: dict[int, list[int] | torch.Tensor],
         *,
         params_per_slot: dict[int, SamplingParams] | None = None,
         return_logprobs: bool = False,
@@ -1064,6 +1096,13 @@ class Qwen36MTPEngine:
             and not params_per_slot[slot].is_greedy
             for slot in slots
         ):
+            # The single-slot fallback consumes drafts on host; a device row
+            # would splat into a list of CUDA scalars and break the verify
+            # fill's numpy conversion.  Normalise once here.
+            drafts_by_slot = {
+                slot: (value.tolist() if isinstance(value, torch.Tensor) else value)
+                for slot, value in drafts_by_slot.items()
+            }
             return {
                 slot: self.round(
                     slot,
@@ -1076,8 +1115,44 @@ class Qwen36MTPEngine:
                 for slot in slots
             }
 
-        if any(len(drafts_by_slot[slot]) != self.k for slot in slots):
-            raise ValueError("batched MTP verify requires the engine's uniform K drafts per slot")
+        # Drafts arrive from two sources: the prefill/eager path stores host
+        # ``list[int]``, while a previous graph round stores device ``[K]``
+        # rows.  A request that finished prefill this round can therefore
+        # mix both kinds in one batch.  The verify graph fill accepts either
+        # an all-host or all-device payload, never a per-slot mix -- so
+        # normalise every slot to device once any slot is already a tensor.
+        # Values are bit-identical (the tensor is built from the same ints),
+        # and the device accept path reconstructs ``committed`` from the
+        # verifier's own predictions, which match the accepted drafts by the
+        # greedy match condition.
+        if any(isinstance(drafts_by_slot[slot], torch.Tensor) for slot in slots):
+            normalized: dict[int, torch.Tensor] = {}
+            for slot in slots:
+                value = drafts_by_slot[slot]
+                if isinstance(value, torch.Tensor):
+                    if tuple(value.shape) != (self.k,):
+                        raise ValueError(
+                            "batched MTP verify requires uniform [K] device drafts"
+                        )
+                    normalized[slot] = value
+                else:
+                    if len(value) != self.k:
+                        raise ValueError(
+                            "batched MTP verify requires the engine's uniform K drafts per slot"
+                        )
+                    normalized[slot] = torch.tensor(
+                        [int(token) for token in value], dtype=torch.long, device=self.device
+                    )
+            drafts_by_slot = normalized
+        if isinstance(drafts_by_slot[slots[0]], torch.Tensor):
+            if any(tuple(drafts_by_slot[slot].shape) != (self.k,) for slot in slots):
+                raise ValueError(
+                    "batched MTP verify requires uniform [K] device drafts per slot"
+                )
+        elif any(len(drafts_by_slot[slot]) != self.k for slot in slots):
+            raise ValueError(
+                "batched MTP verify requires the engine's uniform K drafts per slot"
+            )
 
         round_profile.begin_round()
         pool = self.backend.pool
@@ -1093,7 +1168,22 @@ class Qwen36MTPEngine:
                 "batched MTP verify received a cache without its K-1-row continuation tail"
             )
 
-        verify_tokens = [[anchors[slot], *drafts_by_slot[slot]] for slot in slots]
+        first_value = drafts_by_slot[slots[0]]
+        if isinstance(first_value, torch.Tensor):
+            # Device drafts: build the whole [B, K+1] verify input on device.
+            # The anchor ints are tiny; one H2D row is far cheaper than the
+            # host list of lists the old path reconstructed every round.
+            anchor_rows = torch.tensor(
+                [anchors[slot] for slot in slots], dtype=torch.long, device=self.device
+            ).reshape(-1, 1)
+            drafts_tensor = torch.cat(
+                [drafts_by_slot[slot].reshape(1, -1) for slot in slots], dim=0
+            )
+            verify_tokens = torch.cat([anchor_rows, drafts_tensor], dim=1)
+            drafts_arg = verify_tokens
+        else:
+            verify_tokens = [[anchors[slot], *drafts_by_slot[slot]] for slot in slots]
+            drafts_arg = {slot: [anchors[slot], *drafts_by_slot[slot]] for slot in slots}
         _verify_ev0 = _verify_ev1 = None
         if round_profile.enabled:
             _verify_ev0 = torch.cuda.Event(enable_timing=True)
@@ -1110,7 +1200,7 @@ class Qwen36MTPEngine:
             _post_verify_ev = torch.cuda.Event(enable_timing=True)
         decisions = determine_accept_reject_batch(
             slots,
-            {slot: [anchors[slot], *drafts_by_slot[slot]] for slot in slots},
+            drafts_arg,
             all_logits.reshape(-1, all_logits.shape[-1]),
             self.k,
         )
@@ -1191,10 +1281,14 @@ class Qwen36MTPEngine:
             _ms = torch.cuda.memory_stats()
             round_profile.note("device_alloc", _ms["num_device_alloc"])
             round_profile.note("device_free", _ms["num_device_free"])
-            round_profile.note("sync_gpu_ms", _sync_ev0.elapsed_time(_sync_ev1))
-            # _draft_ev1 was recorded after the draft tolist drained the
-            # stream, so nothing has executed it yet -- wait for it alone.
+            # One blocking sync at the round boundary.  The historical path
+            # drained the stream with the draft-row ``.tolist()`` before
+            # these elapsed-time reads; the device-direct path has no
+            # natural drain, so complete both timed spans explicitly (the
+            # events are stream-ordered, so syncing the last one finishes
+            # both).
             _draft_ev1.synchronize()
+            round_profile.note("sync_gpu_ms", _sync_ev0.elapsed_time(_sync_ev1))
             round_profile.note("draft_gpu_ms", _draft_ev0.elapsed_time(_draft_ev1))
         round_profile.end_round(label=f"mtp_round_b{len(slots)}")
         return results
