@@ -2133,6 +2133,19 @@ class Qwen36DecodeGraphAttention:
         self.page_table = self._workspace.page_table
         self.cache_seqlens = self._workspace.cache_seqlens
 
+    def update_replay_metadata(self) -> None:
+        """Re-derive the split-KV chunking from the LIVE cache lengths.
+
+        The graph's grid and work-item buffers are capture-static, but the
+        chunk size itself is a device scalar the replay updater rewrites
+        from ``cache_seqlens`` through the decode chunk-pages LUT. Without
+        this call every replay keeps the worst-case (full-context) chunking
+        captured at load -- measured 2026-08-06 as ~1.0-1.1 ms/call at
+        128K q=1 where the live-length chunking runs ~0.4 ms
+        (scripts/probe_draft_graph_attn.py).
+        """
+        self._workspace.update_decode_graph_replay_metadata_from_runtime_cache_seqlens()
+
     def forward(
         self,
         *,

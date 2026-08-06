@@ -951,6 +951,13 @@ class Qwen36SlotPool:
         self._batch_input_ids[:b].copy_(self._batch_input_ids_host[:b], non_blocking=True)
         self._batch_positions[:b].copy_(self._batch_positions_host[:b], non_blocking=True)
         attn.cache_seqlens.copy_(self._batch_cache_seqlens_host[:b], non_blocking=True)
+        # Graph-mode driver: re-chunk split-KV for the live lengths (the
+        # capture-static alternative freezes worst-case chunking and runs
+        # ~3x slower at mid contexts -- see Qwen36DecodeGraphAttention.
+        # update_replay_metadata). Eager drivers do not expose it.
+        update = getattr(attn, "update_replay_metadata", None)
+        if update is not None:
+            update()
         self._batch_write_index[:b].copy_(self._batch_write_index_host[:b], non_blocking=True)
         self._batch_slot_index[:b].copy_(self._batch_slot_index_host[:b], non_blocking=True)
         # ``out=`` fills the graph-owned page table without the temporary

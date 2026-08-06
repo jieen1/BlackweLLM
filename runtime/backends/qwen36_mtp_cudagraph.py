@@ -699,6 +699,12 @@ class Qwen36MTPDraftCudaGraph:
             for row, slot in enumerate(slots):
                 driver.page_table[row].copy_(self._page_table_by_slot[slot])
             self._page_table_slots[batch] = slot_key
+        # Re-chunk the draft attention split-KV for this round's live KV
+        # length; without it every replay keeps the worst-case chunking
+        # captured at load (~1.1 ms vs ~0.4 ms per draft attention call at
+        # 128K, measured 2026-08-06).
+        driver.cache_seqlens.copy_(start_pos, non_blocking=True)
+        driver.update_replay_metadata()
 
     def _forward_all_steps(self, batch: int) -> torch.Tensor:
         cos_sin_cache = self.engine.model.model.cos_sin_cache
