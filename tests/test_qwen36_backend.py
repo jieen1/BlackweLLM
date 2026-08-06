@@ -566,8 +566,7 @@ class TestPrefixCacheTwoFamilies:
         e1 = next(iter(backend._persistent_prefixes.values()))  # noqa: SLF001
         assert e1.kv_len == 64
         scratch_page = (
-            backend.pool.scratch_row * backend.pool.pages_per_slot
-            + e1.scratch_page_offsets[0]
+            backend.pool.scratch_row * backend.pool.pages_per_slot + e1.scratch_page_offsets[0]
         )
         kv_before = (
             [t[scratch_page].clone() for t in backend.pool.k_pools if t is not None],

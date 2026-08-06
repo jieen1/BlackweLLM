@@ -98,7 +98,7 @@ def test_build_response_with_tool_call():
     set_active_parser("qwen3_coder")
     try:
         text = (
-            'I will use the tool.\n'
+            "I will use the tool.\n"
             "<tool_call><function=calculator><parameter=expr>2+2</parameter>"
             "</function></tool_call>"
         )
@@ -120,9 +120,7 @@ def test_build_response_with_tool_call():
 
 
 def test_snapshot_has_required_fields():
-    snap = responses_format.snapshot(
-        "resp_x", 123, "qwen3.6", "in_progress", [], None
-    )
+    snap = responses_format.snapshot("resp_x", 123, "qwen3.6", "in_progress", [], None)
     assert snap["id"] == "resp_x"
     assert snap["object"] == "response"
     assert snap["status"] == "in_progress"

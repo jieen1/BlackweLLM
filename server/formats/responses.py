@@ -83,8 +83,7 @@ def parse_input(body: dict) -> list[dict]:
                         "content": "",
                         "tool_calls": [
                             {
-                                "id": item.get("call_id")
-                                or f"call_{uuid.uuid4().hex[:12]}",
+                                "id": item.get("call_id") or f"call_{uuid.uuid4().hex[:12]}",
                                 "type": "function",
                                 "function": {
                                     "name": item.get("name", ""),
@@ -117,9 +116,7 @@ def message_item(item_id: str, text: str) -> dict:
         "id": item_id,
         "type": "message",
         "role": "assistant",
-        "content": [
-            {"type": "output_text", "text": text, "annotations": []}
-        ],
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
     }
 
 

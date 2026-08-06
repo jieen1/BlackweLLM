@@ -614,8 +614,7 @@ class TestTeacherForcedSync:
             def replay_batch(self, slots, seed_tokens, seed_hiddens, start_positions):
                 del seed_hiddens, start_positions
                 self.seed_kind = [
-                    "tensor" if isinstance(seed, torch.Tensor) else "int"
-                    for seed in seed_tokens
+                    "tensor" if isinstance(seed, torch.Tensor) else "int" for seed in seed_tokens
                 ]
                 self.seed_values = [int(seed.item()) for seed in seed_tokens]
                 return {
@@ -644,9 +643,7 @@ class TestTeacherForcedSync:
 
         first_drafts = [first_by_slot[slot][0] for slot in (0, 1)]
         first_hiddens = torch.cat([first_by_slot[slot][1] for slot in (0, 1)], dim=0)
-        next_drafts = engine._continue_draft_batch(
-            [0, 1], first_drafts, first_hiddens
-        )
+        next_drafts = engine._continue_draft_batch([0, 1], first_drafts, first_hiddens)
         assert next_drafts == {0: [13, 14, 15], 1: [23, 24, 25]}
         assert engine._draft_cg.seed_kind == ["tensor", "tensor"]
         assert engine._draft_cg.seed_values == [13, 23]

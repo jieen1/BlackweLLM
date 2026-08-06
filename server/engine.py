@@ -1767,9 +1767,7 @@ class ServerEngine:
                 )
                 newly_finished.append(s)
 
-            round_profile.engine_step(
-                _round_ms, (time.perf_counter() - _bookkeep_t0) * 1000
-            )
+            round_profile.engine_step(_round_ms, (time.perf_counter() - _bookkeep_t0) * 1000)
 
         for s in newly_finished:
             del self.active[s]

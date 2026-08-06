@@ -633,9 +633,7 @@ class Qwen36SlotPool:
         target_row[:shared_pages] = scratch_pages
         self.set_page_table_row(target_slot, target_row)
 
-    def detach_scratch_aliases(
-        self, slot: int, kv_len: int, *, scratch_pages: set[int]
-    ) -> bool:
+    def detach_scratch_aliases(self, slot: int, kv_len: int, *, scratch_pages: set[int]) -> bool:
         """Copy an idle slot's aliased scratch pages back into its own row.
 
         A restored (full-prompt) request keeps its page-table alias on the
