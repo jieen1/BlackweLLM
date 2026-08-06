@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import json
 import logging
 import os
 import threading
@@ -52,6 +53,49 @@ _STOP_TRACKER_THINKING_CAPABLE = False
 os.environ.setdefault("USE_LIBUV", "0")
 os.environ.setdefault("SM120_GQA_USE_V2_DECODE_KERNEL", "1")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+
+# QSR_PROFILE_ADMISSION=1: per-request admission phase timings (queue wait,
+# slot match, reset, reconcile, prefill, activate). Wall-clock only, zero
+# allocations on the hot path when disabled -- same contract as
+# runtime/round_profile.py.
+_ADMISSION_PROFILE = os.environ.get("QSR_PROFILE_ADMISSION") == "1"
+_adm_logger = logging.getLogger("qwen_sm120.round_profile")
+
+
+def _adm_start(req: GenerationRequest) -> None:
+    if _ADMISSION_PROFILE:
+        req._adm_phases = []  # type: ignore[attr-defined]
+        req._adm_t0 = time.perf_counter()  # type: ignore[attr-defined]
+        req._adm_start_at = req._adm_t0  # type: ignore[attr-defined]
+
+
+def _adm_phase(req: GenerationRequest, name: str) -> None:
+    if _ADMISSION_PROFILE:
+        now = time.perf_counter()
+        req._adm_phases.append(  # type: ignore[attr-defined]
+            (name, round((now - req._adm_t0) * 1000.0, 3))  # type: ignore[attr-defined]
+        )
+        req._adm_t0 = now  # type: ignore[attr-defined]
+
+
+def _adm_end(req: GenerationRequest) -> None:
+    if not _ADMISSION_PROFILE or not hasattr(req, "_adm_phases"):
+        return
+    _adm_phase(req, "activate")
+    _adm_logger.info(
+        json.dumps(
+            {
+                "label": "admission",
+                "request_id": req.request_id,
+                "prompt_tokens": len(req.prompt_ids),
+                "wait_ms": round(
+                    (req._adm_start_at - req._admitted_at) * 1000.0, 3  # type: ignore[attr-defined]
+                ),
+                "phases": req._adm_phases,  # type: ignore[attr-defined]
+            }
+        )
+    )
 
 
 # A3 step 7-g (docs/a3-cache-coordinator-design.md §7 row 7-g): fallback for
@@ -154,12 +198,26 @@ _PREFIX_CACHE_HIT_SAMPLES_KEPT = 200
 _SESSION_WARM_CONTINUATION_SAMPLES_KEPT = 200
 
 
-def _longest_common_prefix_len(a: list[int], b: list[int]) -> int:
+def _longest_common_prefix_len(
+    a: list[int], b: list[int], cap: int | None = None
+) -> int:
+    """Length of the common prefix of ``a`` and ``b``, optionally capped.
+
+    ``cap`` exists for the admission-overlap diagnostic below: at
+    131072-token prompts a full Python-level scan costs ~3.5 ms per pair,
+    and scanning every recent prompt on the serving path made TTFT drift
+    upward wave over wave (measured 2026-08-06: activate phase 24 -> 197 ms
+    as the 64-entry history filled). The diagnostic only decides whether
+    overlap crosses ``block_size``, so a capped scan is semantically
+    identical for every consumer of these stats.
+    """
     n = 0
     for x, y in zip(a, b):
         if x != y:
             break
         n += 1
+        if cap is not None and n >= cap:
+            break
     return n
 
 
@@ -977,6 +1035,11 @@ class ServerEngine:
 
     # -- observability (engine thread) ---------------------------------------
     def _log_prefix_overlap(self, admit_now: list[tuple[int, GenerationRequest]]) -> None:
+        # The overlap stats are advisory only (they decide whether a batch
+        # shares >= block_size tokens, nothing more), so every scan is
+        # capped at block_size. Before the cap this was O(B*(B+H)*L) Python
+        # work per admission with L=131072 -- a growing per-wave TTFT tax on
+        # the serving path, not a benchmark artifact.
         new_prompts = [(req.request_id, req.prompt_ids) for _, req in admit_now]
         for i, (rid, prompt) in enumerate(new_prompts):
             same_round_best = 0
@@ -984,12 +1047,15 @@ class ServerEngine:
                 if j == i:
                     continue
                 same_round_best = max(
-                    same_round_best, _longest_common_prefix_len(prompt, other_prompt)
+                    same_round_best,
+                    _longest_common_prefix_len(prompt, other_prompt, cap=self.block_size),
                 )
             history_best = 0
             history_best_rid: str | None = None
             for other_rid, other_prompt in self._recent_prompts:
-                overlap = _longest_common_prefix_len(prompt, other_prompt)
+                overlap = _longest_common_prefix_len(
+                    prompt, other_prompt, cap=self.block_size
+                )
                 if overlap > history_best:
                     history_best = overlap
                     history_best_rid = other_rid
@@ -1056,6 +1122,7 @@ class ServerEngine:
         self, slot: int, req: GenerationRequest, anchor: int, drafts: list[int]
     ) -> None:
         req._prefill_done_at = time.perf_counter()
+        _adm_end(req)
         if not self.production and req.sampling_params.is_greedy:
             self._admission_bootstrap_check(slot, req, anchor)
 
@@ -1424,6 +1491,7 @@ class ServerEngine:
             remaining_slots = list(self.free_slots)
             for _ in range(n):
                 req = self.waiting.pop(0)
+                _adm_start(req)
                 # A3 step 7-b (docs/a3-cache-coordinator-design.md §1.1):
                 # capability-bit query, not a hasattr probe -- the pattern
                 # protocol.py's own module docstring names as the one to
@@ -1447,10 +1515,14 @@ class ServerEngine:
             self.free_slots = remaining_slots
             new_slots = [s for s, _ in admit_now]
             new_prompts = [r.prompt_ids for _, r in admit_now]
+            for _slot, req in admit_now:
+                _adm_phase(req, "slot_match")
             try:
                 for slot, _ in admit_now:
                     if not self.runner.slot_state(slot).is_fresh:
                         self.runner.reset_slot(slot)
+                for _slot, req in admit_now:
+                    _adm_phase(req, "reset")
                 # reconcile_prefix_hit returns a PrefixHit (runtime/backends/
                 # protocol.py); .effective is the length safe to skip prefill
                 # for (== state_hit, never kv_hit -- see PrefixHit's own
@@ -1460,6 +1532,8 @@ class ServerEngine:
                 hit_depths = [
                     self.slot_resources.reconcile_prefix_hit(p).effective for p in new_prompts
                 ]
+                for _slot, req in admit_now:
+                    _adm_phase(req, "reconcile")
                 # E2-b: only non-greedy requests carry an entry -- see the
                 # MTP-round call site's identical comment on why a missing
                 # entry preserves prior (greedy) behavior byte-for-byte.
@@ -1478,6 +1552,8 @@ class ServerEngine:
                     chunk_size=self._prefill_chunk_size,
                     params_per_slot=params_per_slot,
                 )
+                for _slot, req in admit_now:
+                    _adm_phase(req, "prefill_begin")
             except Exception as exc:
                 logger.exception("admission failed for %d request(s)", len(admit_now))
                 for slot, req in admit_now:

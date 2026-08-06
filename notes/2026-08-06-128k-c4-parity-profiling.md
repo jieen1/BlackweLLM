@@ -414,3 +414,141 @@ b4/128K **M32 0.736 ms/call vs M16 0.839 ms/call**（−12%）；图内实测
   `scripts/aggregate_round_profile.py`。
 * 本轮日志：`logs/quality/server_noprof_final_20260806.log`（正式服务）、
   `grid_noprof_headline{,_2}_20260806.out`、`grid_noprof_suffix10240_20260806.out`。
+
+## 14. 质量套件重跑：M32 verify 图在 capacity 8 下的门限修复（2026-08-06 晚）
+
+### 14.1 发现：num_slots=9 时 verify CG 捕获失败 → 静默降级 eager
+
+质量套件 `run_qwen36_quality.sh` 的 suite-fast / mmlu 配置是
+`capacity=8 / num_slots=9`（CG warmup 需要 capacity+1 个物理 slot）。
+首轮重跑（label `qwen36_20260806`）服务日志出现：
+
+```
+Qwen3.6 MTP: verify CUDA Graph capture failed -- degrading to eager
+... cg_status={'anchor': 'unused', 'draft': 'captured',
+               'sync': 'captured', 'verify': 'failed'}
+```
+
+根因：`sparkinfer/attention/paged/_forward.py` 的
+`_use_raw_fp8_verify_forward_kernel` 公共门限写死
+`1 <= batch_capacity <= 8`，batch=9 时 M32 worklist 路径被拒，回落到
+`PagedForwardKernel` 直接 `NotImplementedError`，服务按项目既定策略降级
+eager（`QSR_QWEN36_MTP_REQUIRE_CG=0`）。这不是质量回退，是配置口径
+不符：该轮结果**不能**与历史 MTP+CG 数字对比，已作废并停止。
+
+### 14.2 修复（sparkinfer `d900ef1`，已推 master）
+
+把 `1 <= batch_capacity <= 8` 从公共门限移除，只保留在 Laguna M64/D128
+analytic 分支内。M32 worklist 路径每请求 K+1 个 query 打包进单个 32 行
+tile（`num_qo_tiles == batch`、tile 下标全 0），无 8 行 batch 上限。
+
+### 14.3 有效重跑（label `qwen36_20260806b`）
+
+* 全程单 GPU 进程：每阶段一个服务，阶段间 `server stop` 后才起下一个；
+  三个 dim 并行只是客户端进程，不占显存。用户明确禁止多服务并存。
+* 服务启动确认（`logs/quality/server_suite_qwen36_20260806b.log`）：
+  `cg_status={'anchor': 'unused', 'draft': 'captured', 'sync': 'captured',
+  'verify': 'captured'}`，`capacity=8 num_slots=9`、32K slot、CG + prefix
+  cache + MTP K=3 + FP8 e4m3 KV 全开。
+* 流程：`RUN_LABEL=qwen36_20260806b setsid bash
+  scripts/run_qwen36_quality.sh all`，输出
+  `logs/quality/quality_all_20260806b.log`。
+* 与历史的 ULP 级差异来源：M32 verify 的 split-KV 归约顺序与旧路径不同
+  （2026-08-05 起），质量数值若与历史绝对值有末位差异属预期，需在结果
+  表注明，不能当作回退。
+
+### 14.4 结果（截至 2026-08-06 19:15，MMLU 仍在跑）
+
+| 维度 | 历史（README/07-22） | 08-05 MTP+CG 基线 | 今天 20260806b（MTP+CG 全开） | 状态 |
+|---|---|---|---|---|
+| tool | 1.000 (20/20) | 1.000 (20/20) | 1.000 (20/20) | 一致 |
+| agent | 1.000 (4/4) | 1.000 (4/4) | 1.000 (4/4) | 一致 |
+| longctx 8K/32K/64K/128K | 1.000 (12/12) | 1.000 (12/12) | 1.000 (12/12) | 一致 |
+| code 4096 (HumanEval/+) | —（README 现行为 08-05 门） | 0.921 / 0.884 | **0.890 / 0.866** | 归因中 |
+| HumanEval+ 768 | 0.445 / 0.433 | 0.421 / 0.415 | **0.445 / 0.427** | 与 07-22 持平（base 73/164 完全一致） |
+| MMLU-Pro 414 thinking | 84.54% | 84.54% | 待出 | 待出 |
+
+code 4096 的 −3.1/−1.8pp：任务级翻转 17/164（9 pass→fail、4 fail→pass、
+4 仅 plus 变化），且 164/164 的 reasoning 轨迹都在前 ~30-200 token 处分叉
+（中位首分叉 121 字符）——与 768 维度三代任两代 ~40 题翻转、净差 ≤4 题的
+形态一致，是 greedy 对数值路径敏感的表现，不是系统性失效。根因待
+MTP-off 归因实验确认（对比同构建 eager 是否复现 08-05 输出）；M32
+verifier 的 split-KV 归约顺序变化是首要嫌疑（见 §14.3 与 bec29b5
+Directive）。
+
+## 15. TTFT 逐波漂移根因：admission 路径上的诊断 LCP（2026-08-06 晚，已修）
+
+### 15.1 问题与证据
+
+用户指出的核心问题不是 decode 吞吐，而是 **纯 warm 波内 TTFT 不稳定**：
+同一协议（completions / 128K / c4 / greedy / max_tokens=256 / warm 重复），
+5 波 TTFT 从 ~0.5s 单调漂到 0.84s（`noprof_headline2`），suffix 波更是
+0.80–1.04s。逐段计时（`QSR_PROFILE_ADMISSION=1`，wall-clock 不扰动 GPU）
+把漂移定位到 admission 的 **activate 相位**：
+
+| 波 | 修复前 activate | 修复前 prefill_begin |
+|---|---|---|
+| w1 | 28–41 ms | 52–75 ms |
+| w2 | 25–93 ms | 55–134 ms |
+| w3 | 41–129 ms | 52–104 ms |
+| w4 | 49–158 ms | 39–90 ms |
+| w5 | **56–197 ms** | 41–125 ms |
+
+### 15.2 根因：`_log_prefix_overlap` 在服务关键路径上做 O(B·(B+H)·L) Python LCP
+
+`server/engine.py` 的 `_log_prefix_overlap` 在每次 admission、prefill 与
+activate 之间无条件执行：对每个请求与同波其余 B−1 个、以及 `_recent_prompts`
+历史全部 H 条（`maxlen=64`，每波 +4）做 `_longest_common_prefix_len`——
+一个纯 Python `zip` 循环。131072 token 全匹配实测 **3.55 ms/次**；纯 warm
+波全为相同 prompt，全部全匹配：
+
+* w1：4 × (3 + 4) = 28 次 ≈ 100 ms
+* w5：4 × (3 + 20) = 92 次 ≈ 327 ms
+
+与实测 activate 漂移 28→197 ms 同量级、同形状（一次 LCP 成本 3.55ms 是
+新鲜 list 测量，服务内 list 常驻缓存后略快，量级一致）。这不是 GPU、不是
+decode、不是 HTTP——是一个 instrumentation 函数把每波 TTFT 税逐波抬高。
+历史 run（含 `noprof_headline2`）同样背着这笔税，只是当时没逐段计时，
+被误读成“前缀恢复路径随长度非线性变慢”。
+
+### 15.3 修复（本工作区，待提交）
+
+`_longest_common_prefix_len` 增加 `cap` 参数；`_log_prefix_overlap` 全部
+扫描以 `cap=self.block_size`（16）封顶。该统计只决策“重叠是否 ≥ block_size”
+（事件计数器），封顶后语义完全一致；samples 里的精确重叠值退化为饱和值
+（≥16 记为 16），仅影响诊断精度，不影响任何基准数字。
+
+### 15.4 修复后同口径数据（fixture 已存）
+
+**纯 warm（completions / 128K / c4 / 256 / 5 波）**
+
+| 指标 | 修复前 `noprof_headline2` | 修复后 `noprof_headline_fixed_lcp` |
+|---|---|---|
+| TTFT | 0.503 → 0.547 → 0.568 → 0.757 → **0.841** | 0.216 → 0.216 → 0.216 → 0.227 → **0.218** |
+| wall | 4.60–4.75 s | 4.35–4.64 s |
+| agg e2e | 215–222 tok/s | **220–236 tok/s（最佳 235.6）** |
+| activate 相位 | 24–197 ms | **<1 ms** |
+
+TTFT 不再漂移，且 5 波全部稳定在 0.216–0.227s；最佳波 235.6 tok/s 已超
+历史 222.44 头条（同为轮级/波级口径下）。decode 稳态指标不变（修复不触及
+GPU 路径），证明该漂移本来就是纯 host 开销。
+
+**+10240 后缀（completions / 141312 / 3 波，warm1 付一次性 40960 token prefill）**
+
+| 指标 | 修复前 `noprof_suffix10240` | 修复后 `noprof_suffix_fixed_lcp` |
+|---|---|---|
+| warm1 TTFT | 47.41 s | 12.88 s（batched 路径；见 15.5） |
+| warm2/3 TTFT | 1.035 / 0.795 s | **0.195 / 0.215 s** |
+| warm2/3 wall | 5.19 / 5.09 s | 4.30 / 4.59 s |
+| warm2/3 agg e2e | 197 / 201 tok/s | **238 / 223 tok/s** |
+
+### 15.5 遗留观察（下一步可选）
+
+1. **warm1 后缀 prefill 47.4s → 12.9s**：前者走 per-slot 分块（4×5 chunk ×
+   ~2.2s），后者走 batched 路径（5 chunk × ~2s）。同一代码，仅持久缓存
+   状态不同导致 `build_prefill_batch` 是否可用。值得查为何 per-slot 会
+   在那种状态下触发，统一走 batched。
+2. **首次 MTP scratch restore 12.7s**：冷波中第 2–4 个并发请求的
+   `resync_prefix_tail` 首次 12.7s、后续 14–15ms（页面共享 vs 字节拷贝）。
+   若持久条目首次 restore 能直接共享页面而非拷贝，冷波 TTFT 可再降。
+3. `reconcile` 相位 9–38ms 与 persistent-prefix 条目数相关，量级小，暂不动。

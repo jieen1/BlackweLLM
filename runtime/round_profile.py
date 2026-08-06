@@ -13,6 +13,11 @@ GPU spans in ``qwen36_mtp.py`` (``verify_gpu_ms``/``sync_gpu_ms``/
 read ``elapsed_time``, so mode 2 IS a benchmark perturbation and is for
 diagnosis only.
 
+``QSR_PROFILE_ADMISSION=1`` shares the same stderr channel and adds the
+admission-path phase timers (queue wait / slot match / reset / reconcile /
+prefill / activate) that ``server/engine.py`` and the prefill path log.
+Like mode 1 it is wall-clock-only and never synchronizes.
+
 Design constraints:
 - zero import-time cost and zero allocations on the hot path when disabled;
 - no third-party dependencies (stdlib only);
@@ -33,7 +38,10 @@ class RoundProfile:
     """Accumulates one round's phases and emits a single JSON line at end."""
 
     def __init__(self) -> None:
-        self.enabled = os.environ.get("QSR_PROFILE_ROUNDS") in ("1", "2")
+        self.enabled = (
+            os.environ.get("QSR_PROFILE_ROUNDS") in ("1", "2")
+            or os.environ.get("QSR_PROFILE_ADMISSION") == "1"
+        )
         self.cuda_events = os.environ.get("QSR_PROFILE_ROUNDS") == "2"
         if self.enabled:
             # The server's logging config only wires its own app logger, so

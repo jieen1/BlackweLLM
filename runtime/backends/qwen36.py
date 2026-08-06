@@ -95,8 +95,11 @@ Still deliberately out of scope, stated rather than implied
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
 import sys
+import time
 from array import array
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -122,6 +125,33 @@ if TYPE_CHECKING:
     from runtime.backends.qwen36_mtp import Qwen36MTPEngine
 
 logger = logging.getLogger(__name__)
+
+# Shared with runtime/round_profile.py: QSR_PROFILE_ADMISSION=1 (or
+# QSR_PROFILE_ROUNDS=1/2) logs prefill/restore wall-clock segments to the
+# same stderr channel. Never synchronizes; zero cost when disabled.
+_PREFILL_PROFILE = (
+    os.environ.get("QSR_PROFILE_ADMISSION") == "1"
+    or os.environ.get("QSR_PROFILE_ROUNDS") in ("1", "2")
+)
+_profile_logger = logging.getLogger("qwen_sm120.round_profile")
+
+
+def _prefill_profile(segment: str, ms: float, **fields: object) -> None:
+    """Emit one wall-clock prefill segment to the round-profile channel.
+
+    Gated on the same env flags as the admission profiler; never
+    synchronizes, so a profiled run is byte-identical in GPU behaviour.
+    """
+    if not _PREFILL_PROFILE:
+        return
+    record: dict[str, object] = {
+        "label": "prefill_segment",
+        "segment": segment,
+        "ms": round(ms, 3),
+    }
+    record.update(fields)
+    _profile_logger.info(json.dumps(record))
+
 
 #: Default byte budget for the recurrent-checkpoint pool, expressed as a
 #: multiple of one checkpoint. Two is the smallest number that makes the
@@ -680,7 +710,17 @@ class Qwen36Backend:
 
         suffixes: list[list[int]] = []
         for slot, prompt in zip(slots, prompts_per_slot):
+            if _PREFILL_PROFILE:
+                _t_restore = time.perf_counter()
             hit = self._apply_prefix_hit(slot, prompt)
+            if _PREFILL_PROFILE:
+                _prefill_profile(
+                    "restore",
+                    (time.perf_counter() - _t_restore) * 1000.0,
+                    slot=slot,
+                    hit=hit,
+                    prompt_tokens=len(prompt),
+                )
             # Both guards moved here from `_prefill_forward`, which the chunked
             # path no longer goes through. Dropping them is not cosmetic: a
             # slot at the wrong kv_len makes the GDN layers continue from
@@ -790,10 +830,19 @@ class Qwen36Backend:
                     # equivalent yet.
                     pass
                 else:
+                    if _PREFILL_PROFILE:
+                        _t_batch = time.perf_counter()
                     hidden_batch = self.model.prefill_batch(prefill_batch)
                     self.pool.commit_prefill_batch(batch_slots, batch_tokens)
                     self.stats["prefill_batched_forwards"] += 1
                     anchor_logits = self.model.compute_logits(hidden_batch[:, -1, :])
+                    if _PREFILL_PROFILE:
+                        _prefill_profile(
+                            "batched_forward",
+                            (time.perf_counter() - _t_batch) * 1000.0,
+                            slots=batch_slots,
+                            tokens=len(batch_tokens[0]) if batch_tokens else 0,
+                        )
                     batched_hidden = {
                         slot: hidden_batch[index : index + 1]
                         for index, slot in enumerate(batch_slots)
@@ -837,6 +886,8 @@ class Qwen36Backend:
                     # 250K store silently failed and the WARM wave re-ran
                     # cold).  ``prepare_kv_writes`` is keyed by slot token
                     # coordinates; ``suffix`` begins at ``hit``.
+                    if _PREFILL_PROFILE:
+                        _t_fwd = time.perf_counter()
                     hit = len(prompt) - len(suffix)
                     prepare_kv_writes = getattr(self.pool, "prepare_kv_writes", None)
                     if prepare_kv_writes is not None:
@@ -845,6 +896,13 @@ class Qwen36Backend:
                         [suffix[start:end]], dtype=torch.long, device=self.device
                     )
                     hidden = self.model(input_ids, self.pool.slot_state(slot))
+                    if _PREFILL_PROFILE:
+                        _prefill_profile(
+                            "forward",
+                            (time.perf_counter() - _t_fwd) * 1000.0,
+                            slot=slot,
+                            tokens=end - start,
+                        )
             draft_tokens: list[int] = []
             if self._mtp is not None:
                 # MTP's own attention must see the SAME real prefix as the
@@ -854,7 +912,15 @@ class Qwen36Backend:
                 if is_last:
                     logits = batched_anchor_logits.get(slot)
                     if logits is None:
+                        if _PREFILL_PROFILE:
+                            _t_logits = time.perf_counter()
                         logits = self.model.compute_logits(hidden[0, -1:])
+                        if _PREFILL_PROFILE:
+                            _prefill_profile(
+                                "logits",
+                                (time.perf_counter() - _t_logits) * 1000.0,
+                                slot=slot,
+                            )
                     params = params_per_slot.get(slot)
                     if params is None or params.is_greedy:
                         token = int(logits[-1].argmax(dim=-1).item())
@@ -871,23 +937,49 @@ class Qwen36Backend:
                 if cached_hidden is not None:
                     # The restored snapshot already contains this row; back
                     # up one before re-syncing it (see resync_prefix_tail).
+                    if _PREFILL_PROFILE:
+                        _t_mtp = time.perf_counter()
                     draft_tokens = self._mtp.resync_prefix_tail(
                         slot, shifted_token_ids=shifted, target_hidden=hidden
                     )
+                    if _PREFILL_PROFILE:
+                        _prefill_profile(
+                            "mtp_sync",
+                            (time.perf_counter() - _t_mtp) * 1000.0,
+                            slot=slot,
+                            cached_hidden=1,
+                        )
                 else:
+                    if _PREFILL_PROFILE:
+                        _t_mtp = time.perf_counter()
                     draft_tokens = self._mtp.sync_prefill_chunk(
                         slot,
                         shifted_token_ids=shifted,
                         target_hidden=hidden,
                         final=is_last,
                     )
+                    if _PREFILL_PROFILE:
+                        _prefill_profile(
+                            "mtp_sync",
+                            (time.perf_counter() - _t_mtp) * 1000.0,
+                            slot=slot,
+                            cached_hidden=0,
+                        )
             if not is_last:
                 continue
 
             if self._mtp is None:
                 logits = batched_anchor_logits.get(slot)
                 if logits is None:
+                    if _PREFILL_PROFILE:
+                        _t_logits = time.perf_counter()
                     logits = self.model.compute_logits(hidden[0, -1:])
+                    if _PREFILL_PROFILE:
+                        _prefill_profile(
+                            "logits",
+                            (time.perf_counter() - _t_logits) * 1000.0,
+                            slot=slot,
+                        )
                 params = params_per_slot.get(slot)
                 if params is None or params.is_greedy:
                     token = int(logits[-1].argmax(dim=-1).item())
@@ -896,11 +988,19 @@ class Qwen36Backend:
                     token = int(
                         sample_from_logits(logits[-1].unsqueeze(0), params, generator=gen).item()
                     )
+            if _PREFILL_PROFILE:
+                _t_commit = time.perf_counter()
             self._commit_prefill(slot, prompt, token)
             # Publish the exact prompt boundary before decode drifts the
             # rolling checkpoint past it -- this is the entry a same-prompt
             # repeat restores from without any prefill forward.
             self._store_persistent_prefix(slot, prompt_hidden=hidden[:, -1:, :])
+            if _PREFILL_PROFILE:
+                _prefill_profile(
+                    "commit",
+                    (time.perf_counter() - _t_commit) * 1000.0,
+                    slot=slot,
+                )
             state.result[slot] = {"anchor": token, "draft_tokens": draft_tokens}
 
         state.chunk_start = start + chunk
