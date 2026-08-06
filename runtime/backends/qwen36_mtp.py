@@ -1106,12 +1106,18 @@ class Qwen36MTPEngine:
         self._record_verify_graph_replay(len(slots))
         all_logits = self.model.compute_logits(all_hiddens)
         round_profile.phase("compute_logits")
+        if _verify_ev0 is not None:
+            _post_verify_ev = torch.cuda.Event(enable_timing=True)
         decisions = determine_accept_reject_batch(
             slots,
             {slot: [anchors[slot], *drafts_by_slot[slot]] for slot in slots},
             all_logits.reshape(-1, all_logits.shape[-1]),
             self.k,
         )
+        if _verify_ev0 is not None:
+            _post_verify_ev.record()
+            _post_verify_ev.synchronize()
+            round_profile.note("post_verify_ms", _verify_ev1.elapsed_time(_post_verify_ev))
         round_profile.phase("accept_decision")
         if _verify_ev0 is not None and _verify_ev1 is not None:
             round_profile.note("verify_gpu_ms", _verify_ev0.elapsed_time(_verify_ev1))
@@ -1154,20 +1160,41 @@ class Qwen36MTPEngine:
             results[slot] = result
 
         round_profile.phase("commit_loop")
+        if _verify_ev0 is not None:
+            _sync_ev0 = torch.cuda.Event(enable_timing=True)
+            _sync_ev1 = torch.cuda.Event(enable_timing=True)
+            _sync_ev0.record()
         first_by_slot = self._sync_real_suffix_batch_ragged(
             sync_slots, sync_tokens, sync_hidden_rows
         )
+        if _verify_ev0 is not None:
+            _sync_ev1.record()
         round_profile.phase("sync_ragged")
         first_drafts = [first_by_slot[slot][0] for slot in slots]
         first_hiddens = [first_by_slot[slot][1] for slot in slots]
 
+        if _verify_ev0 is not None:
+            _draft_ev0 = torch.cuda.Event(enable_timing=True)
+            _draft_ev1 = torch.cuda.Event(enable_timing=True)
+            _draft_ev0.record()
         next_drafts_by_slot = self._continue_draft_batch(
             slots, first_drafts, torch.cat(first_hiddens, dim=0)
         )
+        if _verify_ev0 is not None:
+            _draft_ev1.record()
         round_profile.phase("draft_batch")
         for slot in slots:
             results[slot]["next_draft_tokens"] = next_drafts_by_slot[slot]
 
         self.stats["rounds"] += len(slots)
+        if _verify_ev0 is not None:
+            _ms = torch.cuda.memory_stats()
+            round_profile.note("device_alloc", _ms["num_device_alloc"])
+            round_profile.note("device_free", _ms["num_device_free"])
+            round_profile.note("sync_gpu_ms", _sync_ev0.elapsed_time(_sync_ev1))
+            # _draft_ev1 was recorded after the draft tolist drained the
+            # stream, so nothing has executed it yet -- wait for it alone.
+            _draft_ev1.synchronize()
+            round_profile.note("draft_gpu_ms", _draft_ev0.elapsed_time(_draft_ev1))
         round_profile.end_round(label=f"mtp_round_b{len(slots)}")
         return results

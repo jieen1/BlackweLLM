@@ -219,6 +219,7 @@ class Qwen36Backend:
         enable_prefix_cache: bool = True,
         enable_persistent_prefix_cache: bool | None = None,
         checkpoint_byte_budget: int | None = None,
+        checkpoint_budget_multiple: int | None = None,
         batched_decode: bool = True,
     ) -> None:
         self.model = model
@@ -280,7 +281,12 @@ class Qwen36Backend:
         # -- second cache family -------------------------------------------
         ckpt_bytes = self.pool.recurrent_checkpoint_nbytes()
         if checkpoint_byte_budget is None:
-            checkpoint_byte_budget = ckpt_bytes * DEFAULT_CHECKPOINT_BUDGET_MULTIPLE
+            multiple = (
+                checkpoint_budget_multiple
+                if checkpoint_budget_multiple is not None
+                else DEFAULT_CHECKPOINT_BUDGET_MULTIPLE
+            )
+            checkpoint_byte_budget = ckpt_bytes * multiple
         self.checkpoint_pool = RecurrentStatePool(
             checkpoint_byte_budget,
             should_drop_kv_hash=self._checkpoint_kv_is_free,

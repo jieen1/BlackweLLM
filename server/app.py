@@ -163,6 +163,16 @@ SERVER_ENABLE_DFLASH = os.environ.get("QSR_SERVER_ENABLE_DFLASH", "0") != "0"
 # hidden) pairing fix this landing carries.
 SERVER_ENABLE_MTP = os.environ.get("QSR_SERVER_ENABLE_MTP", "0") != "0"
 SERVER_MTP_K = int(os.environ.get("QSR_SERVER_MTP_K", "4"))
+# Recurrent-checkpoint budget, in multiples of one checkpoint
+# (pool.recurrent_checkpoint_nbytes()). Default 0 keeps the backend
+# default (2x). At 128K with a block_size=16 boundary a checkpoint is
+# taken nearly every round per slot, and a budget that only holds two
+# checkpoints forces constant evict+realloc of 96-tensor clones --
+# measured 2026-08-06 as sporadic 50-85 ms GPU-queue stalls on ~17%
+# of rounds. Raise it (e.g. 2*num_slots+2) to stop the churn.
+SERVER_CHECKPOINT_BUDGET_MULTIPLE = int(
+    os.environ.get("QSR_SERVER_CHECKPOINT_BUDGET_MULTIPLE", "0")
+)
 # Per-round KV resync (runtime/backends/qwen36_mtp.py's Qwen36MTPEngine
 # docstring): independently toggleable from MTP itself so it can be A/B
 # measured on real hardware separately from the pairing fix. Only consulted
@@ -426,6 +436,7 @@ async def lifespan(app: FastAPI):
         enable_mtp=SERVER_ENABLE_MTP,
         mtp_num_speculative_tokens=SERVER_MTP_K,
         mtp_resync=SERVER_MTP_RESYNC,
+        checkpoint_budget_multiple=(SERVER_CHECKPOINT_BUDGET_MULTIPLE or None),
         request_timeout_s=SERVER_REQUEST_TIMEOUT_S,
         gpu_memory_utilization=SERVER_GPU_MEM_UTIL,
         production=SERVER_PRODUCTION,

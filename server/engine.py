@@ -279,6 +279,7 @@ class ServerEngine:
         enable_mtp: bool = False,
         mtp_num_speculative_tokens: int = 4,
         mtp_resync: bool | None = None,
+        checkpoint_budget_multiple: int | None = None,
         gpu_memory_utilization: float = 0.85,
         idle_sleep_s: float = 0.005,
         production: bool = True,
@@ -310,6 +311,7 @@ class ServerEngine:
         self.enable_mtp = enable_mtp
         self.mtp_num_speculative_tokens = mtp_num_speculative_tokens
         self.mtp_resync = mtp_resync
+        self.checkpoint_budget_multiple = checkpoint_budget_multiple
         self.MODEL = model
         self.K = 0
 
@@ -681,6 +683,7 @@ class ServerEngine:
             device="cuda",
             dtype=torch.bfloat16,
             enable_prefix_cache=self.enable_prefix_cache,
+            checkpoint_budget_multiple=self.checkpoint_budget_multiple,
         )
         self._warmup_qwen36_full_forward()
         # MTP extends the shared GDN state allocation so its column zero is

@@ -48,7 +48,7 @@ class RoundProfile:
         self._round_start = time.perf_counter()
         self._phase_start = self._round_start
         self._phases = []
-        self._notes = {}
+        self._notes = {"t_begin": round(self._round_start, 6)}
 
     def note(self, name: str, value: float) -> None:
         """Attach a named scalar (e.g. CUDA-event GPU ms) to this round."""
@@ -68,6 +68,7 @@ class RoundProfile:
             return
         now = time.perf_counter()
         self._phases.append(("total", (now - self._round_start) * 1000.0))
+        self._notes["t_end"] = round(now, 6)
         record: dict[str, object] = {"label": label, "phases": self._phases}
         if self._notes:
             record["notes"] = self._notes
