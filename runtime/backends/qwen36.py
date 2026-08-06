@@ -129,10 +129,9 @@ logger = logging.getLogger(__name__)
 # Shared with runtime/round_profile.py: QSR_PROFILE_ADMISSION=1 (or
 # QSR_PROFILE_ROUNDS=1/2) logs prefill/restore wall-clock segments to the
 # same stderr channel. Never synchronizes; zero cost when disabled.
-_PREFILL_PROFILE = (
-    os.environ.get("QSR_PROFILE_ADMISSION") == "1"
-    or os.environ.get("QSR_PROFILE_ROUNDS") in ("1", "2")
-)
+_PREFILL_PROFILE = os.environ.get("QSR_PROFILE_ADMISSION") == "1" or os.environ.get(
+    "QSR_PROFILE_ROUNDS"
+) in ("1", "2")
 _profile_logger = logging.getLogger("qwen_sm120.round_profile")
 
 
@@ -816,11 +815,23 @@ class Qwen36Backend:
             for slot, suffix in zip(state.slots, state.suffix_per_slot)
             if start < len(suffix)
         ]
-        if pending and len(pending) > 1 and start == 0:
+        if pending and len(pending) > 1:
             pending_lengths = {len(suffix) for _slot, suffix in pending}
-            if len(pending_lengths) == 1 and next(iter(pending_lengths)) <= chunk:
+            if len(pending_lengths) == 1:
+                # Every chunk step of a uniform multi-slot admission can
+                # share one BxQ extend forward, not only a suffix that fits
+                # a single chunk: prior KV lengths stay equal because
+                # commit_prefill_batch advances every slot by the same chunk,
+                # and the MTP sync below consumes exactly this chunk's hidden
+                # rows on either path.  The historical 128K+10240 suffix wave
+                # measured 2026-08-06 fell back to the per-slot loop on every
+                # chunk (47 s class vs 13 s class) because the old guard
+                # required start == 0 and len(suffix) <= chunk.
+                uniform_len = next(iter(pending_lengths))
+                end_uniform = min(start + chunk, uniform_len)
+                chunk_is_last = end_uniform >= uniform_len
                 batch_slots = [slot for slot, _suffix in pending]
-                batch_tokens = [suffix for _slot, suffix in pending]
+                batch_tokens = [suffix[start:end_uniform] for _slot, suffix in pending]
                 try:
                     prefill_batch = self.pool.build_prefill_batch(batch_slots, batch_tokens)
                 except ValueError:
@@ -835,7 +846,8 @@ class Qwen36Backend:
                     hidden_batch = self.model.prefill_batch(prefill_batch)
                     self.pool.commit_prefill_batch(batch_slots, batch_tokens)
                     self.stats["prefill_batched_forwards"] += 1
-                    anchor_logits = self.model.compute_logits(hidden_batch[:, -1, :])
+                    if chunk_is_last:
+                        anchor_logits = self.model.compute_logits(hidden_batch[:, -1, :])
                     if _PREFILL_PROFILE:
                         _prefill_profile(
                             "batched_forward",
@@ -847,10 +859,11 @@ class Qwen36Backend:
                         slot: hidden_batch[index : index + 1]
                         for index, slot in enumerate(batch_slots)
                     }
-                    batched_anchor_logits = {
-                        slot: anchor_logits[index : index + 1]
-                        for index, slot in enumerate(batch_slots)
-                    }
+                    if chunk_is_last:
+                        batched_anchor_logits = {
+                            slot: anchor_logits[index : index + 1]
+                            for index, slot in enumerate(batch_slots)
+                        }
 
         for slot, prompt, suffix in zip(state.slots, state.prompts_per_slot, state.suffix_per_slot):
             cached_hidden = self._pending_cached_hidden.pop(slot, None) if start == 0 else None
@@ -1664,11 +1677,7 @@ class Qwen36Backend:
         """
         old_len = self._prefix_hash_len.get(slot, -1)
         ctx = self._prefix_hash_ctx.get(slot)
-        if (
-            ctx is not None
-            and 0 <= old_len < length
-            and length - old_len <= self.block_size
-        ):
+        if ctx is not None and 0 <= old_len < length and length - old_len <= self.block_size:
             delta = array("I", token_ids[old_len:length])
             if sys.byteorder != "little":
                 delta.byteswap()

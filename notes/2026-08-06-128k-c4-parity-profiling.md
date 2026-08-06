@@ -552,3 +552,38 @@ GPU 路径），证明该漂移本来就是纯 host 开销。
    `resync_prefix_tail` 首次 12.7s、后续 14–15ms（页面共享 vs 字节拷贝）。
    若持久条目首次 restore 能直接共享页面而非拷贝，冷波 TTFT 可再降。
 3. `reconcile` 相位 9–38ms 与 persistent-prefix 条目数相关，量级小，暂不动。
+
+## 16. 多 chunk 批量 prefill（2026-08-06 深夜，§15.5-① 部分落地）
+
+### 16.1 改动
+
+`prefill_chunked_step` 的 BxQ 批量分支原来要求 `start == 0 且
+len(suffix) <= chunk`——只有能装进单个 chunk 的 suffix 才走批量。去掉这两个
+限制：**任何 chunk 步上，只要多个待 prefill 槽的 suffix 等长，就批量执行该
+chunk 片**（`build_prefill_batch` 的安全子集检查原样保留：等长 prior KV、
+uniform GDN regime、ordinary live rows；anchor logits 只在最后一片计算）。
+正确性依据：`commit_prefill_batch` 每片对所有槽推进相同长度 → prior KV
+长度逐片保持相等；MTP sync 消费的本来就是"当前 chunk 的 hidden"，与
+per-slot 路径同契约。
+
+### 16.2 实测（capacity 4 / num_slots 5，128K prefix + 10240 suffix，c4）
+
+| 指标 | 修复前（212215 前的状态） | 修复后 |
+|---|---|---|
+| warm1 TTFT | 26.5 s | **19.4 s**（batched_forward ×5 chunk 生效） |
+| warm2/3 agg | 250–252 tok/s | 224–227（跑动间方差带内，round_batch med 58.3 与修复前 57.8 一致） |
+
+### 16.3 未解决（记录在案）
+
+1. **批量只覆盖了同时 admission 的槽**：harness 4 个并发请求经 tokenize 后
+   到达 waiting 队列有时间差，引擎逐到逐 admit（实测 admission batch sizes
+   [1,3,2,2,...]），warm1 只 batch 了 [0,1] 两槽，[2,3] 后到走 per-slot。
+   要拿满 §15.5 估计的 ~13 s，需要 admission 侧的合并（短暂 coalesce 窗口
+   或 chunk 边界并入 later arrivals）——调度语义改动，未做。
+2. **冷波多槽组没有触发批量**（batched_forward 计数只含 warm1）：3 槽冷
+   prefill 组理论上满足批量条件，实际落回 per-slot。曾加临时日志抓
+   `build_prefill_batch` 的 ValueError，但验证用服务两次在模型加载期被
+   环境信号杀死（无 traceback，非代码问题），未完成归因；临时日志已撤。
+   冷波瓶颈仍是 4×128K prefill 的 GPU 计算本身，批量最多再省 ~30%。
+3. 跑动间方差提示：同协议不同跑的 round_batch 中位在 53.8–58.3 ms 之间
+   （acceptance 91–100% 时），单次数值对比必须带方差带。
