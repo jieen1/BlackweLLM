@@ -156,6 +156,19 @@ Historical DirectModelRunner anchors are 227.5 (4K W1-S, different harness),
 verify-path cost, not host-side overhead —
 [`notes/2026-08-05-128k-host-side-profile.md`](notes/2026-08-05-128k-host-side-profile.md) §9.
 
+**2026-08-06 devicedraft optimization** (commit `9595f58`): the batched MTP
+draft graph no longer round-trips its result to host; draft rows stay on
+device through the next verify fill and the GPU-side accept comparison.
+128K/c4 round total dropped 82.8 → 73.7 ms (median; `draft_batch` host phase
+12.5 → 0.1 ms) and warm aggregate e2e moved from 143.8/163.4 to
+**157.5/165.9 tok/s**. Same-parameter cells: 64K/c4 **192.8/202.1**, 4K/c4
+289–324 (variance band, ~flat), 128K/c3 130–140, 128K/c2 105–113. Greedy
+accept/reject stays byte-identical (device path rebuilds committed from
+verifier predictions, which match accepted drafts by construction; new unit
+tests assert dict-vs-tensor equality). Evidence:
+[`notes/2026-08-06-128k-c4-parity-profiling.md`](notes/2026-08-06-128k-c4-parity-profiling.md)
+§12 · fixtures `benchmarks/fixtures/server_perf_grid_devicedraft_fix_*.json`.
+
 For **Laguna-S-2.1**, the live gates are the DFlash acceptance regression,
 the production CUDA Graph gate, and a bit-level router oracle — all run through
 `bfdiag`.

@@ -260,3 +260,22 @@ setsid nohup /home/bot/.venvs/vllm/bin/python -m server.app \
 
 下一目标：把同一修复的 4K/64K 与 c1-c3 补齐，然后全网格对齐历史
 （README Performance 段同步更新）。
+
+## 12.1 同修复扩展验证（2026-08-06 下午，capacity 4 / num_slots 5）
+
+全部 warm 波 prefix-cache 全命中、0 error、每波 4/3/2 × 256 token 完整
+生成（stats_delta 中 mtp_verify/mtp_draft/mtp_batched_sync 计数与基线
+一致）。
+
+| 单元 | warm agg e2e tok/s |
+|---|---:|
+| 4K c4 | 324.04 / 288.99；复测 291.16 / 300.36（§10 前值 345.9/326.6，方差带内，短波噪声） |
+| 64K c4 | 192.79 / 202.14（§10 前值 189.0 / 185.8，**提升**） |
+| 128K c4 | 157.52 / 165.86（基线 143.83 / 163.35，**提升**） |
+| 128K c3 | 140.36 / 130.11 |
+| 128K c2 | 105.04 / 112.87 |
+
+fixture：`server_perf_grid_devicedraft_fix_{4k_c4,4k_c4_rerun,64k_c4,128k_c3,
+128k_c2}_20260806.json`。4K 的 per-round 固定开销（anchor H2D + 轮末
+profile sync）在短波下与跑动方差同量级；若全网格复跑仍低 ~10%，再评估
+把 profile sync 移出热路径（QSR_PROFILE_ROUNDS=0 时本就不执行）。
