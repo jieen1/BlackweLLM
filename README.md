@@ -175,6 +175,31 @@ hit): warm aggregate e2e at c=4 is 4K ~311–319, 32K ~225–262, 64K ~200–211
 128K ~140–146 tok/s. Cross-process variance at 128K/c4 is ~±10% (isolated
 rerun 157.5/165.9); see note §12.2 for the full table.
 
+**2026-08-06 evening — 128K/c4 追平并反超历史 headline.** 在 devicedraft
+基础上继续压主机热路径：滚动 checkpoint 前缀哈希（~1.1 ms/轮全量重哈希
+→ 增量 blake2b）、verify 输入预分配零分配 + lm_head 并入 verify CUDA
+Graph（verify_replay 主机段 10.8 → 1.5 ms）、GDN checkpoint 96 次 clone
+→ 单次 `_foreach_copy_`，以及 sparkinfer M32 raw-FP8 verifier +
+`replay_page_key` 跳过回放 worklist 重建。轮时中位 73.7 → **53.4 ms**
+（瓶颈已移到 GPU verify 本体 ~50 ms/轮；128K 稳态 ~15.75 token/轮）。
+
+正式结果（capacity=4/num_slots=5/256K×3/MTP K=3/FP8 KV/CG/prefix cache/
+GPU util 0.92，与历史参数一致；每波 4×256 token 全量完成、0 error、
+WARM 全命中）：
+
+| 口径 | 128K/c4 warm agg e2e tok/s | 对照 |
+|---|---:|---|
+| 精确重复前缀 warm（README 表口径），新进程 3 波 | 239.26 / 222.53 / 248.03 | **3/3 超过 222.44** |
+| 同上，无 profile 新进程 5 波 | 237.02 / 234.82 / 232.05 / 222.20 / 238.76 | 中位 **234.82**，4/5 超过 |
+| 历史协议形态（前缀 + 10240 新后缀），稳态 warm2/3 | 197.37 / 201.30 | ~89–90%（含后缀 TTFT，首波 47 s） |
+
+全网格 c4（warm2）：4K 384/385、32K 353/340、64K **291/262**（> 历史
+236.69）、128K 204/225。跑间方差 ±5–10% 为主机 CPU 争用（chrome/celery），
+非 GPU；正式对比以新进程隔离样本为准。完整剖析、修复与数据：
+[`notes/2026-08-06-128k-c4-parity-profiling.md`](notes/2026-08-06-128k-c4-parity-profiling.md)
+§13 · fixtures `server_perf_grid_{cglogits,noprof_headline,noprof_suffix10240}_20260806.json`
+· env/复现脚本 `scripts/qwen36_128k_bench_env.sh`。
+
 For **Laguna-S-2.1**, the live gates are the DFlash acceptance regression,
 the production CUDA Graph gate, and a bit-level router oracle — all run through
 `bfdiag`.

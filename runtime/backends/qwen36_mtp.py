@@ -275,6 +275,24 @@ class Qwen36MTPEngine:
         self._batched_sync: Qwen36MTPBatchedSync | None = None
         self._verify_cg = None
         self._cg_captured = False
+        #: Per-batch preallocated ``[B, K+1]`` verify-token buffers and
+        #: pinned anchor staging.  The hot path used to build
+        #: ``verify_tokens`` with ``torch.tensor``/``torch.cat`` every
+        #: round; at ~94/96 GiB resident memory those tiny per-round
+        #: allocations cost allocator round-trips that show up as host
+        #: time in the replay fill (measured 2026-08-06: ~10 ms/round).
+        #: Reusing the buffers keeps the batched device path
+        #: allocation-free.
+        self._verify_tokens_buf: dict[int, torch.Tensor] = {}
+        self._anchor_host: dict[int, torch.Tensor] = {}
+        self._anchor_host_views: dict[int, object] = {}
+        for _batch in range(1, backend.num_slots + 1):
+            self._verify_tokens_buf[_batch] = torch.zeros(
+                _batch, self.k + 1, dtype=torch.long, device=self.device
+            )
+            _anchor = torch.zeros(_batch, 1, dtype=torch.long, device="cpu", pin_memory=True)
+            self._anchor_host[_batch] = _anchor
+            self._anchor_host_views[_batch] = _anchor.numpy()
 
         if self._use_cuda_graph:
             #: One persistent MTP self-attention cache per real slot, plus
@@ -978,7 +996,10 @@ class Qwen36MTPEngine:
         past_len = state.num_tokens_seen
         verify_tokens = [anchor_token, *drafts]
         if self._verify_cg is not None:
-            all_hiddens = self._verify_cg.replay([slot], [verify_tokens], [past_len])
+            all_hiddens, all_logits = self._verify_cg.replay(
+                [slot], [verify_tokens], [past_len]
+            )
+            all_logits = all_logits[0]  # [k+1, vocab]
             self._record_verify_graph_replay(1)
             gdn_snapshots = None
         else:
@@ -991,7 +1012,8 @@ class Qwen36MTPEngine:
                 )
             else:
                 all_hiddens, gdn_snapshots = self.model.verify_forward(verify_input, state)
-        all_logits = self.model.compute_logits(all_hiddens)[0]  # [k+1, vocab]
+        if self._verify_cg is None:
+            all_logits = self.model.compute_logits(all_hiddens)[0]  # [k+1, vocab]
 
         sampled = params is not None and not params.is_greedy
         if sampled:
@@ -1144,6 +1166,23 @@ class Qwen36MTPEngine:
                         [int(token) for token in value], dtype=torch.long, device=self.device
                     )
             drafts_by_slot = normalized
+        else:
+            # Defensive: a caller may have built "host" lists whose elements
+            # are CUDA scalars (``list(device_tensor)``).  The verify fill's
+            # numpy conversion cannot take those; normalise to device once
+            # rather than leaking a second mixed-type failure mode.
+            if any(
+                any(isinstance(token, torch.Tensor) for token in drafts_by_slot[slot])
+                for slot in slots
+            ):
+                drafts_by_slot = {
+                    slot: torch.tensor(
+                        [int(token) for token in drafts_by_slot[slot]],
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    for slot in slots
+                }
         if isinstance(drafts_by_slot[slots[0]], torch.Tensor):
             if any(tuple(drafts_by_slot[slot].shape) != (self.k,) for slot in slots):
                 raise ValueError(
@@ -1170,33 +1209,38 @@ class Qwen36MTPEngine:
 
         first_value = drafts_by_slot[slots[0]]
         if isinstance(first_value, torch.Tensor):
-            # Device drafts: build the whole [B, K+1] verify input on device.
-            # The anchor ints are tiny; one H2D row is far cheaper than the
-            # host list of lists the old path reconstructed every round.
-            anchor_rows = torch.tensor(
-                [anchors[slot] for slot in slots], dtype=torch.long, device=self.device
-            ).reshape(-1, 1)
-            drafts_tensor = torch.cat(
-                [drafts_by_slot[slot].reshape(1, -1) for slot in slots], dim=0
+            # Device drafts: fill the preallocated [B, K+1] verify input in
+            # place (pinned anchor row + per-slot D2D draft rows).  This is
+            # allocation-free on the hot path -- the historical
+            # torch.tensor/torch.cat construction allocated three small
+            # CUDA tensors per round and, under 94/96 GiB resident memory,
+            # the allocator round-trips landed on the host-critical replay
+            # fill.
+            batch = len(slots)
+            verify_tokens = self._verify_tokens_buf[batch]
+            anchor_view = self._anchor_host_views[batch]
+            anchor_view.reshape(-1)[:] = [anchors[slot] for slot in slots]
+            verify_tokens[:, 0].copy_(
+                self._anchor_host[batch].reshape(-1), non_blocking=True
             )
-            verify_tokens = torch.cat([anchor_rows, drafts_tensor], dim=1)
+            for index, slot in enumerate(slots):
+                verify_tokens[index, 1:].copy_(drafts_by_slot[slot], non_blocking=True)
             drafts_arg = verify_tokens
         else:
             verify_tokens = [[anchors[slot], *drafts_by_slot[slot]] for slot in slots]
             drafts_arg = {slot: [anchors[slot], *drafts_by_slot[slot]] for slot in slots}
         _verify_ev0 = _verify_ev1 = None
-        if round_profile.enabled:
+        if round_profile.cuda_events:
             _verify_ev0 = torch.cuda.Event(enable_timing=True)
             _verify_ev1 = torch.cuda.Event(enable_timing=True)
             _verify_ev0.record()
-        all_hiddens = self._verify_cg.replay(slots, verify_tokens, past_lens)
-        if round_profile.enabled:
+        all_hiddens, all_logits = self._verify_cg.replay(slots, verify_tokens, past_lens)
+        if round_profile.cuda_events:
             _verify_ev1.record()
         round_profile.phase("verify_replay")
         self._record_verify_graph_replay(len(slots))
-        all_logits = self.model.compute_logits(all_hiddens)
         round_profile.phase("compute_logits")
-        if _verify_ev0 is not None:
+        if round_profile.cuda_events:
             _post_verify_ev = torch.cuda.Event(enable_timing=True)
         decisions = determine_accept_reject_batch(
             slots,
@@ -1204,12 +1248,12 @@ class Qwen36MTPEngine:
             all_logits.reshape(-1, all_logits.shape[-1]),
             self.k,
         )
-        if _verify_ev0 is not None:
+        if round_profile.cuda_events:
             _post_verify_ev.record()
             _post_verify_ev.synchronize()
             round_profile.note("post_verify_ms", _verify_ev1.elapsed_time(_post_verify_ev))
         round_profile.phase("accept_decision")
-        if _verify_ev0 is not None and _verify_ev1 is not None:
+        if round_profile.cuda_events and _verify_ev0 is not None and _verify_ev1 is not None:
             round_profile.note("verify_gpu_ms", _verify_ev0.elapsed_time(_verify_ev1))
         results: dict[int, dict[str, Any]] = {}
         sync_slots: list[int] = []
@@ -1250,34 +1294,34 @@ class Qwen36MTPEngine:
             results[slot] = result
 
         round_profile.phase("commit_loop")
-        if _verify_ev0 is not None:
+        if round_profile.cuda_events:
             _sync_ev0 = torch.cuda.Event(enable_timing=True)
             _sync_ev1 = torch.cuda.Event(enable_timing=True)
             _sync_ev0.record()
         first_by_slot = self._sync_real_suffix_batch_ragged(
             sync_slots, sync_tokens, sync_hidden_rows
         )
-        if _verify_ev0 is not None:
+        if round_profile.cuda_events:
             _sync_ev1.record()
         round_profile.phase("sync_ragged")
         first_drafts = [first_by_slot[slot][0] for slot in slots]
         first_hiddens = [first_by_slot[slot][1] for slot in slots]
 
-        if _verify_ev0 is not None:
+        if round_profile.cuda_events:
             _draft_ev0 = torch.cuda.Event(enable_timing=True)
             _draft_ev1 = torch.cuda.Event(enable_timing=True)
             _draft_ev0.record()
         next_drafts_by_slot = self._continue_draft_batch(
             slots, first_drafts, torch.cat(first_hiddens, dim=0)
         )
-        if _verify_ev0 is not None:
+        if round_profile.cuda_events:
             _draft_ev1.record()
         round_profile.phase("draft_batch")
         for slot in slots:
             results[slot]["next_draft_tokens"] = next_drafts_by_slot[slot]
 
         self.stats["rounds"] += len(slots)
-        if _verify_ev0 is not None:
+        if round_profile.cuda_events:
             _ms = torch.cuda.memory_stats()
             round_profile.note("device_alloc", _ms["num_device_alloc"])
             round_profile.note("device_free", _ms["num_device_free"])

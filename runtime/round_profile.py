@@ -5,6 +5,14 @@ wall time of every instrumented phase, so a full run's per-phase distribution
 can be aggregated without nsys (whose per-kernel tracing inflates the very
 host-side costs this profiler exists to measure).
 
+``QSR_PROFILE_ROUNDS=1`` is wall-clock-only: it never calls ``synchronize``,
+so a profiled serving run is byte-identical in GPU behaviour to an
+unprofiled one.  ``QSR_PROFILE_ROUNDS=2`` additionally enables the CUDA-event
+GPU spans in ``qwen36_mtp.py`` (``verify_gpu_ms``/``sync_gpu_ms``/
+``draft_gpu_ms``); those record events on the stream and must drain it to
+read ``elapsed_time``, so mode 2 IS a benchmark perturbation and is for
+diagnosis only.
+
 Design constraints:
 - zero import-time cost and zero allocations on the hot path when disabled;
 - no third-party dependencies (stdlib only);
@@ -25,7 +33,8 @@ class RoundProfile:
     """Accumulates one round's phases and emits a single JSON line at end."""
 
     def __init__(self) -> None:
-        self.enabled = os.environ.get("QSR_PROFILE_ROUNDS") == "1"
+        self.enabled = os.environ.get("QSR_PROFILE_ROUNDS") in ("1", "2")
+        self.cuda_events = os.environ.get("QSR_PROFILE_ROUNDS") == "2"
         if self.enabled:
             # The server's logging config only wires its own app logger, so
             # an INFO record on this logger would otherwise be dropped at the

@@ -357,6 +357,13 @@ class Qwen36MTPVerifyCudaGraph:
         self.qo_len = engine.k + 1
         self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._hidden: dict[int, torch.Tensor] = {}
+        #: Graph-owned ``[B, qo_len, vocab]`` lm_head output captured
+        #: alongside the verify body.  ``compute_logits`` used to run
+        #: outside the graph and allocate an ~8 MiB logits tensor every
+        #: round; capturing it makes the buffer graph-owned so the hot
+        #: path performs zero logits allocations (measured host-side
+        #: replay fill ~10 ms/round under 94/96 GiB resident memory).
+        self._logits: dict[int, torch.Tensor] = {}
         self._batches: dict[int, Qwen36VerifyBatch] = {}
         self._inputs: dict[
             int,
@@ -543,6 +550,7 @@ class Qwen36MTPVerifyCudaGraph:
                     page_table,
                     cache_seqlens,
                     driver._cu_seqlens_q,  # noqa: SLF001 - graph-owned metadata buffer
+                    host_cache_seqlens=cache_seqlens_view,
                 )
 
     def capture(self) -> None:
@@ -565,8 +573,10 @@ class Qwen36MTPVerifyCudaGraph:
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     hidden = self.model.verify_batch(batch)
+                    logits = self.model.compute_logits(hidden)
                 self._graphs[batch_size] = graph
                 self._hidden[batch_size] = hidden
+                self._logits[batch_size] = logits
         finally:
             for slot in range(self.pool.num_slots + 1):
                 self.engine._spec_rows.reset_slot(slot)  # noqa: SLF001
@@ -580,7 +590,7 @@ class Qwen36MTPVerifyCudaGraph:
         batch = len(slots)
         self._fill(slots, tokens, past_lens)
         self._graphs[batch].replay()
-        return self._hidden[batch]
+        return self._hidden[batch], self._logits[batch]
 
 
 class Qwen36MTPDraftCudaGraph:

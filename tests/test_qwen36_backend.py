@@ -34,7 +34,7 @@ from runtime.backends.protocol import (  # noqa: E402
     PrefixHit,
     check_conformance,
 )
-from runtime.backends.qwen36 import Qwen36Backend  # noqa: E402
+from runtime.backends.qwen36 import Qwen36Backend, _prefix_hash  # noqa: E402
 from runtime.sampling import SamplingParams  # noqa: E402
 
 _VOCAB = 32
@@ -771,3 +771,65 @@ class TestObservability:
         # Frozen values: mutating the backend afterwards must not change it.
         _run(backend, 2, [7, 7], steps=0)
         assert snap.slots[2].kv_len == 0
+
+
+def test_rolling_prefix_hash_matches_fresh_hash_across_boundaries() -> None:
+    """The incremental checkpoint hash is bit-identical to a fresh full hash.
+
+    ``_rolling_prefix_hash`` feeds only the delta since the last block
+    boundary into a cached blake2b context.  If the delta bookkeeping ever
+    diverges from ``_prefix_hash`` (wrong slice, stale context, byte order),
+    prefix dedupe against the persistent family silently misses or, worse,
+    matches the wrong boundary.  Pin the equivalence with block-aligned and
+    ragged lengths, plus every context-invalidation path.
+    """
+    backend = Qwen36Backend.__new__(Qwen36Backend)
+    backend.block_size = 16
+    backend._prefix_hash_ctx = {}
+    backend._prefix_hash_len = {}
+
+    rng = __import__("random").Random(0xB10C)
+
+    # One slot, one growing prefix: the incremental chain must agree with a
+    # fresh full hash at every boundary and at ragged (non-boundary) points.
+    tokens = [rng.randrange(152064) for _ in range(8192)]
+    for length in (16, 32, 48, 64, 80, 100, 4096, 8192):
+        assert backend._rolling_prefix_hash(0, tokens, length) == _prefix_hash(
+            tokens, length
+        )
+
+    # A second slot hashes the same content independently and agrees.
+    for length in (16, 32, 47, 63, 128, 255, 512):
+        assert backend._rolling_prefix_hash(1, tokens, length) == _prefix_hash(
+            tokens, length
+        )
+
+    # Content replacement is always preceded by a context invalidation
+    # (reset_slot / _commit_prefill); simulate it and re-check from scratch.
+    backend._prefix_hash_ctx.pop(0, None)
+    backend._prefix_hash_len.pop(0, None)
+    new_tokens = [rng.randrange(152064) for _ in range(600)]
+    for length in (16, 32, 47, 63, 128, 255, 512):
+        assert backend._rolling_prefix_hash(0, new_tokens, length) == _prefix_hash(
+            new_tokens, length
+        )
+
+    # Shorter length after a longer one: stale context must be rebuilt.
+    backend._prefix_hash_ctx.pop(0, None)
+    backend._prefix_hash_len.pop(0, None)
+    assert backend._rolling_prefix_hash(0, new_tokens, 64) == _prefix_hash(
+        new_tokens, 64
+    )
+    assert backend._rolling_prefix_hash(0, new_tokens, 128) == _prefix_hash(
+        new_tokens, 128
+    )
+
+    # A jump larger than one block falls back to a fresh hash and rebuilds.
+    backend._prefix_hash_ctx.pop(0, None)
+    backend._prefix_hash_len.pop(0, None)
+    assert backend._rolling_prefix_hash(0, new_tokens, 32) == _prefix_hash(
+        new_tokens, 32
+    )
+    assert backend._rolling_prefix_hash(0, new_tokens, 512) == _prefix_hash(
+        new_tokens, 512
+    )

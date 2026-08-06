@@ -2206,6 +2206,7 @@ class Qwen36VerifyGraphAttention:
         self.verify_tokens = verify_tokens
         self.batch = batch
         self.device = device
+        self.page_size = page_size
         self._default_descale = torch.ones(1, dtype=torch.float32, device=device)
         self._workspace = PagedAttentionWorkspace.for_contract(
             mode="verify",
@@ -2246,9 +2247,26 @@ class Qwen36VerifyGraphAttention:
         page_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
+        host_cache_seqlens: object | None = None,
     ) -> None:
+        replay_page_key = None
+        if host_cache_seqlens is not None:
+            # Host-known lengths (the verify fill has already written them
+            # into the pinned staging array): the split-KV worklist is a pure
+            # function of the per-request page count, so the workspace can
+            # skip its three Triton rebuilds while the count is unchanged.
+            replay_page_key = (
+                len(host_cache_seqlens),
+                tuple(
+                    (int(seq_len) + self.page_size - 1) // self.page_size
+                    for seq_len in host_cache_seqlens
+                ),
+            )
         self._workspace.update_prefill_graph_replay_metadata(
-            page_table, cache_seqlens, cu_seqlens_q
+            page_table,
+            cache_seqlens,
+            cu_seqlens_q,
+            replay_page_key=replay_page_key,
         )
 
     def forward(

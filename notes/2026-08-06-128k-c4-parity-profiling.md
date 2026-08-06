@@ -297,3 +297,120 @@ fixture：`server_perf_grid_devicedraft_full_20260806.json`。128K/c4 在本
 轮跑出 139.9/146.3，早前冷启动后的隔离复测为 157.5/165.9——同参数跨进程
 方差 ~±10%（TTFT 0.29-0.68 s、per-request decode 39-45 tok/s），对比历史
 数字时以隔离复测为准并注明方差带。
+
+## 13. 追平并反超 128K/c4 历史 headline（2026-08-06 傍晚，正式无 profile 口径）
+
+### 13.1 本轮修复链（全部已提交）
+
+1. **滚动 checkpoint 前缀哈希**（`runtime/backends/qwen36.py`
+   `_rolling_prefix_hash`）：`_maybe_checkpoint` 原来每个块边界对整个
+   128K 前缀重打包重哈希（~1.1 ms/轮），现按 slot 缓存 blake2b 上下文，
+   只喂增量尾部。摘要与全量 `_prefix_hash` 逐位一致（新单测
+   `test_rolling_prefix_hash_matches_fresh_hash_across_boundaries` 覆盖
+   块对齐/非对齐/越界跳变/槽复用四条路径）；`reset_slot` /
+   `_commit_prefill` 时失效上下文。
+2. **verify 输入零分配**（`runtime/backends/qwen36_mtp.py`）：每批预分配
+   `[B, K+1]` verify-token 缓冲 + pinned anchor，device-draft 路径原地
+   `copy_`（non_blocking）填充，替换每轮 3 个小 CUDA tensor 分配。
+   verify_replay 主机段中位 **10.78 → 1.48 ms**（−9.3 ms）。
+3. **lm_head 并入 verify CUDA Graph**（`qwen36_mtp_cudagraph.py`）：
+   capture 时把 `compute_logits` 一并捕获，replay 返回
+   `(hidden, graph-owned logits)`；`compute_logits` 阶段从 ~0.8 ms 落到
+   ~0.00 ms，且 logits 缓冲由图持有，热路径零分配。所有假图 stub 同步
+   改为返回 `(hidden, logits)` 对。
+4. **GDN checkpoint 单次拷贝**（`runtime/model/qwen36_slots.py`）：
+   `capture_recurrent_state` 每槽预分配目标缓冲，96 个 `clone()` 合并为
+   一次 `torch._foreach_copy_`。
+5. **sparkinfer M32 raw-FP8 verifier + 回放元数据跳过**：
+   `planner.py` 对 Qwen3.6 verify 几何（cta_tile_q=32、head_dim=256、
+   GQA6、page=128）选 M32 单 tile；`_forward.py` 路由到
+   `PagedFp8ExtendRawForwardKernel`；`workspace.py` 白名单加 M32 自适应
+   chunking，并新增 `replay_page_key`：verify 回放时每请求页数不变就跳过
+   3 个 Triton worklist 重建（128K 稳态每 32 轮才变一次）。
+
+### 13.2 轮级阶段（lm_head 入图后，`QSR_PROFILE_ROUNDS=1` 诊断日志，
+257 rounds，b4 稳态）
+
+| 阶段 | med | mean | p90 |
+|---|---:|---:|---:|
+| total | 53.40 | 56.19 | 65.92 |
+| accept_gpu_wait（GPU verify 执行） | **49.79** | 52.32 | 61.47 |
+| verify_replay（主机填充） | **1.48** | 1.85 | 2.31 |
+| sync_ragged | 1.02 | 1.15 | 1.72 |
+| commit_loop / draft / setup 等 | ≤0.4 | — | — |
+
+主瓶颈已从主机侧移到 **GPU verify 本体 ~50 ms/轮**。日志：
+`logs/quality/server_cglogits_rollinghash_20260806.log`（聚合脚本
+`scripts/aggregate_round_profile.py`）。
+
+### 13.3 内核级归因（eager verify_batch+lm_head，128K×4，10 iters，nsys）
+
+`logs/quality/verify_gpu_profile_rollinghash_20260806.out`，单轮 verify
+合计 ~56 ms（eager + 剖析开销下）：
+
+| 内核 | ms/verify | 说明 |
+|---|---:|---|
+| paged raw-FP8 attention（M32） | 143.78 ms/160 calls ≈ **14.4** | 16 层，图内实测 ~0.899 ms/call |
+| qsr FP8 W8A8 GEMM（FP8 通道线性） | 75.89+72.34 ≈ **14.8** | attention qkv/o + 部分 MLP |
+| NVFP4 fused MoE（W4A4 blockscaled） | 42.99+29.35 ≈ **7.2** | MLP，默认 all-rows W4A4 路径 |
+| GDN fused recurrent | 11.37 ≈ **1.1** | — |
+| dynamic_per_token_e4m3_quant | ~1.3 | — |
+| RMSNorm 系（mean/rsqrt/pow） | ~1.9 | 与历史 A/B 保位级一致，不动 |
+
+attention 独立探针（`scripts/probe_qwen36_verify_attn_sweep.py`）：
+b4/128K **M32 0.736 ms/call vs M16 0.839 ms/call**（−12%）；图内实测
+0.899 ms/call 仍有 ~20% 未归因（chunk 几何/主存带宽方向，下一步候选，
+但需过质量锚）。
+
+### 13.4 正式结果（128K/c4，max_tokens 256，每波 4×256 token 全量完成，
+0 error，WARM 波 prefix 全命中 restores=4）
+
+| 运行（服务/口径） | warm agg e2e tok/s | vs 222.44 |
+|---|---:|---|
+| `server_perf_grid_wallprof_rollinghash_20260806.json`（新进程，profile=1） | 238.36 / 243.33 / 227.35 | **3/3 超过** |
+| `server_perf_grid_cglogits_20260806.json`（新进程，profile=1，lm_head 入图后） | 239.26 / 222.53 / 248.03 | **3/3 超过** |
+| `server_perf_grid_noprof_headline_20260806.json`（**新进程，无 profile 正式口径**） | 237.02 / 234.82 / 232.05 / 222.20 / 238.76 | 中位 **234.82**，4/5 超过 |
+| `server_perf_grid_noprof_headline2_20260806.json`（同进程续跑，缓存已热） | 226.44 / 216.19 / 222.79 / 219.82 / 220.18 / 215.51 | 方差下沿，216–227 |
+| `server_perf_grid_noprof_suffix10240_20260806.json`（**历史协议形态：warm 前缀 + 10240 新后缀**） | warm2/3 = 197.37 / 201.30 | 稳态 ~89–90%（首波含 47.4 s 后缀 continue-prefill） |
+
+全网格（`server_perf_grid_20260806_170138.json`，c4，warm2）：4K
+384.44/385.19、32K 353.26/340.46、64K 291.28/261.91、128K
+204.41/224.89。**64K 已超过历史 236.69**（README 的 267 为低置信回声）；
+128K 网格波落在方差带内，隔离冷启动后即可达 222–248。
+
+### 13.5 结论与口径说明
+
+* **精确重复前缀 warm 协议**（README Performance 表的口径）下，
+  128K/c4 端到端已超过历史 222.44：三个新进程样本的中位/均值
+  234.8 / 233.0，且 cglogits 样本 3/3 波 ≥ 222.44。
+* **历史 DirectModelRunner 协议形态（+10240 新后缀）**下，稳态
+  warm2/warm3 = 197–201 tok/s（~89–90%）。差异组成：HTTP vs 直连
+  （~可忽略）、后缀 continue-prefill 摊入 TTFT（首波 47 s）、以及
+  内容 workload 不同（filler 接受率 ~98% vs 历史 token-id fixture
+  50.3%）。按轮内 token 效率：15.75 token/53.4 ms ≈ 295 tok/s 稳态，
+  高于历史 10.04 token/45.1 ms = 222.6。
+* **跑间方差 ±5–10% 是主机 CPU 争用**（chrome ~275% CPU、celery 常驻），
+  非 GPU 或代码差异；同服务连续重跑（headline2）即落入 216–227。
+  正式对比以新进程隔离样本为准，本笔记同时保留方差下沿样本。
+* 剩余 GPU 侧余量（M32 图内 vs 探针 ~20%、小 M GEMM、elementwise 融合）
+  属 roadmap 阶段四，需先过位级质量锚，本轮不再动。
+
+### 13.6 环境与产物
+
+* 服务 env：`scripts/qwen36_128k_bench_env.sh`（capacity=4 /
+  num_slots=5 / block_size=16 / 256K per slot / MTP K=3 / FP8 e4m3 KV /
+  CG + prefix cache / GPU_MEM_UTIL=0.92 / production=1）。
+* 启动：`set -a; source scripts/qwen36_128k_bench_env.sh; set +a;
+  setsid /home/bot/.venvs/vllm/bin/python -u -m server.app --host
+  127.0.0.1 --port 8300 > logs/quality/server_noprof_final_20260806.log &`
+  （正式基准不设 `QSR_PROFILE_ROUNDS`）。
+* 基准命令：
+  `/home/bot/.venvs/vllm/bin/python -u benchmarks/server_perf_grid.py
+  --base-url http://127.0.0.1:8300 --model qwen3.6 --endpoint completions
+  --contexts 128k --concurrency 4 --max-tokens 256 --warm-rounds N
+  [--warm-suffix-tokens 10240] --out <fixture.json>`。
+* 探针/聚合：`scripts/probe_qwen36_verify_attn_sweep.py`、
+  `scripts/probe_qwen36_verify_gpu_profile.py`、
+  `scripts/aggregate_round_profile.py`。
+* 本轮日志：`logs/quality/server_noprof_final_20260806.log`（正式服务）、
+  `grid_noprof_headline{,_2}_20260806.out`、`grid_noprof_suffix10240_20260806.out`。

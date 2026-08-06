@@ -494,7 +494,11 @@ class TestTeacherForcedSync:
 
             def replay(self, slots, tokens, past_lens):
                 self.calls.append((slots, tokens, past_lens))
-                return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                hidden = torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                # The real graph now returns (hidden, graph-owned logits)
+                # with the lm_head captured inside the graph; the stub
+                # reproduces the same pair via its own compute_logits.
+                return hidden, model.compute_logits(hidden)
 
         verify = _BatchedVerify()
         engine._verify_cg = verify
@@ -522,6 +526,54 @@ class TestTeacherForcedSync:
         assert engine.stats["batched_verify_replays"] == 1
         assert backend.stats["mtp_verify_graph_slots"] == 2
 
+    def test_multi_slot_round_with_device_drafts_fills_preallocated_verify_tokens(
+        self,
+    ) -> None:
+        """The device-draft hot path fills the preallocated [B, K+1] buffer.
+
+        The batched production path receives per-slot device ``[K]`` draft
+        rows and must stage them into ``_verify_tokens_buf`` without any
+        per-round allocation.  Regression: the pinned anchor staging was
+        shaped ``[B, 1]`` and the ``[B, K+1]`` column copy used to fail with
+        a broadcast error on the real server (2026-08-06), which the
+        host-draft tests could not catch.
+        """
+        backend, model = _backend(num_slots=2)
+        backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
+        engine: Qwen36MTPEngine = backend._mtp
+
+        class _BatchedVerify:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list[int], torch.Tensor, list[int]]] = []
+
+            def replay(self, slots, tokens, past_lens):
+                self.calls.append((list(slots), tokens.clone(), list(past_lens)))
+                hidden = tokens.to(torch.float32).unsqueeze(-1)
+                return hidden, model.compute_logits(hidden)
+
+        verify = _BatchedVerify()
+        engine._verify_cg = verify
+        for slot in (0, 1):
+            engine._caches[slot].seq_len = 2
+            backend.pool.slot_kv_len[slot] = 7
+            backend.pool.slot_state(slot).num_tokens_seen = 7
+
+        result = engine.round_batch(
+            [0, 1],
+            {0: 10, 1: 20},
+            {
+                0: torch.tensor([11, 12, 13]),
+                1: torch.tensor([21, 22, 23]),
+            },
+        )
+
+        (slots, tokens, past_lens) = verify.calls[0]
+        assert slots == [0, 1]
+        assert past_lens == [7, 7]
+        assert tokens.tolist() == [[10, 11, 12, 13], [20, 21, 22, 23]]
+        assert result[0]["committed"] == [11, 12, 13, 14]
+        assert result[1]["committed"] == [21, 22, 23, 24]
+
     def test_multi_slot_round_batches_the_chained_draft_replay_too(self) -> None:
         """M-4 follows the historical draft funnel: B-wide at each K step.
 
@@ -537,7 +589,8 @@ class TestTeacherForcedSync:
         class _BatchedVerify:
             def replay(self, slots, tokens, past_lens):
                 del slots, past_lens
-                return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                hidden = torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                return hidden, model.compute_logits(hidden)
 
         class _BatchedDraft:
             def __init__(self) -> None:
@@ -657,7 +710,8 @@ class TestTeacherForcedSync:
         class _BatchedVerify:
             def replay(self, slots, tokens, past_lens):
                 del slots, past_lens
-                return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                hidden = torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                return hidden, model.compute_logits(hidden)
 
         class _BatchedSync:
             def __init__(self) -> None:
@@ -705,7 +759,8 @@ class TestTeacherForcedSync:
         class _BatchedVerify:
             def replay(self, slots, tokens, past_lens):
                 del slots, past_lens
-                return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                hidden = torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                return hidden, model.compute_logits(hidden)
 
         class _RaggedSync:
             def __init__(self) -> None:
@@ -781,7 +836,8 @@ class TestTeacherForcedSync:
         class _BatchedVerify:
             def replay(self, slots, tokens, past_lens):
                 del slots, past_lens
-                return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                hidden = torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                return hidden, model.compute_logits(hidden)
 
         class _LegacyOnly:
             def replay(self, *args, **kwargs):
@@ -808,14 +864,15 @@ class TestTeacherForcedSync:
 
     def test_multi_slot_round_rejects_a_graph_that_reemits_step0(self) -> None:
         """Teacher-forced sync owns step 0, so graph replay must return only K-1 tail tokens."""
-        backend, _ = _backend(num_slots=2)
+        backend, model = _backend(num_slots=2)
         backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
         engine: Qwen36MTPEngine = backend._mtp
 
         class _BatchedVerify:
             def replay(self, slots, tokens, past_lens):
                 del slots, past_lens
-                return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                hidden = torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                return hidden, model.compute_logits(hidden)
 
         class _TooLongDraft:
             def __init__(self) -> None:
@@ -864,7 +921,8 @@ class TestTeacherForcedSync:
 
             def replay(self, slots, tokens, past_lens):
                 self.calls.append((slots, tokens, past_lens))
-                return torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                hidden = torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                return hidden, model.compute_logits(hidden)
 
         verify = _BatchedVerify()
 

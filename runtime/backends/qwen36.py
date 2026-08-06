@@ -299,6 +299,17 @@ class Qwen36Backend:
         #: tensors would make it untestable in the CPU-only CI job.
         self._checkpoint_tensors: dict[int, list[torch.Tensor]] = {}
         self._checkpoint_len: dict[int, int] = {}
+        #: Incremental blake2b contexts for the rolling checkpoint hash.
+        #: ``_maybe_checkpoint`` re-hashes the whole committed prefix at
+        #: every block boundary (~1.1 ms at 128K); the delta since the last
+        #: boundary is only ``block_size`` tokens, so the hot path feeds the
+        #: existing context instead of re-packing 131K ints.  The digest is
+        #: identical to a fresh ``_prefix_hash`` over the same prefix, so
+        #: checkpoint dedupe against the persistent family is unchanged.
+        #: Invalidated on every content replacement (``reset_slot`` /
+        #: ``_commit_prefill``).
+        self._prefix_hash_ctx: dict[int, object] = {}
+        self._prefix_hash_len: dict[int, int] = {}
 
         self.stats: dict[str, int] = {
             "prefix_kv_hit_tokens": 0,
@@ -452,6 +463,8 @@ class Qwen36Backend:
         to survive was already cloned into the checkpoint pool at a
         block boundary; the live buffer is not that clone.
         """
+        self._prefix_hash_ctx.pop(slot, None)
+        self._prefix_hash_len.pop(slot, None)
         if self.pool.slot_committed_tokens[slot] and self.pool.slot_kv_len[slot] > 0:
             self._prefix_cache_tokens[slot] = list(self.pool.slot_committed_tokens[slot])
             self._prefix_cache_kv_len[slot] = self.pool.slot_kv_len[slot]
@@ -629,6 +642,8 @@ class Qwen36Backend:
         return max(1, min(_PREFERRED_PREFILL_CHUNK_TOKENS, hard_cap))
 
     def _commit_prefill(self, slot: int, prompt_ids: list[int], first_token: int) -> None:
+        self._prefix_hash_ctx.pop(slot, None)
+        self._prefix_hash_len.pop(slot, None)
         self.pool.slot_kv_len[slot] = len(prompt_ids)
         self.pool.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
         self._maybe_checkpoint(slot)
@@ -1511,7 +1526,7 @@ class Qwen36Backend:
         # it matters (all slots busy), which is the opposite of a budget.
         self.checkpoint_pool.evict_for_budget(self._checkpoint_bytes)
         key = (slot, kv_len)
-        hash_value = _prefix_hash(tokens, kv_len)
+        hash_value = self._rolling_prefix_hash(slot, tokens, kv_len)
         existing = self.checkpoint_pool.get_by_hash(hash_value)
         if existing is not None and existing != key:
             # RecurrentStatePool's hash index is one-to-one.  The persistent
@@ -1535,6 +1550,40 @@ class Qwen36Backend:
         self._checkpoint_tensors[slot] = self.pool.capture_recurrent_state(slot)
         self._checkpoint_len[slot] = kv_len
         self.stats["checkpoints_taken"] += 1
+
+    def _rolling_prefix_hash(self, slot: int, token_ids: list[int], length: int) -> str:
+        """Content hash of ``token_ids[:length]``, incremental across block
+        boundaries.
+
+        The first call for a slot hashes from scratch (same cost as
+        ``_prefix_hash``).  Later calls with a longer prefix feed only the
+        new tail into the cached blake2b context, which yields the exact
+        digest a fresh full-length hash would.  A stale context (slot reused
+        without a reset, or a shorter ``length``) falls back to a fresh hash
+        and rebuilds the context.
+        """
+        old_len = self._prefix_hash_len.get(slot, -1)
+        ctx = self._prefix_hash_ctx.get(slot)
+        if (
+            ctx is not None
+            and 0 <= old_len < length
+            and length - old_len <= self.block_size
+        ):
+            delta = array("I", token_ids[old_len:length])
+            if sys.byteorder != "little":
+                delta.byteswap()
+            ctx.update(delta.tobytes())  # type: ignore[attr-defined]
+            self._prefix_hash_len[slot] = length
+            return ctx.hexdigest()  # type: ignore[attr-defined]
+        hash_value = _prefix_hash(token_ids, length)
+        ctx = hashlib.blake2b(digest_size=16)
+        packed = array("I", token_ids[:length])
+        if sys.byteorder != "little":
+            packed.byteswap()
+        ctx.update(packed.tobytes())
+        self._prefix_hash_ctx[slot] = ctx
+        self._prefix_hash_len[slot] = length
+        return hash_value
 
     def _evict_checkpoint(self, slot: int) -> None:
         length = self._checkpoint_len.pop(slot, None)

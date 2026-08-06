@@ -330,6 +330,15 @@ class Qwen36SlotPool:
         self._slot_states: list[Qwen36GenerationState] = [
             self._build_slot_state(row) for row in range(self._num_rows)
         ]
+        #: Per-slot destination buffers for recurrent-state checkpoints.
+        #: ``capture_recurrent_state`` copies into these (one
+        #: ``torch._foreach_copy_`` launch) instead of issuing 96
+        #: per-tensor ``clone()`` + allocator round trips on every block
+        #: boundary.  A slot holds at most one live rolling checkpoint at a
+        #: time (``_evict_checkpoint`` pops the previous one before the next
+        #: capture), so reusing one buffer per slot is safe; the persistent
+        #: prefix family clones again at store time and never aliases it.
+        self._checkpoint_dest: dict[int, list[torch.Tensor]] = {}
         #: Populated exactly once, before CUDA Graph capture, when MTP is
         #: enabled.  Each entry has ``K + 1`` views per physical slot: column
         #: zero aliases the ordinary live row and columns ``1..K`` are the
@@ -856,17 +865,29 @@ class Qwen36SlotPool:
     def capture_recurrent_state(self, slot: int) -> list[torch.Tensor]:
         """Clone ``slot``'s recurrent state -- one checkpoint.
 
-        Returns a flat list of freshly allocated tensors (conv, recurrent,
-        conv, recurrent, ... in layer order). Cloned, not viewed: the point
-        of a checkpoint is to survive the slot being reused.
+        Returns a flat list of tensors (conv, recurrent, conv, recurrent, ...
+        in layer order). Copied, not viewed: the point of a checkpoint is to
+        survive the slot being reused.  The destination buffers are
+        pre-allocated per slot and reused, so the copy is a single
+        ``torch._foreach_copy_`` launch instead of 96 small ``clone()``
+        allocations on the hot path.
         """
         out: list[torch.Tensor] = []
         state = self._slot_states[slot]
+        live: list[torch.Tensor] = []
         for gdn in state.gdn_states:
             if gdn is None:
                 continue
-            out.append(gdn.conv_state.clone())
-            out.append(gdn.recurrent_state.clone())
+            live.append(gdn.conv_state)
+            live.append(gdn.recurrent_state)
+        dest = self._checkpoint_dest.get(slot)
+        if dest is None or len(dest) != len(live) or any(
+            a.shape != b.shape or a.dtype != b.dtype for a, b in zip(dest, live, strict=True)
+        ):
+            dest = [t.clone() for t in live]
+            self._checkpoint_dest[slot] = dest
+        torch._foreach_copy_(dest, live)
+        out = dest
         return out
 
     def restore_recurrent_state(self, slot: int, checkpoint: list[torch.Tensor]) -> None:
