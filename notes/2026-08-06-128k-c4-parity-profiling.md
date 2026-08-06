@@ -165,3 +165,35 @@ head_dim 256）。
 待办（§7 第 2/3 项仍是主力）：draft 图注意力同款最坏容量冻结（探针：
 decode b1 worst 0.933 vs 0.392 ms/call）；commit_loop 尖峰定位；
 accept 队列开销。
+
+## 10. 修复二：decode/draft 图回放按 live 长度重切 chunk（4K/64K 大收益，128K 持平）
+
+同类 bug 的第二处：decode/draft 图捕获时绑定最坏容量 chunk 计划，回放
+从不调用 `update_decode_graph_replay_metadata_from_runtime_cache_seqlens`
+（runtime 里 0 处调用），chunk 大小永远冻结在 262K 捕获值。修复 =
+`Qwen36DecodeGraphAttention.update_replay_metadata()` + 两处接线
+（`build_decode_batch`、draft `_fill`）。
+
+探针（q=1 @131K）：b1 1.123→0.474、b2 1.165→0.396、b3 1.008→0.438、
+b4 0.650→0.428 ms/call。服务端 c4 warm agg（capacity 4，MTP K=3）：
+
+| 上下文 | 修复前 | 修复后 |
+|---|---|---|
+| 4K | ~150-195 | **345.9 / 326.6** |
+| 64K | ~146-170 | **189.0 / 185.8** |
+| 128K | ~155-160 | 158.5 / 148.2 / 144.5（持平，128K 贴近最坏容量，重切收益小） |
+
+fixture：`server_perf_grid_20260806_122813.json`（三档合并跑）、
+`server_perf_grid_20260806_123150.json`（128K 复测）。
+
+## 11. 阶段性结论（2026-08-06 午）
+
+* 按每提交 token：~95% 历史水位（4.7 vs 4.5 ms/token）——本轮两处修复后
+  4K/64K 已**超过**历史同档数字（历史 64K/c4=236.69 为 DirectModelRunner
+  口径，当前服务端口径 189 尚未反超；4K 无历史同口径锚点）。
+* 128K/c4 仍 ~0.68× 历史 headline（150 vs 222.44）：瓶颈 = verify 图 GPU
+  ~40 ms（历史整轮才 45 ms）。剩余差距在 kernel 层：verify attn 已压到
+  ~0.8 ms/call 量级，下一个可动的只有 GEMM 小 M 效率与 elementwise 融合
+  （均需过 bit-parity 质量锚，属 roadmap 阶段四工作）。
+* 数值口径警告：两处重切 chunk 都改变 split-KV 归约顺序（ULP 级漂移），
+  重跑质量锚（`scripts/run_qwen36_quality.sh`）前不要引用绝对分数。
