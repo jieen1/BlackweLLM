@@ -573,17 +573,23 @@ per-slot 路径同契约。
 | warm1 TTFT | 26.5 s | **19.4 s**（batched_forward ×5 chunk 生效） |
 | warm2/3 agg | 250–252 tok/s | 224–227（跑动间方差带内，round_batch med 58.3 与修复前 57.8 一致） |
 
-### 16.3 未解决（记录在案）
+### 16.3 遗留项的后续归因（2026-08-06 深夜续查，两项已关闭）
 
-1. **批量只覆盖了同时 admission 的槽**：harness 4 个并发请求经 tokenize 后
-   到达 waiting 队列有时间差，引擎逐到逐 admit（实测 admission batch sizes
-   [1,3,2,2,...]），warm1 只 batch 了 [0,1] 两槽，[2,3] 后到走 per-slot。
-   要拿满 §15.5 估计的 ~13 s，需要 admission 侧的合并（短暂 coalesce 窗口
-   或 chunk 边界并入 later arrivals）——调度语义改动，未做。
-2. **冷波多槽组没有触发批量**（batched_forward 计数只含 warm1）：3 槽冷
-   prefill 组理论上满足批量条件，实际落回 per-slot。曾加临时日志抓
-   `build_prefill_batch` 的 ValueError，但验证用服务两次在模型加载期被
-   环境信号杀死（无 traceback，非代码问题），未完成归因；临时日志已撤。
-   冷波瓶颈仍是 4×128K prefill 的 GPU 计算本身，批量最多再省 ~30%。
+1. **冷波"多槽组未批量"之谜：已关闭，不存在该场景。** 冷波 admission
+   实际是 [1, 3]：第 1 个请求单独 prefill（128K，~64 个 2048-token 片），
+   完成后其 prompt 存入 persistent arena；随后 admit 的 3 个请求在
+   `_apply_prefix_hit` 里**全部持久命中**（hit == len(prompt)），走
+   restore + cached_hidden 路径，根本没有 chunked prefill 可批量。
+   独立复现（无服务器，直接 `build_prefill_batch` 3 个 fresh 槽）确认
+   fresh 多槽组本身可批量——但真实负载里等长同 prompt 的并发请求永远
+   会被首请求的 store 变成持久命中，这正是设计意图（restore ~15 ms vs
+   prefill ~57 s），无需批量。
+2. **admission 合并（warm1 全 4 槽批量）：已放弃，收益不成立。** 实测
+   141K 上下文下 b2 批量片 3.3 s/4096 tokens（0.81 ms/token）与 per-slot
+   片 ~1.6 s/2048（0.78 ms/token）每 token 成本几乎相同——长前缀下
+   prefill 由 attention 主导，批量对 GEMM 形状的收益被摊平。§15.5 估计
+   的"batched ~13 s"是修复链落地前的旧测量（当时 per-slot 路径还背着
+   LCP 诊断税等开销）。当前 warm1 = 19.4 s 已接近该上下文的批量下限，
+   做调度侧 coalesce（语义改动）换不来可测收益。
 3. 跑动间方差提示：同协议不同跑的 round_batch 中位在 53.8–58.3 ms 之间
    （acceptance 91–100% 时），单次数值对比必须带方差带。
