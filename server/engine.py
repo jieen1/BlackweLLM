@@ -90,7 +90,8 @@ def _adm_end(req: GenerationRequest) -> None:
                 "request_id": req.request_id,
                 "prompt_tokens": len(req.prompt_ids),
                 "wait_ms": round(
-                    (req._adm_start_at - req._admitted_at) * 1000.0, 3  # type: ignore[attr-defined]
+                    (req._adm_start_at - req._admitted_at) * 1000.0,
+                    3,  # type: ignore[attr-defined]
                 ),
                 "phases": req._adm_phases,  # type: ignore[attr-defined]
             }
@@ -198,9 +199,7 @@ _PREFIX_CACHE_HIT_SAMPLES_KEPT = 200
 _SESSION_WARM_CONTINUATION_SAMPLES_KEPT = 200
 
 
-def _longest_common_prefix_len(
-    a: list[int], b: list[int], cap: int | None = None
-) -> int:
+def _longest_common_prefix_len(a: list[int], b: list[int], cap: int | None = None) -> int:
     """Length of the common prefix of ``a`` and ``b``, optionally capped.
 
     ``cap`` exists for the admission-overlap diagnostic below: at
@@ -1053,9 +1052,7 @@ class ServerEngine:
             history_best = 0
             history_best_rid: str | None = None
             for other_rid, other_prompt in self._recent_prompts:
-                overlap = _longest_common_prefix_len(
-                    prompt, other_prompt, cap=self.block_size
-                )
+                overlap = _longest_common_prefix_len(prompt, other_prompt, cap=self.block_size)
                 if overlap > history_best:
                     history_best = overlap
                     history_best_rid = other_rid

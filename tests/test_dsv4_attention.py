@@ -27,8 +27,7 @@ from runtime.model.dsv4_quant import dequantize_q8_0  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REFERENCE_DIR = REPO_ROOT / "notes" / "dsv4flash-ref" / "inference"
 REAL_GGUF = Path(
-    "/home/bot/models/DeepSeek-V4-Flash-0731-GGUF/"
-    "DeepSeek-V4-Flash-0731-IQ2_XS-Experts-Q8_0.gguf"
+    "/home/bot/models/DeepSeek-V4-Flash-0731-GGUF/DeepSeek-V4-Flash-0731-IQ2_XS-Experts-Q8_0.gguf"
 )
 if not REAL_GGUF.exists():
     pytest.skip("GGUF download not present", allow_module_level=True)
@@ -75,20 +74,47 @@ def _load_ref():
 
 def _ref_args(ref):
     return ref.ModelArgs(
-        max_batch_size=1, max_seq_len=MAX_SEQ,
-        vocab_size=129280, dim=4096, moe_inter_dim=2048, n_layers=43,
-        n_hash_layers=3, n_mtp_layers=3, n_heads=64, n_routed_experts=256,
-        n_shared_experts=1, n_activated_experts=6, score_func="sqrtsoftplus",
-        route_scale=1.5, swiglu_limit=10.0, q_lora_rank=1024, head_dim=512,
-        rope_head_dim=64, o_groups=8, o_lora_rank=1024, window_size=128,
+        max_batch_size=1,
+        max_seq_len=MAX_SEQ,
+        vocab_size=129280,
+        dim=4096,
+        moe_inter_dim=2048,
+        n_layers=43,
+        n_hash_layers=3,
+        n_mtp_layers=3,
+        n_heads=64,
+        n_routed_experts=256,
+        n_shared_experts=1,
+        n_activated_experts=6,
+        score_func="sqrtsoftplus",
+        route_scale=1.5,
+        swiglu_limit=10.0,
+        q_lora_rank=1024,
+        head_dim=512,
+        rope_head_dim=64,
+        o_groups=8,
+        o_lora_rank=1024,
+        window_size=128,
         compress_ratios=tuple([0, 0] + [4, 128] * 20 + [4]),
-        compress_rope_theta=160000.0, original_seq_len=65536,
-        rope_theta=10000.0, rope_factor=16, beta_fast=32, beta_slow=1,
-        index_n_heads=64, index_head_dim=128, index_topk=512,
-        hc_mult=4, hc_sinkhorn_iters=20, hc_eps=1e-6,
-        dtype="fp8", scale_fmt="ue8m0", expert_dtype=None,
-        dspark_block_size=5, dspark_noise_token_id=128799,
-        dspark_target_layer_ids=(40, 41, 42), dspark_markov_rank=256,
+        compress_rope_theta=160000.0,
+        original_seq_len=65536,
+        rope_theta=10000.0,
+        rope_factor=16,
+        beta_fast=32,
+        beta_slow=1,
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=512,
+        hc_mult=4,
+        hc_sinkhorn_iters=20,
+        hc_eps=1e-6,
+        dtype="fp8",
+        scale_fmt="ue8m0",
+        expert_dtype=None,
+        dspark_block_size=5,
+        dspark_noise_token_id=128799,
+        dspark_target_layer_ids=(40, 41, 42),
+        dspark_markov_rank=256,
     )
 
 
@@ -134,34 +160,50 @@ def _build_pair(layer_id: int):
     torch.set_default_dtype(prev)
     ref_attn = ref_attn.cuda()
     ref_attn.attn_sink = torch.nn.Parameter(t[p + "attn_sinks.weight"].data.float().cuda())
-    ref_attn.wq_a.weight = torch.nn.Parameter(dq(p + "attn_q_a.weight", (1024, 4096)).bfloat16().cuda())
-    ref_attn.q_norm.weight = torch.nn.Parameter(
-        t[p + "attn_q_a_norm.weight"].data.float().cuda()
+    ref_attn.wq_a.weight = torch.nn.Parameter(
+        dq(p + "attn_q_a.weight", (1024, 4096)).bfloat16().cuda()
     )
-    ref_attn.wq_b.weight = torch.nn.Parameter(dq(p + "attn_q_b.weight", (32768, 1024)).bfloat16().cuda())
-    ref_attn.wkv.weight = torch.nn.Parameter(dq(p + "attn_kv.weight", (512, 4096)).bfloat16().cuda())
-    ref_attn.kv_norm.weight = torch.nn.Parameter(
-        t[p + "attn_kv_a_norm.weight"].data.float().cuda()
+    ref_attn.q_norm.weight = torch.nn.Parameter(t[p + "attn_q_a_norm.weight"].data.float().cuda())
+    ref_attn.wq_b.weight = torch.nn.Parameter(
+        dq(p + "attn_q_b.weight", (32768, 1024)).bfloat16().cuda()
     )
-    ref_attn.wo_a.weight = torch.nn.Parameter(dq(p + "attn_output_a.weight", (8192, 4096)).bfloat16().cuda())
-    ref_attn.wo_b.weight = torch.nn.Parameter(dq(p + "attn_output_b.weight", (4096, 8192)).bfloat16().cuda())
+    ref_attn.wkv.weight = torch.nn.Parameter(
+        dq(p + "attn_kv.weight", (512, 4096)).bfloat16().cuda()
+    )
+    ref_attn.kv_norm.weight = torch.nn.Parameter(t[p + "attn_kv_a_norm.weight"].data.float().cuda())
+    ref_attn.wo_a.weight = torch.nn.Parameter(
+        dq(p + "attn_output_a.weight", (8192, 4096)).bfloat16().cuda()
+    )
+    ref_attn.wo_b.weight = torch.nn.Parameter(
+        dq(p + "attn_output_b.weight", (4096, 8192)).bfloat16().cuda()
+    )
     if ratio:
         comp = ref_attn.compressor
         coff = 2 if ratio == 4 else 1
-        comp.wkv.weight = torch.nn.Parameter(dq(p + "attn_compressor_kv.weight", (coff * 512, 4096)).cuda())
+        comp.wkv.weight = torch.nn.Parameter(
+            dq(p + "attn_compressor_kv.weight", (coff * 512, 4096)).cuda()
+        )
         comp.wgate.weight = torch.nn.Parameter(
             dq(p + "attn_compressor_gate.weight", (coff * 512, 4096)).cuda()
         )
-        comp.ape = torch.nn.Parameter(dq(p + "attn_compressor_ape.weight", (ratio, coff * 512)).cuda())
+        comp.ape = torch.nn.Parameter(
+            dq(p + "attn_compressor_ape.weight", (ratio, coff * 512)).cuda()
+        )
         comp.norm.weight = torch.nn.Parameter(
             t[p + "attn_compressor_norm.weight"].data.float().cuda()
         )
     if ratio == 4:
         idx = ref_attn.indexer
-        idx.wq_b.weight = torch.nn.Parameter(dq(p + "indexer.attn_q_b.weight", (8192, 1024)).bfloat16().cuda())
-        idx.weights_proj.weight = torch.nn.Parameter(dq(p + "indexer.proj.weight", (64, 4096)).bfloat16().cuda())
+        idx.wq_b.weight = torch.nn.Parameter(
+            dq(p + "indexer.attn_q_b.weight", (8192, 1024)).bfloat16().cuda()
+        )
+        idx.weights_proj.weight = torch.nn.Parameter(
+            dq(p + "indexer.proj.weight", (64, 4096)).bfloat16().cuda()
+        )
         icomp = idx.compressor
-        icomp.wkv.weight = torch.nn.Parameter(dq(p + "indexer_compressor_kv.weight", (256, 4096)).cuda())
+        icomp.wkv.weight = torch.nn.Parameter(
+            dq(p + "indexer_compressor_kv.weight", (256, 4096)).cuda()
+        )
         icomp.wgate.weight = torch.nn.Parameter(
             dq(p + "indexer_compressor_gate.weight", (256, 4096)).cuda()
         )
@@ -183,9 +225,7 @@ def _build_pair(layer_id: int):
         ours.compressor.wkv.load_packed(t[p + "attn_compressor_kv.weight"])
         ours.compressor.wgate.load_packed(t[p + "attn_compressor_gate.weight"])
         ours.compressor.ape.copy_(dq(p + "attn_compressor_ape.weight", (ratio, coff * 512)).cuda())
-        ours.compressor.norm_weight.copy_(
-            t[p + "attn_compressor_norm.weight"].data.float().cuda()
-        )
+        ours.compressor.norm_weight.copy_(t[p + "attn_compressor_norm.weight"].data.float().cuda())
     if ratio == 4:
         ours.indexer.wq_b.load_packed(t[p + "indexer.attn_q_b.weight"])
         ours.indexer.weights_proj.load_packed(t[p + "indexer.proj.weight"])

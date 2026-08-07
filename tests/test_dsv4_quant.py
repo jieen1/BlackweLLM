@@ -20,8 +20,7 @@ from runtime.loading.gguf import (  # noqa: E402
 from runtime.model.dsv4_quant import dequantize_iq2_xs, dequantize_q8_0  # noqa: E402
 
 REAL_GGUF = Path(
-    "/home/bot/models/DeepSeek-V4-Flash-0731-GGUF/"
-    "DeepSeek-V4-Flash-0731-IQ2_XS-Experts-Q8_0.gguf"
+    "/home/bot/models/DeepSeek-V4-Flash-0731-GGUF/DeepSeek-V4-Flash-0731-IQ2_XS-Experts-Q8_0.gguf"
 )
 
 

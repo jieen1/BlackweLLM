@@ -881,8 +881,12 @@ class Qwen36SlotPool:
             live.append(gdn.conv_state)
             live.append(gdn.recurrent_state)
         dest = self._checkpoint_dest.get(slot)
-        if dest is None or len(dest) != len(live) or any(
-            a.shape != b.shape or a.dtype != b.dtype for a, b in zip(dest, live, strict=True)
+        if (
+            dest is None
+            or len(dest) != len(live)
+            or any(
+                a.shape != b.shape or a.dtype != b.dtype for a, b in zip(dest, live, strict=True)
+            )
         ):
             dest = [t.clone() for t in live]
             self._checkpoint_dest[slot] = dest

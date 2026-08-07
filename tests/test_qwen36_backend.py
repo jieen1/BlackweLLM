@@ -794,15 +794,11 @@ def test_rolling_prefix_hash_matches_fresh_hash_across_boundaries() -> None:
     # fresh full hash at every boundary and at ragged (non-boundary) points.
     tokens = [rng.randrange(152064) for _ in range(8192)]
     for length in (16, 32, 48, 64, 80, 100, 4096, 8192):
-        assert backend._rolling_prefix_hash(0, tokens, length) == _prefix_hash(
-            tokens, length
-        )
+        assert backend._rolling_prefix_hash(0, tokens, length) == _prefix_hash(tokens, length)
 
     # A second slot hashes the same content independently and agrees.
     for length in (16, 32, 47, 63, 128, 255, 512):
-        assert backend._rolling_prefix_hash(1, tokens, length) == _prefix_hash(
-            tokens, length
-        )
+        assert backend._rolling_prefix_hash(1, tokens, length) == _prefix_hash(tokens, length)
 
     # Content replacement is always preceded by a context invalidation
     # (reset_slot / _commit_prefill); simulate it and re-check from scratch.
@@ -817,19 +813,11 @@ def test_rolling_prefix_hash_matches_fresh_hash_across_boundaries() -> None:
     # Shorter length after a longer one: stale context must be rebuilt.
     backend._prefix_hash_ctx.pop(0, None)
     backend._prefix_hash_len.pop(0, None)
-    assert backend._rolling_prefix_hash(0, new_tokens, 64) == _prefix_hash(
-        new_tokens, 64
-    )
-    assert backend._rolling_prefix_hash(0, new_tokens, 128) == _prefix_hash(
-        new_tokens, 128
-    )
+    assert backend._rolling_prefix_hash(0, new_tokens, 64) == _prefix_hash(new_tokens, 64)
+    assert backend._rolling_prefix_hash(0, new_tokens, 128) == _prefix_hash(new_tokens, 128)
 
     # A jump larger than one block falls back to a fresh hash and rebuilds.
     backend._prefix_hash_ctx.pop(0, None)
     backend._prefix_hash_len.pop(0, None)
-    assert backend._rolling_prefix_hash(0, new_tokens, 32) == _prefix_hash(
-        new_tokens, 32
-    )
-    assert backend._rolling_prefix_hash(0, new_tokens, 512) == _prefix_hash(
-        new_tokens, 512
-    )
+    assert backend._rolling_prefix_hash(0, new_tokens, 32) == _prefix_hash(new_tokens, 32)
+    assert backend._rolling_prefix_hash(0, new_tokens, 512) == _prefix_hash(new_tokens, 512)
