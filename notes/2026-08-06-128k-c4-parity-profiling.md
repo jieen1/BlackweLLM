@@ -619,3 +619,45 @@ max_tokens=4096，concurrency 8）。
 
 数据：`evalplus_results/quality/code_mtpoff_20260806.part.code.json`、
 日志 `logs/quality/suite_code_code_mtpoff_20260806.log`。
+
+## 18. code-4096 四方归因：MTP 算法无罪，差值钉死到两处 kernel 归约顺序（2026-08-07）
+
+§17 只证明了差距在 MTP 路径内。用户追问"08-05 也开 MTP，差在哪"，补做
+两个 sparkinfer A/B 开关后四方对比（同构建、同 suite-fast profile、同
+code 协议，只动 verify 数值路径）：
+
+| 配置 | HumanEval | HumanEval+ |
+|---|---|---|
+| MTP-ON M32+adaptive（当前生产） | 0.8902 | 0.8659 |
+| MTP-ON M16+adaptive | 0.9024 | 0.8902 |
+| **MTP-ON M16+frozen（08-05 数值模式）** | **0.9268** | **0.8902** |
+| **MTP-OFF** | **0.9268** | **0.8902** |
+| 08-05 基线（MTP-on） | 0.921 | 0.884 |
+
+**结论：**
+1. **MTP 算法本身无罪**：把 verify 数值路径还原到 08-05 形态（M16 kernel +
+   frozen worst-case chunking）后，MTP-ON 与 MTP-OFF 得分逐位一致
+   （0.9268 = 0.9268），且都高于 08-05 基线 0.921（greedy 翻转噪声带内）。
+2. **−3.7pp（0.9268→0.8902）拆成两处 split-KV 归约顺序效应**：
+   * adaptive replay re-chunking（`d5865f8`，2026-08-06）：0.9268→0.9024，
+     **−2.4pp**——live 长度重切 chunk 改变了每个 KV chunk 的边界与 merge
+     归约树；
+   * M32 raw-FP8 verifier tiling（sparkinfer `3fc4a5b`，2026-08-06）：
+     0.9024→0.8902，**−1.2pp**——cta_tile_q 16→32 单 tile worklist，K/V 页
+     读取与累加顺序与 M16 双 query-tile 不同。
+   两者都是 ULP 级 logits 差异在 greedy 边界题上的翻转（164 题中 ~17 题
+   任务级翻转），不是系统性质量回退（MMLU-Pro 85.75 > 84.54 等其余指标
+   全面持平或更好）。
+3. **性能代价**：M16+frozen 模式 verify 注意力每页读两次 + 短中上下文沿用
+   最坏 chunk，verify 注意力约慢 ~2×（probe 口径），128K/c4 轮时约
+   +10 ms；换来的是与 08-05 / 非投机路径逐位一致的数值。
+
+**A/B 开关（sparkinfer fork，本次落地）：**
+* `SPARKINFER_QWEN36_VERIFY_M16=1`：planner 对 Qwen3.6 verify 几何返回
+   cta_tile_q=16（M32 gate 失配 → 通用 kernel），复现 08-05 kernel 形态。
+* `SPARKINFER_QWEN36_VERIFY_NO_ADAPTIVE=1`：workspace 的 adaptive
+   re-chunking gate 排除 Qwen3.6 几何，复现 frozen worst-case chunking。
+两开关齐开 = 08-05 数值模式（上表第三行，实测复现）。
+
+数据：`evalplus_results/quality/code_m16verify_20260807.part.code.json`、
+`code_m16noadapt_20260807.part.code.json`、`code_mtpoff_20260806.part.code.json`。
