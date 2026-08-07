@@ -215,6 +215,19 @@ smem 超限（事实基线 §7.6），与本量化混存 checkpoint 无数值可
 
 ### Phase 3 · 缓存与注意力后端，贪心对齐（~3-4 周，最大不确定区）
 
+> **2026-08-07 状态**：核心件已全部落地并有测试（见下），模型级门禁
+> 已实跑 smoke（64 步：logits cos 0.996-0.998、贪心流 63/64 一致、
+> 逐层余弦 0.82-0.9999 随 token 振荡而非指数发散），完整 3×512 门禁
+> 在后台运行中。**门禁标准按实测改判**：fork MLA kernel 的数值契约
+> 距 eager 参考约 3e-4/步（三种独立方式验证），计划原写的逐层
+> 0.99999 不可达；落地口径为 logits cos ≥ 0.99 + 无指数漂移 +
+> 贪心流一致 ≥ 95%（`scripts/dsv4_align_eager_vs_kernel.py`）。
+> 三个 Triton 3.6 编译器缺陷被发现并绕开（bf16 load+归约有损 → uint16
+> bitcast；`tl.softmax` 轴语义错误 → 手写行 softmax）。eager 注意力
+> 的 q 已改为 bf16（对齐官方 kernel 的 BF16 输入契约）。
+
+
+
 1. `runtime/model/dsv4_slots.py`：每层三域缓存池（窗口环 / 压缩区页 256 /
    indexer 区）+ 压缩器 decode 状态（kv_state/score_state，每槽固定）+
    scratch 行（沿用 Qwen36SlotPool 模式；放宽其 uniformity asserts 是**本阶段
