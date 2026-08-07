@@ -79,9 +79,14 @@ def fill_moe(moe: Dsv4MoE, seed: int) -> None:
     for container in (moe.gate_exps, moe.up_exps, moe.down_exps):
         data = valid_iq2_xs_blocks(rng, container.packed.numel() // 74)
         container.packed.copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
-    for linear in (moe.shared_w1, moe.shared_w3, moe.shared_w2, moe.gate.weight):
+    for linear in (moe.shared_w1, moe.shared_w3, moe.shared_w2):
         data = valid_q8_0_blocks(rng, linear.packed.numel() // 34)
         linear.packed.copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
+    # ffn_gate_inp is BF16 in the file (DenseLinear container)
+    gate_w = moe.gate.weight.weight
+    gate_w.copy_(
+        torch.randn(gate_w.shape, generator=torch.Generator().manual_seed(seed + 1)) * 0.05
+    )
     if hasattr(moe.gate, "bias"):
         moe.gate.bias.copy_(
             torch.randn(moe.gate.bias.shape, generator=torch.Generator().manual_seed(seed))
@@ -97,7 +102,7 @@ def reference_moe_output(moe: Dsv4MoE, x: torch.Tensor, input_ids) -> torch.Tens
     weights -- the oracle for the module's gather/scatter wiring."""
     cfg = moe.config
     flat = x.reshape(-1, x.shape[-1]).float()
-    gate_w = moe.gate.weight.dequantized()
+    gate_w = moe.gate.weight.weight.float()
     scores = torch.nn.functional.softplus(flat @ gate_w.t()).sqrt()
     if moe.gate.hashed:
         indices = moe.gate.tid2eid[input_ids.reshape(-1)].to(torch.int64)

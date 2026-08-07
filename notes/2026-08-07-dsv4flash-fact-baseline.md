@@ -40,11 +40,13 @@
 - indexer 张量实际命名（此前猜测有误，已纠正）：`blk.L.indexer.proj.weight`、
   `blk.L.indexer.attn_q_b.weight`、`blk.L.indexer_compressor_{kv,gate,ape,norm}.weight`。
 - 张量族清单：全局 6（token_embd/output/output_norm/output_hc_{fn,base,scale}）；
-  每层固定 20（attn_norm/sinks/q_a/q_a_norm/q_b/kv/kv_a_norm/output_a/output_b、
+  每层固定 23（attn_norm/sinks/q_a/q_a_norm/q_b/kv/kv_a_norm/output_a/output_b、
   hc_{attn,ffn}_{fn,base,scale}×2、ffn_norm/gate_inp/{gate,up,down}_exps/
   {gate,up,down}_shexp）；ratio≠0 层 +4（attn_compressor_{kv,gate,ape,norm}）；
   ratio=4 层再 +6（indexer.proj/attn_q_b + indexer_compressor_{kv,gate,ape,norm}）；
-  层 0-2 有 ffn_gate_tid2eid，层 3+ 有 exp_probs_b.bias。合计 6+43×20+41×4+21×6+3 = 1328 ✓。
+  层 0-2 有 ffn_gate_tid2eid（3），层 3+ 有 exp_probs_b.bias（40）。
+  合计 6 + 43×23 + 3 + 41×4 + 21×6 + 40 = 1328 ✓（2026-08-07 重新逐张量清点
+  核实；本条此前写"固定 20"且算式不闭合，已更正）。
 
 ## 3. 反量化语义（已位精确验证）
 
@@ -150,3 +152,37 @@ acc_s_cast 8 KB + margin），而本机 RTX PRO 6000 Blackwell（SM120）的 opt
 - 贪心逐 token 对齐（Phase 3：我们的 kernel vs llama.cpp，同 artifact）。
 - pre-tokenize/encoding 端到端 round-trip（Phase 4 用官方 4 组向量）。
 - DSpark 伴生模型（Phase 5，尚未下载）。
+
+## 9. Phase 2 收尾事实（2026-08-07，全图 eager 打通）
+
+### 9.1 逐层形状复核（全文件清点，纠正 §2.1 的族计数）
+
+- ratio-4 层（偶数 2..42，21 层）：`attn_compressor_{kv,gate}` (1024, 4096) Q8_0，
+  `attn_compressor_ape` (4, 1024) Q8_0，`attn_compressor_norm` (512,) F32；
+  indexer 六件：`indexer.attn_q_b` (8192, 1024)、`indexer.proj` (64, 4096)、
+  `indexer_compressor_{kv,gate}` (256, 4096)、`indexer_compressor_ape` (4, 256)、
+  `indexer_compressor_norm` (128,)。
+- ratio-128 层（奇数 3..41，20 层）：`attn_compressor_{kv,gate}` (512, 4096) Q8_0，
+  `attn_compressor_ape` (128, 512) Q8_0，norm (512,) F32；无 indexer。
+- `exp_probs_b.bias` (256,) F32 在层 3..42（40 层，即全部非 hash 层）；
+  `ffn_gate_tid2eid` (129280, 6) I32 在层 0-2。两者按层互斥。
+- 复现：`python tools/verify_dsv4_tensor_map.py`（形状）+ 本节清点脚本
+  （`iterate_gguf_checkpoint` 全量遍历，1328/1328 与
+  `expected_gguf_tensor_names(config)` 集合相等，见
+  `tests/test_dsv4_model.py::test_expected_names_match_real_header`）。
+
+### 9.2 全量装载 + eager 前向冒烟（真实权重，GPU 冷进程）
+
+- 复现：`QSR_DSV4_FULL_LOAD=1 ~/.venvs/vllm/bin/python -m pytest \
+  tests/test_dsv4_model.py -q -k full_load -s`（约 2 分钟：81.9 GiB packed
+  直上 GPU + 两步前向）。
+- `load_dsv4_from_gguf` 流式装载 1328/1328 张量零豁免；图直接在 GPU 上构造
+  （主机 RAM 仅 23 GiB，任何 CPU 中转都会 OOM —— 构造期 device 直通是硬约束）。
+- 贪心冒烟（prompt "The meaning of life is"，eager fp32 dequant 数值）：
+  - 末位 logits：mean 1.395，std 5.433，max 22.074；
+  - top-5：396 " that"(22.074)、304 " to"(22.048)、554 " not"(21.589)、
+    260 " a"(20.031)、1613 "..."(19.688)；argmax = " that"；
+  - decode 第 1 步（start_pos=5，走窗口环/压缩器 decode 路径）argmax = 436 " it"
+    → "The meaning of life is that it…"，语义连贯。
+- 该记录是 Phase 3 贪心对齐的 eager 锚点之一（另一锚点是 llama.cpp 基线，
+  同 prompt 复跑见 §7）。

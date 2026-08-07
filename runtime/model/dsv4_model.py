@@ -1,11 +1,12 @@
 """DeepSeek-V4-Flash model graph (GGUF IQ2_XS/Q8_0).
 
-Phase 2 status: FFN half (weight containers, RMSNorm, Gate, MoE) with eager
-dequant-on-demand numerics; attention half and assembly land in the next
-increments. Quantized weights stay packed end-to-end (plan D2): eager paths
-dequantize on demand without caching BF16 copies (the Qwen3.6 dequant-cache
-memory floor is the standing warning), and Phase 3 replaces the dequant call
-sites with fused kernels keeping the same numerics as dsv4_quant.
+Phase 2 complete: full eager graph (containers, RMSNorm, Gate, MoE,
+compressor, indexer, attention, Hyper-Connections, Block, Transformer) plus
+the zero-exemption GGUF loader. Quantized weights stay packed end-to-end
+(plan D2): eager paths dequantize on demand without caching BF16 copies (the
+Qwen3.6 dequant-cache memory floor is the standing warning), and Phase 3
+replaces the dequant call sites with fused kernels keeping the same numerics
+as dsv4_quant.
 
 Weight naming follows the GGUF file (verified 1:1 against llama.cpp's
 create_tensor declarations, notes/2026-08-07-dsv4flash-fact-baseline.md §2.1).
@@ -13,37 +14,39 @@ create_tensor declarations, notes/2026-08-07-dsv4flash-fact-baseline.md §2.1).
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-from runtime.loading.gguf import GgufTensor
-from runtime.model.dsv4_config import Dsv4Config
+from loader.gguf_header import read_gguf_header
+from runtime.loading.gguf import GgufTensor, iterate_gguf_checkpoint
+from runtime.model.dsv4_config import Dsv4Config, config_from_gguf_kv
 from runtime.model.dsv4_quant import dequantize_iq2_xs, dequantize_q8_0
 
 
-class PackedQ8_0Linear(nn.Module):
-    """Linear over a packed Q8_0 weight; dequantized per forward (eager).
+class PackedQ8_0Weight(nn.Module):
+    """Packed Q8_0 storage plus on-demand fp32 dequantization (no forward).
 
-    ``weight_dtype=None`` (default): fp32 dequant, fp32 compute -- the eager
-    accuracy contract. ``weight_dtype=torch.bfloat16``: the dequantized values
-    round to bf16 first and the matmul runs bf16 -- the regime the reference
-    uses for bf16-declared linears (its ``linear()`` is strict on dtypes),
-    and what these layers will run at in production.
+    Also the container for Q8_0 matrices that are consumed outside a plain
+    linear (the HC mixing matrices ``hc_*_fn``, dequantized inside hc_pre).
     """
 
     def __init__(
-        self, out_features: int, in_features: int, *, weight_dtype: torch.dtype | None = None
+        self, out_features: int, in_features: int, *, device: torch.device | str | None = None
     ) -> None:
         super().__init__()
         self.out_features = out_features
         self.in_features = in_features
-        self.weight_dtype = weight_dtype
         numel = out_features * in_features
         n_bytes = numel // 32 * 34
-        self.register_buffer("packed", torch.empty(n_bytes, dtype=torch.uint8))
+        self.register_buffer("packed", torch.empty(n_bytes, dtype=torch.uint8, device=device))
 
     def load_packed(self, tensor: GgufTensor) -> None:
+        if tensor.type_name != "Q8_0":
+            raise ValueError(f"{tensor.name}: expected Q8_0, got {tensor.type_name}")
         if tuple(tensor.shape) != (self.out_features, self.in_features):
             raise ValueError(
                 f"{tensor.name}: expected {self.out_features}x{self.in_features}, "
@@ -54,11 +57,66 @@ class PackedQ8_0Linear(nn.Module):
     def dequantized(self) -> torch.Tensor:
         return dequantize_q8_0(self.packed).reshape(self.out_features, self.in_features)
 
+
+class PackedQ8_0Linear(PackedQ8_0Weight):
+    """Linear over a packed Q8_0 weight; dequantized per forward (eager).
+
+    ``weight_dtype=None`` (default): fp32 dequant, fp32 compute -- the eager
+    accuracy contract. ``weight_dtype=torch.bfloat16``: the dequantized values
+    round to bf16 first and the matmul runs bf16 -- the regime the reference
+    uses for bf16-declared linears (its ``linear()`` is strict on dtypes),
+    and what these layers will run at in production.
+    """
+
+    def __init__(
+        self,
+        out_features: int,
+        in_features: int,
+        *,
+        weight_dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
+    ) -> None:
+        super().__init__(out_features, in_features, device=device)
+        self.weight_dtype = weight_dtype
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = self.dequantized()
         if self.weight_dtype is not None:
             return F.linear(x, weight.to(self.weight_dtype))
         return F.linear(x.float(), weight)
+
+
+class DenseLinear(nn.Module):
+    """Dense weight stored in the file's own dtype; fp32-matmul forward.
+
+    Used for the router weight (``ffn_gate_inp``, BF16 in the file). The
+    reference regime is ``linear(x.float(), weight.float())`` -- an fp32
+    matmul over bf16 values (reference Gate.forward).
+    """
+
+    def __init__(
+        self, out_features: int, in_features: int, *, device: torch.device | str | None = None
+    ) -> None:
+        super().__init__()
+        self.out_features = out_features
+        self.in_features = in_features
+        self.register_buffer(
+            "weight",
+            torch.empty(out_features, in_features, dtype=torch.bfloat16, device=device),
+        )
+
+    def load(self, tensor: GgufTensor) -> None:
+        if tensor.type_name != "BF16":
+            raise ValueError(f"{tensor.name}: expected BF16, got {tensor.type_name}")
+        if tuple(tensor.shape) != (self.out_features, self.in_features):
+            raise ValueError(
+                f"{tensor.name}: expected {self.out_features}x{self.in_features}, "
+                f"got {tensor.shape}"
+            )
+        self.weight.copy_(tensor.data.to(self.weight.device))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x.float(), self.weight.float())
 
 
 class PackedIQ2_XSExperts(nn.Module):
@@ -69,7 +127,9 @@ class PackedIQ2_XSExperts(nn.Module):
     in fp32, more than the card's headroom.
     """
 
-    def __init__(self, num_experts: int, rows: int, cols: int) -> None:
+    def __init__(
+        self, num_experts: int, rows: int, cols: int, *, device: torch.device | str | None = None
+    ) -> None:
         super().__init__()
         self.num_experts = num_experts
         self.rows = rows
@@ -77,9 +137,11 @@ class PackedIQ2_XSExperts(nn.Module):
         row_blocks = cols // 256
         self._row_bytes = row_blocks * 74
         total = num_experts * rows * self._row_bytes
-        self.register_buffer("packed", torch.empty(total, dtype=torch.uint8))
+        self.register_buffer("packed", torch.empty(total, dtype=torch.uint8, device=device))
 
     def load_packed(self, tensor: GgufTensor) -> None:
+        if tensor.type_name != "IQ2_XS":
+            raise ValueError(f"{tensor.name}: expected IQ2_XS, got {tensor.type_name}")
         if tuple(tensor.shape) != (self.num_experts, self.rows, self.cols):
             raise ValueError(
                 f"{tensor.name}: expected "
@@ -110,18 +172,30 @@ class Dsv4Gate(nn.Module):
     graph-owned module.
     """
 
-    def __init__(self, config: Dsv4Config, *, hashed: bool) -> None:
+    def __init__(
+        self,
+        config: Dsv4Config,
+        *,
+        hashed: bool,
+        device: torch.device | str | None = None,
+    ) -> None:
         super().__init__()
         self.top_k = config.n_activated_experts
         self.route_scale = config.route_scale
         self.hashed = hashed
-        self.weight = PackedQ8_0Linear(config.n_routed_experts, config.hidden_size)
+        # ffn_gate_inp is BF16 in the file; reference regime is fp32 matmul
+        # over bf16 values (linear(x.float(), weight.float())).
+        self.weight = DenseLinear(config.n_routed_experts, config.hidden_size, device=device)
         if hashed:
             self.register_buffer(
-                "tid2eid", torch.empty(config.vocab_size, self.top_k, dtype=torch.int32)
+                "tid2eid",
+                torch.empty(config.vocab_size, self.top_k, dtype=torch.int32, device=device),
             )
         else:
-            self.register_buffer("bias", torch.empty(config.n_routed_experts, dtype=torch.float32))
+            self.register_buffer(
+                "bias",
+                torch.empty(config.n_routed_experts, dtype=torch.float32, device=device),
+            )
 
     def forward(
         self, x: torch.Tensor, input_ids: torch.Tensor | None
@@ -153,19 +227,25 @@ class Dsv4MoE(nn.Module):
     fused permute/scatter kernel is Phase 3.
     """
 
-    def __init__(self, config: Dsv4Config, *, hashed: bool) -> None:
+    def __init__(
+        self,
+        config: Dsv4Config,
+        *,
+        hashed: bool,
+        device: torch.device | str | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
-        self.gate = Dsv4Gate(config, hashed=hashed)
+        self.gate = Dsv4Gate(config, hashed=hashed, device=device)
         inter = config.moe_intermediate_size
         hidden = config.hidden_size
         experts = config.n_routed_experts
-        self.gate_exps = PackedIQ2_XSExperts(experts, inter, hidden)
-        self.up_exps = PackedIQ2_XSExperts(experts, inter, hidden)
-        self.down_exps = PackedIQ2_XSExperts(experts, hidden, inter)
-        self.shared_w1 = PackedQ8_0Linear(inter, hidden)
-        self.shared_w3 = PackedQ8_0Linear(inter, hidden)
-        self.shared_w2 = PackedQ8_0Linear(hidden, inter)
+        self.gate_exps = PackedIQ2_XSExperts(experts, inter, hidden, device=device)
+        self.up_exps = PackedIQ2_XSExperts(experts, inter, hidden, device=device)
+        self.down_exps = PackedIQ2_XSExperts(experts, hidden, inter, device=device)
+        self.shared_w1 = PackedQ8_0Linear(inter, hidden, device=device)
+        self.shared_w3 = PackedQ8_0Linear(inter, hidden, device=device)
+        self.shared_w2 = PackedQ8_0Linear(hidden, inter, device=device)
 
     def _shared_forward(self, x: torch.Tensor) -> torch.Tensor:
         gate = self.shared_w1(x)
@@ -229,6 +309,7 @@ class Dsv4Compressor(nn.Module):
         *,
         head_dim: int | None = None,
         rotate: bool = False,
+        device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
         self.ratio = config.layer_ratio(layer_id)
@@ -241,20 +322,28 @@ class Dsv4Compressor(nn.Module):
         self.ue8m0 = True  # production QAT config (fp8-origin weights)
         coff = 2 if self.overlap else 1
         self.coeff = coff
-        self.wkv = PackedQ8_0Linear(coff * self.head_dim, config.hidden_size)
-        self.wgate = PackedQ8_0Linear(coff * self.head_dim, config.hidden_size)
+        self.wkv = PackedQ8_0Linear(coff * self.head_dim, config.hidden_size, device=device)
+        self.wgate = PackedQ8_0Linear(coff * self.head_dim, config.hidden_size, device=device)
         self.register_buffer(
-            "ape", torch.empty(self.ratio, coff * self.head_dim, dtype=torch.float32)
+            "ape", torch.empty(self.ratio, coff * self.head_dim, dtype=torch.float32, device=device)
         )
-        self.register_buffer("norm_weight", torch.empty(self.head_dim, dtype=torch.float32))
+        self.register_buffer(
+            "norm_weight", torch.empty(self.head_dim, dtype=torch.float32, device=device)
+        )
         # per-slot decode state; batch dim sized at capture/slot time (eager: 1)
         self.register_buffer(
-            "kv_state", torch.zeros(1, coff * self.ratio, coff * self.head_dim, dtype=torch.float32)
+            "kv_state",
+            torch.zeros(
+                1, coff * self.ratio, coff * self.head_dim, dtype=torch.float32, device=device
+            ),
         )
         self.register_buffer(
             "score_state",
             torch.full(
-                (1, coff * self.ratio, coff * self.head_dim), float("-inf"), dtype=torch.float32
+                (1, coff * self.ratio, coff * self.head_dim),
+                float("-inf"),
+                dtype=torch.float32,
+                device=device,
             ),
         )
         self.freqs_cis: torch.Tensor | None = None
@@ -374,7 +463,14 @@ class Dsv4Indexer(nn.Module):
     linears); the score accumulation after the einsum is fp32.
     """
 
-    def __init__(self, config: Dsv4Config, layer_id: int, *, max_seq_len: int = 4096) -> None:
+    def __init__(
+        self,
+        config: Dsv4Config,
+        layer_id: int,
+        *,
+        max_seq_len: int = 4096,
+        device: torch.device | str | None = None,
+    ) -> None:
         super().__init__()
         assert config.has_indexer(layer_id)
         self.n_heads = config.index_n_heads
@@ -383,12 +479,17 @@ class Dsv4Indexer(nn.Module):
         self.index_topk = config.index_topk
         self.softmax_scale = self.head_dim**-0.5
         self.wq_b = PackedQ8_0Linear(
-            self.n_heads * self.head_dim, config.q_lora_rank, weight_dtype=torch.bfloat16
+            self.n_heads * self.head_dim,
+            config.q_lora_rank,
+            weight_dtype=torch.bfloat16,
+            device=device,
         )
         self.weights_proj = PackedQ8_0Linear(
-            self.n_heads, config.hidden_size, weight_dtype=torch.bfloat16
+            self.n_heads, config.hidden_size, weight_dtype=torch.bfloat16, device=device
         )
-        self.compressor = Dsv4Compressor(config, layer_id, head_dim=self.head_dim, rotate=True)
+        self.compressor = Dsv4Compressor(
+            config, layer_id, head_dim=self.head_dim, rotate=True, device=device
+        )
         # indexer owns its scoring cache (reference layout); its compressor
         # writes into it via the wiring in forward().
         self.register_buffer(
@@ -398,6 +499,7 @@ class Dsv4Indexer(nn.Module):
                 max_seq_len // config.layer_ratio(layer_id),
                 self.head_dim,
                 dtype=torch.bfloat16,
+                device=device,
             ),
         )
         self.freqs_cis: torch.Tensor | None = None
@@ -456,7 +558,14 @@ class Dsv4Attention(nn.Module):
     scoring cache inside itself.
     """
 
-    def __init__(self, config: Dsv4Config, layer_id: int, *, max_seq_len: int = 4096) -> None:
+    def __init__(
+        self,
+        config: Dsv4Config,
+        layer_id: int,
+        *,
+        max_seq_len: int = 4096,
+        device: torch.device | str | None = None,
+    ) -> None:
         super().__init__()
         self.layer_id = layer_id
         self.ratio = config.layer_ratio(layer_id)
@@ -470,33 +579,53 @@ class Dsv4Attention(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
 
         self.wq_a = PackedQ8_0Linear(
-            config.q_lora_rank, config.hidden_size, weight_dtype=torch.bfloat16
+            config.q_lora_rank, config.hidden_size, weight_dtype=torch.bfloat16, device=device
         )
-        self.register_buffer("q_norm_weight", torch.empty(config.q_lora_rank, dtype=torch.float32))
+        self.register_buffer(
+            "q_norm_weight",
+            torch.empty(config.q_lora_rank, dtype=torch.float32, device=device),
+        )
         self.wq_b = PackedQ8_0Linear(
-            self.n_heads * self.head_dim, config.q_lora_rank, weight_dtype=torch.bfloat16
+            self.n_heads * self.head_dim,
+            config.q_lora_rank,
+            weight_dtype=torch.bfloat16,
+            device=device,
         )
-        self.wkv = PackedQ8_0Linear(self.head_dim, config.hidden_size, weight_dtype=torch.bfloat16)
-        self.register_buffer("kv_norm_weight", torch.empty(self.head_dim, dtype=torch.float32))
+        self.wkv = PackedQ8_0Linear(
+            self.head_dim, config.hidden_size, weight_dtype=torch.bfloat16, device=device
+        )
+        self.register_buffer(
+            "kv_norm_weight", torch.empty(self.head_dim, dtype=torch.float32, device=device)
+        )
         self.wo_a = PackedQ8_0Linear(
             self.n_groups * self.o_lora_rank,
             self.n_heads * self.head_dim // self.n_groups,
             weight_dtype=torch.bfloat16,
+            device=device,
         )
         self.wo_b = PackedQ8_0Linear(
-            config.hidden_size, self.n_groups * self.o_lora_rank, weight_dtype=torch.bfloat16
+            config.hidden_size,
+            self.n_groups * self.o_lora_rank,
+            weight_dtype=torch.bfloat16,
+            device=device,
         )
-        self.register_buffer("attn_sink", torch.empty(self.n_heads, dtype=torch.float32))
+        self.register_buffer(
+            "attn_sink", torch.empty(self.n_heads, dtype=torch.float32, device=device)
+        )
 
-        self.compressor = Dsv4Compressor(config, layer_id) if self.ratio else None
+        self.compressor = Dsv4Compressor(config, layer_id, device=device) if self.ratio else None
         self.indexer = (
-            Dsv4Indexer(config, layer_id, max_seq_len=max_seq_len) if self.ratio == 4 else None
+            Dsv4Indexer(config, layer_id, max_seq_len=max_seq_len, device=device)
+            if self.ratio == 4
+            else None
         )
 
         n_compressed = max_seq_len // self.ratio if self.ratio else 0
         self.register_buffer(
             "kv_cache",
-            torch.zeros(1, self.window + n_compressed, self.head_dim, dtype=torch.bfloat16),
+            torch.zeros(
+                1, self.window + n_compressed, self.head_dim, dtype=torch.bfloat16, device=device
+            ),
         )
         if self.ratio:
             freqs = precompute_freqs_cis(
@@ -519,6 +648,8 @@ class Dsv4Attention(nn.Module):
                 beta_fast=config.beta_fast,
                 beta_slow=config.beta_slow,
             )
+        if device is not None:
+            freqs = freqs.to(device)
         self.register_buffer("freqs_cis", freqs)
 
     def _wire_subcaches(self) -> None:
@@ -586,3 +717,457 @@ class Dsv4Attention(nn.Module):
 
     def kv_norm(self, x: torch.Tensor) -> torch.Tensor:
         return rms_norm(x, self.kv_norm_weight, self.eps)
+
+
+# ---------------------------------------------------------------------------
+# Hyper-Connections (reference Block, model.py). hc_pre reduces hc_mult
+# residual copies to one via Sinkhorn-projected mixing weights; hc_post
+# expands back. The Sinkhorn loop ENDS on a column normalization on purpose
+# (row sums drift; the reference relies on it) -- verified against the
+# tilelang kernel in tests/test_dsv4_reference_parts.py.
+# ---------------------------------------------------------------------------
+
+
+def hc_split_sinkhorn(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """mixes layout: [pre(hc) | post(hc) | comb(hc*hc)], per token."""
+    hc = hc_mult
+    pre = torch.sigmoid(mixes[..., :hc] * hc_scale[0] + hc_base[:hc]) + eps
+    post = 2 * torch.sigmoid(mixes[..., hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc])
+    comb = (mixes[..., 2 * hc :] * hc_scale[2] + hc_base[2 * hc :]).reshape(
+        *mixes.shape[:-1], hc, hc
+    )
+    comb = comb.softmax(dim=-1) + eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(sinkhorn_iters - 1):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    return pre, post, comb
+
+
+class Dsv4Embedding(nn.Module):
+    """Packed Q8_0 token embedding with dequantizing row lookup.
+
+    Rows are exactly ``hidden_size // 32`` Q8_0 blocks (the contiguous
+    dimension), so a lookup dequantizes only the requested rows. Output is
+    bf16 -- the reference stream dtype.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_size: int,
+        *,
+        device: torch.device | str | None = None,
+    ) -> None:
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.hidden_size = hidden_size
+        self._row_bytes = hidden_size // 32 * 34
+        self.register_buffer(
+            "packed", torch.empty(vocab_size * self._row_bytes, dtype=torch.uint8, device=device)
+        )
+
+    def load_packed(self, tensor: GgufTensor) -> None:
+        if tensor.type_name != "Q8_0":
+            raise ValueError(f"{tensor.name}: expected Q8_0, got {tensor.type_name}")
+        if tuple(tensor.shape) != (self.vocab_size, self.hidden_size):
+            raise ValueError(
+                f"{tensor.name}: expected {(self.vocab_size, self.hidden_size)}, got {tensor.shape}"
+            )
+        self.packed.copy_(tensor.data.to(self.packed.device))
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        flat = input_ids.reshape(-1)
+        rows = self.packed.view(-1, self._row_bytes)[flat]
+        values = dequantize_q8_0(rows.reshape(-1))
+        return values.reshape(*input_ids.shape, self.hidden_size).to(torch.bfloat16)
+
+
+class Dsv4Block(nn.Module):
+    """Transformer block with Hyper-Connections mixing (reference Block).
+
+    hc_pre: hc_mult copies -> 1 via Sinkhorn-weighted sum; hc_post: expand
+    1 -> hc_mult copies via post weights + combination matrix. attn/ffn run
+    on the single reduced stream, bf16 like the reference.
+    """
+
+    def __init__(
+        self,
+        config: Dsv4Config,
+        layer_id: int,
+        *,
+        max_seq_len: int = 4096,
+        device: torch.device | str | None = None,
+    ) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.eps = config.norm_eps
+        self.hc_mult = config.hc_mult
+        self.hc_eps = config.hc_eps
+        self.hc_iters = config.hc_sinkhorn_iters
+        self.attn = Dsv4Attention(config, layer_id, max_seq_len=max_seq_len, device=device)
+        self.moe = Dsv4MoE(config, hashed=layer_id in config.hash_layer_ids, device=device)
+        self.register_buffer(
+            "attn_norm_weight",
+            torch.empty(config.hidden_size, dtype=torch.float32, device=device),
+        )
+        self.register_buffer(
+            "ffn_norm_weight",
+            torch.empty(config.hidden_size, dtype=torch.float32, device=device),
+        )
+        self.hc_attn_fn = PackedQ8_0Weight(config.hc_mix_dim, config.hc_dim, device=device)
+        self.hc_ffn_fn = PackedQ8_0Weight(config.hc_mix_dim, config.hc_dim, device=device)
+        self.register_buffer(
+            "hc_attn_base", torch.empty(config.hc_mix_dim, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "hc_ffn_base", torch.empty(config.hc_mix_dim, dtype=torch.float32, device=device)
+        )
+        self.register_buffer("hc_attn_scale", torch.empty(3, dtype=torch.float32, device=device))
+        self.register_buffer("hc_ffn_scale", torch.empty(3, dtype=torch.float32, device=device))
+
+    def hc_pre(
+        self,
+        x: torch.Tensor,
+        hc_fn: PackedQ8_0Weight,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # x: [b,s,hc,d] -> reduced [b,s,d] plus the post/comb weights.
+        shape, dtype = x.shape, x.dtype
+        xf = x.flatten(2).float()
+        rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
+        mixes = F.linear(xf, hc_fn.dequantized()) * rsqrt
+        pre, post, comb = hc_split_sinkhorn(
+            mixes, hc_scale, hc_base, self.hc_mult, self.hc_iters, self.hc_eps
+        )
+        y = (pre.unsqueeze(-1) * x.view(shape)).sum(dim=2)
+        return y.to(dtype), post, comb
+
+    @staticmethod
+    def hc_post(
+        x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
+    ) -> torch.Tensor:
+        # x: [b,s,d], residual: [b,s,hc,d] -> [b,s,hc,d]
+        y = post.unsqueeze(-1) * x.unsqueeze(-2) + (
+            comb.unsqueeze(-1) * residual.unsqueeze(-2)
+        ).sum(dim=2)
+        return y.to(x.dtype)
+
+    def forward(self, x: torch.Tensor, start_pos: int, input_ids: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        x = rms_norm(x, self.attn_norm_weight, self.eps)
+        x = self.attn(x, start_pos)
+        x = self.hc_post(x, residual, post, comb)
+
+        residual = x
+        x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        x = rms_norm(x, self.ffn_norm_weight, self.eps)
+        x = self.moe(x, input_ids)
+        x = self.hc_post(x, residual, post, comb)
+        return x
+
+
+class Dsv4Transformer(nn.Module):
+    """Full eager graph: embed -> HC expand -> 43 blocks -> hc_head -> logits.
+
+    No DSpark/MTP stage by design (the quant-mix GGUF carries no mtp.*
+    tensors; DSpark support, if ever attempted, is a later self-quant
+    experiment -- plan D9). forward returns fp32 logits [b, s, vocab];
+    sampling is the server's job.
+    """
+
+    def __init__(
+        self,
+        config: Dsv4Config,
+        *,
+        max_seq_len: int = 4096,
+        device: torch.device | str | None = None,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.eps = config.norm_eps
+        self.hc_mult = config.hc_mult
+        self.hc_eps = config.hc_eps
+        self.embed = Dsv4Embedding(config.vocab_size, config.hidden_size, device=device)
+        self.blocks = nn.ModuleList(
+            Dsv4Block(config, layer_id, max_seq_len=max_seq_len, device=device)
+            for layer_id in range(config.num_layers)
+        )
+        self.register_buffer(
+            "norm_weight", torch.empty(config.hidden_size, dtype=torch.float32, device=device)
+        )
+        self.hc_head_fn = PackedQ8_0Weight(config.hc_mult, config.hc_dim, device=device)
+        self.register_buffer(
+            "hc_head_base", torch.empty(config.hc_mult, dtype=torch.float32, device=device)
+        )
+        self.register_buffer("hc_head_scale", torch.empty(1, dtype=torch.float32, device=device))
+        self.lm_head = PackedQ8_0Linear(config.vocab_size, config.hidden_size, device=device)
+
+    def hc_head(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [b,s,hc,d] -> [b,s,d]; sigmoid weights, no Sinkhorn (reference).
+        shape, dtype = x.shape, x.dtype
+        xf = x.flatten(2).float()
+        rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
+        mixes = F.linear(xf, self.hc_head_fn.dequantized()) * rsqrt
+        pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
+        return (pre.unsqueeze(-1) * x.view(shape)).sum(dim=2).to(dtype)
+
+    @torch.inference_mode()
+    def forward(self, input_ids: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+        h = self.embed(input_ids)
+        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        for block in self.blocks:
+            h = block(h, start_pos, input_ids)
+        h = self.hc_head(h)
+        return self.lm_head(rms_norm(h, self.norm_weight, self.eps))
+
+
+# ---------------------------------------------------------------------------
+# GGUF loading: every one of the 1328 tensors maps by name to exactly one
+# home in the graph, with type and shape asserted at the store site. Zero
+# exemptions -- an unknown tensor or a missing expectation is a hard error,
+# the same refusal posture as the registry.
+# ---------------------------------------------------------------------------
+
+_BLK_RE = re.compile(r"^blk\.(\d+)\.(.+)$")
+
+
+def expected_gguf_tensor_names(config: Dsv4Config) -> set[str]:
+    """The full tensor inventory implied by the config (verified 1:1 against
+    the real file header; notes/2026-08-07-dsv4flash-fact-baseline.md §2)."""
+    names = {
+        "token_embd.weight",
+        "output.weight",
+        "output_norm.weight",
+        "output_hc_fn.weight",
+        "output_hc_base.weight",
+        "output_hc_scale.weight",
+    }
+    for layer_id in range(config.num_layers):
+        prefix = f"blk.{layer_id}."
+        names |= {
+            prefix + fixed
+            for fixed in (
+                "attn_norm.weight",
+                "ffn_norm.weight",
+                "attn_sinks.weight",
+                "attn_q_a.weight",
+                "attn_q_a_norm.weight",
+                "attn_q_b.weight",
+                "attn_kv.weight",
+                "attn_kv_a_norm.weight",
+                "attn_output_a.weight",
+                "attn_output_b.weight",
+                "hc_attn_fn.weight",
+                "hc_attn_base.weight",
+                "hc_attn_scale.weight",
+                "hc_ffn_fn.weight",
+                "hc_ffn_base.weight",
+                "hc_ffn_scale.weight",
+                "ffn_gate_inp.weight",
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+                "ffn_gate_shexp.weight",
+                "ffn_up_shexp.weight",
+                "ffn_down_shexp.weight",
+            )
+        }
+        if layer_id in config.hash_layer_ids:
+            names.add(prefix + "ffn_gate_tid2eid.weight")
+        else:
+            names.add(prefix + "exp_probs_b.bias")
+        if config.has_compressor(layer_id):
+            names |= {
+                prefix + part
+                for part in (
+                    "attn_compressor_kv.weight",
+                    "attn_compressor_gate.weight",
+                    "attn_compressor_ape.weight",
+                    "attn_compressor_norm.weight",
+                )
+            }
+        if config.has_indexer(layer_id):
+            names |= {
+                prefix + part
+                for part in (
+                    "indexer.attn_q_b.weight",
+                    "indexer.proj.weight",
+                    "indexer_compressor_kv.weight",
+                    "indexer_compressor_gate.weight",
+                    "indexer_compressor_ape.weight",
+                    "indexer_compressor_norm.weight",
+                )
+            }
+    return names
+
+
+def _f32_into(tensor: GgufTensor, buffer: torch.Tensor) -> None:
+    if tensor.type_name != "F32":
+        raise ValueError(f"{tensor.name}: expected F32, got {tensor.type_name}")
+    if tuple(tensor.shape) != tuple(buffer.shape):
+        raise ValueError(f"{tensor.name}: expected {tuple(buffer.shape)}, got {tensor.shape}")
+    buffer.copy_(tensor.data.to(buffer.device))
+
+
+def _i32_into(tensor: GgufTensor, buffer: torch.Tensor) -> None:
+    if tensor.type_name != "I32":
+        raise ValueError(f"{tensor.name}: expected I32, got {tensor.type_name}")
+    if tuple(tensor.shape) != tuple(buffer.shape):
+        raise ValueError(f"{tensor.name}: expected {tuple(buffer.shape)}, got {tensor.shape}")
+    buffer.copy_(tensor.data.to(buffer.device))
+
+
+def _q8_0_dequant_into(tensor: GgufTensor, buffer: torch.Tensor) -> None:
+    """APE tensors are Q8_0 in the file but fp32 operands in the graph."""
+    if tensor.type_name != "Q8_0":
+        raise ValueError(f"{tensor.name}: expected Q8_0, got {tensor.type_name}")
+    values = dequantize_q8_0(tensor.data)
+    if values.numel() != buffer.numel():
+        raise ValueError(f"{tensor.name}: expected {buffer.numel()} values, got {values.numel()}")
+    buffer.copy_(values.reshape(buffer.shape).to(buffer.device))
+
+
+def store_gguf_tensor(model: Dsv4Transformer, tensor: GgufTensor) -> None:
+    """Route one streamed tensor into the graph; raises on any mismatch."""
+    name = tensor.name
+    if name == "token_embd.weight":
+        return model.embed.load_packed(tensor)
+    if name == "output.weight":
+        return model.lm_head.load_packed(tensor)
+    if name == "output_norm.weight":
+        return _f32_into(tensor, model.norm_weight)
+    if name == "output_hc_fn.weight":
+        return model.hc_head_fn.load_packed(tensor)
+    if name == "output_hc_base.weight":
+        return _f32_into(tensor, model.hc_head_base)
+    if name == "output_hc_scale.weight":
+        return _f32_into(tensor, model.hc_head_scale)
+
+    match = _BLK_RE.match(name)
+    if match is None:
+        raise ValueError(f"unknown GGUF tensor: {name}")
+    layer_id, rest = int(match.group(1)), match.group(2)
+    if layer_id >= len(model.blocks):
+        raise ValueError(f"{name}: layer {layer_id} out of range ({len(model.blocks)})")
+    block = model.blocks[layer_id]
+    attn, moe = block.attn, block.moe
+
+    simple_f32 = {
+        "attn_norm.weight": block.attn_norm_weight,
+        "ffn_norm.weight": block.ffn_norm_weight,
+        "hc_attn_base.weight": block.hc_attn_base,
+        "hc_attn_scale.weight": block.hc_attn_scale,
+        "hc_ffn_base.weight": block.hc_ffn_base,
+        "hc_ffn_scale.weight": block.hc_ffn_scale,
+        "attn_q_a_norm.weight": attn.q_norm_weight,
+        "attn_kv_a_norm.weight": attn.kv_norm_weight,
+        "attn_sinks.weight": attn.attn_sink,
+    }
+    if rest in simple_f32:
+        return _f32_into(tensor, simple_f32[rest])
+
+    simple_q8 = {
+        "hc_attn_fn.weight": block.hc_attn_fn,
+        "hc_ffn_fn.weight": block.hc_ffn_fn,
+        "attn_q_a.weight": attn.wq_a,
+        "attn_q_b.weight": attn.wq_b,
+        "attn_kv.weight": attn.wkv,
+        "attn_output_a.weight": attn.wo_a,
+        "attn_output_b.weight": attn.wo_b,
+        "ffn_gate_shexp.weight": moe.shared_w1,
+        "ffn_up_shexp.weight": moe.shared_w3,
+        "ffn_down_shexp.weight": moe.shared_w2,
+    }
+    if rest in simple_q8:
+        return simple_q8[rest].load_packed(tensor)
+
+    if rest == "ffn_gate_inp.weight":
+        return moe.gate.weight.load(tensor)
+    if rest == "ffn_gate_exps.weight":
+        return moe.gate_exps.load_packed(tensor)
+    if rest == "ffn_up_exps.weight":
+        return moe.up_exps.load_packed(tensor)
+    if rest == "ffn_down_exps.weight":
+        return moe.down_exps.load_packed(tensor)
+    if rest == "ffn_gate_tid2eid.weight":
+        if not moe.gate.hashed:
+            raise ValueError(f"{name}: layer {layer_id} is not a hash layer")
+        return _i32_into(tensor, moe.gate.tid2eid)
+    if rest == "exp_probs_b.bias":
+        if moe.gate.hashed:
+            raise ValueError(f"{name}: layer {layer_id} is a hash layer")
+        return _f32_into(tensor, moe.gate.bias)
+
+    if attn.compressor is not None:
+        compressor = attn.compressor
+        if rest == "attn_compressor_kv.weight":
+            return compressor.wkv.load_packed(tensor)
+        if rest == "attn_compressor_gate.weight":
+            return compressor.wgate.load_packed(tensor)
+        if rest == "attn_compressor_ape.weight":
+            return _q8_0_dequant_into(tensor, compressor.ape)
+        if rest == "attn_compressor_norm.weight":
+            return _f32_into(tensor, compressor.norm_weight)
+
+    if attn.indexer is not None:
+        indexer = attn.indexer
+        if rest == "indexer.attn_q_b.weight":
+            return indexer.wq_b.load_packed(tensor)
+        if rest == "indexer.proj.weight":
+            return indexer.weights_proj.load_packed(tensor)
+        icomp = indexer.compressor
+        if rest == "indexer_compressor_kv.weight":
+            return icomp.wkv.load_packed(tensor)
+        if rest == "indexer_compressor_gate.weight":
+            return icomp.wgate.load_packed(tensor)
+        if rest == "indexer_compressor_ape.weight":
+            return _q8_0_dequant_into(tensor, icomp.ape)
+        if rest == "indexer_compressor_norm.weight":
+            return _f32_into(tensor, icomp.norm_weight)
+
+    raise ValueError(f"unknown GGUF tensor: {name}")
+
+
+def load_weights(model: Dsv4Transformer, path: Path | str, *, device: str = "cuda") -> int:
+    """Stream the whole file into the graph; assert zero-exemption coverage."""
+    expected = expected_gguf_tensor_names(model.config)
+    seen: set[str] = set()
+    for tensor in iterate_gguf_checkpoint(Path(path), device=device):
+        if tensor.name in seen:
+            raise ValueError(f"duplicate tensor in file: {tensor.name}")
+        seen.add(tensor.name)
+        if tensor.name not in expected:
+            raise ValueError(f"GGUF tensor not expected by this config: {tensor.name}")
+        store_gguf_tensor(model, tensor)
+    missing = expected - seen
+    if missing:
+        raise ValueError(
+            f"{len(missing)} expected tensors missing from the file, e.g. {sorted(missing)[:5]}"
+        )
+    return len(seen)
+
+
+def load_dsv4_from_gguf(
+    path: Path | str, *, max_seq_len: int = 4096, device: str = "cuda"
+) -> tuple[Dsv4Transformer, int]:
+    """Build the graph straight onto `device` and stream every tensor in.
+
+    The graph is far larger than host RAM, so construction must never route
+    through CPU: every buffer is allocated on the target device from the
+    start and the file is streamed tensor-by-tensor into it.
+    """
+    header = read_gguf_header(Path(path))
+    config = config_from_gguf_kv(header.kv)
+    model = Dsv4Transformer(config, max_seq_len=max_seq_len, device=device)
+    count = load_weights(model, path, device=device)
+    return model, count

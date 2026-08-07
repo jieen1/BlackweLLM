@@ -174,7 +174,20 @@ packed 形态参与计算（kernel 内 dequant）。
 Gate/HC 部件对拍 ✅（Compressor/Indexer 对拍顺延至 Phase 2/3，理由：其语义
 验证与模型图实现强耦合，提前单独做重复劳动）。
 
-### Phase 2 · GGUF 加载器 + 模型图（~2 周）
+### Phase 2 · GGUF 加载器 + 模型图（~2 周）— ✅ 完成（2026-08-07）
+
+**状态**：GGUF 流式读取器、`deepseek_v4` registry 分支、Dsv4Config、
+全部件（dequant 链 / Gate / MoE / Compressor / Indexer / MLA 注意力 / HC /
+Block / Transformer）与零豁免 `load_weights` 均已落地并逐件对拍官方
+reference（见事实基线 §7.5/§9）。81.9 GiB 真实权重全量上卡，eager 前向
+产出连贯贪心续写（事实基线 §9.2）。
+
+**门禁兑付与一处改判**：覆盖率断言 ✅（1328/1328，集合相等，零豁免）。
+原门禁"单 token 前向 vs 官方 reference logits 余弦 > 0.99999"**不可达**：
+官方 reference 只吃原始 BF16/FP8 权重且其 sparse_attn kernel 在 SM120 上
+smem 超限（事实基线 §7.6），与本量化混存 checkpoint 无数值可比性。改判为：
+部件级 reference 对拍（已过）+ Phase 3 与 llama.cpp 同权重贪心逐 token 对齐
+承接整体数值门禁（唯一共享同一份量化权重的 oracle）。
 
 1. `runtime/loading/gguf.py`：mmap + 逐张量 yield `(name, tensor)`，遵守
    `iterate_safetensors_checkpoint` 的流式契约（23 GiB 主机内存红线）；
