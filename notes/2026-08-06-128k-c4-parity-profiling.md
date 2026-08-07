@@ -661,3 +661,238 @@ code 协议，只动 verify 数值路径）：
 
 数据：`evalplus_results/quality/code_m16verify_20260807.part.code.json`、
 `code_m16noadapt_20260807.part.code.json`、`code_mtpoff_20260806.part.code.json`。
+
+## 19. 性能与质量兼得路径调研：fixed-split 契约复原（2026-08-07）
+
+用户指令："去调研或者论证有没有获得这些性能优化但是不影响质量的方式，
+包括参考历史代码、参考 vllm、参考其他内核"。本节是完整论证 + 实测。
+
+### 19.1 理论界限：ULP 差异从哪里来，什么能消除它
+
+§18 已把 −3.7pp 钉到两处 split-KV 归约顺序效应。这里把"能不能在不影响
+质量的前提下拿回性能"这个问题闭掉：
+
+1. **split-KV attention 的最终输出是 KV 分片上的 fp32 归约**。softmax 归一化
+   下的分片合并（logsumexp merge）在精确算术下满足结合律，但 fp32 下不满足：
+   不同的分片划分 = 不同的求和结合树 = 不同的舍入 = ULP 级差异。
+2. **merge 阶段本身是确定性的**：`PagedPersistentMergeKernel`（sparkinfer
+   `attention/paged/merge.py`）按 chunk 下标顺序逐个合并 partial（row/head
+   persistent，`_merge_async_slot` 按 `start_idx + iter` 顺序消费），不存在
+   完成序竞争。同一次运行、同一 chunking 下结果逐位可复现。
+3. 因此配置间差异的**唯一来源是 partial 本身不同**：chunk 边界不同
+   （adaptive 按 live 长度重切 vs frozen 固定）或 kernel 内部累加不同
+   （M32 raw-FP8 单 tile vs M16 通用 kernel 双 query-tile）。
+4. **推论（否掉一条看似聪明的路）**：把 merge 换成 Kahan/fp64/树状归约等
+   "顺序无关"方案**不能**恢复 08-05 数值——partial 已经不同了，merge 再精确
+   也只是精确地合并了一组不同的输入。顺序无关归约只在"partial 相同、合并顺序
+   不同"时有意义，而这里合并顺序本来就固定。**已否决：不做 order-independent
+   merge。**
+5. **推论（正向路径）**：要拿回与 08-05 同族的质量，chunk 划分必须是
+   （请求长度的）确定函数且与 08-05/历史验证过的形态同族；kernel 差异则必须
+   实测过质量锚。没有任何先验方法保证一个新 ULP 模式不翻边界题——~17/164
+   题对 ULP 敏感，每个新配置是一次新的抽取，只能实测。
+
+### 19.2 历史代码参考：fixed-split 契约（oracle/qwen36_vllm）
+
+* `direct_model_runner.py:681-684`：`_DECODE_TARGET_SPLITS_PER_REQ = 32`，
+  `decode_fixed_kv_split_size = ceil(slot容量/32)`（=8192 token），
+  `decode_fixed_max_num_splits = 32`。**kv_split_size 由槽容量上界导出，
+  与 live batch、live 长度都无关**——chunk 边界是 8192 的固定倍数。
+* 该契约正是 2026-07 README 质量门（code 0.921/0.884）与 222.44 tok/s
+  性能锚共用的形态：**fixed-split 同时给过我们质量和性能**。
+* 同文件 653-680 行注释记录了 vLLM 自身 `SM120GQAMetadataBuilder.build()`
+  （`vllm/v1/attention/backends/sm120_gqa.py`）的做法：**永远从 build 期上界
+  （max_model_len）导出固定 kv_split_size**——vLLM 的 SM120 后端本身就是
+  fixed-split 设计（CUDA Graph 静态调度的副产物是数值按长度确定）。
+* 2026-07 的 splits 扫描（docs/archive/2026-07-20-PROGRESS.md ~L4129）：
+  128K 下 qo=4（verify 形态）splits=32 最优（1.566ms，优于 16/48/64/96/128），
+  随后全局采用 32，得到 181.95→222.44 tok/s 里程碑。
+* **本仓库自己的前例**（同文档 ~L3110）：`CapturedBatchDecodeGraph` 曾用
+  陈旧的 TARGET_SPLITS=16（对生产值 64），acceptance rate 70.29%→76.67%
+  漂移；统一 split 数后**逐位回到** eager 路径数值。——split 数变化翻动
+  near-tie 决策，在本仓库发生过且被 fixed-split 治愈。
+
+### 19.3 外部参考：vLLM / FlashInfer / 其他内核的确定性实践
+
+（web 检索在本环境不可用，以下为实现层已知事实，供复核时按图索骥。）
+
+* **FlashInfer**：plan/decode 的 split 数是 batch 与 seq_len 的函数以填满 SM；
+  不同 shape 下归约顺序不同是已知行为。早期 single-decode/single-prefill API
+  曾有 `deterministic=True` 参数（固定归约布局），plan-based API 时代未提供
+  跨 shape 位级确定性。
+* **vLLM**：不承诺跨 batch/shape 位级可复现；SM120 GQA 后端用固定
+  kv_split_size（见 19.2）是"图静态调度"的必然选择，其副产物正是按长度
+  确定的数值。
+* **FlashAttention-2/3**：forward 对固定 shape 确定（每行按 KV tile 顺序
+  online softmax），但 decode 的 split-KV（flash-decoding）merge 随 split 数
+  变化——与本仓库同构。
+* **结论**：业界没有任何上游在 split-KV decode 上提供跨 shape 位级确定性；
+  通行做法就是我们正在做的——**固定 split 契约（shape 确定 ⇒ 数值确定）+
+  质量锚实测**。这条路有历史数据背书（19.2），不是实验性赌博。
+
+### 19.4 新 knob：SPARKINFER_QWEN36_VERIFY_FIXED_SPLITS（sparkinfer fork）
+
+实现（sparkinfer 提交 `7f6021e`，已推 origin/master）：
+
+* `workspace.py::_qwen36_verify_fixed_split_pages_from_env`：
+  `SPARKINFER_QWEN36_VERIFY_FIXED_SPLITS=N` 在 Qwen3.6 verify 几何
+  （fp8 KV / head_dim 256 / page 128）下解析为
+  `fixed_split_size = ceil(最坏页数/N)` 页——即历史契约
+  `kv_split_size = ceil(槽容量/N)` 的按页形式。N=32 ⇒ 64 页 = 8192 token，
+  与 oracle 逐位同构。
+* `prepare_prefill_graph_replay_state` 把它传给 planner；planner 对
+  fixed-split 图计划放宽 SM-fill 预算（worst-case worklist 即包络）。
+* adaptive 重切 gate 排除 `fixed_split_size ≥ 0` 的计划——回放保持捕获期
+  chunk 大小，chunk 边界成为 live batch/live 长度的不变量。
+* M32 kernel 保持不变（快速路径保留），M16/NO_ADAPTIVE 两个 §18 开关不受影响。
+* 双模型安全：Laguna 几何（hd128/gqa6/cta64）不在 gate 内，行为零变化。
+
+### 19.5 探针矩阵（probe_qwen36_graph_attn_capacity.py，128K live）
+
+`logs/quality/probe_fixedsplit_*.log`。两种捕获包络：--worst 1024
+（捕获==live）与 --worst 2048（生产 256K 槽同包络）。
+
+| 配置 | b4@1024 | b4@2048 | 备注 |
+|---|---:|---:|---|
+| M32+adaptive（生产） | 0.891 | 2.231 | §13.3 生产图内实测 0.899 ⇒ 生产包络≈1024 侧 |
+| M32+frozen | 0.879 | 2.807 | |
+| fixed32（新） | 1.206 | 2.284 | b1@2048=2.088 严重（64 CTA 欠占用） |
+| M16+frozen（08-05） | 0.944 | 1.266 | 大包络下 partial 行减半反而最快 |
+
+**探针≠生产的警示**：@2048 包络的绝对值与生产图内实测（0.899）对不上，
+说明探针的捕获/回放路径与生产图存在未归因差异（包络 worklist 的固定开销被
+探针放大）。**因此排名结论以 19.6 的真服务器 A/B 为准，探针只作旁证。**
+
+### 19.6 真服务器 A/B（128K/c4 生产 profile + QSR_PROFILE_ROUNDS）
+
+`scripts/ab_verify_chunking_configs.sh`，逐配置：起服务（128k bench env）→
+filler warm 3 波 → 轮级聚合。
+
+| 配置 | warm agg tok/s（3 波） | 轮时 med (ms) | accept_gpu_wait med (ms) |
+|---|---:|---:|---:|
+| baseline（M32+adaptive，生产） | 173.0 / 198.3 / 183.8 | **50.98** | 46.56 |
+| m16frozen（08-05 数值模式） | 166.2 / 171.2 / 182.7 | 61.45（+10.5） | 56.86 |
+| fixed32（新 knob，M32 kernel） | 149.3 / 156.8 / 166.1 | 69.47（+18.5） | 65.07 |
+| m32frozen | 153.5 / 146.1 / 146.3 | 70.44（+19.5） | 65.84 |
+
+（均含 QSR_PROFILE_ROUNDS=1 剖析开销，同口径相对比较；baseline 轮时与
+§13.2 的 53.4ms 同量级互相印证。）
+
+**实测结论（与探针对照）：**
+1. **生产排名与探针 @2048 包络的预测相反**：真服务器上 m16frozen 不是最快
+   而是 +10.5ms（与 §18 的 "+10ms" 一致），fixed32/m32frozen 更差。探针的
+   连续页表 + L2 热态 + 孤立调用三个条件都不成立于生产（散页、冷缓存、
+   16 层与其它 kernel 交错），**探针只能作同配置前后的相对参考，跨配置
+   排名必须真服务器验证**——本节的 A/B 就是为此补的课。
+2. fixed32 在 128K/c4 慢 18.5ms 的原因：固定 64 页 chunk 在 live 128K 只有
+   16 chunk/req × 4 = 64 work items（256 CTA），机器填不满；历史 vLLM
+   kernel 的 CTA 分解不同（split×KVH 直接映射），没有这个欠占用。
+   fixed-split 契约的价值在数值确定性，不在 128K 吞吐。
+3. m32frozen 比 m16frozen 还慢：128K live 下 M32 frozen 的 chunk 几何相对
+   adaptive 损失最大（§9 的 −4.6ms/轮收益正是 adaptive 带来的，frozen 全数
+   吐回且 M32 单 tile 无冗余 query-tile 可摊）。
+
+### 19.7 质量锚（suite-fast profile，code dim，同 §18 协议）
+
+| 配置 | HumanEval | HumanEval+ |
+|---|---:|---:|
+| M32+adaptive（生产） | 0.8902 | 0.8659 |
+| M16+adaptive | 0.9024 | 0.8902 |
+| **M16+frozen（08-05 数值模式）** | **0.9268** | **0.8902** |
+| MTP-OFF | 0.9268 | 0.8902 |
+| **M32+fixed32（新 knob，本次实测）** | **0.915** | **0.866** |
+| 历史门（README，旧 vLLM kernel + fixed32） | 0.921 | 0.884 |
+
+数据：`evalplus_results/quality/code_fixed32_20260807.part.code.json`
+（164/164，生成 1251s，conc 8）。
+
+**解读：**
+1. fixed-split 契约单独恢复了约 2/3 的回退（0.8902→0.915），印证 §18 的
+   加法分解：chunking 与 kernel 是两个独立 ULP 源。
+2. 剩余差距（0.915→0.9268）是 M32 raw-FP8 kernel 自身的归约数值——
+   历史 0.921 是旧 vLLM kernel 的抽取，M32 kernel 的抽取略差且
+   HumanEval+（0.866）未过历史 0.884 门。
+3. **唯一双双越过历史门的配置仍是 M16+frozen**（0.9268≥0.921，
+   0.8902≥0.884）。fixed32 knob 留作研究/对照锚，不作质量模式。
+
+### 19.8 短上下文 A/B 与 128K 无剖析校准（Phase C，2026-08-07 午）
+
+suite-fast profile（32K 槽 / cap 8），4K/c8 filler：
+
+| 配置 | warm agg tok/s（3 波） |
+|---|---:|
+| baseline（M32+adaptive） | 112.5 / 126.7 / 382.9（前两波受污染，干净波 383） |
+| **m16frozen（08-05 模式）** | **485.4 / 480.9 / 462.0（三波稳定）** |
+
+128K/c4 无剖析净吞吐（bench env，5 warm 波）：
+
+| 配置 | warm agg tok/s | 中位 |
+|---|---|---:|
+| baseline 校准（今日同机） | 170.0 / 149.6 / 171.4 / 163.0 / 174.7 | 170.0 |
+| m16frozen | 155.4 / 144.9 / 154.4 / 145.0 / 152.6 | 152.6 |
+
+**关键事实：**
+1. **短上下文 m16frozen 不但不慢，反而显著更快**（干净波对比 +24% 以上，
+   且三波无方差）。机理：32K 捕获下 code-dim 长度（≤8K）frozen chunking
+   只有 1–2 个 chunk——**等于无 split-KV 的单遍注意力**，省掉 adaptive 的
+   重切 metadata、partial 缓冲与 merge kernel；M16 双 query-tile 的页读代价
+   在这个尺度上可忽略。
+2. **今日主机状态异常**：load average ~9800（数千个 D 状态僵尸进程 +
+   headless chrome swiftshader 常驻 ~285% CPU），当日无剖析 baseline 中位
+   170 vs §13.4 的 234.8（−28%，两配置同比例受影响）。**绝对值不可与
+   08-06 直接对比，同日相对比较仍有效**：m16frozen 128K 成本 = 152.6/170
+   = **−10%**（剖析口径 −6.9%，两者同向）。
+3. 健康机器外推：m16frozen 128K ≈ 234.8 × 0.90 ≈ **211 tok/s**——略低于
+   历史 222.44（−5%）。这是"质量模式"唯一的性能缺口。
+
+### 19.9 最终结论
+
+**调研问题："有没有获得这些性能优化但不影响质量的方式？"**
+
+**论证结论：没有免费的午餐，但有明确的工程解。**
+
+1. **性能与质量的冲突是本质的，不是实现缺陷**：M32 tiling 与 adaptive
+   chunking 这两个性能优化的物理内容，恰好就是改变 split-KV 归约划分的
+   两个操作；质量回退的 ULP 翻转来自划分本身（§19.1 已证 order-independent
+   merge 无法修复——partial 不同，merge 再精确也无用）。任何"保留这两个
+   优化又恢复 0.9268 数值"的方案在 fp32 非结合律下不存在。
+2. **历史契约复现实验（fixed32）给出了干净的反证**：同样的 fixed-split
+   几何在 M32 kernel 上只得 0.915/0.866（HumanEval+ 未过 0.884 门），
+   且 128K 慢 18.5ms——历史 0.921 是"旧 vLLM kernel + fixed split"的
+   联合抽取，kernel 换了，抽取就变了。fixed-split 本身不是质量护身符，
+   **08-05 数值模式（M16+frozen）才是本仓库验证过的质量锚**。
+3. **推荐配置**：
+   * **质量关键路径（质量套件、对外质量承诺）→ 08-05 数值模式**
+     （`SPARKINFER_QWEN36_VERIFY_M16=1` + `SPARKINFER_QWEN36_VERIFY_NO_ADAPTIVE=1`）：
+     0.9268/0.8902 双过历史门；短上下文更快（+24%）；128K −10%。
+   * **吞吐关键路径（128K 基准 headline）→ 维持生产默认（M32+adaptive）**：
+     235 tok/s，接受 0.8902 质量带。
+   * 两个数值模式都已 knob 化、可复现、已入档（§18 四方 + 本节五方数据）。
+4. **同时拿到两者的唯一工程路径（后续优化目标）**：在保序前提下加速
+   08-05 数值模式的 128K verify（缺口 ~5%）。候选，均为位级安全
+   （不改每个 query-tile 内的累加顺序，只改数据搬运）：
+   a. **M16 kernel 跨 query-tile 的 KV 页复用**——当前每页读两次
+      （两个 query-tile 各读一遍），smem/L2 侧做 tile 间复用可省一半
+      KV 读带宽；输入位模式不变 ⇒ 数值不变。
+   b. **捕获视界调优**：128K workload 用 128K 视界捕获 verify 图
+      （frozen chunk 在 live==捕获视界时恰好填满预算；256K 视界捕获在
+      128K live 只填半个机器）——ben ch env 改 blocks_per_slot 即可实验。
+   c. merge/partial 搬运开销削减（partial 行数在 M16 已减半，剩余空间小）。
+5. **双模型安全**：所有 knob 均 gate 在 Qwen3.6 verify 几何（fp8 KV /
+   hd256 / page128），Laguna（hd128/gqa6/cta64）路径零变化；Laguna 服务
+   不受本次任何改动影响。
+
+### 19.10 产物索引
+
+* sparkinfer `7f6021e`（origin/master）：fixed-split knob + 预算放宽 +
+  adaptive gate 排除。
+* `logs/quality/probe_fixedsplit_*.log` —— 探针矩阵（两包络 × 4 配置）。
+* `logs/quality/ab_{server,grid,rounds}_*.log/.json/.txt` —— 128K/c4
+  真服务器 A/B（4 配置，剖析口径）。
+* `evalplus_results/quality/code_fixed32_20260807.part.code.json` ——
+  fixed32 质量锚（0.915/0.866）。
+* `logs/quality/ab_grid_shortctx_*.json` —— 4K/c8 短上下文 A/B。
+* `logs/quality/ab_grid_c2_*.json` —— 128K 无剖析净吞吐（m16frozen +
+  baseline 同日校准）。
+* `scripts/ab_verify_chunking_configs.sh` / `scripts/ab_quality_code_dim.sh`
+  / `scripts/ab_shortctx_m16frozen.sh` —— 本节的三个 A/B 复用脚本。
