@@ -937,6 +937,24 @@ class Dsv4Transformer(nn.Module):
         h = self.hc_head(h)
         return self.lm_head(rms_norm(h, self.norm_weight, self.eps))
 
+    def reset_caches(self) -> None:
+        """Zero the recursive compressor state of every layer.
+
+        KV bytes stay (positions are overwritten, stale bytes are never read
+        past the sequence length); the recursive kv_state/score_state must be
+        cleared because the first step of the next sequence reads them --
+        the same rule as the slot pool's ``reset_slot``.
+        """
+        for block in self.blocks:
+            attn = block.attn
+            if attn.compressor is not None:
+                attn.compressor.kv_state.zero_()
+                attn.compressor.score_state.fill_(float("-inf"))
+            if attn.indexer is not None:
+                attn.indexer.compressor.kv_state.zero_()
+                attn.indexer.compressor.score_state.fill_(float("-inf"))
+                attn.indexer.kv_cache.zero_()
+
 
 # ---------------------------------------------------------------------------
 # GGUF loading: every one of the 1328 tensors maps by name to exactly one
