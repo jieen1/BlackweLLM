@@ -110,7 +110,7 @@ packed 形态参与计算（kernel 内 dequant）。
 | D4 | 注意力 kernel | (a) sparkinfer fork 的 compressed_mla/sparse_mla/nsa_indexer (b) 自研 | **(a)** | fork 中就是为 DSV4 写的，`attn_sink`/512topk/128 窗口全是一等参数；"sparkinfer 是唯一注意力 kernel"是仓库政策 |
 | D5 | KV 布局 | 按 `compressed_reference.py` 页格式：每 token [448 FP8][64 BF16 rope][8 UE8M0 scale]，页 256 token；窗口环 + 压缩区 + indexer 区三域分层池 | **照此** | 与 fork kernel 的内存池契约一致（SGLang 兼容布局）；分层池有 Qwen36SlotPool/Laguna 环先例 |
 | D6 | 路由 kernel | (a) 参数化 laguna_router_sm120.cu (b) 新写 dsv4 路由 kernel | **(b)，先 Triton 后 CUDA** | Laguna kernel 是位精确资产（oracle 钉死），不动它；DSV4 需要 sqrtsoftplus+top6+route_scale+hash(input_ids)，差异过大 |
-| D7 | 投机 | 一期不做；二期 DSpark（DFlash 骨架 + Markov/confidence head） | **分期** | DSpark 权重不在主 GGUF；先保证主模型贪心对齐 |
+| D7 | 投机 | ~~二期 DSpark~~ → **默认无投机**；DSpark 降为 Phase 5 可选实验 | **无投机为设计前提**（2026-08-07 定案） | 显存账：余量 11.7 GiB，原版 DSpark 权重 10.15 GiB + 服务最低需求装不下；唯一路径是自量化到 IQ2_XS 档（≈6 GiB，单槽短上下文，接受率风险），属实验不属前提。无投机下的性能抓手：批处理摊销专家带宽（13B 激活模型批处理友好）+ CG + IQ2_XS kernel |
 | D8 | 对齐 oracle | 官方 reference（部件级）+ llama.cpp（端到端） | **双 oracle** | reference 验证数学语义；llama.cpp 消费同一 artifact，给出端到端贪心/top-k-logit 基线 |
 | D9 | tokenizer | ~~从 GGUF 抽取重构~~ → 官方 `tokenizer.json` 直接用 + 服务层 vendoring `encoding_dsv4.py` | **官方件** | 官方仓库提供 tokenizer.json；已证与 GGUF 内嵌版一致（D9 修订 2026-08-07） |
 | D10 | 前缀缓存 | 一期关；压缩条目是 token 块的确定函数，hash 可复用 block_pool 的 blake2b 链 | **延后** | 先对齐正确性；异构缓存联动是 Qwen3.6 级工程量 |
@@ -249,11 +249,13 @@ Gate/HC 部件对拍 ✅（Compressor/Indexer 对拍顺延至 Phase 2/3，理由
 
 1. IQ2_XS dequant-GEMM 调优（Triton → 手写 CUDA/tilelang；目标 decode ≥ 100 tok/s）。
 2. prefill 分块（indexer/压缩器的 chunked 语义）与长上下文容量实测（128K → 1M）。
-3. **DSpark**：下载 `DeepSeek-V4-Flash-0731-DSpark.gguf`（10.9 GB）；
-   3 阶段 DSparkBlock（自带 MoE + HC）走 DFlash 骨架：main_proj 注入
-   （替代 DFlash 的 per-layer context-KV 预计算）、noise token ≈ MASK、
-   verify 批 6 token（anchor+5）、Markov head（rank-256 logits 偏置，块内自回归）
-   + confidence head；accept 复用 `mtp_accept.py`（K=5 直接映射）。
+3. **DSpark（可选实验，默认不做）**：原版 10.15 GiB 装不进 11.7 GiB 余量；
+   若做，先自量化到 IQ2_XS 档（≈6 GiB）再走 DFlash 骨架（main_proj 注入、
+   noise token ≈ MASK、verify 批 6 token、Markov/confidence head、
+   `mtp_accept.py` K=5 映射），并接受率对拍合格才启用；
+   **服务默认路径永远按无投机交付**。
+4. **无投机性能主线**：IQ2_XS dequant-GEMM kernel → decode CG →
+   批处理 MoE（专家权重按步摊销）→ chunked prefill 调优。
 4. 前缀缓存：压缩条目哈希接入 block_pool 的链式 blake2b；异构缓存联动按
    Qwen3.6 双向非对称 lockstep（INV-A3-3）模式。
 

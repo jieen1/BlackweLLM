@@ -34,10 +34,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from loader.gguf_header import read_gguf_header
 from runtime.architecture import (
     ArchitectureSpec,
     UnsupportedArchitectureError,
     parse_architecture,
+    parse_dsv4_gguf_architecture,
     validate_text_only,
 )
 
@@ -45,6 +47,10 @@ from runtime.architecture import (
 LOADER_FOR_QUANT_METHOD = {
     "compressed-tensors": "compressed_tensors",
     "modelopt": "modelopt",
+    # GGUF is a container, not an HF quant method; the "method" value is
+    # synthesized by parse_dsv4_gguf_architecture. Capacity-driven exception
+    # for models that only fit at sub-3bpw -- see the DSV4-Flash plan §1.3.
+    "gguf": "gguf",
 }
 
 #: ``compressed-tensors`` is a container, not a payload format, and the formats
@@ -107,6 +113,12 @@ _WHY_REFUSED: dict[str | None, str] = {
 SUPPORTED_QUANT_FORMATS: dict[str, frozenset[str | None]] = {
     "compressed-tensors": frozenset({"nvfp4-pack-quantized", "mixed-precision", None}),
     "modelopt": frozenset({None}),
+    # Format strings are the sorted ggml quant-type mix of the file (see
+    # parse_dsv4_gguf_architecture). The IQ2_XS-experts/Q8_0-dense mix is the
+    # one that fits the 96 GB card; other mixes of the same model (IQ3_XXS,
+    # MXFP4-lossless, ...) are different points on the size/quality curve and
+    # are refused until deliberately added, per the (method, format) discipline.
+    "gguf": frozenset({"iq2_xs+q8_0"}),
 }
 
 
@@ -135,6 +147,17 @@ REGISTRY: tuple[ArchitectureFamily, ...] = (
         architecture="Qwen3_5ForConditionalGeneration",
         backend="qwen36",
         speculative="mtp",
+    ),
+    # DSV4-Flash (GGUF). Registered so resolution is testable and the error
+    # for it is honest; IMPLEMENTED_BACKENDS below is what keeps it from
+    # claiming to work before the backend has served a real request.
+    # Speculative strategy is "dspark" (block-5 draft companion file), which
+    # the main GGUF does not carry -- resolve downgrades it per checkpoint,
+    # the same way mtp is downgraded when the layers are absent.
+    ArchitectureFamily(
+        architecture="DeepseekV4ForCausalLM",
+        backend="deepseek_v4",
+        speculative="dspark",
     ),
 )
 
@@ -237,9 +260,56 @@ def resolve_config(config: dict[str, Any]) -> Resolution:
     )
 
 
+def resolve_gguf_checkpoint(path: str | Path) -> Resolution:
+    """Resolve a single-file GGUF checkpoint from its header.
+
+    GGUF carries no config.json; the header KV pairs and the tensor-type mix
+    are the identity. Same order as :func:`resolve_config`: parse, reject what
+    cannot be served, then choose.
+    """
+    header = read_gguf_header(Path(path))
+    gguf_arch = header.kv.get("general.architecture")
+    if gguf_arch != "deepseek4":
+        raise UnsupportedArchitectureError(
+            f"GGUF architecture {gguf_arch!r} is not supported; this runtime "
+            "only serves 'deepseek4' GGUF files (DeepSeek-V4 family)"
+        )
+    tensor_type_names = frozenset(tensor.type_name for tensor in header.tensors)
+    mtp_layers = sum(1 for t in header.tensors if t.name.startswith("mtp."))
+    spec = parse_dsv4_gguf_architecture(
+        header.kv, tensor_type_names=tensor_type_names, mtp_layers=mtp_layers
+    )
+    validate_text_only(spec, language_model_only=True)
+
+    family = _family_for(spec)
+    if family.backend not in IMPLEMENTED_BACKENDS:
+        raise UnsupportedArchitectureError(
+            f"{spec.architecture!r} resolves to the {family.backend!r} backend, "
+            f"which is not implemented yet; implemented backends are "
+            f"{sorted(IMPLEMENTED_BACKENDS)}"
+        )
+    speculative = family.speculative
+    if speculative == "dspark" and mtp_layers == 0:
+        speculative = None
+    return Resolution(
+        spec=spec,
+        backend=family.backend,
+        loader=_loader_for(spec),
+        speculative=speculative,
+    )
+
+
 def resolve_checkpoint(path: str | Path) -> Resolution:
-    """Resolve a checkpoint directory by reading its ``config.json``."""
-    config_path = Path(path) / "config.json"
+    """Resolve a checkpoint directory (config.json) or a GGUF weight file."""
+    path = Path(path)
+    if path.is_file():
+        if path.suffix == ".gguf":
+            return resolve_gguf_checkpoint(path)
+        raise UnsupportedArchitectureError(
+            f"{path} is a weight file; only .gguf files are directly servable "
+            "(safetensors checkpoints must be given as their directory)"
+        )
+    config_path = path / "config.json"
     if not config_path.is_file():
         raise UnsupportedArchitectureError(
             f"no config.json under {path}; a checkpoint directory is expected, "

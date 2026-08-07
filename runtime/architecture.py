@@ -40,7 +40,17 @@ from dataclasses import dataclass
 from typing import Any
 
 #: Attention kinds that consume paged KV, keyed by the ``layer_types`` spelling.
-PAGED_KV_ATTENTION = ("full_attention", "sliding_attention")
+#: ``csa_attention`` / ``hca_attention`` are DeepSeek-V4's compressed attention
+#: layers (ratio-4 with learned indexer / ratio-128 all-compressed); they are
+#: still length-proportional KV storage, hence the paged-KV family -- the
+#: per-layer heterogeneity (window ring + compressed region + indexer region)
+#: is a backend concern, not a cache-family concern.
+PAGED_KV_ATTENTION = (
+    "full_attention",
+    "sliding_attention",
+    "csa_attention",
+    "hca_attention",
+)
 #: Attention kinds that carry length-independent recurrent state instead.
 RECURRENT_ATTENTION = ("linear_attention",)
 
@@ -250,6 +260,122 @@ def _parse_layers(text: dict[str, Any], num_layers: int) -> tuple[LayerSpec, ...
             cache=_cache_for(str(attention)),
         )
         for i, attention in enumerate(layer_types)
+    )
+
+
+#: DSV4 compression ratios this runtime understands (llama.cpp's deepseek4
+#: loader enforces the same set; the reference implementation defines them).
+_DSV4_RATIOS = {0: "sliding_attention", 4: "csa_attention", 128: "hca_attention"}
+
+#: GGUF ggml type names that are quantized payloads (everything else is a
+#: plain tensor: norms, sinks, APE, embeddings-as-bf16, routing tables, ...).
+_DSV4_QUANT_TYPES = ("iq2_xs", "q8_0")
+
+
+def parse_dsv4_gguf_architecture(
+    kv: dict[str, Any],
+    *,
+    tensor_type_names: frozenset[str],
+    mtp_layers: int = 0,
+) -> ArchitectureSpec:
+    """Build the ArchitectureSpec for a DeepSeek-V4 GGUF checkpoint.
+
+    GGUF has no ``config.json``; its header KV pairs are the config. This is
+    the GGUF sibling of :func:`parse_architecture` -- same contract: parse and
+    reject before a single weight is read, name the offending field.
+
+    ``tensor_type_names`` is the set of ggml type names present in the tensor
+    index (e.g. ``{"IQ2_XS", "Q8_0", "F32", "BF16", "I32"}``); it drives the
+    quant format gate the same way ``quantization_config`` does for
+    safetensors -- different GGUF quant mixes of the same model are not
+    interchangeable, so the mix is part of the identity.
+    """
+    block_count = int(kv.get("deepseek4.block_count", 0))
+    if block_count <= 0:
+        raise UnsupportedArchitectureError("GGUF metadata has no positive 'deepseek4.block_count'")
+    ratios_raw = kv.get("deepseek4.attention.compress_ratios")
+    if not isinstance(ratios_raw, list) or len(ratios_raw) < block_count:
+        raise UnsupportedArchitectureError(
+            "GGUF 'deepseek4.attention.compress_ratios' is missing or shorter "
+            f"than block_count ({block_count}); the file may carry extra MTP "
+            "entries, but it must at least cover every main layer"
+        )
+    layers: list[LayerSpec] = []
+    for index in range(block_count):
+        ratio = int(ratios_raw[index])
+        attention = _DSV4_RATIOS.get(ratio)
+        if attention is None:
+            raise UnsupportedArchitectureError(
+                f"layer {index} has compress_ratio {ratio}; supported ratios "
+                f"are {sorted(_DSV4_RATIOS)}"
+            )
+        layers.append(
+            LayerSpec(index=index, attention=attention, mlp="sparse", cache=CACHE_PAGED_KV)
+        )
+
+    quant_types = sorted(
+        name.lower() for name in tensor_type_names if name.lower() in _DSV4_QUANT_TYPES
+    )
+    unknown_types = sorted(
+        name.lower()
+        for name in tensor_type_names
+        if name.lower() not in _DSV4_QUANT_TYPES
+        and not name.lower().startswith(("f32", "bf16", "f16", "i8", "i16", "i32", "i64"))
+    )
+    format_name = "+".join([*quant_types, *unknown_types]) or "none"
+
+    vocab = kv.get("tokenizer.ggml.tokens")
+    rope_theta = float(kv.get("deepseek4.rope.freq_base", 10000.0))
+    scaling_type = str(kv.get("deepseek4.rope.scaling.type", "default"))
+    factor = kv.get("deepseek4.rope.scaling.factor")
+    original_ctx = kv.get("deepseek4.rope.scaling.original_context_length")
+    return ArchitectureSpec(
+        # The HF spelling (config.json architectures[0]) is what the registry
+        # keys on; the GGUF arch name ("deepseek4") is recorded as model_type.
+        architecture="DeepseekV4ForCausalLM",
+        model_type=str(kv.get("general.architecture", "")),
+        vocab_size=len(vocab) if isinstance(vocab, list) else 0,
+        hidden_size=int(kv.get("deepseek4.embedding_length", 0)),
+        num_hidden_layers=block_count,
+        max_position_embeddings=int(kv.get("deepseek4.context_length", 0)),
+        num_attention_heads=int(kv.get("deepseek4.attention.head_count", 0)),
+        num_key_value_heads=int(kv.get("deepseek4.attention.head_count_kv", 0)),
+        head_dim=int(kv.get("deepseek4.attention.key_length", 0)),
+        sliding_window=kv.get("deepseek4.attention.sliding_window"),
+        attn_output_gate=False,
+        layers=tuple(layers),
+        rope={
+            "default": RopeSpec(
+                rope_type=scaling_type,
+                theta=rope_theta,
+                partial_rotary_factor=1.0,
+                factor=float(factor) if factor is not None else None,
+                original_max_position_embeddings=(
+                    int(original_ctx) if original_ctx is not None else None
+                ),
+            ),
+            # Compressed-KV entries are re-rotated with their own theta
+            # (verified against reference Compressor + GGUF KV).
+            "compressed": RopeSpec(
+                rope_type=scaling_type,
+                theta=float(kv.get("deepseek4.attention.compress_rope_freq_base", 160000.0)),
+                partial_rotary_factor=1.0,
+                factor=float(factor) if factor is not None else None,
+                original_max_position_embeddings=(
+                    int(original_ctx) if original_ctx is not None else None
+                ),
+            ),
+        },
+        quant=QuantSpec(method="gguf", format=format_name, kv_num_bits=None, kv_type=None),
+        moe=MoESpec(
+            num_experts=int(kv.get("deepseek4.expert_count", 0)),
+            top_k=int(kv.get("deepseek4.expert_used_count", 0)),
+            intermediate_size=kv.get("deepseek4.expert_feed_forward_length"),
+            shared_expert_intermediate_size=kv.get("deepseek4.expert_feed_forward_length"),
+        ),
+        mtp_layers=mtp_layers,
+        has_vision_tower=False,
+        declares_language_model_only=None,
     )
 
 
