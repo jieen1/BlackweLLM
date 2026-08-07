@@ -677,6 +677,11 @@ class Dsv4Attention(nn.Module):
         q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
         apply_rotary_emb(q[..., -rd:], freqs)
+        # The official attention kernel's q input is BF16 (kernel.py's
+        # sparse_attn_kernel signature); the eager path casts to match, so
+        # the kernel path (bf16 q by contract) and the eager path compare
+        # like for like.
+        q = q.to(torch.bfloat16)
 
         # kv path
         kv = self.kv_norm(self.wkv(x))

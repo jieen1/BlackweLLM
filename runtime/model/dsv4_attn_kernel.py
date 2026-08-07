@@ -28,6 +28,7 @@ page buffers with pool views.
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -68,6 +69,7 @@ class Dsv4AttnKernelLayer(nn.Module):
         max_seq_len: int = 4096,
         max_q_rows: int = 1,
         device: torch.device | str | None = None,
+        shared_from: Any = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -82,52 +84,92 @@ class Dsv4AttnKernelLayer(nn.Module):
         self.softmax_scale = self.head_dim**-0.5
         self.max_q_rows = max_q_rows
 
-        self.wq_a = PackedQ8_0Linear(
-            config.q_lora_rank,
-            config.hidden_size,
-            weight_dtype=torch.bfloat16,
-            device=device,
-        )
-        self.register_buffer(
-            "q_norm_weight",
-            torch.empty(config.q_lora_rank, dtype=torch.float32, device=device),
-        )
-        self.wq_b = PackedQ8_0Linear(
-            self.n_heads * self.head_dim,
-            config.q_lora_rank,
-            weight_dtype=torch.bfloat16,
-            device=device,
-        )
-        self.wkv = PackedQ8_0Linear(
-            self.head_dim, config.hidden_size, weight_dtype=torch.bfloat16, device=device
-        )
-        self.register_buffer(
-            "kv_norm_weight", torch.empty(self.head_dim, dtype=torch.float32, device=device)
-        )
-        self.wo_a = PackedQ8_0Linear(
-            self.n_groups * self.o_lora_rank,
-            self.n_heads * self.head_dim // self.n_groups,
-            weight_dtype=torch.bfloat16,
-            device=device,
-        )
-        self.wo_b = PackedQ8_0Linear(
-            config.hidden_size,
-            self.n_groups * self.o_lora_rank,
-            weight_dtype=torch.bfloat16,
-            device=device,
-        )
-        self.register_buffer(
-            "attn_sink", torch.empty(self.n_heads, dtype=torch.float32, device=device)
-        )
+        if shared_from is not None:
+            # Reuse the eager layer's weight modules (Phase 3 step 5 gate and
+            # the Phase 4 backend run one model, two paths; duplicating the
+            # packed projections would cost another ~5 GB). Buffers are
+            # shared by reference too.
+            self.wq_a = shared_from.wq_a
+            self.wq_b = shared_from.wq_b
+            self.wkv = shared_from.wkv
+            self.wo_a = shared_from.wo_a
+            self.wo_b = shared_from.wo_b
+            self.q_norm_weight = shared_from.q_norm_weight
+            self.kv_norm_weight = shared_from.kv_norm_weight
+            self.attn_sink = shared_from.attn_sink
+            self.compressor = (
+                Dsv4Compressor(config, layer_id, quantize=False, device=device)
+                if self.ratio
+                else None
+            )
+            if self.compressor is not None:
+                self.compressor.wkv = shared_from.compressor.wkv
+                self.compressor.wgate = shared_from.compressor.wgate
+                self.compressor.ape = shared_from.compressor.ape
+                self.compressor.norm_weight = shared_from.compressor.norm_weight
+            self.indexer = (
+                Dsv4Indexer(config, layer_id, max_seq_len=max_seq_len, device=device)
+                if self.ratio == 4
+                else None
+            )
+            if self.indexer is not None:
+                self.indexer.wq_b = shared_from.indexer.wq_b
+                self.indexer.weights_proj = shared_from.indexer.weights_proj
+                self.indexer.compressor.wkv = shared_from.indexer.compressor.wkv
+                self.indexer.compressor.wgate = shared_from.indexer.compressor.wgate
+                self.indexer.compressor.ape = shared_from.indexer.compressor.ape
+                self.indexer.compressor.norm_weight = (
+                    shared_from.indexer.compressor.norm_weight
+                )
+        else:
+            self.wq_a = PackedQ8_0Linear(
+                config.q_lora_rank,
+                config.hidden_size,
+                weight_dtype=torch.bfloat16,
+                device=device,
+            )
+            self.register_buffer(
+                "q_norm_weight",
+                torch.empty(config.q_lora_rank, dtype=torch.float32, device=device),
+            )
+            self.wq_b = PackedQ8_0Linear(
+                self.n_heads * self.head_dim,
+                config.q_lora_rank,
+                weight_dtype=torch.bfloat16,
+                device=device,
+            )
+            self.wkv = PackedQ8_0Linear(
+                self.head_dim, config.hidden_size, weight_dtype=torch.bfloat16, device=device
+            )
+            self.register_buffer(
+                "kv_norm_weight", torch.empty(self.head_dim, dtype=torch.float32, device=device)
+            )
+            self.wo_a = PackedQ8_0Linear(
+                self.n_groups * self.o_lora_rank,
+                self.n_heads * self.head_dim // self.n_groups,
+                weight_dtype=torch.bfloat16,
+                device=device,
+            )
+            self.wo_b = PackedQ8_0Linear(
+                config.hidden_size,
+                self.n_groups * self.o_lora_rank,
+                weight_dtype=torch.bfloat16,
+                device=device,
+            )
+            self.register_buffer(
+                "attn_sink", torch.empty(self.n_heads, dtype=torch.float32, device=device)
+            )
 
-        self.compressor = (
-            Dsv4Compressor(config, layer_id, quantize=False, device=device) if self.ratio else None
-        )
-        self.indexer = (
-            Dsv4Indexer(config, layer_id, max_seq_len=max_seq_len, device=device)
-            if self.ratio == 4
-            else None
-        )
+            self.compressor = (
+                Dsv4Compressor(config, layer_id, quantize=False, device=device)
+                if self.ratio
+                else None
+            )
+            self.indexer = (
+                Dsv4Indexer(config, layer_id, max_seq_len=max_seq_len, device=device)
+                if self.ratio == 4
+                else None
+            )
 
         if self.ratio:
             freqs = precompute_freqs_cis(
@@ -298,6 +340,16 @@ class Dsv4AttnKernelLayer(nn.Module):
 
     def kv_norm(self, x: torch.Tensor) -> torch.Tensor:
         return rms_norm(x, self.kv_norm_weight, self.eps)
+
+    def reset_caches(self) -> None:
+        """Zero the recursive compressor state (the pool reset rule)."""
+        if self.compressor is not None:
+            self.compressor.kv_state.zero_()
+            self.compressor.score_state.fill_(float("-inf"))
+        if self.indexer is not None:
+            self.indexer.compressor.kv_state.zero_()
+            self.indexer.compressor.score_state.fill_(float("-inf"))
+            self.indexer.kv_cache.zero_()
 
     # -- forward -------------------------------------------------------------
 
