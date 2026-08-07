@@ -123,6 +123,24 @@ class Dsv4Config:
                     f"layer {index} has compress_ratio {ratio}; supported "
                     f"ratios are {list(SUPPORTED_RATIOS)}"
                 )
+        # Load-bearing fields must be present in the GGUF metadata: a zero
+        # here does not mean "absent by design", it means the file does not
+        # describe this model, and empty modules would build silently.
+        required = {
+            "vocab_size": self.vocab_size,
+            "hidden_size": self.hidden_size,
+            "num_layers": self.num_layers,
+            "num_heads": self.num_heads,
+            "head_dim": self.head_dim,
+            "n_routed_experts": self.n_routed_experts,
+            "n_activated_experts": self.n_activated_experts,
+            "moe_intermediate_size": self.moe_intermediate_size,
+        }
+        missing = sorted(name for name, value in required.items() if value <= 0)
+        if missing:
+            raise UnsupportedArchitectureError(
+                f"GGUF metadata is missing or zero for required fields: {missing}"
+            )
 
 
 def config_from_gguf_kv(kv: dict) -> Dsv4Config:
