@@ -251,6 +251,37 @@ class Qwen36Backend:
         checkpoint_budget_multiple: int | None = None,
         batched_decode: bool = True,
     ) -> None:
+        # Verify-attention numerics-mode policy (2026-08-07, five-way A/B in
+        # notes/2026-08-06-128k-c4-parity-profiling.md S19): the DEFAULT is
+        # the 08-05 numerics mode -- M16 verify kernel + frozen worst-case
+        # chunking (sparkinfer knobs SPARKINFER_QWEN36_VERIFY_M16=1 and
+        # SPARKINFER_QWEN36_VERIFY_NO_ADAPTIVE=1).  That mode clears both
+        # historical code-quality gates (0.9268/0.8902 vs 0.921/0.884), is
+        # bitwise the mode the 08-05 baseline was measured in, and is even
+        # faster at short context (+24% at 4K/c8: single-chunk verify skips
+        # split-KV entirely).  The 2026-08-06 fast mode (M32 raw-FP8
+        # verifier + adaptive re-chunking) wins ~10% at 128K but moves the
+        # split-KV reduction ordering and dips code-4096 to 0.8902/0.8659,
+        # so it is OPT-IN for throughput-headline measurement only:
+        #   SPARKINFER_QWEN36_VERIFY_M16=0 SPARKINFER_QWEN36_VERIFY_NO_ADAPTIVE=0
+        # (sparkinfer treats "1" as the only enable value, so any other
+        # value opts out).  setdefault keeps operator env in charge.
+        os.environ.setdefault("SPARKINFER_QWEN36_VERIFY_M16", "1")
+        os.environ.setdefault("SPARKINFER_QWEN36_VERIFY_NO_ADAPTIVE", "1")
+        _m16_on = os.environ["SPARKINFER_QWEN36_VERIFY_M16"] == "1"
+        _frozen_on = os.environ["SPARKINFER_QWEN36_VERIFY_NO_ADAPTIVE"] == "1"
+        if _m16_on and _frozen_on:
+            _numerics_mode = "08-05 quality mode (M16 kernel + frozen chunking)"
+        elif not _m16_on and not _frozen_on:
+            _numerics_mode = (
+                "FAST mode (M32 kernel + adaptive chunking; "
+                "code-quality dip, see notes S19)"
+            )
+        else:
+            _numerics_mode = (
+                f"MIXED verify numerics mode (M16={_m16_on}, frozen_chunking={_frozen_on})"
+            )
+        logger.info("Qwen3.6 verify attention numerics mode: %s", _numerics_mode)
         self.model = model
         self.num_slots = num_slots
         self.block_size = block_size

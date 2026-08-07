@@ -161,6 +161,10 @@ server_maybe_stop() {
 }
 
 server_start_suite() {
+    # Quality gates were defined in the 08-05 numerics mode; pin it
+    # explicitly (also the runtime default since 2026-08-07, notes S19).
+    SPARKINFER_QWEN36_VERIFY_M16=1 \
+    SPARKINFER_QWEN36_VERIFY_NO_ADAPTIVE=1 \
     QSR_SERVER_MODEL_PATH="$MODEL_SNAPSHOT" \
     QSR_SERVER_PRODUCTION=1 \
     QSR_SERVER_CAPACITY=8 \
@@ -187,6 +191,10 @@ server_start_suite() {
 }
 
 server_start_longctx() {
+    # Quality gates were defined in the 08-05 numerics mode; pin it
+    # explicitly (also the runtime default since 2026-08-07, notes S19).
+    SPARKINFER_QWEN36_VERIFY_M16=1 \
+    SPARKINFER_QWEN36_VERIFY_NO_ADAPTIVE=1 \
     QSR_SERVER_MODEL_PATH="$MODEL_SNAPSHOT" \
     QSR_SERVER_PRODUCTION=1 \
     QSR_SERVER_CAPACITY=4 \
@@ -213,6 +221,10 @@ server_start_longctx() {
 }
 
 server_start_mmlu() {
+    # Quality gates were defined in the 08-05 numerics mode; pin it
+    # explicitly (also the runtime default since 2026-08-07, notes S19).
+    SPARKINFER_QWEN36_VERIFY_M16=1 \
+    SPARKINFER_QWEN36_VERIFY_NO_ADAPTIVE=1 \
     QSR_SERVER_MODEL_PATH="$MODEL_SNAPSHOT" \
     QSR_SERVER_PRODUCTION=1 \
     QSR_SERVER_CAPACITY=8 \

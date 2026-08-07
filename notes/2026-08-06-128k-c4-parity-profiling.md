@@ -896,3 +896,21 @@ suite-fast profile（32K 槽 / cap 8），4K/c8 filler：
   baseline 同日校准）。
 * `scripts/ab_verify_chunking_configs.sh` / `scripts/ab_quality_code_dim.sh`
   / `scripts/ab_shortctx_m16frozen.sh` —— 本节的三个 A/B 复用脚本。
+
+## 20. 默认数值模式切换：生产默认 = 08-05 质量模式（2026-08-07）
+
+依据 §19 的五方实测，默认策略落地：
+
+* **runtime 默认**（`runtime/backends/qwen36.py::__init__` 的
+  `os.environ.setdefault`）：`SPARKINFER_QWEN36_VERIFY_M16=1` +
+  `SPARKINFER_QWEN36_VERIFY_NO_ADAPTIVE=1` = 08-05 数值模式。
+  服务启动日志明示当前模式（"Qwen3.6 verify attention numerics mode: ..."）。
+* **吞吐基准 profile**（`scripts/qwen36_128k_bench_env.sh`）显式
+  `=0/=0` opt-in FAST 模式——headline 测量继续用快速数值，注释写明代价。
+* **质量套件**（`scripts/run_qwen36_quality.sh` 三个 profile）显式钉死
+  08-05 模式（与默认一致，显式化以防漂移）。
+* 验证：两次真启动日志确认（默认 → "08-05 quality mode"；bench env →
+  "FAST mode"），torch-free 套件 1162 passed。
+* 取舍记录：质量双过历史门（0.9268/0.8902 ≥ 0.921/0.884）为硬约束；
+  128K/c4 从 ~235 降到 ~211（−10%）为已知代价；追回路径 = §19.9-4 的
+  位级安全 kernel 优化（M16 跨 query-tile KV 页读复用），不动归约顺序。

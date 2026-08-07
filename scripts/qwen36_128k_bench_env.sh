@@ -29,3 +29,12 @@ export QSR_TOOL_CALL_PARSER=qwen3_coder
 export QSR_SERVED_MODEL_NAME=qwen3.6
 export QSR_DEBUG_REQUESTS=0
 export HF_HUB_OFFLINE=1
+
+# Verify-attention numerics mode (2026-08-07, notes S19): this is the
+# THROUGHPUT-HEADLINE profile, so it explicitly opts into the fast mode
+# (M32 raw-FP8 verifier + adaptive re-chunking). The runtime DEFAULT is
+# the 08-05 quality mode; fast mode costs code quality (0.8902/0.8659 vs
+# 0.9268/0.8902) and is for perf measurement only. sparkinfer treats "1"
+# as the only enable value, so "0" opts out of each half.
+export SPARKINFER_QWEN36_VERIFY_M16=0
+export SPARKINFER_QWEN36_VERIFY_NO_ADAPTIVE=0
