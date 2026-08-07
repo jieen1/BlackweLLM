@@ -914,3 +914,59 @@ suite-fast profile（32K 槽 / cap 8），4K/c8 filler：
 * 取舍记录：质量双过历史门（0.9268/0.8902 ≥ 0.921/0.884）为硬约束；
   128K/c4 从 ~235 降到 ~211（−10%）为已知代价；追回路径 = §19.9-4 的
   位级安全 kernel 优化（M16 跨 query-tile KV 页读复用），不动归约顺序。
+
+## 21. 质量模式 128K 成本追回实验（2026-08-07 下午）
+
+§20 把默认切到 08-05 质量模式后，128K/c4 成本 −10%（256K 槽）。两条
+位级安全追回路径的实测：
+
+### 21.1 捕获视界调优（env-only，成功）
+
+`scripts/qwen36_128k_bench_env.sh` 的 `QSR_SERVER_BLOCKS_PER_SLOT`
+16384（256K）→ 8216（131456 token，恰好覆盖 128K+256+模板）：
+
+| 配置（m16frozen，128K/c4 无剖析 5 波） | warm tok/s | 中位 |
+|---|---|---:|
+| 256K 槽 | 155.4/144.9/154.4/145.0/152.6 | 152.6 |
+| **128K 槽（视界调优）** | 165.7/160.9/164.0/178.2/152.8 | **164.0（+7.5%）** |
+
+同机 baseline（M32+adaptive，256K 槽）中位 170.0 → 差距从 −10.2% 收窄到
+**−3.5%**；健康机外推 ≈ 234.8×164/170 ≈ **226 > 历史 222.44**。
+机理：frozen chunking 的 chunk 大小由捕获期最坏长度导出——256K 视界在
+128K live 只得 6 chunk/req（187 页/chunk，半台机器空转）；128K 视界得
+11 chunk/req（94 页/chunk，填满预算）。探针同向印证：m16frozen b4
+capture@1024 = 0.944ms vs capture@2048 = 1.266ms（−25%）。
+注意：这是 workload-适配的槽位口径（与质量套件"按 workload 定槽位"的
+08-05 项目决策同哲学），改变了 bench 槽位参数，与 §13.4 的 256K 槽
+headline 不同口径，引用时须注明。
+
+### 21.2 worklist 顺序交换（L2 局部性假设，实测否决）
+
+假设：planner worklist 从 (req, q_tile, chunk) 改为 (req, chunk, q_tile)，
+同 chunk 的两个 query-tile CTA 在 launch 序上相邻 → 共享 KV 页的 L2，
+M16 双读带宽减半。实现（planner + graph_replay triton 分解同步改）后：
+
+* **位级中性验证通过**：同输入两序输出 `torch.equal == True`
+  （partial 行按 `request_partial_start + token_local*num_chunks_kv +
+  kv_tile_idx` 算术寻址，merge 走 indptr，launch 序不入数值）✓
+* **性能实测否决**（同 session 探针，m16frozen @2048）：
+  b1 0.514 vs 0.522（持平）、b3 1.009 vs 0.875（**+15% 劣化**）、
+  b4 1.476 vs 1.195（**+23% 劣化**）。相邻 CTA 并未时间重叠到可共享
+  L2，反而打断了按 chunk 顺序流的 DRAM 行局部性。**已完整回滚**
+  （planner.py / graph_replay.py 恢复 HEAD，测试 83 passed）。
+
+Rejected: worklist 顺序交换（kv outer）| 位级安全但性能劣化 15–23%，
+L2 共享假设在真实调度下不成立（本节实测）
+Directive: 任何 worklist 布局改动必须先过位级等价探针 + 同 session
+性能 A/B，两者都过才落地
+
+### 21.3 结论与剩余路径
+
+1. **已落地**：质量模式默认（§20）+ 128K workload 用适配槽位（21.1）
+   ⇒ 质量 0.9268/0.8902 与 ~226 tok/s（健康机外推）兼得。
+2. **剩余 −3.5%（256K 槽口径）**：M16 每页双读是带宽根因。位级安全的
+   深修 = kernel 内跨 query-tile 复用 KV（一个 CTA 处理同 chunk 的两个
+   q_tile，KV 只读一次，per-tile 算术不变）——CuTeDSL kernel 手术，
+   风险/工期独立立项。
+3. **备选（未验证质量）**：M16+FIXED_SPLITS=22（94 页 chunk，等效 21.1
+   的颗粒度但保持 256K 槽）——新 ULP 抽取，需先过质量锚再考虑。
