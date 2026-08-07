@@ -1,0 +1,205 @@
+"""Fused DSV4 mHC pre-kernel: linear -> rsqrt -> sinkhorn -> pre/post/comb.
+
+The eager ``Dsv4Block.hc_pre`` chain runs ~47 tiny launches per token per
+block (dequant + linear + rsqrt + sigmoid/softmax + 2x19 sinkhorn norms);
+at 86 block-sides per decode step that is thousands of small kernels a
+step. This kernel fuses the whole pre side into one program per token:
+
+    mixes[t, j] = (x[t] . dequant_q8_0(W[j])) * rsqrt(mean(x[t]^2) + eps)
+
+then the reference ``hc_split_sinkhorn`` semantics in fp32 (sigmoid
+pre/post, softmax+eps comb, 19 rounds of row/column normalization ending
+on a column normalize -- deliberately NOT re-symmetrized, that would
+"fix" the reference), and finally the reduced stream
+
+    y[t, :] = sum_h pre[h] * x[t, h, :]
+
+matching ``Dsv4Block.hc_pre`` in fp32 modulo reduction order (the parity
+tolerance for HC is 1e-4, measured below). Weights stay packed Q8_0 --
+dequantized inside the kernel, no bf16 cache ever.
+
+Implementation notes:
+- bf16 loads followed by fp32 reductions are LOSSY on this Triton build
+  (sums quantize to coarse grids; verified 2026-08-07, see the kernel
+  comment). Every x read therefore goes through the raw-bytes bitcast
+  path, which is exact (1e-7 agreement).
+- The 512 Q8_0 block loop is rolled, not unrolled: static unrolling blows
+  up both compile time and code size.
+"""
+
+from __future__ import annotations
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _hc_pre_kernel(
+    x_ptr,  # [T, hc*d] bf16, row-major
+    w_ptr,  # [hc_mix, hc*d] Q8_0 packed, row stride w_row_bytes bytes
+    scale_ptr,  # [3] fp32
+    base_ptr,  # [hc_mix] fp32
+    y_ptr,  # [T, d] bf16 out (reduced stream)
+    post_ptr,  # [T, hc] fp32 out
+    comb_ptr,  # [T, hc*hc] fp32 out
+    eps,
+    sinkhorn_iters: tl.constexpr,
+    hc: tl.constexpr,  # hc_mult (4)
+    d: tl.constexpr,  # hidden size (4096)
+    hc_dim: tl.constexpr,  # hc * d (16384)
+    w_row_bytes: tl.constexpr,  # packed bytes per W row (hc_dim/32*34)
+):
+    t = tl.program_id(0)
+    idx32 = tl.arange(0, 32)
+    rows_ok = idx32 < hc * 6  # only hc*6 (24) of the 32 lanes are real W rows
+
+    # bf16 -> fp32 via the raw bytes: tl.load of bf16 followed by fp32 math
+    # quantizes on this Triton build (verified 2026-08-07); the bitcast path
+    # is exact.
+    x_u16 = x_ptr.to(tl.pointer_type(tl.uint16))
+
+    # -- pass 1: rsqrt over the whole row -----------------------------------
+    cols = tl.arange(0, hc_dim)
+    xf = (tl.load(x_u16 + t * hc_dim + cols).to(tl.uint32) << 16).to(tl.float32, bitcast=True)
+    rsqrt = 1.0 / tl.sqrt(tl.sum(xf * xf) / hc_dim + eps)
+
+    # -- pass 2: 24 dot products, Q8_0 dequantized in-kernel -----------------
+    acc = tl.zeros((32,), dtype=tl.float32)
+    # Q8_0 packed blocks: 34 bytes = 2-byte fp16 d + 32 int8 q.
+    # Rolled (not unrolled): 512 iterations would blow up the compile.
+    for blk in range(hc_dim // 32):
+        xs = (tl.load(x_u16 + t * hc_dim + blk * 32 + idx32).to(tl.uint32) << 16).to(
+            tl.float32, bitcast=True
+        )
+        offs_j = idx32[:, None] * w_row_bytes
+        wq = tl.load(
+            w_ptr + offs_j + blk * 34 + 2 + idx32[None, :],
+            mask=rows_ok[:, None],
+            other=0,
+        )
+        d2 = tl.load(
+            w_ptr + offs_j + blk * 34 + tl.arange(0, 2)[None, :],
+            mask=rows_ok[:, None],
+            other=0,
+        )
+        d_lo, d_hi = tl.split(d2)
+        d_u16 = d_lo.to(tl.uint16) | (d_hi.to(tl.uint16) << 8)
+        d_f = d_u16.to(tl.float16, bitcast=True).to(tl.float32)
+        dots = tl.sum(
+            xs[None, :] * wq.to(tl.int8, bitcast=True).to(tl.float32) * d_f[:, None],
+            axis=1,
+        )
+        acc += dots
+    mixes = acc * rsqrt  # [32]; lanes >= hc*6 are garbage
+
+    # -- sinkhorn ------------------------------------------------------------
+    scale = tl.load(scale_ptr + tl.arange(0, 4), mask=tl.arange(0, 4) < 3, other=0.0)
+    base = tl.load(base_ptr + idx32, mask=idx32 < hc * 6, other=0.0)
+    scale0 = tl.sum(tl.where(tl.arange(0, 4) == 0, scale, 0.0), axis=0)
+    scale1 = tl.sum(tl.where(tl.arange(0, 4) == 1, scale, 0.0), axis=0)
+    scale2 = tl.sum(tl.where(tl.arange(0, 4) == 2, scale, 0.0), axis=0)
+    sc = tl.where(
+        idx32 < hc,
+        scale0,
+        tl.where(idx32 < hc * 2, scale1, tl.where(idx32 < hc * 6, scale2, scale0)),
+    )
+    pre_full = tl.sigmoid(mixes * sc + base) + eps
+    post_full = 2.0 * tl.sigmoid(mixes * sc + base)
+
+    # comb elements are lanes hc*2 .. hc*3
+    comb16 = tl.sum(
+        tl.where(
+            idx32[:, None] == (hc * 2 + tl.arange(0, 16)[None, :]),
+            (mixes * sc + base)[:, None],
+            0.0,
+        ),
+        axis=0,
+    )
+    comb = tl.reshape(comb16, (hc, hc))
+    # Manual row softmax: tl.softmax on a [hc, hc] tensor normalizes along
+    # the WRONG axis on this Triton build (per-column, verified 2026-08-07).
+    row_max = tl.max(comb, axis=1)[:, None]
+    exp_c = tl.exp(comb - row_max)
+    comb = exp_c / tl.sum(exp_c, axis=1)[:, None] + eps
+    comb = comb / (tl.sum(comb, axis=0)[None, :] + eps)
+    for _ in tl.static_range(sinkhorn_iters - 1):
+        comb = comb / (tl.sum(comb, axis=1)[:, None] + eps)
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + eps)
+
+    # -- reduced stream: y = sum_h pre[h] * x[t, h, :] -----------------------
+    y = tl.zeros((d,), dtype=tl.float32)
+    for h in tl.static_range(hc):
+        pre_h = tl.sum(tl.where(idx32 == h, pre_full, 0.0), axis=0)
+        xh = (tl.load(x_u16 + t * hc_dim + h * d + tl.arange(0, d)).to(tl.uint32) << 16).to(
+            tl.float32, bitcast=True
+        )
+        y += pre_h * xh
+    tl.store(y_ptr + t * d + tl.arange(0, d), y.to(tl.bfloat16))
+
+    # -- outputs -------------------------------------------------------------
+    post4 = tl.sum(
+        tl.where(
+            idx32[:, None] == (hc + tl.arange(0, hc)[None, :]),
+            post_full[:, None],
+            0.0,
+        ),
+        axis=0,
+    )
+    tl.store(post_ptr + t * hc + tl.arange(0, hc), post4)
+    tl.store(comb_ptr + t * hc * hc + tl.arange(0, 16), tl.reshape(comb, (16,)))
+
+
+def hc_fused_pre(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    *,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused ``Dsv4Block.hc_pre`` for x [T, hc, d] bf16.
+
+    ``hc_fn`` is the packed Q8_0 flat uint8 storage (hc*6 rows of hc*d/32*34
+    bytes). Returns (y [T, d] bf16, post [T, hc] fp32, comb [T, hc, hc] fp32)
+    -- the same three tensors the eager chain yields.
+    """
+    if x.ndim != 3 or x.dtype != torch.bfloat16:
+        raise ValueError(f"x must be [T, {hc_mult}, d] bf16, got {tuple(x.shape)} {x.dtype}")
+    t_tokens, hc, d = x.shape
+    if hc != hc_mult:
+        raise ValueError(f"x second dim must be hc_mult {hc_mult}, got {hc}")
+    if hc_fn.dtype != torch.uint8 or hc_fn.ndim != 1:
+        raise ValueError(
+            f"hc_fn must be a flat packed uint8 buffer, got {hc_fn.dtype} {hc_fn.ndim}d"
+        )
+    row_bytes = hc * d // 32 * 34
+    if hc_fn.numel() != hc * 6 * row_bytes:
+        raise ValueError(
+            f"hc_fn packed bytes must be {hc * 6} rows x {row_bytes}, got {hc_fn.numel()}"
+        )
+    if sinkhorn_iters < 1:
+        raise ValueError(f"sinkhorn_iters must be >= 1, got {sinkhorn_iters}")
+    y = torch.empty(t_tokens, d, dtype=torch.bfloat16, device=x.device)
+    post = torch.empty(t_tokens, hc, dtype=torch.float32, device=x.device)
+    comb = torch.empty(t_tokens, hc, hc, dtype=torch.float32, device=x.device)
+    if t_tokens == 0:
+        return y, post, comb
+    _hc_pre_kernel[(t_tokens,)](
+        x.reshape(t_tokens, hc * d).contiguous(),
+        hc_fn,
+        hc_scale,
+        hc_base,
+        y,
+        post,
+        comb,
+        eps,
+        sinkhorn_iters=sinkhorn_iters,
+        hc=hc_mult,
+        d=d,
+        hc_dim=hc * d,
+        w_row_bytes=row_bytes,
+    )
+    return y, post, comb
