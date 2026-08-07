@@ -309,6 +309,7 @@ class Dsv4Compressor(nn.Module):
         *,
         head_dim: int | None = None,
         rotate: bool = False,
+        quantize: bool = True,
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
@@ -316,6 +317,10 @@ class Dsv4Compressor(nn.Module):
         assert self.ratio != 0
         self.overlap = self.ratio == 4
         self.rotate = rotate  # indexer variant: Hadamard + full-dim fp4 simulation
+        # False for the kernel-path attention layer: its packed FP8 pages are
+        # quantized by the pack kernel (dsv4_kv_pack), so the compressor emits
+        # the raw normed/rotated entry and the QAT simulation moves downstream.
+        self.quantize = quantize
         self.head_dim = head_dim if head_dim is not None else config.head_dim
         self.rope_head_dim = config.rope_head_dim
         self.eps = config.norm_eps
@@ -369,6 +374,8 @@ class Dsv4Compressor(nn.Module):
         else:
             freqs = self.freqs_cis[start_pos + 1 - self.ratio].unsqueeze(0)
         apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs)
+        if not self.quantize:
+            return kv
         if self.rotate:
             # indexer path: Hadamard over the full head dim, then fp4 block-32
             # simulation on everything (rope included, post-rotation).
