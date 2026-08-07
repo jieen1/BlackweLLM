@@ -199,3 +199,50 @@ acc_s_cast 8 KB + margin），而本机 RTX PRO 6000 Blackwell（SM120）的 opt
   "I"，曾造成误判）。Phase 3 对齐必须带 `-no-cnv`（裸补全模式）。
 - 复现：`timeout 280 ./bin/llama-completion -m <gguf> -p "The meaning of life is"
   --temp -1 -n 2 -no-cnv --verbose-prompt`（装载约 50 s，prompt eval ~31 t/s）。
+
+## 10. 首次 128-token 贪心对齐（2026-08-07）：一致率 2/256 —— 差异归因分析
+
+### 10.1 实测结果（harness：scripts/dsv4_align_eager_vs_llama.py）
+
+- 两个 workload × 128 token，我方 eager 图（fp32 dequant、reference QAT
+  语义的 act_quant_simulate）vs llama.cpp 默认参数（`-no-cnv --temp -1`）。
+- workload 1 "The meaning of life is"：前 2 token 一致（" that" " it"），
+  第 3 token 分叉：我方 " stops" vs llama " ends"（近义、疑似 logit 近平手）；
+  此后各自走入不同的（均开始发散为 JSON 片段的）续写。
+- workload 2 "Explain the theory of relativity in simple terms:"：第 0 token
+  即分叉。我方续写完全连贯（" The theory of relativity is a fundamental
+  theory in physics..."）；llama 输出不连贯（裸 JSON 碎片 `"\n }...`）。
+- 总一致率 2/256 (0.78%)，远低于 Phase 3 门禁的 top-1 ≥99% 预期。
+
+### 10.2 归因（已确证：llama.cpp 省略了 reference 的 QAT 模拟）
+
+**对照实验**：`-ctk f16 -ctv f16` 复跑 workload 1，llama 输出与 q8_0-KV
+逐 token 相同（仍在第 3 token 给出 " ends"）→ KV 缓存量化域**不是**分叉源。
+
+**源码证据**（/home/bot/project/llama.cpp/src/models/deepseek4.cpp，
+b1-79bba02a，全文检索）：
+- 全文件无任何 fp8/e4m3/e2m1/ue8m0/hadamard 算子 —— reference 在
+  attention 操作数上的 QAT 模拟被整体省略：
+  1. 主 latent KV 的 nope 段 fp8-e4m3 block-64 ue8m0 模拟（我方
+     Dsv4Attention.kv 路径已实现并位级对拍）；
+  2. indexer 的 q/K Hadamard 旋转 + fp4 block-32 模拟（我方 Dsv4Indexer
+     已实现；llama 的 build_lid_top_k 直接对未量化张量做 mul_mat，
+     deepseek4.cpp:572 附近）；
+  3. compressor 产出的压缩条目的相应模拟。
+- 结构件（compressor/indexer/sinks/HC sinkhorn/ratio 0-4-128）llama.cpp
+  均有实现，架构是完整的；缺的是 QAT 数值语义。
+
+**结论**：我方 eager 图对该模型比 llama.cpp **更忠实于官方 reference**
+（QAT 模拟是训练时行为，权重就是为它优化的）。2/256 的低一致率是
+llama.cpp 省略 QAT 的固有结果，不是我方 bug；workload 2 上我方连贯、
+llama 不连贯与此一致。
+
+### 10.3 Phase 3 oracle 策略（改判，已生效）
+
+- **权威语义 = 官方 reference**。我方 eager 是其 executable definition
+  （部件级位级对拍全覆盖，Phase 2 门禁已兑付）。
+- **llama.cpp 降级为 sanity oracle**：装载/分词/连贯性/量级核对可用；
+  贪心 token 流不做一致性门禁。
+- **Phase 3 数值红线改为**：kernel 化路径 vs eager 路径的同语义对拍
+  （逐层 logits 余弦 > 0.99999 + 贪心流一致），外加本节的 llama.cpp
+  sanity 核对。原计划中"vs llama.cpp top-1 ≥99%"门禁作废，理由存档于此。

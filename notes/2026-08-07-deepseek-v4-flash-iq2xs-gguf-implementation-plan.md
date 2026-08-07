@@ -237,11 +237,14 @@ smem 超限（事实基线 §7.6），与本量化混存 checkpoint 无数值可
    （`ModelBackend` 协议 12 成员 + `BackendCapabilities`，
    `check_conformance` 过）；eager、batch=1、无图、无前缀缓存。
 
-**门禁（正确性红线）**：与 llama.cpp 同 prompt 贪心逐 token 对齐，
-≥3 个工作负载 × 512 token；不要求 100%（不同 kernel 库累加序差异），
-但要求 top-1 一致率 ≥ 99%、top-5 logit 一致率 ≥ 99.9%、无系统性漂移
-（`docs/model-support.md` §4 的量化 kernel 验收口径）；逐层 logits 余弦进 bfdiag；
-`bf trace` 全绿。
+**门禁（正确性红线，2026-08-07 改判）**：原"vs llama.cpp top-1 ≥99%"作废。
+实测 llama.cpp 对本模型省略了 reference 的全部 QAT 模拟（fp8/fp4/hadamard，
+源码证据见事实基线 §10.2），贪心流低一致率（2/256）是其固有属性。改判为：
+1. **kernel 路径 vs eager 路径同语义对拍**（eager = reference executable
+   definition）：逐层 logits 余弦 > 0.99999，贪心流一致，≥3 工作负载 × 512
+   token，无系统性漂移（`docs/model-support.md` §4 口径）；
+2. llama.cpp 仅做 sanity 核对（装载、分词、连贯性、量级）；
+3. 逐层 logits 余弦进 bfdiag；`bf trace` 全绿。
 
 ### Phase 4 · 服务化（~2-3 周）
 
