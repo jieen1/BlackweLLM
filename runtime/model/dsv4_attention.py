@@ -205,6 +205,7 @@ def hadamard_matrix(dim: int, device: torch.device) -> torch.Tensor:
 
 
 def hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
-    """Drop-in semantics of fast_hadamard_transform.hadamard_transform."""
+    """Drop-in semantics of fast_hadamard_transform.hadamard_transform
+    (fp32 accumulate, output in the input dtype)."""
     h = hadamard_matrix(x.shape[-1], x.device)
-    return (x.float() @ h) * scale
+    return ((x.float() @ h) * scale).to(x.dtype)

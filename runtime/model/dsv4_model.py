@@ -23,12 +23,22 @@ from runtime.model.dsv4_quant import dequantize_iq2_xs, dequantize_q8_0
 
 
 class PackedQ8_0Linear(nn.Module):
-    """Linear over a packed Q8_0 weight; dequantized per forward (eager)."""
+    """Linear over a packed Q8_0 weight; dequantized per forward (eager).
 
-    def __init__(self, out_features: int, in_features: int) -> None:
+    ``weight_dtype=None`` (default): fp32 dequant, fp32 compute -- the eager
+    accuracy contract. ``weight_dtype=torch.bfloat16``: the dequantized values
+    round to bf16 first and the matmul runs bf16 -- the regime the reference
+    uses for bf16-declared linears (its ``linear()`` is strict on dtypes),
+    and what these layers will run at in production.
+    """
+
+    def __init__(
+        self, out_features: int, in_features: int, *, weight_dtype: torch.dtype | None = None
+    ) -> None:
         super().__init__()
         self.out_features = out_features
         self.in_features = in_features
+        self.weight_dtype = weight_dtype
         numel = out_features * in_features
         n_bytes = numel // 32 * 34
         self.register_buffer("packed", torch.empty(n_bytes, dtype=torch.uint8))
@@ -45,9 +55,9 @@ class PackedQ8_0Linear(nn.Module):
         return dequantize_q8_0(self.packed).reshape(self.out_features, self.in_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # fp32 compute is the eager contract (accuracy scaffold; kernels later
-        # keep fp32 accumulation).
         weight = self.dequantized()
+        if self.weight_dtype is not None:
+            return F.linear(x, weight.to(self.weight_dtype))
         return F.linear(x.float(), weight)
 
 
@@ -194,6 +204,8 @@ class Dsv4MoE(nn.Module):
 from runtime.model.dsv4_attention import (  # noqa: E402
     act_quant_simulate,
     apply_rotary_emb,
+    fp4_act_quant_simulate,
+    hadamard_transform,
 )
 
 
@@ -206,12 +218,20 @@ class Dsv4Compressor(nn.Module):
     (overlapping) window and emits one compressed entry every `ratio` steps.
     """
 
-    def __init__(self, config: Dsv4Config, layer_id: int) -> None:
+    def __init__(
+        self,
+        config: Dsv4Config,
+        layer_id: int,
+        *,
+        head_dim: int | None = None,
+        rotate: bool = False,
+    ) -> None:
         super().__init__()
         self.ratio = config.layer_ratio(layer_id)
         assert self.ratio != 0
         self.overlap = self.ratio == 4
-        self.head_dim = config.head_dim
+        self.rotate = rotate  # indexer variant: Hadamard + full-dim fp4 simulation
+        self.head_dim = head_dim if head_dim is not None else config.head_dim
         self.rope_head_dim = config.rope_head_dim
         self.eps = config.norm_eps
         self.ue8m0 = True  # production QAT config (fp8-origin weights)
@@ -256,9 +276,15 @@ class Dsv4Compressor(nn.Module):
         else:
             freqs = self.freqs_cis[start_pos + 1 - self.ratio].unsqueeze(0)
         apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs)
-        kv[..., : -self.rope_head_dim] = act_quant_simulate(
-            kv[..., : -self.rope_head_dim], 64, ue8m0=self.ue8m0
-        )
+        if self.rotate:
+            # indexer path: Hadamard over the full head dim, then fp4 block-32
+            # simulation on everything (rope included, post-rotation).
+            kv = hadamard_transform(kv, self.head_dim**-0.5)
+            kv = fp4_act_quant_simulate(kv, 32)
+        else:
+            kv[..., : -self.rope_head_dim] = act_quant_simulate(
+                kv[..., : -self.rope_head_dim], 64, ue8m0=self.ue8m0
+            )
         return kv
 
     def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor | None:
@@ -331,3 +357,70 @@ class Dsv4Compressor(nn.Module):
         kv = self._finalize(kv, 0, dtype, start_pos)
         self.kv_cache[:bsz, start_pos // ratio] = kv.squeeze(1)
         return kv
+
+
+class Dsv4Indexer(nn.Module):
+    """Selects top-k compressed-KV positions for CSA layers (ratio 4).
+
+    Reference Indexer transcription: low-rank query from the main q latent,
+    rope + Hadamard + fp4 QAT simulation on the query; its own rotating
+    compressor builds the compressed K cache; scores = relu(q·k) weighted by
+    weights_proj, summed over heads, top-k. Q8_0 file weights round to bf16
+    for the query/weight projections (the reference regime for bf16-declared
+    linears); the score accumulation after the einsum is fp32.
+    """
+
+    def __init__(self, config: Dsv4Config, layer_id: int) -> None:
+        super().__init__()
+        assert config.has_indexer(layer_id)
+        self.n_heads = config.index_n_heads
+        self.head_dim = config.index_head_dim
+        self.rope_head_dim = config.rope_head_dim
+        self.index_topk = config.index_topk
+        self.softmax_scale = self.head_dim**-0.5
+        self.wq_b = PackedQ8_0Linear(
+            self.n_heads * self.head_dim, config.q_lora_rank, weight_dtype=torch.bfloat16
+        )
+        self.weights_proj = PackedQ8_0Linear(
+            self.n_heads, config.hidden_size, weight_dtype=torch.bfloat16
+        )
+        self.compressor = Dsv4Compressor(config, layer_id, head_dim=self.head_dim, rotate=True)
+        self.kv_cache: torch.Tensor | None = None  # owner-assigned [b, entries, head_dim]
+        self.freqs_cis: torch.Tensor | None = None
+
+    def forward(
+        self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int
+    ) -> torch.Tensor:
+        assert self.kv_cache is not None and self.freqs_cis is not None
+        bsz, seqlen, _ = x.shape
+        ratio = self.compressor.ratio
+        end_pos = start_pos + seqlen
+        if self.compressor.kv_cache is None:
+            self.compressor.kv_cache = self.kv_cache
+            self.compressor.freqs_cis = self.freqs_cis
+        freqs = self.freqs_cis[start_pos:end_pos]
+        q = self.wq_b(qr)
+        q = q.unflatten(-1, (self.n_heads, self.head_dim))
+        apply_rotary_emb(q[..., -self.rope_head_dim :], freqs)
+        q = hadamard_transform(q, self.head_dim**-0.5)
+        q = fp4_act_quant_simulate(q, 32)
+        self.compressor(x, start_pos)
+        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+        index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz, : end_pos // ratio])
+        index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
+        if start_pos == 0:
+            causal = torch.arange(seqlen // ratio, device=x.device).repeat(seqlen, 1)
+            causal = causal >= torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
+            index_score = index_score + torch.where(
+                causal, torch.tensor(float("-inf"), device=x.device), 0.0
+            )
+        k = min(self.index_topk, end_pos // ratio)
+        topk_idxs = index_score.topk(k, dim=-1)[1]
+        if start_pos == 0:
+            invalid = topk_idxs >= (
+                torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
+            )
+            topk_idxs = torch.where(invalid, -1, topk_idxs + offset)
+        else:
+            topk_idxs = topk_idxs + offset
+        return topk_idxs
