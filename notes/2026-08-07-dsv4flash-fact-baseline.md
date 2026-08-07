@@ -112,6 +112,25 @@ YaRN（factor 16，65536→1M，theta 10000；压缩 KV 用 theta 160000；纯�
 - 官方 reference（tilelang 0.1.9）可 import；`fast_hadamard_transform` 安装失败，
   需要时用 torch Sylvester-Hadamard 等价替换（只影响 indexer 路径）。
 
+## 7.5 部件级语义对拍（tests/test_dsv4_reference_parts.py，GPU 实测）
+
+用真实 GGUF 权重初始化官方 reference 模块，与我们独立写的实现对拍：
+
+- **Gate（打分路由层）**：`softplus(logits).sqrt()` → 偏置只进 top-k **选择**、
+  不进权重 → 无偏分数 gather → renorm × 1.5。**位精确一致**（indices + weights
+  全等）。不变量：每 token 权重和恒为 1.5（route_scale）。
+- **Gate（哈希层 0-2）**：`indices = tid2eid[input_ids]`（[129280,6]），
+  **但 gate logits 照常计算、权重仍从中 gather**（"跳过选择，不跳过 gate"）；
+  **位精确一致**。
+- **hc_split_sinkhorn**（tilelang kernel vs torch 复现，fp32）：mixes[24] =
+  pre(4) | post(4) | comb(16)；`pre = sigmoid(m·scale[0]+base)+eps`，
+  `post = 2·sigmoid(m·scale[1]+base)`，comb = softmax(行)+eps → 列归一 →
+  19 轮（行归一 → 列归一）。容差内一致（归约序差异）。
+  ⚠️ **已验证的微妙事实：循环以列归一化收尾，终态列和≈1、行和自由漂移
+  （实测 0.92–1.08），并非双随机矩阵——实现时不要"修正"成对称归一。**
+- 尚未对拍：Compressor（overlap/APE/decode 状态机）、Indexer、注意力聚合
+  （Phase 2/3 随模型图落地时补对拍）。
+
 ## 8. 尚未实测（后续阶段的门禁项）
 
 - 本 runtime 内的权重上卡占用与 KV 预算（Phase 2/3，冷进程）。

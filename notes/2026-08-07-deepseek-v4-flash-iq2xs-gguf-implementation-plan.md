@@ -162,10 +162,17 @@ packed 形态参与计算（kernel 内 dequant）。
    `pre=joyai-llm` 正则已从 llama.cpp `llama-vocab.cpp:320` 核对
    （= DEEPSEEK3_LLM 集合，clean_spaces=false，与 tokenizer.json 的
    Split 序列一致）。4 组官方 encoding 测试向量已落盘待 Phase 4 使用。
-5. 显存实测：权重全量上 GPU 的占用（冷进程），确认 §1.4 测算。
+5. [x] 显存实测：llama.cpp 冷进程 2K ctx 总占用 85,909 MiB（权重 83,825 MiB +
+   ~2 GiB 上下文），与 §1.4 测算一致（见事实基线 §6）。
+6. [x] 部件级对拍（Gate 打分/哈希路由位精确、hc_split_sinkhorn 容差内一致；
+   见事实基线 §7.5）；Compressor/Indexer 对拍随 Phase 2/3 补齐。
+7. [x] 张量形状三方核验 1328/1328、0 失配（tools/verify_dsv4_tensor_map.py，
+   事实基线 §2.1）；纠正 compress_ratios 解读（主层 [0,0]+[4,128]×20+[4]）。
 
 **门禁**：IQ2_XS/Q8_0 反量化与 llama.cpp bit-exact（CPU 侧）✅；tokenizer
-一致性 ✅；显存实测与测算差 <5%（待下载完成后冷进程实测）。
+一致性 ✅；显存实测 85.9 GiB vs 测算 ~86 GiB（差 <1%）✅；张量形状三方核验 ✅；
+Gate/HC 部件对拍 ✅（Compressor/Indexer 对拍顺延至 Phase 2/3，理由：其语义
+验证与模型图实现强耦合，提前单独做重复劳动）。
 
 ### Phase 2 · GGUF 加载器 + 模型图（~2 周）
 

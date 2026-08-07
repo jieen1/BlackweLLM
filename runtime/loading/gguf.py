@@ -85,7 +85,8 @@ def iterate_gguf_checkpoint(
                 payload = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
                 dtype = _PLAIN_DTYPES.get(info.type_name)
                 if dtype is not None:
-                    payload = payload.view(dtype)
+                    # plain tensors arrive shaped; packed quant payloads stay flat
+                    payload = payload.view(dtype).reshape(_torch_shape(info))
                 yield GgufTensor(
                     name=info.name,
                     type_name=info.type_name,
