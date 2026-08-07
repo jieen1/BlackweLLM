@@ -47,7 +47,7 @@ DeepSeek-V4-Flash-0731：**284B 总参 / 13B 激活**，1M 上下文，MIT。
 | MoE | 256 routed + 1 shared，top-6，inter 2048，`sqrtsoftplus` 打分 + noaux_tc 选择偏置 + renorm × route_scale 1.5，swiglu clamp ±10 |
 | hash 路由 | 前 3 层：专家选择由 `tid2eid[token_id]`（[129280,6] int32）预定，权重仍取自 gate logits |
 | 注意力 | MLA 变体：q_lora 1024 → 64 头 × head_dim 512（latent，448 nope + 64 rope），单 latent KV，o_groups 8 × o_lora 1024，每头 `attn_sink` 偏置 |
-| 混合注意力 | `compress_ratios` 逐层：层 0,1,40,41,42 = 0（纯滑窗 128，base rope 无 YaRN）；层 2,4,…,38 = 4（CSA：滑窗 + indexer top-512/压缩位）；层 3,5,…,39 = 128（HCA：滑窗 + 全部 seq/128 压缩位） |
+| 混合注意力 | `compress_ratios` 46 项 = 43 主层 + 3 MTP 阶段。主层：层 0,1 = 0（纯滑窗 128，base rope 无 YaRN）；偶数层 2..42 = 4（**21 层**，CSA：滑窗 + indexer top-512/压缩位）；奇数层 3..41 = 128（**20 层**，HCA：滑窗 + 全部 seq/128 压缩位）。⚠️ 末尾三个 0 属 DSpark 阶段，层 40-42 带压缩器（2026-08-07 经文件张量存在性核验） |
 | 压缩器 | 每 ratio 个 token 做学习门控池化（wkv/wgate + APE + softmax），ratio-4 带 overlap；输出 nope FP8（block-64 ue8m0）+ rope BF16；indexer 专用压缩器额外做 Hadamard 旋转 + FP4 模拟量化 |
 | indexer | q 来自 q latent（wq_b 1024→64×128），Hadamard + FP4 模拟；weights_proj [4096→64] BF16；对压缩 K 打分取 top-512 |
 | mHC 超连接 | hc_mult 4：每层 attn/ffn 前后各做一次 `(2+4)*4=24`-mix，Sinkhorn 20 迭代投影（fp32）；最终 hc_head 收敛到 logits |
@@ -87,10 +87,12 @@ Pareto 集里唯一 <90 GB 的点）。因此：
 | 项 | 估算 |
 |---|---|
 | 权重（packed，常驻不反量化） | 81.86 GiB |
-| KV/槽（128K ctx）：窗口环 43×128×~584B + ratio-4 层 19×32K×584B + ratio-128 层 19×1K×584B + indexer 19×32K×68B | ≈0.45 GiB |
-| KV/槽（1M ctx） | ≈3.3 GiB |
+| KV/槽（128K ctx）：窗口环 43×128×~584B + ratio-4 层 **21**×32K×584B + ratio-128 层 **20**×1K×584B + indexer **21**×32K×68B | ≈0.47 GiB |
+| KV/槽（256K ctx） | ≈0.92 GiB |
+| KV/槽（1M ctx） | ≈3.5 GiB |
 | 压缩器 decode 状态、激活、workspace、CUDA context、CG | ~4 GiB |
 | **2 槽 × 128K 合计** | **≈86.8 GiB（余量 ~9 GiB）** |
+| **10 槽 × 256K 合计** | **≈83.8 + 9.2 + ~3 ≈ 96 GiB —— 理论 ~12 槽，保守 10 槽**（详见事实基线 §6） |
 
 红线：**禁止任何"懒反量化成 BF16 常驻"的路径**（Qwen3.6 dequant-cache 教训，
 `notes/2026-08-02-qwen36-dequant-cache-memory-floor.md`）。所有量化权重必须以
@@ -300,6 +302,8 @@ packed 形态参与计算（kernel 内 dequant）。
 | `blk.L.attn_output_a/b` | `attn.wo_a/wo_b`（o_a 按组视图 [8,1024,4096]） |
 | `blk.L.attn_sinks` | `attn.attn_sink` |
 | `blk.L.attn_compressor_{kv,gate,ape,norm}` | `compressor.wkv/wgate/ape/norm` |
+| `blk.L.indexer.proj` / `blk.L.indexer.attn_q_b` | `indexer.weights_proj` / `indexer.wq_b` |
+| `blk.L.indexer_compressor_{kv,gate,ape,norm}` | `indexer.compressor.wkv/wgate/ape/norm`（ratio-4 层，rotate=True） |
 | `blk.L.ffn_gate_exps/up_exps/down_exps` | `experts[*].w1/w3/w2`（E 维融合） |
 | `blk.L.ffn_*_shexp` | `shared_experts.w1/w3/w2` |
 | `blk.L.ffn_gate_inp` | `gate.weight` |

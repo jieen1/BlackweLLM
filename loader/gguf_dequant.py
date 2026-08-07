@@ -67,9 +67,9 @@ def dequantize_iq2_xs_block(block: bytes) -> list[float]:
             delta = db0 if group < 2 else db1
             base = 32 * ib32 + 8 * group
             for j in range(8):
-                magnitude = (grid >> (8 * j)) & 0xFF
+                magnitude = float((grid >> (8 * j)) & 0xFF)
                 if signs & KMASK_IQ2XS[j]:
-                    magnitude = -magnitude
+                    magnitude = -magnitude  # keeps -0.0, matching C float semantics
                 out[base + j] = _f32(delta * magnitude)
     return out
 
