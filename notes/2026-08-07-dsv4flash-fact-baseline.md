@@ -186,3 +186,16 @@ acc_s_cast 8 KB + margin），而本机 RTX PRO 6000 Blackwell（SM120）的 opt
     → "The meaning of life is that it…"，语义连贯。
 - 该记录是 Phase 3 贪心对齐的 eager 锚点之一（另一锚点是 llama.cpp 基线，
   同 prompt 复跑见 §7）。
+
+### 9.3 与 llama.cpp oracle 的首次贪心交叉验证（2026-08-07，前 2 token 完全一致）
+
+- 同 prompt 同权重：llama.cpp（build-sm120，b1-79bba02a）贪心续写
+  "The meaning of life is" → **" that"** → **" it"**，与我们 eager 图的
+  argmax 序列逐 token 一致。
+- 分词已对死：两边均为 [671, 5281, 294, 1988, 344]
+  （"The" " meaning" " of" " life" " is"），GGUF `add_bos_token=false`，无 BOS。
+- **对齐 harness 的坑（已实测）**：`llama-completion` 默认套 chat template，
+  会把裸 prompt 包成 `<｜User｜>...<｜Assistant｜>`（7 token，首 token 变成
+  "I"，曾造成误判）。Phase 3 对齐必须带 `-no-cnv`（裸补全模式）。
+- 复现：`timeout 280 ./bin/llama-completion -m <gguf> -p "The meaning of life is"
+  --temp -1 -n 2 -no-cnv --verbose-prompt`（装载约 50 s，prompt eval ~31 t/s）。
