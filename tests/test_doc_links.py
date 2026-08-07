@@ -49,6 +49,10 @@ def _relative_targets(text: str) -> list[str]:
         target = match.group(1).split()[0].strip() if match.group(1).strip() else ""
         if not target or target.startswith(("http://", "https://", "mailto:", "#")):
             continue
+        # Bare e-mail targets (`[x@y](x@y)` in verbatim upstream docs) are
+        # mailto-equivalents, not file paths.
+        if "@" in target and "/" not in target:
+            continue
         targets.append(target)
     return targets
 

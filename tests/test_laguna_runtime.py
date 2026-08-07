@@ -160,6 +160,11 @@ def test_server_app_resolves_the_default_model_to_the_laguna_backend() -> None:
     # entry for the checkpoint, same as tests/test_model_registry.py's
     # checkpoint_dir() helper.
     pytest.importorskip("fastapi")
+    # runtime.laguna_config imports torch/huggingface_hub/transformers at
+    # module scope; the torch-free job must skip here, not crash.
+    pytest.importorskip("torch")
+    pytest.importorskip("huggingface_hub")
+    pytest.importorskip("transformers")
     from runtime.laguna_config import _resolve_laguna_model_dir
 
     try:
