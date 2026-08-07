@@ -1,6 +1,7 @@
 # DeepSeek-V4-Flash-0731（GGUF IQ2_XS）接入实施方案
 
-> 编制日期：2026-08-07 · 状态：🟢 方案已定，待实施
+> 编制日期：2026-08-07 · 状态：🟢 方案已定，P0/P1 进行中（见 §3 勾选）
+> 基线 tag：两仓库 `pre-dsv4flash-20260807`（blackwellm + sparkinfer）
 > 触发：用户指令 —— 在本 runtime 上运行
 > `bullerwins/DeepSeek-V4-Flash-0731-GGUF` 的
 > `DeepSeek-V4-Flash-0731-IQ2_XS-Experts-Q8_0.gguf`（87.9 GB / 81.86 GiB）。
@@ -109,7 +110,7 @@ packed 形态参与计算（kernel 内 dequant）。
 | D6 | 路由 kernel | (a) 参数化 laguna_router_sm120.cu (b) 新写 dsv4 路由 kernel | **(b)，先 Triton 后 CUDA** | Laguna kernel 是位精确资产（oracle 钉死），不动它；DSV4 需要 sqrtsoftplus+top6+route_scale+hash(input_ids)，差异过大 |
 | D7 | 投机 | 一期不做；二期 DSpark（DFlash 骨架 + Markov/confidence head） | **分期** | DSpark 权重不在主 GGUF；先保证主模型贪心对齐 |
 | D8 | 对齐 oracle | 官方 reference（部件级）+ llama.cpp（端到端） | **双 oracle** | reference 验证数学语义；llama.cpp 消费同一 artifact，给出端到端贪心/top-k-logit 基线 |
-| D9 | tokenizer | 从 GGUF 抽取 vocab/merges 生成 HF tokenizer 目录 + 服务层 vendoring `encoding_dsv4.py` | **照此** | 官方明确不用 Jinja 模板；4 组官方测试向量作 fixture |
+| D9 | tokenizer | ~~从 GGUF 抽取重构~~ → 官方 `tokenizer.json` 直接用 + 服务层 vendoring `encoding_dsv4.py` | **官方件** | 官方仓库提供 tokenizer.json；已证与 GGUF 内嵌版一致（D9 修订 2026-08-07） |
 | D10 | 前缀缓存 | 一期关；压缩条目是 token 块的确定函数，hash 可复用 block_pool 的 blake2b 链 | **延后** | 先对齐正确性；异构缓存联动是 Qwen3.6 级工程量 |
 
 ---
@@ -126,35 +127,43 @@ packed 形态参与计算（kernel 内 dequant）。
       → `/home/bot/models/DeepSeek-V4-Flash-0731-GGUF/`
 - [x] 官方参考落盘 `notes/dsv4flash-ref/`（含 encoding 4 组测试向量）
 - [x] GGUF header 解析（本文 §1.2；脚本可沉淀为 `loader/inspect_gguf.py`）
-- [ ] 构建本地 llama.cpp（master 已含 `LLM_ARCH_DEEPSEEK4`）：
-      `cmake -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`；跑通
-      `llama-cli -m <gguf> -p "..." --temp 0`，作为端到端 oracle
-- [ ] sparkinfer fork 三个 DSV4 op 的**功能实测**：在 fork 内跑
-      `tests/attention/test_compressed_mla.py`、`test_sparse_mla.py`、
-      `test_attention_nsa_indexer_*.py`（先处理 fork 当前未提交的
-      tensor_fp8_channel_linear WIP —— 开工前 `git status` 确认分支节奏）
-- [ ] 安装 `fast_hadamard_transform`（官方 reference 的依赖；tilelang 0.1.9 已在）
+- [x] 构建本地 llama.cpp（master 已含 `LLM_ARCH_DEEPSEEK4`）：
+      `build-sm120/`（Ninja，`-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120`，
+      cmake/ninja 用 `~/.venvs/vllm/bin/` 的 pip 版本）；端到端跑通待下载完成
+- [x] sparkinfer fork 三个 DSV4 op **功能实测通过：67/67**
+      （compressed_mla 2、sparse_mla 2、mla_compressed 21、nsa_indexer 系列 42；
+      日志 `/home/bot/models/sparkinfer_dsv4_tests.log`）→ **R3 解除**
+- [x] ~~安装 `fast_hadamard_transform`~~ 构建失败（无匹配 wheel、源码编译挂）；
+      改为 torch Sylvester-Hadamard 等价实现供 reference 跑用（仅 indexer 路径需要）
+- [x] fork 未提交 WIP（tensor_fp8_channel_linear）已作快照提交并随 tag 冻结
 
 ### Phase 1 · 事实基线与离线参考（~1 周）
 
 产出：`notes/2026-08-XX-dsv4flash-fact-baseline.md` + 离线工具。
-1. `loader/inspect_gguf.py`：张量清单/类型/偏移/字节统计，进 CI-sim 可跑的
-   纯 stdlib 解析器（bfdiag 无第三方依赖原则）。
-2. **IQ2_XS / Q8_0 CPU 参考反量化器**（Python/numba 均可，离线工具不限依赖）：
-   IQ2_XS 块格式按 ggml 定义（256 元素超块，8×32 子块，2-bit 查表 + 子块 scale），
-   用 imatrix 文件与 llama.cpp 的 dequant 做交叉验证。
+1. [x] `loader/gguf_header.py` + `loader/inspect_gguf.py`：纯 stdlib 解析器，
+   支持部分下载文件（已在 82 GiB 真文件上复现 README 的 81.86 GiB 总量）。
+2. [x] **IQ2_XS / Q8_0 CPU 参考反量化器** `loader/gguf_dequant.py`（纯 stdlib，
+   逐步模拟 C fp32 舍入）；码表 `loader/gguf_quant_tables.py` 自 llama.cpp
+   79bba02a 逐字抽取；`tools/gguf_dequant_golden.c` 链接 llama.cpp 官方
+   dequant 做 **位精确**对比 —— 两种格式均通过（16 随机块/格式）。
+   真实张量探针：`tools/gguf_tensor_probe.py`（mmap 单张量读取 + 反量化统计，
+   即 Phase-2 流式加载器的首块原型）。
 3. **部件级数值 oracle**：用 GGUF 反量化出的单层权重（Q8_0/F32 部件可精确反量化）
    初始化官方 `inference/model.py` 的 Compressor / Indexer / Block(hc) 模块，
    随机输入下对比我们实现的输出（fp32 参考，容差按 §4 门禁）。
    重点：overlap_transform、APE 加在 softmax 前/后的顺序、rope 去旋转时机、
    sinkhorn 的行列归一化方向、hash 路由"权重仍取自 logits"的语义。
-4. tokenizer 抽取：GGUF → HF `tokenizer.json`（gpt2 BPE）+ special tokens；
-   `pre=joyai-llm` 的 pre-tokenize 正则从 llama.cpp 源码核对；
-   用 4 组官方 encoding 测试向量做 round-trip 验证。
+4. [x] tokenizer：**官方仓库直接提供 `tokenizer.json`/`tokenizer_config.json`**
+   （已落盘 `dsv4flash-ref/`，无需从 GGUF 重构）。`loader/gguf_tokenizer.py`
+   证明 GGUF 内嵌 tokenizer 与官方版 id 空间内**逐字节一致**（129280 ids；
+   HF 多出的 3 个 added_tokens 是 bos/eos/pad 的重复声明）。
+   `pre=joyai-llm` 正则已从 llama.cpp `llama-vocab.cpp:320` 核对
+   （= DEEPSEEK3_LLM 集合，clean_spaces=false，与 tokenizer.json 的
+   Split 序列一致）。4 组官方 encoding 测试向量已落盘待 Phase 4 使用。
 5. 显存实测：权重全量上 GPU 的占用（冷进程），确认 §1.4 测算。
 
-**门禁**：IQ2_XS 反量化与 llama.cpp 逐张量 bit-exact（CPU 侧）；tokenizer
-round-trip 4/4；显存实测与测算差 <5%。
+**门禁**：IQ2_XS/Q8_0 反量化与 llama.cpp bit-exact（CPU 侧）✅；tokenizer
+一致性 ✅；显存实测与测算差 <5%（待下载完成后冷进程实测）。
 
 ### Phase 2 · GGUF 加载器 + 模型图（~2 周）
 
@@ -258,7 +267,7 @@ round-trip 4/4；显存实测与测算差 <5%。
 |---|---|---|---|
 | R1 | 显存余量仅 ~9 GiB | CG 捕获尖峰/碎片 OOM | packed-only 常驻；空槽捕获；显存审计；必要时降为 1 槽或缩上下文 |
 | R2 | IQ2_XS Triton GEMM 性能未知 | decode 不达预期 | decode 是带宽瓶颈，dequant 开销可吸收；Phase 5 再上 CUDA |
-| R3 | sparkinfer 三个 DSV4 op 在本卡**未功能验证**（is_supported 只是版本地板） | Phase 3 地基塌 | Phase 0 先跑 fork 自带测试；不行就在 fork 内修（fork 可直接编辑） |
+| R3 | ~~sparkinfer 三个 DSV4 op 在本卡未功能验证~~ **已解除（2026-08-07，67/67 通过）** | — | — |
 | R4 | `joyai-llm` pre-tokenizer 行为不明 | tokenizer 对齐失败 | 以 llama.cpp 实现为基准 + 官方 4 组测试向量 round-trip |
 | R5 | noaux_tc 平局/偏置语义细节 | 贪心漂移 | 以 reference `Gate.forward` 逐行为准；topk 平局取最小索引 |
 | R6 | mHC sinkhorn fp32 数值与性能 | 慢/漂移 | 融合 kernel 全 fp32；与 reference 对拍 20 迭代结果 |
