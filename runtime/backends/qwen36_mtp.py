@@ -996,9 +996,7 @@ class Qwen36MTPEngine:
         past_len = state.num_tokens_seen
         verify_tokens = [anchor_token, *drafts]
         if self._verify_cg is not None:
-            all_hiddens, all_logits = self._verify_cg.replay(
-                [slot], [verify_tokens], [past_len]
-            )
+            all_hiddens, all_logits = self._verify_cg.replay([slot], [verify_tokens], [past_len])
             all_logits = all_logits[0]  # [k+1, vocab]
             self._record_verify_graph_replay(1)
             gdn_snapshots = None
@@ -1153,9 +1151,7 @@ class Qwen36MTPEngine:
                 value = drafts_by_slot[slot]
                 if isinstance(value, torch.Tensor):
                     if tuple(value.shape) != (self.k,):
-                        raise ValueError(
-                            "batched MTP verify requires uniform [K] device drafts"
-                        )
+                        raise ValueError("batched MTP verify requires uniform [K] device drafts")
                     normalized[slot] = value
                 else:
                     if len(value) != self.k:
@@ -1185,13 +1181,9 @@ class Qwen36MTPEngine:
                 }
         if isinstance(drafts_by_slot[slots[0]], torch.Tensor):
             if any(tuple(drafts_by_slot[slot].shape) != (self.k,) for slot in slots):
-                raise ValueError(
-                    "batched MTP verify requires uniform [K] device drafts per slot"
-                )
+                raise ValueError("batched MTP verify requires uniform [K] device drafts per slot")
         elif any(len(drafts_by_slot[slot]) != self.k for slot in slots):
-            raise ValueError(
-                "batched MTP verify requires the engine's uniform K drafts per slot"
-            )
+            raise ValueError("batched MTP verify requires the engine's uniform K drafts per slot")
 
         round_profile.begin_round()
         pool = self.backend.pool
@@ -1220,9 +1212,7 @@ class Qwen36MTPEngine:
             verify_tokens = self._verify_tokens_buf[batch]
             anchor_view = self._anchor_host_views[batch]
             anchor_view.reshape(-1)[:] = [anchors[slot] for slot in slots]
-            verify_tokens[:, 0].copy_(
-                self._anchor_host[batch].reshape(-1), non_blocking=True
-            )
+            verify_tokens[:, 0].copy_(self._anchor_host[batch].reshape(-1), non_blocking=True)
             for index, slot in enumerate(slots):
                 verify_tokens[index, 1:].copy_(drafts_by_slot[slot], non_blocking=True)
             drafts_arg = verify_tokens

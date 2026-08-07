@@ -274,8 +274,7 @@ class Qwen36Backend:
             _numerics_mode = "08-05 quality mode (M16 kernel + frozen chunking)"
         elif not _m16_on and not _frozen_on:
             _numerics_mode = (
-                "FAST mode (M32 kernel + adaptive chunking; "
-                "code-quality dip, see notes S19)"
+                "FAST mode (M32 kernel + adaptive chunking; code-quality dip, see notes S19)"
             )
         else:
             _numerics_mode = (
