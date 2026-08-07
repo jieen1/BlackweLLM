@@ -35,6 +35,7 @@
 | `2026-07-23-e1-model-abstraction-design.md` | **模型抽象层的早期设计**——Track A 的先验，必读 |
 | `2026-07-23-gpu-verification-checklist.md` | GPU 验证清单 |
 | `reference-map.md` | 参考实现地图 |
+| `2026-08-07-deepseek-v4-flash-iq2xs-gguf-implementation-plan.md` | **DeepSeek-V4-Flash-0731（GGUF IQ2_XS）接入实施方案**——事实基线、D1–D10 决策、六阶段计划、oracle 链与风险登记；参考材料在 `dsv4flash-ref/` |
 
 ## 2. 已定案的根因分析 🟢
 
