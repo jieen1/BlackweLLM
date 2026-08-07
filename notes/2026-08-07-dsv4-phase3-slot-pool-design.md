@@ -68,6 +68,14 @@ kv 路径），**是**，同布局。
 可用预算：95.6 GiB 卡 − 权重常驻（packed 81.9 GiB + CUDA/scratch ~2-3 GiB，
 llama.cpp 2K 冒烟实测总占用 85,909 MiB 佐证）≈ **KV 预算 ~10.5-11.5 GiB**。
 
+实测修正（2026-08-07）：eager 图全量装载 + 解码稳态时 nvidia-smi 显示
+**92,295 MiB（90.1 GiB）**，比 llama.cpp 的 83.9 GiB 高约 6 GiB —— 差额是
+eager 逐次反量化的临时 fp32 缓冲（lm_head 全表 2.1 GB + 每步 6 专家×3 阵
+IQ2_XS 反量化 ~0.6 GB 等）被 torch allocator 持有。**这些临时量在 Phase 3
+融合 kernel（dequant-GEMM 不物化 fp32 权重）后会消失**，生产容量规划按
+kernel 化后的常驻（≈84-85 GiB）计，Phase 3 完成后须复测并在本备忘更新。
+在此之前，eager 路径下的 KV 余量只有 ~5.5 GiB，仅够短上下文实验。
+
 | 用户目标 | fp8 需求 | 判定 |
 |---|---:|---|
 | 10 × 256K | 11.1 GiB | **可行（贴边）** |
