@@ -204,8 +204,12 @@ class Dsv4MoE(nn.Module):
 from runtime.model.dsv4_attention import (  # noqa: E402
     act_quant_simulate,
     apply_rotary_emb,
+    compress_topk_idxs,
     fp4_act_quant_simulate,
     hadamard_transform,
+    precompute_freqs_cis,
+    sparse_attention_eager,
+    window_topk_idxs,
 )
 
 
@@ -370,7 +374,7 @@ class Dsv4Indexer(nn.Module):
     linears); the score accumulation after the einsum is fp32.
     """
 
-    def __init__(self, config: Dsv4Config, layer_id: int) -> None:
+    def __init__(self, config: Dsv4Config, layer_id: int, *, max_seq_len: int = 4096) -> None:
         super().__init__()
         assert config.has_indexer(layer_id)
         self.n_heads = config.index_n_heads
@@ -385,7 +389,17 @@ class Dsv4Indexer(nn.Module):
             self.n_heads, config.hidden_size, weight_dtype=torch.bfloat16
         )
         self.compressor = Dsv4Compressor(config, layer_id, head_dim=self.head_dim, rotate=True)
-        self.kv_cache: torch.Tensor | None = None  # owner-assigned [b, entries, head_dim]
+        # indexer owns its scoring cache (reference layout); its compressor
+        # writes into it via the wiring in forward().
+        self.register_buffer(
+            "kv_cache",
+            torch.zeros(
+                1,
+                max_seq_len // config.layer_ratio(layer_id),
+                self.head_dim,
+                dtype=torch.bfloat16,
+            ),
+        )
         self.freqs_cis: torch.Tensor | None = None
 
     def forward(
@@ -424,3 +438,151 @@ class Dsv4Indexer(nn.Module):
         else:
             topk_idxs = topk_idxs + offset
         return topk_idxs
+
+
+class Dsv4Attention(nn.Module):
+    """MLA-variant attention with window ring + compressed KV regions.
+
+    Reference Attention transcription for the eager graph: q via low-rank
+    projections with per-head renorm, single latent KV (rope on the last 64
+    dims, fp8 ue8m0 QAT simulation on the nope part), window-ring cache plus
+    the compressor/indexer-owned compressed region, sparse gather attention
+    with the learned sink, and the grouped low-rank output (derotate, then
+    per-group wo_a einsum, then wo_b).
+
+    Cache layout per slot: [window (128) | compressed (max_seq // ratio)]
+    entries of head_dim latents. The compressor writes the compressed region
+    directly (its kv_cache is a view of ours); the indexer keeps its own
+    scoring cache inside itself.
+    """
+
+    def __init__(self, config: Dsv4Config, layer_id: int, *, max_seq_len: int = 4096) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.ratio = config.layer_ratio(layer_id)
+        self.window = config.window_size
+        self.n_heads = config.num_heads
+        self.head_dim = config.head_dim
+        self.rope_head_dim = config.rope_head_dim
+        self.n_groups = config.o_groups
+        self.o_lora_rank = config.o_lora_rank
+        self.eps = config.norm_eps
+        self.softmax_scale = self.head_dim**-0.5
+
+        self.wq_a = PackedQ8_0Linear(
+            config.q_lora_rank, config.hidden_size, weight_dtype=torch.bfloat16
+        )
+        self.register_buffer("q_norm_weight", torch.empty(config.q_lora_rank, dtype=torch.float32))
+        self.wq_b = PackedQ8_0Linear(
+            self.n_heads * self.head_dim, config.q_lora_rank, weight_dtype=torch.bfloat16
+        )
+        self.wkv = PackedQ8_0Linear(self.head_dim, config.hidden_size, weight_dtype=torch.bfloat16)
+        self.register_buffer("kv_norm_weight", torch.empty(self.head_dim, dtype=torch.float32))
+        self.wo_a = PackedQ8_0Linear(
+            self.n_groups * self.o_lora_rank,
+            self.n_heads * self.head_dim // self.n_groups,
+            weight_dtype=torch.bfloat16,
+        )
+        self.wo_b = PackedQ8_0Linear(
+            config.hidden_size, self.n_groups * self.o_lora_rank, weight_dtype=torch.bfloat16
+        )
+        self.register_buffer("attn_sink", torch.empty(self.n_heads, dtype=torch.float32))
+
+        self.compressor = Dsv4Compressor(config, layer_id) if self.ratio else None
+        self.indexer = (
+            Dsv4Indexer(config, layer_id, max_seq_len=max_seq_len) if self.ratio == 4 else None
+        )
+
+        n_compressed = max_seq_len // self.ratio if self.ratio else 0
+        self.register_buffer(
+            "kv_cache",
+            torch.zeros(1, self.window + n_compressed, self.head_dim, dtype=torch.bfloat16),
+        )
+        if self.ratio:
+            freqs = precompute_freqs_cis(
+                self.rope_head_dim,
+                max_seq_len,
+                original_seq_len=config.rope_original_seq_len,
+                base=config.compress_rope_theta,
+                factor=config.rope_factor,
+                beta_fast=config.beta_fast,
+                beta_slow=config.beta_slow,
+            )
+        else:
+            # window-only layers: base theta, no YaRN (verified reference behavior)
+            freqs = precompute_freqs_cis(
+                self.rope_head_dim,
+                max_seq_len,
+                original_seq_len=0,
+                base=config.rope_theta,
+                factor=config.rope_factor,
+                beta_fast=config.beta_fast,
+                beta_slow=config.beta_slow,
+            )
+        self.register_buffer("freqs_cis", freqs)
+
+    def _wire_subcaches(self) -> None:
+        if self.compressor is not None and self.compressor.kv_cache is None:
+            self.compressor.kv_cache = self.kv_cache[:, self.window :]
+            self.compressor.freqs_cis = self.freqs_cis
+            if self.indexer is not None:
+                self.indexer.freqs_cis = self.freqs_cis
+
+    def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
+        self._wire_subcaches()
+        bsz, seqlen, _ = x.shape
+        win, ratio, rd = self.window, self.ratio, self.rope_head_dim
+        freqs = self.freqs_cis[start_pos : start_pos + seqlen]
+
+        # q path
+        qr = rms_norm(self.wq_a(x), self.q_norm_weight, self.eps)
+        q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+        apply_rotary_emb(q[..., -rd:], freqs)
+
+        # kv path
+        kv = self.kv_norm(self.wkv(x))
+        apply_rotary_emb(kv[..., -rd:], freqs)
+        kv[..., :-rd] = act_quant_simulate(kv[..., :-rd], 64, ue8m0=True)
+
+        device = x.device
+        topk_idxs = window_topk_idxs(win, bsz, seqlen, start_pos, device)
+        if ratio:
+            offset = kv.size(1) if start_pos == 0 else win
+            if self.indexer is not None:
+                compress_idxs = self.indexer(x, qr, start_pos, offset).int()
+            else:
+                compress_idxs = compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset, device)
+            topk_idxs = torch.cat([topk_idxs, compress_idxs], dim=-1)
+
+        if start_pos == 0:
+            if seqlen <= win:
+                self.kv_cache[:bsz, :seqlen] = kv
+            else:
+                cutoff = seqlen % win
+                tail = kv[:, -win:]
+                self.kv_cache[:bsz, cutoff:win] = tail[:, : win - cutoff]
+                self.kv_cache[:bsz, :cutoff] = tail[:, win - cutoff :]
+            attn_kv = kv
+            if ratio:
+                compressed = self.compressor(x, 0)
+                if compressed is not None:
+                    attn_kv = torch.cat([kv, compressed], dim=1)
+            o = sparse_attention_eager(q, attn_kv, self.attn_sink, topk_idxs, self.softmax_scale)
+        else:
+            self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+            if ratio:
+                self.compressor(x, start_pos)
+            o = sparse_attention_eager(
+                q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale
+            )
+
+        # output path: derotate rope part, grouped low-rank projection
+        apply_rotary_emb(o[..., -rd:], freqs, inverse=True)
+        o = o.view(bsz, seqlen, self.n_groups, -1)
+        wo_a = self.wo_a.dequantized().to(x.dtype).view(self.n_groups, self.o_lora_rank, -1)
+        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        return self.wo_b(o.flatten(2))
+
+    def kv_norm(self, x: torch.Tensor) -> torch.Tensor:
+        return rms_norm(x, self.kv_norm_weight, self.eps)

@@ -131,6 +131,19 @@ YaRN（factor 16，65536→1M，theta 10000；压缩 KV 用 theta 160000；纯�
 - 尚未对拍：Compressor（overlap/APE/decode 状态机）、Indexer、注意力聚合
   （Phase 2/3 随模型图落地时补对拍）。
 
+## 7.6 参考 sparse_attn kernel 在 SM120 上不可运行（2026-08-07 实测）
+
+官方 reference 的 `sparse_attn` tilelang kernel 在生产形状（h=64, d=512,
+block=64）下需要 **~141 KB 动态共享内存**（q_shared 64 KB + kv_shared 64 KB +
+acc_s_cast 8 KB + margin），而本机 RTX PRO 6000 Blackwell（SM120）的 opt-in
+上限为 **101,376 B ≈ 99 KB**（`torch.cuda.get_device_properties` 实测）。
+该 kernel 面向数据中心 Blackwell（228 KB smem）。后果：
+
+- Phase 3 的自研 sparse-gather 注意力 kernel 是**可运行性必需**，不只是性能项；
+- 当前的对拍策略：小形状（h=16, d=64）下我们的 eager 实现与真实 tilelang
+  kernel 容差内一致（语义锚点）；全模块对拍中 reference 的聚合步骤由该
+  eager 等价实现代入（tests/test_dsv4_attention.py 内有完整理由注释）。
+
 ## 8. 尚未实测（后续阶段的门禁项）
 
 - 本 runtime 内的权重上卡占用与 KV 预算（Phase 2/3，冷进程）。

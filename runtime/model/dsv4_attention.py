@@ -209,3 +209,51 @@ def hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
     (fp32 accumulate, output in the input dtype)."""
     h = hadamard_matrix(x.shape[-1], x.device)
     return ((x.float() @ h) * scale).to(x.dtype)
+
+
+# ---------------------------------------------------------------------------
+# Gather-index construction (reference get_window_topk_idxs /
+# get_compress_topk_idxs transcriptions).
+# ---------------------------------------------------------------------------
+
+
+def window_topk_idxs(window: int, bsz: int, seqlen: int, start_pos: int, device) -> torch.Tensor:
+    """Indices into the window region of the KV cache.
+
+    Decode (start_pos >= window-1): ring order oldest->newest. Early decode
+    (cache partially filled): valid prefix padded with -1. Prefill: causal
+    window over absolute positions (the prefill path attends the full
+    current sequence, so positions are token ids).
+    """
+    if start_pos >= window - 1:
+        pos = start_pos % window
+        matrix = torch.cat(
+            [torch.arange(pos + 1, window, device=device), torch.arange(0, pos + 1, device=device)]
+        )
+    elif start_pos > 0:
+        matrix = torch.nn.functional.pad(
+            torch.arange(start_pos + 1, device=device), (0, window - start_pos - 1), value=-1
+        )
+    else:
+        base = torch.arange(seqlen, device=device).unsqueeze(1)
+        matrix = (base - window + 1).clamp(0) + torch.arange(min(seqlen, window), device=device)
+        matrix = torch.where(matrix > base, torch.full_like(matrix, -1), matrix)
+    return matrix.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
+
+
+def compress_topk_idxs(
+    ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int, device
+) -> torch.Tensor:
+    """Indices into the compressed region (all entries, for ratio-128 layers).
+
+    Decode: every compressed entry emitted so far. Prefill: causal mask over
+    entries, offset shifts them past the window region (prefill) or is the
+    window size (decode).
+    """
+    if start_pos > 0:
+        matrix = torch.arange(0, (start_pos + 1) // ratio, device=device) + offset
+    else:
+        matrix = torch.arange(seqlen // ratio, device=device).repeat(seqlen, 1)
+        mask = matrix >= torch.arange(1, seqlen + 1, device=device).unsqueeze(1) // ratio
+        matrix = torch.where(mask, torch.full_like(matrix, -1), matrix + offset)
+    return matrix.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
