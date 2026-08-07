@@ -23,8 +23,7 @@ from runtime.loading.gguf import (  # noqa: E402
 )
 
 REAL_GGUF = Path(
-    "/home/bot/models/DeepSeek-V4-Flash-0731-GGUF/"
-    "DeepSeek-V4-Flash-0731-IQ2_XS-Experts-Q8_0.gguf"
+    "/home/bot/models/DeepSeek-V4-Flash-0731-GGUF/DeepSeek-V4-Flash-0731-IQ2_XS-Experts-Q8_0.gguf"
 )
 
 
@@ -62,8 +61,7 @@ def test_q8_0_numpy_matches_bit_exact_reference() -> None:
     packed = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
     ours = dequantize_q8_0_packed(packed, shape=(8, 32))
     ref_bits = [struct.unpack("<I", struct.pack("<f", v))[0] for v in reference]
-    our_bits = [struct.unpack("<I", struct.pack("<f", v))[0]
-                for v in ours.flatten().tolist()]
+    our_bits = [struct.unpack("<I", struct.pack("<f", v))[0] for v in ours.flatten().tolist()]
     assert ref_bits == our_bits
 
 
@@ -76,19 +74,18 @@ def test_iq2_xs_numpy_matches_bit_exact_reference() -> None:
     packed = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
     ours = dequantize_iq2_xs_packed(packed, shape=(4, 256))
     ref_bits = [struct.unpack("<I", struct.pack("<f", v))[0] for v in reference]
-    our_bits = [struct.unpack("<I", struct.pack("<f", v))[0]
-                for v in ours.flatten().tolist()]
+    our_bits = [struct.unpack("<I", struct.pack("<f", v))[0] for v in ours.flatten().tolist()]
     assert ref_bits == our_bits
 
 
 @pytest.mark.skipif(not REAL_GGUF.exists(), reason="GGUF download not present")
 def test_stream_real_tensors_cpu() -> None:
     wanted = {
-        "blk.0.attn_sinks.weight",          # F32, tiny
-        "blk.0.ffn_gate_inp.weight",        # BF16 [256, 4096]
-        "blk.0.ffn_gate_tid2eid.weight",    # I32 [6, 129280]
-        "blk.0.attn_q_a.weight",            # Q8_0 packed
-        "blk.0.ffn_gate_exps.weight",       # IQ2_XS packed (streams 577 MiB)
+        "blk.0.attn_sinks.weight",  # F32, tiny
+        "blk.0.ffn_gate_inp.weight",  # BF16 [256, 4096]
+        "blk.0.ffn_gate_tid2eid.weight",  # I32 [6, 129280]
+        "blk.0.attn_q_a.weight",  # Q8_0 packed
+        "blk.0.ffn_gate_exps.weight",  # IQ2_XS packed (streams 577 MiB)
     }
     tensors = load_gguf_tensors(REAL_GGUF, wanted, device="cpu")
     assert set(tensors) == wanted

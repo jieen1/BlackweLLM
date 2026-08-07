@@ -59,9 +59,11 @@
   IQ2_XS gate_exps 落在特征离散网格 ±0.1 —— 形态正常）。
 - **符号零语义**：C 参考按 `(db*grid)*(±1)` 计算，零幅值带符号位时产生 −0.0；
   任何实现必须在浮点域取负（纯 Python 参考已按此修正并仍与 llama.cpp 位精确）。
-- numpy 向量化反量化（`runtime/loading/gguf.py`）当前与位精确参考**尚有差异待修**
-  （非连续切片的 view 问题）；在它修复并通过位精确门禁之前，
-  **`loader/gguf_dequant.py` 纯 Python 版是唯一位精确基准**。
+- numpy 向量化反量化（`runtime/loading/gguf.py::dequantize_{q8_0,iq2_xs}_packed`）
+  已通过与纯 Python 位精确参考的逐位对比（`tests/test_gguf_loader.py`），
+  可用于批量离线工具；**位精确基准链**：llama.cpp 官方 C 实现
+  （`tools/gguf_dequant_golden.c` 链接验证）⇔ 纯 Python 参考
+  （`loader/gguf_dequant.py`）⇔ numpy 向量化版。
 
 ## 4. 架构要点（config.json + GGUF KV + 官方 reference 三方一致）
 

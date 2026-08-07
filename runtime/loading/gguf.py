@@ -118,8 +118,8 @@ def dequantize_q8_0_packed(packed: torch.Tensor, shape: tuple[int, ...]) -> torc
     if raw.size % Q8_0_BLOCK_BYTES:
         raise ValueError("packed Q8_0 payload is not a multiple of the block size")
     blocks = raw.reshape(-1, Q8_0_BLOCK_BYTES)
-    d = blocks[:, :2].view(np.float16).astype(np.float32)
-    qs = blocks[:, 2:].view(np.int8).astype(np.float32)
+    d = np.ascontiguousarray(blocks[:, :2]).view(np.float16).astype(np.float32).reshape(-1)
+    qs = np.ascontiguousarray(blocks[:, 2:]).view(np.int8).astype(np.float32)
     values = (d[:, None] * qs).reshape(-1)
     numel = 1
     for dim in shape:
@@ -138,7 +138,7 @@ def dequantize_iq2_xs_packed(packed: torch.Tensor, shape: tuple[int, ...]) -> to
         raise ValueError("packed IQ2_XS payload is not a multiple of the block size")
     n_blocks = raw.size // IQ2_XS_BLOCK_BYTES
     blocks = raw.reshape(n_blocks, IQ2_XS_BLOCK_BYTES)
-    d = blocks[:, :2].copy().view(np.float16).astype(np.float32)  # (B,)
+    d = np.ascontiguousarray(blocks[:, :2]).view(np.float16).astype(np.float32).reshape(-1)
     codes = np.ascontiguousarray(blocks[:, 2:66]).view(np.uint16)  # (B, 32)
     scales = blocks[:, 66:74]  # (B, 8) uint8
 
