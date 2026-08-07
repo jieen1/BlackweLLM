@@ -201,6 +201,8 @@ def main() -> None:
                     f"  step {step + 1}: logits cos {lc:.8f}  mismatches so far {total_mismatch}",
                     flush=True,
                 )
+            pos += 1  # advance the cache position (a fixed pos recomputes the
+            # same step forever -- identical cosines, meaningless streams)
         agree = sum(1 for a, b in zip(stream_e, stream_k) if a == b)
         print(f"  stream: {agree}/{len(stream_e)} tokens agree", flush=True)
 
