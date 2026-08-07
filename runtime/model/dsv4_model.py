@@ -183,3 +183,151 @@ class Dsv4MoE(nn.Module):
             y.index_add_(0, token_idx, routed)
         y = y + self._shared_forward(flat)
         return y.to(x.dtype).reshape(*x.shape[:-1], y.shape[-1])
+
+
+# ---------------------------------------------------------------------------
+# Compressor: gated pooling of every `ratio` tokens into one compressed KV
+# entry (reference Compressor, model.py). Eager torch transcription; the
+# QAT-simulation quant step uses dsv4_attention.act_quant_simulate.
+# ---------------------------------------------------------------------------
+
+from runtime.model.dsv4_attention import (  # noqa: E402
+    act_quant_simulate,
+    apply_rotary_emb,
+)
+
+
+class Dsv4Compressor(nn.Module):
+    """Compresses the latent KV stream ratio:1 with learned gated pooling.
+
+    ratio-4 layers use overlap (coff=2): the first half of the wide rows is
+    the previous window's carry-over, materialized by overlap_transform.
+    Decode keeps kv_state/score_state per slot position within the current
+    (overlapping) window and emits one compressed entry every `ratio` steps.
+    """
+
+    def __init__(self, config: Dsv4Config, layer_id: int) -> None:
+        super().__init__()
+        self.ratio = config.layer_ratio(layer_id)
+        assert self.ratio != 0
+        self.overlap = self.ratio == 4
+        self.head_dim = config.head_dim
+        self.rope_head_dim = config.rope_head_dim
+        self.eps = config.norm_eps
+        self.ue8m0 = True  # production QAT config (fp8-origin weights)
+        coff = 2 if self.overlap else 1
+        self.coeff = coff
+        self.wkv = PackedQ8_0Linear(coff * self.head_dim, config.hidden_size)
+        self.wgate = PackedQ8_0Linear(coff * self.head_dim, config.hidden_size)
+        self.register_buffer(
+            "ape", torch.empty(self.ratio, coff * self.head_dim, dtype=torch.float32)
+        )
+        self.register_buffer("norm_weight", torch.empty(self.head_dim, dtype=torch.float32))
+        # per-slot decode state; batch dim sized at capture/slot time (eager: 1)
+        self.register_buffer(
+            "kv_state", torch.zeros(1, coff * self.ratio, coff * self.head_dim, dtype=torch.float32)
+        )
+        self.register_buffer(
+            "score_state",
+            torch.full(
+                (1, coff * self.ratio, coff * self.head_dim), float("-inf"), dtype=torch.float32
+            ),
+        )
+        self.freqs_cis: torch.Tensor | None = None
+        self.kv_cache: torch.Tensor | None = None  # assigned by the attention owner
+
+    def overlap_transform(self, tensor: torch.Tensor, value: float) -> torch.Tensor:
+        """[b, s, r, 2d] -> [b, s, 2r, d]: current window's second half plus
+        the previous window's first half shifted down one row."""
+        b, s, _, _ = tensor.shape
+        ratio, d = self.ratio, self.head_dim
+        out = tensor.new_full((b, s, 2 * ratio, d), value)
+        out[:, :, ratio:] = tensor[:, :, :, d:]
+        out[:, 1:, :ratio] = tensor[:, :-1, :, :d]
+        return out
+
+    def _finalize(
+        self, kv: torch.Tensor, position_count: int, dtype: torch.dtype, start_pos: int
+    ) -> torch.Tensor:
+        """Norm + rope + QAT simulation; writes into the owner's kv_cache."""
+        kv = rms_norm(kv.to(dtype), self.norm_weight, self.eps)
+        if start_pos == 0:
+            freqs = self.freqs_cis[: position_count : self.ratio]
+        else:
+            freqs = self.freqs_cis[start_pos + 1 - self.ratio].unsqueeze(0)
+        apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs)
+        kv[..., : -self.rope_head_dim] = act_quant_simulate(
+            kv[..., : -self.rope_head_dim], 64, ue8m0=self.ue8m0
+        )
+        return kv
+
+    def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor | None:
+        assert self.kv_cache is not None and self.freqs_cis is not None
+        bsz, seqlen, _ = x.shape
+        ratio, overlap = self.ratio, self.overlap
+        dtype = x.dtype
+        xf = x.float()
+        kv = self.wkv(xf)
+        score = self.wgate(xf)
+        if start_pos == 0:
+            should_compress = seqlen >= ratio
+            remainder = seqlen % ratio
+            cutoff = seqlen - remainder
+            offset = ratio if overlap else 0
+            if overlap and cutoff >= ratio:
+                self.kv_state[:bsz, :ratio] = kv[:, cutoff - ratio : cutoff]
+                self.score_state[:bsz, :ratio] = score[:, cutoff - ratio : cutoff] + self.ape
+            if remainder > 0:
+                kv_head, kv_tail = kv.split([cutoff, remainder], dim=1)
+                self.kv_state[:bsz, offset : offset + remainder] = kv_tail
+                self.score_state[:bsz, offset : offset + remainder] = (
+                    score[:, cutoff:] + self.ape[:remainder]
+                )
+                kv, score = kv_head, score[:, :cutoff]
+            kv = kv.unflatten(1, (-1, ratio))
+            score = score.unflatten(1, (-1, ratio)) + self.ape
+            if overlap:
+                kv = self.overlap_transform(kv, 0)
+                score = self.overlap_transform(score, float("-inf"))
+            kv = (kv * score.softmax(dim=2)).sum(dim=2)
+            if not should_compress:
+                return None
+            kv = self._finalize(kv, cutoff, dtype, start_pos)
+            self.kv_cache[:bsz, : seqlen // ratio] = kv
+            return kv
+        # decode step
+        should_compress = (start_pos + 1) % ratio == 0
+        score = score + self.ape[start_pos % ratio]
+        if overlap:
+            self.kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1)
+            self.score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1)
+            if should_compress:
+                kv_state = torch.cat(
+                    [
+                        self.kv_state[:bsz, :ratio, : self.head_dim],
+                        self.kv_state[:bsz, ratio:, self.head_dim :],
+                    ],
+                    dim=1,
+                )
+                score_state = torch.cat(
+                    [
+                        self.score_state[:bsz, :ratio, : self.head_dim],
+                        self.score_state[:bsz, ratio:, self.head_dim :],
+                    ],
+                    dim=1,
+                )
+                kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+                self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
+                self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
+        else:
+            self.kv_state[:bsz, start_pos % ratio] = kv.squeeze(1)
+            self.score_state[:bsz, start_pos % ratio] = score.squeeze(1)
+            if should_compress:
+                kv = (self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(
+                    dim=1, keepdim=True
+                )
+        if not should_compress:
+            return None
+        kv = self._finalize(kv, 0, dtype, start_pos)
+        self.kv_cache[:bsz, start_pos // ratio] = kv.squeeze(1)
+        return kv
