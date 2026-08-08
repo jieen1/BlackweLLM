@@ -298,7 +298,11 @@ class Dsv4AttnKernelLayer(nn.Module):
                 page_size=DSV4_PAGE_SIZE,
             )
         else:
-            ids = torch.tensor([start_pos % win], dtype=torch.int64, device=kv_row.device)
+            # mid-sequence prefill chunk OR single-token decode: ring slots
+            # p % win for every token in the chunk (decode is a 1-token chunk)
+            ids = (
+                torch.arange(start_pos, start_pos + seqlen, device=kv_row.device) % win
+            ).to(torch.int64)
             pack_latent_kv(kv_row, self.window_pages, ids, page_size=DSV4_PAGE_SIZE)
 
     def _pack_compressed(self, entry: torch.Tensor, start_pos: int, seqlen: int) -> None:
@@ -311,7 +315,12 @@ class Dsv4AttnKernelLayer(nn.Module):
     def _attn_indices(
         self, seqlen: int, start_pos: int, qr: torch.Tensor, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """swa idx/len, compressed idx/len (kernel flat-id spaces)."""
+        """swa idx/len, compressed idx/len (kernel flat-id spaces).
+
+        Mid-sequence prefill chunks (start_pos > 0, seqlen > 1) run through
+        the same helpers; the kernel's compressed flat-id space is absolute
+        compressed position (offset=0).
+        """
         win = self.window
         swa = window_topk_idxs(win, 1, seqlen, start_pos, x.device)[0]
         if swa.shape[1] < win:

@@ -224,7 +224,22 @@ def window_topk_idxs(window: int, bsz: int, seqlen: int, start_pos: int, device)
     (cache partially filled): valid prefix padded with -1. Prefill: causal
     window over absolute positions (the prefill path attends the full
     current sequence, so positions are token ids).
+
+    Mid-sequence prefill chunk (start_pos > 0, seqlen > 1): each row's
+    window is its own causal window over absolute positions, ring-ordered
+    (slot p % window), padded with -1 before the ring has filled.
     """
+    if seqlen > 1 and start_pos > 0:
+        rows = torch.arange(start_pos, start_pos + seqlen, device=device).unsqueeze(1)
+        cols = torch.arange(window, device=device).unsqueeze(0)
+        # absolute positions each row may attend: [p-window+1, p] (ring slots)
+        matrix = rows - window + 1 + cols  # [seqlen, window] absolute pos
+        # -1 for positions not yet written (before seq start OR after row p)
+        matrix = torch.where(
+            (matrix < 0) | (matrix > rows), torch.full_like(matrix, -1), matrix
+        )
+        matrix = torch.where(matrix >= 0, matrix % window, matrix)  # ring slot
+        return matrix.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
     if start_pos >= window - 1:
         pos = start_pos % window
         matrix = torch.cat(
@@ -250,6 +265,17 @@ def compress_topk_idxs(
     entries, offset shifts them past the window region (prefill) or is the
     window size (decode).
     """
+    if start_pos > 0 and seqlen > 1:
+        # Mid-sequence prefill chunk: each row attends every compressed
+        # entry emitted up to its own position, offset past the window
+        # region (same convention as the other branches).
+        rows = torch.arange(seqlen, device=device).unsqueeze(1)
+        n = (start_pos + 1 + rows) // ratio  # entries valid per row
+        maxn = (start_pos + seqlen) // ratio
+        matrix = torch.arange(maxn, device=device).unsqueeze(0).repeat(seqlen, 1)
+        matrix = torch.where(matrix >= n, torch.full_like(matrix, -1), matrix)
+        matrix = torch.where(matrix >= 0, matrix + offset, matrix)
+        return matrix.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
     if start_pos > 0:
         matrix = torch.arange(0, (start_pos + 1) // ratio, device=device) + offset
     else:

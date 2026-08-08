@@ -212,7 +212,16 @@ class DeepseekV4Backend:
         return state.done
 
     def _prefill_logits(self, slot: int, prompt_ids: list[int]) -> torch.Tensor:
-        """Prefill and return the full logits (shared by prefill paths)."""
+        """Prefill the whole prompt in chunks; return the final logits.
+
+        The MLA scratch is planned for ``max_q_rows`` rows per forward
+        (bounded, not the full context -- a full-context plan OOMs: the
+        gate measured ~11 GB of scratch per 128 rows across the ratio-4
+        layers).  Each chunk is one multi-row forward at its absolute
+        start position; the compressor/indexer state machines step per
+        token inside, and only the last chunk's logits matter (the
+        anchor).
+        """
         if not 0 <= slot < self.num_slots:
             raise IndexError(f"slot {slot} out of range ({self.num_slots} slots)")
         if not prompt_ids:
@@ -221,8 +230,16 @@ class DeepseekV4Backend:
             raise RuntimeError(
                 f"slot {slot} is at kv_len={self._kv_len[slot]}; the caller must reset_slot first"
             )
-        prompt_t = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
-        logits = self._forward(slot, prompt_t, 0)
+        chunk = max(1, min(self.max_q_rows, 128))
+        logits = None
+        for start in range(0, len(prompt_ids), chunk):
+            ids = prompt_ids[start : start + chunk]
+            logits = self._forward(
+                slot,
+                torch.tensor([ids], dtype=torch.long, device=self.device),
+                start,
+            )
+        assert logits is not None
         self._kv_len[slot] = len(prompt_ids)
         self._committed[slot] = list(prompt_ids)
         return logits

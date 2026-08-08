@@ -852,7 +852,12 @@ class ServerEngine:
             model.config,
             num_slots=self.num_slots,
             max_seq_len=max_model_len,
-            max_q_rows=1,
+            # The MLA scratch is planned for a bounded prefill chunk, not
+            # the full context: a full-context plan OOMs (~11 GB of scratch
+            # per 128 rows across the ratio-4 layers, gate measurement).
+            # The backend prefills long prompts in chunks of min(max_q_rows,
+            # window)=128 rows, so plan exactly that.
+            max_q_rows=128,
             device="cuda",
         )
         # Warm nothing yet: the first forward compiles the fork MLA kernels

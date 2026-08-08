@@ -147,8 +147,9 @@ def test_prefill_and_decode_advance_slot() -> None:
     assert out == [3]
     assert backend.slot_state(0).kv_len == 4
     assert backend.slot_state(0).committed_tokens == (1, 2, 3, 3)
-    # prefill called at start_pos 0 with the full prompt; decode at kv_len.
-    assert backend._test_calls == [(0, 0, 3), (0, 3, 1)]
+    # prefill is chunked at max_q_rows (=1 in this tiny backend): one forward
+    # per token at absolute positions 0,1,2, then decode at kv_len=3.
+    assert backend._test_calls == [(0, 0, 1), (0, 1, 1), (0, 2, 1), (0, 3, 1)]
 
 
 def test_sampled_decode_uses_params_seed() -> None:

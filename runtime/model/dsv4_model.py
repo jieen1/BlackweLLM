@@ -365,14 +365,22 @@ class Dsv4Compressor(nn.Module):
         return out
 
     def _finalize(
-        self, kv: torch.Tensor, position_count: int, dtype: torch.dtype, start_pos: int
+        self, kv: torch.Tensor, position_count: int, dtype: torch.dtype, pos: int
     ) -> torch.Tensor:
-        """Norm + rope + QAT simulation; writes into the owner's kv_cache."""
+        """Norm + rope + QAT simulation; writes into the owner's kv_cache.
+
+        ``pos`` is the absolute position of the entry's last token: the
+        bulk path (pos==0) applies one frame per compressed entry over the
+        first ``position_count`` tokens; the decode/chunk path applies the
+        single frame of the entry's own window end (``pos+1-ratio``) --
+        the exact convention the sequential decode oracle uses, which is
+        why a chunk of L tokens equals L single decode steps.
+        """
         kv = rms_norm(kv.to(dtype), self.norm_weight, self.eps)
-        if start_pos == 0:
-            freqs = self.freqs_cis[: position_count : self.ratio]
+        if pos == 0:
+            freqs = self.freqs_cis[:position_count : self.ratio]
         else:
-            freqs = self.freqs_cis[start_pos + 1 - self.ratio].unsqueeze(0)
+            freqs = self.freqs_cis[pos + 1 - self.ratio].unsqueeze(0)
         apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs)
         if not self.quantize:
             return kv
@@ -421,42 +429,52 @@ class Dsv4Compressor(nn.Module):
             kv = self._finalize(kv, cutoff, dtype, start_pos)
             self.kv_cache[:bsz, : seqlen // ratio] = kv
             return kv
-        # decode step
-        should_compress = (start_pos + 1) % ratio == 0
-        score = score + self.ape[start_pos % ratio]
-        if overlap:
-            self.kv_state[:bsz, ratio + start_pos % ratio] = kv.squeeze(1)
-            self.score_state[:bsz, ratio + start_pos % ratio] = score.squeeze(1)
-            if should_compress:
-                kv_state = torch.cat(
-                    [
-                        self.kv_state[:bsz, :ratio, : self.head_dim],
-                        self.kv_state[:bsz, ratio:, self.head_dim :],
-                    ],
-                    dim=1,
-                )
-                score_state = torch.cat(
-                    [
-                        self.score_state[:bsz, :ratio, : self.head_dim],
-                        self.score_state[:bsz, ratio:, self.head_dim :],
-                    ],
-                    dim=1,
-                )
-                kv = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
-                self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
-                self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
-        else:
-            self.kv_state[:bsz, start_pos % ratio] = kv.squeeze(1)
-            self.score_state[:bsz, start_pos % ratio] = score.squeeze(1)
-            if should_compress:
-                kv = (self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)).sum(
-                    dim=1, keepdim=True
-                )
-        if not should_compress:
+        # decode / mid-sequence prefill chunk: step the per-token state
+        # machine `seqlen` times (a chunk is L sequential decode steps --
+        # the eager decode branch is the per-token oracle).
+        emitted: list[torch.Tensor] = []
+        for i in range(seqlen):
+            pos = start_pos + i
+            kv_i = kv[:, i : i + 1]
+            score_i = score[:, i : i + 1]
+            should_compress = (pos + 1) % ratio == 0
+            score_i = score_i + self.ape[pos % ratio]
+            if overlap:
+                self.kv_state[:bsz, ratio + pos % ratio] = kv_i.squeeze(1)
+                self.score_state[:bsz, ratio + pos % ratio] = score_i.squeeze(1)
+                if should_compress:
+                    kv_state = torch.cat(
+                        [
+                            self.kv_state[:bsz, :ratio, : self.head_dim],
+                            self.kv_state[:bsz, ratio:, self.head_dim :],
+                        ],
+                        dim=1,
+                    )
+                    score_state = torch.cat(
+                        [
+                            self.score_state[:bsz, :ratio, : self.head_dim],
+                            self.score_state[:bsz, ratio:, self.head_dim :],
+                        ],
+                        dim=1,
+                    )
+                    kv_c = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+                    self.kv_state[:bsz, :ratio] = self.kv_state[:bsz, ratio:]
+                    self.score_state[:bsz, :ratio] = self.score_state[:bsz, ratio:]
+            else:
+                self.kv_state[:bsz, pos % ratio] = kv_i.squeeze(1)
+                self.score_state[:bsz, pos % ratio] = score_i.squeeze(1)
+                if should_compress:
+                    kv_c = (
+                        self.kv_state[:bsz] * self.score_state[:bsz].softmax(dim=1)
+                    ).sum(dim=1, keepdim=True)
+            if not should_compress:
+                continue
+            kv_c = self._finalize(kv_c, 0, dtype, pos)
+            self.kv_cache[:bsz, pos // ratio] = kv_c.squeeze(1)
+            emitted.append(kv_c)
+        if not emitted:
             return None
-        kv = self._finalize(kv, 0, dtype, start_pos)
-        self.kv_cache[:bsz, start_pos // ratio] = kv.squeeze(1)
-        return kv
+        return torch.cat(emitted, dim=1)
 
 
 class Dsv4Indexer(nn.Module):
@@ -531,7 +549,24 @@ class Dsv4Indexer(nn.Module):
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
         index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz, : end_pos // ratio])
         index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
-        if start_pos == 0:
+        if seqlen > 1:
+            # Mid-sequence prefill chunk: each row attends only the
+            # compressed entries up to its own position ((pos+1)//ratio,
+            # including its just-written entry -- same as single-token
+            # decode).  Mask later entries out BEFORE topk so they can
+            # never steal a slot, exactly like the start_pos==0 branch.
+            bounds = ((start_pos + torch.arange(1, seqlen + 1, device=x.device)) // ratio)
+            causal = (
+                torch.arange(end_pos // ratio, device=x.device)
+                .unsqueeze(0)
+                .repeat(seqlen, 1)
+            )
+            index_score = index_score + torch.where(
+                causal >= bounds.unsqueeze(1),
+                torch.tensor(float("-inf"), device=x.device),
+                0.0,
+            )
+        elif start_pos == 0:
             causal = torch.arange(seqlen // ratio, device=x.device).repeat(seqlen, 1)
             causal = causal >= torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
             index_score = index_score + torch.where(
@@ -539,7 +574,12 @@ class Dsv4Indexer(nn.Module):
             )
         k = min(self.index_topk, end_pos // ratio)
         topk_idxs = index_score.topk(k, dim=-1)[1]
-        if start_pos == 0:
+        if seqlen > 1:
+            # Absolute bounds per row; masked entries become -1.
+            bounds = ((start_pos + torch.arange(1, seqlen + 1, device=x.device)) // ratio)
+            invalid = topk_idxs >= bounds.unsqueeze(1)
+            topk_idxs = torch.where(invalid, -1, topk_idxs + offset)
+        elif start_pos == 0:
             invalid = topk_idxs >= (
                 torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
             )
