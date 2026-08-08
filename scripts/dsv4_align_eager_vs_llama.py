@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -28,7 +29,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 GGUF = Path(
     "/home/bot/models/DeepSeek-V4-Flash-0731-GGUF/DeepSeek-V4-Flash-0731-IQ2_XS-Experts-Q8_0.gguf"
 )
-LLAMA_COMPLETION = Path("/home/bot/project/llama.cpp/build-sm120/bin/llama-completion")
+_DEFAULT_LLAMA_COMPLETION = "/home/bot/project/llama.cpp/build-sm120/bin/llama-completion"
+LLAMA_COMPLETION = Path(os.environ.get("QSR_LLAMA_COMPLETION", _DEFAULT_LLAMA_COMPLETION))
 TOKENIZER = REPO_ROOT / "notes" / "dsv4flash-ref" / "tokenizer.json"
 
 DEFAULT_PROMPTS = [

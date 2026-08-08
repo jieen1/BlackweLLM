@@ -28,6 +28,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -227,8 +228,20 @@ async def _tokenize_chat(engine_ref, messages, tools=None, chat_template_kwargs=
     official Qwen3.6 ``{"enable_thinking": False}`` toggle (and any other template
     option) is honored exactly as in stock vLLM. Without this the template always
     defaults to thinking mode and the toggle sent by clients is silently ignored.
+
+    The deepseek_v4 backend does not carry a Jinja chat template at all --
+    the official ``encoding_dsv4.py`` message encoder is the contract (plan
+    §7.2 / D9).  Its ``encode_messages`` returns the prompt string; the
+    standard tokenizer then tokenizes it.  ``chat_template_kwargs`` is
+    accepted for shape-compatibility and ignored (DSV4 encodes from
+    message roles, not template kwargs).
     """
     loop = asyncio.get_running_loop()
+    if getattr(engine_ref, "backend_name", None) == "deepseek_v4":
+        from server.formats.dsv4_encoding import encode_messages_dsv4
+
+        prompt = await loop.run_in_executor(None, encode_messages_dsv4, messages, tools)
+        return engine_ref.tok.encode(prompt, add_special_tokens=False)
     fn = functools.partial(
         engine_ref.tok.apply_chat_template,
         messages,
@@ -404,7 +417,11 @@ async def lifespan(app: FastAPI):
     from runtime.laguna_config import _resolve_laguna_model_dir
     from runtime.model_registry import resolve_checkpoint
 
-    resolution = resolve_checkpoint(_resolve_laguna_model_dir(SERVER_MODEL_PATH))
+    model_path = Path(SERVER_MODEL_PATH)
+    if model_path.is_file() and model_path.suffix == ".gguf":
+        resolution = resolve_checkpoint(model_path)
+    else:
+        resolution = resolve_checkpoint(_resolve_laguna_model_dir(SERVER_MODEL_PATH))
     logger.info(
         "loading model=%s backend=%s (registry-resolved; this can take a while: "
         "model load + KV cache alloc)...",
@@ -1142,10 +1159,12 @@ def _run_startup_preflight() -> None:
     and lets warnings through with their remediation text.
 
     The checkpoint checks want a local directory, but ``SERVER_MODEL_PATH``
-    is a HuggingFace repo id. ``_resolve_laguna_model_dir`` is the resolver
-    the loader itself uses (offline-only, no network fetch); importing the
-    private name is deliberate -- duplicating two lines of resolution logic
-    here would be free to drift away from what actually gets loaded.
+    is a HuggingFace repo id (or a local .gguf weight file for DSV4).
+    ``_resolve_laguna_model_dir`` is the resolver the loader itself uses
+    (offline-only, no network fetch) for directories; a local .gguf path
+    is passed through as-is.  Importing the private name is deliberate --
+    duplicating two lines of resolution logic here would be free to drift
+    away from what actually gets loaded.
     """
     import sys
 
@@ -1153,7 +1172,11 @@ def _run_startup_preflight() -> None:
     from runtime.preflight import run_preflight
 
     try:
-        checkpoint_dir = _resolve_laguna_model_dir(SERVER_MODEL_PATH)
+        model_path = Path(SERVER_MODEL_PATH)
+        if model_path.is_file() and model_path.suffix == ".gguf":
+            checkpoint_dir = model_path
+        else:
+            checkpoint_dir = _resolve_laguna_model_dir(SERVER_MODEL_PATH)
     except Exception as exc:  # noqa: BLE001 - any resolution failure is fatal here
         print(
             f"preflight: cannot resolve a local checkpoint for {SERVER_MODEL_PATH!r}: {exc}\n"

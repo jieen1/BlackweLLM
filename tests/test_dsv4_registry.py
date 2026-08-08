@@ -154,13 +154,14 @@ def write_synthetic_deepseek4_gguf(path: Path, quant_types: tuple[int, ...]) -> 
     path.write_bytes(bytes(out))
 
 
-def test_resolve_synthetic_gguf_honestly_not_implemented(tmp_path: Path) -> None:
+def test_resolve_synthetic_gguf_resolves_to_deepseek_v4(tmp_path: Path) -> None:
     target = tmp_path / "mini.gguf"
     # 17 = IQ2_XS, 8 = Q8_0, 0 = F32
     write_synthetic_deepseek4_gguf(target, quant_types=(17, 8, 0))
-    assert "deepseek_v4" not in IMPLEMENTED_BACKENDS
-    with pytest.raises(UnsupportedArchitectureError, match="not implemented"):
-        resolve_checkpoint(target)
+    assert "deepseek_v4" in IMPLEMENTED_BACKENDS
+    resolution = resolve_checkpoint(target)
+    assert resolution.backend == "deepseek_v4"
+    assert resolution.spec.architecture == "DeepseekV4ForCausalLM"
 
 
 def test_resolve_rejects_non_deepseek4_gguf(tmp_path: Path) -> None:
@@ -181,9 +182,10 @@ def test_resolve_rejects_plain_weight_files(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(not REAL_GGUF.exists(), reason="GGUF download not present")
 def test_resolve_real_gguf_header() -> None:
-    # The backend gate is the expected outcome until Phase 3/4 lands; the
-    # assertion is that resolution gets that far with the right identity.
-    with pytest.raises(UnsupportedArchitectureError) as excinfo:
-        resolve_checkpoint(REAL_GGUF)
-    message = str(excinfo.value)
-    assert "deepseek_v4" in message and "not implemented" in message
+    # Phase 4: deepseek_v4 is implemented; resolution must succeed with the
+    # right identity and no speculative strategy (the main GGUF carries no
+    # dspark/mtp tensors).
+    resolution = resolve_checkpoint(REAL_GGUF)
+    assert resolution.backend == "deepseek_v4"
+    assert resolution.spec.architecture == "DeepseekV4ForCausalLM"
+    assert resolution.speculative is None

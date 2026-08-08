@@ -1,32 +1,41 @@
-"""DeepSeek-V4-Flash backend: eager, single-slot (Phase 3).
+"""DeepSeek-V4-Flash backend: multi-slot kernel-path serving (Phase 4).
 
-Phase 3's contract is correctness, not concurrency: eager forward, one
-slot, no CUDA Graph, no speculative decode, no prefix cache. The eager
-``Dsv4Transformer`` owns exactly one set of per-layer caches (attention
-KV, compressor decode state, indexer scoring caches), so ``num_slots``
-must be 1 here; the multi-slot slot-pool integration is the next phase's
-work (``runtime/model/dsv4_slots.py`` + ``Dsv4AttnKernelLayer`` exist for
-it, and ``reset_slot`` already implements the pool's semantics: KV bytes
-survive, recursive compressor state is zeroed).
+The serving path runs the kernel-path attention stack (``Dsv4AttnKernelLayer``
+per slot, weights shared from the eager ``Dsv4Transformer`` that owns the
+checkpoint) -- packed FP8 KV pages + the fork compressed_mla kernel -- with
+the eager graph kept as the load-time weight holder and oracle only.  Each
+slot owns a full 43-layer kernel stack (its own page buffers, compressor
+decode state, and indexer scoring caches); ``reset_slot`` zeroes the
+recursive compressor state (KV bytes survive, same rule as the slot pool).
 
-Conforms to ``ModelBackend`` with every capability flag False, i.e. the
-six unconditionally required members only.
+Phase 3's single-slot eager backend is superseded; the protocol surface is
+unchanged (``ModelBackend``'s six unconditional members).  Capabilities are
+still conservative: no CUDA Graph, no chunked prefill, no prefix cache --
+those land incrementally, each with its own gate.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 
 from runtime.backends.protocol import (
     BackendCapabilities,
     BackendSnapshot,
+    PrefixHit,
     PrefixSnapshot,
     SlotSnapshot,
 )
+from runtime.block_pool import ChunkedPrefillState
+from runtime.model.dsv4_attn_kernel import Dsv4AttnKernelLayer
 from runtime.model.dsv4_config import Dsv4Config
-from runtime.model.dsv4_model import Dsv4Transformer
+from runtime.model.dsv4_model import (
+    Dsv4Transformer,
+    load_dsv4_from_gguf,
+    rms_norm,
+)
 from runtime.sampling import SamplingParams, make_generator, sample_from_logits
 
 EOS_TOKENS: tuple[int, ...] = (1,)
@@ -34,7 +43,7 @@ EOS_TOKENS: tuple[int, ...] = (1,)
 
 @dataclass(frozen=True)
 class Dsv4SlotStateView:
-    """Read-only server view of the single DSV4 slot (protocol shape)."""
+    """Read-only server view of one DSV4 slot (protocol shape)."""
 
     kv_len: int
     committed_tokens: tuple[int, ...]
@@ -45,7 +54,13 @@ class Dsv4SlotStateView:
 
 
 class DeepseekV4Backend:
-    """Eager single-slot serving of the DSV4-Flash graph."""
+    """Multi-slot kernel-path serving of the DSV4-Flash graph.
+
+    ``forward_fn`` is an injection point for tests: the production default
+    is the kernel-path stack forward (``_forward``), which requires the
+    real 512-dim DSV4 shapes; tests stub it with a tiny zeroed-graph
+    forward to exercise the serving contract without weights.
+    """
 
     def __init__(
         self,
@@ -54,20 +69,44 @@ class DeepseekV4Backend:
         *,
         num_slots: int = 1,
         max_seq_len: int = 4096,
+        max_q_rows: int = 1,
         device: str = "cuda",
+        forward_fn: Any | None = None,
     ) -> None:
-        if num_slots != 1:
-            raise NotImplementedError(
-                "Phase 3 serves one slot: the eager graph owns one cache set; "
-                "multi-slot wiring lands with the slot-pool integration"
-            )
+        if num_slots < 1:
+            raise ValueError(f"num_slots must be >= 1, got {num_slots}")
         self.model = model
         self.config = config
         self.num_slots = num_slots
         self.max_seq_len = max_seq_len
+        self.max_q_rows = max_q_rows
         self.device = device
-        self._kv_len = 0
-        self._committed: list[int] = []
+        self._forward_fn = forward_fn
+
+        # One kernel-path attention stack per slot, weights shared from the
+        # eager model (which stays the weight owner and oracle).  Each slot's
+        # stack owns its page buffers, compressor state and indexer caches.
+        # Built lazily: the real shapes (512 head dim, 256-page window) are
+        # DSV4-specific, so tests with a tiny config pass ``forward_fn`` and
+        # never build the stacks.
+        self.slot_layers: list[list[Dsv4AttnKernelLayer]] = []
+        if forward_fn is None:
+            for _ in range(num_slots):
+                self.slot_layers.append(
+                    [
+                        Dsv4AttnKernelLayer(
+                            config,
+                            layer_id,
+                            max_seq_len=max_seq_len,
+                            max_q_rows=max_q_rows,
+                            device=device,
+                            shared_from=model.blocks[layer_id].attn,
+                        )
+                        for layer_id in range(config.num_layers)
+                    ]
+                )
+        self._kv_len = [0] * num_slots
+        self._committed: list[list[int]] = [[] for _ in range(num_slots)]
         self._cg_status: dict[str, str] = {}
 
     # -- protocol ------------------------------------------------------------
@@ -89,24 +128,25 @@ class DeepseekV4Backend:
         same-slot prefix reuse wants them kept) -- the same rule as the
         slot pool and qwen36_slots.
         """
-        if slot != 0:
-            raise IndexError(f"slot {slot} out of range (Phase 3 has 1 slot)")
-        self.model.reset_caches()
-        self._kv_len = 0
-        self._committed = []
-
+        if not 0 <= slot < self.num_slots:
+            raise IndexError(f"slot {slot} out of range ({self.num_slots} slots)")
+        if self.slot_layers:
+            for layer in self.slot_layers[slot]:
+                layer.reset_caches()
+        self._kv_len[slot] = 0
+        self._committed[slot] = []
     def slot_state(self, slot: int) -> Dsv4SlotStateView:
-        if slot != 0:
-            raise IndexError(f"slot {slot} out of range (Phase 3 has 1 slot)")
+        if not 0 <= slot < self.num_slots:
+            raise IndexError(f"slot {slot} out of range ({self.num_slots} slots)")
         return Dsv4SlotStateView(
-            kv_len=self._kv_len,
-            committed_tokens=tuple(self._committed),
+            kv_len=self._kv_len[slot],
+            committed_tokens=tuple(self._committed[slot]),
         )
 
     def snapshot(self) -> BackendSnapshot:
         return BackendSnapshot(
             slots=tuple(
-                SlotSnapshot(slot=s, kv_len=self._kv_len, is_fresh=self._kv_len == 0)
+                SlotSnapshot(slot=s, kv_len=self._kv_len[s], is_fresh=self._kv_len[s] == 0)
                 for s in range(self.num_slots)
             ),
             prefix=tuple(
@@ -116,23 +156,117 @@ class DeepseekV4Backend:
             dflash_cg_status=tuple(sorted(self._cg_status.items())),
         )
 
-    def prefill(self, slot: int, prompt_ids: list[int]) -> int:
-        """Cold prefill of ``prompt_ids``; greedy first token (Laguna contract)."""
-        if slot != 0:
-            raise IndexError(f"slot {slot} out of range (Phase 3 has 1 slot)")
+    # -- prefix-cache surface (no-op: Phase 4 serves without prefix cache) --
+
+    def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
+        """No warm prefix: ``PrefixHit(0, 0)``, the no-cache contract."""
+        return PrefixHit(kv_hit=0, state_hit=0)
+
+    def find_best_slot_for_prompt(
+        self,
+        token_ids: list[int],
+        free_slots: list[int],
+    ) -> tuple[int, int]:
+        """No prefix cache: pick the first free slot, zero hit depth."""
+        if not free_slots:
+            raise IndexError("no free slots")
+        return free_slots[0], 0
+
+    @property
+    def has_speculative_decode(self) -> bool:
+        return False
+
+    # -- chunked prefill surface (one-shot: DSV4 prefill is never chunked) --
+
+    def prefill_chunked_begin(
+        self,
+        slots: list[int],
+        prompts_per_slot: list[list[int]],
+        chunk_size: int = 512,
+        *,
+        params_per_slot: dict[int, SamplingParams] | None = None,
+    ) -> ChunkedPrefillState:
+        """One-shot prefill: every prompt fully prefilled, done immediately."""
+        if len(slots) != len(prompts_per_slot):
+            raise ValueError("slots and prompts_per_slot must have equal length")
+        result: dict[int, dict] = {}
+        for slot, prompt in zip(slots, prompts_per_slot):
+            params = params_per_slot.get(slot) if params_per_slot else None
+            if params is not None and params.temperature != 0.0:
+                # E2-b contract: the anchor of a non-greedy request must be
+                # sampled, not argmax'd.  Sample from the prefill logits.
+                logits = self._prefill_logits(slot, prompt)
+                gen = make_generator(params.seed)
+                anchor = int(
+                    sample_from_logits(
+                        logits[0, -1].unsqueeze(0), params, generator=gen
+                    ).item()
+                )
+            else:
+                anchor = self.prefill(slot, prompt)
+            result[slot] = {"anchor": anchor, "draft_tokens": []}
+        return ChunkedPrefillState(done=True, result=result)
+
+    def prefill_chunked_step(self, state: ChunkedPrefillState) -> bool:
+        """DSV4 prefill is never incremental; state is always already done."""
+        return state.done
+
+    def _prefill_logits(self, slot: int, prompt_ids: list[int]) -> torch.Tensor:
+        """Prefill and return the full logits (shared by prefill paths)."""
+        if not 0 <= slot < self.num_slots:
+            raise IndexError(f"slot {slot} out of range ({self.num_slots} slots)")
         if not prompt_ids:
             raise ValueError("prefill needs at least one token")
-        if self._kv_len != 0:
+        if self._kv_len[slot] != 0:
             raise RuntimeError(
-                f"slot {slot} is at kv_len={self._kv_len}; the caller must reset_slot first"
+                f"slot {slot} is at kv_len={self._kv_len[slot]}; the caller must reset_slot first"
             )
-        logits = self.model.forward(
-            torch.tensor([prompt_ids], dtype=torch.long, device=self.device), 0
-        )
-        first_token = int(logits[0, -1].argmax(dim=-1).item())
-        self._kv_len = len(prompt_ids)
-        self._committed = list(prompt_ids)
-        return first_token
+        prompt_t = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
+        logits = self._forward(slot, prompt_t, 0)
+        self._kv_len[slot] = len(prompt_ids)
+        self._committed[slot] = list(prompt_ids)
+        return logits
+
+    # -- serving forward -----------------------------------------------------
+
+    def _forward(self, slot: int, input_ids: torch.Tensor, start_pos: int) -> torch.Tensor:
+        """One forward on the slot's kernel-path stack.
+
+        Mirrors the Phase-3 gate's kernel-path run: eager HC/FFN/moe, kernel
+        attention, sharing every weight module with the eager graph.
+        ``input_ids`` is a [1, seq] long tensor; returns fp32 logits.
+
+        With a test-injected ``forward_fn`` this is replaced entirely
+        (``forward_fn(slot, input_ids, start_pos)``).
+        """
+        if self._forward_fn is not None:
+            return self._forward_fn(slot, input_ids, start_pos)
+        model, layers = self.model, self.slot_layers[slot]
+        h = model.embed(input_ids)
+        h = h.unsqueeze(2).repeat(1, 1, model.hc_mult, 1)
+        for i, block in enumerate(model.blocks):
+            residual = h
+            x, post, comb = block.hc_pre(
+                h, block.hc_attn_fn, block.hc_attn_scale, block.hc_attn_base
+            )
+            x = rms_norm(x, block.attn_norm_weight, block.eps)
+            x = layers[i](x, start_pos)
+            x = block.hc_post(x, residual, post, comb)
+            residual = x
+            x, post, comb = block.hc_pre(
+                x, block.hc_ffn_fn, block.hc_ffn_scale, block.hc_ffn_base
+            )
+            x = rms_norm(x, block.ffn_norm_weight, block.eps)
+            x = block.moe(x, input_ids)
+            x = block.hc_post(x, residual, post, comb)
+            h = x
+        h = model.hc_head(h)
+        return model.lm_head(rms_norm(h, model.norm_weight, model.eps))
+
+    def prefill(self, slot: int, prompt_ids: list[int]) -> int:
+        """Cold prefill of ``prompt_ids``; greedy first token (server contract)."""
+        logits = self._prefill_logits(slot, prompt_ids)
+        return int(logits[0, -1].argmax(dim=-1).item())
 
     def decode_batch_sampled(
         self,
@@ -144,31 +278,56 @@ class DeepseekV4Backend:
         return_logprobs: bool = False,
         top_logprobs: int = 0,
     ) -> list[int] | tuple[list[int], list[dict]]:
-        """One decode step per slot (Phase 3: exactly one slot)."""
+        """One decode step per slot through the kernel-path stack."""
         if return_logprobs:
             raise NotImplementedError(
-                "logprobs are Phase 4 work; the Phase 3 gate is greedy/sampled token identity"
+                "logprobs are Phase 4 follow-up work; decode returns token ids only"
             )
-        if len(slot_ids) != 1:
-            raise NotImplementedError(f"Phase 3 decodes one slot at a time, got {len(slot_ids)}")
-        (slot,) = slot_ids
-        (token,), (kv_len,) = token_ids, kv_lengths
-        if slot != 0:
-            raise IndexError(f"slot {slot} out of range (Phase 3 has 1 slot)")
-        if kv_len != self._kv_len:
-            raise RuntimeError(
-                f"slot {slot} is at kv_len={self._kv_len}, caller says {kv_len}; "
-                "the caller must reset_slot first"
+        if len(slot_ids) != len(token_ids) != len(kv_lengths) != len(params_list):
+            raise ValueError("slot_ids/token_ids/kv_lengths/params_list must be equal length")
+        outs: list[int] = []
+        for slot, token, kv_len, params in zip(slot_ids, token_ids, kv_lengths, params_list):
+            if not 0 <= slot < self.num_slots:
+                raise IndexError(f"slot {slot} out of range ({self.num_slots} slots)")
+            if kv_len != self._kv_len[slot]:
+                raise RuntimeError(
+                    f"slot {slot} is at kv_len={self._kv_len[slot]}, caller says {kv_len}; "
+                    "the caller must reset_slot first"
+                )
+            logits = self._forward(
+                slot, torch.tensor([[token]], dtype=torch.long, device=self.device), kv_len
             )
-        logits = self.model.forward(
-            torch.tensor([[token]], dtype=torch.long, device=self.device), kv_len
-        )
-        params = params_list[0]
-        if params.temperature == 0.0:
-            out = int(logits[0, 0].argmax(dim=-1).item())
-        else:
-            gen = make_generator(params.seed)
-            out = int(sample_from_logits(logits[0, 0].unsqueeze(0), params, generator=gen).item())
-        self._kv_len += 1
-        self._committed.append(out)
-        return [out]
+            if params.temperature == 0.0:
+                out = int(logits[0, 0].argmax(dim=-1).item())
+            else:
+                gen = make_generator(params.seed)
+                out = int(
+                    sample_from_logits(
+                        logits[0, 0].unsqueeze(0), params, generator=gen
+                    ).item()
+                )
+            self._kv_len[slot] += 1
+            self._committed[slot].append(out)
+            outs.append(out)
+        return outs
+
+
+def load_deepseek_v4_backend(
+    gguf_path: str | torch,  # torch re-export guard for the engine import path
+    *,
+    num_slots: int = 1,
+    max_seq_len: int = 4096,
+    max_q_rows: int = 1,
+    device: str = "cuda",
+) -> DeepseekV4Backend:
+    """Load the GGUF and build the serving backend (engine-thread entry)."""
+    model, count = load_dsv4_from_gguf(gguf_path, max_seq_len=max_seq_len, device=device)
+    backend = DeepseekV4Backend(
+        model,
+        model.config,
+        num_slots=num_slots,
+        max_seq_len=max_seq_len,
+        max_q_rows=max_q_rows,
+        device=device,
+    )
+    return backend

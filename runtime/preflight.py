@@ -640,27 +640,62 @@ def check_sparkinfer_analytic_decode_gate(
 
 def check_checkpoint_path(checkpoint_path: str | Path) -> CheckResult:
     path = Path(checkpoint_path)
-    if path.is_dir():
+    if path.is_dir() or (path.is_file() and path.suffix == ".gguf"):
         return CheckResult(
             name="checkpoint_path",
             passed=True,
             severity="fatal",
             actual=str(path),
-            expected="an existing directory",
+            expected="an existing checkpoint directory or .gguf weight file",
         )
     remediation = f"Check the model path passed at startup; `{path}` must exist before load."
     return CheckResult(
         name="checkpoint_path",
         passed=False,
         severity="fatal",
-        actual=f"{path} does not exist or is not a directory",
-        expected="an existing directory",
+        actual=f"{path} does not exist",
+        expected="an existing checkpoint directory or .gguf weight file",
         remediation=remediation,
     )
 
 
 def check_checkpoint_config(checkpoint_path: str | Path) -> CheckResult:
-    config_path = Path(checkpoint_path) / "config.json"
+    path = Path(checkpoint_path)
+    if path.is_file() and path.suffix == ".gguf":
+        # GGUF checkpoints carry no config.json; the header KV pairs are the
+        # identity (registry's resolve_gguf_checkpoint parses them).  Verify
+        # the header parses as a DSV4 file here so a corrupt/mismatched
+        # GGUF fails fast at preflight rather than mid-load.
+        try:
+            from loader.gguf_header import read_gguf_header
+
+            header = read_gguf_header(path)
+            arch = header.kv.get("general.architecture")
+            actual = f"gguf arch={arch!r} tensors={len(header.tensors)}"
+            expected = "a parseable deepseek4 GGUF header"
+            passed = arch == "deepseek4"
+            remediation = (
+                "Verify the GGUF file is the DeepSeek-V4-Flash quant-mix "
+                "artifact (bullerwins/DeepSeek-V4-Flash-0731-GGUF)."
+            )
+        except Exception as exc:  # noqa: BLE001 - any header failure is fatal here
+            return CheckResult(
+                name="checkpoint_config",
+                passed=False,
+                severity="fatal",
+                actual=f"cannot read/parse GGUF header: {exc}",
+                expected="a parseable deepseek4 GGUF header",
+                remediation="Re-download or repair the GGUF; the header is corrupt/unreadable.",
+            )
+        return CheckResult(
+            name="checkpoint_config",
+            passed=passed,
+            severity="fatal",
+            actual=actual,
+            expected=expected,
+            remediation=remediation if not passed else None,
+        )
+    config_path = path / "config.json"
     if not config_path.is_file():
         return CheckResult(
             name="checkpoint_config",

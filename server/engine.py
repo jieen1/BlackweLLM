@@ -28,6 +28,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from runtime.architecture import ArchitectureSpec, parse_architecture
@@ -460,22 +461,44 @@ class ServerEngine:
         # -- tokenizer (CPU-only, thread-safe for reads) --
         from transformers import AutoTokenizer
 
-        # Laguna ships a custom AutoConfig/tokenizer class (configuration_laguna.py)
-        # that transformers only loads with trust_remote_code=True; without it,
-        # config validation falls onto a generic path that chokes on Laguna's
-        # yarn rope_parameters (KeyError: 'original_max_position_embeddings').
-        self.tok = AutoTokenizer.from_pretrained(self.MODEL, trust_remote_code=True)
-        self.eos_token_id = self.tok.eos_token_id
-        try:
-            from transformers import GenerationConfig
-
-            gen_cfg_eos = GenerationConfig.from_pretrained(self.MODEL).eos_token_id
-        except Exception:
-            gen_cfg_eos = self.eos_token_id
-        if isinstance(gen_cfg_eos, (list, tuple, set)):
-            self.eos_token_ids = frozenset(int(e) for e in gen_cfg_eos)
+        if backend == "deepseek_v4":
+            # DSV4 is served from a GGUF weight file, which carries no
+            # tokenizer for the transformers loader; the official HF
+            # tokenizer dir (tokenizer.json + tokenizer_config.json) is a
+            # standard PreTrainedTokenizerFast -- no trust_remote_code, no
+            # custom classes.  Default is the vendored reference dir; a
+            # deployment points QSR_DSV4_TOKENIZER_DIR at its own copy.
+            tokenizer_dir = os.environ.get(
+                "QSR_DSV4_TOKENIZER_DIR",
+                str(Path(__file__).resolve().parent.parent / "notes" / "dsv4flash-ref"),
+            )
+            if not (Path(tokenizer_dir) / "tokenizer.json").is_file():
+                raise RuntimeError(
+                    f"DSV4 tokenizer dir {tokenizer_dir!r} lacks tokenizer.json; "
+                    "set QSR_DSV4_TOKENIZER_DIR"
+                )
+            self.tok = AutoTokenizer.from_pretrained(tokenizer_dir)
+            # DSV4 serving contract: EOS=1, no BOS added (plan §7.2).
+            self.eos_token_id = 1
+            self.eos_token_ids = frozenset({1})
         else:
-            self.eos_token_ids = frozenset({int(gen_cfg_eos)})
+            # Laguna ships a custom AutoConfig/tokenizer class
+            # (configuration_laguna.py) that transformers only loads with
+            # trust_remote_code=True; without it, config validation falls
+            # onto a generic path that chokes on Laguna's yarn
+            # rope_parameters (KeyError: 'original_max_position_embeddings').
+            self.tok = AutoTokenizer.from_pretrained(self.MODEL, trust_remote_code=True)
+            self.eos_token_id = self.tok.eos_token_id
+            try:
+                from transformers import GenerationConfig
+
+                gen_cfg_eos = GenerationConfig.from_pretrained(self.MODEL).eos_token_id
+            except Exception:
+                gen_cfg_eos = self.eos_token_id
+            if isinstance(gen_cfg_eos, (list, tuple, set)):
+                self.eos_token_ids = frozenset(int(e) for e in gen_cfg_eos)
+            else:
+                self.eos_token_ids = frozenset({int(gen_cfg_eos)})
 
         # -- high-performance request channel (asyncio → engine thread) --
         # deque is GIL-atomic for append/popleft; pipe provides instant wakeup
@@ -601,6 +624,8 @@ class ServerEngine:
         """
         if self.backend_name == "qwen36":
             self._load_qwen36_model()
+        elif self.backend_name == "deepseek_v4":
+            self._load_deepseek_model()
         else:
             self._load_laguna_model()
 
@@ -777,6 +802,73 @@ class ServerEngine:
             self.runner.max_seq_len,
             self.runner.pool.geometry.recurrent_bytes_per_slot / 2**20,
             self.runner.pool.geometry.kv_bytes_per_slot / 2**20,
+        )
+
+    def _load_deepseek_model(self) -> None:
+        """Load ``DeepseekV4Backend`` (Phase 4). MUST run on engine thread.
+
+        The checkpoint is a single GGUF weight file (``self.MODEL`` is the
+        file path, resolved by ``resolve_gguf_checkpoint`` in
+        ``server/app.py``'s lifespan); the eager ``Dsv4Transformer`` built
+        by ``load_dsv4_from_gguf`` owns the weights, and the serving
+        backend stacks one kernel-path attention layer set per slot on
+        top of them.
+
+        Memory discipline: the DSV4-Flash IQ2_XS checkpoint is 81.9 GiB
+        packed; the per-slot kernel layers add page buffers + MLA scratch
+        (order 0.5 GiB/slot at 128K ctx) on top, and the eager oracle's
+        own caches live for the process.  The plan's 2-slot x 128K budget
+        lands at ~87 GiB; ``capacity``/``num_slots``/``blocks_per_slot``
+        are sized from that in the server env (QSR_SERVER_*).
+        """
+        from runtime.backends.dsv4 import DeepseekV4Backend
+        from runtime.model.dsv4_model import load_dsv4_from_gguf
+
+        if self.enable_dflash:
+            raise ValueError(
+                "enable_dflash is not supported by the deepseek_v4 backend "
+                "(DFlash is Laguna's draft model; DSV4's speculative story "
+                "is DSpark, which is not served). "
+                "Start the server with QSR_SERVER_ENABLE_DFLASH=0."
+            )
+        if self.enable_mtp:
+            raise ValueError(
+                "enable_mtp is not supported by the deepseek_v4 backend "
+                "(MTP is Qwen3.6's mechanism; DSV4's is DSpark, not served). "
+                "Start the server with QSR_SERVER_ENABLE_MTP=0."
+            )
+
+        max_model_len = self.blocks_per_slot * self.block_size
+        model, count = load_dsv4_from_gguf(
+            self.MODEL, max_seq_len=max_model_len, device="cuda"
+        )
+        logger.info(
+            "DeepSeek-V4-Flash GGUF loaded: %d tensors, max_context=%d tokens/slot",
+            count,
+            max_model_len,
+        )
+        self.runner = DeepseekV4Backend(
+            model,
+            model.config,
+            num_slots=self.num_slots,
+            max_seq_len=max_model_len,
+            max_q_rows=1,
+            device="cuda",
+        )
+        # Warm nothing yet: the first forward compiles the fork MLA kernels
+        # (disk-cached; the compile happens inside the first request and the
+        # request pays it once).  CUDA Graph capture for DSV4 is Phase 4
+        # follow-up (compressed_mla replay-state mode).
+        if self._enable_cudagraph:
+            logger.warning(
+                "deepseek_v4: decode CUDA Graph not implemented yet; serving eager "
+                "(QSR_SERVER_ENABLE_CUDAGRAPH=1 has no effect for this backend)"
+            )
+        logger.info(
+            "DeepSeek-V4-Flash model loaded on engine thread: num_slots=%d "
+            "max_context=%d tokens/slot",
+            self.num_slots,
+            max_model_len,
         )
 
     def _load_laguna_model(self) -> None:

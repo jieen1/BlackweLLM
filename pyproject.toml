@@ -141,6 +141,11 @@ select = ["E", "F", "I", "UP"]
 # (runtime/, server/, loader/, model/, oracle/).
 "benchmarks/*" = ["E401", "E402", "E501", "E701", "E702", "E722", "E741", "I001", "F841"]
 "tests/debug/*" = ["E401", "E402", "E501", "E701", "E702", "E722", "E741", "I001", "F841"]
+# server/formats/encoding_dsv4.py is the vendored official DeepSeek-V4
+# encoding module (MIT, from notes/dsv4flash-ref); keep it verbatim so
+# upstream diffs stay clean. The adapter dsv4_encoding.py is ours and
+# linted normally.
+"server/formats/encoding_dsv4.py" = ["E401", "E402", "E501", "E701", "E702", "E722", "E741", "I001", "F841", "UP006", "UP035", "UP045", "UP007"]
 # Historical vLLM source snapshots are retained as investigation evidence,
 # not maintained production modules. Keep their lint gate limited to rules
 # that can catch accidental undefined names or syntax errors.
