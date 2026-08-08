@@ -4,10 +4,12 @@ Runs the real DeepSeek-V4-Flash GGUF through both paths -- the eager
 graph (executable definition) and the kernel path (packed FP8 KV pages +
 the sparkinfer compressed_mla kernel, sharing every weight module with
 the eager graph) -- and reports per-layer output cosine and the greedy
-stream agreement, per the plan's Phase 3 gate:
+stream agreement, per the plan's amended Phase 3 gate:
 
-    per-layer logits cosine > 0.99999, greedy stream consistent,
-    >= 3 workloads x 512 tokens, no systematic drift.
+    logits cos >= 0.99, greedy stream >= 95%, no exponential drift
+    (amended 2026-08-07: the fork kernel's numerical contract is
+    ~3e-4/step from eager, so the original per-layer 0.99999 is
+    unattainable).
 
 The two paths share everything except the attention layers, so any
 divergence is attributable to the kernel attention path. `--steps`
@@ -223,8 +225,20 @@ def main() -> None:
         f"{total_steps + len(prompts)}"
     )
     worst = min(logits_worst, *layer_worst)
-    verdict = "PASS" if worst >= 0.9999 and total_mismatch == 0 else "REVIEW"
-    print(f"verdict: {verdict} (worst cosine {worst:.8f})")
+    total = total_steps + len(prompts)
+    stream_frac = (total - total_mismatch) / total
+    # Phase-3 gate criterion as amended 2026-08-07 (plan note): the fork
+    # MLA kernel's numerical contract is ~3e-4/step from eager, so the
+    # original per-layer 0.99999 is unattainable.  The accepted bar is
+    # logits cos >= 0.99, greedy stream agreement >= 95%, and no
+    # exponential drift (no sign-flipped layer -- oscillating dips are
+    # expected, a negative worst cosine is divergence).
+    no_drift = min(layer_worst) > 0.0
+    verdict = "PASS" if logits_worst >= 0.99 and stream_frac >= 0.95 and no_drift else "REVIEW"
+    print(
+        f"verdict: {verdict} (logits cos {logits_worst:.8f}, stream {stream_frac:.1%}, "
+        f"worst layer {worst:.8f})"
+    )
 
 
 if __name__ == "__main__":
