@@ -51,11 +51,21 @@ fp8-q 是 kernel 的性能设计，偏离官方契约。
 - 门禁基线（3×512，eager vs kernel 路径）：**流一致 1512/1539 = 98.2%**，
   最终 logits cos 最差 0.82（漂移 dips 振荡、非指数）
 
-## 5. 未解（下一步）
+## 5. 已解决（2026-08-08 第二轮）—— topk>2 根因与验证
 
-- **topk>2 时 A=K 方向（实测可工作）的 a1/a3 行半（候选 8..15）逃过共享 s3 掩码**；
-  A=Q 方向与 s3 语义一致但 mma 输出不流动。两者各差一步，需聚焦一轮：
-  a) 给变体传 `section_len`/候选有效性，直接掩掉无效行半；
-  b) 或复刻 H8 的 mxfp8 变体的行掩码语义。
-- 之后：fork 基准（QK 是小的 MMA，bf16 全局读的带宽代价要实测）→ 重跑门禁对比
-  （预期 logits cos 0.82 → ~0.9+、流一致 98.2% → 99%+）。
+**根因**：`_kernel_body`（per_token_len 内核）的 s0 分发只认 NVFP4 —— bf16-q
+模式下 DSV4 仍走 `s0_quantize_q_to_smem`，往 **0 字节的 q staging 区域**写
+fp8 量化 q，**污染相邻的 q_rope smem** → s2（rope QK）读垃圾 → 分数巨大
+（LSE ~78）→ topk>2 输出 garbage。修复：两个 kernel body 的 s0 分发都加
+`or t.dsv4_bf16_q` + `stage_nope=(not t.dsv4_bf16_q)`（fork 提交 `82d12f3`）。
+
+**验证**：
+- 真实尺度探针（8 行 × 64 头 × 8 token）：kernel vs 纯 fp32-q 参考
+  **0.99972 → 0.99986**（q-fp8 噪声消除）；topk 2/8 均 0.99999+
+- fork 套件带/不带 env 均 21/21
+- 模型级门禁 smoke（16 步，bf16-q vs eager）：
+  **最差逐层 0.816 → 0.942、最终 logits 0.980 → 0.986**（漂移显著减小）
+- 残余 ~1.4e-4 噪声 = XV 侧（P/V 处理），非 QK
+
+**后续**：fork 基准（bf16 全局读的带宽代价实测）→ 完整门禁对比（后台跑）→
+若 XV 侧也想清，查 s6 的 w_fp8（fp8 重量化 P）语义。
