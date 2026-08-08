@@ -67,5 +67,12 @@ fp8 量化 q，**污染相邻的 q_rope smem** → s2（rope QK）读垃圾 → 
   **最差逐层 0.816 → 0.942、最终 logits 0.980 → 0.986**（漂移显著减小）
 - 残余 ~1.4e-4 噪声 = XV 侧（P/V 处理），非 QK
 
+**XV 侧噪声源（s6_xv_nope 已确认）**：DSV4 的 XV 把 softmax 权重 W 重新量化成
+e4m3 存入 w_fp8（per-head w_head_sc 后缩放），走 PLAIN fp8 MMA —— 与 QK 侧的
+q-fp8 同构的 3-bit 尾数量化。NVFP4 模式已有 bf16-PV 变体
+（s6_xv_nope_nvfp4_bf16）但不适用于 DSV4（V 是 e4m3 非 E2M1）。给 DSV4 做
+bf16-PV 需新 s6 变体（bf16 P × e4m3 V 寄存器反量化）—— 工作量同 QK 变体，
+是下一个可选增量（预期 0.99986 → ~0.9999+）。
+
 **后续**：fork 基准（bf16 全局读的带宽代价实测）→ 完整门禁对比（后台跑）→
-若 XV 侧也想清，查 s6 的 w_fp8（fp8 重量化 P）语义。
+若 XV 侧也想清，按 s6 的分析做 bf16-PV 变体。
