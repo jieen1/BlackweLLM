@@ -113,7 +113,14 @@ def reset_all(model: Dsv4Transformer, kernel_layers: list[Dsv4AttnKernelLayer]) 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("gguf", type=str, help="DeepSeek-V4-Flash GGUF file")
-    parser.add_argument("--steps", type=int, default=512, help="decode steps per workload")
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=128,
+        help="decode steps per workload (default 128: the drift and stream "
+        "trends are visible within this; a 512x3 run costs ~2.5h on the "
+        "eager path's MoE dequant and is only for final confirmation)",
+    )
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--max-q-rows", type=int, default=0,
                         help="MLA plan rows (default: largest prompt length)")
