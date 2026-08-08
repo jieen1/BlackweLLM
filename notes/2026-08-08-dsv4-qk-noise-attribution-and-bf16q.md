@@ -1,6 +1,6 @@
 # DSV4 注意力噪声归因与 bf16-QK 优化尝试（2026-08-08）
 
-状态：🟡 归因闭环；优化实现 85%，topk>2 掩码问题未解（fork worktree `sparkinfer-wt-dsv4-bf16q`，分支 `work/dsv4-bf16q-20260807`，提交 `58d5208`）。
+状态：🟢 QK 与 XV 两侧噪声均已消除（fork 提交 `679c921`）；模型级完整门禁后台运行中。
 
 ## 1. 归因（闭环）
 
@@ -76,3 +76,34 @@ bf16-PV 需新 s6 变体（bf16 P × e4m3 V 寄存器反量化）—— 工作�
 
 **后续**：fork 基准（bf16 全局读的带宽代价实测）→ 完整门禁对比（后台跑）→
 若 XV 侧也想清，按 s6 的分析做 bf16-PV 变体。
+
+## 6. bf16-PV XV 变体完成（2026-08-08 第三轮）
+
+**实现**（fork `work/dsv4-bf16q-20260807`，提交 `679c921`）：新的
+`s6_xv_nope_dsv4_bf16` 不再读 S5 的 sm_p_full（H8 路径上 S5 的 fill 根本不跑，
+c6d6bc4 提交的变体因此读 garbage），而是像 `s6_xv_nope_dsv4_h8_swap_ab` 一样
+从 swapped-score w_pre 片段自建普通 [head, candidate] BF16 sm_p_full，barrier
+后再做 BF16 MMA（A=P 直接 bf16，B=V 逐 lane 寄存器反量化 e4m3×ue8m0）。
+
+**修掉的真 bug —— 逐候选 scale**：初版（含 c6d6bc4 与 14:23 快照）只加载
+candidate `ent0` 的 footer scale 字节，却把它套用到 **四个不同候选**
+（ent0, ent0+1, ent0+8, ent0+9）。footer 布局是每候选独立 7 字节 ue8m0 块
+（与 QK 侧 `s1_qk_nope_dsv4_bf16` 的逐候选索引一致），所以 v1/v8/v9 全用错
+scale。修复为四个候选各读各的 scale 字节。CG 重放探针（32 头，DSV4 页）：
+**kernel vs 参考 cos 0.971610 → 0.999996**（fp8 基线 0.999991），eager 与
+CG 重放 bit 一致。fork 套件带/不带 env 均 21/21。
+
+**16:31 那次调试为什么没找到它**：`branch_probe.txt` 从未被写出 —— cute.jit
+kernel body 是从磁盘编译缓存服务的，`decode_math.py`/`kernel.py` 的改动根本没
+进执行的内核（note §3 的坑第二次踩中）。清 `~/.cache/sparkinfer/compile` 后
+改动才真正生效，一测就定位到 scale bug。
+
+**eager 门禁路径的 OOM 陷阱**：工作区里试过的 expert 反量化 LRU 缓存
+（`PackedIQ2_XSExperts._expert_cache`，cap 48/模块）装不进显存 ——
+43 层 × 3 模块 × ~7 路由专家 × 32 MiB fp32 ≈ 28 GiB 常驻，压在 84.9 GiB
+（模型 81.9 + kernel 层）之上，余量只有 ~11 GiB，首个 eager forward 即 OOM。
+已回退（`8d3c4d9`），门禁脚本默认步数定为 128（512×3 在 eager 路径上约 2.5h，
+只留作最终确认）。
+
+**状态**：模型级 3×512 完整门禁（bf16-q + bf16-pv vs eager）后台运行中，
+以它为准。
