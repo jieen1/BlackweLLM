@@ -22,9 +22,13 @@ from torch import nn
 from torch.nn import functional as F
 
 from loader.gguf_header import read_gguf_header
+from loader.gguf_quant_tables import IQ2XS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS
 from runtime.loading.gguf import GgufTensor, iterate_gguf_checkpoint
 from runtime.model.dsv4_config import Dsv4Config, config_from_gguf_kv
 from runtime.model.dsv4_quant import dequantize_iq2_xs, dequantize_q8_0
+
+#: Per-device IQ2_XS dequant tables for the fused MoE GEMM (cached once).
+_expert_tables_cache: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
 
 class PackedQ8_0Weight(nn.Module):
@@ -155,6 +159,19 @@ class PackedIQ2_XSExperts(nn.Module):
         end = start + self.rows * self._row_bytes
         return dequantize_iq2_xs(self.packed[start:end]).reshape(self.rows, self.cols)
 
+    def tables(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """IQ2_XS dequant tables on this module's device (cached)."""
+        key = str(self.packed.device)
+        cache = _expert_tables_cache.get(key)
+        if cache is None:
+            cache = (
+                torch.tensor(IQ2XS_GRID, dtype=torch.int64, device=self.packed.device),
+                torch.tensor(KSIGNS_IQ2XS, dtype=torch.int32, device=self.packed.device),
+                torch.tensor(KMASK_IQ2XS, dtype=torch.int32, device=self.packed.device),
+            )
+            _expert_tables_cache[key] = cache
+        return cache
+
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     """Reference RMSNorm: fp32 internally, weight applied fp32, cast back."""
@@ -262,17 +279,46 @@ class Dsv4MoE(nn.Module):
             if int(counts[expert_id]) == 0:
                 continue
             token_idx, top_slot = torch.where(indices == expert_id)
-            w1 = self.gate_exps.expert_weight(expert_id)
-            w3 = self.up_exps.expert_weight(expert_id)
-            w2 = self.down_exps.expert_weight(expert_id)
-            xs = flat[token_idx].float()
-            gate = xs @ w1.t()
-            up = xs @ w3.t()
+            xs = flat[token_idx]
+            gate = self._expert_gemm(self.gate_exps, expert_id, xs)
+            up = self._expert_gemm(self.up_exps, expert_id, xs)
             h = swiglu(gate, up, limit)
-            routed = (h @ w2.t()) * weights[token_idx, top_slot].unsqueeze(-1)
+            routed = self._expert_gemm(self.down_exps, expert_id, h) * weights[
+                token_idx, top_slot
+            ].unsqueeze(-1)
             y.index_add_(0, token_idx, routed)
         y = y + self._shared_forward(flat)
         return y.to(x.dtype).reshape(*x.shape[:-1], y.shape[-1])
+
+    def _expert_gemm(
+        self, exps: PackedIQ2_XSExperts, expert_id: int, xs: torch.Tensor
+    ) -> torch.Tensor:
+        """``xs @ W_expert^T`` with the fused IQ2_XS dequant-GEMM.
+
+        The expert is [rows, cols] = [inter, hidden] for gate/up and
+        [hidden, inter] for down; ``xs`` is [M, cols] activations (already
+        bf16).  Falls back to the eager dequant+fp32-matmul for CPU or
+        non-block-aligned shapes (the kernel is a CUDA Triton program).
+        """
+        if (
+            exps.packed.device.type != "cuda"
+            or exps.cols % 256
+            or xs.device.type != "cuda"
+        ):
+            w = exps.expert_weight(expert_id)
+            return xs.float() @ w.t()
+        from runtime.kernels.dsv4_iq2xs_gemm import iq2xs_dequant_gemm
+
+        start = expert_id * exps.rows * exps._row_bytes
+        end = start + exps.rows * exps._row_bytes
+        packed_expert = exps.packed[start:end]
+        return iq2xs_dequant_gemm(
+            xs,
+            packed_expert,
+            rows=exps.rows,
+            cols=exps.cols,
+            grid_tables=exps.tables(),
+        )
 
 
 # ---------------------------------------------------------------------------
