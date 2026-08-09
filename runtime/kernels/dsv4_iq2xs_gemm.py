@@ -38,12 +38,13 @@ _IQ2_XS_BLOCK_ELEMS = 256
 
 
 @triton.jit
-def _iq2xs_dequant_gemm_kernel(
-    x_ptr,  # [M, K] bf16 activations (routed tokens x hidden)
-    w_ptr,  # [rows, cols] IQ2_XS packed, row-major, w_row_stride bytes
+def _iq2xs_dequant_gemm_batch_kernel(
+    x_ptr,  # [E, M, K] bf16 activations (routed expert x tokens x hidden)
+    w_ptr,  # [E, rows, cols] IQ2_XS packed, row-major, w_row_stride bytes
     grid_ptr,  # [512] int64 magnitudes (8 packed per entry)
     ksigns_ptr,  # [128] int32 sign bytes
-    out_ptr,  # [M, rows] fp32 out
+    out_ptr,  # [E, M, rows] fp32 out
+    E,
     M,
     K: tl.constexpr,  # hidden 4096
     ROWS: tl.constexpr,  # inter 2048 (output rows of W^T = output cols)
@@ -52,13 +53,15 @@ def _iq2xs_dequant_gemm_kernel(
     BLK_ELEMS: tl.constexpr,  # 256 values per IQ2_XS block
     BLK_BYTES: tl.constexpr,  # 74 bytes per IQ2_XS block
 ):
-    """One program per (token, BLOCK_COLS output columns)."""
-    pid_m = tl.program_id(0)
-    pid_c = tl.program_id(1)
+    """One program per (expert, token, BLOCK_COLS output columns)."""
+    pid_e = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_c = tl.program_id(2)
     col0 = pid_c * BLOCK_COLS
 
     # activation row base in bf16 (raw-bytes bitcast, per dsv4_mhc)
     x_u16 = x_ptr.to(tl.pointer_type(tl.uint16))
+    x_base = pid_e * M * K + pid_m * K
 
     crows = col0 + tl.arange(0, BLOCK_COLS)  # [BC]
     acc = tl.zeros((BLOCK_COLS,), dtype=tl.float32)
@@ -67,7 +70,11 @@ def _iq2xs_dequant_gemm_kernel(
     for kb in range(0, K, BLK_ELEMS):
         kb_block = kb // BLK_ELEMS
         # per-block byte offset for each owned output column
-        col_byte = crows * W_ROW_STRIDE + kb_block * BLK_BYTES  # [BC]
+        col_byte = (
+            pid_e * ROWS * W_ROW_STRIDE
+            + crows * W_ROW_STRIDE
+            + kb_block * BLK_BYTES
+        )  # [BC]
         base = w_ptr + col_byte  # [BC]
 
         # 32 int16 codes at offset 2..66 (64 bytes)
@@ -100,29 +107,31 @@ def _iq2xs_dequant_gemm_kernel(
             # value index for (code s, sub-block j): code-major, value
             # v = s*8 + j (verified against the eager dequant ordering)
             xv = (tl.load(
-                x_u16 + pid_m * K + kb + c32 * 8 + j
+                x_u16 + x_base + kb + c32 * 8 + j
             ).to(tl.uint32) << 16).to(tl.float32, bitcast=True)  # [32]
             acc += tl.sum(valj * xv[None, :], axis=1)
 
-    tl.store(out_ptr + pid_m * ROWS + crows, acc)
+    tl.store(out_ptr + pid_e * M * ROWS + pid_m * ROWS + crows, acc)
 
 
-def iq2xs_dequant_gemm(
+def iq2xs_dequant_gemm_batch(
     x: torch.Tensor,
     packed: torch.Tensor,
     *,
     rows: int,
     cols: int,
     grid_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-    BLOCK_COLS: int = 64,
+    BLOCK_COLS: int = 32,
 ) -> torch.Tensor:
-    """``x @ W^T`` with W = IQ2_XS packed [rows, cols], dequant in-kernel.
+    """Batched ``x @ W^T`` over ``E`` experts in one launch.
 
-    ``x`` is [M, cols] activations (cols = hidden dim); returns [M, rows].
+    ``x`` is [E, M, cols]; ``packed`` is [E, rows*stride] (each expert's
+    packed bytes row-major); returns [E, M, rows].  One kernel launch for
+    the whole expert batch -- collapses the MoE's per-expert launches.
     """
-    M = x.shape[0]
+    E, M, _ = x.shape
     x = x.to(torch.bfloat16).contiguous()
-    out = torch.empty((M, rows), dtype=torch.float32, device=x.device)
+    out = torch.empty((E, M, rows), dtype=torch.float32, device=x.device)
     grid_t, ksigns_t, _ = grid_tables
     if cols % _IQ2_XS_BLOCK_ELEMS:
         raise ValueError(
@@ -130,15 +139,16 @@ def iq2xs_dequant_gemm(
             "IQ2_XS block"
         )
     w_row_stride = (cols // _IQ2_XS_BLOCK_ELEMS) * _IQ2_XS_BLOCK_BYTES
-    assert (rows * w_row_stride) == packed.numel(), (
-        f"packed {packed.numel()} != rows {rows} x stride {w_row_stride}"
+    assert (E * rows * w_row_stride) == packed.numel(), (
+        f"packed {packed.numel()} != experts {E} x rows {rows} x stride {w_row_stride}"
     )
-    _iq2xs_dequant_gemm_kernel[(M, rows // BLOCK_COLS)](
+    _iq2xs_dequant_gemm_batch_kernel[(E, M, rows // BLOCK_COLS)](
         x,
         packed,
         grid_t,
         ksigns_t,
         out,
+        E,
         M,
         K=cols,
         ROWS=rows,
@@ -148,3 +158,24 @@ def iq2xs_dequant_gemm(
         BLK_BYTES=74,
     )
     return out
+
+
+def iq2xs_dequant_gemm(
+    x: torch.Tensor,
+    packed: torch.Tensor,
+    *,
+    rows: int,
+    cols: int,
+    grid_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    BLOCK_COLS: int = 32,
+) -> torch.Tensor:
+    """Single-expert ``x @ W^T`` (wrapper over the batched kernel)."""
+    return iq2xs_dequant_gemm_batch(
+        x.unsqueeze(0),
+        packed.unsqueeze(0),
+        rows=rows,
+        cols=cols,
+        grid_tables=grid_tables,
+        BLOCK_COLS=BLOCK_COLS,
+    )[0]
+

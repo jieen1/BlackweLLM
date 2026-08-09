@@ -272,24 +272,92 @@ class Dsv4MoE(nn.Module):
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor | None) -> torch.Tensor:
         flat = x.reshape(-1, x.shape[-1])
         weights, indices = self.gate(flat, input_ids.reshape(-1) if input_ids is not None else None)
-        y = torch.zeros_like(flat, dtype=torch.float32)
         limit = self.config.swiglu_limit
-        # Routed experts on the GPU (no per-expert int() CPU sync -- measured
-        # 42.6 ms/layer of sync stalls for a 256-expert scan x 43 layers, the
-        # dominant cost before batching).
-        routed = torch.unique(indices.reshape(-1))
-        for expert_id in routed.tolist():
-            token_idx, top_slot = torch.where(indices == expert_id)
-            xs = flat[token_idx]
-            gate = self._expert_gemm(self.gate_exps, expert_id, xs)
-            up = self._expert_gemm(self.up_exps, expert_id, xs)
-            h = swiglu(gate, up, limit)
-            routed = self._expert_gemm(self.down_exps, expert_id, h) * weights[
-                token_idx, top_slot
-            ].unsqueeze(-1)
-            y.index_add_(0, token_idx, routed)
+        y = torch.zeros_like(flat, dtype=torch.float32)
+        n_tokens = flat.shape[0]
+        if flat.device.type == "cuda" and n_tokens > 0:
+            if n_tokens == 1:
+                # Decode (M=1): the single token is routed to exactly
+                # n_activated_experts experts, ALL receiving the same input.
+                # Batch them as [E, 1, hidden] -- no padding, no sort, no
+                # scatter: one batched dequant-GEMM per (gate/up/down).
+                w1 = weights[0]  # [E]
+                eids = indices[0].tolist()
+                xs_batch = flat.expand(len(eids), 1, -1).contiguous()
+                wts = w1
+                gate = self._batch_expert_gemm(self.gate_exps, eids, xs_batch)
+                up = self._batch_expert_gemm(self.up_exps, eids, xs_batch)
+                h = swiglu(gate, up, limit)
+                routed = self._batch_expert_gemm(self.down_exps, eids, h)
+                y = (routed * wts[:, None, None]).sum(dim=0).to(torch.float32)
+            else:
+                # Prefill (M>1): route tokens to their experts in one pass
+                # (GPU sort groups tokens by expert), batched GEMM.
+                tok_ids = torch.arange(n_tokens, device=flat.device).repeat_interleave(
+                    indices.shape[1]
+                )
+                exp_ids = indices.reshape(-1)
+                order = torch.argsort(exp_ids, stable=True)
+                exp_sorted = exp_ids[order]
+                tok_sorted = tok_ids[order]
+                wt_sorted = weights.reshape(-1)[order]
+                exp_uniq, exp_counts = torch.unique(exp_sorted, return_counts=True)
+                exp_uniq_l, exp_counts_l = exp_uniq.tolist(), exp_counts.tolist()
+                E, M_max = len(exp_uniq_l), int(exp_counts.max().item())
+                xs_batch = torch.zeros(
+                    E, M_max, flat.shape[-1], dtype=torch.bfloat16, device=flat.device
+                )
+                wt_batch = torch.zeros(E, M_max, dtype=torch.float32, device=flat.device)
+                base = 0
+                for e in range(E):
+                    n = exp_counts_l[e]
+                    xs_batch[e, :n] = flat[tok_sorted[base : base + n]]
+                    wt_batch[e, :n] = wt_sorted[base : base + n]
+                    base += n
+                gate = self._batch_expert_gemm(self.gate_exps, exp_uniq_l, xs_batch)
+                up = self._batch_expert_gemm(self.up_exps, exp_uniq_l, xs_batch)
+                h = swiglu(gate, up, limit)
+                routed = self._batch_expert_gemm(self.down_exps, exp_uniq_l, h)
+                routed = routed * wt_batch.unsqueeze(-1)
+                base = 0
+                for e in range(E):
+                    n = exp_counts_l[e]
+                    y.index_add_(0, tok_sorted[base : base + n], routed[e, :n].to(torch.float32))
+                    base += n
+        else:
+            # CPU fallback: per-expert eager dequant (small/rare path)
+            routed_ids = torch.unique(indices.reshape(-1))
+            for expert_id in routed_ids.tolist():
+                token_idx, top_slot = torch.where(indices == expert_id)
+                xs = flat[token_idx]
+                gate = self._expert_gemm(self.gate_exps, expert_id, xs)
+                up = self._expert_gemm(self.up_exps, expert_id, xs)
+                h = swiglu(gate, up, limit)
+                routed_e = self._expert_gemm(self.down_exps, expert_id, h) * weights[
+                    token_idx, top_slot
+                ].unsqueeze(-1)
+                y.index_add_(0, token_idx, routed_e)
         y = y + self._shared_forward(flat)
         return y.to(x.dtype).reshape(*x.shape[:-1], y.shape[-1])
+
+    def _batch_expert_gemm(
+        self,
+        exps: PackedIQ2_XSExperts,
+        eids: list[int],
+        xs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Batched ``xs @ W_e^T`` over the routed ``eids`` in one launch."""
+        from runtime.kernels.dsv4_iq2xs_gemm import iq2xs_dequant_gemm_batch
+
+        rb = exps._row_bytes * exps.rows
+        packed = torch.stack([exps.packed[eid * rb : (eid + 1) * rb] for eid in eids])
+        return iq2xs_dequant_gemm_batch(
+            xs,
+            packed,
+            rows=exps.rows,
+            cols=exps.cols,
+            grid_tables=exps.tables(),
+        )
 
     def _expert_gemm(
         self, exps: PackedIQ2_XSExperts, expert_id: int, xs: torch.Tensor
