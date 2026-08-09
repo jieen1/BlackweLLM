@@ -85,3 +85,17 @@ num_main_chunks 的 split"处理错误（partial O/LSE 归约）。两个候选�
 (a) 修 QK/XV 的 split-vs-extra 交互（深）；
 (b) bf16-q 激活且 has_extra 时把 auto num_splits 钳到 num_main_chunks
 （浅，避免触发配置，保留 bf16-q 收益）。先做 (b) 验证 cos 恢复，再决定 (a)。
+
+## 6. 性能优化进展（2026-08-09）
+
+- **fused IQ2_XS dequant-GEMM**（`runtime/kernels/dsv4_iq2xs_gemm.py`）：
+  内核内反量化，零 fp32 权重常驻；bit-exact（rel 7.7e-8），单专家
+  1.65ms→0.24ms（6.8x）。接入 `Dsv4MoE._expert_gemm`。
+- **消除 per-expert CPU sync**：`torch.unique(indices)` 在 GPU 上求路由集，
+  替代 256 路 `int(counts[eid])` 同步（42.6ms/层 → 无）；MoE 2387→236ms
+  （10x）。
+- **实测**：真实服务 40-token 请求 108s→23.7s（4.6x，含首请求 kernel
+  编译 ~10s）；稳态 ~1.4 tok/s（decode step 2.6s→0.5s）。
+- **剩余瓶颈**：kernel-path attention（~163ms/step，43 层 compressed_mla
+  调用）+ per-expert Python 开销（torch.where/index_add/swiglu）。下一步：
+  把 6 个 routed experts 批量成单个 GEMM；评估 attention 融合。
