@@ -1,6 +1,10 @@
 # DeepSeek-V4-Flash-0731（GGUF IQ2_XS）接入实施方案
 
-> 编制日期：2026-08-07 · 状态：🟢 方案已定，P0/P1 进行中（见 §3 勾选）
+> 编制日期：2026-08-07 · 状态：🟢 服务化可用（Phase 4 完成核心；Phase 5 性能进行中）
+> 2026-08-09 更新：Phase 3 对齐（kernel vs eager）+ Phase 4 服务化（HTTP 端到端
+> 正确输出）已落地；性能优化已实现 fused IQ2_XS dequant-GEMM + MoE sync 消除
+> （decode step 2.6s→0.5s，真实服务 40-token 108s→23.7s）。详见
+> [`notes/2026-08-09-dsv4-serving-e2e-and-bf16q-prefill-bug.md`](2026-08-09-dsv4-serving-e2e-and-bf16q-prefill-bug.md)。
 > 基线 tag：两仓库 `pre-dsv4flash-20260807`（blackwellm + sparkinfer）
 > 触发：用户指令 —— 在本 runtime 上运行
 > `bullerwins/DeepSeek-V4-Flash-0731-GGUF` 的
