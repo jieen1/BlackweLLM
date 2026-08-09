@@ -163,7 +163,9 @@ one-line edit.
 
 ## External dependencies
 
-- **SparkInfer** (`/home/bot/project/sparkinfer`) — SM120 kernel library.
+- **SparkInfer** (`/home/bot/project/sparkinfer`, package name **`b12x`** since
+  the 2026-08-09 upstream merge — upstream renamed the `sparkinfer/` tree to
+  `b12x/`; the runtime imports `b12x.*`) — SM120 kernel library.
   **Directly editable as of 2026-08-02**, superseding the earlier hand-it-over
   rule. `origin` is `jieen1/sparkinfer`, this project's own fork, and is where
   changes go; `upstream` is `local-inference-lab/sparkinfer` and is not ours.
@@ -171,7 +173,9 @@ one-line edit.
   branch rhythm and has collided with in-flight branch switches before, so
   check `git status` and `git log` before starting. Note that the current
   performance numbers depend on local gating patches that are not upstream yet
-  (roadmap T0-5).
+  (roadmap T0-5). The DSV4 bf16-Q/PV experiment work lives on
+  `work/dsv4-bf16q-20260807` (rebased onto the b12x tree 2026-08-09); serving
+  uses the default kernel (bf16_q=0) and does not depend on it.
 
 ## Coding style
 

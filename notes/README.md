@@ -36,6 +36,7 @@
 | `2026-07-23-gpu-verification-checklist.md` | GPU 验证清单 |
 | `reference-map.md` | 参考实现地图 |
 | `2026-08-07-deepseek-v4-flash-iq2xs-gguf-implementation-plan.md` | **DeepSeek-V4-Flash-0731（GGUF IQ2_XS）接入实施方案**——事实基线、D1–D10 决策、六阶段计划、oracle 链与风险登记；参考材料在 `dsv4flash-ref/` |
+| `2026-08-09-dsv4-cudagraph-decode-driver.md` | **DSV4 CUDA-Graph decode 驱动进展**——sparkinfer fork 合并上游 b12x 重命名（runtime 46 处 import 已改，1810 测试绿）；DSV4 work 分支 rebase 到 b12x；43 层 decode 捕获成功（311→136ms，2.3×）；compressor 连续多步 `score_state` 迁移 `0*(-inf)=nan` bug（根因已定位，未修） |
 
 ## 2. 已定案的根因分析 🟢
 

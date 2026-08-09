@@ -307,7 +307,7 @@ class Dsv4MoE(nn.Module):
                 # Batch them as [E, 1, hidden] -- no padding, no sort, no
                 # scatter: one batched dequant-GEMM per (gate/up/down).
                 w1 = weights[0]  # [E]
-                eids = indices[0].tolist()
+                eids = indices[0]  # [E] int64 on device (capture-safe gather)
                 xs_batch = flat.expand(len(eids), 1, -1).contiguous()
                 wts = w1
                 gate = self._batch_expert_gemm(self.gate_exps, eids, xs_batch)
@@ -368,14 +368,20 @@ class Dsv4MoE(nn.Module):
     def _batch_expert_gemm(
         self,
         exps: PackedIQ2_XSExperts,
-        eids: list[int],
+        eids: torch.Tensor,
         xs: torch.Tensor,
     ) -> torch.Tensor:
-        """Batched ``xs @ W_e^T`` over the routed ``eids`` in one launch."""
+        """Batched ``xs @ W_e^T`` over the routed ``eids`` in one launch.
+
+        ``eids`` is an int64 [E] tensor on the packed's device (decode
+        route ids straight from the gate -- no CPU round-trip, so the
+        path is CUDA-Graph capture-safe).
+        """
         from runtime.kernels.dsv4_iq2xs_gemm import iq2xs_dequant_gemm_batch
 
         rb = exps._row_bytes * exps.rows
-        packed = torch.stack([exps.packed[eid * rb : (eid + 1) * rb] for eid in eids])
+        e = eids.to(torch.int64)
+        packed = exps.packed.reshape(-1, rb)[e]  # [E, rb] GPU gather
         return iq2xs_dequant_gemm_batch(
             xs,
             packed,
@@ -504,6 +510,79 @@ class Dsv4Compressor(nn.Module):
         out[:, 1:, :ratio] = tensor[:, :-1, :, :d]
         return out
 
+    def forward_graph(
+        self, x: torch.Tensor, pos: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Capture-safe decode step: single token at GPU position ``pos``.
+
+        Mirrors the ``start_pos > 0`` branch of :meth:`forward` for seqlen=1
+        but drives the position-dependent steps with the GPU scalar ``pos``
+        and mask-outs the conditional write/state-migration so the graph has
+        no Python branches and no allocations beyond the fixed buffers.
+
+        Returns the emitted compressed entry ``[1, 1, head_dim]`` or None on
+        a non-compress step -- the same contract as the eager path.
+        """
+        assert self.kv_cache is not None and self.freqs_cis is not None
+        ratio, overlap = self.ratio, self.overlap
+        dtype = x.dtype
+        xf = x.float()
+        kv = self.wkv(xf)
+        score = self.wgate(xf)
+        bsz, seqlen, _ = x.shape
+        assert seqlen == 1, "forward_graph is the 1-token decode step"
+        pos0 = pos  # [1] int64
+        slot = pos0 % ratio
+        should_compress = ((pos0 + 1) % ratio) == 0  # [1] bool
+        kv_i = kv[:, 0:1]
+        score_i = score[:, 0:1]
+        apeslot = self.ape[slot].unsqueeze(0)  # [1,1,coff*head_dim]
+        score_i = score_i + apeslot
+        if overlap:
+            kvs = self.kv_state  # [1, 2r, 2d]
+            scs = self.score_state
+            # GPU advanced index write (capture-safe: fixed buffer, value from pos)
+            idx = (ratio + slot).to(torch.long)  # [1]
+            kvs[:, idx] = kv_i.squeeze(1)
+            scs[:, idx] = score_i.squeeze(1)
+            kv_state = torch.cat(
+                [kvs[:bsz, :ratio, : self.head_dim], kvs[:bsz, ratio:, self.head_dim :]], dim=1
+            )
+            score_state = torch.cat(
+                [scs[:bsz, :ratio, : self.head_dim], scs[:bsz, ratio:, self.head_dim :]], dim=1
+            )
+            kv_c = (kv_state * score_state.softmax(dim=1)).sum(dim=1, keepdim=True)
+            # masked state migration (only on compress steps)
+            sc_flat = should_compress.to(torch.float32).reshape(1, 1, 1)
+            kvs[:, :ratio] = kvs[:, :ratio] * (1 - sc_flat) + kvs[:, ratio:] * sc_flat
+            scs[:, :ratio] = scs[:, :ratio] * (1 - sc_flat) + scs[:, ratio:] * sc_flat
+        else:
+            kvs = self.kv_state
+            scs = self.score_state
+            idx = slot.to(torch.long)
+            kvs[:, idx] = kv_i.squeeze(1)
+            scs[:, idx] = score_i.squeeze(1)
+            kv_c = (kvs[:bsz] * scs[:bsz].softmax(dim=1)).sum(dim=1, keepdim=True)
+
+        # finalize (norm + rope + quant), always compute; write masked
+        kv_c = self._finalize_graph(kv_c, pos0, dtype)
+        kv_cache = self.kv_cache  # [1, n_entries, head_dim]
+        slot_c = (pos0 // ratio).to(torch.long)  # [1] entry index (dim 1)
+        sc_mask = should_compress.reshape(1, 1)
+        existing = kv_cache[:bsz].index_select(1, slot_c)  # [1, 1, head_dim]
+        new_entry = kv_c.squeeze(1)  # [1, head_dim]
+        merged = torch.where(
+            sc_mask.reshape(1, 1, 1).expand_as(existing), new_entry.unsqueeze(1), existing
+        )
+        kv_cache[:bsz].index_copy_(1, slot_c, merged)
+        # The pack path always runs (graph has no branch); return the entry
+        # that EQUALS the current kv_cache slot on every step -- the freshly
+        # finalized entry on a compress step, the existing slot otherwise --
+        # so packing it into the FP8 pages always mirrors kv_cache.
+        return torch.where(
+            should_compress.reshape(1, 1).expand_as(new_entry), kv_c.squeeze(1), existing.squeeze(1)
+        ).unsqueeze(1)
+
     def _finalize(
         self, kv: torch.Tensor, position_count: int, dtype: torch.dtype, pos: int
     ) -> torch.Tensor:
@@ -527,6 +606,24 @@ class Dsv4Compressor(nn.Module):
         if self.rotate:
             # indexer path: Hadamard over the full head dim, then fp4 block-32
             # simulation on everything (rope included, post-rotation).
+            kv = hadamard_transform(kv, self.head_dim**-0.5)
+            kv = fp4_act_quant_simulate(kv, 32)
+        else:
+            kv[..., : -self.rope_head_dim] = act_quant_simulate(
+                kv[..., : -self.rope_head_dim], 64, ue8m0=self.ue8m0
+            )
+        return kv
+
+    def _finalize_graph(
+        self, kv: torch.Tensor, pos: torch.Tensor, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Capture-safe ``_finalize`` for a single entry at GPU position ``pos``."""
+        kv = rms_norm(kv.to(dtype), self.norm_weight, self.eps)
+        freqs = self.freqs_cis[pos + 1 - self.ratio].unsqueeze(0)
+        apply_rotary_emb(kv[..., -self.rope_head_dim :], freqs)
+        if not self.quantize:
+            return kv
+        if self.rotate:
             kv = hadamard_transform(kv, self.head_dim**-0.5)
             kv = fp4_act_quant_simulate(kv, 32)
         else:
@@ -726,6 +823,43 @@ class Dsv4Indexer(nn.Module):
             topk_idxs = torch.where(invalid, -1, topk_idxs + offset)
         else:
             topk_idxs = topk_idxs + offset
+        return topk_idxs
+
+    def forward_graph(
+        self, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor
+    ) -> torch.Tensor:
+        """Capture-safe decode top-k index selection at GPU position ``pos``.
+
+        Equivalent to :meth:`forward` for ``start_pos>0, seqlen=1`` but
+        driven by the GPU scalar ``pos``: the compressed-entry count is
+        ``(pos+1)//ratio`` and entries beyond it are masked to -inf before
+        a FIXED-k topk (``index_topk``) so the graph has no Python-size
+        dependence.  Returns [1, seqlen, index_topk] int32 with -1 padding.
+        The caller must have already advanced ``self.compressor`` to ``pos``
+        (via ``forward_graph``) so ``kv_cache`` holds the new entry.
+        """
+        assert self.kv_cache is not None and self.freqs_cis is not None
+        bsz, seqlen, _ = x.shape
+        ratio = self.compressor.ratio
+        freqs = self.freqs_cis[pos]
+        q = self.wq_b(qr)
+        q = q.unflatten(-1, (self.n_heads, self.head_dim))
+        apply_rotary_emb(q[..., -self.rope_head_dim :], freqs)
+        q = hadamard_transform(q, self.head_dim**-0.5)
+        q = fp4_act_quant_simulate(q, 32)
+        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+        n_entries = self.kv_cache.shape[1]
+        index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz])
+        index_score = (index_score.relu() * weights.unsqueeze(-1)).sum(dim=2)
+        # mask entries beyond (pos+1)//ratio (not yet written / not causally
+        # available) to -inf so the fixed-k topk can never select them
+        valid = torch.arange(n_entries, device=pos.device).unsqueeze(0)
+        limit = ((pos + 1) // ratio).reshape(1, 1)  # [1,1]
+        index_score = index_score + torch.where(valid >= limit, float("-inf"), 0.0)
+        k = self.index_topk
+        topk_idxs = index_score.topk(k, dim=-1)[1]
+        invalid = topk_idxs >= limit
+        topk_idxs = torch.where(invalid, -1, topk_idxs).to(torch.int32)
         return topk_idxs
 
 

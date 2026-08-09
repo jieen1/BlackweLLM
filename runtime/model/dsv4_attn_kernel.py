@@ -250,6 +250,12 @@ class Dsv4AttnKernelLayer(nn.Module):
             comp_width = 0
         self._width = self.window + comp_width
         self._init_mla_plan(device)
+        # CUDA-Graph capture buffers: pre-allocated ids slot so the decode
+        # pack path never allocates during capture (torch.arange in the
+        # capture region is graph-pool-allocated and legal, but the
+        # pack_latent_kv bounds check's .item() is a GPU->CPU sync that is
+        # NOT; the capture path writes this fixed slot and skips the check).
+        self._capture_ids = torch.empty(1, dtype=torch.int64, device=device)
 
     def _init_mla_plan(self, device) -> None:
         from b12x.attention.compressed_mla import Caps, plan, split_chunks_for_contract
@@ -282,9 +288,17 @@ class Dsv4AttnKernelLayer(nn.Module):
             return self.csa_pages, C4_PAGE_SIZE
         return self.hca_pages, C128_PAGE_SIZE
 
-    def _pack_window(self, kv_row: torch.Tensor, seqlen: int, start_pos: int) -> None:
+    def _pack_window(
+        self,
+        kv_row: torch.Tensor,
+        seqlen: int,
+        start_pos: int,
+        *,
+        capture: bool = False,
+        pos_tensor: torch.Tensor | None = None,
+    ) -> None:
         win = self.window
-        if start_pos == 0:
+        if start_pos == 0 and not capture:
             # the ring keeps the last win tokens (ring layout, p % win), so
             # decode continuity holds; the full current sequence goes to the
             # prefill page area, which the attention of this step reads
@@ -300,28 +314,100 @@ class Dsv4AttnKernelLayer(nn.Module):
         else:
             # mid-sequence prefill chunk OR single-token decode: ring slots
             # p % win for every token in the chunk (decode is a 1-token chunk)
+            if capture:
+                # Capture-safe decode: fixed 1-token ids slot, no allocation,
+                # no .item() bounds check (capacity is pre-validated).
+                assert pos_tensor is not None
+                self._capture_ids.fill_((pos_tensor % win)[0])
+                pack_latent_kv(
+                    kv_row,
+                    self.window_pages,
+                    self._capture_ids,
+                    page_size=DSV4_PAGE_SIZE,
+                    validate_ids=False,
+                )
+                return
             ids = (
                 torch.arange(start_pos, start_pos + seqlen, device=kv_row.device) % win
             ).to(torch.int64)
             pack_latent_kv(kv_row, self.window_pages, ids, page_size=DSV4_PAGE_SIZE)
 
-    def _pack_compressed(self, entry: torch.Tensor, start_pos: int, seqlen: int) -> None:
+    def _pack_compressed(
+        self,
+        entry: torch.Tensor,
+        start_pos: int,
+        seqlen: int,
+        *,
+        capture: bool = False,
+        pos_tensor: torch.Tensor | None = None,
+    ) -> None:
         pages, page_size = self._comp_pages()
         n = entry.shape[1]
+        if capture:
+            # single emitted entry at compressed slot (pos+1)//ratio - 1 == pos//ratio
+            assert pos_tensor is not None
+            first = (pos_tensor + seqlen) // self.ratio - n  # [1] GPU
+            ids = torch.arange(n, dtype=torch.int64, device=entry.device) + first
+            pack_latent_kv(
+                entry.reshape(n, self.head_dim),
+                pages,
+                ids,
+                page_size=page_size,
+                validate_ids=False,
+            )
+            return
         first = (start_pos + seqlen) // self.ratio - n
         ids = torch.arange(first, first + n, dtype=torch.int64, device=entry.device)
         pack_latent_kv(entry.reshape(n, self.head_dim), pages, ids, page_size=page_size)
 
     def _attn_indices(
-        self, seqlen: int, start_pos: int, qr: torch.Tensor, x: torch.Tensor
+        self,
+        seqlen: int,
+        start_pos: int,
+        qr: torch.Tensor,
+        x: torch.Tensor,
+        *,
+        pos_tensor: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """swa idx/len, compressed idx/len (kernel flat-id spaces).
 
         Mid-sequence prefill chunks (start_pos > 0, seqlen > 1) run through
         the same helpers; the kernel's compressed flat-id space is absolute
         compressed position (offset=0).
+
+        ``pos_tensor``: when given (CUDA-Graph decode), the indices are
+        generated on-device from a GPU scalar position -- no Python int,
+        so the same captured graph can advance position between replays.
         """
         win = self.window
+        if pos_tensor is not None:
+            from runtime.kernels.dsv4_decode_indices import (
+                decode_comp_indices,
+                decode_swa_indices,
+            )
+
+            swa = decode_swa_indices(pos_tensor, win, device=x.device)  # [1, win]
+            swa_len = (swa >= 0).sum(dim=-1)
+            comp: torch.Tensor | None = None
+            comp_len: torch.Tensor | None = None
+            if self.ratio:
+                if self.indexer is not None:
+                    # ratio-4 layer: top-k indexed selection on device
+                    comp = self.indexer.forward_graph(x, qr, pos_tensor)  # [1,1,index_topk]
+                    comp = comp.reshape(seqlen, -1)
+                    comp_len = (comp >= 0).sum(dim=-1)
+                else:
+                    max_comp = self.freqs_cis.shape[0] // self.ratio
+                    comp, comp_len = decode_comp_indices(
+                        pos_tensor, self.ratio, max_comp, device=x.device
+                    )
+                    comp_len = comp_len.reshape(1)
+            return (
+                swa.contiguous(),
+                swa_len.to(torch.int32),
+                comp,
+                comp_len.to(torch.int32) if comp is not None else None,
+            )
         swa = window_topk_idxs(win, 1, seqlen, start_pos, x.device)[0]
         if swa.shape[1] < win:
             # prefill under the window: eager's matrix is [s, min(s, win)];
@@ -362,11 +448,25 @@ class Dsv4AttnKernelLayer(nn.Module):
 
     # -- forward -------------------------------------------------------------
 
-    def forward(self, x: torch.Tensor, start_pos: int) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        *,
+        capture: bool = False,
+        pos_tensor: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         bsz, seqlen, _ = x.shape
         assert bsz == 1, "kernel-path layer is batch-1 until the backend wiring"
         ratio, rd = self.ratio, self.rope_head_dim
-        freqs = self.freqs_cis[start_pos : start_pos + seqlen]
+        if pos_tensor is not None:
+            # CUDA-Graph capture path: position is a GPU scalar, read by
+            # advanced indexing (capture-safe) instead of a Python slice.
+            pos = pos_tensor  # [1] int64 on device
+            freqs = self.freqs_cis[pos]  # [1, rd] -- matches [pos:pos+1]
+            start_pos = int(pos.item()) if not capture else -1
+        else:
+            freqs = self.freqs_cis[start_pos : start_pos + seqlen]
 
         # q path (identical math to the eager layer)
         qr = rms_norm(self.wq_a(x), self.q_norm_weight, self.eps)
@@ -379,13 +479,20 @@ class Dsv4AttnKernelLayer(nn.Module):
         kv = self.kv_norm(self.wkv(x))
         apply_rotary_emb(kv[..., -rd:], freqs)
         kv_row = kv.reshape(seqlen, self.head_dim)
-        self._pack_window(kv_row, seqlen, start_pos)
+        self._pack_window(kv_row, seqlen, start_pos, capture=capture, pos_tensor=pos_tensor)
         if ratio:
-            entry = self.compressor(x, start_pos)
+            if capture:
+                entry = self.compressor.forward_graph(x, pos)
+            else:
+                entry = self.compressor(x, start_pos)
             if entry is not None:
-                self._pack_compressed(entry, start_pos, seqlen)
+                self._pack_compressed(
+                    entry, start_pos, seqlen, capture=capture, pos_tensor=pos_tensor
+                )
 
-        swa_idx, swa_len, comp_idx, comp_len = self._attn_indices(seqlen, start_pos, qr, x)
+        swa_idx, swa_len, comp_idx, comp_len = self._attn_indices(
+            seqlen, start_pos, qr, x, pos_tensor=pos_tensor
+        )
         if comp_idx is not None and comp_idx.shape[1] == 0:
             # no compressed entries exist yet (early prefill / empty slot):
             # a zero-width stream is rejected by the kernel, drop it entirely

@@ -142,6 +142,8 @@ def pack_latent_kv(
     page_buffer: torch.Tensor,
     token_ids: torch.Tensor,
     page_size: int = DSV4_PAGE_SIZE,
+    *,
+    validate_ids: bool = True,
 ) -> None:
     """Quantize+pack bf16 latent rows into the compressed-MLA page layout.
 
@@ -150,6 +152,11 @@ def pack_latent_kv(
     quantization). ``page_buffer`` is [num_pages, page_nbytes] uint8
     (see :func:`page_nbytes`); each ``token_ids[i]`` addresses the flat
     token slot written by row ``i``. In-place; returns None.
+
+    ``validate_ids=False`` skips the ``token_ids.max().item()`` bounds
+    check -- a GPU->CPU sync that is illegal inside CUDA Graph capture.
+    Callers that pre-allocate the ids buffer and know the capacity is
+    satisfied must pass it when capturing.
     """
     if kv.ndim != 2 or kv.shape[-1] != HEAD_DIM:
         raise ValueError(f"kv must have shape [N, {HEAD_DIM}], got {tuple(kv.shape)}")
@@ -167,11 +174,12 @@ def pack_latent_kv(
         raise ValueError(f"page_buffer must be uint8, got {page_buffer.dtype}")
     if n_tokens == 0:
         return
-    max_id = int(token_ids.max().item())
-    if max_id >= page_buffer.shape[0] * page_size:
-        raise ValueError(
-            f"token id {max_id} exceeds page capacity {page_buffer.shape[0] * page_size}"
-        )
+    if validate_ids:
+        max_id = int(token_ids.max().item())
+        if max_id >= page_buffer.shape[0] * page_size:
+            raise ValueError(
+                f"token id {max_id} exceeds page capacity {page_buffer.shape[0] * page_size}"
+            )
     _pack_latent_kv_kernel[(n_tokens,)](
         kv,
         page_buffer,
