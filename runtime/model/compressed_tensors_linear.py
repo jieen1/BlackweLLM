@@ -378,7 +378,7 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
         if self._fp8_channel_packed_weight is not None:
             return
 
-        from sparkinfer.gemm import tensor_fp8_linear
+        from b12x.gemm import tensor_fp8_linear
 
         unit_output_scale = torch.ones(1, dtype=torch.float32, device=self.weight.device)
         self._fp8_channel_packed_weight = tensor_fp8_linear.pack_weight(
@@ -387,7 +387,7 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
         weight_scale = self.weight_scale.data.to(torch.float32)
         self._fp8_channel_kernel_weight_scale = weight_scale.reshape(1, self.output_size)
         try:
-            from sparkinfer.gemm import tensor_fp8_channel_linear
+            from b12x.gemm import tensor_fp8_channel_linear
         except ImportError:
             self._fp8_channel_fused_packed_weight = None
         else:
@@ -427,7 +427,7 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
         x_2d = x.reshape(-1, self.input_size).contiguous()
         x_fp8, activation_scale = quantize_fp8_activation_per_token(x_2d)
         if x_fp8.shape[0] == 1 and self._fp8_channel_fused_packed_weight is not None:
-            from sparkinfer.gemm import tensor_fp8_channel_linear
+            from b12x.gemm import tensor_fp8_channel_linear
 
             output = tensor_fp8_channel_linear.mm(
                 x_fp8,
@@ -437,7 +437,7 @@ class CompressedTensorsFP8ChannelLinear(nn.Module):
                 expected_m=expected_m,
             ).to(x.dtype)
         else:
-            from sparkinfer.gemm import tensor_fp8_linear
+            from b12x.gemm import tensor_fp8_linear
 
             raw_output = tensor_fp8_linear.mm(
                 x_fp8,

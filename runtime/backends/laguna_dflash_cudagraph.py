@@ -115,8 +115,8 @@ class DFlashDraftCudaGraph:
 
     def _init_workspace(self) -> None:
         """Create a fixed-address Sparkinfer verify workspace for draft CG."""
-        from sparkinfer.attention.paged.planner import create_paged_plan
-        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+        from b12x.attention.paged.planner import create_paged_plan
+        from b12x.attention.paged.workspace import PagedAttentionWorkspace
 
         from runtime.backends.dflash_constants import (
             DRAFT_HEAD_DIM,

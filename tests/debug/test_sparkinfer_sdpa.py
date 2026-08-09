@@ -83,10 +83,10 @@ print(f"  K relative error: {k_err.item():.6f}")
 print(f"  V relative error: {v_err.item():.6f}")
 
 # Run sparkinfer attention
-from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
-from sparkinfer.attention.paged.planner import create_paged_plan
-from sparkinfer.attention.paged._forward import paged_attention_forward
-from sparkinfer.attention.paged._scratch import build_paged_attention_binding
+from b12x.attention.paged.workspace import PagedAttentionWorkspace
+from b12x.attention.paged.planner import create_paged_plan
+from b12x.attention.paged._forward import paged_attention_forward
+from b12x.attention.paged._scratch import build_paged_attention_binding
 
 # Metadata
 page_table = torch.tensor([[0]], dtype=torch.int32, device=device)  # page 0

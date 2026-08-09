@@ -15,7 +15,7 @@ from runtime.backends._sparkinfer_import import ensure_sparkinfer_path  # noqa: 
 
 ensure_sparkinfer_path()
 
-from sparkinfer._lib.intrinsics import (  # noqa: E402
+from b12x._lib.intrinsics import (  # noqa: E402
     as_grouped_scale_view,
     quantize_grouped_nvfp4_torch,
     swizzle_block_scale,

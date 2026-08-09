@@ -231,12 +231,12 @@ class TestExplicitKernelPreflightRouting:
             calls.append(("fallback", ()))
             raise AssertionError("M=1 should not hit the fallback path")
 
-        sparkinfer_mod = types.ModuleType("sparkinfer")
-        gemm_mod = types.ModuleType("sparkinfer.gemm")
+        sparkinfer_mod = types.ModuleType("b12x")
+        gemm_mod = types.ModuleType("b12x.gemm")
         gemm_mod.tensor_fp8_channel_linear = types.SimpleNamespace(mm=fake_fused_mm)
         gemm_mod.tensor_fp8_linear = types.SimpleNamespace(mm=fake_linear_mm)
-        monkeypatch.setitem(sys.modules, "sparkinfer", sparkinfer_mod)
-        monkeypatch.setitem(sys.modules, "sparkinfer.gemm", gemm_mod)
+        monkeypatch.setitem(sys.modules, "b12x", sparkinfer_mod)
+        monkeypatch.setitem(sys.modules, "b12x.gemm", gemm_mod)
 
         x = _activation(m=1, in_features=32)
         actual = lin.forward_fp8_channel_kernel(x, expected_m=1)
@@ -262,12 +262,12 @@ class TestExplicitKernelPreflightRouting:
             calls.append(("fallback", tuple(x_fp8.shape)))
             return torch.ones((x_fp8.shape[0], 4), dtype=torch.bfloat16)
 
-        sparkinfer_mod = types.ModuleType("sparkinfer")
-        gemm_mod = types.ModuleType("sparkinfer.gemm")
+        sparkinfer_mod = types.ModuleType("b12x")
+        gemm_mod = types.ModuleType("b12x.gemm")
         gemm_mod.tensor_fp8_channel_linear = types.SimpleNamespace(mm=fake_fused_mm)
         gemm_mod.tensor_fp8_linear = types.SimpleNamespace(mm=fake_linear_mm)
-        monkeypatch.setitem(sys.modules, "sparkinfer", sparkinfer_mod)
-        monkeypatch.setitem(sys.modules, "sparkinfer.gemm", gemm_mod)
+        monkeypatch.setitem(sys.modules, "b12x", sparkinfer_mod)
+        monkeypatch.setitem(sys.modules, "b12x.gemm", gemm_mod)
 
         x = _activation(m=2, in_features=32)
         _, activation_scale = quantize_fp8_activation_per_token(x)

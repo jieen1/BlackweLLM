@@ -253,7 +253,7 @@ class SparkinferPrefillWorkspace:
         # Lazy, like every other sparkinfer import in this module: importing
         # sparkinfer at module scope would make this file unimportable in the
         # sparkinfer-free environments some tests run in.
-        from sparkinfer.attention.paged.planner import PagedPlanBudget
+        from b12x.attention.paged.planner import PagedPlanBudget
 
         self.device = device
         self._descale = torch.ones(1, dtype=torch.float32, device=device)
@@ -410,7 +410,7 @@ class SparkinferPrefillWorkspace:
         so sizing at the max bound is a genuine upper bound, not another
         guess.
         """
-        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+        from b12x.attention.paged.workspace import PagedAttentionWorkspace
 
         if mode in ("extend", "decode"):
             max_work_items = PagedAttentionWorkspace.eager_extend_work_items_capacity(
@@ -434,7 +434,7 @@ class SparkinferPrefillWorkspace:
                     "repeat the exact under-provisioning bug this check exists "
                     "to prevent (see notes/2026-08-01-c1-c2-gpu-investigation.md)."
                 )
-            from sparkinfer.attention.paged.planner import create_paged_plan
+            from b12x.attention.paged.planner import create_paged_plan
 
             num_cache_pages = int(k_cache.shape[0])
             page_size = int(k_cache.shape[1])
@@ -485,10 +485,10 @@ class SparkinferPrefillWorkspace:
         plan_cache_key: object | None = None,
     ) -> None:
         """Run extend/verify-mode attention (prefill or speculative verify)."""
-        from sparkinfer.attention.paged._forward import paged_attention_forward
-        from sparkinfer.attention.paged._scratch import build_paged_attention_binding
-        from sparkinfer.attention.paged.planner import create_paged_plan
-        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+        from b12x.attention.paged._forward import paged_attention_forward
+        from b12x.attention.paged._scratch import build_paged_attention_binding
+        from b12x.attention.paged.planner import create_paged_plan
+        from b12x.attention.paged.workspace import PagedAttentionWorkspace
 
         if k_descale is None:
             k_descale = self._descale
@@ -627,7 +627,7 @@ class SparkinferDecodeWorkspace:
         device: str = "cuda",
         page_size: int = PAGE_SIZE,
     ):
-        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+        from b12x.attention.paged.workspace import PagedAttentionWorkspace
 
         self.num_q_heads = num_q_heads
         self.num_kv_heads = num_kv_heads
@@ -711,8 +711,8 @@ class SparkinferDecodeWorkspace:
 
     def forward(self) -> torch.Tensor:
         """Run attention (captured in CUDA graph)."""
-        from sparkinfer.attention.paged._forward import paged_attention_forward
-        from sparkinfer.attention.paged._scratch import build_paged_attention_binding
+        from b12x.attention.paged._forward import paged_attention_forward
+        from b12x.attention.paged._scratch import build_paged_attention_binding
 
         binding = build_paged_attention_binding(
             scratch=self._workspace,

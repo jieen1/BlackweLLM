@@ -252,7 +252,7 @@ class Dsv4AttnKernelLayer(nn.Module):
         self._init_mla_plan(device)
 
     def _init_mla_plan(self, device) -> None:
-        from sparkinfer.attention.compressed_mla import Caps, plan, split_chunks_for_contract
+        from b12x.attention.compressed_mla import Caps, plan, split_chunks_for_contract
 
         width = self._width
         chunks = split_chunks_for_contract(rows=self.max_q_rows, width=width)
@@ -391,7 +391,7 @@ class Dsv4AttnKernelLayer(nn.Module):
             # a zero-width stream is rejected by the kernel, drop it entirely
             comp_idx, comp_len = None, None
 
-        from sparkinfer.attention.compressed_mla import run
+        from b12x.attention.compressed_mla import run
 
         binding = self._mla_plan.bind(
             scratch=self._mla_scratch,

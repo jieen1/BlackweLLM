@@ -36,15 +36,15 @@ def _clean_sparkinfer_state(monkeypatch: pytest.MonkeyPatch):
     of these tests (that's the whole point: these test the *resolver*,
     not sparkinfer itself)."""
     monkeypatch.delenv("BF_SPARKINFER_PATH", raising=False)
-    monkeypatch.delitem(sys.modules, "sparkinfer", raising=False)
+    monkeypatch.delitem(sys.modules, "b12x", raising=False)
     original_path = list(sys.path)
     yield
     sys.path[:] = original_path
 
 
 def _fake_module_at(root: Path) -> types.ModuleType:
-    fake = types.ModuleType("sparkinfer")
-    fake.__file__ = str(root / "sparkinfer" / "__init__.py")
+    fake = types.ModuleType("b12x")
+    fake.__file__ = str(root / "b12x" / "__init__.py")
     return fake
 
 
@@ -61,7 +61,7 @@ def test_ensure_sparkinfer_path_inserts_requested_path_when_not_yet_imported(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("BF_SPARKINFER_PATH", "/some/other/checkout")
-    assert "sparkinfer" not in sys.modules
+    assert "b12x" not in sys.modules
 
     result = sut.ensure_sparkinfer_path()
 
@@ -87,7 +87,7 @@ def test_ensure_sparkinfer_path_noop_when_already_loaded_from_the_requested_root
     from precisely the checkout that was requested anyway -- this must be a
     silent, error-free no-op."""
     monkeypatch.setenv("BF_SPARKINFER_PATH", "/requested/checkout")
-    sys.modules["sparkinfer"] = _fake_module_at(Path("/requested/checkout"))
+    sys.modules["b12x"] = _fake_module_at(Path("/requested/checkout"))
 
     result = sut.ensure_sparkinfer_path()
 
@@ -102,7 +102,7 @@ def test_ensure_sparkinfer_path_raises_when_already_loaded_from_elsewhere(
     requested override can no longer take effect. This must fail loudly,
     not silently keep serving the wrong checkout."""
     monkeypatch.setenv("BF_SPARKINFER_PATH", "/requested/checkout")
-    sys.modules["sparkinfer"] = _fake_module_at(Path("/some/uncontrolled/checkout"))
+    sys.modules["b12x"] = _fake_module_at(Path("/some/uncontrolled/checkout"))
 
     with pytest.raises(RuntimeError, match="ALREADY imported"):
         sut.ensure_sparkinfer_path()

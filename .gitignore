@@ -76,3 +76,7 @@ benchmarks/fixtures/vllm_profile/
 
 # Date-stamped acceptance snapshots point to the authoritative bfdiag record.
 benchmarks/fixtures/acceptance_regression_*.json
+
+# local agent tooling config (intentional, gitignored)
+.opencode/
+opencode.json

@@ -424,7 +424,7 @@ def probe_sparkinfer(*, gpu: GpuProbe | None = None) -> SparkInferProbe:
     it degrades to `gate_accepts_production_shape=None` rather than raising.
     """
     try:
-        import sparkinfer
+        import b12x as sparkinfer
     except Exception as exc:
         return SparkInferProbe(
             importable=False,
@@ -440,13 +440,13 @@ def probe_sparkinfer(*, gpu: GpuProbe | None = None) -> SparkInferProbe:
         try:
             from importlib import metadata
 
-            version = metadata.version("sparkinfer")
+            version = metadata.version("b12x")
         except Exception:
             version = None
     module_path = getattr(sparkinfer, "__file__", None)
 
     try:
-        from sparkinfer.attention.paged import planner as _planner
+        from b12x.attention.paged import planner as _planner
     except Exception as exc:
         return SparkInferProbe(
             importable=True,

@@ -836,7 +836,7 @@ class LagunaBackend:
         from runtime.backends._sparkinfer_import import ensure_sparkinfer_path
 
         ensure_sparkinfer_path()
-        from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
+        from b12x.moe.fused_moe._impl import allocate_tp_moe_workspace_pool
 
         from runtime.backends.laguna_sparkinfer_moe import (
             SparkinferMoELayer,

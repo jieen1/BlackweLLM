@@ -105,19 +105,19 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-from sparkinfer.attention.gated_delta_rule import (
+from b12x.attention.gated_delta_rule import (
     fused_recurrent_gated_delta_rule_multistep,
     fused_recurrent_gated_delta_rule_multistep_indexed,
 )
-from sparkinfer.attention.paged._forward import paged_attention_forward
-from sparkinfer.attention.paged._scratch import build_paged_attention_binding
-from sparkinfer.attention.paged.planner import (
+from b12x.attention.paged._forward import paged_attention_forward
+from b12x.attention.paged._scratch import build_paged_attention_binding
+from b12x.attention.paged.planner import (
     PagedPlanBudget,
     create_paged_plan,
     plan_decode_graph_capacity,
 )
-from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+from b12x.attention.paged.workspace import PagedAttentionWorkspace
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 from torch import nn
 
 from runtime.kernels.rope import apply_rotary_embedding_inplace, compute_cos_sin_cache_default
@@ -3075,8 +3075,8 @@ class Qwen36MLP(nn.Module):
         from runtime.backends._sparkinfer_import import ensure_sparkinfer_path
 
         ensure_sparkinfer_path()
-        from sparkinfer._lib.intrinsics import swizzle_block_scale
-        from sparkinfer.moe._shared.kernels.w4a16.prepare import (
+        from b12x._lib.intrinsics import swizzle_block_scale
+        from b12x.moe._shared.kernels.w4a16.prepare import (
             prepare_w4a16_modelopt_nvfp4_weights,
         )
 
@@ -3217,7 +3217,7 @@ class Qwen36MLP(nn.Module):
         from runtime.backends._sparkinfer_import import ensure_sparkinfer_path
 
         ensure_sparkinfer_path()
-        from sparkinfer._lib.intrinsics import (
+        from b12x._lib.intrinsics import (
             as_grouped_scale_view,
             swizzle_block_scale,
         )
@@ -3263,11 +3263,11 @@ class Qwen36MLP(nn.Module):
         ``forward``'s dispatch. Activation quantization is the bit-exact
         Triton kernel (``runtime/kernels/nvfp4_quant.py``, gated by
         ``tests/test_nvfp4_quant_triton.py``), NOT the pure-Torch oracle."""
-        from sparkinfer._lib.intrinsics import (
+        from b12x._lib.intrinsics import (
             as_grouped_scale_view,
             swizzle_block_scale,
         )
-        from sparkinfer.gemm import blockscaled
+        from b12x.gemm import blockscaled
 
         from runtime.kernels.nvfp4_quant import quantize_nvfp4_activation
 
@@ -3313,8 +3313,8 @@ class Qwen36MLP(nn.Module):
 
     def _forward_w4a16_fused(self, x: torch.Tensor) -> torch.Tensor:
         self._ensure_w4a16_fused_ready()
-        from sparkinfer.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
-        from sparkinfer.moe._shared.kernels.w4a16.prepare import make_w4a16_packed_buffers
+        from b12x.moe._shared.kernels.w4a16.kernel import run_w4a16_moe
+        from b12x.moe._shared.kernels.w4a16.prepare import make_w4a16_packed_buffers
 
         if x.dtype != torch.bfloat16:
             raise TypeError(

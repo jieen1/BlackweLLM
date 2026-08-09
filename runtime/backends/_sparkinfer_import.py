@@ -5,9 +5,9 @@ notes/2026-08-01-sparkinfer-patch-recovery-and-repro.md §7.2 and
 docs/diagnostics-guide.md): ``BF_SPARKINFER_PATH`` was only honored by
 ``laguna_sparkinfer_attn.py`` and ``laguna_sparkinfer_moe.py``, each doing
 its own ``sys.path.insert(0, os.environ.get("BF_SPARKINFER_PATH", ...))``
-immediately before its own ``from sparkinfer... import``. But
+immediately before its own ``from b12x... import``. But
 ``laguna.py``'s ``_patch_moe_sparkinfer`` did its OWN direct
-``from sparkinfer.moe.fused_moe._impl import allocate_tp_moe_workspace_pool``
+``from b12x.moe.fused_moe._impl import allocate_tp_moe_workspace_pool``
 *before* importing anything from ``laguna_sparkinfer_moe`` -- and (confirmed
 with an ``__import__`` traceback hook) that direct import is the actual
 first touch of the top-level ``sparkinfer`` name in the real
@@ -20,7 +20,7 @@ startup path, no error, no warning.
 
 Fix: every Laguna call site that is about to touch ``sparkinfer`` for the
 first time calls :func:`ensure_sparkinfer_path` here FIRST, before its own
-``from sparkinfer...`` import. This module has no other responsibility, so
+``from b12x...`` import. This module has no other responsibility, so
 import order across call sites stops mattering -- whichever one runs first
 resolves the path for everyone; a second call is a cheap no-op check.
 
@@ -50,7 +50,7 @@ def ensure_sparkinfer_path() -> str:
     """Make the *next* ``import sparkinfer`` (from anywhere in the process)
     resolve under :func:`requested_sparkinfer_path`.
 
-    Call this before your module's own first ``from sparkinfer...`` or
+    Call this before your module's own first ``from b12x...`` or
     ``import sparkinfer`` statement -- not after. Safe to call more than
     once (idempotent) and safe to call from multiple modules in any order,
     as long as each one calls it before its *own* first sparkinfer import.
@@ -61,7 +61,7 @@ def ensure_sparkinfer_path() -> str:
     wrong checkout.
     """
     requested = requested_sparkinfer_path()
-    already = sys.modules.get("sparkinfer")
+    already = sys.modules.get("b12x")
     if already is not None:
         loaded_file = getattr(already, "__file__", None)
         loaded_root = (
@@ -69,11 +69,11 @@ def ensure_sparkinfer_path() -> str:
         )
         if loaded_root != requested:
             raise RuntimeError(
-                f"ensure_sparkinfer_path(): sparkinfer is ALREADY imported from "
+                f"ensure_sparkinfer_path(): b12x is ALREADY imported from "
                 f"{loaded_root!r}, but {requested!r} was requested (via "
                 "BF_SPARKINFER_PATH or the default). It is too late to "
                 "redirect it -- sys.path changes cannot retroactively affect "
-                "an already-imported module. Something imported `sparkinfer` "
+                "an already-imported module. Something imported `b12x` "
                 "without going through ensure_sparkinfer_path() first; see "
                 "this module's docstring."
             )

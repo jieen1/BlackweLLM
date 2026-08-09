@@ -661,8 +661,8 @@ class LagunaCudaGraphVerify:
 
     def _init_workspaces(self) -> None:
         """Create sparkinfer extend workspaces per layer group (CG mode)."""
-        from sparkinfer.attention.paged.planner import create_paged_plan
-        from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace
+        from b12x.attention.paged.planner import create_paged_plan
+        from b12x.attention.paged.workspace import PagedAttentionWorkspace
 
         backend = self.backend
         nt = self.num_tokens
@@ -1087,7 +1087,7 @@ class _SparkinferCGExtendImpl:
             out.data_ptr(),
         )
         if self._binding is None or binding_signature != self._binding_signature:
-            from sparkinfer.attention.paged._scratch import build_paged_attention_binding
+            from b12x.attention.paged._scratch import build_paged_attention_binding
 
             self._binding = build_paged_attention_binding(
                 scratch=self._ws,
@@ -1100,7 +1100,7 @@ class _SparkinferCGExtendImpl:
             )
             self._binding_signature = binding_signature
 
-        from sparkinfer.attention.paged._forward import paged_attention_forward
+        from b12x.attention.paged._forward import paged_attention_forward
 
         paged_attention_forward(binding=self._binding)
         return output

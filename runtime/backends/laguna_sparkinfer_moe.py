@@ -57,13 +57,13 @@ os.environ.setdefault("SPARKINFER_ENABLE_DYNAMIC_DOWN_SCALE", "1")
 ensure_sparkinfer_path()
 
 try:
-    from sparkinfer._lib.intrinsics import swizzle_block_scale
-    from sparkinfer.moe.fused_moe._impl import (
+    from b12x._lib.intrinsics import swizzle_block_scale
+    from b12x.moe.fused_moe._impl import (
         allocate_tp_moe_workspace_pool,
+        b12x_moe_fp4,
         build_tp_moe_fp4_binding,
-        plan_sparkinfer_fp4_moe_weights,
-        prepare_sparkinfer_fp4_moe_weights,
-        sparkinfer_moe_fp4,
+        plan_b12x_fp4_moe_weights,
+        prepare_b12x_fp4_moe_weights,
     )
 except ImportError as exc:
     raise ImportError(
@@ -79,9 +79,9 @@ sys.path[:] = [p for p in sys.path if "nvidia_cutlass_dsl/dsl_packages/cutlass/b
 def sparkinfer_version() -> str:
     """Return sparkinfer git commit sha for version stamping."""
     try:
-        import sparkinfer
+        import b12x
 
-        pkg_dir = pathlib.Path(sparkinfer.__file__).parent
+        pkg_dir = pathlib.Path(b12x.__file__).parent
         git_dir = pkg_dir.parent / ".git"
         if git_dir.exists():
             result = subprocess.run(
@@ -280,7 +280,7 @@ def prepare_sparkinfer_layer(
     else:
         a2_gscale_t = a2_gscale
 
-    wplan = plan_sparkinfer_fp4_moe_weights(
+    wplan = plan_b12x_fp4_moe_weights(
         quant_modes="nvfp4",
         source_format="modelopt_nvfp4",
         activation="silu",
@@ -290,7 +290,7 @@ def prepare_sparkinfer_layer(
         intermediate_size=INTERMEDIATE_SIZE,
         w13_layout="w13",
     )
-    return prepare_sparkinfer_fp4_moe_weights(
+    return prepare_b12x_fp4_moe_weights(
         plan=wplan,
         w1_global_scale=w1_alpha,
         w2_global_scale=w2_alpha,
@@ -374,7 +374,7 @@ class SparkinferMoELayer:
             input_scales_static=True,
             output=out,
         )
-        return sparkinfer_moe_fp4(binding=binding)
+        return b12x_moe_fp4(binding=binding)
 
 
 class SparkinferMoEModel:
