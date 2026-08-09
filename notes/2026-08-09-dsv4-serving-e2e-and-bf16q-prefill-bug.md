@@ -42,12 +42,21 @@ reasoning/content 分流正确：模型把答案放在未闭合 `<think>` 块内
 （bf16-PV XV）对 indexed 候选流的 prefill（多行）处理错误；单 token decode
 正常（此前 CG 探针 0.999996 验证过）。
 
-**影响**：服务用**缺省内核**（bf16_q=0）已正确（上述端到端 ✅）；bf16-q
-数值改进模式对 serving 不可用，直到 fork 修好 indexed+prefill 路径。
+**根因已隔离（2026-08-09 复测）**：`SPARKINFER_MLA_SM120_NUM_SPLITS=1` 强制
+单 split 后 bf16-q 的 14 行 prefill+indexed **cos=1.0（完美）**；auto splits
+（>1）时 cos=0.19。同形状 fp8 路径 splits=auto 和 =1 均 cos=1.0。即
+**bf16-q 变体在 num_splits>1（split-K 多 CTA 部分归约）下产生错误的
+partial O/LSE**，而 fp8 路径正确。单 split 时（小行数或强制）bf16-q 正确。
+疑点：`s6_xv_nope_dsv4_bf16` 自建 sm_p_full 的 barrier 与 fp8 路径的
+double-buffer/split 调度在 num_splits>1 时可能冲突；`s1_qk_nope_dsv4_bf16`
+的 global Q 读本身正确（fp8 对照佐证 split 机制本身没问题）。
 
-**待修方向**：检查 bf16-q 变体对 `has_extra`（indexed）流的多行 dispatch——
-QK 的 q 逐 lane 从 global 读、XV 的 B 操作数寄存器反量化，indexed 候选的
-scale/footer 寻址在 prefill（每行长度不同）下可能越界或错位。
+**影响**：服务用**缺省内核**（bf16_q=0）已正确（上述端到端 ✅）；bf16-q
+数值改进模式对 serving 不可用，直到 fork 修好 split-K>1 路径。
+
+**待修方向**：修 fork 的 bf16-q QK/XV 在 split-K>1 下的 partial 归约
+（先复现最小 split=2 用例，再查 s6 自建 sm_p_full 与 fp8 barrier/缓冲
+切换的冲突）。
 
 ## 4. 遗留
 
