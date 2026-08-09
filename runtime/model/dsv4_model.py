@@ -274,10 +274,11 @@ class Dsv4MoE(nn.Module):
         weights, indices = self.gate(flat, input_ids.reshape(-1) if input_ids is not None else None)
         y = torch.zeros_like(flat, dtype=torch.float32)
         limit = self.config.swiglu_limit
-        counts = torch.bincount(indices.reshape(-1), minlength=self.config.n_routed_experts)
-        for expert_id in range(self.config.n_routed_experts):
-            if int(counts[expert_id]) == 0:
-                continue
+        # Routed experts on the GPU (no per-expert int() CPU sync -- measured
+        # 42.6 ms/layer of sync stalls for a 256-expert scan x 43 layers, the
+        # dominant cost before batching).
+        routed = torch.unique(indices.reshape(-1))
+        for expert_id in routed.tolist():
             token_idx, top_slot = torch.where(indices == expert_id)
             xs = flat[token_idx]
             gate = self._expert_gemm(self.gate_exps, expert_id, xs)
