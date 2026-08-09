@@ -63,3 +63,25 @@ double-buffer/split 调度在 num_splits>1 时可能冲突；`s1_qk_nope_dsv4_bf
 - bf16-q prefill+indexed 修复（fork，待排期）
 - 与 llama.cpp 端到端贪心对齐（质量基线）
 - 性能优化：IQ2_XS/Q8_0 的 kernel 内 dequant（原生计算，不做 BF16 反量化常驻）
+
+## 5. 精确触发矩阵（fork 复测，2026-08-09）
+
+bf16-q + prefill(多行) + indexed 流，cos vs 参考：
+
+| width | chunks (main+extra) | num_splits | cos |
+|---|---|---|---|
+| 68  | 1+1=2 | 2, 3 | **1.0** ✅ |
+| 128 | 2+0=2 | 2, 3 | **1.0** ✅ |
+| 132 | 2+1=3 | 2 | **1.0** ✅ |
+| 132 | 2+1=3 | 3, 4 | **0.0** 🔴 |
+| 196 | 3+1=4 | 4 | **0.0** 🔴 |
+
+**触发条件**：`extra 流存在 AND num_splits > num_main_chunks`。
+真实 ratio-4 层（window 128 = 2 main chunks + indexed ≤512）auto num_splits
+≥3 即触发 → 全模型 layer 2 NaN 的机制。
+
+**修复方向**（fork）：bf16-q 模式下 QK/XV 对"extra chunk 落在 num_splits>
+num_main_chunks 的 split"处理错误（partial O/LSE 归约）。两个候选：
+(a) 修 QK/XV 的 split-vs-extra 交互（深）；
+(b) bf16-q 激活且 has_extra 时把 auto num_splits 钳到 num_main_chunks
+（浅，避免触发配置，保留 bf16-q 收益）。先做 (b) 验证 cos 恢复，再决定 (a)。
