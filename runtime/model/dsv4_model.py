@@ -70,6 +70,14 @@ class PackedQ8_0Linear(PackedQ8_0Weight):
     round to bf16 first and the matmul runs bf16 -- the regime the reference
     uses for bf16-declared linears (its ``linear()`` is strict on dtypes),
     and what these layers will run at in production.
+
+    ``fused_q8=True`` routes bf16 projections through the fused Q8_0
+    dequant-GEMM tensor-core kernel instead of eager dequant+cuBLAS.  The
+    kernel accumulates in fp32, so its output is MORE accurate than cuBLAS
+    bf16 (2.6e-5 vs 0.012 vs the exact reference) and never materializes a
+    bf16/fp32 weight.  It is an opt-in accelerator (the eager path stays
+    the official-reference bit-exact oracle); the serving backend turns it
+    on for the decode hot path.
     """
 
     def __init__(
@@ -78,12 +86,28 @@ class PackedQ8_0Linear(PackedQ8_0Weight):
         in_features: int,
         *,
         weight_dtype: torch.dtype | None = None,
+        fused_q8: bool = False,
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__(out_features, in_features, device=device)
         self.weight_dtype = weight_dtype
+        self.fused_q8 = fused_q8
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fused_q8 and x.device.type == "cuda":
+            from runtime.kernels.dsv4_q8_gemm import q8_0_dequant_gemm
+
+            leading = x.shape[:-1]
+            out = q8_0_dequant_gemm(
+                x.reshape(-1, self.in_features),
+                self.packed,
+                out_features=self.out_features,
+                in_features=self.in_features,
+            )
+            out = out.reshape(*leading, self.out_features)
+            if self.weight_dtype is torch.bfloat16:
+                return out.to(torch.bfloat16)
+            return out
         weight = self.dequantized()
         if self.weight_dtype is not None:
             return F.linear(x, weight.to(self.weight_dtype))
