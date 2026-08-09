@@ -421,6 +421,23 @@ class Dsv4AttnKernelLayer(nn.Module):
         # output path (identical to the eager layer)
         apply_rotary_emb(o[..., -rd:], freqs, inverse=True)
         o = o.view(bsz, seqlen, self.n_groups, -1)
-        wo_a = self.wo_a.dequantized().to(x.dtype).view(self.n_groups, self.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        if self.wo_a.fused_q8:
+            from runtime.kernels.dsv4_q8_gemm import q8_0_grouped_dequant_gemm
+
+            # Group-major rows: [G, bs*seq, d] flattened to [G*bs*seq, d],
+            # the wo_a einsum contraction per group, no dequant material.
+            d_k = o.shape[-1]
+            x2 = o.permute(2, 0, 1, 3).reshape(self.n_groups * bsz * seqlen, d_k)
+            res = q8_0_grouped_dequant_gemm(
+                x2,
+                self.wo_a.packed,
+                num_groups=self.n_groups,
+                group_size=self.o_lora_rank,
+                in_features=d_k,
+                rows_per_group=bsz * seqlen,
+            )
+            o = res.reshape(self.n_groups, bsz, seqlen, self.o_lora_rank).permute(1, 2, 0, 3)
+        else:
+            wo_a = self.wo_a.dequantized().to(x.dtype).view(self.n_groups, self.o_lora_rank, -1)
+            o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         return self.wo_b(o.flatten(2))

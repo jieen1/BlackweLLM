@@ -120,3 +120,122 @@ def q8_0_dequant_gemm(
         BLK_BYTES=34,
     )
     return out
+
+
+@triton.jit
+def _q8_0_grouped_dequant_gemm_tc_kernel(
+    x_ptr,  # [G * ROWS_PER_G, K] bf16 activations, group-contiguous
+    w_ptr,  # [G * R, in] Q8_0 packed, w_row_stride bytes/row
+    out_ptr,  # [G * ROWS_PER_G, R] fp32
+    NUM_GROUPS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,  # R output rows per group
+    ROWS_PER_G: tl.constexpr,  # activation rows per group (1 for decode)
+    K: tl.constexpr,
+    W_ROW_STRIDE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLK_ELEMS: tl.constexpr,
+    BLK_BYTES: tl.constexpr,
+):
+    """Grouped ``x[m, :] @ W[group(m), r, :]^T``.
+
+    x rows are group-contiguous (``ROWS_PER_G`` rows of group 0, then
+    group 1, ...).  A program covers ``BLOCK_M`` rows of ONE group, so the
+    group index -- and therefore the weight-row base -- is a scalar, and a
+    plain 2D ``tl.dot`` works.  Grid x = groups x row-blocks-per-group,
+    grid y = output-column blocks.
+    """
+    pid_g = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_g * ROWS_PER_G + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < (pid_g + 1) * ROWS_PER_G
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    w_base = pid_g * GROUP_SIZE  # scalar: this program's whole group
+
+    for k in range(0, K, BLK_ELEMS):
+        kb = k // BLK_ELEMS
+        a_u16 = (x_ptr + offs_m[:, None] * K + k + tl.arange(0, BLK_ELEMS)[None, :]).to(
+            tl.pointer_type(tl.uint16)
+        )
+        a_tile = (tl.load(a_u16, mask=m_mask[:, None], other=0).to(tl.uint32) << 16).to(
+            tl.float32, bitcast=True
+        )
+        w_rows = w_base + offs_n  # [BLOCK_N] scalar base + vector
+        q_ptrs = (
+            w_ptr
+            + w_rows[:, None] * W_ROW_STRIDE
+            + kb * BLK_BYTES
+            + 2
+            + tl.arange(0, BLK_ELEMS)[None, :]
+        )
+        qs = tl.load(q_ptrs).to(tl.int8, bitcast=True).to(tl.float32)
+        d_lo = tl.load(w_ptr + w_rows * W_ROW_STRIDE + kb * BLK_BYTES).to(tl.uint32)
+        d_hi = tl.load(w_ptr + w_rows * W_ROW_STRIDE + kb * BLK_BYTES + 1).to(tl.uint32)
+        d_u16 = d_lo.to(tl.uint16) | (d_hi.to(tl.uint16) << 8)
+        d_f = d_u16.to(tl.float16, bitcast=True).to(tl.float32)  # [BLOCK_N]
+        w_tile = (qs * d_f[:, None]).to(tl.bfloat16)  # [BLOCK_N, 32]
+        w_t = tl.trans(w_tile)  # [32, BLOCK_N]
+        acc = tl.dot(a_tile.to(tl.bfloat16), w_t, acc)
+
+    out_ptrs = out_ptr + offs_m[:, None] * GROUP_SIZE + offs_n[None, :]
+    tl.store(out_ptrs, acc.to(tl.float32), mask=m_mask[:, None])
+
+
+def q8_0_grouped_dequant_gemm(
+    x: torch.Tensor,
+    packed: torch.Tensor,
+    *,
+    num_groups: int,
+    group_size: int,
+    in_features: int,
+    rows_per_group: int = 1,
+    BLOCK_M: int = 16,
+    BLOCK_N: int = 64,
+) -> torch.Tensor:
+    """Grouped ``x[m, :] @ W[group(m), r, :]^T`` with W = Q8_0 packed.
+
+    ``x`` is [num_groups * rows_per_group, K], group-contiguous (the
+    MLA wo_a contraction ``o[bs, seq, g, d] @ wo_a[g, r, d]`` flattened).
+    W is packed [num_groups * group_size, in].  Returns [M, group_size]
+    fp32 -- the dequantized weight is never materialized.
+
+    Triton has no 3D batched tl.dot, so each group is handled by a 2D
+    program with a scalar weight-row base; groups fill grid.x.
+    """
+    M = x.shape[0]
+    assert M == num_groups * rows_per_group, (M, num_groups, rows_per_group)
+    x = x.to(torch.bfloat16).contiguous()
+    out = torch.empty((M, group_size), dtype=torch.float32, device=x.device)
+    if in_features % 32:
+        raise ValueError(f"in_features {in_features} is not a multiple of 32")
+    w_row_stride = (in_features // 32) * 34
+    assert (num_groups * group_size * w_row_stride) == packed.numel(), (
+        f"packed {packed.numel()} != groups {num_groups} x {group_size} x stride {w_row_stride}"
+    )
+    # A program covers only rows of ONE group (the weight-row base is a
+    # scalar per program), so BLOCK_M must not exceed rows_per_group.
+    if rows_per_group < BLOCK_M:
+        BLOCK_M = rows_per_group
+    grid = (
+        num_groups,
+        triton.cdiv(group_size, BLOCK_N),
+    )
+    _q8_0_grouped_dequant_gemm_tc_kernel[grid](
+        x,
+        packed,
+        out,
+        NUM_GROUPS=num_groups,
+        GROUP_SIZE=group_size,
+        ROWS_PER_G=rows_per_group,
+        K=in_features,
+        W_ROW_STRIDE=w_row_stride,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLK_ELEMS=32,
+        BLK_BYTES=34,
+    )
+    return out

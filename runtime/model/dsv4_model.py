@@ -44,6 +44,7 @@ class PackedQ8_0Weight(nn.Module):
         super().__init__()
         self.out_features = out_features
         self.in_features = in_features
+        self.fused_q8 = False
         numel = out_features * in_features
         n_bytes = numel // 32 * 34
         self.register_buffer("packed", torch.empty(n_bytes, dtype=torch.uint8, device=device))
@@ -1033,9 +1034,28 @@ class Dsv4Block(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # x: [b,s,hc,d] -> reduced [b,s,d] plus the post/comb weights.
         shape, dtype = x.shape, x.dtype
-        xf = x.flatten(2).float()
-        rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
-        mixes = F.linear(xf, hc_fn.dequantized()) * rsqrt
+        bsz, seq, hc, d = shape
+        if x.is_cuda and x.dtype == torch.bfloat16:
+            from runtime.kernels.dsv4_mhc import hc_fused_pre
+
+            y, post, comb = hc_fused_pre(
+                x.reshape(bsz * seq, hc, d),
+                hc_fn.packed,
+                hc_scale,
+                hc_base,
+                hc_mult=self.hc_mult,
+                sinkhorn_iters=self.hc_iters,
+                eps=self.hc_eps,
+            )
+            return (
+                y.reshape(bsz, seq, d).to(dtype),
+                post.reshape(bsz, seq, hc),
+                comb.reshape(bsz, seq, hc, hc),
+            )
+        xf = x.flatten(2)
+        rsqrt = torch.rsqrt(xf.float().square().mean(-1, keepdim=True) + self.eps)
+        mixes = F.linear(xf.float(), hc_fn.dequantized())
+        mixes = mixes * rsqrt
         pre, post, comb = hc_split_sinkhorn(
             mixes, hc_scale, hc_base, self.hc_mult, self.hc_iters, self.hc_eps
         )

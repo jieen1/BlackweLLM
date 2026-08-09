@@ -109,10 +109,12 @@ class DeepseekV4Backend:
             # dequant-GEMM on the serving path (more accurate than cuBLAS
             # bf16, zero dequant cache).  The eager graph stays untouched as
             # the official-reference oracle.
-            from runtime.model.dsv4_model import PackedQ8_0Linear
+            from runtime.model.dsv4_model import PackedQ8_0Weight
 
             for mod in model.modules():
-                if isinstance(mod, PackedQ8_0Linear) and mod.weight_dtype is torch.bfloat16:
+                if isinstance(mod, PackedQ8_0Weight) and getattr(
+                    mod, "weight_dtype", torch.bfloat16
+                ) is torch.bfloat16:
                     mod.fused_q8 = True
         self._kv_len = [0] * num_slots
         self._committed: list[list[int]] = [[] for _ in range(num_slots)]
