@@ -148,8 +148,10 @@ def run_cuda_graph_gate(
             f"DSV4 CUDA Graph gate requires two captured slots, got {captured}; "
             f"status={backend.snapshot().dflash_cg_status}"
         )
-    # Slot 0 is the continuous kernel-eager oracle. Keep slot 1's graph.
-    backend._decode_graphs.pop(0)  # noqa: SLF001 -- diagnostic A/B control
+    # Slot 0 is the continuous kernel-eager oracle; slot 1 replays the B=1
+    # decode graph (the new backend shares one bucketed driver across
+    # slots, so there is no per-slot graph to drop -- slot 0 never uses it).
+    assert 1 in backend._decode_graphs, "B=1 decode graph was not captured"  # noqa: SLF001
 
     worst_cos = 1.0
     mismatches = 0
@@ -184,8 +186,13 @@ def run_cuda_graph_gate(
 
             torch.cuda.synchronize()
             started = time.perf_counter()
-            graph_logits = backend._decode_graphs[1].replay(  # noqa: SLF001
-                1, token, position
+            # New backend (post-64a9850): _decode_graphs is keyed by batch
+            # size; the B=1 driver takes host inputs for one slot.
+            graph_logits = backend._decode_graphs[1].replay_host(  # noqa: SLF001
+                [token],
+                [position],
+                [1],
+                max_index_entries=backend._decode_index_bucket([position]),
             )
             torch.cuda.synchronize()
             graph_ms.append((time.perf_counter() - started) * 1000)
@@ -196,7 +203,7 @@ def run_cuda_graph_gate(
             graph_token = int(graph_logits[0, 0].argmax().item())
             mismatches += int(token != graph_token)
             total += 1
-            for layer in backend.slot_layers[1]:
+            for layer in backend.slot_layers:
                 compressors = [layer.compressor]
                 if layer.indexer is not None:
                     compressors.append(layer.indexer.compressor)
