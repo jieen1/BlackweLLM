@@ -10,8 +10,9 @@
   **4.3ms/层**（dual gate+up）+ 2.3ms（down）≈ 6.8ms/层
 - torch.profiler M=32 单 chunk（43 层）：**MoE 289ms / 350ms = 83%**，attn 16ms，HC 14ms
 - 带宽账：M=32 → top-8 → 192 routes → **131 唯一专家**，**每专家平均 1.47 token**（最大 4）
-  每层读激活专家权重 ~1GB（gate+up+down 137×2.4MB×3）；HBM 极限 → **~3,800 tok/s**
-  （当前 83 = 带宽/计算利用 ~2-4%）
+  **每 route 输出 gate/up 的 inter=2048 全行**（不是 8 行），每层读激活专家权重
+  ~1.5GB（131×2048×4096×0.375B×3）；fused kernel 不落全局的带宽极限 ~5TB/s
+  （当前 4.3ms/层 = 反量化计算 2.6% 效率，不是带宽）
 
 ## 2. 根因（多路径交叉确认）
 
@@ -28,11 +29,14 @@
 | M 批处理 kernel（block 内多 token 复用权重，3D acc） | kernel 数值 bitwise 正确（16 测试绿）但 **每专家 1.47 token 无批可复**，E=131 m_pad=2 实测 0.8×（padding 反而 1.4-4× 冗余） |
 | expert-grouping 接入（sort/unique/pad + M 批处理） | **8× 退化**（9 tok/s）：`counts.max().item()` GPU→CPU 同步 + m_pad 变化触发 Triton 重新编译；已回滚 |
 | BLOCK_COLS 调参（8→16/32/64） | 无影响（4.30/4.14/4.42/4.62ms）——瓶颈不是 block 组织 |
-| deq（Triton IQ2→bf16）+ cuBLAS bmm | 单层 8.9ms（0.8×）：137 专家 bf16 反量化输出 2.2GB/层 **写带宽 bound**（1.6TB/s，32%），bmm 137 次小 GEMM 也慢 |
+| deq（Triton IQ2→bf16）+ cuBLAS bmm（137 专家批量） | 单层 8.9ms（0.8×）：137 专家 bf16 反量化输出 2.2GB/层 **写带宽 bound**（1.6TB/s，32%），bmm 137 次小 GEMM 也慢 |
+| deq（131 专家全量 bf16）+ 大 GEMM（[32,4096]×[4096,272K]） | GEMM 1.47ms（cuBLAS 仅 17 TFLOPS，M=32 计算密度低）+ **17× 冗余**（每 token 只需它的 8 专家，却算全部 131 专家） |
 | max_q_rows 增大 | 64 最优 83 tok/s；96 退化（MLA scratch/overhead）；128 OOM |
 
-**共同限制**：任何"反量化全权重（137 专家）并落全局（bf16/fp32）再 GEMM"的路径都被
-bf16 输出写带宽封顶在 ~几百 tok/s。**必须不落全局、直接量化内积**。
+**共同限制**：(a) 任何"反量化全权重并落全局（bf16/fp32）再 GEMM"的路径被 bf16 写带宽
+封顶；(b) 任何 cuBLAS 大 GEMM 被 M=32 小 batch 的低计算密度 + 专家冗余（每 token 只
+需 top-8）封顶；(c) M 批处理被"每专家 1.47 token"的固有稀疏路由封顶（唯一专家数太多）。
+**必须保持 fused（不落全局），优化其反量化计算（对齐布局去 gather + dp4a int8 内积）**。
 
 ## 4. 正解：dp4a int8 内积（ds4 §2B 已验证方案）
 
@@ -44,8 +48,15 @@ bf16 输出写带宽封顶在 ~几百 tok/s。**必须不落全局、直接量�
    → × xscale × wscale（wscale 只每块 1 个，不是每元素反量化）
 4. 可选：gate/up/mid 单 kernel 融合（双累加 acc_g/acc_u + epilogue 内 clamp/silu/weights）
 
-**预期**：MoE prefill 计算 4-8× 减（int8 vs fp32 内积 + 免 per-element 反量化），
-prefill 83 → **400-1,500 tok/s**（接近带宽极限 3,800 的 10-40%）。
+**预期**：fused kernel 内积（fp32 标量）约占总时间 2/3（deq 纯反量化 1.4ms vs fused 4.3ms），
+dp4a 内积 4× + 对齐去 gather 后 **fused 4.3ms → 1-2ms/层，prefill 83 → 170-330 tok/s（2-4×）**。
+**不是数量级提升**：反量化查表（`IQ2XS_GRID`/`KSIGNS` gather）固有，每 route 需全 2048 行输出、
+每专家平均 1.47 token 的路由稀疏性、bf16 落全局写带宽三者共同封顶。要 >1,000 tok/s 需要
+换模型格式（NVFP4 专家 + tensor-core fused MoE，sglang 路线）或权重预反量化缓存（显存不足）。
+
+实测排除：对齐布局（code 连续）对 **deq kernel 无加速**（1.40 vs 1.41ms，写 bf16 带宽 bound，
+读 0.6GB 非瓶颈）；对齐对 **fused kernel**（不落全局、反量化 gather 是计算瓶颈）可能有效但
+需接 repack + 改 kernel（数值对齐 bug 未修，方向已否定前不必修）。
 
 **实施顺序建议**：
 1. preq 激活量化 kernel（简单，独立）
