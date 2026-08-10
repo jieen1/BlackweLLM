@@ -48,6 +48,22 @@ class PackedQ8_0Weight(nn.Module):
         numel = out_features * in_features
         n_bytes = numel // 32 * 34
         self.register_buffer("packed", torch.empty(n_bytes, dtype=torch.uint8, device=device))
+        # Lazily-built aligned SoA planes (code row-contiguous, scale separate)
+        # for the fused GEMV -- avoids the 2-byte-aligned 34B code stream that
+        # underuses DRAM on cold M=1 decode (measured +13% kernel, +61% pure
+        # load).  Built on first fused use; the interleaved ``packed`` stays
+        # the eager oracle.
+        self._soa_q: torch.Tensor | None = None
+        self._soa_d: torch.Tensor | None = None
+
+    def soa_planes(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._soa_q is None or self._soa_d is None:
+            from runtime.kernels.dsv4_q8_gemm import repack_q8_0_soa
+
+            q, d = repack_q8_0_soa(self.packed, self.out_features, self.in_features)
+            self._soa_q = q
+            self._soa_d = d
+        return self._soa_q, self._soa_d
 
     def load_packed(self, tensor: GgufTensor) -> None:
         if tensor.type_name != "Q8_0":
@@ -116,12 +132,14 @@ class PackedQ8_0Linear(PackedQ8_0Weight):
             )
             return out.reshape(*leading, self.out_features)
         if self.fused_q8 and x.device.type == "cuda":
-            from runtime.kernels.dsv4_q8_gemm import q8_0_dequant_gemm
+            from runtime.kernels.dsv4_q8_gemm import q8_0_dequant_gemm_soa
 
             leading = x.shape[:-1]
-            out = q8_0_dequant_gemm(
+            q, d = self.soa_planes()
+            out = q8_0_dequant_gemm_soa(
                 x.reshape(-1, self.in_features),
-                self.packed,
+                q,
+                d,
                 out_features=self.out_features,
                 in_features=self.in_features,
             )
