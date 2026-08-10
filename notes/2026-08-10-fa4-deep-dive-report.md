@@ -468,3 +468,41 @@ row_max 增长缓慢，**绝大多数迭代都能跳过**。我们的 MLA decode
 | 论文 exp2 精度表 | `fa4_paper.txt` 第 324-334 行（表 2） |
 | 论文 2-CTA/DSMEM/dQ 减半 | `fa4_paper.txt` 第 499-527 行 |
 | 论文 LPT 收益 | `fa4_paper.txt` 第 565-569 行 |
+
+---
+
+## 补充：第二轮执行层细节（2026-08-10 增补）
+
+### 软 exp2 多项式系数（utils.py:32-64，sollya fpminimax）
+| deg | c0 | c1 | c2 | c3 | c4 | c5 | 最大相对误差 |
+|---|---|---|---|---|---|---|---|
+| 3 | 1.0 | 0.695146143436431884765625 | 0.227564394474029541015625 | 0.077119089663028717041015625 | | | 8.8e-5 |
+| 4 | 1.0 | 0.693042695522308349609375 | 0.2412912547588348388671875 | 0.052225358784198760986328125 | 0.013434938155114650726318359375 | | 3.0e-6 |
+| 5 | 1.0 | 0.693151414394378662109375 | 0.24016360938549041748046875 | 0.055802188813686370849609375 | 0.00901452265679836273193359375 | 0.00186810153536498546600341796875 | 8.5e-8 |
+
+- 硬件 ex2.approx ≈ 2^-22 ≈ 2.4e-7。deg3 反而比硬件差 ~300 倍，deg5 才追平。
+  FA4 用模拟**不是为精度，是为流水线平衡**（MUFU→FMA 管）。
+- 魔法数 6291456.0（2^23+2^22），add.rm.ftz.f32 + 两次 rn 减 + `(bits<<23)+bits` 拼位。
+- 混用：`ex2_emu_freq`（FP8 fwd 用 freq=8~32），SM103 用 freq=0 全硬件。
+
+### scale_subtract_rowmax（softmax.py:342-357，★直接抄）
+`x*scale_log2 - row_max*scale_log2 + max_offset` 三步并成一条 packed FMA
+（bias = max_offset - row_max_scaled），每 2 元素 1 指令。
+
+### 条件 rescale 的 M=1 退化（★直接抄）
+M=1 时 row_max 是标量，判定从 vote_ballot(128 lane) 退化成一次标量比较。省：
+① 计算 acc_scale 的 exp2；② **整趟 acc_O 的 rescale pass**（读累加器乘一遍写回）。
+阈值 8.0（fp16/bf16）依赖 P 低精度存储码点余量；P 若 fp32 需调小。
+
+### P 按输入 dtype 存储（softmax.py:359-451）
+寄存器里 recast 同一块 rmem 为输入 dtype；P 与 S 共用缓冲各半幅。
+M=1 收益有限（P 只是 1×N 小行），真正大的是 V。除非把多 head/batch 打包进 M。
+
+### gather 行指针 shuffle 分发（topk_gather_kv.py:257-261）
+每 lane 算自己的行指针，shuffle_sync 在同行线程组互取 → 避免重复算 topk 地址，
+保证同行的 128-bit 连续加载由一组线程完成。**检查 b12x gather 是否重复读 index**。
+
+### M=1 最肥的优化：多级 KV smem + producer warp 超前 cp.async（flash_fwd_sm100.py:1499-1560）
+KV 管道可深到 32 级（kv_stage，:376），load warp 一口气超前发长串 cp.async，
+计算从尾部倒序消费。SM120 没有异步 MMA，但 **cp.async 是异步的**——
+producer warp 提前 2~4 block 发，计算时零等待。这是 decode 最肥的一块。

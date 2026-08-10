@@ -177,6 +177,24 @@ one-line edit.
   `work/dsv4-bf16q-20260807` (rebased onto the b12x tree 2026-08-09); serving
   uses the default kernel (bf16_q=0) and does not depend on it.
 
+## 性能优化前必读（2026-08-10 起强制）
+
+做任何 DSV4 M=1 decode 性能优化前，**必须先读以下调研文档**——它们记录了
+已验证的根因和解法，避免重复我踩过的坑（把 q8_0 170 GB/s 误判为 latency-bound）：
+
+| 文档 | 内容 |
+|---|---|
+| `notes/2026-08-10-m1-decode-deep-dive.md` | **先读这个**。四路调研交叉印证的总览 + 按 ROI 行动清单 |
+| `notes/2026-08-10-ds4-cuda-deep-dive.md` | **q8_0 对齐 SoA 重打包**（实测 +43~66%，根因是 34B 布局 2B 对齐）+ warp-per-row dp4a 完整结构 |
+| `notes/2026-08-10-laguna-optimization-path.md` | 带宽账方法论（必须冷缓存）、融合 kernel、图内元数据 |
+| `notes/2026-08-10-sglang-dsv4-deep-dive.md` | MTP/DSpark verify 批量、FP8 减字节、融合 kernel |
+| `notes/2026-08-10-fa4-deep-dive-report.md` | 软 exp2、条件 rescale、P 按 dtype 存储、多级 KV smem 等执行层细节 |
+
+关键已证结论：
+- **q8_0 170 GB/s 根因是 34B 交错布局的 2B 对齐**（非 latency）——对齐 SoA 重打包 + warp-per-row dp4a 实测 +43~66%
+- **测量必须冷缓存**（≥256MB 旋转足迹），否则 L2 污染出假数字
+- 之前用 tensor-core tl.dot 做 SoA 失败（内存 OOM），正确方案是**离线重打包 + dp4a**（ds4 验证过）
+
 ## Coding style
 
 Python, four-space indent, `snake_case` modules/functions, `PascalCase` classes,
