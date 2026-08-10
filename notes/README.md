@@ -42,6 +42,7 @@
 | `2026-08-10-sglang-dsv4-deep-dive.md` | **SGLang DeepSeek V4 完整调研**——MLA/MoE/HC 结构、SM120 注意力 kernel 选择（FlashInfer sparse_mla_sm120 + Triton tiled 备选）、MTP/DSpark verify 批量机制、decode 调度。结论：SGLang 无魔法 M=1 kernel，破墙靠 DSpark/MTP（M=γ+1）+ FP8/NVFP4 减字节 |
 | `2026-08-10-laguna-optimization-path.md` | **Laguna 性能优化完整路径调研**——CG decode 元数据烤进图、融合元数据 kernel、向量化纪律（5.6×）、fused_kv_scatter/fused_rms_norm、MoE 单 kernel 38μs/层、带宽账方法论（必须冷缓存）、DFlash M=16 摊销原理。DSV4 已抄 argmax 烤进图，缺 kernel 融合 + 布局重排 |
 | `2026-08-10-m1-decode-deep-dive.md` | **M=1 decode 深度调研结论总览**——四路交叉印证：q8_0 对齐是根因（非 latency）、ds4 实测数字、行动清单按 ROI |
+| `2026-08-10-dsv4-q8-warprow-gate-regression.md` | **DSV4 Q8_0 warp-per-row 优化未过门禁的完整说明**——单 kernel 正确（与 tl.dot maxdiff 0）但门禁 3-workload 漂移（0.99903 vs 基线 0.99999988）。含现象、已确证事实、尝试方案、未解疑点（soa_planes 懒构建与 graph pool 交互、逐层定位建议）。已回滚，门禁 PASS。**接手者先读此文档** |
 
 ## 2. 已定案的根因分析 🟢
 
