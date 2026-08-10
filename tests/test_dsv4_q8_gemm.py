@@ -121,12 +121,17 @@ def test_q8_soa_repack_produces_contiguous_planes() -> None:
 
 
 def test_q8_weight_reload_invalidates_soa_cache() -> None:
+    """load_packed must replace the resident SoA planes (decode reads them)."""
     out, inp = 2, 32
     linear = PackedQ8_0Linear(out, inp)
-    linear.packed.copy_(_random_packed(out, inp, "cpu"))
-    old_q, old_d = linear.soa_planes()
-    replacement = _random_packed(out + 1, inp, "cpu")[: linear.packed.numel()].clone()
-
+    first = _random_packed(out, inp, "cpu")
+    linear.load_packed(
+        GgufTensor(name="test.weight", type_name="Q8_0", shape=(out, inp), data=first)
+    )
+    old_q, old_d = (t.clone() for t in linear.soa_planes())
+    replacement = _random_packed(out, inp, "cpu").clone()
+    replacement[0] ^= 0xFF
+    replacement[2] ^= 0xFF
     linear.load_packed(
         GgufTensor(
             name="test.weight",
@@ -136,11 +141,10 @@ def test_q8_weight_reload_invalidates_soa_cache() -> None:
         )
     )
 
-    assert linear._soa_q is None
-    assert linear._soa_d is None
     new_q, new_d = linear.soa_planes()
     assert not torch.equal(new_q, old_q)
     assert not torch.equal(new_d, old_d)
+    assert linear.packed.shape == (out * inp // 32 * 34,)
 
 
 @CUDA_REQUIRED

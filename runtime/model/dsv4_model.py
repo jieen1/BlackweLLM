@@ -45,23 +45,46 @@ class PackedQ8_0Weight(nn.Module):
         self.out_features = out_features
         self.in_features = in_features
         self.fused_q8 = False
-        numel = out_features * in_features
-        n_bytes = numel // 32 * 34
-        self.register_buffer("packed", torch.empty(n_bytes, dtype=torch.uint8, device=device))
-        # Cached repacked SoA planes for the M=1 warp-row GEMV (lazily built
-        # on first use; scale plane is contiguous so the kernel's linear
-        # addressing is correct).
-        self._soa_q: torch.Tensor | None = None
-        self._soa_d: torch.Tensor | None = None
+        # SoA planes are the resident storage: code [out, in] int8 + scale
+        # [out, in/32] fp16 (total bytes == the interleaved 34B layout, so
+        # no extra residency).  The interleaved `packed` view is rebuilt
+        # lazily only for the M>1 tensor-core path / eager oracle that read
+        # the old layout.
+        nb = in_features // 32
+        self.register_buffer(
+            "qcode", torch.empty(out_features * in_features, dtype=torch.uint8, device=device)
+        )
+        self.register_buffer(
+            "qscale", torch.empty(out_features * nb, dtype=torch.float16, device=device)
+        )
 
     def soa_planes(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._soa_q is None or self._soa_d is None:
-            from runtime.kernels.dsv4_q8_gemm import repack_q8_0_soa
+        return self.qcode, self.qscale
 
-            q, d = repack_q8_0_soa(self.packed, self.out_features, self.in_features)
-            self._soa_q = q
-            self._soa_d = d
-        return self._soa_q, self._soa_d
+    @property
+    def packed(self) -> torch.Tensor:
+        """Rebuild the interleaved 34B layout from the SoA planes.
+
+        Compatibility view for the M>1 tensor-core kernel / eager oracle /
+        tests that read the original GGUF block layout.  Allocates a
+        [out*in/32*34] buffer each call -- used only on the M>1 (prefill)
+        path, never the M=1 warp-row decode hot path.
+        """
+        nb = self.in_features // 32
+        q = self.qcode.view(self.out_features, nb, 32)
+        d = self.qscale.view(self.out_features, nb, 1)
+        out = torch.empty(
+            (self.out_features, nb, 34), dtype=torch.uint8, device=self.qcode.device
+        )
+        out[:, :, :2].view(torch.float16).copy_(d)
+        out[:, :, 2:].copy_(q)
+        return out.reshape(-1)
+
+    @packed.setter
+    def packed(self, value: torch.Tensor) -> None:
+        wv = value.view(self.out_features, self.in_features // 32, 34)
+        self.qcode.copy_(wv[:, :, 2:].reshape(-1))
+        self.qscale.copy_(wv[:, :, :2].view(torch.float16).squeeze(-1).reshape(-1))
 
     def load_packed(self, tensor: GgufTensor) -> None:
         if tensor.type_name != "Q8_0":
@@ -71,14 +94,22 @@ class PackedQ8_0Weight(nn.Module):
                 f"{tensor.name}: expected {self.out_features}x{self.in_features}, "
                 f"got {tensor.shape}"
             )
-        self.packed.copy_(tensor.data.to(self.packed.device))
-        # A loader retry or explicit weight replacement must not leave the
-        # decode kernel reading SoA planes derived from the previous bytes.
-        self._soa_q = None
-        self._soa_d = None
+        # Store directly as SoA planes (setter splits the 34B interleaved
+        # layout into code+scale); no 34B packed view is resident.
+        self.packed = tensor.data.to(self.qcode.device)
 
     def dequantized(self) -> torch.Tensor:
-        return dequantize_q8_0(self.packed).reshape(self.out_features, self.in_features)
+        # Directly from the aligned SoA planes (qcode [out, in] int8 +
+        # qscale [out, in/32] fp16) -- bit-identical to dequantize_q8_0 of
+        # the interleaved packed layout (verified maxdiff 0.0), and avoids
+        # rebuilding the 34B view when SoA is the resident storage.
+        qf = (
+            self.qcode.view(self.out_features, self.in_features // 32, 32)
+            .view(torch.int8)
+            .to(torch.float32)
+        )
+        df = self.qscale.view(self.out_features, self.in_features // 32, 1).to(torch.float32)
+        return (df * qf).reshape(self.out_features, self.in_features)
 
 
 class PackedQ8_0Linear(PackedQ8_0Weight):

@@ -95,7 +95,7 @@ def fill_moe(moe: Dsv4MoE, seed: int) -> None:
         container.packed.copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
     for linear in (moe.shared_w1, moe.shared_w3, moe.shared_w2):
         data = valid_q8_0_blocks(rng, linear.packed.numel() // 34)
-        linear.packed.copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
+        linear.packed = torch.frombuffer(bytearray(data), dtype=torch.uint8)
     # ffn_gate_inp is BF16 in the file (DenseLinear container)
     gate_w = moe.gate.weight.weight
     gate_w.copy_(
