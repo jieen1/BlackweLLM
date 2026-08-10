@@ -422,3 +422,79 @@ def q8_0_grouped_dequant_gemm(
         BLK_BYTES=34,
     )
     return out
+
+
+@triton.jit
+def _q8_0_warp_row_gemv_bf16_kernel(
+    x_ptr,  # [K] bf16 activations
+    q_ptr,  # [out, K] int8 code plane, row-contiguous
+    d_ptr,  # [out, K/32] fp16 scale plane, CONTIGUOUS
+    out_ptr,  # [out] fp32
+    OUT,
+    K: tl.constexpr,
+):
+    """M=1 Q8_0 GEMV: one warp per output row, lanes split the K blocks.
+
+    The weight is rounded to bf16 (w = (qs*d).to(bf16)) so the numerical
+    contract matches the tensor-core tl.dot path exactly (verified maxdiff
+    0.0 on wo_b).  The end-to-end CUDA Graph gate separately compares this
+    kernel through the same batched decode body on both sides; see
+    notes/2026-08-10-dsv4-q8-warprow-gate-regression.md.
+
+    The aligned SoA planes remove the 34B-block 2-byte alignment penalty:
+    measured wo_b [8192, 4096] 196 -> 1386 GB/s (7.1x) with fp32 round,
+    same bandwidth with the bf16 round.  num_warps=1.
+    """
+    row = tl.program_id(0)
+    pid = tl.arange(0, 32)
+    n_blocks = K // 32
+    x_u16 = x_ptr.to(tl.pointer_type(tl.uint16))
+    acc = tl.zeros((32,), dtype=tl.float32)
+    for b0 in range(0, n_blocks, 32):
+        b = b0 + pid
+        xv = (tl.load(x_u16 + b[:, None] * 32 + tl.arange(0, 32)[None, :],
+                      mask=(b < n_blocks)[:, None], other=0).to(tl.uint32) << 16).to(
+            tl.float32, bitcast=True)
+        qv = tl.load(q_ptr + row * K + b[:, None] * 32 + tl.arange(0, 32)[None, :],
+                     mask=(b < n_blocks)[:, None], other=0).to(tl.int8, bitcast=True).to(
+            tl.float32)
+        dv = tl.load(d_ptr + row * n_blocks + b, mask=b < n_blocks, other=0).to(
+            tl.float16).to(tl.float32)
+        w = (qv * dv[:, None]).to(tl.bfloat16).to(tl.float32)  # match tl.dot contract
+        dots = tl.sum(xv * w, axis=1)
+        acc += dots
+    tl.store(out_ptr + row, tl.sum(acc, axis=0))
+
+
+def repack_q8_0_soa(
+    packed: torch.Tensor,
+    out_features: int,
+    in_features: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split interleaved Q8_0 [out*in/32*34] into (code, scale) SoA planes.
+
+    code [out, in] int8 row-contiguous, scale [out, in/32] fp16 CONTIGUOUS
+    (the scale view off the 34B block is strided; it MUST be copied to a
+    contiguous buffer or the linear-addressed kernel misplaces scales).
+    """
+    wv = packed.view(out_features, in_features // 32, 34)
+    q = wv[:, :, 2:].reshape(out_features, in_features).contiguous()
+    d = wv[:, :, :2].view(torch.float16).squeeze(-1).contiguous()
+    return q, d
+
+
+def q8_0_dequant_gemv_warp_row_bf16(
+    x: torch.Tensor,
+    q: torch.Tensor,
+    d: torch.Tensor,
+    *,
+    out_features: int,
+    in_features: int,
+) -> torch.Tensor:
+    """M=1 Q8_0 GEMV, bf16-weight contract matching tensor-core tl.dot."""
+    x = x.reshape(-1).to(torch.bfloat16).contiguous()
+    out = torch.empty((out_features,), dtype=torch.float32, device=x.device)
+    _q8_0_warp_row_gemv_bf16_kernel[(out_features,)](
+        x, q, d, out, out_features, K=in_features, num_warps=1
+    )
+    return out

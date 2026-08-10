@@ -20,8 +20,11 @@ from runtime.kernels.dsv4_q8_gemm import (  # noqa: E402
     _select_q8_0_grouped_block_n,
     q8_0_dequant_gemm,
     q8_0_dequant_gemv_fp32,
+    q8_0_dequant_gemv_warp_row_bf16,
     q8_0_grouped_dequant_gemm,
+    repack_q8_0_soa,
 )
+from runtime.loading.gguf import GgufTensor  # noqa: E402
 from runtime.model.dsv4_model import PackedQ8_0Linear  # noqa: E402
 from runtime.model.dsv4_quant import dequantize_q8_0  # noqa: E402
 
@@ -103,6 +106,68 @@ def _random_packed(out: int, inp: int, device) -> torch.Tensor:
         for _ in range(32):
             blob += struct.pack("<b", int(torch.randint(-20, 21, (1,), generator=g).item()))
     return torch.frombuffer(bytes(blob), dtype=torch.uint8).to(device)
+
+
+def test_q8_soa_repack_produces_contiguous_planes() -> None:
+    out, inp = 3, 64
+    packed = _random_packed(out, inp, "cpu")
+
+    q, d = repack_q8_0_soa(packed, out, inp)
+
+    assert q.shape == (out, inp)
+    assert d.shape == (out, inp // 32)
+    assert q.is_contiguous()
+    assert d.is_contiguous()
+
+
+def test_q8_weight_reload_invalidates_soa_cache() -> None:
+    out, inp = 2, 32
+    linear = PackedQ8_0Linear(out, inp)
+    linear.packed.copy_(_random_packed(out, inp, "cpu"))
+    old_q, old_d = linear.soa_planes()
+    replacement = _random_packed(out + 1, inp, "cpu")[: linear.packed.numel()].clone()
+
+    linear.load_packed(
+        GgufTensor(
+            name="test.weight",
+            type_name="Q8_0",
+            shape=(out, inp),
+            data=replacement,
+        )
+    )
+
+    assert linear._soa_q is None
+    assert linear._soa_d is None
+    new_q, new_d = linear.soa_planes()
+    assert not torch.equal(new_q, old_q)
+    assert not torch.equal(new_d, old_d)
+
+
+@CUDA_REQUIRED
+@pytest.mark.parametrize("out,inp", [(64, 64), (1024, 512)])
+def test_q8_warp_row_matches_tensor_core_bf16_contract(out: int, inp: int) -> None:
+    packed = _random_packed(out, inp, "cuda")
+    q, d = repack_q8_0_soa(packed, out, inp)
+    x = torch.randn(1, inp, device="cuda", dtype=torch.bfloat16)
+
+    got = q8_0_dequant_gemv_warp_row_bf16(
+        x,
+        q,
+        d,
+        out_features=out,
+        in_features=inp,
+    )
+    expect = q8_0_dequant_gemm(
+        x,
+        packed,
+        out_features=out,
+        in_features=inp,
+    )[0]
+
+    # Both kernels round dequantized weights to BF16 and accumulate in FP32;
+    # only the reduction tree differs.
+    rel = (got - expect).abs().max().item() / (expect.abs().max().item() + 1e-9)
+    assert rel < 2e-5, f"out={out} inp={inp} rel={rel:.2e}"
 
 
 @CUDA_REQUIRED

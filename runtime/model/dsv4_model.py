@@ -48,6 +48,20 @@ class PackedQ8_0Weight(nn.Module):
         numel = out_features * in_features
         n_bytes = numel // 32 * 34
         self.register_buffer("packed", torch.empty(n_bytes, dtype=torch.uint8, device=device))
+        # Cached repacked SoA planes for the M=1 warp-row GEMV (lazily built
+        # on first use; scale plane is contiguous so the kernel's linear
+        # addressing is correct).
+        self._soa_q: torch.Tensor | None = None
+        self._soa_d: torch.Tensor | None = None
+
+    def soa_planes(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._soa_q is None or self._soa_d is None:
+            from runtime.kernels.dsv4_q8_gemm import repack_q8_0_soa
+
+            q, d = repack_q8_0_soa(self.packed, self.out_features, self.in_features)
+            self._soa_q = q
+            self._soa_d = d
+        return self._soa_q, self._soa_d
 
     def load_packed(self, tensor: GgufTensor) -> None:
         if tensor.type_name != "Q8_0":
@@ -58,6 +72,10 @@ class PackedQ8_0Weight(nn.Module):
                 f"got {tensor.shape}"
             )
         self.packed.copy_(tensor.data.to(self.packed.device))
+        # A loader retry or explicit weight replacement must not leave the
+        # decode kernel reading SoA planes derived from the previous bytes.
+        self._soa_q = None
+        self._soa_d = None
 
     def dequantized(self) -> torch.Tensor:
         return dequantize_q8_0(self.packed).reshape(self.out_features, self.in_features)
@@ -116,15 +134,33 @@ class PackedQ8_0Linear(PackedQ8_0Weight):
             )
             return out.reshape(*leading, self.out_features)
         if self.fused_q8 and x.device.type == "cuda":
-            from runtime.kernels.dsv4_q8_gemm import q8_0_dequant_gemm
+            from runtime.kernels.dsv4_q8_gemm import (
+                q8_0_dequant_gemm,
+                q8_0_dequant_gemv_warp_row_bf16,
+            )
 
             leading = x.shape[:-1]
-            out = q8_0_dequant_gemm(
-                x.reshape(-1, self.in_features),
-                self.packed,
-                out_features=self.out_features,
-                in_features=self.in_features,
-            )
+            x2 = x.reshape(-1, self.in_features)
+            if x2.shape[0] == 1 and self.in_features % 32 == 0:
+                # M=1 decode: warp-per-row GEMV over the repacked SoA planes
+                # with the bf16 weight contract (matches tensor-core tl.dot
+                # exactly, verified maxdiff 0) -- the aligned code plane
+                # removes the 34B 2-byte alignment penalty (7.1x bandwidth).
+                q, d = self.soa_planes()
+                out = q8_0_dequant_gemv_warp_row_bf16(
+                    x2,
+                    q,
+                    d,
+                    out_features=self.out_features,
+                    in_features=self.in_features,
+                )
+            else:
+                out = q8_0_dequant_gemm(
+                    x2,
+                    self.packed,
+                    out_features=self.out_features,
+                    in_features=self.in_features,
+                )
             out = out.reshape(*leading, self.out_features)
             if self.weight_dtype is torch.bfloat16:
                 return out.to(torch.bfloat16)

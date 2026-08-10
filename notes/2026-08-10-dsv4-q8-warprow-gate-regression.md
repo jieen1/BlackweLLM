@@ -83,11 +83,11 @@
 - 对比**同一输入下** eager 的 `_forward` 与 graph replay 的**逐 kernel 中间值**（wq_a/wq_b/wkv/wo_a/wo_b/MLA/compressor），找出第一个不一致的算子。
 - 验证 soa_planes 在 graph 捕获 vs 连续执行的内容一致性（打印 data_ptr + 首值）。
 
-## 7. 当前代码状态
+## 7. 接手时的代码状态
 
-- 已回滚 warp-row（`037cbb5` Revert wo_a、`3e9420f` Revert Q8_0），**门禁 PASS（0.99999988）**，decode 58ms。
-- 门禁脚本已修复适配新后端（`22f746f`）：`--cuda-graph` 从崩溃恢复，能跑（之前 `_decode_graphs.pop(0)` KeyError）。
-- 工作区干净。未提交的调试脚本在 /tmp/opencode/*.py。
+- `1704036` 的已提交基线回滚了 warp-row（`037cbb5` Revert wo_a、`3e9420f` Revert Q8_0），门禁 PASS（0.99999988），decode 58ms。
+- 门禁脚本在 `22f746f` 只修复了 graph 侧以适配新 batched backend：`--cuda-graph` 从 `_decode_graphs.pop(0)` KeyError 恢复为可运行。
+- 接手工作区已重新加入 Q8_0 warp-row、BF16 权重舍入和连续 scale plane，供本次根因定位与修复。
 
 ## 8. 参考
 
@@ -95,3 +95,50 @@
 - 门禁脚本：`scripts/dsv4_align_eager_vs_kernel.py`（`run_cuda_graph_gate` 128-230 行）
 - 后端 `_forward_decode_batch`：`runtime/backends/dsv4.py:682`
 - 门禁脚本的历史 PASS 记录：`notes/2026-08-09-dsv4-cudagraph-decode-driver.md:74-88`（0.99999988，旧 per-slot 后端）
+
+## 9. 根因与修复（2026-08-10）
+
+### 9.1 根因
+
+`22f746f` 适配 batched decode graph 时只改了 graph replay 侧，eager oracle 仍调用
+`backend._forward(0, ids, position)`。文档此前把它误记为会进入
+`_forward_decode_batch`，但最新代码中两者是两套不同 body：
+
+- `_forward`：旧 serial attention/MoE 路径；
+- `_forward_decode_batch`：生产 B=1/2/4 eager fallback，也是 CUDA Graph 实际捕获的 body。
+
+因此旧门禁并非“同一 body 的 eager vs graph”，而是“serial body vs batched body”。
+tensor-core Q8_0 下两套实现的递归状态微差碰巧没有越过阈值；warp-row 改变数值轨迹后，
+wl2 的 compressor/indexer 状态将该微差放大，形成 0.99907 的假回归。单 kernel maxdiff 0
+与端到端门禁漂移的“核心矛盾”由此解释：问题不在 Q8_0 kernel，而在 oracle 选错 body。
+
+### 9.2 修复
+
+门禁 eager 侧改为调用 `_forward_decode_batch`，并传入与 graph replay 相同的 B=1
+`positions`、`slot_ids` 和 `max_index_entries` bucket。这样两侧只剩 capture/replay 差异。
+
+同时补齐两项防护：
+
+- Q8_0 SoA code/scale plane 连续性及 warp-row 对 tensor-core BF16 契约的 CUDA 回归测试；
+- `load_packed()` 替换权重后清空 SoA cache，避免重载后继续读旧派生数据。
+
+### 9.3 GPU 验证
+
+真实 SM120、真实 GGUF、`2 slots / max_model_len=4096 / prefill_rows=9`、
+3 workloads × 12 decode steps：
+
+| 指标 | 修复后 |
+|---|---:|
+| worst logits cosine | **0.99999988** |
+| greedy agreement | **39/39 (100%)** |
+| eager B=1 decode | 126.47 ms |
+| graph decode | **40.20 ms** |
+| verdict | **PASS** |
+
+结论：Q8_0 aligned SoA + warp-per-row 可保留，质量门禁回归已消除；无需修改
+compressor/indexer、graph bucket 或 kernel 算术。
+
+范围限制：上述结论只关闭数值门禁问题。当前 SoA cache 会额外常驻约 6.8 GiB；在已按
+`4 slots / max_model_len=131072` 加载到接近容量上限的 daemon 上热补丁后实测 OOM。
+这不是本次 2-slot/4096 质量门禁的失败，但在默认长上下文 serving profile 启用前仍需做
+一次冷启动容量资格验证，或将 SoA 改为不与 interleaved 权重双份常驻的布局。

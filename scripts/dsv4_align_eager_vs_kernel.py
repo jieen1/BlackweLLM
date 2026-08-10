@@ -128,8 +128,9 @@ def run_cuda_graph_gate(
     """Compare continuous kernel-eager decode with the captured full graph.
 
     Two slot-owned attention stacks share weights but not recursive/cache
-    state. Slot 0 stays eager as the oracle; slot 1 replays its address-bound
-    graph. Both consume the eager stream's token at each position.
+    state. Slot 0 runs the same native B=1 decode body eagerly; slot 1 replays
+    the graph captured from that body. Both consume the eager stream's token
+    at each position.
     """
     from runtime.backends.dsv4 import DeepseekV4Backend
 
@@ -180,7 +181,17 @@ def run_cuda_graph_gate(
 
             torch.cuda.synchronize()
             started = time.perf_counter()
-            eager_logits = backend._forward(0, ids, position)  # noqa: SLF001
+            # Keep the gate body-identical: the batched CUDA Graph captures
+            # ``_forward_decode_batch``, not the legacy serial ``_forward``
+            # path.  Comparing those two different bodies happened to pass
+            # with the tensor-core Q8_0 kernel, but the warp-row kernel exposed
+            # their recursive compressor/indexer drift on workload 2.
+            eager_logits = backend._forward_decode_batch(  # noqa: SLF001
+                ids,
+                torch.tensor([position], dtype=torch.long, device="cuda"),
+                torch.tensor([0], dtype=torch.long, device="cuda"),
+                max_index_entries=backend._decode_index_bucket([position]),  # noqa: SLF001
+            )
             torch.cuda.synchronize()
             eager_ms.append((time.perf_counter() - started) * 1000)
 

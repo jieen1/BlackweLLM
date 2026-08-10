@@ -525,7 +525,7 @@ def test_q8_block_n_selection_matches_sm120_real_weight_sweep() -> None:
         _select_q8_0_grouped_block_n,
     )
 
-    assert _select_q8_0_block_n(1, 4096, 1024) == 32
+    assert _select_q8_0_block_n(1, 4096, 1024) == 8
     assert _select_q8_0_block_n(1, 1024, 32768) == 64
     assert _select_q8_0_block_n(1, 4096, 129280) == 32
     assert _select_q8_0_block_n(32, 4096, 129280) == 64
