@@ -35,6 +35,58 @@ import triton.language as tl
 
 
 @triton.jit
+def _hc_mixes_partial_kernel(
+    x_ptr,  # [T, hc*d] bf16, row-major
+    w_ptr,  # [hc_mix, hc*d] Q8_0 packed, row stride w_row_bytes bytes
+    mixes_ptr,  # [T, N_SPLITS, 32] fp32 out (partial sums)
+    hc_dim: tl.constexpr,
+    w_row_bytes: tl.constexpr,
+    hc6: tl.constexpr,  # hc*6 (24 real W rows)
+    BLKS_PER_SPLIT: tl.constexpr,
+    N_SPLITS: tl.constexpr,
+):
+    """Split-K partial Q8_0 GEMV for the mHC mixes.
+
+    One program per (token, split); each accumulates ``BLKS_PER_SPLIT`` of
+    the 512 Q8_0 blocks into a partial 32-lane sum.  Splits fill grid.y so
+    decode's single token uses many SMs instead of one (measured 156us ->
+    12us at 32 splits on SM120 for the GEMV portion).
+    """
+    t = tl.program_id(0)
+    sp = tl.program_id(1)
+    idx32 = tl.arange(0, 32)
+    rows_ok = idx32 < hc6
+    x_u16 = x_ptr.to(tl.pointer_type(tl.uint16))
+    acc = tl.zeros((32,), dtype=tl.float32)
+    start = sp * BLKS_PER_SPLIT * 32
+    for k in range(0, BLKS_PER_SPLIT * 32, 32):
+        blk = start + k
+        xs = (tl.load(x_u16 + t * hc_dim + blk + idx32).to(tl.uint32) << 16).to(
+            tl.float32, bitcast=True
+        )
+        offs_j = idx32[:, None] * w_row_bytes
+        wq = tl.load(
+            w_ptr + offs_j + (blk // 32) * 34 + 2 + idx32[None, :],
+            mask=rows_ok[:, None],
+            other=0,
+        )
+        d2 = tl.load(
+            w_ptr + offs_j + (blk // 32) * 34 + tl.arange(0, 2)[None, :],
+            mask=rows_ok[:, None],
+            other=0,
+        )
+        d_lo, d_hi = tl.split(d2)
+        d_u16 = d_lo.to(tl.uint16) | (d_hi.to(tl.uint16) << 8)
+        d_f = d_u16.to(tl.float16, bitcast=True).to(tl.float32)
+        dots = tl.sum(
+            xs[None, :] * wq.to(tl.int8, bitcast=True).to(tl.float32) * d_f[:, None],
+            axis=1,
+        )
+        acc += dots
+    tl.store(mixes_ptr + t * N_SPLITS * 32 + sp * 32 + idx32, acc, mask=rows_ok)
+
+
+@triton.jit
 def _hc_pre_kernel(
     x_ptr,  # [T, hc*d] bf16, row-major
     w_ptr,  # [hc_mix, hc*d] Q8_0 packed, row stride w_row_bytes bytes
@@ -49,6 +101,8 @@ def _hc_pre_kernel(
     d: tl.constexpr,  # hidden size (4096)
     hc_dim: tl.constexpr,  # hc * d (16384)
     w_row_bytes: tl.constexpr,  # packed bytes per W row (hc_dim/32*34)
+    mixes_ptr,  # [T, N_SPLITS, 32] fp32 partial sums (None for single-program path)
+    n_splits: tl.constexpr,
 ):
     t = tl.program_id(0)
     idx32 = tl.arange(0, 32)
@@ -65,32 +119,42 @@ def _hc_pre_kernel(
     rsqrt = 1.0 / tl.sqrt(tl.sum(xf * xf) / hc_dim + eps)
 
     # -- pass 2: 24 dot products, Q8_0 dequantized in-kernel -----------------
-    acc = tl.zeros((32,), dtype=tl.float32)
-    # Q8_0 packed blocks: 34 bytes = 2-byte fp16 d + 32 int8 q.
-    # Rolled (not unrolled): 512 iterations would blow up the compile.
-    for blk in range(hc_dim // 32):
-        xs = (tl.load(x_u16 + t * hc_dim + blk * 32 + idx32).to(tl.uint32) << 16).to(
-            tl.float32, bitcast=True
-        )
-        offs_j = idx32[:, None] * w_row_bytes
-        wq = tl.load(
-            w_ptr + offs_j + blk * 34 + 2 + idx32[None, :],
-            mask=rows_ok[:, None],
-            other=0,
-        )
-        d2 = tl.load(
-            w_ptr + offs_j + blk * 34 + tl.arange(0, 2)[None, :],
-            mask=rows_ok[:, None],
-            other=0,
-        )
-        d_lo, d_hi = tl.split(d2)
-        d_u16 = d_lo.to(tl.uint16) | (d_hi.to(tl.uint16) << 8)
-        d_f = d_u16.to(tl.float16, bitcast=True).to(tl.float32)
-        dots = tl.sum(
-            xs[None, :] * wq.to(tl.int8, bitcast=True).to(tl.float32) * d_f[:, None],
-            axis=1,
-        )
-        acc += dots
+    if n_splits > 1:
+        # split-K path: reduce the per-split partial sums (deterministic:
+        # fixed split order, fp32 accumulate).
+        mix_part = tl.load(
+            mixes_ptr + t * n_splits * 32 + tl.arange(0, n_splits)[:, None] * 32 + idx32[None, :],
+            mask=tl.arange(0, n_splits)[:, None] < n_splits,
+            other=0.0,
+        )  # [n_splits, 32]
+        acc = tl.sum(mix_part, axis=0)  # [32]
+    else:
+        acc = tl.zeros((32,), dtype=tl.float32)
+        # Q8_0 packed blocks: 34 bytes = 2-byte fp16 d + 32 int8 q.
+        # Rolled (not unrolled): 512 iterations would blow up the compile.
+        for blk in range(hc_dim // 32):
+            xs = (tl.load(x_u16 + t * hc_dim + blk * 32 + idx32).to(tl.uint32) << 16).to(
+                tl.float32, bitcast=True
+            )
+            offs_j = idx32[:, None] * w_row_bytes
+            wq = tl.load(
+                w_ptr + offs_j + blk * 34 + 2 + idx32[None, :],
+                mask=rows_ok[:, None],
+                other=0,
+            )
+            d2 = tl.load(
+                w_ptr + offs_j + blk * 34 + tl.arange(0, 2)[None, :],
+                mask=rows_ok[:, None],
+                other=0,
+            )
+            d_lo, d_hi = tl.split(d2)
+            d_u16 = d_lo.to(tl.uint16) | (d_hi.to(tl.uint16) << 8)
+            d_f = d_u16.to(tl.float16, bitcast=True).to(tl.float32)
+            dots = tl.sum(
+                xs[None, :] * wq.to(tl.int8, bitcast=True).to(tl.float32) * d_f[:, None],
+                axis=1,
+            )
+            acc += dots
     mixes = acc * rsqrt  # [32]; lanes >= hc*6 are garbage
 
     # -- sinkhorn ------------------------------------------------------------
@@ -264,24 +328,66 @@ def hc_fused_pre(
     comb = torch.empty(t_tokens, hc, hc, dtype=torch.float32, device=x.device)
     if t_tokens == 0:
         return y, post, comb
-    _hc_pre_kernel[(t_tokens,)](
-        x.reshape(t_tokens, hc * d).contiguous(),
-        hc_fn,
-        hc_scale,
-        hc_base,
-        y,
-        post,
-        comb,
-        eps,
-        sinkhorn_iters=sinkhorn_iters,
-        hc=hc_mult,
-        d=d,
-        hc_dim=hc * d,
-        w_row_bytes=row_bytes,
-        # Real-weight SM120 decode sweeps are consistently faster with eight
-        # warps for T=1/2/4. Keep prefill's established four-warp regime.
-        num_warps=8 if t_tokens <= 4 else 4,
-    )
+    x2 = x.reshape(t_tokens, hc * d).contiguous()
+    if t_tokens <= 4:
+        # decode / tiny batch: the 512-block Q8_0 GEMV on one token is
+        # single-SM (measured 156us); split K across up to 32 programs so
+        # the M=1 surface uses the idle SMs (measured 12us at 32 splits).
+        n_splits = 32
+        blks_per = (hc * d // 32) // n_splits
+        assert blks_per * n_splits == hc * d // 32
+        mixes_partial = torch.empty(
+            t_tokens, n_splits, 32, dtype=torch.float32, device=x.device
+        )
+        _hc_mixes_partial_kernel[(t_tokens, n_splits)](
+            x2,
+            hc_fn,
+            mixes_partial,
+            hc_dim=hc * d,
+            w_row_bytes=row_bytes,
+            hc6=hc * 6,
+            BLKS_PER_SPLIT=blks_per,
+            N_SPLITS=n_splits,
+        )
+        _hc_pre_kernel[(t_tokens,)](
+            x2,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            y,
+            post,
+            comb,
+            eps,
+            sinkhorn_iters=sinkhorn_iters,
+            hc=hc_mult,
+            d=d,
+            hc_dim=hc * d,
+            w_row_bytes=row_bytes,
+            mixes_ptr=mixes_partial,
+            n_splits=n_splits,
+            num_warps=8 if t_tokens <= 4 else 4,
+        )
+    else:
+        _hc_pre_kernel[(t_tokens,)](
+            x2,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            y,
+            post,
+            comb,
+            eps,
+            sinkhorn_iters=sinkhorn_iters,
+            hc=hc_mult,
+            d=d,
+            hc_dim=hc * d,
+            w_row_bytes=row_bytes,
+            mixes_ptr=None,
+            n_splits=1,
+            # Real-weight SM120 decode sweeps are consistently faster with eight
+            # warps for T=1/2/4. Keep prefill's established four-warp regime.
+            num_warps=8 if t_tokens <= 4 else 4,
+        )
     return y, post, comb
 
 
