@@ -43,21 +43,40 @@ def _register_daemon(subparsers: argparse._SubParsersAction) -> None:
     start_parser = daemon_sub.add_parser(
         "start", help="start the daemon (reuses an already-running instance)"
     )
-    start_parser.add_argument("--provider", choices=["fake", "laguna"], default="laguna")
+    start_parser.add_argument(
+        "--provider",
+        choices=["fake", "laguna", "deepseek_v4"],
+        default="laguna",
+    )
     start_parser.add_argument("--socket", default=None)
     start_parser.add_argument("--model-path", default=None)
+    start_parser.add_argument("--tokenizer-path", default=None)
     start_parser.add_argument("--num-slots", type=int, default=1)
     start_parser.add_argument("--blocks-per-slot", type=int, default=4096)
     start_parser.add_argument("--block-size", type=int, default=64)
     start_parser.add_argument("--dtype", default="bfloat16")
     start_parser.add_argument("--max-model-len", type=int, default=131072)
     start_parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
+    start_parser.add_argument("--prefill-rows", type=int, default=32)
+    start_parser.set_defaults(enable_cudagraph=True)
+    start_parser.add_argument(
+        "--cudagraph",
+        dest="enable_cudagraph",
+        action="store_true",
+        help="capture decode CUDA Graphs during provider load",
+    )
+    start_parser.add_argument(
+        "--no-cudagraph",
+        dest="enable_cudagraph",
+        action="store_false",
+        help="disable decode CUDA Graph capture during provider load",
+    )
     start_parser.add_argument("--no-canary", action="store_true")
     start_parser.add_argument(
         "--default-timeout-s",
         type=float,
         default=None,
-        help="default per-exec timeout (Laguna defaults to 900 seconds)",
+        help="default per-exec timeout (GPU providers default to 900 seconds)",
     )
     start_parser.add_argument(
         "--idle-ttl-s",
@@ -80,7 +99,7 @@ def _register_daemon(subparsers: argparse._SubParsersAction) -> None:
 
     reload_parser = daemon_sub.add_parser(
         "reload",
-        help="hot-reload supported Laguna runtime code without reloading weights",
+        help="hot-reload supported provider runtime code without reloading weights",
     )
     reload_parser.add_argument("--socket", default=None)
     reload_parser.add_argument("--timeout-s", type=float, default=120.0)
@@ -165,6 +184,22 @@ def _requested_load_config(args: argparse.Namespace) -> dict[str, object]:
     key-space as ``LagunaEngineProvider.describe()["load_config"]`` (see
     ``provider.LOAD_TIME_CONFIG_KEYS``) -- used to decide whether reusing
     an already-running daemon is actually safe."""
+    provider = getattr(args, "provider", None)
+    if provider == "fake":
+        return {"num_slots": args.num_slots}
+    if provider == "deepseek_v4":
+        requested = {
+            "model_path": args.model_path,
+            "tokenizer_path": getattr(args, "tokenizer_path", None),
+            "num_slots": args.num_slots,
+            "max_model_len": args.max_model_len,
+            "prefill_rows": getattr(args, "prefill_rows", None),
+            "enable_cudagraph": getattr(args, "enable_cudagraph", True),
+        }
+        # Omitted optional paths mean "reuse the running provider's value".
+        # Keeping them as explicit None would force a pointless cold restart
+        # on this single-GPU host even when the loaded model is unchanged.
+        return {key: value for key, value in requested.items() if value is not None}
     return {
         "model_path": args.model_path,
         "num_slots": args.num_slots,
@@ -182,6 +217,16 @@ def _cmd_daemon_start(args: argparse.Namespace) -> int:
     try:
         if client.ping().ok:
             running_status = client.status().result
+            running_kind = running_status.get("provider", {}).get("kind")
+            if running_kind and running_kind != args.provider:
+                print(
+                    f"bf daemon start: a daemon is already running at {socket_path} with "
+                    f"provider={running_kind!r}, not the requested provider={args.provider!r}. "
+                    "Run `bf daemon stop` first, then start again with the new provider.",
+                    file=sys.stderr,
+                )
+                _print_status(client)
+                return 1
             running_cfg = running_status.get("provider", {}).get("load_config", {})
             requested_cfg = _requested_load_config(args)
             # Only compare keys the running provider actually tracks (a
@@ -189,14 +234,19 @@ def _cmd_daemon_start(args: argparse.Namespace) -> int:
             # missing-there means "not meaningful for this provider", not
             # "a requested change"), and treat an unset --model-path
             # (None) as "keep whatever's already loaded", not a deliberate
-            # override attempt.
+            # override attempt.  Optional omissions have already been removed
+            # by ``_requested_load_config``.
             comparable_requested_cfg = {
                 key: value for key, value in requested_cfg.items() if key in running_cfg
             }
-            if requested_cfg.get("model_path") is None:
-                comparable_requested_cfg.pop("model_path", None)
+            # ``requires_cold_restart`` intentionally treats a key missing on
+            # either side as a configuration change.  At this CLI boundary,
+            # however, an omitted optional argument means "keep the running
+            # value", so materialize that effective request explicitly.
+            effective_requested_cfg = dict(running_cfg)
+            effective_requested_cfg.update(comparable_requested_cfg)
             mismatched = requires_cold_restart(
-                running_cfg, comparable_requested_cfg, locked_keys=LOAD_TIME_CONFIG_KEYS
+                running_cfg, effective_requested_cfg, locked_keys=LOAD_TIME_CONFIG_KEYS
             )
             if mismatched:
                 print(
@@ -237,8 +287,15 @@ def _cmd_daemon_start(args: argparse.Namespace) -> int:
     ]
     if args.model_path:
         cmd += ["--model-path", args.model_path]
+    tokenizer_path = getattr(args, "tokenizer_path", None)
+    if tokenizer_path:
+        cmd += ["--tokenizer-path", tokenizer_path]
     if args.num_slots:
         cmd += ["--num-slots", str(args.num_slots)]
+    prefill_rows = getattr(args, "prefill_rows", None)
+    if prefill_rows is not None:
+        cmd += ["--prefill-rows", str(prefill_rows)]
+    cmd.append("--cudagraph" if getattr(args, "enable_cudagraph", True) else "--no-cudagraph")
     if args.no_canary:
         cmd.append("--no-canary")
     default_timeout_s = getattr(args, "default_timeout_s", None)
@@ -271,7 +328,8 @@ def _cmd_daemon_start(args: argparse.Namespace) -> int:
 
     print(
         f"bfdiag daemon still starting after {args.wait_s:.0f}s "
-        f"(model load can take minutes for --provider laguna); check {log_path} "
+        "(model load can take minutes for GPU providers like "
+        f"laguna/deepseek_v4); check {log_path} "
         "or run `bf daemon status` again shortly."
     )
     return 0
@@ -303,9 +361,9 @@ def _cmd_daemon_stop(args: argparse.Namespace) -> int:
 def _cmd_daemon_reload(args: argparse.Namespace) -> int:
     """Reload supported hot-path modules through the single engine worker.
 
-    ``LagunaEngineProvider.hot_reload_code`` owns the reset and before/after
-    canary.  Sending it as an ordinary exec also preserves the daemon's FIFO,
-    pre-exec canary, and memory snapshots.
+    The provider's own ``hot_reload_code`` implementation owns the reset and
+    before/after canary. Sending it as an ordinary exec also preserves the
+    daemon's FIFO, pre-exec canary, and memory snapshots.
     """
     client = _client_for(args)
     try:
@@ -313,7 +371,18 @@ def _cmd_daemon_reload(args: argparse.Namespace) -> int:
             "import importlib\n"
             "import bfdiag.daemon.provider as provider_module\n"
             "importlib.reload(provider_module)\n"
-            "provider.__class__ = provider_module.LagunaEngineProvider\n"
+            "provider_class_name = type(provider).__name__\n"
+            "if not hasattr(provider, 'hot_reload_code'):\n"
+            "    raise RuntimeError(\n"
+            "        f'provider {provider_class_name} does not support hot reload; '\n"
+            "        'restart the daemon to pick up code changes'\n"
+            "    )\n"
+            "replacement = getattr(provider_module, provider_class_name, None)\n"
+            "if replacement is None:\n"
+            "    raise RuntimeError(\n"
+            "        f'reloaded provider module does not define {provider_class_name}'\n"
+            "    )\n"
+            "provider.__class__ = replacement\n"
             "result = provider.hot_reload_code()",
             timeout_s=args.timeout_s,
         )

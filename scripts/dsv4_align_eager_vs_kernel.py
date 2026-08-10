@@ -21,6 +21,7 @@ lookup), so no external tokenizer is needed for the parity workloads.
 
 Usage:
     python scripts/dsv4_align_eager_vs_kernel.py <model.gguf> [--steps N]
+    python scripts/dsv4_align_eager_vs_kernel.py <model.gguf> --cuda-graph [--steps N]
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from pathlib import Path
 
 import torch
 
+import runtime
 from runtime.loading.gguf import read_gguf_header
 from runtime.model.dsv4_attn_kernel import Dsv4AttnKernelLayer
 from runtime.model.dsv4_model import (
@@ -44,6 +46,9 @@ WORKLOAD_WORDS = [
     ["Explain", " the", " theory", " of", " relativity", " in", " simple", " terms", ":"],
     ["def", " fibonacci", "(", "n", ")"],
 ]
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+assert Path(runtime.__file__).resolve().is_relative_to(REPO_ROOT), runtime.__file__
 
 
 def _norm(word: str) -> list[str]:
@@ -112,6 +117,118 @@ def reset_all(model: Dsv4Transformer, kernel_layers: list[Dsv4AttnKernelLayer]) 
         layer.reset_caches()
 
 
+def run_cuda_graph_gate(
+    model: Dsv4Transformer,
+    prompts: list[list[int]],
+    *,
+    steps: int,
+    max_seq_len: int,
+    max_q_rows: int,
+) -> None:
+    """Compare continuous kernel-eager decode with the captured full graph.
+
+    Two slot-owned attention stacks share weights but not recursive/cache
+    state. Slot 0 stays eager as the oracle; slot 1 replays its address-bound
+    graph. Both consume the eager stream's token at each position.
+    """
+    from runtime.backends.dsv4 import DeepseekV4Backend
+
+    backend = DeepseekV4Backend(
+        model,
+        model.config,
+        num_slots=2,
+        max_seq_len=max_seq_len,
+        max_q_rows=max_q_rows,
+        device="cuda",
+    )
+    print("capturing per-slot decode graphs ...", flush=True)
+    captured = backend.capture_decode_cuda_graph()
+    if captured != 2:
+        raise RuntimeError(
+            f"DSV4 CUDA Graph gate requires two captured slots, got {captured}; "
+            f"status={backend.snapshot().dflash_cg_status}"
+        )
+    # Slot 0 is the continuous kernel-eager oracle. Keep slot 1's graph.
+    backend._decode_graphs.pop(0)  # noqa: SLF001 -- diagnostic A/B control
+
+    worst_cos = 1.0
+    mismatches = 0
+    total = 0
+    eager_ms: list[float] = []
+    graph_ms: list[float] = []
+    for workload, prompt in enumerate(prompts):
+        backend.reset_slot(0)
+        backend.reset_slot(1)
+        eager_prefill = backend._prefill_logits(0, prompt)  # noqa: SLF001
+        graph_prefill = backend._prefill_logits(1, prompt)  # noqa: SLF001
+        prefill_cos = cosine(eager_prefill, graph_prefill)
+        token = int(eager_prefill[0, -1].argmax().item())
+        graph_token = int(graph_prefill[0, -1].argmax().item())
+        mismatches += int(token != graph_token)
+        total += 1
+        print(
+            f"workload {workload}: prefill cos {prefill_cos:.8f}, "
+            f"anchor eager/graph={token}/{graph_token}",
+            flush=True,
+        )
+
+        for step in range(steps):
+            position = len(prompt) + step
+            ids = torch.tensor([[token]], dtype=torch.long, device="cuda")
+
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            eager_logits = backend._forward(0, ids, position)  # noqa: SLF001
+            torch.cuda.synchronize()
+            eager_ms.append((time.perf_counter() - started) * 1000)
+
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            graph_logits = backend._decode_graphs[1].replay(  # noqa: SLF001
+                1, token, position
+            )
+            torch.cuda.synchronize()
+            graph_ms.append((time.perf_counter() - started) * 1000)
+
+            current_cos = cosine(eager_logits, graph_logits)
+            worst_cos = min(worst_cos, current_cos)
+            token = int(eager_logits[0, 0].argmax().item())
+            graph_token = int(graph_logits[0, 0].argmax().item())
+            mismatches += int(token != graph_token)
+            total += 1
+            for layer in backend.slot_layers[1]:
+                compressors = [layer.compressor]
+                if layer.indexer is not None:
+                    compressors.append(layer.indexer.compressor)
+                for compressor in compressors:
+                    if compressor is not None and torch.isnan(compressor.score_state).any():
+                        raise AssertionError(
+                            f"score_state NaN at workload={workload} step={step} "
+                            f"layer={layer.layer_id}"
+                        )
+            if step < 4 or (step + 1) % 16 == 0:
+                print(
+                    f"  step {step + 1}: cos {current_cos:.8f}, "
+                    f"token eager/graph={token}/{graph_token}, "
+                    f"eager={eager_ms[-1]:.1f}ms graph={graph_ms[-1]:.1f}ms",
+                    flush=True,
+                )
+
+    agreement = (total - mismatches) / total
+    eager_avg = sum(eager_ms) / len(eager_ms)
+    graph_avg = sum(graph_ms) / len(graph_ms)
+    verdict = "PASS" if worst_cos >= 0.99999 and agreement == 1.0 else "REVIEW"
+    print("\n=== DSV4 CUDA Graph gate summary ===")
+    print(f"worst logits cosine: {worst_cos:.8f}")
+    print(f"greedy agreement: {total - mismatches}/{total} ({agreement:.1%})")
+    print(
+        f"mean decode: eager {eager_avg:.1f}ms, graph {graph_avg:.1f}ms "
+        f"({eager_avg / graph_avg:.2f}x)"
+    )
+    print(f"capture status: {backend.snapshot().dflash_cg_status}")
+    print(f"verdict: {verdict}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("gguf", type=str, help="DeepSeek-V4-Flash GGUF file")
@@ -124,8 +241,14 @@ def main() -> None:
         "eager path's MoE dequant and is only for final confirmation)",
     )
     parser.add_argument("--max-seq-len", type=int, default=4096)
-    parser.add_argument("--max-q-rows", type=int, default=0,
-                        help="MLA plan rows (default: largest prompt length)")
+    parser.add_argument(
+        "--max-q-rows", type=int, default=0, help="MLA plan rows (default: largest prompt length)"
+    )
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="compare continuous kernel-eager decode with full CUDA Graph replay",
+    )
     args = parser.parse_args()
 
     device = "cuda"
@@ -145,6 +268,16 @@ def main() -> None:
     # ~11 GB across the 21 ratio-4 layers on top of the 82 GB model).
     plan_rows = args.max_q_rows or max(len(p) for p in prompts)
     print(f"MLA plan rows: {plan_rows}", flush=True)
+
+    if args.cuda_graph:
+        run_cuda_graph_gate(
+            model,
+            prompts,
+            steps=args.steps,
+            max_seq_len=args.max_seq_len,
+            max_q_rows=plan_rows,
+        )
+        return
 
     print("building kernel-path attention layers (shared weights) ...", flush=True)
     kernel_layers = [

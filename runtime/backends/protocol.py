@@ -199,11 +199,18 @@ class BackendSnapshot:
     behavior change. Tuple-of-pairs rather than a dict to keep this
     dataclass's fields all plain immutable values, matching
     ``slots``/``prefix`` above.
+
+    ``runtime_stats`` and ``cg_fallback_reasons`` use the same immutable
+    tuple-of-pairs shape.  They are optional because older backends do not
+    maintain these counters; observability callers can iterate them without
+    reaching into backend-private dictionaries or special-casing a model.
     """
 
     slots: tuple[SlotSnapshot, ...]
     prefix: tuple[PrefixSnapshot, ...]
     dflash_cg_status: tuple[tuple[str, str], ...] = ()
+    runtime_stats: tuple[tuple[str, int], ...] = ()
+    cg_fallback_reasons: tuple[tuple[str, int], ...] = ()
 
 
 @runtime_checkable

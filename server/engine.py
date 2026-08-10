@@ -839,9 +839,7 @@ class ServerEngine:
             )
 
         max_model_len = self.blocks_per_slot * self.block_size
-        model, count = load_dsv4_from_gguf(
-            self.MODEL, max_seq_len=max_model_len, device="cuda"
-        )
+        model, count = load_dsv4_from_gguf(self.MODEL, max_seq_len=max_model_len, device="cuda")
         logger.info(
             "DeepSeek-V4-Flash GGUF loaded: %d tensors, max_context=%d tokens/slot",
             count,
@@ -860,15 +858,18 @@ class ServerEngine:
             max_q_rows=int(os.environ.get("QSR_DSV4_PREFILL_ROWS", "32")),
             device="cuda",
         )
-        # Warm nothing yet: the first forward compiles the fork MLA kernels
-        # (disk-cached; the compile happens inside the first request and the
-        # request pays it once).  CUDA Graph capture for DSV4 is Phase 4
-        # follow-up (compressed_mla replay-state mode).
         if self._enable_cudagraph:
-            logger.warning(
-                "deepseek_v4: decode CUDA Graph not implemented yet; serving eager "
-                "(QSR_SERVER_ENABLE_CUDAGRAPH=1 has no effect for this backend)"
-            )
+            graph_batches = self.runner.capture_decode_cuda_graph()
+            if graph_batches is not None:
+                logger.info(
+                    "DeepSeek-V4 decode CUDA Graph captured at load for %d batch buckets",
+                    graph_batches,
+                )
+            else:
+                logger.warning(
+                    "DeepSeek-V4 decode CUDA Graph capture failed or unavailable; "
+                    "falling back to eager decode"
+                )
         logger.info(
             "DeepSeek-V4-Flash model loaded on engine thread: num_slots=%d "
             "max_context=%d tokens/slot",

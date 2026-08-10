@@ -92,13 +92,19 @@ _INT64_FIELDS = (
     "round_idx",
     "slot",
     "kv_len_before",
+    "position",
+    "row_count",
+    "compressor_ratio",
+    "window_entries",
+    "ratio4_entries",
+    "ratio128_entries",
     "draft_tokens_n",
     "accepted_n",
     "reject_position",
     "bonus_token",
     "mem_allocated",
 )
-_INT8_FIELDS = ("path", "cg_miss_reason", "valid")
+_INT8_FIELDS = ("event_kind", "path", "cg_miss_reason", "valid")
 
 
 class RoundRing:
@@ -136,6 +142,13 @@ class RoundRing:
         self._cols["round_idx"][row] = self._written
         self._cols["slot"][row] = slot
         self._cols["kv_len_before"][row] = kv_len_before
+        self._cols["position"][row] = -1
+        self._cols["row_count"][row] = 0
+        self._cols["compressor_ratio"][row] = -1
+        self._cols["window_entries"][row] = 0
+        self._cols["ratio4_entries"][row] = 0
+        self._cols["ratio128_entries"][row] = 0
+        self._cols["event_kind"][row] = int(events.EventKind.DECODE_ROUND)
         self._cols["valid"][row] = 0
         self._timer.begin(row)
         self._phase_codes[row * events.MAX_MARKS_PER_ROUND] = events.PHASE_START
@@ -170,9 +183,23 @@ class RoundRing:
         accepted_n: int,
         reject_position: int,
         bonus_token: int,
+        event_kind: int = events.EventKind.DECODE_ROUND,
+        position: int = -1,
+        row_count: int = 0,
+        compressor_ratio: int = -1,
+        window_entries: int = 0,
+        ratio4_entries: int = 0,
+        ratio128_entries: int = 0,
         mem_allocated: int = 0,
     ) -> None:
         self.mark(row, phase)  # inherits the QSR_FORCE_SYNC check above
+        self._cols["event_kind"][row] = int(event_kind)
+        self._cols["position"][row] = position
+        self._cols["row_count"][row] = row_count
+        self._cols["compressor_ratio"][row] = compressor_ratio
+        self._cols["window_entries"][row] = window_entries
+        self._cols["ratio4_entries"][row] = ratio4_entries
+        self._cols["ratio128_entries"][row] = ratio128_entries
         self._cols["path"][row] = int(path)
         self._cols["cg_miss_reason"][row] = int(cg_miss_reason)
         self._cols["draft_tokens_n"][row] = draft_tokens_n
@@ -229,6 +256,13 @@ class RoundRing:
             t_verify=durations["t_verify"],
             t_commit=durations["t_commit"],
             t_round=durations["t_round"],
+            event_kind=events.event_kind_label(self._cols["event_kind"][row]),
+            position=self._cols["position"][row],
+            row_count=self._cols["row_count"][row],
+            compressor_ratio=self._cols["compressor_ratio"][row],
+            window_entries=self._cols["window_entries"][row],
+            ratio4_entries=self._cols["ratio4_entries"][row],
+            ratio128_entries=self._cols["ratio128_entries"][row],
         )
 
 
@@ -261,6 +295,17 @@ def mark(row: int, phase: int) -> None:
 
 def finish_round(row: int, phase: int, **kwargs: Any) -> None:
     _ring.finish_round(row, phase, **kwargs)  # type: ignore[union-attr]
+
+
+def _split_dsv4_compressed_entries(
+    compressor_ratio: int,
+    compressed_entries: int,
+) -> tuple[int, int]:
+    if compressor_ratio == 4:
+        return compressed_entries, 0
+    if compressor_ratio == 128:
+        return 0, compressed_entries
+    return 0, 0
 
 
 def finish_dflash_round(
@@ -303,6 +348,129 @@ def finish_dflash_round(
     )
 
 
+def record_dsv4_prefill_chunk(
+    slot: int,
+    kv_len_before: int,
+    *,
+    position: int,
+    row_count: int,
+    compressor_ratio: int,
+    window_entries: int,
+    compressed_entries: int,
+) -> None:
+    """One-shot DSV4 prefill-chunk record.
+
+    Prefill may emit layer-specific chunk events, so ``compressor_ratio`` is
+    recorded directly and the compressed-entry count is stored in the ratio-4
+    or ratio-128 column according to that ratio.
+    """
+    ratio4_entries, ratio128_entries = _split_dsv4_compressed_entries(
+        compressor_ratio, compressed_entries
+    )
+    row = begin_round(slot, kv_len_before)
+    finish_dsv4_prefill_chunk(
+        row,
+        position=position,
+        row_count=row_count,
+        compressor_ratio=compressor_ratio,
+        window_entries=window_entries,
+        ratio4_entries=ratio4_entries,
+        ratio128_entries=ratio128_entries,
+    )
+
+
+def finish_dsv4_prefill_chunk(
+    row: int,
+    *,
+    position: int,
+    row_count: int,
+    compressor_ratio: int,
+    window_entries: int,
+    ratio4_entries: int,
+    ratio128_entries: int,
+) -> None:
+    """Finish a prefill row begun before the real forward executes."""
+    finish_round(
+        row,
+        events.PHASE_VERIFY,
+        event_kind=events.EventKind.PREFILL_CHUNK,
+        position=position,
+        row_count=row_count,
+        compressor_ratio=compressor_ratio,
+        window_entries=window_entries,
+        ratio4_entries=ratio4_entries,
+        ratio128_entries=ratio128_entries,
+        path=events.Path.EAGER,
+        cg_miss_reason=events.CgMissReason.NONE,
+        draft_tokens_n=0,
+        accepted_n=1,
+        reject_position=-1,
+        bonus_token=-1,
+    )
+
+
+def record_dsv4_decode_round(
+    slot: int,
+    kv_len_before: int,
+    *,
+    position: int,
+    row_count: int,
+    path: int,
+    cg_miss_reason: int,
+    window_entries: int,
+    ratio4_entries: int,
+    ratio128_entries: int,
+) -> None:
+    """One-shot DSV4 decode-round record.
+
+    A single decode round stays a single row even when it touches both the
+    ratio-4 and ratio-128 compressed regions; this preserves round counts and
+    CUDA-Graph hit-rate accounting.
+    """
+    row = begin_round(slot, kv_len_before)
+    finish_dsv4_decode_round(
+        row,
+        position=position,
+        row_count=row_count,
+        path=path,
+        cg_miss_reason=cg_miss_reason,
+        window_entries=window_entries,
+        ratio4_entries=ratio4_entries,
+        ratio128_entries=ratio128_entries,
+    )
+
+
+def finish_dsv4_decode_round(
+    row: int,
+    *,
+    position: int,
+    row_count: int,
+    path: int,
+    cg_miss_reason: int,
+    window_entries: int,
+    ratio4_entries: int,
+    ratio128_entries: int,
+) -> None:
+    """Finish a decode row begun before graph replay/eager execution."""
+    finish_round(
+        row,
+        events.PHASE_VERIFY,
+        event_kind=events.EventKind.DECODE_ROUND,
+        position=position,
+        row_count=row_count,
+        compressor_ratio=-1,
+        window_entries=window_entries,
+        ratio4_entries=ratio4_entries,
+        ratio128_entries=ratio128_entries,
+        path=path,
+        cg_miss_reason=cg_miss_reason,
+        draft_tokens_n=0,
+        accepted_n=1,
+        reject_position=-1,
+        bonus_token=-1,
+    )
+
+
 def record_decode_batch_path(
     slot_ids: list[int],
     kv_lengths: list[int],
@@ -342,6 +510,7 @@ def record_simple(slot: int, kv_len_before: int, path: int, cg_miss_reason: int)
     finish_round(
         row,
         events.PHASE_VERIFY,
+        event_kind=events.EventKind.DECODE_ROUND,
         path=path,
         cg_miss_reason=cg_miss_reason,
         draft_tokens_n=0,

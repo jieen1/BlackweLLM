@@ -182,8 +182,8 @@ def test_window_indices_chunk_matches_single_shot() -> None:
     window [p-win+1, p] maps to ring slots pos%win.  The single-shot
     prefill (start_pos=0) reads absolute positions; converting its rows to
     ring slots must reproduce the chunk rows' valid subsequences (the
-    kernel skips -1, so padding placement is irrelevant; the ORDER of
-    valid slots is what matters).
+    kernel consumes only the first ``swa_topk_length`` entries, so the valid
+    slots must be a prefix and ``-1`` padding must trail them.
     """
     win, bsz = TINY.window_size, 1
     start_pos, seqlen = 5, 6  # crosses the window boundary at p=7
@@ -196,6 +196,9 @@ def test_window_indices_chunk_matches_single_shot() -> None:
         valid_c = [int(v) for v in row_c if v >= 0]
         valid_a = [int(v % win) for v in row_a if v >= 0]
         assert valid_c == valid_a, f"{valid_c} != {valid_a}"
+        valid_length = len(valid_c)
+        assert (row_c[:valid_length] >= 0).all()
+        assert (row_c[valid_length:] == -1).all()
 
 
 def test_window_indices_ring_order_for_late_rows() -> None:

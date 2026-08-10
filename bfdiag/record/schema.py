@@ -63,14 +63,25 @@ class ModelInfo:
 
 @dataclass
 class WorkloadInfo:
+    # Stable workload identity.  These fields are first-class because a
+    # benchmark contract change must make ``bf diff`` refuse comparison,
+    # rather than hiding under ``fingerprint.extra.workload_extra``.
+    contract: str | None = None
+    contract_version: int | None = None
+    workload_name: str | None = None
     prompt_hash: str | None = None
     prompt_len: int | None = None
+    generated_tokens: int | None = None
+    batch: int | None = None
     k: int | None = None
     seed: int | None = None
     greedy: bool | None = None
     block_size: int | None = None
     capacity: int | None = None
     max_model_len: int | None = None
+    max_q_rows: int | None = None
+    cuda_graph_status: str | None = None
+    warm_only: bool | None = None
     # Blocks reserved per slot. NOT a capacity knob: it sets the
     # sparkinfer decode workspace's ``max_pages`` for full-attention
     # groups (``runtime/backends/laguna_cuda_graph.py``), which can change

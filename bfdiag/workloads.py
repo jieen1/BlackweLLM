@@ -32,9 +32,7 @@ def summarize_sparkinfer_workspace_pools(
         for key, arena in pool.core_arenas.items():
             plan = arena.plan
             views = [dict(view) for view in view_mapper(plan)]
-            arena_nbytes = int(
-                arena.shared_arena.numel() * arena.shared_arena.element_size()
-            )
+            arena_nbytes = int(arena.shared_arena.numel() * arena.shared_arena.element_size())
             arenas.append(
                 {
                     "workspace_key": repr(key),
@@ -125,10 +123,7 @@ def capture_dynamic_route_tile_trace(backend: Any) -> dict[str, int]:
     ]
     if not candidates:
         raise RuntimeError("no dynamic SparkInfer workspace was materialized")
-    snapshots = [
-        (sum(workspace.row_counts.cpu().tolist()), workspace)
-        for workspace in candidates
-    ]
+    snapshots = [(sum(workspace.row_counts.cpu().tolist()), workspace) for workspace in candidates]
     routed_rows, workspace = max(snapshots, key=lambda item: item[0])
     if routed_rows <= 0:
         capacities = [int(workspace.routed_rows_capacity) for workspace in candidates]
@@ -180,6 +175,7 @@ def audit_sparkinfer_workspace(backend: Any) -> dict[str, Any]:
             rec.metric(f"route_tile_{name}", value)
         run_id = rec.run_id
     return {"run_id": run_id, **report}
+
 
 HISTORICAL_M1_CONTEXT_TOKENS = 65_536
 HISTORICAL_M1_SUFFIX_TOKENS = 10_240
@@ -257,9 +253,7 @@ def historical_dflash_m16_prompt_ids(
     big = text * max(chars_needed // max(len(text), 1) + 1, 10)
     ids = tokenizer.encode(big, add_special_tokens=False)
     if len(ids) < length:
-        raise ValueError(
-            f"tokenizer produced only {len(ids)} tokens, need {length}"
-        )
+        raise ValueError(f"tokenizer produced only {len(ids)} tokens, need {length}")
     return ids[:length]
 
 
@@ -422,9 +416,7 @@ def _repeat_tokenized_text(tokenizer: Any, text: str, length: int) -> list[int]:
     big = text * max(chars_needed // max(len(text), 1) + 1, 10)
     ids = tokenizer.encode(big, add_special_tokens=False)
     if len(ids) < length:
-        raise ValueError(
-            f"tokenizer produced only {len(ids)} tokens, need {length}"
-        )
+        raise ValueError(f"tokenizer produced only {len(ids)} tokens, need {length}")
     return ids[:length]
 
 
@@ -447,6 +439,357 @@ def historical_dflash_prefix_prompt_ids(tokenizer: Any) -> tuple[list[int], list
 
 def _token_ids_hash(token_ids: list[int]) -> str:
     return hashlib.sha256(b"".join(token.to_bytes(4, "little") for token in token_ids)).hexdigest()
+
+
+DSV4_WARM_BASELINE_CONTRACT = "dsv4-warm-baseline"
+DSV4_WARM_BASELINE_VERSION = 1
+DSV4_WARM_BASELINE_GENERATED_TOKENS = 64
+DSV4_WARM_BASELINE_SPECS = (
+    {
+        "name": "chat-short-96",
+        "kind": "chat",
+        "prompt_len": 96,
+        "text": (
+            "<|system|>\nYou are concise and exact.\n<|user|>\n"
+            "Summarize why compressed attention helps long-context inference "
+            "in two short sentences.\n<|assistant|>\n"
+        ),
+    },
+    {
+        "name": "chat-cross-128",
+        "kind": "chat",
+        "prompt_len": 129,
+        "text": (
+            "<|system|>\nYou are a runtime debugging assistant.\n<|user|>\n"
+            "List three likely causes of a decode-only throughput regression "
+            "after a graph-capture change, and keep each cause to one line.\n"
+            "<|assistant|>\n"
+        ),
+    },
+    {
+        "name": "code-instruction-cross-256",
+        "kind": "code_instruction",
+        "prompt_len": 257,
+        "text": (
+            "You are reviewing a Python inference runtime.\n"
+            "Task: explain the control flow, then rewrite the function so it "
+            "returns both the running mean and the final token budget.\n\n"
+            "```python\n"
+            "def summarize(values):\n"
+            "    total = 0\n"
+            "    count = 0\n"
+            "    for value in values:\n"
+            "        total += value\n"
+            "        count += 1\n"
+            "    return total / max(count, 1)\n"
+            "```\n\n"
+            "Constraints:\n"
+            "- preserve deterministic behavior\n"
+            "- keep intermediate names explicit\n"
+            "- mention any state that must be reset between runs\n"
+        ),
+    },
+)
+
+
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    if not 0.0 <= q <= 1.0:
+        raise ValueError("percentile q must be within [0, 1]")
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    idx = q * (len(ordered) - 1)
+    lo = int(idx)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = idx - lo
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
+
+
+def _nested_token_ids_hash(token_groups: list[list[int]]) -> str:
+    payload = json.dumps(token_groups, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _cuda_synchronize() -> None:
+    import torch
+
+    torch.cuda.synchronize()
+
+
+def _cuda_reset_peak_memory_stats() -> None:
+    import torch
+
+    torch.cuda.reset_peak_memory_stats()
+
+
+def _cuda_max_memory_allocated() -> int:
+    import torch
+
+    return int(torch.cuda.max_memory_allocated())
+
+
+def dsv4_warm_baseline_workloads(tokenizer: Any) -> list[dict[str, Any]]:
+    """Build the fixed tokenizer-derived DSV4 warm-baseline prompt set."""
+    workloads = []
+    for spec in DSV4_WARM_BASELINE_SPECS:
+        prompt_ids = _repeat_tokenized_text(tokenizer, spec["text"], spec["prompt_len"])
+        workloads.append(
+            {
+                "name": spec["name"],
+                "kind": spec["kind"],
+                "prompt_ids": prompt_ids,
+                "prompt_len": len(prompt_ids),
+                "prompt_hash": _token_ids_hash(prompt_ids),
+            }
+        )
+    return workloads
+
+
+def _dsv4_decode_graph_status(backend: Any) -> str:
+    snapshot = getattr(backend, "snapshot", None)
+    if not callable(snapshot):
+        return "unknown"
+    try:
+        status = dict(snapshot().dflash_cg_status)
+    except Exception:
+        return "unknown"
+    return str(status.get("decode", "unknown"))
+
+
+def _dsv4_model_identity(backend: Any) -> dict[str, str]:
+    identity = getattr(backend, "bfdiag_model_identity", None)
+    if not isinstance(identity, dict) or not identity.get("path") or not identity.get("revision"):
+        raise RuntimeError(
+            "DSV4 warm baseline requires backend.bfdiag_model_identity with "
+            "non-empty path and revision; load it through DeepseekV4EngineProvider"
+        )
+    return {"path": str(identity["path"]), "revision": str(identity["revision"])}
+
+
+def _run_dsv4_warm_baseline_sample(
+    backend: Any,
+    prompt_ids: list[int],
+    *,
+    batch: int,
+    generated_tokens: int,
+    synchronize: Callable[[], None] = _cuda_synchronize,
+    reset_peak_memory: Callable[[], None] = _cuda_reset_peak_memory_stats,
+    peak_memory_allocated: Callable[[], int] = _cuda_max_memory_allocated,
+    clock: Callable[[], float] = time.perf_counter,
+) -> dict[str, Any]:
+    if batch < 1:
+        raise ValueError("batch must be positive")
+    if generated_tokens < 2:
+        raise ValueError("generated_tokens must be at least two")
+
+    from runtime.sampling import SamplingParams
+
+    slots = list(range(batch))
+    params = [SamplingParams(temperature=0.0) for _ in slots]
+    slot_outputs = [[] for _ in slots]
+    decode_itl_ms: list[float] = []
+
+    try:
+        reset_peak_memory()
+        synchronize()
+        prefill_start = clock()
+        current_tokens = []
+        for slot_index, slot in enumerate(slots):
+            token = int(backend.prefill(slot, prompt_ids))
+            current_tokens.append(token)
+            slot_outputs[slot_index].append(token)
+        synchronize()
+        prefill_s = clock() - prefill_start
+
+        for _ in range(generated_tokens - 1):
+            kv_lengths = [int(backend.slot_state(slot).kv_len) for slot in slots]
+            synchronize()
+            step_start = clock()
+            next_tokens = backend.decode_batch_sampled(slots, current_tokens, kv_lengths, params)
+            synchronize()
+            decode_itl_ms.append((clock() - step_start) * 1000.0)
+            current_tokens = [int(token) for token in next_tokens]
+            for slot_index, token in enumerate(current_tokens):
+                slot_outputs[slot_index].append(token)
+        peak_memory_allocated_bytes = peak_memory_allocated()
+    finally:
+        for slot in slots:
+            backend.reset_slot(slot)
+
+    prefill_tokens = len(prompt_ids) * batch
+    decode_steps = generated_tokens - 1
+    decode_s = sum(decode_itl_ms) / 1000.0
+    return {
+        "batch": batch,
+        "prompt_len": len(prompt_ids),
+        "generated_tokens": generated_tokens,
+        "prefill_s": prefill_s,
+        "prefill_tok_s": prefill_tokens / prefill_s if prefill_s > 0.0 else 0.0,
+        "decode_s": decode_s,
+        "decode_steps": decode_steps,
+        "itl_p50_ms": _percentile(decode_itl_ms, 0.50),
+        "itl_p95_ms": _percentile(decode_itl_ms, 0.95),
+        "tok_s": decode_steps / decode_s if decode_s > 0.0 else 0.0,
+        "aggregate_tok_s": (decode_steps * batch) / decode_s if decode_s > 0.0 else 0.0,
+        "output_hash": _nested_token_ids_hash(slot_outputs),
+        "slot_output_hashes": [_token_ids_hash(tokens) for tokens in slot_outputs],
+        "slot_outputs": slot_outputs,
+        "decode_itl_ms": decode_itl_ms,
+        "peak_memory_allocated_bytes": peak_memory_allocated_bytes,
+    }
+
+
+def run_dsv4_warm_baseline_case(
+    backend: Any,
+    tokenizer: Any,
+    *,
+    workload_name: str,
+    batch: int = 1,
+    generated_tokens: int = DSV4_WARM_BASELINE_GENERATED_TOKENS,
+) -> dict[str, Any]:
+    """Run one warm DSV4 baseline case.
+
+    This measures an already-loaded backend only. It intentionally excludes
+    model load, first-process initialization, and cold-TTFT claims; use a
+    cold-process workflow for those questions.
+    """
+    if generated_tokens < 2:
+        raise ValueError("generated_tokens must be at least two")
+    if batch not in (1, 2, 4):
+        raise ValueError("batch must be 1, 2, or 4")
+    if batch > int(backend.num_slots):
+        raise ValueError(f"batch={batch} requires backend.num_slots>={batch}")
+
+    workload = next(
+        (item for item in dsv4_warm_baseline_workloads(tokenizer) if item["name"] == workload_name),
+        None,
+    )
+    if workload is None:
+        known = ", ".join(spec["name"] for spec in DSV4_WARM_BASELINE_SPECS)
+        raise ValueError(f"unknown workload_name {workload_name!r}; expected one of: {known}")
+
+    model_identity = _dsv4_model_identity(backend)
+    # Prime the exact path once before the measured sample so the result is a
+    # warm-engine decode baseline rather than a first-touch artifact.
+    warmup = _run_dsv4_warm_baseline_sample(
+        backend,
+        workload["prompt_ids"],
+        batch=batch,
+        generated_tokens=generated_tokens,
+    )
+    graph_capture_status = _dsv4_decode_graph_status(backend)
+    with run_record(
+        script=__file__,
+        model=model_identity,
+        workload={
+            "contract": DSV4_WARM_BASELINE_CONTRACT,
+            "contract_version": DSV4_WARM_BASELINE_VERSION,
+            "workload_name": workload["name"],
+            "prompt_hash": workload["prompt_hash"],
+            "prompt_len": workload["prompt_len"],
+            "generated_tokens": generated_tokens,
+            "batch": batch,
+            "max_model_len": int(backend.max_seq_len),
+            "max_q_rows": int(backend.max_q_rows),
+            "capacity": int(backend.num_slots),
+            "cuda_graph_status": graph_capture_status,
+            "warm_only": True,
+        },
+        extra={
+            "workload_extra": {
+                "kind": workload["kind"],
+                "graph_capture_status": graph_capture_status,
+                "warm_only": True,
+            }
+        },
+    ) as rec:
+        result = _run_dsv4_warm_baseline_sample(
+            backend,
+            workload["prompt_ids"],
+            batch=batch,
+            generated_tokens=generated_tokens,
+        )
+        if result["output_hash"] != warmup["output_hash"]:
+            raise AssertionError(
+                "DSV4 warm baseline output changed between identical reset runs: "
+                f"warmup={warmup['output_hash']} measured={result['output_hash']}"
+            )
+        rec.metric("prefill_tok_s", result["prefill_tok_s"])
+        rec.metric("decode_tok_s", result["tok_s"])
+        rec.metric("aggregate_tok_s", result["aggregate_tok_s"])
+        rec.metric("itl_p50_ms", result["itl_p50_ms"])
+        rec.metric("itl_p95_ms", result["itl_p95_ms"])
+        rec.metric("prefill_s", result["prefill_s"])
+        rec.metric("decode_s", result["decode_s"])
+        rec.metric("peak_memory_allocated_bytes", result["peak_memory_allocated_bytes"])
+        rec.record.fingerprint.extra["output_hash"] = result["output_hash"]
+        rec.record.fingerprint.extra["slot_output_hashes"] = result["slot_output_hashes"]
+        rec.record.fingerprint.extra["decode_itl_ms"] = result["decode_itl_ms"]
+        run_id = rec.run_id
+
+    return {
+        "run_id": run_id,
+        "contract": DSV4_WARM_BASELINE_CONTRACT,
+        "contract_version": DSV4_WARM_BASELINE_VERSION,
+        "workload_name": workload["name"],
+        "workload_kind": workload["kind"],
+        "prompt_hash": workload["prompt_hash"],
+        "prompt_len": workload["prompt_len"],
+        "generated_tokens": generated_tokens,
+        "batch": batch,
+        "max_model_len": int(backend.max_seq_len),
+        "max_q_rows": int(backend.max_q_rows),
+        "num_slots": int(backend.num_slots),
+        "graph_capture_status": graph_capture_status,
+        **result,
+    }
+
+
+def run_dsv4_warm_baseline(
+    backend: Any,
+    tokenizer: Any,
+    *,
+    generated_tokens: int = DSV4_WARM_BASELINE_GENERATED_TOKENS,
+) -> dict[str, Any]:
+    """Run the fixed DSV4 warm-baseline suite for native B=1/2/4 buckets.
+
+    This suite is only for a warm, already-loaded backend. It is not valid
+    evidence for cold load cost, cold TTFT, or first-touch initialization.
+    """
+    if generated_tokens < 2:
+        raise ValueError("generated_tokens must be at least two")
+
+    results = []
+    for workload in dsv4_warm_baseline_workloads(tokenizer):
+        results.append(
+            run_dsv4_warm_baseline_case(
+                backend,
+                tokenizer,
+                workload_name=workload["name"],
+                batch=1,
+                generated_tokens=generated_tokens,
+            )
+        )
+        for batch in (2, 4):
+            if int(backend.num_slots) < batch:
+                continue
+            results.append(
+                run_dsv4_warm_baseline_case(
+                    backend,
+                    tokenizer,
+                    workload_name=workload["name"],
+                    batch=batch,
+                    generated_tokens=generated_tokens,
+                )
+            )
+    return {
+        "contract": DSV4_WARM_BASELINE_CONTRACT,
+        "contract_version": DSV4_WARM_BASELINE_VERSION,
+        "generated_tokens": generated_tokens,
+        "results": results,
+    }
 
 
 def _tensor_content_hash(tensor: Any) -> str:
@@ -730,9 +1073,7 @@ def check_dflash_verify_cg_parity(
                     else None
                 )
                 eager_decision = (
-                    eager_decisions[mismatch_step]
-                    if mismatch_step < len(eager_decisions)
-                    else None
+                    eager_decisions[mismatch_step] if mismatch_step < len(eager_decisions) else None
                 )
                 raise AssertionError(
                     "DFlash captured/eager verify parity diverged at step "
@@ -846,9 +1187,7 @@ def diagnose_dflash_verify_cg_divergence(
         "logits_rmse": float(logits_delta.square().mean().sqrt()),
         "captured_logits_hash": _tensor_content_hash(captured["logits"]),
         "eager_logits_hash": _tensor_content_hash(eager["logits"]),
-        "captured_aux_hashes": [
-            _tensor_content_hash(item) for item in captured["aux"] or []
-        ],
+        "captured_aux_hashes": [_tensor_content_hash(item) for item in captured["aux"] or []],
         "eager_aux_hashes": [_tensor_content_hash(item) for item in eager["aux"] or []],
         "aux": aux_report,
     }
@@ -1753,9 +2092,7 @@ def profile_laguna_target_shape_matrix(
 
     backend = engine.backend
     required_tokens = HISTORICAL_DFLASH_M16_CONTEXT_TOKENS + max(shapes)
-    required_blocks = (
-        required_tokens + backend.block_size - 1
-    ) // backend.block_size
+    required_blocks = (required_tokens + backend.block_size - 1) // backend.block_size
     if backend.block_size != HISTORICAL_DFLASH_PREFIX_BLOCK_SIZE:
         raise ValueError(
             "target shape profiler requires "
@@ -1817,9 +2154,7 @@ def profile_laguna_target_shape_matrix(
                 torch.cuda.synchronize()
                 table_path = artifacts / f"cuda_profile_m{shape}.txt"
                 table_path.write_text(
-                    profiler.key_averages().table(
-                        sort_by="self_cuda_time_total", row_limit=120
-                    )
+                    profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=120)
                 )
                 rec.artifact(f"cuda_profile_m{shape}", table_path)
                 rec.metric(f"m{shape}_replays", replays_per_shape)
@@ -1899,8 +2234,12 @@ def capture_laguna_route_histograms(
         for shape in shapes:
             captures.clear()
             backend._forward(
-                [0], list(range(1000, 1000 + shape)), [kv_len],
-                qo_len=shape, is_decode=False, skip_logits=True,
+                [0],
+                list(range(1000, 1000 + shape)),
+                [kv_len],
+                qo_len=shape,
+                is_decode=False,
+                skip_logits=True,
             )
             if len(captures) != 47:
                 raise RuntimeError(f"M={shape} captured {len(captures)} MoE layers, expected 47")
@@ -2190,8 +2529,7 @@ def _first_verify_round_divergence(
                     "candidate": actual_committed,
                 }
             prefix_drafts_match = (
-                expected["draft_tokens"][:first_position]
-                == actual["draft_tokens"][:first_position]
+                expected["draft_tokens"][:first_position] == actual["draft_tokens"][:first_position]
             )
             expected_top1 = expected["positions"][first_position]["top1_tok"]
             actual_top1 = actual["positions"][first_position]["top1_tok"]

@@ -121,13 +121,14 @@ def _reset_trace_for_record() -> Any | None:
     return ring
 
 
-def _write_record_trace(trace_ring: Any, store: RunStore, run_id: str) -> None:
+def _write_record_trace(trace_ring: Any, store: RunStore, run_id: str) -> Path | None:
     """Flush a trace-enabled record before a long-lived daemon continues."""
     from bfdiag.trace import dump
 
     ring = trace_ring.get_ring()
     if ring is not None:
-        dump.write_trace(ring, store.run_dir(run_id) / "trace.jsonl")
+        return dump.write_trace(ring, store.run_dir(run_id) / "trace.jsonl")
+    return None
 
 
 @contextlib.contextmanager
@@ -180,5 +181,8 @@ def run_record(
         active_store.save(record)
     finally:
         if trace_ring is not None:
-            _write_record_trace(trace_ring, active_store, record.run_id)
+            trace_path = _write_record_trace(trace_ring, active_store, record.run_id)
+            if trace_path is not None:
+                record.trace_path = str(trace_path.relative_to(active_store.root))
+                active_store.save(record)
         _restore_env(env_tokens)

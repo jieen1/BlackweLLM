@@ -84,6 +84,7 @@ def compute_stats(rows: list[RoundEvent]) -> RunStats:
     num_rounds = len(rows)
     dropped = rows[0].round_idx if rows else 0
     dflash_rows = [r for r in rows if r.draft_tokens_n > 0]
+    decode_rows = [r for r in rows if r.event_kind == "decode_round"]
 
     total_draft = sum(r.draft_tokens_n for r in dflash_rows)
     total_accepted = sum(r.accepted_n for r in dflash_rows)
@@ -94,12 +95,12 @@ def compute_stats(rows: list[RoundEvent]) -> RunStats:
         reject_hist[r.reject_position] = reject_hist.get(r.reject_position, 0) + 1
 
     path_counts: dict[str, int] = {}
-    for r in rows:
+    for r in decode_rows:
         path_counts[r.path] = path_counts.get(r.path, 0) + 1
-    cg_hit_rate = (path_counts.get("cg_replay", 0) / num_rounds) if num_rounds else 0.0
+    cg_hit_rate = (path_counts.get("cg_replay", 0) / len(decode_rows)) if decode_rows else 0.0
 
     miss_reason_hist: dict[str, int] = {}
-    for r in rows:
+    for r in decode_rows:
         if r.path != "cg_replay":
             miss_reason_hist[r.cg_miss_reason] = miss_reason_hist.get(r.cg_miss_reason, 0) + 1
 
@@ -159,13 +160,16 @@ def render_round_table(rows: list[RoundEvent], limit: int = 50) -> str:
     """Per-round table, most recent ``limit`` rows (0 = all)."""
     shown = rows if limit <= 0 else rows[-limit:]
     header = (
-        f"{'round':>6} {'slot':>4} {'kv_before':>9} {'path':>10} {'miss_reason':>20} "
-        f"{'draft_n':>7} {'acc_n':>5} {'rej_pos':>7} {'t_round(ms)':>11}"
+        f"{'round':>6} {'slot':>4} {'kind':>13} {'pos':>6} {'rows':>5} {'ratio':>5} "
+        f"{'win':>5} {'r4':>5} {'r128':>5} {'kv_before':>9} {'path':>10} "
+        f"{'miss_reason':>20} {'draft_n':>7} {'acc_n':>5} {'rej_pos':>7} {'t_round(ms)':>11}"
     )
     lines = [header, "-" * len(header)]
     for r in shown:
         lines.append(
-            f"{r.round_idx:>6} {r.slot:>4} {r.kv_len_before:>9} {r.path:>10} "
+            f"{r.round_idx:>6} {r.slot:>4} {r.event_kind:>13} {r.position:>6} {r.row_count:>5} "
+            f"{r.compressor_ratio:>5} {r.window_entries:>5} {r.ratio4_entries:>5} "
+            f"{r.ratio128_entries:>5} {r.kv_len_before:>9} {r.path:>10} "
             f"{r.cg_miss_reason:>20} {r.draft_tokens_n:>7} {r.accepted_n:>5} "
             f"{r.reject_position:>7} {r.t_round:>11.3f}"
         )
@@ -238,7 +242,14 @@ def render_json(rows: list[RoundEvent], stats: RunStats) -> str:
 # they vary run to run even when nothing is structurally wrong, so a diff
 # based on them would never stabilize.
 _DIFF_FIELDS = (
+    "event_kind",
     "slot",
+    "position",
+    "row_count",
+    "compressor_ratio",
+    "window_entries",
+    "ratio4_entries",
+    "ratio128_entries",
     "kv_len_before",
     "path",
     "cg_miss_reason",

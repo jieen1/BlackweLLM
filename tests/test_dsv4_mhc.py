@@ -13,11 +13,11 @@ import pytest
 torch = pytest.importorskip("torch")
 triton = pytest.importorskip("triton")
 
-from runtime.kernels.dsv4_mhc import hc_fused_pre  # noqa: E402
+from runtime.kernels.dsv4_mhc import hc_fused_post, hc_fused_pre  # noqa: E402
 from runtime.model.dsv4_config import Dsv4Config  # noqa: E402
 from runtime.model.dsv4_model import hc_split_sinkhorn  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+CUDA_REQUIRED = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 
 CONFIG = Dsv4Config()
 HC_MULT = CONFIG.hc_mult  # 4
@@ -48,6 +48,7 @@ def eager_pre(x: torch.Tensor, hc_fn_f32: torch.Tensor, scale, base):
     return y.to(dtype), post[0], comb[0]
 
 
+@CUDA_REQUIRED
 @pytest.mark.parametrize("tokens", [1, 7, 64])
 def test_hc_fused_matches_eager(tokens: int) -> None:
     device = "cuda"
@@ -89,6 +90,7 @@ def test_hc_fused_matches_eager(tokens: int) -> None:
     assert comb_max <= 5e-2, f"comb diverges: {comb_max}"
 
 
+@CUDA_REQUIRED
 def test_hc_fused_output_contract() -> None:
     device = "cuda"
     gen = torch.Generator(device=device).manual_seed(9)
@@ -107,3 +109,36 @@ def test_hc_fused_output_contract() -> None:
     # reference sinkhorn invariant: column sums drift, rows do not (verified
     # property of the reference loop ending on a column normalize)
     assert torch.isfinite(post).all() and torch.isfinite(comb).all()
+
+
+@CUDA_REQUIRED
+@pytest.mark.parametrize("tokens", [1, 7])
+def test_hc_fused_post_is_bit_exact(tokens: int) -> None:
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(20260819 + tokens)
+    x = torch.randn(
+        tokens,
+        CONFIG.hidden_size,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    residual = torch.randn(
+        tokens,
+        HC_MULT,
+        CONFIG.hidden_size,
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    post = torch.sigmoid(torch.randn(tokens, HC_MULT, generator=generator, device=device)) * 2
+    comb = torch.softmax(
+        torch.randn(tokens, HC_MULT, HC_MULT, generator=generator, device=device), dim=-1
+    )
+    expected = (
+        post.unsqueeze(-1) * x.unsqueeze(-2)
+        + (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(dim=1)
+    ).to(torch.bfloat16)
+
+    actual = hc_fused_post(x, residual, post, comb)
+    assert torch.equal(actual, expected)

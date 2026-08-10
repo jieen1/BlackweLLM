@@ -30,6 +30,7 @@ from bfdiag.daemon.client import Client, DaemonNotRunning
 from bfdiag.daemon.protocol import Response
 from bfdiag.daemon.provider import (
     LOAD_TIME_ENV_VARS,
+    DeepseekV4EngineProvider,
     EngineProvider,
     FakeEngineProvider,
     LagunaEngineProvider,
@@ -138,8 +139,23 @@ class TestHotReloadMechanics:
 
         assert cli._cmd_daemon_reload(argparse.Namespace(timeout_s=120.0)) == 0
         assert "importlib.reload(provider_module)" in client_stub.code
-        assert "provider.__class__ = provider_module.LagunaEngineProvider" in client_stub.code
+        assert "provider_class_name = type(provider).__name__" in client_stub.code
+        assert "provider.__class__ = replacement" in client_stub.code
         assert "provider.hot_reload_code()" in client_stub.code
+
+    def test_reload_command_rejects_provider_without_hot_reload(self, monkeypatch, capsys):
+        class ClientStub:
+            def exec_code(self, code, *, timeout_s):
+                return Response(
+                    ok=False,
+                    error="provider DeepseekV4EngineProvider does not support hot reload",
+                )
+
+        monkeypatch.setattr(cli, "_client_for", lambda _args: ClientStub())
+
+        assert cli._cmd_daemon_reload(argparse.Namespace(timeout_s=120.0)) == 1
+        captured = capsys.readouterr()
+        assert "does not support hot reload" in captured.err
 
 
 class TestEngineProviderProtocolConformance:
@@ -187,6 +203,55 @@ class TestEngineProviderProtocolConformance:
 
 
 class TestLifecycle:
+    def test_socket_is_published_only_after_provider_load(self):
+        socket_dir = Path(tempfile.mkdtemp())
+        socket_path = socket_dir / "d.sock"
+
+        class LoadObservingProvider(FakeEngineProvider):
+            def load(self, *, on_stage=None):
+                assert not socket_path.exists()
+                super().load(on_stage=on_stage)
+
+        daemon = Daemon(
+            provider_factory=LoadObservingProvider,
+            socket_path=socket_path,
+            canary_enabled=False,
+        )
+        try:
+            daemon.start()
+            assert socket_path.exists()
+        finally:
+            daemon._stop()
+            shutil.rmtree(socket_dir, ignore_errors=True)
+
+    def test_failed_provider_load_does_not_leave_socket_or_lock(self):
+        socket_dir = Path(tempfile.mkdtemp())
+        socket_path = socket_dir / "d.sock"
+
+        class FailingProvider(FakeEngineProvider):
+            def load(self, *, on_stage=None):
+                raise RuntimeError("load failed")
+
+        failed = Daemon(
+            provider_factory=FailingProvider,
+            socket_path=socket_path,
+            canary_enabled=False,
+        )
+        replacement = Daemon(
+            provider_factory=FakeEngineProvider,
+            socket_path=socket_path,
+            canary_enabled=False,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="load failed"):
+                failed.start()
+            assert not socket_path.exists()
+            replacement.start()
+            assert socket_path.exists()
+        finally:
+            replacement._stop()
+            shutil.rmtree(socket_dir, ignore_errors=True)
+
     def test_ping_and_status(self, daemon_factory):
         _daemon, client = daemon_factory()
         assert client.ping().ok is True
@@ -397,11 +462,37 @@ class TestTimeoutAndAbandonment:
 
 class TestTimeoutDefaults:
     def test_laguna_process_default_is_long_but_fake_default_stays_fast(self):
-        from bfdiag.daemon.server import DEFAULT_LAGUNA_TIMEOUT_S, _resolve_default_timeout_s
+        from bfdiag.daemon.server import (
+            DEFAULT_DEVICE_PROVIDER_TIMEOUT_S,
+            _resolve_default_timeout_s,
+        )
 
-        assert _resolve_default_timeout_s("laguna", None) == DEFAULT_LAGUNA_TIMEOUT_S
+        assert _resolve_default_timeout_s("laguna", None) == DEFAULT_DEVICE_PROVIDER_TIMEOUT_S
+        assert _resolve_default_timeout_s("deepseek_v4", None) == DEFAULT_DEVICE_PROVIDER_TIMEOUT_S
         assert _resolve_default_timeout_s("fake", None) is None
         assert _resolve_default_timeout_s("laguna", 123.0) == 123.0
+
+    def test_build_provider_supports_deepseek_v4(self):
+        provider = __import__("bfdiag.daemon.server", fromlist=["_build_provider"])._build_provider(
+            argparse.Namespace(
+                provider="deepseek_v4",
+                model_path="/tmp/model.gguf",
+                tokenizer_path="/tmp/tokenizer",
+                num_slots=2,
+                max_model_len=4096,
+                prefill_rows=17,
+                enable_cudagraph=False,
+            )
+        )
+        assert isinstance(provider, DeepseekV4EngineProvider)
+        assert provider.describe()["load_config"] == {
+            "model_path": "/tmp/model.gguf",
+            "tokenizer_path": "/tmp/tokenizer",
+            "num_slots": 2,
+            "max_model_len": 4096,
+            "prefill_rows": 17,
+            "enable_cudagraph": False,
+        }
 
     def test_device_provider_timeout_refuses_unsafe_in_process_recovery(self, daemon_factory):
         load_count = {"n": 0}
@@ -518,12 +609,15 @@ class TestCliSubprocessLifecycle:
                 provider="fake",
                 socket=str(socket_path),
                 model_path=None,
+                tokenizer_path=None,
                 num_slots=1,
                 blocks_per_slot=4096,
                 block_size=64,
                 dtype="bfloat16",
                 max_model_len=131072,
                 gpu_memory_utilization=0.88,
+                prefill_rows=32,
+                enable_cudagraph=True,
                 no_canary=False,
                 idle_ttl_s=None,
                 wait_s=2.0,
@@ -583,12 +677,15 @@ class TestCliSubprocessLifecycle:
                 provider="fake",
                 socket=str(socket_path),
                 model_path=None,
+                tokenizer_path=None,
                 num_slots=2,  # DIFFERENT from the running instance's 1
                 blocks_per_slot=4096,
                 block_size=64,
                 dtype="bfloat16",
                 max_model_len=131072,
                 gpu_memory_utilization=0.88,
+                prefill_rows=32,
+                enable_cudagraph=True,
                 no_canary=False,
                 idle_ttl_s=None,
                 wait_s=2.0,
@@ -601,6 +698,169 @@ class TestCliSubprocessLifecycle:
             assert "num_slots" in captured.err
             # The running daemon must be completely unaffected.
             assert client.status().result["provider"]["load_config"]["num_slots"] == 1
+        finally:
+            with contextlib.suppress(DaemonNotRunning):
+                client.shutdown()
+            if proc.poll() is None:
+                proc.terminate()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=5.0)
+            shutil.rmtree(socket_dir, ignore_errors=True)
+
+    def test_requested_load_config_includes_deepseek_v4_fields(self):
+        cfg = cli._requested_load_config(
+            argparse.Namespace(
+                provider="deepseek_v4",
+                model_path="/tmp/model.gguf",
+                tokenizer_path="/tmp/tokenizer",
+                num_slots=2,
+                blocks_per_slot=4096,
+                block_size=64,
+                dtype="bfloat16",
+                max_model_len=8192,
+                gpu_memory_utilization=0.88,
+                prefill_rows=24,
+                enable_cudagraph=False,
+            )
+        )
+        assert cfg["tokenizer_path"] == "/tmp/tokenizer"
+        assert cfg["prefill_rows"] == 24
+        assert cfg["enable_cudagraph"] is False
+
+    def test_requested_dsv4_config_treats_omitted_paths_as_reuse(self):
+        cfg = cli._requested_load_config(
+            argparse.Namespace(
+                provider="deepseek_v4",
+                model_path=None,
+                tokenizer_path=None,
+                num_slots=2,
+                max_model_len=8192,
+                prefill_rows=24,
+                enable_cudagraph=True,
+            )
+        )
+
+        assert "model_path" not in cfg
+        assert "tokenizer_path" not in cfg
+
+    def test_daemon_start_reuses_dsv4_when_optional_paths_are_omitted(
+        self, monkeypatch, capsys
+    ):
+        running_config = {
+            "model_path": "/models/current.gguf",
+            "tokenizer_path": "/models/tokenizer",
+            "num_slots": 2,
+            "max_model_len": 8192,
+            "prefill_rows": 24,
+            "enable_cudagraph": True,
+        }
+
+        class ClientStub:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def ping(self):
+                return Response(ok=True)
+
+            def status(self):
+                return Response(
+                    ok=True,
+                    result={
+                        "provider": {
+                            "kind": "deepseek_v4",
+                            "load_config": running_config,
+                        }
+                    },
+                )
+
+        monkeypatch.setattr(cli, "Client", ClientStub)
+        args = argparse.Namespace(
+            provider="deepseek_v4",
+            socket=None,
+            model_path=None,
+            tokenizer_path=None,
+            num_slots=2,
+            max_model_len=8192,
+            prefill_rows=24,
+            enable_cudagraph=True,
+        )
+
+        assert cli._cmd_daemon_start(args) == 0
+        assert "reusing" in capsys.readouterr().out
+
+    def test_requested_load_config_for_laguna_does_not_include_dsv4_fields(self):
+        cfg = cli._requested_load_config(
+            argparse.Namespace(
+                provider="laguna",
+                model_path="/tmp/laguna",
+                tokenizer_path="/tmp/tokenizer",
+                num_slots=2,
+                blocks_per_slot=1024,
+                block_size=64,
+                dtype="bfloat16",
+                max_model_len=8192,
+                gpu_memory_utilization=0.75,
+                prefill_rows=24,
+                enable_cudagraph=False,
+            )
+        )
+        assert "tokenizer_path" not in cfg
+        assert "prefill_rows" not in cfg
+        assert "enable_cudagraph" not in cfg
+
+    def test_daemon_start_refuses_reuse_on_provider_kind_mismatch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ):
+        monkeypatch.setenv("QSR_BFDIAG_DIR", str(tmp_path))
+        socket_dir = Path(tempfile.mkdtemp())
+        socket_path = socket_dir / "d.sock"
+        repo_root = Path(__file__).resolve().parents[1]
+
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "bfdiag.daemon.server",
+                "--provider",
+                "fake",
+                "--socket",
+                str(socket_path),
+            ],
+            cwd=str(repo_root),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            client = Client(socket_path=socket_path, timeout_s=5.0)
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not client.is_running():
+                time.sleep(0.1)
+            assert client.is_running()
+
+            args = argparse.Namespace(
+                provider="deepseek_v4",
+                socket=str(socket_path),
+                model_path="/tmp/model.gguf",
+                tokenizer_path="/tmp/tokenizer",
+                num_slots=1,
+                blocks_per_slot=4096,
+                block_size=64,
+                dtype="bfloat16",
+                max_model_len=131072,
+                gpu_memory_utilization=0.88,
+                prefill_rows=32,
+                enable_cudagraph=True,
+                no_canary=False,
+                idle_ttl_s=None,
+                wait_s=2.0,
+            )
+            rc = cli._cmd_daemon_start(args)
+            captured = capsys.readouterr()
+
+            assert rc == 1
+            assert "provider='fake'" in captured.err
+            assert "provider='deepseek_v4'" in captured.err
         finally:
             with contextlib.suppress(DaemonNotRunning):
                 client.shutdown()

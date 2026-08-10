@@ -22,7 +22,12 @@ from bfdiag.record.schema import RunRecord
 # between them to mean anything. Names mirror the leaf names used in the
 # bfdiag shared contract (e.g. "workload.prompt_hash").
 DEFAULT_COMPARABLE_FIELDS: tuple[str, ...] = (
+    "fingerprint.workload.contract",
+    "fingerprint.workload.contract_version",
+    "fingerprint.workload.workload_name",
     "fingerprint.workload.prompt_hash",
+    "fingerprint.workload.generated_tokens",
+    "fingerprint.workload.batch",
     "fingerprint.model.revision",
     "fingerprint.git.qwen-sm120-runtime.sha",
     "fingerprint.git.sparkinfer.sha",
@@ -30,6 +35,9 @@ DEFAULT_COMPARABLE_FIELDS: tuple[str, ...] = (
     "fingerprint.workload.greedy",
     "fingerprint.workload.block_size",
     "fingerprint.workload.max_model_len",
+    "fingerprint.workload.max_q_rows",
+    "fingerprint.workload.cuda_graph_status",
+    "fingerprint.workload.warm_only",
     # blocks_per_slot sets the sparkinfer decode workspace's max_pages, so it
     # can shift kernel tiling and float reduction order -- i.e. it moves
     # acceptance rate, not just memory. capacity (concurrent slots) changes

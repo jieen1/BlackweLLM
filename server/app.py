@@ -232,15 +232,20 @@ async def _tokenize_chat(engine_ref, messages, tools=None, chat_template_kwargs=
     The deepseek_v4 backend does not carry a Jinja chat template at all --
     the official ``encoding_dsv4.py`` message encoder is the contract (plan
     §7.2 / D9).  Its ``encode_messages`` returns the prompt string; the
-    standard tokenizer then tokenizes it.  ``chat_template_kwargs`` is
-    accepted for shape-compatibility and ignored (DSV4 encodes from
-    message roles, not template kwargs).
+    standard tokenizer then tokenizes it.  For DSV4 the adapter maps
+    ``enable_thinking`` and ``reasoning_effort`` onto the official encoder.
     """
     loop = asyncio.get_running_loop()
     if getattr(engine_ref, "backend_name", None) == "deepseek_v4":
         from server.formats.dsv4_encoding import encode_messages_dsv4
 
-        prompt = await loop.run_in_executor(None, encode_messages_dsv4, messages, tools)
+        encode = functools.partial(
+            encode_messages_dsv4,
+            messages,
+            tools,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+        prompt = await loop.run_in_executor(None, encode)
         return engine_ref.tok.encode(prompt, add_special_tokens=False)
     fn = functools.partial(
         engine_ref.tok.apply_chat_template,
@@ -811,6 +816,10 @@ async def debug_stats():
         # contract), not omitted from the response, so a caller can
         # distinguish "no capture attempted" from "field doesn't exist".
         engine.stats["_cuda_graph_dbg"] = dict(snapshot.dflash_cg_status)
+        engine.stats["_backend_snapshot_stats_dbg"] = dict(snapshot.runtime_stats)
+        engine.stats["_cuda_graph_fallback_reasons_dbg"] = dict(
+            snapshot.cg_fallback_reasons
+        )
     # 2026-08-02 CG audit (docs/implementation-plan.md §7.3 C7-2, "activity
     # confirmation"): `_cuda_graph_dbg` above proves capture succeeded, not
     # that a real decode round actually replayed the captured graph instead
@@ -1514,6 +1523,34 @@ async def metrics_endpoint():
         lines.append(
             f'blackwellm:dflash_cg_captured{{model_name="{engine.MODEL}",graph="{graph_name}"}} '
             f"{captured}"
+        )
+
+    snapshot_stats = dict(snapshot.runtime_stats) if snapshot is not None else {}
+    for stat_name in (
+        "decode_graph_capture_attempts",
+        "decode_graph_capture_successes",
+        "decode_graph_capture_failures",
+        "decode_graph_replays",
+        "decode_eager_fallbacks",
+    ):
+        lines.append(
+            f"# HELP blackwellm:{stat_name}_total Backend {stat_name.replace('_', ' ')}."
+        )
+        lines.append(f"# TYPE blackwellm:{stat_name}_total counter")
+        lines.append(
+            f'blackwellm:{stat_name}_total{{model_name="{engine.MODEL}"}} '
+            f"{snapshot_stats.get(stat_name, 0)}"
+        )
+    lines.append(
+        "# HELP blackwellm:decode_eager_fallback_reason_total "
+        "Decode tokens using eager fallback, by reason."
+    )
+    lines.append("# TYPE blackwellm:decode_eager_fallback_reason_total counter")
+    fallback_reasons = snapshot.cg_fallback_reasons if snapshot is not None else ()
+    for reason, count in fallback_reasons:
+        lines.append(
+            f'blackwellm:decode_eager_fallback_reason_total{{model_name="{engine.MODEL}",'
+            f'reason="{reason}"}} {count}'
         )
 
     # Accuracy/correctness signal: the admission bootstrap check re-runs each

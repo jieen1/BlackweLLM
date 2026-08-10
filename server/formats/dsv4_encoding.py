@@ -20,17 +20,40 @@ from server.formats.encoding_dsv4 import encode_messages
 
 
 def encode_messages_dsv4(
-    messages: list[dict[str, Any]], tools: Any = None
+    messages: list[dict[str, Any]],
+    tools: Any = None,
+    chat_template_kwargs: dict[str, Any] | None = None,
 ) -> str:
     """Encode OpenAI-style messages into the DSV4 prompt string.
 
-    ``tools`` is accepted for signature compatibility with the server's
-    chat-tokenization call sites; tool calling for DSV4 is follow-up work
-    (the official encoder supports ``tools=`` inside message dicts once the
-    request layer maps them in).
+    The official encoder expects request-level tools on the first system or
+    developer message.  Copy the request before injecting them so FastAPI's
+    parsed body is never mutated.  ``chat_template_kwargs`` maps the common
+    API's ``enable_thinking`` and DSV4's ``reasoning_effort`` onto the
+    official encoder rather than silently ignoring them.
     """
+    encoded_messages = [dict(message) for message in messages]
+    if tools:
+        target = next(
+            (
+                message
+                for message in encoded_messages
+                if message.get("role") in {"system", "developer"}
+            ),
+            None,
+        )
+        if target is None:
+            target = {"role": "system", "content": ""}
+            encoded_messages.insert(0, target)
+        target["tools"] = tools
+
+    template_kwargs = dict(chat_template_kwargs or {})
+    thinking_mode = template_kwargs.get("thinking_mode")
+    if thinking_mode is None:
+        thinking_mode = "thinking" if template_kwargs.get("enable_thinking", False) else "chat"
     return encode_messages(
-        messages,
-        thinking_mode="chat",
+        encoded_messages,
+        thinking_mode=thinking_mode,
         add_default_bos_token=False,
+        reasoning_effort=template_kwargs.get("reasoning_effort"),
     )

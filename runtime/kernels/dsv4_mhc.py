@@ -150,6 +150,83 @@ def _hc_pre_kernel(
     tl.store(comb_ptr + t * hc * hc + tl.arange(0, 16), tl.reshape(comb, (16,)))
 
 
+@triton.jit
+def _hc_post_kernel(
+    x_ptr,  # [T, d] bf16
+    residual_ptr,  # [T, hc, d] bf16
+    post_ptr,  # [T, hc] fp32
+    comb_ptr,  # [T, hc, hc] fp32, first hc axis is reduced
+    out_ptr,  # [T, hc, d] bf16
+    d: tl.constexpr,
+    hc: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    t = tl.program_id(0)
+    out_h = tl.program_id(1)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < d
+    x_u16 = x_ptr.to(tl.pointer_type(tl.uint16))
+    residual_u16 = residual_ptr.to(tl.pointer_type(tl.uint16))
+    x = (tl.load(x_u16 + t * d + cols, mask=mask, other=0).to(tl.uint32) << 16).to(
+        tl.float32, bitcast=True
+    )
+    residual = (
+        tl.load(residual_u16 + (t * hc) * d + cols, mask=mask, other=0).to(tl.uint32) << 16
+    ).to(tl.float32, bitcast=True)
+    coefficient = tl.load(comb_ptr + t * hc * hc + out_h)
+    mixed = tl.inline_asm_elementwise(
+        asm="mul.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[coefficient, residual],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    for in_h in tl.static_range(1, hc):
+        residual = (
+            tl.load(
+                residual_u16 + (t * hc + in_h) * d + cols,
+                mask=mask,
+                other=0,
+            ).to(tl.uint32)
+            << 16
+        ).to(tl.float32, bitcast=True)
+        coefficient = tl.load(comb_ptr + (t * hc + in_h) * hc + out_h)
+        term = tl.inline_asm_elementwise(
+            asm="mul.rn.f32 $0, $1, $2;",
+            constraints="=f,f,f",
+            args=[coefficient, residual],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        mixed = tl.inline_asm_elementwise(
+            asm="add.rn.f32 $0, $1, $2;",
+            constraints="=f,f,f",
+            args=[mixed, term],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
+        )
+    post_term = tl.inline_asm_elementwise(
+        asm="mul.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[tl.load(post_ptr + t * hc + out_h), x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    value = tl.inline_asm_elementwise(
+        asm="add.rn.f32 $0, $1, $2;",
+        constraints="=f,f,f",
+        args=[post_term, mixed],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+    tl.store(out_ptr + (t * hc + out_h) * d + cols, value, mask=mask)
+
+
 def hc_fused_pre(
     x: torch.Tensor,
     hc_fn: torch.Tensor,
@@ -201,5 +278,46 @@ def hc_fused_pre(
         d=d,
         hc_dim=hc * d,
         w_row_bytes=row_bytes,
+        # Real-weight SM120 decode sweeps are consistently faster with eight
+        # warps for T=1/2/4. Keep prefill's established four-warp regime.
+        num_warps=8 if t_tokens <= 4 else 4,
     )
     return y, post, comb
+
+
+def hc_fused_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+) -> torch.Tensor:
+    """Fuse the decode HC residual expansion without FP32 broadcast temporaries."""
+    if x.ndim != 2 or x.dtype != torch.bfloat16:
+        raise ValueError(f"x must be [T, d] bf16, got {tuple(x.shape)} {x.dtype}")
+    if residual.ndim != 3 or residual.dtype != torch.bfloat16:
+        raise ValueError(
+            f"residual must be [T, hc, d] bf16, got {tuple(residual.shape)} {residual.dtype}"
+        )
+    tokens, d = x.shape
+    if residual.shape[0] != tokens or residual.shape[2] != d:
+        raise ValueError("x and residual token/hidden dimensions must match")
+    hc = residual.shape[1]
+    if post.shape != (tokens, hc) or post.dtype != torch.float32:
+        raise ValueError(f"post must be [{tokens}, {hc}] fp32")
+    if comb.shape != (tokens, hc, hc) or comb.dtype != torch.float32:
+        raise ValueError(f"comb must be [{tokens}, {hc}, {hc}] fp32")
+    out = torch.empty_like(residual)
+    if tokens == 0:
+        return out
+    _hc_post_kernel[(tokens, hc)](
+        x,
+        residual,
+        post,
+        comb,
+        out,
+        d=d,
+        hc=hc,
+        BLOCK=triton.next_power_of_2(d),
+        num_warps=8,
+    )
+    return out

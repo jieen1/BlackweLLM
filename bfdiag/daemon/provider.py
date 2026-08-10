@@ -37,11 +37,19 @@ from __future__ import annotations
 import importlib
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 _DEFAULT_LAGUNA_MODEL_PATH = (
     "~/.cache/huggingface/hub/models--poolside--Laguna-S-2.1-NVFP4/"
     "snapshots/07614121b31898586430f189d27a25a0be310843/"
+)
+_DEFAULT_DSV4_MODEL_PATH = (
+    "/home/bot/models/DeepSeek-V4-Flash-0731-GGUF/"
+    "DeepSeek-V4-Flash-0731-IQ2_XS-Experts-Q8_0.gguf"
+)
+_DEFAULT_DSV4_TOKENIZER_PATH = str(
+    Path(__file__).resolve().parents[2] / "notes" / "dsv4flash-ref"
 )
 
 #: LagunaEngineProvider constructor kwargs that are fixed the instant
@@ -58,6 +66,9 @@ LOAD_TIME_CONFIG_KEYS: frozenset[str] = frozenset(
         "max_model_len",
         "gpu_memory_utilization",
         "dflash_model_path",
+        "tokenizer_path",
+        "prefill_rows",
+        "enable_cudagraph",
     }
 )
 
@@ -698,6 +709,200 @@ class LagunaEngineProvider:
         }
 
 
+class DeepseekV4EngineProvider:
+    """Real bfdiag engine provider for the DeepSeek-V4 GGUF backend.
+
+    GPU-only. Like ``LagunaEngineProvider``, all heavy imports are deferred so
+    importing ``bfdiag.daemon.provider`` stays torch-free.
+    """
+
+    allow_in_process_recovery_after_taint = False
+
+    def __init__(
+        self,
+        model_path: str | None = None,
+        tokenizer_path: str | None = None,
+        num_slots: int = 1,
+        max_model_len: int = 131072,
+        prefill_rows: int = 32,
+        enable_cudagraph: bool = True,
+    ) -> None:
+        self._model_path = model_path or _DEFAULT_DSV4_MODEL_PATH
+        self._tokenizer_path = tokenizer_path or _DEFAULT_DSV4_TOKENIZER_PATH
+        self._num_slots = num_slots
+        self._max_model_len = max_model_len
+        self._prefill_rows = prefill_rows
+        self._enable_cudagraph = enable_cudagraph
+        self._backend: Any = None
+        self._tokenizer: Any = None
+        self._load_timings_s: dict[str, float] = {}
+
+    def load(self, *, on_stage: Callable[[str], None] | None = None) -> None:
+        import os
+
+        from transformers import AutoTokenizer
+
+        from runtime.backends.dsv4 import load_deepseek_v4_backend
+
+        model_path = os.path.expanduser(self._model_path)
+        tokenizer_path = os.path.expanduser(self._tokenizer_path)
+        if not Path(model_path).is_file():
+            raise FileNotFoundError(f"DeepSeek-V4 GGUF not found: {model_path}")
+        if not (Path(tokenizer_path) / "tokenizer.json").is_file():
+            raise FileNotFoundError(
+                f"DeepSeek-V4 tokenizer dir lacks tokenizer.json: {tokenizer_path}"
+            )
+        load_started = time.perf_counter()
+        stage_started = load_started
+        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        self._load_timings_s["tokenizer"] = time.perf_counter() - stage_started
+        if on_stage is not None:
+            on_stage("after_tokenizer")
+        stage_started = time.perf_counter()
+        self._backend = load_deepseek_v4_backend(
+            model_path,
+            num_slots=self._num_slots,
+            max_seq_len=self._max_model_len,
+            max_q_rows=self._prefill_rows,
+            device="cuda",
+        )
+        # The fixed bfdiag workload refuses to produce a run record without
+        # a concrete model identity.  Keep the annotation on the provider-
+        # owned backend so ``bf exec`` users cannot accidentally omit it.
+        self._backend.bfdiag_model_identity = {
+            "path": str(Path(model_path).resolve()),
+            "revision": _extract_revision(model_path),
+        }
+        self._load_timings_s["backend"] = time.perf_counter() - stage_started
+        if on_stage is not None:
+            on_stage("after_target_backend")
+        stage_started = time.perf_counter()
+        if self._enable_cudagraph:
+            self._backend.capture_decode_cuda_graph()
+        self._load_timings_s["cuda_graph_capture"] = time.perf_counter() - stage_started
+        if on_stage is not None:
+            on_stage("after_decode_cuda_graphs")
+        self.reset()
+        self._load_timings_s["total"] = time.perf_counter() - load_started
+        if on_stage is not None:
+            on_stage("after_reset")
+
+    def reset(self) -> None:
+        if self._backend is None:
+            raise RuntimeError("DeepseekV4EngineProvider.reset() called before load()")
+        for slot in range(self._num_slots):
+            self._backend.reset_slot(slot)
+
+    def _snapshot_fields(self) -> tuple[dict[str, str], dict[str, int], dict[str, int]]:
+        if self._backend is None:
+            return {}, {}, {}
+        try:
+            snapshot = self._backend.snapshot()
+        except Exception:
+            return {}, {}, {}
+        return (
+            dict(snapshot.dflash_cg_status),
+            dict(snapshot.runtime_stats),
+            dict(snapshot.cg_fallback_reasons),
+        )
+
+    def describe(self) -> dict[str, Any]:
+        cg_status, runtime_stats, cg_fallback_reasons = self._snapshot_fields()
+        return {
+            "kind": "deepseek_v4",
+            "loaded": self._backend is not None,
+            "model_path": self._model_path,
+            "tokenizer_path": self._tokenizer_path,
+            "model_revision": _extract_revision(self._model_path),
+            "num_slots": self._num_slots,
+            "load_config": {
+                "model_path": self._model_path,
+                "tokenizer_path": self._tokenizer_path,
+                "num_slots": self._num_slots,
+                "max_model_len": self._max_model_len,
+                "prefill_rows": self._prefill_rows,
+                "enable_cudagraph": self._enable_cudagraph,
+            },
+            "cg_status": cg_status,
+            "runtime_stats": runtime_stats,
+            "cg_fallback_reasons": cg_fallback_reasons,
+            "load_timings_s": dict(self._load_timings_s),
+        }
+
+    def is_healthy(self) -> bool:
+        return self._backend is not None and self._tokenizer is not None
+
+    def unload(self) -> None:
+        import gc
+
+        import torch
+
+        self._backend = None
+        self._tokenizer = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def memory_snapshot(self) -> dict[str, Any]:
+        import torch
+
+        stats = torch.cuda.memory_stats()
+        allocated = stats.get("allocated_bytes.all.current", 0)
+        reserved = stats.get("reserved_bytes.all.current", 0)
+        num_alloc_retries = stats.get("num_alloc_retries", 0)
+        fragmentation_ratio = (reserved - allocated) / reserved if reserved else 0.0
+        return {
+            "kind": "deepseek_v4",
+            "allocated_bytes": allocated,
+            "reserved_bytes": reserved,
+            "num_alloc_retries": num_alloc_retries,
+            "fragmentation_ratio": fragmentation_ratio,
+        }
+
+    def generate(
+        self,
+        prompt_ids: list[int],
+        max_tokens: int,
+        *,
+        temperature: float = 0.0,
+    ) -> list[int]:
+        if self._backend is None:
+            raise RuntimeError("DeepseekV4EngineProvider.generate() called before load()")
+        if temperature != 0.0:
+            raise NotImplementedError(
+                "DeepseekV4EngineProvider.generate() is greedy-only (temperature=0)"
+            )
+        if max_tokens <= 0:
+            return []
+
+        from runtime.sampling import SamplingParams
+
+        slot = self._num_slots - 1
+        self.reset()
+        try:
+            tokens = [self._backend.prefill(slot, prompt_ids)]
+            params = SamplingParams(temperature=0.0)
+            while len(tokens) < max_tokens:
+                kv_len = self._backend.slot_state(slot).kv_len
+                next_token = self._backend.decode_batch_sampled(
+                    [slot],
+                    [tokens[-1]],
+                    [kv_len],
+                    [params],
+                )[0]
+                tokens.append(next_token)
+            return tokens
+        finally:
+            self.reset()
+
+    def namespace(self) -> dict[str, Any]:
+        return {
+            "backend": self._backend,
+            "engine": self._backend,
+            "tokenizer": self._tokenizer,
+            "provider": self,
+        }
+
+
 def _extract_revision(model_path: str) -> str:
     """Best-effort HF snapshot hash from a ``.../snapshots/<hash>/`` path,
     for the canary's model-identity fingerprint. Falls back to the whole
@@ -705,6 +910,14 @@ def _extract_revision(model_path: str) -> str:
     parts = [p for p in model_path.rstrip("/").split("/") if p]
     if len(parts) >= 2 and parts[-2] == "snapshots":
         return parts[-1]
+    path = Path(model_path).expanduser()
+    if path.is_file():
+        stat = path.stat()
+        # Hashing a tens-of-gigabytes GGUF on every diagnostic run would
+        # contaminate cold-start and I/O measurements.  Size + nanosecond
+        # mtime is a cheap local-file revision token; the absolute path is
+        # recorded separately in ModelInfo.path.
+        return f"stat:{stat.st_size}:{stat.st_mtime_ns}"
     return model_path
 
 

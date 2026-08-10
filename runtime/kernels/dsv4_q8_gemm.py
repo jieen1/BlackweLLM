@@ -28,6 +28,149 @@ import triton
 import triton.language as tl
 
 
+def _select_q8_0_block_n(m: int, in_features: int, out_features: int) -> int:
+    """Choose the measured SM120 tile for DSV4's fixed projection shapes."""
+    if m <= 4 and (in_features, out_features) in ((4096, 64), (4096, 1024)):
+        return 8
+    if m <= 4 and (in_features, out_features) == (1024, 8192):
+        return 32 if m == 2 else 16
+    if m <= 4 and (in_features, out_features) in ((4096, 512), (8192, 4096)):
+        return 16
+    if in_features == 1024 and out_features == 32768:
+        return 64
+    if m > 4 and out_features >= 65536:
+        return 64
+    return 32
+
+
+def _select_q8_0_block_m(m: int, in_features: int, out_features: int) -> int:
+    """Choose the measured SM120 row tile for DSV4 decode projections."""
+    if m <= 4 and (in_features, out_features) in (
+        (1024, 8192),
+        (4096, 512),
+        (4096, 1024),
+        (8192, 4096),
+    ):
+        return 8
+    if m <= 2 and (in_features, out_features) == (4096, 64):
+        return 8
+    return 16
+
+
+def _select_q8_0_grouped_block_n(rows_per_group: int) -> int:
+    """Choose the measured SM120 tile for MLA's grouped output projection."""
+    return 16 if rows_per_group <= 4 else 64
+
+
+def _select_q8_0_grouped_block_m(rows_per_group: int) -> int:
+    """Choose the measured SM120 row tile for decode's grouped MLA projection."""
+    return 8 if rows_per_group <= 4 else 16
+
+
+def _select_q8_0_fp32_block_cols(m: int, in_features: int, out_features: int) -> int:
+    """Choose the exact-FP32 shared-expert tile measured on SM120."""
+    if m in (1, 2, 4) and (in_features, out_features) in (
+        (4096, 2048),
+        (2048, 4096),
+    ):
+        return 8
+    return 32
+
+
+@triton.jit
+def _q8_0_dequant_gemv_fp32_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    M,
+    K: tl.constexpr,
+    OUT: tl.constexpr,
+    W_ROW_STRIDE: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+    BLK_ELEMS: tl.constexpr,
+    BLK_BYTES: tl.constexpr,
+):
+    """Q8_0 GEMV with the eager path's FP32 dequant/accumulation semantics."""
+    pid_m = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    rows = pid_c * BLOCK_COLS + tl.arange(0, BLOCK_COLS)
+    row_mask = rows < OUT
+    elems = tl.arange(0, BLK_ELEMS)
+    x_u16 = x_ptr.to(tl.pointer_type(tl.uint16))
+    x_base = pid_m * K
+    acc = tl.zeros((BLOCK_COLS,), dtype=tl.float32)
+
+    for k in range(0, K, BLK_ELEMS):
+        block = k // BLK_ELEMS
+        packed_block = w_ptr + rows * W_ROW_STRIDE + block * BLK_BYTES
+        d_lo = tl.load(packed_block, mask=row_mask, other=0).to(tl.uint32)
+        d_hi = tl.load(packed_block + 1, mask=row_mask, other=0).to(tl.uint32)
+        d_u16 = d_lo.to(tl.uint16) | (d_hi.to(tl.uint16) << 8)
+        scale = d_u16.to(tl.float16, bitcast=True).to(tl.float32)
+        quant = tl.load(
+            packed_block[:, None] + 2 + elems[None, :],
+            mask=row_mask[:, None],
+            other=0,
+        ).to(tl.int8, bitcast=True).to(tl.float32)
+        activation = (
+            tl.load(x_u16 + x_base + k + elems).to(tl.uint32) << 16
+        ).to(tl.float32, bitcast=True)
+        acc += tl.sum(quant * scale[:, None] * activation[None, :], axis=1)
+
+    tl.store(out_ptr + pid_m * OUT + rows, acc, mask=row_mask)
+
+
+
+
+def q8_0_dequant_gemv_fp32(
+    x: torch.Tensor,
+    packed: torch.Tensor,
+    *,
+    out_features: int,
+    in_features: int,
+    BLOCK_COLS: int | None = None,
+) -> torch.Tensor:
+    """Packed Q8_0 linear preserving FP32 weight-product semantics.
+
+    This decode-oriented path avoids materializing the full FP32 weight while
+    retaining the reference regime used by FP32-declared DSV4 linears.  It is
+    intentionally separate from :func:`q8_0_dequant_gemm`, whose BF16 weight
+    tile is substantially faster but is not numerically safe when repeated
+    through every shared expert layer.  The fixed shared-expert shapes use a
+    measured 8-column SM120 tile for B1/B2/B4; explicit overrides remain
+    available for kernel qualification.
+    """
+    if x.ndim != 2:
+        raise ValueError(f"x must be rank 2, got shape {tuple(x.shape)}")
+    if in_features % 32:
+        raise ValueError(f"in_features {in_features} is not a multiple of 32")
+    x = x.to(torch.bfloat16).contiguous()
+    row_stride = (in_features // 32) * 34
+    if out_features * row_stride != packed.numel():
+        raise ValueError(
+            f"packed {packed.numel()} != out {out_features} x stride {row_stride}"
+        )
+    if BLOCK_COLS is None:
+        BLOCK_COLS = _select_q8_0_fp32_block_cols(
+            int(x.shape[0]), in_features, out_features
+        )
+    out = torch.empty((x.shape[0], out_features), dtype=torch.float32, device=x.device)
+    grid = (x.shape[0], triton.cdiv(out_features, BLOCK_COLS))
+    _q8_0_dequant_gemv_fp32_kernel[grid](
+        x,
+        packed,
+        out,
+        x.shape[0],
+        K=in_features,
+        OUT=out_features,
+        W_ROW_STRIDE=row_stride,
+        BLOCK_COLS=BLOCK_COLS,
+        BLK_ELEMS=32,
+        BLK_BYTES=34,
+    )
+    return out
+
+
 @triton.jit
 def _q8_0_dequant_gemm_tc_kernel(
     x_ptr,  # [M, K] bf16 activations
@@ -49,6 +192,7 @@ def _q8_0_dequant_gemm_tc_kernel(
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     m_mask = offs_m < M
+    n_mask = offs_n < OUT
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
@@ -70,10 +214,16 @@ def _q8_0_dequant_gemm_tc_kernel(
             + 2
             + tl.arange(0, BLK_ELEMS)[None, :]
         )
-        qs = tl.load(q_ptrs).to(tl.int8, bitcast=True).to(tl.float32)
+        qs = tl.load(q_ptrs, mask=n_mask[:, None], other=0).to(tl.int8, bitcast=True).to(
+            tl.float32
+        )
         # fp16 d at bytes 0..1 (per output row, same for all 32 k)
-        d_lo = tl.load(w_ptr + offs_n * W_ROW_STRIDE + kb * BLK_BYTES).to(tl.uint32)
-        d_hi = tl.load(w_ptr + offs_n * W_ROW_STRIDE + kb * BLK_BYTES + 1).to(tl.uint32)
+        d_lo = tl.load(
+            w_ptr + offs_n * W_ROW_STRIDE + kb * BLK_BYTES, mask=n_mask, other=0
+        ).to(tl.uint32)
+        d_hi = tl.load(
+            w_ptr + offs_n * W_ROW_STRIDE + kb * BLK_BYTES + 1, mask=n_mask, other=0
+        ).to(tl.uint32)
         d_u16 = d_lo.to(tl.uint16) | (d_hi.to(tl.uint16) << 8)
         d_f = d_u16.to(tl.float16, bitcast=True).to(tl.float32)  # [BLOCK_N]
         # weight tile [BLOCK_N, 32] (output x K), transposed to [32, BLOCK_N]
@@ -83,7 +233,7 @@ def _q8_0_dequant_gemm_tc_kernel(
         acc = tl.dot(a_tile.to(tl.bfloat16), w_t, acc)
 
     out_ptrs = out_ptr + offs_m[:, None] * OUT + offs_n[None, :]
-    tl.store(out_ptrs, acc.to(tl.float32), mask=m_mask[:, None])
+    tl.store(out_ptrs, acc.to(tl.float32), mask=m_mask[:, None] & n_mask[None, :])
 
 
 def q8_0_dequant_gemm(
@@ -92,11 +242,20 @@ def q8_0_dequant_gemm(
     *,
     out_features: int,
     in_features: int,
-    BLOCK_M: int = 16,
-    BLOCK_N: int = 64,
+    BLOCK_M: int | None = None,
+    BLOCK_N: int | None = None,
 ) -> torch.Tensor:
     """``x @ W^T`` with W = Q8_0 packed [out, in], dequant-in-kernel."""
     M = x.shape[0]
+    if BLOCK_M is None:
+        BLOCK_M = _select_q8_0_block_m(M, in_features, out_features)
+    if BLOCK_N is None:
+        # Real-weight SM120 sweeps show that decode's narrow M=1 surface is
+        # normally limited by the work carried by each output tile, while the
+        # 1024->32768 query projection and large multi-row output head retain
+        # enough parallel work to favour 64 columns.  Keep explicit overrides
+        # available for kernel qualification tests.
+        BLOCK_N = _select_q8_0_block_n(M, in_features, out_features)
     x = x.to(torch.bfloat16).contiguous()
     out = torch.empty((M, out_features), dtype=torch.float32, device=x.device)
     if in_features % 32:
@@ -142,15 +301,18 @@ def _q8_0_grouped_dequant_gemm_tc_kernel(
     x rows are group-contiguous (``ROWS_PER_G`` rows of group 0, then
     group 1, ...).  A program covers ``BLOCK_M`` rows of ONE group, so the
     group index -- and therefore the weight-row base -- is a scalar, and a
-    plain 2D ``tl.dot`` works.  Grid x = groups x row-blocks-per-group,
-    grid y = output-column blocks.
+    plain 2D ``tl.dot`` works.  Grid x = groups, grid y = row blocks
+    within one group, and grid z = output-column blocks.
     """
     pid_g = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
 
-    offs_m = pid_g * ROWS_PER_G + tl.arange(0, BLOCK_M)
+    local_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_m = pid_g * ROWS_PER_G + local_m
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    m_mask = offs_m < (pid_g + 1) * ROWS_PER_G
+    m_mask = local_m < ROWS_PER_G
+    n_mask = offs_n < GROUP_SIZE
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
@@ -172,9 +334,19 @@ def _q8_0_grouped_dequant_gemm_tc_kernel(
             + 2
             + tl.arange(0, BLK_ELEMS)[None, :]
         )
-        qs = tl.load(q_ptrs).to(tl.int8, bitcast=True).to(tl.float32)
-        d_lo = tl.load(w_ptr + w_rows * W_ROW_STRIDE + kb * BLK_BYTES).to(tl.uint32)
-        d_hi = tl.load(w_ptr + w_rows * W_ROW_STRIDE + kb * BLK_BYTES + 1).to(tl.uint32)
+        qs = tl.load(q_ptrs, mask=n_mask[:, None], other=0).to(
+            tl.int8, bitcast=True
+        ).to(tl.float32)
+        d_lo = tl.load(
+            w_ptr + w_rows * W_ROW_STRIDE + kb * BLK_BYTES,
+            mask=n_mask,
+            other=0,
+        ).to(tl.uint32)
+        d_hi = tl.load(
+            w_ptr + w_rows * W_ROW_STRIDE + kb * BLK_BYTES + 1,
+            mask=n_mask,
+            other=0,
+        ).to(tl.uint32)
         d_u16 = d_lo.to(tl.uint16) | (d_hi.to(tl.uint16) << 8)
         d_f = d_u16.to(tl.float16, bitcast=True).to(tl.float32)  # [BLOCK_N]
         w_tile = (qs * d_f[:, None]).to(tl.bfloat16)  # [BLOCK_N, 32]
@@ -182,7 +354,7 @@ def _q8_0_grouped_dequant_gemm_tc_kernel(
         acc = tl.dot(a_tile.to(tl.bfloat16), w_t, acc)
 
     out_ptrs = out_ptr + offs_m[:, None] * GROUP_SIZE + offs_n[None, :]
-    tl.store(out_ptrs, acc.to(tl.float32), mask=m_mask[:, None])
+    tl.store(out_ptrs, acc.to(tl.float32), mask=m_mask[:, None] & n_mask[None, :])
 
 
 def q8_0_grouped_dequant_gemm(
@@ -193,8 +365,8 @@ def q8_0_grouped_dequant_gemm(
     group_size: int,
     in_features: int,
     rows_per_group: int = 1,
-    BLOCK_M: int = 16,
-    BLOCK_N: int = 64,
+    BLOCK_M: int | None = None,
+    BLOCK_N: int | None = None,
 ) -> torch.Tensor:
     """Grouped ``x[m, :] @ W[group(m), r, :]^T`` with W = Q8_0 packed.
 
@@ -203,11 +375,22 @@ def q8_0_grouped_dequant_gemm(
     W is packed [num_groups * group_size, in].  Returns [M, group_size]
     fp32 -- the dequantized weight is never materialized.
 
-    Triton has no 3D batched tl.dot, so each group is handled by a 2D
-    program with a scalar weight-row base; groups fill grid.x.
+    Triton has no batched tl.dot, so each group/row tile is handled by a
+    2D dot program with a scalar weight-row base.
     """
     M = x.shape[0]
     assert M == num_groups * rows_per_group, (M, num_groups, rows_per_group)
+    if BLOCK_M is None:
+        # Real-weight SM120 decode sweeps over wo_a's grouped contraction show
+        # that a narrower 8-row tile wins for B1/B2/B4 while remaining
+        # bit-exact against the established 16x16 kernel. Prefill keeps the
+        # existing 16-row tile.
+        BLOCK_M = _select_q8_0_grouped_block_m(rows_per_group)
+    if BLOCK_N is None:
+        # Real-weight SM120 sweeps favour finer output tiling for decode's
+        # B1/B2/B4 surface.  Wider prefill row groups amortize a 64-column
+        # tile better.  Explicit overrides remain available for qualification.
+        BLOCK_N = _select_q8_0_grouped_block_n(rows_per_group)
     x = x.to(torch.bfloat16).contiguous()
     out = torch.empty((M, group_size), dtype=torch.float32, device=x.device)
     if in_features % 32:
@@ -216,12 +399,12 @@ def q8_0_grouped_dequant_gemm(
     assert (num_groups * group_size * w_row_stride) == packed.numel(), (
         f"packed {packed.numel()} != groups {num_groups} x {group_size} x stride {w_row_stride}"
     )
-    # A program covers only rows of ONE group (the weight-row base is a
-    # scalar per program), so BLOCK_M must not exceed rows_per_group.
-    if rows_per_group < BLOCK_M:
-        BLOCK_M = rows_per_group
+    # Keep BLOCK_M power-of-two (required by tl.arange) and mask the final
+    # row tile. A separate grid dimension covers every tile when prefill's
+    # rows_per_group exceeds BLOCK_M; decode remains one masked tile.
     grid = (
         num_groups,
+        triton.cdiv(rows_per_group, BLOCK_M),
         triton.cdiv(group_size, BLOCK_N),
     )
     _q8_0_grouped_dequant_gemm_tc_kernel[grid](

@@ -62,10 +62,52 @@ def apply_rotary_emb(
     y = x
     xc = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
     phasor = freqs_cis.conj() if inverse else freqs_cis
-    if xc.ndim == 3:
-        phasor = phasor.view(1, xc.size(1), xc.size(-1))
+    pair_dim = xc.size(-1)
+    if xc.ndim not in (3, 4):
+        raise ValueError(
+            "apply_rotary_emb expects x shaped [B,S,rd] or [B,S,H,rd], "
+            f"got {tuple(x.shape)}"
+        )
+    if phasor.ndim == 1:
+        if phasor.size(0) != pair_dim:
+            raise ValueError(
+                "rotary phasor dim must match x last-dim/2, got "
+                f"{phasor.size(0)} for {pair_dim}"
+            )
+        if xc.ndim == 3:
+            phasor = phasor.view(1, 1, pair_dim)
+        else:
+            phasor = phasor.view(1, 1, 1, pair_dim)
+    elif phasor.ndim == 2:
+        rows, cols = phasor.shape
+        if cols != pair_dim:
+            raise ValueError(
+                "rotary phasor dim must match x last-dim/2, got "
+                f"{cols} for {pair_dim}"
+            )
+        seq_len = xc.size(1)
+        batch = xc.size(0)
+        if rows == seq_len:
+            if xc.ndim == 3:
+                phasor = phasor.view(1, seq_len, pair_dim)
+            else:
+                phasor = phasor.view(1, seq_len, 1, pair_dim)
+        elif seq_len == 1 and rows == batch:
+            if xc.ndim == 3:
+                phasor = phasor.view(batch, 1, pair_dim)
+            else:
+                phasor = phasor.view(batch, 1, 1, pair_dim)
+        else:
+            raise ValueError(
+                "freqs_cis rows must match sequence length, or batch size when "
+                "x is a decode batch with S=1; got "
+                f"x={tuple(x.shape)}, freqs={tuple(freqs_cis.shape)}"
+            )
     else:
-        phasor = phasor.view(1, xc.size(1), 1, xc.size(-1))
+        raise ValueError(
+            "freqs_cis must be a 1D phasor or 2D bank of phasors, got "
+            f"{tuple(freqs_cis.shape)}"
+        )
     xc = torch.view_as_real(xc * phasor).flatten(-2)
     y.copy_(xc)
     return y
@@ -232,12 +274,12 @@ def window_topk_idxs(window: int, bsz: int, seqlen: int, start_pos: int, device)
     if seqlen > 1 and start_pos > 0:
         rows = torch.arange(start_pos, start_pos + seqlen, device=device).unsqueeze(1)
         cols = torch.arange(window, device=device).unsqueeze(0)
-        # absolute positions each row may attend: [p-window+1, p] (ring slots)
-        matrix = rows - window + 1 + cols  # [seqlen, window] absolute pos
-        # -1 for positions not yet written (before seq start OR after row p)
-        matrix = torch.where(
-            (matrix < 0) | (matrix > rows), torch.full_like(matrix, -1), matrix
-        )
+        # The kernel's ``swa_topk_length`` contract consumes a VALID PREFIX,
+        # not an arbitrary mask.  Put [max(0,p-window+1), p] first and trail it
+        # with -1 while the ring is only partially populated.
+        first = (rows - window + 1).clamp_min(0)
+        matrix = first + cols  # [seqlen, window] absolute positions
+        matrix = torch.where(matrix <= rows, matrix, torch.full_like(matrix, -1))
         matrix = torch.where(matrix >= 0, matrix % window, matrix)  # ring slot
         return matrix.int().unsqueeze(0).expand(bsz, -1, -1).contiguous()
     if start_pos >= window - 1:

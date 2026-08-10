@@ -67,12 +67,18 @@ from typing import Any
 
 from bfdiag.daemon.canary import DEFAULT_CANARY_PROMPT_IDS, DEFAULT_CANARY_STEPS, CanaryChecker
 from bfdiag.daemon.protocol import ProtocolError, Request, read_line, write_line
-from bfdiag.daemon.provider import EngineProvider, FakeEngineProvider, LagunaEngineProvider
+from bfdiag.daemon.provider import (
+    DeepseekV4EngineProvider,
+    EngineProvider,
+    FakeEngineProvider,
+    LagunaEngineProvider,
+)
 
 logger = logging.getLogger("bfdiag.daemon")
 
 DEFAULT_TIMEOUT_S = 30.0
 DEFAULT_LAGUNA_TIMEOUT_S = 900.0
+DEFAULT_DEVICE_PROVIDER_TIMEOUT_S = DEFAULT_LAGUNA_TIMEOUT_S
 DEFAULT_IDLE_TTL_S = 900.0  # 15 minutes -- see module docstring's idle-TTL bullet
 _STATES = ("STARTING", "READY", "BUSY", "TAINTED", "STOPPED")
 
@@ -287,21 +293,29 @@ class Daemon:
 
     def start(self) -> None:
         """Acquire the single-instance lock, load the provider, bind the
-        socket, and start the FIFO worker thread. Does not accept
+        ready socket, and start the FIFO worker thread. Does not accept
         connections yet -- call ``serve_forever()``/``serve_in_background()``
         (or ``_accept_loop()`` directly) for that."""
         self._bfdiag_dir.mkdir(parents=True, exist_ok=True)
         self._acquire_lock()
-        if self._socket_path.exists():
-            # Safe: we hold the exclusive flock, so any leftover socket
-            # file is guaranteed stale (a crashed previous daemon).
-            self._socket_path.unlink()
-        self._listen_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._listen_sock.bind(str(self._socket_path))
-        self._listen_sock.listen(16)
-        self._listen_sock.settimeout(0.2)
+        try:
+            if self._socket_path.exists():
+                # Safe: we hold the exclusive flock, so any leftover socket
+                # file is guaranteed stale (a crashed previous daemon).
+                self._socket_path.unlink()
 
-        self._provider.load()
+            # Do not publish a connectable socket until the model and graphs
+            # are ready.  A GPU load can take minutes; binding first makes a
+            # readiness ping connect successfully and then hang in the listen
+            # backlog because the accept loop has not started yet.
+            self._provider.load()
+            self._listen_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._listen_sock.bind(str(self._socket_path))
+            self._listen_sock.listen(16)
+            self._listen_sock.settimeout(0.2)
+        except BaseException:
+            self._stop()
+            raise
         self._set_state("READY")
         self._started_at = time.time()
         self._started_clock_ts = self._clock()
@@ -698,15 +712,24 @@ def _build_provider(args: argparse.Namespace) -> EngineProvider:
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory_utilization,
         )
+    if args.provider == "deepseek_v4":
+        return DeepseekV4EngineProvider(
+            model_path=args.model_path,
+            tokenizer_path=args.tokenizer_path,
+            num_slots=args.num_slots,
+            max_model_len=args.max_model_len,
+            prefill_rows=args.prefill_rows,
+            enable_cudagraph=args.enable_cudagraph,
+        )
     raise ValueError(f"unknown provider {args.provider!r}")
 
 
 def _resolve_default_timeout_s(provider: str, configured: float | None) -> float | None:
     """Keep normal interactive defaults for fake/CPU providers while giving
-    Laguna's complete fixed workloads enough time to finish."""
+    real GPU providers' complete fixed workloads enough time to finish."""
     if configured is not None:
         return configured
-    return DEFAULT_LAGUNA_TIMEOUT_S if provider == "laguna" else None
+    return DEFAULT_DEVICE_PROVIDER_TIMEOUT_S if provider in {"laguna", "deepseek_v4"} else None
 
 
 def _add_provider_args(parser: argparse.ArgumentParser) -> None:
@@ -714,15 +737,30 @@ def _add_provider_args(parser: argparse.ArgumentParser) -> None:
     ``bf daemon start`` so the two never drift out of sync on what a
     Laguna load-time config actually looks like (see provider.py's
     ``LOAD_TIME_CONFIG_KEYS``)."""
-    parser.add_argument("--provider", choices=["fake", "laguna"], default="fake")
+    parser.add_argument("--provider", choices=["fake", "laguna", "deepseek_v4"], default="fake")
     parser.add_argument("--socket", default=None)
     parser.add_argument("--model-path", default=None)
+    parser.add_argument("--tokenizer-path", default=None)
     parser.add_argument("--num-slots", type=int, default=1)
     parser.add_argument("--blocks-per-slot", type=int, default=4096)
     parser.add_argument("--block-size", type=int, default=64)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--max-model-len", type=int, default=131072)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
+    parser.add_argument("--prefill-rows", type=int, default=32)
+    parser.set_defaults(enable_cudagraph=True)
+    parser.add_argument(
+        "--cudagraph",
+        dest="enable_cudagraph",
+        action="store_true",
+        help="capture decode CUDA Graphs during provider load",
+    )
+    parser.add_argument(
+        "--no-cudagraph",
+        dest="enable_cudagraph",
+        action="store_false",
+        help="disable decode CUDA Graph capture during provider load",
+    )
     parser.add_argument("--no-canary", action="store_true")
     parser.add_argument("--idle-ttl-s", type=float, default=None)
     parser.add_argument(
@@ -730,7 +768,7 @@ def _add_provider_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=None,
         help=(
-            "default per-exec timeout; Laguna defaults to 900 seconds so long "
+            "default per-exec timeout; GPU providers default to 900 seconds so long "
             "fixed-contract benchmarks cannot accidentally taint the daemon"
         ),
     )

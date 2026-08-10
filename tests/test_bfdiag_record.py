@@ -187,13 +187,17 @@ def test_run_record_scopes_and_flushes_an_enabled_trace(monkeypatch, store: RunS
     )
     monkeypatch.setattr(
         "bfdiag.record._write_record_trace",
-        lambda ring, active_store, run_id: events.append(("flush", run_id)),
+        lambda ring, active_store, run_id: (
+            events.append(("flush", run_id))
+            or active_store.run_dir(run_id) / "trace.jsonl"
+        ),
     )
 
     with run_record(script="demo.py", store=store) as rec:
         run_id = rec.run_id
 
     assert events == [("reset", None), ("flush", run_id)]
+    assert store.load(run_id).trace_path == f"runs/{run_id}/trace.jsonl"
 
 
 def test_run_record_exports_and_restores_env_vars(store: RunStore, monkeypatch) -> None:

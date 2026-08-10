@@ -233,7 +233,14 @@ class _FakeSnapshotRunner:
     the tests below go red.
     """
 
-    def __init__(self, kv_lens, prefix=(), dflash_cg_status=()):
+    def __init__(
+        self,
+        kv_lens,
+        prefix=(),
+        dflash_cg_status=(),
+        runtime_stats=(),
+        cg_fallback_reasons=(),
+    ):
         from runtime.backends.protocol import BackendSnapshot, PrefixSnapshot, SlotSnapshot
 
         self._snapshot = BackendSnapshot(
@@ -245,6 +252,8 @@ class _FakeSnapshotRunner:
                 for i, (kv, t) in enumerate(prefix)
             ),
             dflash_cg_status=dflash_cg_status,
+            runtime_stats=runtime_stats,
+            cg_fallback_reasons=cg_fallback_reasons,
         )
 
     def snapshot(self):
@@ -351,6 +360,53 @@ class TestMetricsEndpointItself:
         body = self._call(monkeypatch, engine)
         assert 'blackwellm:dflash_cg_captured{model_name="test/model",graph="draft"} 1' in body
         assert 'blackwellm:dflash_cg_captured{model_name="test/model",graph="verify"} 0' in body
+
+    def test_scrape_reports_backend_cuda_graph_activity_and_fallback_reason(self, monkeypatch):
+        engine = _FakeEngine(
+            _FakeSnapshotRunner(
+                [12],
+                runtime_stats=(
+                    ("decode_graph_capture_attempts", 1),
+                    ("decode_graph_capture_successes", 0),
+                    ("decode_graph_capture_failures", 1),
+                    ("decode_graph_replays", 7),
+                    ("decode_eager_fallbacks", 2),
+                ),
+                cg_fallback_reasons=(("capture_failed", 2),),
+            )
+        )
+        body = self._call(monkeypatch, engine)
+        assert (
+            'blackwellm:decode_graph_replays_total{model_name="test/model"} 7' in body
+        )
+        assert (
+            'blackwellm:decode_eager_fallbacks_total{model_name="test/model"} 2' in body
+        )
+        assert (
+            'blackwellm:decode_eager_fallback_reason_total{model_name="test/model",'
+            'reason="capture_failed"} 2'
+        ) in body
+
+    def test_debug_stats_reports_snapshot_activity_without_private_reads(self, monkeypatch):
+        import asyncio
+
+        pytest.importorskip("fastapi")
+        import server.app as app_module
+
+        runner = _FakeSnapshotRunner(
+            [4],
+            dflash_cg_status=(("decode", "captured"),),
+            runtime_stats=(("decode_graph_replays", 3),),
+            cg_fallback_reasons=(("not_captured", 1),),
+        )
+        engine = _FakeEngine(runner)
+        monkeypatch.setattr(app_module, "engine", engine)
+
+        result = asyncio.run(app_module.debug_stats())
+
+        assert result["_cuda_graph_dbg"] == {"decode": "captured"}
+        assert result["_backend_snapshot_stats_dbg"] == {"decode_graph_replays": 3}
+        assert result["_cuda_graph_fallback_reasons_dbg"] == {"not_captured": 1}
 
     def test_endpoint_does_not_reach_past_the_contract(self, monkeypatch):
         # The nail this whole step is driven around. This backend carries a

@@ -96,10 +96,22 @@ class CgMissReason(IntEnum):
     BATCH_SIZE_MISMATCH = 3  # len(slot_ids) != captured decode CG batch_size
     NON_GREEDY = 4  # a request in the batch is not greedy sampling
     LOGPROBS_REQUESTED = 5  # caller asked for logprobs (CG replay can't produce them)
+    CAPTURE_FAILED = 6  # capture was attempted and failed
+    NOT_CAPTURED = 7  # capture has not been attempted for this graph yet
 
 
 _PATH_LABELS = {int(p): p.name.lower() for p in Path}
 _REASON_LABELS = {int(r): r.name.lower() for r in CgMissReason}
+
+
+class EventKind(IntEnum):
+    """High-level round type. Legacy rows default to ``DECODE_ROUND``."""
+
+    DECODE_ROUND = 0
+    PREFILL_CHUNK = 1
+
+
+_EVENT_KIND_LABELS = {int(kind): kind.name.lower() for kind in EventKind}
 
 
 def path_label(value: int) -> str:
@@ -108,6 +120,10 @@ def path_label(value: int) -> str:
 
 def reason_label(value: int) -> str:
     return _REASON_LABELS.get(int(value), f"unknown({value})")
+
+
+def event_kind_label(value: int) -> str:
+    return _EVENT_KIND_LABELS.get(int(value), f"unknown({value})")
 
 
 # --------------------------------------------------------------------------
@@ -143,6 +159,12 @@ NUMERIC_FIELDS: tuple[str, ...] = (
     "round_idx",
     "slot",
     "kv_len_before",
+    "position",
+    "row_count",
+    "compressor_ratio",
+    "window_entries",
+    "ratio4_entries",
+    "ratio128_entries",
     "path",
     "cg_miss_reason",
     "draft_tokens_n",
@@ -167,7 +189,7 @@ ALL_FIELDS: tuple[str, ...] = NUMERIC_FIELDS + TIMING_FIELDS
 # fields (see ``RoundEvent.from_dict``) rather than requiring a lockstep
 # writer/reader upgrade -- the "offline decode dictionary" this schema
 # module IS should evolve without invalidating trace files already on disk.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -195,6 +217,13 @@ class RoundEvent:
     t_verify: float
     t_commit: float
     t_round: float
+    event_kind: str = "decode_round"
+    position: int = -1
+    row_count: int = 0
+    compressor_ratio: int = -1
+    window_entries: int = 0
+    ratio4_entries: int = 0
+    ratio128_entries: int = 0
     site_id: int = 0
     tier: int = 0
     payload_ref: str = ""
@@ -245,10 +274,23 @@ if __name__ == "__main__":
         assert path_label(int(p)) == p.name.lower()
     for r in CgMissReason:
         assert reason_label(int(r)) == r.name.lower()
+    for kind in EventKind:
+        assert event_kind_label(int(kind)) == kind.name.lower()
 
     # Forward-compat: a record from before site_id/tier/payload_ref existed
     # (no such keys in the dict) still parses, filling in the defaults.
-    _reserved_keys = ("site_id", "tier", "payload_ref")
+    _reserved_keys = (
+        "event_kind",
+        "position",
+        "row_count",
+        "compressor_ratio",
+        "window_entries",
+        "ratio4_entries",
+        "ratio128_entries",
+        "site_id",
+        "tier",
+        "payload_ref",
+    )
     legacy_data = {k: v for k, v in asdict(ev).items() if k not in _reserved_keys}
     legacy_ev = RoundEvent.from_dict(legacy_data)
     assert legacy_ev == ev

@@ -150,7 +150,12 @@ def test_check_comparability_flags_git_sha_drift() -> None:
 
 def test_default_comparable_fields_cover_the_documented_set() -> None:
     expected_leaves = {
+        "workload.contract",
+        "workload.contract_version",
+        "workload.workload_name",
         "workload.prompt_hash",
+        "workload.generated_tokens",
+        "workload.batch",
         "model.revision",
         "git.qwen-sm120-runtime.sha",
         "git.sparkinfer.sha",
@@ -158,6 +163,9 @@ def test_default_comparable_fields_cover_the_documented_set() -> None:
         "workload.greedy",
         "workload.block_size",
         "workload.max_model_len",
+        "workload.max_q_rows",
+        "workload.cuda_graph_status",
+        "workload.warm_only",
         # Added 2026-07-27 after a real incident: a warm daemon defaulting to
         # blocks_per_slot=4096 was compared against a cold-start script
         # deriving 130, acceptance 0.6754 vs 0.452525, and `bf diff` called
@@ -172,6 +180,46 @@ def test_default_comparable_fields_cover_the_documented_set() -> None:
     }
     leaves = {p[len("fingerprint.") :] for p in DEFAULT_COMPARABLE_FIELDS}
     assert leaves == expected_leaves
+
+
+def test_dsv4_baselines_with_different_batch_or_graph_mode_are_not_comparable() -> None:
+    common = {
+        "contract": "dsv4-warm-baseline",
+        "contract_version": 1,
+        "workload_name": "chat-short-96",
+        "generated_tokens": 64,
+        "max_q_rows": 32,
+        "cuda_graph_status": "captured",
+        "warm_only": True,
+    }
+    batch_one = _record(
+        "dsv4batch01",
+        prompt_hash="d5" * 16,
+        acceptance_rate=1.0,
+        batch=1,
+        **common,
+    )
+    batch_two = _record(
+        "dsv4batch02",
+        prompt_hash="d5" * 16,
+        acceptance_rate=1.0,
+        batch=2,
+        **common,
+    )
+    eager = _record(
+        "dsv4eager01",
+        prompt_hash="d5" * 16,
+        acceptance_rate=1.0,
+        batch=1,
+        **{**common, "cuda_graph_status": "not_captured"},
+    )
+
+    assert [item.path for item in check_comparability(batch_one, batch_two)] == [
+        "fingerprint.workload.batch"
+    ]
+    assert [item.path for item in check_comparability(batch_one, eager)] == [
+        "fingerprint.workload.cuda_graph_status"
+    ]
 
 
 def test_differ_flags_the_warm_daemon_blocks_per_slot_incident() -> None:

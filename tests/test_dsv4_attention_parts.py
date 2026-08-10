@@ -87,6 +87,83 @@ def test_apply_rotary_bit_exact(ref) -> None:
     assert torch.equal(x1, x2)
 
 
+def _manual_rotary_decode(
+    x: torch.Tensor, freqs: torch.Tensor, *, inverse: bool = False
+) -> torch.Tensor:
+    out = x.clone()
+    for row in range(x.size(0)):
+        xc = torch.view_as_complex(out[row : row + 1].float().unflatten(-1, (-1, 2)))
+        phasor = freqs[row].conj() if inverse else freqs[row]
+        if xc.ndim == 3:
+            rotated = torch.view_as_real(xc * phasor.view(1, 1, -1)).flatten(-2)
+        else:
+            rotated = torch.view_as_real(xc * phasor.view(1, 1, 1, -1)).flatten(-2)
+        out[row : row + 1].copy_(rotated)
+    return out
+
+
+def _manual_rotary_sequence(
+    x: torch.Tensor, freqs: torch.Tensor, *, inverse: bool = False
+) -> torch.Tensor:
+    xc = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+    phasor = freqs.conj() if inverse else freqs
+    rotated = torch.view_as_real(xc * phasor.view(1, freqs.size(0), 1, freqs.size(1))).flatten(-2)
+    return rotated.to(x.dtype)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
+@pytest.mark.parametrize("with_heads", [False, True])
+@pytest.mark.parametrize("inverse", [False, True])
+def test_apply_rotary_decode_batch_per_row_phasors(
+    batch_size: int, with_heads: bool, inverse: bool
+) -> None:
+    gen = torch.Generator().manual_seed(30 + batch_size + int(with_heads) * 10 + int(inverse) * 100)
+    rope_dim = 16
+    x_shape = (batch_size, 1, 3, rope_dim) if with_heads else (batch_size, 1, rope_dim)
+    x = torch.randn(*x_shape, generator=gen)
+    freqs_bank = precompute_freqs_cis(
+        rope_dim,
+        32,
+        original_seq_len=65536,
+        base=10000.0,
+        factor=16.0,
+        beta_fast=32,
+        beta_slow=1,
+    )
+    positions = torch.tensor([0, 5, 11, 19][:batch_size], dtype=torch.long)
+    freqs = freqs_bank.index_select(0, positions)
+    expected = _manual_rotary_decode(x, freqs, inverse=inverse)
+    actual = x.clone()
+    apply_rotary_emb(actual, freqs, inverse=inverse)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("inverse", [False, True])
+def test_apply_rotary_legacy_sequence_layout_with_heads(inverse: bool) -> None:
+    gen = torch.Generator().manual_seed(41 + int(inverse) * 100)
+    x = torch.randn(2, 5, 3, 16, generator=gen)
+    freqs = precompute_freqs_cis(
+        16,
+        5,
+        original_seq_len=65536,
+        base=10000.0,
+        factor=16.0,
+        beta_fast=32,
+        beta_slow=1,
+    )
+    expected = _manual_rotary_sequence(x, freqs, inverse=inverse)
+    actual = x.clone()
+    apply_rotary_emb(actual, freqs, inverse=inverse)
+    assert torch.equal(actual, expected)
+
+
+def test_apply_rotary_rejects_mismatched_2d_freq_rows() -> None:
+    x = torch.randn(2, 3, 4, 16)
+    freqs = torch.ones(2, 8, dtype=torch.complex64)
+    with pytest.raises(ValueError, match="freqs_cis rows must match"):
+        apply_rotary_emb(x, freqs)
+
+
 @NEEDS_GPU
 @pytest.mark.parametrize("ue8m0", [True, False])
 def test_act_quant_matches_reference_kernel(ref, ue8m0: bool) -> None:

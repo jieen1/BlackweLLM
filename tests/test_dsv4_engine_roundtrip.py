@@ -64,7 +64,7 @@ TINY = Dsv4Config(
 
 
 def _zeroed_model(max_seq_len: int = 64) -> Dsv4Transformer:
-    model = Dsv4Transformer(TINY, max_seq_len=max_seq_len, device="cuda")
+    model = Dsv4Transformer(TINY, max_seq_len=max_seq_len, device="cpu")
     for buf in model.buffers():
         buf.zero_()
     for module in model.modules():
@@ -91,7 +91,7 @@ def _make_backend() -> DeepseekV4Backend:
         TINY,
         num_slots=2,
         max_seq_len=64,
-        device="cuda",
+        device="cpu",
         forward_fn=forward_fn,
     )
 

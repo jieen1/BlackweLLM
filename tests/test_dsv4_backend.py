@@ -15,7 +15,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from runtime.backends.dsv4 import DeepseekV4Backend  # noqa: E402
+from runtime.backends.dsv4 import (  # noqa: E402
+    DeepseekV4Backend,
+    _enable_serving_q8_kernels,
+)
 from runtime.backends.protocol import (  # noqa: E402
     BackendCapabilities,
     PrefixHit,
@@ -105,22 +108,37 @@ def _make_backend(num_slots: int = 2) -> DeepseekV4Backend:
     return backend
 
 
+def test_serving_q8_policy_enables_lm_head_without_blanket_fp32_conversion() -> None:
+    model = _zeroed_model()
+
+    assert model.lm_head.weight_dtype is None
+    assert model.blocks[0].moe.shared_w1.weight_dtype is None
+    assert model.blocks[0].attn.wq_a.weight_dtype is torch.bfloat16
+
+    _enable_serving_q8_kernels(model)
+
+    assert model.lm_head.fused_q8 is True
+    assert model.blocks[0].attn.wq_a.fused_q8 is True
+    assert model.blocks[0].moe.shared_w1.fused_q8 is False
+    assert model.blocks[0].moe.shared_w1.fused_q8_fp32 is True
+
+
 # -- protocol conformance (GPU-free) -----------------------------------------
 
 
-def test_backend_conforms_with_no_capabilities() -> None:
+def test_backend_conforms_with_cuda_graph_capability() -> None:
     problems = check_conformance(
         DeepseekV4Backend,
-        BackendCapabilities(False, False, False, False, False),
+        BackendCapabilities(False, True, True, False, False),
     )
     assert problems == [], problems
 
 
-def test_backend_declares_no_capabilities() -> None:
+def test_backend_declares_cuda_graph_capability() -> None:
     caps = DeepseekV4Backend.capabilities.fget(None)
     assert caps.speculative_decode is False
-    assert caps.prefix_cache is False
-    assert caps.cuda_graph is False
+    assert caps.prefix_cache is True
+    assert caps.cuda_graph is True
     assert caps.chunked_prefill is False
     assert caps.warm_continue is False
 
@@ -146,10 +164,87 @@ def test_prefill_and_decode_advance_slot() -> None:
     out = backend.decode_batch_sampled([0], [7], [3], [SamplingParams(temperature=0.0)])
     assert out == [3]
     assert backend.slot_state(0).kv_len == 4
-    assert backend.slot_state(0).committed_tokens == (1, 2, 3, 3)
+    assert backend.slot_state(0).committed_tokens == (1, 2, 3, 7)
     # prefill is chunked at max_q_rows (=1 in this tiny backend): one forward
     # per token at absolute positions 0,1,2, then decode at kv_len=3.
     assert backend._test_calls == [(0, 0, 1), (0, 1, 1), (0, 2, 1), (0, 3, 1)]
+    assert backend.stats["prefill_calls"] == 1
+    assert backend.stats["prefill_chunks"] == 3
+    assert backend.stats["prefill_tokens"] == 3
+    assert backend.stats["decode_rounds"] == 1
+    assert backend.stats["decode_tokens"] == 1
+    assert backend.stats["decode_eager_fallbacks"] == 1
+    assert backend.cg_fallback_reasons == {"not_captured": 1}
+
+
+def test_prefill_rejects_capacity_overflow_before_forward_mutation() -> None:
+    backend = _make_backend()
+
+    with pytest.raises(IndexError, match="prefill length 65 exceeds max_seq_len=64"):
+        backend.prefill(0, list(range(65)))
+
+    assert backend._test_calls == []
+    assert backend.slot_state(0).is_fresh
+
+
+def test_decode_uses_slot_cuda_graph_when_captured() -> None:
+    backend = _make_backend()
+    backend.prefill(0, [1, 2])
+    calls: list[tuple[int, int, int]] = []
+
+    class FakeGraph:
+        def replay(self, slot: int, token: int, position: int) -> torch.Tensor:
+            calls.append((slot, token, position))
+            logits = torch.zeros(1, 1, TINY.vocab_size, device="cuda")
+            logits[0, 0, 9] = 3
+            return logits
+
+    eager_calls = list(backend._test_calls)
+    backend._decode_graphs[0] = FakeGraph()
+    out = backend.decode_batch_sampled([0], [7], [2], [SamplingParams(temperature=0.0)])
+
+    assert out == [9]
+    assert calls == [(0, 7, 2)]
+    assert backend._test_calls == eager_calls
+    assert backend.stats["decode_graph_replays"] == 1
+    assert backend.stats["decode_eager_fallbacks"] == 0
+
+
+def test_prefill_and_decode_emit_dsv4_flight_recorder_rows(monkeypatch) -> None:
+    from bfdiag.trace import ring as bfdiag_trace
+
+    monkeypatch.setattr(bfdiag_trace, "TRACE_ENABLED", True)
+    bfdiag_trace.reset(16, use_cuda=False)
+    backend = _make_backend()
+
+    anchor = backend.prefill(0, [1, 2, 3])
+    backend.decode_batch_sampled(
+        [0],
+        [anchor],
+        [3],
+        [SamplingParams(temperature=0.0)],
+    )
+
+    rows = bfdiag_trace.get_ring().snapshot()
+    assert [row.event_kind for row in rows] == [
+        "prefill_chunk",
+        "prefill_chunk",
+        "prefill_chunk",
+        "decode_round",
+    ]
+    assert [(row.position, row.row_count) for row in rows] == [
+        (0, 1),
+        (1, 1),
+        (2, 1),
+        (3, 1),
+    ]
+    decode = rows[-1]
+    assert decode.path == "eager"
+    assert decode.cg_miss_reason == "not_captured"
+    assert decode.window_entries == 4
+    assert decode.ratio4_entries == 1
+    assert decode.ratio128_entries == 0
+    assert decode.t_round > 0.0
 
 
 def test_sampled_decode_uses_params_seed() -> None:
@@ -188,6 +283,18 @@ def test_decode_kv_length_mismatch_raises() -> None:
         backend.decode_batch_sampled([0], [7], [99], [SamplingParams(temperature=0.0)])
 
 
+def test_decode_batch_sampled_rejects_any_parameter_length_mismatch() -> None:
+    backend = _make_backend(num_slots=2)
+    backend.prefill(0, [1])
+    with pytest.raises(ValueError, match="equal length"):
+        backend.decode_batch_sampled(
+            [0],
+            [7, 8],
+            [1],
+            [SamplingParams(temperature=0.0), SamplingParams(temperature=0.0)],
+        )
+
+
 def test_snapshot_shapes() -> None:
     backend = _make_backend(num_slots=2)
     snap = backend.snapshot()
@@ -195,6 +302,8 @@ def test_snapshot_shapes() -> None:
     assert [s.slot for s in snap.slots] == [0, 1]
     assert len(snap.prefix) == 2
     assert snap.dflash_cg_status == ()
+    assert dict(snap.runtime_stats)["decode_graph_replays"] == 0
+    assert snap.cg_fallback_reasons == ()
 
 
 def test_multislot_serving() -> None:
@@ -212,6 +321,221 @@ def test_multislot_serving() -> None:
     assert backend.slot_state(1).kv_len == 3
 
 
+def test_decode_graphs_are_slot_isolated_across_interleaved_replay_and_reset() -> None:
+    backend = _make_backend(num_slots=2)
+    assert backend.prefill(0, [1, 2]) == 3
+    assert backend.prefill(1, [4, 5]) == 3
+
+    class FakeLayer:
+        def __init__(self) -> None:
+            self.reset_slots: list[int] = []
+
+        def reset_caches(self, slot: int) -> None:
+            self.reset_slots.append(slot)
+
+    class FakeGraph:
+        def __init__(self, slot: int, out_token: int) -> None:
+            self.slot = slot
+            self.out_token = out_token
+            self.calls: list[tuple[int, int, int]] = []
+
+        def replay(self, slot: int, token: int, position: int) -> torch.Tensor:
+            self.calls.append((slot, token, position))
+            logits = torch.zeros(1, 1, TINY.vocab_size, device="cuda")
+            logits[0, 0, self.out_token] = 5.0
+            return logits
+
+    layers = [FakeLayer(), FakeLayer()]
+    slot0_graph = FakeGraph(0, 11)
+    slot1_graph = FakeGraph(1, 17)
+    backend.slot_layers = layers
+    backend._decode_graphs = {0: slot0_graph, 1: slot1_graph}
+    eager_calls = list(backend._test_calls)
+
+    out = backend.decode_batch_sampled(
+        [1, 0],
+        [8, 7],
+        [2, 2],
+        [SamplingParams(temperature=0.0), SamplingParams(temperature=0.0)],
+    )
+
+    assert out == [17, 11]
+    assert slot0_graph.calls == [(0, 7, 2)]
+    assert slot1_graph.calls == [(1, 8, 2)]
+    assert backend._test_calls == eager_calls
+    assert backend.slot_state(0).kv_len == 3
+    assert backend.slot_state(0).committed_tokens == (1, 2, 7)
+    assert backend.slot_state(1).kv_len == 3
+    assert backend.slot_state(1).committed_tokens == (4, 5, 8)
+
+    backend.reset_slot(0)
+
+    assert [layer.reset_slots for layer in layers] == [[0], [0]]
+    assert backend.slot_state(0).is_fresh
+    assert backend.slot_state(0).committed_tokens == ()
+    assert backend.slot_state(1).kv_len == 3
+    assert backend.slot_state(1).committed_tokens == (4, 5, 8)
+
+    out = backend.decode_batch_sampled([1], [9], [3], [SamplingParams(temperature=0.0)])
+
+    assert out == [17]
+    assert slot0_graph.calls == [(0, 7, 2)]
+    assert slot1_graph.calls == [(1, 8, 2), (1, 9, 3)]
+    assert backend.slot_state(1).kv_len == 4
+    assert backend.slot_state(1).committed_tokens == (4, 5, 8, 9)
+
+
+def test_capture_decode_graphs_rejects_active_slots() -> None:
+    backend = _make_backend(num_slots=1)
+    backend.prefill(0, [1])
+    backend._forward_fn = None
+    backend.slot_layers = [object()]
+    backend._native_decode_batch_available = True
+
+    with pytest.raises(RuntimeError, match="before slot admission.*0"):
+        backend.capture_decode_cuda_graph()
+
+
+def test_capture_decode_graphs_is_atomic_and_idempotent(monkeypatch) -> None:
+    backend = _make_backend(num_slots=2)
+    backend._forward_fn = None
+    backend._native_decode_batch_available = True
+
+    class FakeLayer:
+        def __init__(self) -> None:
+            self.reset_slots: list[int] = []
+
+        def reset_caches(self, slot: int) -> None:
+            self.reset_slots.append(slot)
+
+    layers = [FakeLayer(), FakeLayer()]
+    backend.slot_layers = layers
+    built: list[object] = []
+
+    class FakeDriver:
+        def __init__(self, **kwargs) -> None:
+            self.backend = kwargs["backend"]
+            self.captures = 0
+            built.append(self)
+
+        def capture(self) -> None:
+            self.captures += 1
+
+    monkeypatch.setattr(
+        "runtime.backends.dsv4_cudagraph.build_batched_decode_graph_driver", FakeDriver
+    )
+
+    assert backend.capture_decode_cuda_graph() == 2
+    assert set(backend._decode_graphs) == {1, 2}
+    assert len(built) == 1
+    assert built[0].captures == 1
+    assert backend._decode_graphs[1] is backend._decode_graphs[2] is built[0]
+    assert [layer.reset_slots for layer in layers] == [[0, 1], [0, 1]]
+
+    backend._kv_len[0] = 1
+    assert backend.capture_decode_cuda_graph() == 2
+    assert [layer.reset_slots for layer in layers] == [[0, 1], [0, 1]]
+
+
+def test_capture_decode_graphs_rolls_back_partial_failure(monkeypatch) -> None:
+    backend = _make_backend(num_slots=2)
+    backend._forward_fn = None
+    backend._native_decode_batch_available = True
+
+    class FakeLayer:
+        def __init__(self) -> None:
+            self.reset_slots: list[int] = []
+
+        def reset_caches(self, slot: int) -> None:
+            self.reset_slots.append(slot)
+
+    layers = [FakeLayer(), FakeLayer()]
+    backend.slot_layers = layers
+
+    class FailingDriver:
+        def __init__(self, **kwargs) -> None:
+            return None
+
+        def capture(self) -> None:
+            raise RuntimeError("capture failed")
+
+    monkeypatch.setattr(
+        "runtime.backends.dsv4_cudagraph.build_batched_decode_graph_driver", FailingDriver
+    )
+
+    assert backend.capture_decode_cuda_graph() is None
+    assert backend._decode_graphs == {}
+    assert backend.snapshot().dflash_cg_status == (("decode", "failed"),)
+    assert [layer.reset_slots for layer in layers] == [[0, 1], [0, 1]]
+
+
+def test_bucketed_decode_graph_driver_picks_smallest_covering_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from runtime.backends import dsv4_cudagraph
+
+    class FakeIndexer:
+        def __init__(self) -> None:
+            self.kv_cache = torch.zeros(1, 16384, 4)
+
+    class FakeLayer:
+        def __init__(self) -> None:
+            self.indexer = FakeIndexer()
+
+    seen_caps: list[tuple[int | None, int]] = []
+
+    class FakeDriver:
+        def __init__(self, *, max_index_entries=None, graph_pool=None, **kwargs) -> None:
+            self.max_index_entries = max_index_entries
+            self.graph_pool = graph_pool or object()
+
+        def capture(self, slot: int) -> None:
+            self.slot = slot
+
+        def replay(self, slot: int, token: int, position: int) -> torch.Tensor:
+            seen_caps.append((self.max_index_entries, position))
+            return torch.zeros(1, 1, TINY.vocab_size, device="cuda")
+
+    monkeypatch.setattr(dsv4_cudagraph, "Dsv4DecodeGraphDriver", FakeDriver)
+
+    graph = dsv4_cudagraph.build_decode_graph_driver(
+        model=object(),
+        kernel_layers=[FakeLayer()],
+        max_seq_len=65536,
+        device="cuda",
+    )
+    graph.capture(0)
+
+    assert [cap for cap, _driver in graph._drivers] == [512, 1024, 4096, 16384]
+
+    graph.replay(0, 7, 3)
+    graph.replay(0, 7, 4099)
+    graph.replay(0, 7, 65000)
+
+    assert seen_caps == [
+        (512, 3),
+        (4096, 4099),
+        (16384, 65000),
+    ]
+
+
+def test_q8_block_n_selection_matches_sm120_real_weight_sweep() -> None:
+    from runtime.kernels.dsv4_q8_gemm import (
+        _select_q8_0_block_n,
+        _select_q8_0_grouped_block_n,
+    )
+
+    assert _select_q8_0_block_n(1, 4096, 1024) == 32
+    assert _select_q8_0_block_n(1, 1024, 32768) == 64
+    assert _select_q8_0_block_n(1, 4096, 129280) == 32
+    assert _select_q8_0_block_n(32, 4096, 129280) == 64
+    assert _select_q8_0_grouped_block_n(1) == 16
+    assert _select_q8_0_grouped_block_n(2) == 16
+    assert _select_q8_0_grouped_block_n(4) == 16
+    assert _select_q8_0_grouped_block_n(5) == 64
+    assert _select_q8_0_grouped_block_n(32) == 64
+
+
 def test_out_of_range_slot_raises() -> None:
     backend = _make_backend(num_slots=1)
     with pytest.raises(IndexError, match="out of range"):
@@ -220,16 +544,31 @@ def test_out_of_range_slot_raises() -> None:
         backend.slot_state(1)
 
 
-def test_logprobs_rejected() -> None:
+def test_logprobs_return_chosen_and_top_tokens() -> None:
     backend = _make_backend()
     backend.prefill(0, [1])
-    with pytest.raises(NotImplementedError, match="logprobs"):
-        backend.decode_batch_sampled(
-            [0], [7], [1], [SamplingParams(temperature=0.0)], return_logprobs=True
-        )
+    tokens, logprobs = backend.decode_batch_sampled(
+        [0],
+        [7],
+        [1],
+        [SamplingParams(temperature=0.0)],
+        return_logprobs=True,
+        top_logprobs=3,
+    )
+
+    assert len(tokens) == len(logprobs) == 1
+    assert logprobs[0]["token_id"] == tokens[0]
+    assert len(logprobs[0]["top_logprobs"]) == 3
+    assert logprobs[0]["top_logprobs"][0]["token_id"] == tokens[0]
+    assert logprobs[0]["logprob"] == pytest.approx(logprobs[0]["top_logprobs"][0]["logprob"])
 
 
-# -- prefix-cache no-op surface ----------------------------------------------
+def test_empty_logprobs_batch_preserves_protocol_shape() -> None:
+    backend = _make_backend()
+    assert backend.decode_batch_sampled([], [], [], [], return_logprobs=True) == ([], [])
+
+
+# -- empty prefix-cache surface ----------------------------------------------
 
 
 def test_reconcile_prefix_hit_is_zero() -> None:
@@ -267,9 +606,7 @@ def test_prefill_chunked_begin_completes_immediately() -> None:
 def test_prefill_chunked_begin_sampled_anchor() -> None:
     backend = _make_backend()
     params = SamplingParams(temperature=0.8, seed=7)
-    state = backend.prefill_chunked_begin(
-        [0], [[1, 2]], params_per_slot={0: params}
-    )
+    state = backend.prefill_chunked_begin([0], [[1, 2]], params_per_slot={0: params})
     assert state.done is True
     # The sampled anchor comes from the stub logits (uniform + 2.0 on 3);
     # sampling with seed is deterministic -- just assert it is a valid token.
