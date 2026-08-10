@@ -38,6 +38,11 @@ from triton.compiler import ASTSource
 _IQ2_XS_BLOCK_BYTES = 74
 _IQ2_XS_BLOCK_ELEMS = 256
 _DEFAULT_IQ2XS_BLOCK_COLS = 8
+
+def _next_pow2(n: int) -> int:
+    return 1 << (n - 1).bit_length()
+
+
 _DEFAULT_IQ2XS_NUM_WARPS = 4
 _DEFAULT_IQ2XS_NUM_STAGES = 3
 
@@ -254,7 +259,7 @@ def _iq2xs_dequant_gemm_batch_indexed_kernel(
     ksigns_ptr,
     out_ptr,
     E,
-    M,
+    M_PAD: tl.constexpr,
     K: tl.constexpr,
     ROWS: tl.constexpr,
     W_ROW_STRIDE: tl.constexpr,
@@ -262,25 +267,69 @@ def _iq2xs_dequant_gemm_batch_indexed_kernel(
     BLK_ELEMS: tl.constexpr,
     BLK_BYTES: tl.constexpr,
 ):
-    """Route-batched variant selecting experts from one global packed table."""
+    """Route-batched IQ2_XS dequant-GEMM with per-expert M-token batching.
+
+    One block covers one (expert, row-block) and dequantizes its packed
+    weights ONCE, then reuses them across all ``M`` tokens assigned to that
+    expert.  The previous layout launched one block per token, re-reading
+    the same weight block ``M`` times from HBM (that is why M>1 prefill was
+    only ~4x faster than M=1 decode instead of M-times faster).  ``acc`` is
+    [M, BLOCK_COLS] so the K-accumulation stays correct across the kb loop.
+    """
     pid_e = tl.program_id(0)
-    pid_m = tl.program_id(1)
-    pid_c = tl.program_id(2)
+    pid_c = tl.program_id(1)
     col0 = pid_c * BLOCK_COLS
 
     x_u16 = x_ptr.to(tl.pointer_type(tl.uint16))
-    x_base = pid_e * M * K + pid_m * K
     eid = tl.load(expert_ids_ptr + pid_e).to(tl.int32)
 
     crows = col0 + tl.arange(0, BLOCK_COLS)
-    acc = tl.zeros((BLOCK_COLS,), dtype=tl.float32)
+    c32 = tl.arange(0, 32)
+
+    if M_PAD == 1:
+        # M=1: 2D reduction bit-identical to the legacy per-token kernel
+        # (the B1 decode kernel keeps this exact accumulation order).
+        acc = tl.zeros((BLOCK_COLS,), dtype=tl.float32)
+        for kb in range(0, K, BLK_ELEMS):
+            kb_block = kb // BLK_ELEMS
+            col_byte = eid * ROWS * W_ROW_STRIDE + crows * W_ROW_STRIDE + kb_block * BLK_BYTES
+            base = w_ptr + col_byte
+
+            lo = tl.load(base[:, None] + 2 + c32[None, :] * 2).to(tl.uint32)
+            hi = tl.load(base[:, None] + 2 + c32[None, :] * 2 + 1).to(tl.uint32)
+            codes = (lo | (hi << 8)) & 0xFFFF
+
+            g = tl.load(grid_ptr + (codes & 511))
+            sb = tl.load(ksigns_ptr + (codes >> 9))
+
+            d_lo = tl.load(base).to(tl.uint32)
+            d_hi = tl.load(base + 1).to(tl.uint32)
+            d_u16 = d_lo.to(tl.uint16) | (d_hi.to(tl.uint16) << 8)
+            d_f = d_u16.to(tl.float16, bitcast=True).to(tl.float32)
+            sc = tl.load(base[:, None] + 66 + (c32[None, :] // 4))
+            nib = tl.where((c32[None, :] % 4) < 2, sc & 0xF, sc >> 4).to(tl.float32)
+            deltab = d_f[:, None] * (0.5 + nib) * 0.25
+
+            for j in tl.static_range(8):
+                magj = ((g >> (8 * j)) & 0xFF).to(tl.float32)
+                signj = tl.where((sb & (1 << j)) != 0, -1.0, 1.0)
+                valj = signj * magj * deltab
+                xv = (tl.load(x_u16 + pid_e * K + kb + c32 * 8 + j).to(tl.uint32) << 16).to(
+                    tl.float32, bitcast=True
+                )
+                acc += tl.sum(valj * xv[None, :], axis=1)
+
+        tl.store(out_ptr + pid_e * ROWS + crows, acc)
+        return
+
+    m = tl.arange(0, M_PAD)
+    acc = tl.zeros((M_PAD, BLOCK_COLS), dtype=tl.float32)
 
     for kb in range(0, K, BLK_ELEMS):
         kb_block = kb // BLK_ELEMS
         col_byte = eid * ROWS * W_ROW_STRIDE + crows * W_ROW_STRIDE + kb_block * BLK_BYTES
         base = w_ptr + col_byte
 
-        c32 = tl.arange(0, 32)
         lo = tl.load(base[:, None] + 2 + c32[None, :] * 2).to(tl.uint32)
         hi = tl.load(base[:, None] + 2 + c32[None, :] * 2 + 1).to(tl.uint32)
         codes = (lo | (hi << 8)) & 0xFFFF
@@ -292,20 +341,22 @@ def _iq2xs_dequant_gemm_batch_indexed_kernel(
         d_hi = tl.load(base + 1).to(tl.uint32)
         d_u16 = d_lo.to(tl.uint16) | (d_hi.to(tl.uint16) << 8)
         d_f = d_u16.to(tl.float16, bitcast=True).to(tl.float32)
+        sc = tl.load(base[:, None] + 66 + (c32[None, :] // 4))
+        nib = tl.where((c32[None, :] % 4) < 2, sc & 0xF, sc >> 4).to(tl.float32)
+        deltab = d_f[:, None] * (0.5 + nib) * 0.25
 
         for j in tl.static_range(8):
             magj = ((g >> (8 * j)) & 0xFF).to(tl.float32)
             signj = tl.where((sb & (1 << j)) != 0, -1.0, 1.0)
-            scj = tl.load(base[:, None] + 66 + (c32[None, :] // 4))
-            nib = tl.where((c32[None, :] % 4) < 2, scj & 0xF, scj >> 4).to(tl.float32)
-            deltaj = d_f[:, None] * (0.5 + nib) * 0.25
-            valj = signj * magj * deltaj
-            xv = (tl.load(x_u16 + x_base + kb + c32 * 8 + j).to(tl.uint32) << 16).to(
+            valj = signj * magj * deltab
+            xaddr = pid_e * M_PAD * K + m[:, None] * K + kb + c32[None, :] * 8 + j
+            xv = (tl.load(x_u16 + xaddr).to(tl.uint32) << 16).to(
                 tl.float32, bitcast=True
             )
-            acc += tl.sum(valj * xv[None, :], axis=1)
+            acc += tl.sum(valj[None, :, :] * xv[:, None, :], axis=2)
 
-    tl.store(out_ptr + pid_e * M * ROWS + pid_m * ROWS + crows, acc)
+    out_addr = pid_e * M_PAD * ROWS + m[:, None] * ROWS + crows[None, :]
+    tl.store(out_ptr + out_addr, acc)
 
 
 @triton.jit
@@ -319,7 +370,7 @@ def _iq2xs_dequant_gemm_batch_indexed_dual_kernel(
     gate_out_ptr,
     up_out_ptr,
     E,
-    M,
+    M_PAD: tl.constexpr,
     K: tl.constexpr,
     ROWS: tl.constexpr,
     W_ROW_STRIDE: tl.constexpr,
@@ -327,20 +378,82 @@ def _iq2xs_dequant_gemm_batch_indexed_dual_kernel(
     BLK_ELEMS: tl.constexpr,
     BLK_BYTES: tl.constexpr,
 ):
-    """Indexed dual-path IQ2_XS dequant-GEMM sharing activation loads."""
+    """Indexed dual-path IQ2_XS dequant-GEMM sharing activation loads.
+
+    Weights are dequantized once per (expert, row-block) and reused across
+    the M tokens assigned to that expert; ``acc`` is [M, BLOCK_COLS] so the
+    K-accumulation accumulates correctly across the kb loop.
+    """
     pid_e = tl.program_id(0)
-    pid_m = tl.program_id(1)
-    pid_c = tl.program_id(2)
+    pid_c = tl.program_id(1)
     col0 = pid_c * BLOCK_COLS
 
     x_u16 = x_ptr.to(tl.pointer_type(tl.uint16))
-    x_base = pid_e * M * K + pid_m * K
     eid = tl.load(expert_ids_ptr + pid_e).to(tl.int32)
 
     crows = col0 + tl.arange(0, BLOCK_COLS)
     c32 = tl.arange(0, 32)
-    gate_acc = tl.zeros((BLOCK_COLS,), dtype=tl.float32)
-    up_acc = tl.zeros((BLOCK_COLS,), dtype=tl.float32)
+    scale_idx = 66 + (c32[None, :] // 4)
+    is_lo = (c32[None, :] % 4) < 2
+
+    if M_PAD == 1:
+        # M=1: 2D reduction, bit-identical to the legacy per-token dual
+        # kernel (kept so the B1 decode kernel's split-exactly contract holds).
+        gate_acc = tl.zeros((BLOCK_COLS,), dtype=tl.float32)
+        up_acc = tl.zeros((BLOCK_COLS,), dtype=tl.float32)
+        for kb in range(0, K, BLK_ELEMS):
+            kb_block = kb // BLK_ELEMS
+            col_byte = eid * ROWS * W_ROW_STRIDE + crows * W_ROW_STRIDE + kb_block * BLK_BYTES
+            gate_base = gate_w_ptr + col_byte
+            up_base = up_w_ptr + col_byte
+
+            gate_lo = tl.load(gate_base[:, None] + 2 + c32[None, :] * 2).to(tl.uint32)
+            gate_hi = tl.load(gate_base[:, None] + 2 + c32[None, :] * 2 + 1).to(tl.uint32)
+            gate_codes = (gate_lo | (gate_hi << 8)) & 0xFFFF
+            gate_g = tl.load(grid_ptr + (gate_codes & 511))
+            gate_sb = tl.load(ksigns_ptr + (gate_codes >> 9))
+            gate_d_lo = tl.load(gate_base).to(tl.uint32)
+            gate_d_hi = tl.load(gate_base + 1).to(tl.uint32)
+            gate_d_u16 = gate_d_lo.to(tl.uint16) | (gate_d_hi.to(tl.uint16) << 8)
+            gate_d_f = gate_d_u16.to(tl.float16, bitcast=True).to(tl.float32)
+            gate_sc = tl.load(gate_base[:, None] + scale_idx)
+            gate_nib = tl.where(is_lo, gate_sc & 0xF, gate_sc >> 4).to(tl.float32)
+            gate_deltab = gate_d_f[:, None] * (0.5 + gate_nib) * 0.25
+
+            up_lo = tl.load(up_base[:, None] + 2 + c32[None, :] * 2).to(tl.uint32)
+            up_hi = tl.load(up_base[:, None] + 2 + c32[None, :] * 2 + 1).to(tl.uint32)
+            up_codes = (up_lo | (up_hi << 8)) & 0xFFFF
+            up_g = tl.load(grid_ptr + (up_codes & 511))
+            up_sb = tl.load(ksigns_ptr + (up_codes >> 9))
+            up_d_lo = tl.load(up_base).to(tl.uint32)
+            up_d_hi = tl.load(up_base + 1).to(tl.uint32)
+            up_d_u16 = up_d_lo.to(tl.uint16) | (up_d_hi.to(tl.uint16) << 8)
+            up_d_f = up_d_u16.to(tl.float16, bitcast=True).to(tl.float32)
+            up_sc = tl.load(up_base[:, None] + scale_idx)
+            up_nib = tl.where(is_lo, up_sc & 0xF, up_sc >> 4).to(tl.float32)
+            up_deltab = up_d_f[:, None] * (0.5 + up_nib) * 0.25
+
+            for j in tl.static_range(8):
+                xv = (tl.load(x_u16 + pid_e * K + kb + c32 * 8 + j).to(tl.uint32) << 16).to(
+                    tl.float32, bitcast=True
+                )
+                gate_magj = ((gate_g >> (8 * j)) & 0xFF).to(tl.float32)
+                gate_signj = tl.where((gate_sb & (1 << j)) != 0, -1.0, 1.0)
+                gate_valj = gate_signj * gate_magj * gate_deltab
+                gate_acc += tl.sum(gate_valj * xv[None, :], axis=1)
+                up_magj = ((up_g >> (8 * j)) & 0xFF).to(tl.float32)
+                up_signj = tl.where((up_sb & (1 << j)) != 0, -1.0, 1.0)
+                up_valj = up_signj * up_magj * up_deltab
+                up_acc += tl.sum(up_valj * xv[None, :], axis=1)
+
+        out_base = pid_e * ROWS + crows
+        tl.store(gate_out_ptr + out_base, gate_acc)
+        tl.store(up_out_ptr + out_base, up_acc)
+        return
+
+    m = tl.arange(0, M_PAD)
+    gate_acc = tl.zeros((M_PAD, BLOCK_COLS), dtype=tl.float32)
+    up_acc = tl.zeros((M_PAD, BLOCK_COLS), dtype=tl.float32)
 
     for kb in range(0, K, BLK_ELEMS):
         kb_block = kb // BLK_ELEMS
@@ -357,6 +470,9 @@ def _iq2xs_dequant_gemm_batch_indexed_dual_kernel(
         gate_d_hi = tl.load(gate_base + 1).to(tl.uint32)
         gate_d_u16 = gate_d_lo.to(tl.uint16) | (gate_d_hi.to(tl.uint16) << 8)
         gate_d_f = gate_d_u16.to(tl.float16, bitcast=True).to(tl.float32)
+        gate_sc = tl.load(gate_base[:, None] + scale_idx)
+        gate_nib = tl.where(is_lo, gate_sc & 0xF, gate_sc >> 4).to(tl.float32)
+        gate_deltab = gate_d_f[:, None] * (0.5 + gate_nib) * 0.25
 
         up_lo = tl.load(up_base[:, None] + 2 + c32[None, :] * 2).to(tl.uint32)
         up_hi = tl.load(up_base[:, None] + 2 + c32[None, :] * 2 + 1).to(tl.uint32)
@@ -367,34 +483,29 @@ def _iq2xs_dequant_gemm_batch_indexed_dual_kernel(
         up_d_hi = tl.load(up_base + 1).to(tl.uint32)
         up_d_u16 = up_d_lo.to(tl.uint16) | (up_d_hi.to(tl.uint16) << 8)
         up_d_f = up_d_u16.to(tl.float16, bitcast=True).to(tl.float32)
-
-        scale_idx = 66 + (c32[None, :] // 4)
-        gate_sc = tl.load(gate_base[:, None] + scale_idx)
         up_sc = tl.load(up_base[:, None] + scale_idx)
-        is_lo = (c32[None, :] % 4) < 2
+        up_nib = tl.where(is_lo, up_sc & 0xF, up_sc >> 4).to(tl.float32)
+        up_deltab = up_d_f[:, None] * (0.5 + up_nib) * 0.25
 
         for j in tl.static_range(8):
-            xv = (tl.load(x_u16 + x_base + kb + c32 * 8 + j).to(tl.uint32) << 16).to(
+            xaddr = pid_e * M_PAD * K + m[:, None] * K + kb + c32[None, :] * 8 + j
+            xv = (tl.load(x_u16 + xaddr).to(tl.uint32) << 16).to(
                 tl.float32, bitcast=True
             )
 
             gate_magj = ((gate_g >> (8 * j)) & 0xFF).to(tl.float32)
             gate_signj = tl.where((gate_sb & (1 << j)) != 0, -1.0, 1.0)
-            gate_nib = tl.where(is_lo, gate_sc & 0xF, gate_sc >> 4).to(tl.float32)
-            gate_deltaj = gate_d_f[:, None] * (0.5 + gate_nib) * 0.25
-            gate_valj = gate_signj * gate_magj * gate_deltaj
-            gate_acc += tl.sum(gate_valj * xv[None, :], axis=1)
+            gate_valj = gate_signj * gate_magj * gate_deltab
+            gate_acc += tl.sum(gate_valj[None, :, :] * xv[:, None, :], axis=2)
 
             up_magj = ((up_g >> (8 * j)) & 0xFF).to(tl.float32)
             up_signj = tl.where((up_sb & (1 << j)) != 0, -1.0, 1.0)
-            up_nib = tl.where(is_lo, up_sc & 0xF, up_sc >> 4).to(tl.float32)
-            up_deltaj = up_d_f[:, None] * (0.5 + up_nib) * 0.25
-            up_valj = up_signj * up_magj * up_deltaj
-            up_acc += tl.sum(up_valj * xv[None, :], axis=1)
+            up_valj = up_signj * up_magj * up_deltab
+            up_acc += tl.sum(up_valj[None, :, :] * xv[:, None, :], axis=2)
 
-    out_base = pid_e * M * ROWS + pid_m * ROWS + crows
-    tl.store(gate_out_ptr + out_base, gate_acc)
-    tl.store(up_out_ptr + out_base, up_acc)
+    out_addr = pid_e * M_PAD * ROWS + m[:, None] * ROWS + crows[None, :]
+    tl.store(gate_out_ptr + out_addr, gate_acc)
+    tl.store(up_out_ptr + out_addr, up_acc)
 
 
 @triton.jit
@@ -548,9 +659,14 @@ def iq2xs_dequant_gemm_batch_indexed(
         block_cols=BLOCK_COLS,
     )
     E, M, _ = x.shape
-    out = torch.empty((E, M, rows), dtype=torch.float32, device=x.device)
+    m_pad = _next_pow2(M)
+    if m_pad != M:
+        padded = torch.zeros((E, m_pad, cols), dtype=x.dtype, device=x.device)
+        padded[:, :M] = x
+        x = padded
+    out = torch.empty((E, m_pad, rows), dtype=torch.float32, device=x.device)
     grid_t, ksigns_t, _ = grid_tables
-    _iq2xs_dequant_gemm_batch_indexed_kernel[(E, M, rows // BLOCK_COLS)](
+    _iq2xs_dequant_gemm_batch_indexed_kernel[(E, rows // BLOCK_COLS)](
         x,
         packed_all,
         expert_ids,
@@ -558,7 +674,7 @@ def iq2xs_dequant_gemm_batch_indexed(
         ksigns_t,
         out,
         E,
-        M,
+        m_pad,
         K=cols,
         ROWS=rows,
         W_ROW_STRIDE=w_row_stride,
@@ -566,7 +682,7 @@ def iq2xs_dequant_gemm_batch_indexed(
         BLK_ELEMS=256,
         BLK_BYTES=74,
     )
-    return out
+    return out[:, :M]
 
 
 def iq2xs_dequant_gemm_batch_indexed_dual(
@@ -593,10 +709,15 @@ def iq2xs_dequant_gemm_batch_indexed_dual(
         )
     )
     E, M, _ = x.shape
-    gate_out = torch.empty((E, M, rows), dtype=torch.float32, device=x.device)
+    m_pad = _next_pow2(M)
+    if m_pad != M:
+        padded = torch.zeros((E, m_pad, cols), dtype=x.dtype, device=x.device)
+        padded[:, :M] = x
+        x = padded
+    gate_out = torch.empty((E, m_pad, rows), dtype=torch.float32, device=x.device)
     up_out = torch.empty_like(gate_out)
     grid_t, ksigns_t, _ = grid_tables
-    _iq2xs_dequant_gemm_batch_indexed_dual_kernel[(E, M, rows // BLOCK_COLS)](
+    _iq2xs_dequant_gemm_batch_indexed_dual_kernel[(E, rows // BLOCK_COLS)](
         x,
         packed_gate_all,
         packed_up_all,
@@ -606,7 +727,7 @@ def iq2xs_dequant_gemm_batch_indexed_dual(
         gate_out,
         up_out,
         E,
-        M,
+        m_pad,
         K=cols,
         ROWS=rows,
         W_ROW_STRIDE=w_row_stride,
@@ -614,7 +735,7 @@ def iq2xs_dequant_gemm_batch_indexed_dual(
         BLK_ELEMS=256,
         BLK_BYTES=74,
     )
-    return gate_out, up_out
+    return gate_out[:, :M], up_out[:, :M]
 
 
 def iq2xs_dequant_gemm_batch_indexed_dual_swiglu_b1(
