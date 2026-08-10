@@ -37,6 +37,7 @@
 | `reference-map.md` | 参考实现地图 |
 | `2026-08-07-deepseek-v4-flash-iq2xs-gguf-implementation-plan.md` | **DeepSeek-V4-Flash-0731（GGUF IQ2_XS）接入实施方案**——事实基线、D1–D10 决策、六阶段计划、oracle 链与风险登记；参考材料在 `dsv4flash-ref/` |
 | `2026-08-09-dsv4-cudagraph-decode-driver.md` | **DSV4 CUDA-Graph decode 驱动进展**——`torch.where` 修掉 compressor 迁移 `0 * -inf = NaN`，ratio-4 / ratio-128 回归已加；compressed pack 写址修正、indexer 自有 compressor 推进、decode graph driver/backend/engine 接入完成；grouped Q8 prefill 和 MoE prefill 真实模型阻断修复；真实权重 3 workload × 12-step gate 通过（worst cosine 0.99999988、token 12/12、eager 449.1ms vs graph 272.1ms，历史 136ms 口径不可直接比较）；P1 仍待统一诊断基线 |
+| `2026-08-10-fa4-deep-dive-report.md` | **FA4 穷尽式深度调研**（纯调研，未写码）——基于 `fa4-latest` 源码逐行拆解 + `fa4_paper.pdf` 全文提取：16-warp 分工/tmem 布局/QK-PV ping-pong/软 exp2/条件 rescale/LPT 调度/2-CTA 协作/topk-gather-MLA 全路径，均带 文件:行 索引；确认 SM120 在 FA4 中仅是 SM80 fallback（99KB smem）。§6 给出针对 DSV4 M=1 decode/MLA 的 5 个最高价值移植点（P 按输入 dtype 存储、软 exp2、条件 rescale、QK/PV 交错、LPT+头部 swizzle） |
 
 ## 2. 已定案的根因分析 🟢
 
