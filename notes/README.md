@@ -43,6 +43,7 @@
 | `2026-08-10-laguna-optimization-path.md` | **Laguna 性能优化完整路径调研**——CG decode 元数据烤进图、融合元数据 kernel、向量化纪律（5.6×）、fused_kv_scatter/fused_rms_norm、MoE 单 kernel 38μs/层、带宽账方法论（必须冷缓存）、DFlash M=16 摊销原理。DSV4 已抄 argmax 烤进图，缺 kernel 融合 + 布局重排 |
 | `2026-08-10-m1-decode-deep-dive.md` | **M=1 decode 深度调研结论总览**——四路交叉印证：q8_0 对齐是根因（非 latency）、ds4 实测数字、行动清单按 ROI |
 | `2026-08-10-dsv4-q8-warprow-gate-regression.md` | **DSV4 Q8_0 warp-per-row 优化未过门禁的完整说明**——单 kernel 正确（与 tl.dot maxdiff 0）但门禁 3-workload 漂移（0.99903 vs 基线 0.99999988）。含现象、已确证事实、尝试方案、未解疑点（soa_planes 懒构建与 graph pool 交互、逐层定位建议）。已回滚，门禁 PASS。**接手者先读此文档** |
+| `2026-08-10-dsv4-prefill-moe-kernel-deep-dive.md` | **DSV4 prefill MoE kernel 性能深挖**——prefill 83 tok/s 根因：IQ2 kernel fp32 反量化+逐 route 内积（2.6% 效率，MoE 占 chunk 83%）。带宽账：M=32 → 131 唯一专家 → 权重读 ~1GB/层，极限 ~3,800 tok/s。已排除 M 批处理/grouped/BLOCK_COLS/deq+cuBLAS/max_q_rows；正解 dp4a int8 内积 + 激活预量化（ds4 §2B），预期 400-1,500 tok/s。含长上下文现状（decode 无 NaN、prefix same-slot 600×） |
 
 ## 2. 已定案的根因分析 🟢
 
