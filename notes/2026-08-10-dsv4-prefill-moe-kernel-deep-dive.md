@@ -58,6 +58,23 @@ dp4a 内积 4× + 对齐去 gather 后 **fused 4.3ms → 1-2ms/层，prefill 83 
 读 0.6GB 非瓶颈）；对齐对 **fused kernel**（不落全局、反量化 gather 是计算瓶颈）可能有效但
 需接 repack + 改 kernel（数值对齐 bug 未修，方向已否定前不必修）。
 
+## 4b. dp4a 已验证（2026-08-10，可直接用于 fused kernel 内积）
+
+`tl.inline_asm_elementwise` 跑通 PTX `dp4a.s32.s32`：
+- **数值 maxdiff 0**（4×int8 打包成 int32 用 int32 指针读 + dp4a）
+- **内积快 2.2×**（4096 int8 pairs：dp4a 6.2μs vs torch fp32 13.4μs）
+- Triton 用法要点：`constraints="=r,r,r,r"`（1 输出 + 3 输入），`args=[a, b, acc]`
+  （**不含输出占位 $0**），打包用 `a_ptr.to(tl.pointer_type(tl.int32))` 直接读 4 字节
+
+**fused kernel 接入步骤**（当前 4.3ms/层，内积 ~2/3）：
+1. 激活预量化 preq（torch 版已验证：0.042ms，rel err 3.9e-3）：x → int8 xq + fp32 xscale（每 32 元素）
+2. kernel 内反量化解码成 int8 magnitude（现有 `g`/`sb` 位操作，输出 int8 而非 fp32）
+3. 内积改 dp4a（int8×int8 → int32 累加）+ epilogue `× xscale × wscale`
+4. 预期 **fused 4.3 → 2.5-3ms/层 → prefill 83 → 120-160 tok/s（1.4-1.9×）**
+
+**（注意：dp4a 只是内积加速，反量化查表 gather 仍是主要成本；完整对齐+dp4a 才到
+170-330 tok/s 区间。超过需要换模型格式。）**
+
 **实施顺序建议**：
 1. preq 激活量化 kernel（简单，独立）
 2. IQ2 对齐 repack（加载时一次）+ dp4a kernel（单专家验证 → routes 批量）
