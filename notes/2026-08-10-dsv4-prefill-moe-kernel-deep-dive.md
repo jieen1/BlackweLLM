@@ -90,6 +90,25 @@ dp4a 内积 4× + 对齐去 gather 后 **fused 4.3ms → 1-2ms/层，prefill 83 
 - prefix cache：same-slot 命中 1.4s（冷 855s → **600×**）；跨 slot 命中在 server 流程未验证
 - **唯一短板 = prefill 速度**（本 notes 主题）
 
+## 5b. 并发 128k 内存边界（2026-08-10 实测，96GB 卡）
+
+| 配置 | load | capture 后 reserved | 结论 |
+|---|---|---|---|
+| 2 slots × 128k | 90.3GB | 95.0GB | ✅ decode graph 捕获成功 |
+| 3 slots × 128k | 90.3GB | 96.0GB | ❌ capture 失败（`None`，回退 eager） |
+| 4 slots × 128k | 90.3GB | **98.5GB** | ❌ 超 96GB（OOM 风险） |
+
+**4 并发 128k 的硬障碍 = decode graph 池**（每 slot 的 B=1/2/4 bucket kernel 中间张量；
+3 slots 比 2 slots 的 capture 增量 ~1GB，4 slots 共超 7GB over 2 slots）。KV 本身很小
+（4×128k 仅 3.66GB）。模型 88GB + 4 slots graph 池 > 96GB。
+
+**解除路径**（按 ROI）：
+1. decode graph 池优化（跨 slot/bucket 共享中间张量、按需 bucket 捕获）——深水区，收益最大
+2. `QSR_SERVER_GPU_MEM_UTIL` / 负载调参（降 max_q_rows 等）——收益小
+3. 3 slots 128k（B=1/2 只捕 2 bucket）——接近但 capture 失败需先省 graph 池
+
+SoA 存储（`4d1751c`）已省 7GB，否则连 2 slots 128k 都紧张。
+
 ## 6. 相关提交
 
 - `4d1751c` Store Q8_0 weights as aligned SoA planes（省 7GB 显存，4 slots/131072 不再 OOM）
