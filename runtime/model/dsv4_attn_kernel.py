@@ -844,37 +844,21 @@ class Dsv4AttnKernelLayer(nn.Module):
         apply_rotary_emb(o[..., -rd:], freqs, inverse=True)
         o = o.view(bsz, seqlen, self.n_groups, -1)
         if self.wo_a.fused_q8:
-            from runtime.kernels.dsv4_q8_gemm import (
-                q8_0_grouped_dequant_gemm,
-                q8_0_woa_warp_row_gemv,
-            )
+            from runtime.kernels.dsv4_q8_gemm import q8_0_grouped_dequant_gemm
 
             # Group-major rows: [G, bs*seq, d] flattened to [G*bs*seq, d],
             # the wo_a einsum contraction per group, no dequant material.
             d_k = o.shape[-1]
-            if bsz * seqlen == 1:
-                # M=1 decode: one row per group, warp-per-row (4.4x vs tc).
-                q, d = self.wo_a.soa_planes()
-                res = q8_0_woa_warp_row_gemv(
-                    o.reshape(self.n_groups, d_k),
-                    q,
-                    d,
-                    num_groups=self.n_groups,
-                    out_per_group=self.o_lora_rank,
-                    in_features=d_k,
-                )
-                o = res.reshape(1, 1, self.n_groups, self.o_lora_rank)
-            else:
-                x2 = o.permute(2, 0, 1, 3).reshape(self.n_groups * bsz * seqlen, d_k)
-                res = q8_0_grouped_dequant_gemm(
-                    x2,
-                    self.wo_a.packed,
-                    num_groups=self.n_groups,
-                    group_size=self.o_lora_rank,
-                    in_features=d_k,
-                    rows_per_group=bsz * seqlen,
-                )
-                o = res.reshape(self.n_groups, bsz, seqlen, self.o_lora_rank).permute(1, 2, 0, 3)
+            x2 = o.permute(2, 0, 1, 3).reshape(self.n_groups * bsz * seqlen, d_k)
+            res = q8_0_grouped_dequant_gemm(
+                x2,
+                self.wo_a.packed,
+                num_groups=self.n_groups,
+                group_size=self.o_lora_rank,
+                in_features=d_k,
+                rows_per_group=bsz * seqlen,
+            )
+            o = res.reshape(self.n_groups, bsz, seqlen, self.o_lora_rank).permute(1, 2, 0, 3)
         else:
             wo_a = self.wo_a.dequantized().to(x.dtype).view(self.n_groups, self.o_lora_rank, -1)
             o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
