@@ -79,6 +79,12 @@ class Dsv4DecodeGraphDriver:
         self._position = torch.zeros((1,), dtype=torch.long, device=device)
         self._logits: torch.Tensor | None = None
         self._slot: int | None = None
+        # Greedy sampling baked into the graph: the argmax of the final
+        # logits is written straight back into ``_input_ids`` during replay,
+        # so the host reads the next token with one .item() and never
+        # touches the full [1, vocab] logits (Laguna's pattern, mirrors
+        # laguna_cuda_graph.py's captured argmax).
+        self.greedy = False
 
     @property
     def graph_pool(self) -> Any | None:
@@ -136,7 +142,15 @@ class Dsv4DecodeGraphDriver:
             x = block.moe(x, self._input_ids)
             h = block.hc_post(x, residual, post, comb)
         h = model.hc_head(h)
-        return model.lm_head(rms_norm(h, model.norm_weight, model.eps))
+        logits = model.lm_head(rms_norm(h, model.norm_weight, model.eps))
+        if self.greedy:
+            # Bake the greedy decision into the graph: write argmax back to
+            # the input buffer so replay advances to the next token with no
+            # host-side logits round-trip.  The final logits are still
+            # produced (they are the sampled distribution's source) but the
+            # host only reads ``_input_ids[0]`` after replay.
+            self._input_ids.fill_(logits.argmax(dim=-1).squeeze())
+        return logits
 
     def capture(self, slot: int) -> None:
         """Warm kernels eagerly, then capture the decode step into a graph."""
@@ -186,6 +200,10 @@ class Dsv4DecodeGraphDriver:
             raise RuntimeError(f"graph is bound to slot {self._slot}, not slot {slot}")
         self._fill(token, position)
         self.graph.replay()
+        if self.greedy:
+            # The graph wrote argmax back into _input_ids; return the next
+            # token directly (host reads a scalar, never the full logits).
+            return int(self._input_ids[0].item())
         return self._logits
 
 
@@ -261,6 +279,7 @@ class Dsv4BatchedDecodeGraphDriver:
         max_index_entries: int | None = None,
         device: str = "cuda",
         graph_pool: Any | None = None,
+        greedy: bool = False,
     ) -> None:
         if batch_size not in (1, 2, 4):
             raise ValueError(f"batch_size must be one of (1, 2, 4), got {batch_size}")
@@ -270,6 +289,7 @@ class Dsv4BatchedDecodeGraphDriver:
         self.device = device
         self.graph: torch.cuda.CUDAGraph | None = None
         self._graph_pool = graph_pool
+        self.greedy = greedy
         # Pack all dynamic integer inputs into one allocation so production
         # replay needs one pinned H2D copy, not three device allocations plus
         # three D2D copies per token step.
@@ -369,12 +389,18 @@ class Dsv4BatchedDecodeGraphDriver:
             self.backend.reset_slot(slot)
 
     def _forward(self) -> torch.Tensor:
-        return self.backend._forward_decode_batch(
+        logits = self.backend._forward_decode_batch(
             self._input_ids,
             self._positions,
             self._slot_ids,
             max_index_entries=self.max_index_entries,
         )
+        if self.greedy:
+            # Bake the greedy decision into the graph: each batch row's
+            # argmax is written back into _input_ids, so replay advances
+            # every slot with no host-side logits round-trip.
+            self._input_ids.copy_(logits.argmax(dim=-1))
+        return logits
 
     def capture(self) -> None:
         if self.graph is not None:
@@ -416,6 +442,9 @@ class Dsv4BatchedDecodeGraphDriver:
             raise RuntimeError("DSV4 batched decode graph has not been captured")
         self._copy_inputs(input_ids, positions, slot_ids)
         self.graph.replay()
+        if self.greedy:
+            # The graph wrote each row's argmax back into _input_ids.
+            return self._input_ids[:, 0].clone()
         return self._logits
 
     @torch.inference_mode()
@@ -429,6 +458,8 @@ class Dsv4BatchedDecodeGraphDriver:
             raise RuntimeError("DSV4 batched decode graph has not been captured")
         self._copy_host_inputs(input_ids, positions, slot_ids)
         self.graph.replay()
+        if self.greedy:
+            return self._input_ids[:, 0].clone()
         return self._logits
 
 
@@ -443,10 +474,12 @@ class Dsv4BucketedBatchedDecodeGraphDriver:
         backend,
         device: str = "cuda",
         graph_pool: Any | None = None,
+        greedy: bool = False,
     ) -> None:
         self.backend = backend
         self.device = device
         self._graph_pool = graph_pool
+        self.greedy = greedy
         self._bucket_caps = _index_entry_buckets(backend.slot_layers)
         self._drivers: dict[int, list[tuple[int | None, Dsv4BatchedDecodeGraphDriver]]] = {}
 
@@ -472,6 +505,7 @@ class Dsv4BucketedBatchedDecodeGraphDriver:
                     max_index_entries=cap,
                     device=self.device,
                     graph_pool=pool,
+                    greedy=self.greedy,
                 )
                 driver.capture()
                 pool = driver.graph_pool

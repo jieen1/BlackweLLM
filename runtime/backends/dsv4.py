@@ -931,8 +931,13 @@ class DeepseekV4Backend:
                 raise
 
             if all(params.temperature == 0.0 for params in chunk_params):
-                # One result synchronization for the whole greedy batch.
-                chunk_outs = [int(token) for token in logits[:, 0].argmax(dim=-1).tolist()]
+                if graph is not None and getattr(graph, "greedy", False):
+                    # The graph baked argmax into the input buffer; replay
+                    # already returned the next-token ids for the batch.
+                    chunk_outs = [int(t) for t in logits.tolist()]
+                else:
+                    # One result synchronization for the whole greedy batch.
+                    chunk_outs = [int(token) for token in logits[:, 0].argmax(dim=-1).tolist()]
             else:
                 chunk_outs = []
                 for row, params in enumerate(chunk_params):
