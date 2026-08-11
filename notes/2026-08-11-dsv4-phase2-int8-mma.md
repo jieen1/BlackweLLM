@@ -1,8 +1,9 @@
 # Phase 2 进展：IQ2 INT8 Tensor-Core grouped MoE（2026-08-11）
 
-> 状态：tensor-core 收益已验证（3.2×，kill gate ≤6.5ms/layer 达标）；exact
-> per-code scale 需手写 `mma.sync.m16n8k16`（Triton tl.dot 的 K≥32 限制 + 无法
-> 从 K32 累加分解 per-code scale）。
+> 状态：手写 `mma.sync.m16n8k16` 数值**已全对**（cos 1.0，maxrel ~1e-6），
+> B 布局谜底已解（PTX ISA 文档布局即硬件布局；之前"CUTLASS 提取"结论是
+> 探针符号扩展 bug 的假象）。kernel 内两个真 bug（B 列 + per-K16 scale 行）
+> 已修。下一步：dual gate/up + SwiGLU + down 融合、grouped 接入、性能 kill gate。
 >
 > 计划：`docs/dsv4-prefill-2k-implementation-plan.md` Phase 2。
 
@@ -144,6 +145,34 @@ a1 高 3 字节全变 0xFF）。修好打包（`& 0xFF` 掩码）后，PTX 文�
 
 已达成：single-layer p50 ≤6.5ms 的数值前置条件（kernel cos ≥0.9999 的 0.9999
 阈值远超满足，实际 1.0）。下一步进入 Phase 2 性能 kill gate 和 grouped 接入。
+
+## 3b. 性能优化进展（2026-08-11，kill gate 未达）
+
+已实现的 kernel 结构（`/tmp/opencode/iq2_mma16_*.cu` 迭代原型）：
+- **dual gate+up**：一个 warp 同时算 gate 和 up，共享 A 片段解码（验证 cos=1.0）
+- **B-decode reuse**：每个 K16 的 IQ2 B 片段只解码一次，复用于该 expert 的所有
+  M-tile（M_PAD=32 → 2 个 M16 tile 复用）
+- **smem int8 预解码**：block 一次把 74-byte blocks 载入 smem，解码为 int8，
+  mma 内循环只读 smem（消除 grid/ksigns 随机查表）
+- **4-way ILP**：连续 4 个 K16 先发 mma 再统一 float 转换
+
+E=192（≈1024-token superchunk 活跃 expert 数）gate+up 实测：
+| 版本 | 时间 |
+|---|---:|
+| 初始（每 K16 串行 float 转换） | 17.7 ms |
+| +4-way ILP | 10.0 ms |
+| 纯 mma+float（无 decode/load，理论下界） | ~7 ms |
+| 纯 mma+int32（无 scale，仅下界参考） | 1.4 ms |
+
+**瓶颈定位**：exact IQ2 需要每 K16（16 值）独立的 fp32 scale，K16 mma 结果必须
+I2F+FFMA 转换。I2F 在 ALU pipe，与 mma 结果串行依赖，占指令流 ~40%。纯 int32
+累加（无 scale）只需 IADD，1.4ms；加上 exact scale 的 float 转换后 ~7ms 下界。
+计划 §3.1 的 6.5ms/layer 预算包含 gate+up+SwiGLU+down，exact 路径在 E=192 时
+紧平衡，需要下界优化（A 片段 smem 化、减少 LDG、更大的 N-tile/warp）才有余量。
+
+**关键结论**：kernel 数值已全对（这是 Phase 2 的硬前置）；性能差距 ~1.5-2x 来自
+exact per-K16 scale 的 float 转换指令成本，方向明确（A smem 化 + 更大 N tile +
+合并 xs 到 scale），不是架构死路。
 
 ## 4. 相关提交
 
