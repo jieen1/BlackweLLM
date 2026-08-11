@@ -496,24 +496,27 @@ class Dsv4MoE(nn.Module):
         n_tokens, hidden = flat.shape
         top_k = indices.shape[1]
         routes = n_tokens * top_k
-        xs_batch = (
-            flat.unsqueeze(1)
-            .expand(n_tokens, top_k, hidden)
-            .reshape(routes, 1, hidden)
-            .contiguous()
-        )
         eids = indices.reshape(routes).contiguous()
 
-        # Share activation loads between gate/up while keeping both FP32
-        # outputs and the existing standalone SwiGLU boundary.  Unlike the
-        # decode-only fused SwiGLU kernel, this is bitwise identical to the two
-        # independent indexed GEMMs and therefore preserves prefill numerics.
+        # dp4a path: activations are int8-quantized (preq) and the IQ2 codes
+        # are decoded in-register with an int8 dp4a inner product; the
+        # per-code scale is applied before the code reduction.
         from runtime.kernels.dsv4_iq2xs_gemm import (
-            iq2xs_dequant_gemm_batch_indexed_dual,
+            iq2xs_dequant_gemm_indexed_dp4a,
+            iq2xs_dequant_gemm_indexed_dual_dp4a,
+            preq_activation,
         )
 
-        gate, up = iq2xs_dequant_gemm_batch_indexed_dual(
-            xs_batch,
+        xr = (
+            flat.unsqueeze(1)
+            .expand(n_tokens, top_k, hidden)
+            .reshape(routes, hidden)
+            .contiguous()
+        )
+        xq, xs = preq_activation(xr)
+        gate, up = iq2xs_dequant_gemm_indexed_dual_dp4a(
+            xq,
+            xs,
             self.gate_exps.packed,
             self.up_exps.packed,
             eids,
@@ -522,8 +525,17 @@ class Dsv4MoE(nn.Module):
             grid_tables=self.gate_exps.tables(),
         )
         h = swiglu(gate, up, self.config.swiglu_limit)
-        routed = self._batch_expert_gemm(self.down_exps, eids, h)
-        contributions = routed[:, 0].reshape(n_tokens, top_k, -1) * weights.unsqueeze(-1)
+        hq, hs = preq_activation(h)
+        routed = iq2xs_dequant_gemm_indexed_dp4a(
+            hq,
+            hs,
+            self.down_exps.packed,
+            eids,
+            rows=self.down_exps.rows,
+            cols=self.down_exps.cols,
+            grid_tables=self.down_exps.tables(),
+        )
+        contributions = routed.reshape(n_tokens, top_k, -1) * weights.unsqueeze(-1)
         order = torch.argsort(indices, dim=1, stable=True)
         contributions = contributions.gather(
             1,

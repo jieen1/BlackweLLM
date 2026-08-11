@@ -923,3 +923,222 @@ def iq2xs_dequant_gemm(
         grid_tables=grid_tables,
         BLOCK_COLS=BLOCK_COLS,
     )[0]
+
+
+def preq_activation(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize activations to int8 with per-32-element fp32 scales."""
+    k = x.shape[-1]
+    xr = x.reshape(-1, k // 32, 32)
+    scale = xr.abs().max(-1, keepdim=True).values / 127.0
+    scale = torch.clamp(scale, min=1e-8)
+    xq = (xr / scale).round().clamp(-128, 127).to(torch.int8)
+    return xq.reshape_as(x), scale.reshape(-1, k // 32)
+
+
+@triton.jit
+def _iq2xs_dequant_gemm_indexed_dp4a_kernel(
+    xq_ptr,
+    xs_ptr,
+    w_ptr,
+    eids_ptr,
+    grid_ptr,
+    ksigns_ptr,
+    out_ptr,
+    E,
+    K: tl.constexpr,
+    ROWS: tl.constexpr,
+    W_ROW_STRIDE: tl.constexpr,
+    BR: tl.constexpr,
+):
+    """Route-batched IQ2_XS dequant-GEMM with int8 dp4a inner product.
+
+    Activations arrive int8-quantized (``xq`` + per-32 ``xs`` scales).  The
+    packed IQ2 weights are decoded in-register to signed int8 magnitudes and
+    the 8-j code inner product runs on the PTX ``dp4a`` instruction; the
+    per-code scale (d x nibble x activation scale) is applied before the
+    code reduction.  One block covers one (route, BR output rows) x full K.
+    """
+    pid_e = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    eid = tl.load(eids_ptr + pid_e).to(tl.int32)
+    r = pid_c * BR + tl.arange(0, BR)
+    c32 = tl.arange(0, 32)
+    acc = tl.zeros((BR,), dtype=tl.float32)
+    for kb in range(0, K, 256):
+        kb_block = kb // 256
+        base = w_ptr + eid.to(tl.int64) * ROWS * W_ROW_STRIDE + r.to(tl.int64) * W_ROW_STRIDE + kb_block * 74
+        lo = tl.load(base[:, None] + 2 + c32[None, :] * 2).to(tl.uint32)
+        hi = tl.load(base[:, None] + 2 + c32[None, :] * 2 + 1).to(tl.uint32)
+        codes = (lo | (hi << 8)) & 0xFFFF
+        g = tl.load(grid_ptr + (codes & 511)).to(tl.int64)
+        sb = tl.load(ksigns_ptr + (codes >> 9))
+        d_lo = tl.load(base).to(tl.uint32)
+        d_hi = tl.load(base + 1).to(tl.uint32)
+        d_f = (d_lo.to(tl.uint16) | (d_hi.to(tl.uint16) << 8)).to(
+            tl.float16, bitcast=True
+        ).to(tl.float32)
+        sc = tl.load(base[:, None] + 66 + (c32[None, :] // 4))
+        nib = tl.where((c32[None, :] % 4) < 2, sc & 0xF, sc >> 4).to(tl.float32)
+        res_code = tl.zeros((BR, 32), dtype=tl.int32)
+        for half in tl.static_range(2):
+            wp = tl.zeros((BR, 32), dtype=tl.int32)
+            xp = tl.zeros((32,), dtype=tl.int32)
+            for j in tl.static_range(4):
+                jj = half * 4 + j
+                mag = ((g >> (8 * jj)) & 0xFF).to(tl.int32)
+                mag = tl.where((sb & (1 << jj)) != 0, -mag, mag) & 0xFF
+                xv = tl.load(xq_ptr + pid_e.to(tl.int64) * K + kb + c32 * 8 + jj).to(tl.int32) & 0xFF
+                wp = wp | (mag << (8 * j))
+                xp = xp | (xv << (8 * j))
+            xpb = tl.broadcast_to(xp[None, :], (BR, 32))
+            acc0 = tl.zeros((BR, 32), dtype=tl.int32)
+            ah = tl.inline_asm_elementwise(
+                "dp4a.s32.s32 $0, $1, $2, $3;", "=r,r,r,r",
+                [wp, xpb, acc0], tl.int32, is_pure=False, pack=1,
+            )
+            res_code = res_code + ah
+        xs = tl.load(xs_ptr + pid_e.to(tl.int64) * (K // 32) + kb // 32 + c32 // 4)
+        scale = d_f[:, None] * (0.5 + nib) * 0.25 * xs[None, :]
+        acc += tl.sum(res_code.to(tl.float32) * scale, axis=1)
+    tl.store(out_ptr + pid_e.to(tl.int64) * ROWS + r, acc)
+
+
+@triton.jit
+def _iq2xs_dequant_gemm_indexed_dual_dp4a_kernel(
+    xq_ptr,
+    xs_ptr,
+    gate_w_ptr,
+    up_w_ptr,
+    eids_ptr,
+    grid_ptr,
+    ksigns_ptr,
+    gate_out_ptr,
+    up_out_ptr,
+    E,
+    K: tl.constexpr,
+    ROWS: tl.constexpr,
+    W_ROW_STRIDE: tl.constexpr,
+    BR: tl.constexpr,
+):
+    """Dual-path (gate+up) dp4a IQ2 GEMM sharing activation loads."""
+    pid_e = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    eid = tl.load(eids_ptr + pid_e).to(tl.int32)
+    r = pid_c * BR + tl.arange(0, BR)
+    c32 = tl.arange(0, 32)
+    gate_acc = tl.zeros((BR,), dtype=tl.float32)
+    up_acc = tl.zeros((BR,), dtype=tl.float32)
+    for kb in range(0, K, 256):
+        kb_block = kb // 256
+        gate_base = gate_w_ptr + eid.to(tl.int64) * ROWS * W_ROW_STRIDE + r.to(tl.int64) * W_ROW_STRIDE + kb_block * 74
+        up_base = up_w_ptr + eid.to(tl.int64) * ROWS * W_ROW_STRIDE + r.to(tl.int64) * W_ROW_STRIDE + kb_block * 74
+        g_lo = tl.load(gate_base[:, None] + 2 + c32[None, :] * 2).to(tl.uint32)
+        g_hi = tl.load(gate_base[:, None] + 2 + c32[None, :] * 2 + 1).to(tl.uint32)
+        g_codes = (g_lo | (g_hi << 8)) & 0xFFFF
+        g_g = tl.load(grid_ptr + (g_codes & 511)).to(tl.int64)
+        g_sb = tl.load(ksigns_ptr + (g_codes >> 9))
+        g_d_lo = tl.load(gate_base).to(tl.uint32)
+        g_d_hi = tl.load(gate_base + 1).to(tl.uint32)
+        g_d = (g_d_lo.to(tl.uint16) | (g_d_hi.to(tl.uint16) << 8)).to(
+            tl.float16, bitcast=True
+        ).to(tl.float32)
+        g_sc = tl.load(gate_base[:, None] + 66 + (c32[None, :] // 4))
+        g_nib = tl.where((c32[None, :] % 4) < 2, g_sc & 0xF, g_sc >> 4).to(tl.float32)
+
+        u_lo = tl.load(up_base[:, None] + 2 + c32[None, :] * 2).to(tl.uint32)
+        u_hi = tl.load(up_base[:, None] + 2 + c32[None, :] * 2 + 1).to(tl.uint32)
+        u_codes = (u_lo | (u_hi << 8)) & 0xFFFF
+        u_g = tl.load(grid_ptr + (u_codes & 511)).to(tl.int64)
+        u_sb = tl.load(ksigns_ptr + (u_codes >> 9))
+        u_d_lo = tl.load(up_base).to(tl.uint32)
+        u_d_hi = tl.load(up_base + 1).to(tl.uint32)
+        u_d = (u_d_lo.to(tl.uint16) | (u_d_hi.to(tl.uint16) << 8)).to(
+            tl.float16, bitcast=True
+        ).to(tl.float32)
+        u_sc = tl.load(up_base[:, None] + 66 + (c32[None, :] // 4))
+        u_nib = tl.where((c32[None, :] % 4) < 2, u_sc & 0xF, u_sc >> 4).to(tl.float32)
+
+        g_res = tl.zeros((BR, 32), dtype=tl.int32)
+        u_res = tl.zeros((BR, 32), dtype=tl.int32)
+        for half in tl.static_range(2):
+            g_wp = tl.zeros((BR, 32), dtype=tl.int32)
+            u_wp = tl.zeros((BR, 32), dtype=tl.int32)
+            xp = tl.zeros((32,), dtype=tl.int32)
+            for j in tl.static_range(4):
+                jj = half * 4 + j
+                g_mag = ((g_g >> (8 * jj)) & 0xFF).to(tl.int32)
+                g_mag = tl.where((g_sb & (1 << jj)) != 0, -g_mag, g_mag) & 0xFF
+                u_mag = ((u_g >> (8 * jj)) & 0xFF).to(tl.int32)
+                u_mag = tl.where((u_sb & (1 << jj)) != 0, -u_mag, u_mag) & 0xFF
+                xv = tl.load(xq_ptr + pid_e.to(tl.int64) * K + kb + c32 * 8 + jj).to(tl.int32) & 0xFF
+                g_wp = g_wp | (g_mag << (8 * j))
+                u_wp = u_wp | (u_mag << (8 * j))
+                xp = xp | (xv << (8 * j))
+            xpb = tl.broadcast_to(xp[None, :], (BR, 32))
+            acc0 = tl.zeros((BR, 32), dtype=tl.int32)
+            g_ah = tl.inline_asm_elementwise(
+                "dp4a.s32.s32 $0, $1, $2, $3;", "=r,r,r,r",
+                [g_wp, xpb, acc0], tl.int32, is_pure=False, pack=1,
+            )
+            u_ah = tl.inline_asm_elementwise(
+                "dp4a.s32.s32 $0, $1, $2, $3;", "=r,r,r,r",
+                [u_wp, xpb, acc0], tl.int32, is_pure=False, pack=1,
+            )
+            g_res = g_res + g_ah
+            u_res = u_res + u_ah
+        xs = tl.load(xs_ptr + pid_e.to(tl.int64) * (K // 32) + kb // 32 + c32 // 4)
+        g_scale = g_d[:, None] * (0.5 + g_nib) * 0.25 * xs[None, :]
+        u_scale = u_d[:, None] * (0.5 + u_nib) * 0.25 * xs[None, :]
+        gate_acc += tl.sum(g_res.to(tl.float32) * g_scale, axis=1)
+        up_acc += tl.sum(u_res.to(tl.float32) * u_scale, axis=1)
+    out_base = pid_e.to(tl.int64) * ROWS + r
+    tl.store(gate_out_ptr + out_base, gate_acc)
+    tl.store(up_out_ptr + out_base, up_acc)
+
+
+def iq2xs_dequant_gemm_indexed_dp4a(
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    packed: torch.Tensor,
+    expert_ids: torch.Tensor,
+    *,
+    rows: int,
+    cols: int,
+    grid_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    BR: int = 8,
+) -> torch.Tensor:
+    """dp4a route-batched ``x @ W_e^T``; xq/xs are preq-quantized activations."""
+    E = expert_ids.numel()
+    out = torch.empty((E, rows), dtype=torch.float32, device=xq.device)
+    grid_t, ksigns_t, _ = grid_tables
+    w_row_stride = _check_iq2xs_shape(rows, cols, BR)
+    _iq2xs_dequant_gemm_indexed_dp4a_kernel[(E, rows // BR)](
+        xq, xs, packed, expert_ids, grid_t, ksigns_t, out, E,
+        K=cols, ROWS=rows, W_ROW_STRIDE=w_row_stride, BR=BR,
+    )
+    return out
+
+
+def iq2xs_dequant_gemm_indexed_dual_dp4a(
+    xq: torch.Tensor,
+    xs: torch.Tensor,
+    packed_gate: torch.Tensor,
+    packed_up: torch.Tensor,
+    expert_ids: torch.Tensor,
+    *,
+    rows: int,
+    cols: int,
+    grid_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    BR: int = 8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """dp4a dual-path gate+up GEMM over routed experts."""
+    E = expert_ids.numel()
+    gate_out = torch.empty((E, rows), dtype=torch.float32, device=xq.device)
+    up_out = torch.empty_like(gate_out)
+    grid_t, ksigns_t, _ = grid_tables
+    w_row_stride = _check_iq2xs_shape(rows, cols, BR)
+    _iq2xs_dequant_gemm_indexed_dual_dp4a_kernel[(E, rows // BR)](
+        xq, xs, packed_gate, packed_up, expert_ids, grid_t, ksigns_t,
+        gate_out, up_out, E, K=cols, ROWS=rows, W_ROW_STRIDE=w_row_stride, BR=BR,
+    )
+    return gate_out, up_out

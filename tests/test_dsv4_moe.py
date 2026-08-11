@@ -374,7 +374,8 @@ def test_cuda_prefill_keeps_batched_expert_ids_on_device(
     seen: dict[str, torch.Tensor] = {}
 
     def fake_dual(
-        x: torch.Tensor,
+        xq: torch.Tensor,
+        _xs: torch.Tensor,
         _packed_gate_all: torch.Tensor,
         _packed_up_all: torch.Tensor,
         expert_ids: torch.Tensor,
@@ -383,24 +384,28 @@ def test_cuda_prefill_keeps_batched_expert_ids_on_device(
         **_kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         seen["dual_eids"] = expert_ids.clone()
-        seen["dual_x"] = x.clone()
-        output = torch.zeros(expert_ids.numel(), 1, rows, dtype=torch.float32, device=x.device)
+        seen["dual_x"] = xq.clone()
+        output = torch.zeros(expert_ids.numel(), rows, dtype=torch.float32, device=xq.device)
         return output, output.clone()
 
-    def fake_batch(_self, exps, eids: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
-        assert isinstance(eids, torch.Tensor)
-        assert eids.device == xs.device
-        seen["down_eids"] = eids.clone()
-        return torch.zeros(
-            xs.shape[0], xs.shape[1], exps.rows, dtype=torch.float32, device=xs.device
-        )
+    def fake_down(
+        _hq: torch.Tensor,
+        _hs: torch.Tensor,
+        _packed_down: torch.Tensor,
+        expert_ids: torch.Tensor,
+        *,
+        rows: int,
+        **_kwargs,
+    ) -> torch.Tensor:
+        seen["down_eids"] = expert_ids.clone()
+        return torch.zeros(expert_ids.numel(), rows, dtype=torch.float32, device=_hq.device)
 
     def fake_shared(_self, x: torch.Tensor) -> torch.Tensor:
         return torch.zeros_like(x)
 
     moe.gate = FixedGate()
-    monkeypatch.setattr(iq2xs_kernels, "iq2xs_dequant_gemm_batch_indexed_dual", fake_dual)
-    monkeypatch.setattr(Dsv4MoE, "_batch_expert_gemm", fake_batch)
+    monkeypatch.setattr(iq2xs_kernels, "iq2xs_dequant_gemm_indexed_dual_dp4a", fake_dual)
+    monkeypatch.setattr(iq2xs_kernels, "iq2xs_dequant_gemm_indexed_dp4a", fake_down)
     monkeypatch.setattr(Dsv4MoE, "_shared_forward", fake_shared)
 
     output = moe(
@@ -412,7 +417,7 @@ def test_cuda_prefill_keeps_batched_expert_ids_on_device(
     expected_eids = torch.tensor([0, 1, 1, 2, 0, 2], dtype=torch.int64, device="cuda")
     assert torch.equal(seen["dual_eids"], expected_eids)
     assert torch.equal(seen["down_eids"], expected_eids)
-    assert seen["dual_x"].shape == (6, 1, cfg.hidden_size)
+    assert seen["dual_x"].shape == (6, cfg.hidden_size)
 
 
 def test_rms_norm_matches_reference_formula() -> None:
