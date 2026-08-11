@@ -77,8 +77,16 @@ dp4a 内积 4× + 对齐去 gather 后 **fused 4.3ms → 1-2ms/层，prefill 83 
   2D 张量 inline_asm 逐元素可用；**kernel 调用缺 grid 会误报 "Cannot call @jit outside kernel"**；
   **同名 kernel 编译失败会被 Triton 磁盘缓存**（改名可绕过）
 
-**剩余空间**：dp4a 只加速内积（~2/3）；反量化查表 gather 仍是主要成本，完整对齐+dp4a
-预计 170-330 tok/s。超过 1k 需要 NVFP4 专家 + tensor-core fused MoE（换模型格式）。
+**剩余空间（已系统调研，2026-08-10）**：129 tok/s = 带宽利用 5%（每层读 200 专家 gate+up+down
+~1.2GB，带宽极限 ~6,400 tok/s @ M=64）。已实测排除的快速路径：
+- **对齐布局**（code 连续）：对 dp4a kernel **无收益**（交错 code 在 74B 块内本就连续；0.84 vs 0.80ms）
+- **预计算 code→magnitude 表**（65536×2 int32，去 grid/ksigns 查表）：**更慢 2.5×**（256KB 表 L2 压力）
+- **M 批处理 + dp4a**（E=200, M=2）：仅 1.2×（每专家 token 少，3D acc 开销）
+- **num_warps**：4 最优（8 更慢）；**BR**：8 最优（16/32 更慢）
+瓶颈是 kernel 计算效率（每 block 8 行×1 token 的反量化+dp4a 指令流），非带宽非查表。
+**几千 tok/s 需要**：(a) ds4 完整 warp-per-row 对齐 kernel（`notes/2026-08-10-ds4-cuda-deep-dive.md`
+§2B，32 threads/warp/行 + dp4a + 对齐 SoA，数天工程）；或 (b) NVFP4 专家 + tensor-core fused
+MoE（sglang 路线，换模型格式）。两者都是独立大工程。
 
 **实施顺序建议**：
 1. preq 激活量化 kernel（简单，独立）
