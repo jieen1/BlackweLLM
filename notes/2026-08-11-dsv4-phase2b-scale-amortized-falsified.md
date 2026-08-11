@@ -118,3 +118,37 @@ routes 下，gate+up 的现实下限 ~5 ms（纯 mma）。kill gate 2.4 ms 需�
 mma + sB 重算 + facc 伴随指令是主项。two-plane 预解码 + 预存 sB 是唯一能同时消
 decode 和 sB 重算的路径，但其上限 = pure-mma ≈ 4.72ms（mma 指令量由问题形状决定，
 two-plane 不改变），仍超 kill gate 2.4ms 约 2 倍。
+
+## 9. two-plane 实测与 §9 判定（2026-08-11）
+
+two-plane 是文档 §9 "K-group 与 two-plane 都失败才停止" 的第二分支。做了三个
+独立实测（E=256 真实形状，real GGUF blk.4 权重，E 用 32-expert 复制到 256）：
+
+| 变体 | gate+up | down | 说明 |
+|---|---:|---:|---|
+| fold (committed baseline) | 8.20 ms | — | 全 decode + sB 重算 |
+| smem-sB（已提交） | 7.00 ms | 6.44 ms | decode 算 sB 存 smem，消除重算 |
+| nodecode（two-plane 上限） | 3.21 ms | — | decode 用 const 填 smem，sB 也 const |
+| nodecode+nofacc | 2.17 ms | — | scale 折 1.0（不可用，数值破坏） |
+| two-plane floor (global int8 cb) | 10.21 ms | — | int8 codebook 从 global 读，DRAM 饱和 |
+| **kill gate** | **2.4 ms** | **1.3 ms** | |
+
+分解（E=256）：decode 45%（~2.9ms）、facc scale 34%（~1.1ms）、mma+A/B 2.17ms。
+
+关键结论：
+1. **two-plane 上限 = nodecode 3.21ms**，仍超 kill gate 1.34x。且这是"decode 完全
+   消除"的理想形态——真实 two-plane（预解码 int8 codebook 从 global 读）实测
+   10.21ms（DRAM 饱和），等驻留 SoA 只能部分改善。
+2. **facc 34% 不可消除**：K-group=32 是数值 gate（down cos>=0.9999）的最大可行组
+   （prescreen 实测 K64 down 0.99987 失败），每 32 值一次 I2F+scale 是硬要求。
+   更大 K-group 减 facc 但破坏数值。
+3. **down 6.44ms vs 1.3ms gate**，5x 超。
+4. N_ROWS=128（每 block 128 行摊薄 decode）实测失败：寄存器压力（facc[4] 需 tile
+   维 → 232 regs）与 smem 放大抵消收益，E=64 0.53x。
+
+**§9 判定**：K-group 与 two-plane decomposition 均实测失败 → 触发"停止当前
+IQ2_XS 表示的 2K 承诺"分支。剩余选项：
+(a) 新 2-bit Tensor-Core-native checkpoint format（文档 §9 指定方向）；
+(b) 重新核算 6.5ms/layer MoE 预算（gate+up 现实下限 ~3.2ms two-plane 或
+    ~7ms 现实现）；
+(c) 如实记录"未证可达"。
