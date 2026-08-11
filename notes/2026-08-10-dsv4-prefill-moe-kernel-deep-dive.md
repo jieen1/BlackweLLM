@@ -84,9 +84,15 @@ dp4a 内积 4× + 对齐去 gather 后 **fused 4.3ms → 1-2ms/层，prefill 83 
 - **M 批处理 + dp4a**（E=200, M=2）：仅 1.2×（每专家 token 少，3D acc 开销）
 - **num_warps**：4 最优（8 更慢）；**BR**：8 最优（16/32 更慢）
 瓶颈是 kernel 计算效率（每 block 8 行×1 token 的反量化+dp4a 指令流），非带宽非查表。
-**几千 tok/s 需要**：(a) ds4 完整 warp-per-row 对齐 kernel（`notes/2026-08-10-ds4-cuda-deep-dive.md`
-§2B，32 threads/warp/行 + dp4a + 对齐 SoA，数天工程）；或 (b) NVFP4 专家 + tensor-core fused
-MoE（sglang 路线，换模型格式）。两者都是独立大工程。
+**手写 CUDA warp-per-row 已实测**（`runtime/kernels/iq2_warp_row.cu`，sm_120 编译，32 lanes/warp/行）：
+0.66ms vs Triton dp4a 0.80ms（仅 1.2×）；smem 查表（grid 4KB+ksigns 512B）无额外改善。
+**指令吞吐分析**：每 code 解码+2×dp4a+scale ~30 指令，M=64 gate 420M code = 12.6G lane 指令，
+0.66ms（192 routes）→ 约 SM120 指令吞吐的 ~30%，**kernel 已接近指令级峰值**（每 code 的
+解码/查表/dp4a 是量化格式的固有指令量）。129 tok/s 是**当前 IQ2 格式 + kernel 的指令级上限**
+（带宽只用了 5%，但计算已近饱和）。
+**要几千 tok/s 必须减少每 code 指令量或 code 数**：(a) 换量化格式（NVFP4 专家 + tensor-core
+fused MoE，sglang 路线——tensor core 吞吐 >> dp4a，且 NVFP4 解码更少指令）；或 (b) 更大量化块
+（每 code 更多元素摊薄解码）。两者都是模型格式级变更，非 kernel 微调可达。
 
 **实施顺序建议**：
 1. preq 激活量化 kernel（简单，独立）
