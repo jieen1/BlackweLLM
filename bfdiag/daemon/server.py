@@ -747,7 +747,7 @@ def _add_provider_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--max-model-len", type=int, default=131072)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
-    parser.add_argument("--prefill-rows", type=int, default=32)
+    parser.add_argument("--prefill-rows", type=int, default=64)
     parser.set_defaults(enable_cudagraph=True)
     parser.add_argument(
         "--cudagraph",

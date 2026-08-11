@@ -1,6 +1,6 @@
 # BlackweLLM 文档索引
 
-> 最后整理：2026-08-05 · 基线 commit `8ed33e9`
+> 最后整理：2026-08-11 · 基线 commit `b468d1c`
 
 ## 先读哪一份
 
@@ -8,6 +8,7 @@
 |---|---|
 | 了解项目现在是什么、要去哪 | [`roadmap.md`](roadmap.md) |
 | **知道下一个动作是什么、谁卡着谁** | [`implementation-plan.md`](implementation-plan.md) |
+| **把 DSV4 单卡 prefill 提到 ≥2000 tok/s** | [`dsv4-prefill-2k-implementation-plan.md`](dsv4-prefill-2k-implementation-plan.md) |
 | **有哪些待排查 / 待拍板的事项** | [`investigation-queue.md`](investigation-queue.md) |
 | **E2E 测试 / 兼容性 / 稳定性怎么分期、GPU 窗口怎么排** | [`e2e-and-quality-plan.md`](e2e-and-quality-plan.md) |
 | 了解系统怎么搭的、准备改核心代码 | [`architecture.md`](architecture.md) |
@@ -33,6 +34,7 @@
 | [`model-support.md`](model-support.md) | 支持矩阵、各模型架构事实、接入新模型的六步流程、跨模型陷阱 | 新模型接入、支持状态变化 |
 | [`qwen36-rebuild-spec.md`](qwen36-rebuild-spec.md) | Track B 重建规格：`oracle/qwen36_vllm/` 逐模块判定与新位置映射、Qwen3.6-vLLM 时代验收基线（吞吐/接受率/MMLU-Pro/HumanEval+/显存）、在 Track A 抽象上的重建设计、风险与待验证清单 | `oracle/` 判定变化、新实测基线产出、Track B 里程碑推进 |
 | [`2026-08-04-qwen36-w4a16-current-status.md`](2026-08-04-qwen36-w4a16-current-status.md) | Qwen3.6 当前 W4A16 热点、Nsight 证据与下一道性能门禁 | 新 profiling 结论或路径判定变化 |
+| [`dsv4-prefill-2k-implementation-plan.md`](dsv4-prefill-2k-implementation-plan.md) | DSV4 单卡 prefill ≥2000 tok/s 的架构、强制依赖、分阶段性能预算和发布门禁 | 任一阶段完成、性能预算变化、目标约束变化 |
 | [`diagnostics-guide.md`](diagnostics-guide.md) | bfdiag 使用指南、三条黄金法则、温冷引擎边界 | bfdiag 能力变化 |
 | [`../README.md`](../README.md) | 面向外部的项目介绍、快速开始、配置 | 面向用户的行为变化 |
 | [`../AGENTS.md`](../AGENTS.md) | 给 agent 的仓库约定（结构、命令、诊断纪律、风格） | 目录结构或工程约定变化 |

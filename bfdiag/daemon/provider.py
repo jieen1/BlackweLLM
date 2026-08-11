@@ -724,7 +724,7 @@ class DeepseekV4EngineProvider:
         tokenizer_path: str | None = None,
         num_slots: int = 1,
         max_model_len: int = 131072,
-        prefill_rows: int = 32,
+        prefill_rows: int = 64,
         enable_cudagraph: bool = True,
     ) -> None:
         self._model_path = model_path or _DEFAULT_DSV4_MODEL_PATH

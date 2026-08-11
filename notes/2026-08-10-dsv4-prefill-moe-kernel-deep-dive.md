@@ -1,7 +1,8 @@
 # DSV4 prefill MoE 性能深挖：83 tok/s 的根因与 dp4a 正解（2026-08-10）
 
-状态：🔴 prefill 当前 **83 tok/s**（max_q_rows=64 最优），长上下文 128k 冷 prefill 约 25 分钟，
-**不可用**。根因已确证，正解（dp4a）已明确但未实施（预计 4-8 小时）。
+状态：🟡 dp4a 已将 prefill 从 76 提到 **129 tok/s**；2026-08-11 复测
+`max_q_rows=64` 稳态为 131.8-133.3 tok/s，仍受 IQ2 指令吞吐限制。长上下文 cold prefill
+依然过慢，数量级提升需要模型格式级改造。
 
 ## 1. 事实基线（真实 GGUF，SM120，96GB）
 
@@ -9,7 +10,7 @@
 - 单层 MoE（M=32）fused kernel（`iq2xs_dequant_gemm_batch_indexed_dual`，E=192 routes, M=1）：
   **4.3ms/层**（dual gate+up）+ 2.3ms（down）≈ 6.8ms/层
 - torch.profiler M=32 单 chunk（43 层）：**MoE 289ms / 350ms = 83%**，attn 16ms，HC 14ms
-- 带宽账：M=32 → top-8 → 192 routes → **131 唯一专家**，**每专家平均 1.47 token**（最大 4）
+- 带宽账：M=32 → top-6 → 192 routes → **131 唯一专家**，**每专家平均 1.47 token**（最大 4）
   **每 route 输出 gate/up 的 inter=2048 全行**（不是 8 行），每层读激活专家权重
   ~1.5GB（131×2048×4096×0.375B×3）；fused kernel 不落全局的带宽极限 ~5TB/s
   （当前 4.3ms/层 = 反量化计算 2.6% 效率，不是带宽）
@@ -17,7 +18,7 @@
 ## 2. 根因（多路径交叉确认）
 
 **MoE prefill kernel 是反量化计算-bound，不是带宽-bound**：
-- `_route_expanded_prefill` 把每 token 的 top-8 展开成 E=192 条 route、M=1，每 block 只算
+- `_route_expanded_prefill` 把每 token 的 top-6 展开成 E=192 条 route、M=1，每 block 只算
   1 token × 8 行（`BLOCK_COLS=8`），同一专家权重被多条 route 重复反量化
 - IQ2 反量化（`IQ2XS_GRID`/`KSIGNS` 查表 gather + 8-j 位操作）+ fp32 内积
   → 2.6% 计算效率（4.3ms/层 = 1.7 Gops/s vs SM120 ~100 Tops）
@@ -35,7 +36,7 @@
 
 **共同限制**：(a) 任何"反量化全权重并落全局（bf16/fp32）再 GEMM"的路径被 bf16 写带宽
 封顶；(b) 任何 cuBLAS 大 GEMM 被 M=32 小 batch 的低计算密度 + 专家冗余（每 token 只
-需 top-8）封顶；(c) M 批处理被"每专家 1.47 token"的固有稀疏路由封顶（唯一专家数太多）。
+需 top-6）封顶；(c) M 批处理被"每专家 1.47 token"的固有稀疏路由封顶（唯一专家数太多）。
 **必须保持 fused（不落全局），优化其反量化计算（对齐布局去 gather + dp4a int8 内积）**。
 
 ## 4. 正解：dp4a int8 内积（ds4 §2B 已验证方案）
@@ -99,6 +100,23 @@ fused MoE，sglang 路线——tensor core 吞吐 >> dp4a，且 NVFP4 解码更�
 2. IQ2 对齐 repack（加载时一次）+ dp4a kernel（单专家验证 → routes 批量）
 3. 数值门禁：单 kernel vs `dequantize_iq2_xs`（rel < 1e-3），端到端 prefill cos ≥ 0.99
 4. 接入 `_route_expanded_prefill`（替换 `iq2xs_dequant_gemm_batch_indexed_dual` 调用）
+
+## 4c. 线上默认 chunk 修正（2026-08-11）
+
+最新代码已通过 `_share_mla_scratch_across_layers` 让 43 层共用一个 MLA scratch，旧的
+“0.107 GiB/row × 43 层 × slot”容量估算已经失效，但 server 和 bfdiag 仍沿用旧默认
+`max_q_rows=32`。同一冷启动进程、同一 256-token workload、交错运行的实测：
+
+| max_q_rows | 稳态 prefill | 说明 |
+|---|---:|---|
+| 32 | 90.3-104.8 tok/s | 4 chunks |
+| 64 | **131.8-133.3 tok/s** | 2 chunks，约 +35% |
+
+64 行共享 scratch 实测仅 **0.376 GiB**，不随 slot 数增长；2 slots × 128K、无 decode graph
+的真实 backend 完成 1,600-token A/B 后 resident 93.8 GiB。`preq_activation` 两种生产形状
+仅 0.0817/0.0427 ms/调用，合计约 5.4 ms/43 层（不足整次 prefill 的 0.3%），不值得为了
+它增加新 kernel。server、bfdiag provider/CLI 的默认值因此统一改为 64，环境变量和命令行
+显式覆盖仍保留。
 
 ## 5. 长上下文现状（本目标的另一半，已基本达标）
 

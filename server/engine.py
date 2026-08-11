@@ -850,12 +850,12 @@ class ServerEngine:
             model.config,
             num_slots=self.num_slots,
             max_seq_len=max_model_len,
-            # The MLA scratch is planned for a bounded prefill chunk, not
-            # the full context: scratch ~ 0.107 GiB/row across all 43
-            # layers per slot (measured), so 32 rows x 2 slots is ~6.8 GiB
-            # on top of the ~82 GiB model.  The backend prefills long
-            # prompts in chunks of min(max_q_rows, window) rows.
-            max_q_rows=int(os.environ.get("QSR_DSV4_PREFILL_ROWS", "32")),
+            # The MLA scratch is planned for a bounded prefill chunk and is
+            # shared across all 43 layers.  At 64 rows it is 0.376 GiB and
+            # does not scale with slot count; 64 rows measured ~35% faster
+            # than 32 while 96 rows regressed.  Long prompts are chunked at
+            # min(max_q_rows, 128), so keep the measured optimum as default.
+            max_q_rows=int(os.environ.get("QSR_DSV4_PREFILL_ROWS", "64")),
             device="cuda",
         )
         if self._enable_cudagraph:

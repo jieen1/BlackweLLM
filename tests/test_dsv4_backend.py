@@ -70,10 +70,6 @@ def _zeroed_model(max_seq_len: int = 64) -> Dsv4Transformer:
     model = Dsv4Transformer(TINY, max_seq_len=max_seq_len, device="cuda")
     for buf in model.buffers():
         buf.zero_()
-    for module in model.modules():
-        packed = getattr(module, "packed", None)
-        if packed is not None:
-            packed.zero_()
     return model
 
 

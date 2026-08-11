@@ -144,7 +144,9 @@ def test_provider_module_imports_without_torch_side_effects() -> None:
 
 
 def test_deepseek_provider_is_a_structural_engine_provider() -> None:
-    assert isinstance(DeepseekV4EngineProvider(), EngineProvider)
+    provider = DeepseekV4EngineProvider()
+    assert isinstance(provider, EngineProvider)
+    assert provider.describe()["load_config"]["prefill_rows"] == 64
 
 
 def test_deepseek_provider_load_describe_namespace_and_snapshot_fields(

@@ -39,7 +39,7 @@ from bfdiag.daemon.provider import (
     requires_cold_restart,
 )
 from bfdiag.daemon.queue import check_sweep_is_hot_safe, submit
-from bfdiag.daemon.server import AlreadyRunningError, Daemon, ManualClock
+from bfdiag.daemon.server import AlreadyRunningError, Daemon, ManualClock, _add_provider_args
 
 
 @pytest.fixture
@@ -69,6 +69,19 @@ def daemon_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         with contextlib.suppress(Exception):
             shutil.rmtree(socket_dir, ignore_errors=True)
     time.sleep(0.1)
+
+
+def test_deepseek_prefill_row_cli_defaults_match_provider() -> None:
+    parser = argparse.ArgumentParser()
+    cli.register(parser.add_subparsers(dest="command", required=True))
+    cli_args = parser.parse_args(["daemon", "start", "--provider", "deepseek_v4"])
+
+    server_parser = argparse.ArgumentParser()
+    _add_provider_args(server_parser)
+    server_args = server_parser.parse_args(["--provider", "deepseek_v4"])
+
+    assert cli_args.prefill_rows == 64
+    assert server_args.prefill_rows == 64
 
 
 class TestHotReloadMechanics:

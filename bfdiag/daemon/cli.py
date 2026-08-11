@@ -57,7 +57,7 @@ def _register_daemon(subparsers: argparse._SubParsersAction) -> None:
     start_parser.add_argument("--dtype", default="bfloat16")
     start_parser.add_argument("--max-model-len", type=int, default=131072)
     start_parser.add_argument("--gpu-memory-utilization", type=float, default=0.88)
-    start_parser.add_argument("--prefill-rows", type=int, default=32)
+    start_parser.add_argument("--prefill-rows", type=int, default=64)
     start_parser.set_defaults(enable_cudagraph=True)
     start_parser.add_argument(
         "--cudagraph",
