@@ -66,15 +66,18 @@ iq2_mma16_kernel(
             a[reg] = ab;
         }
 
-        // B = weight [K16, N8]: b0 byte j = B[l4*4+j, l4*2] = mag(code, jj).
+        // B = weight [K16, N8]: b0 byte j holds B[k, n] with n = l4*2 (j<2)
+        // or l4*2+1 (j>=2), k = l4*4 + j (probe: one b0 feeds both c0 and c1).
         int32_t b = 0;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
+            const int ncol = l4 * 2 + (j >= 2 ? 1 : 0);
             const int kk = k0 + j;
             const int code = k16 * 2 + kk / 8;
             const int jj = kk % 8;
             const int kb2 = code / 32, ci2 = code % 32;
-            const uint8_t* blk2 = wp + (int64_t)kb2 * 74;
+            const uint8_t* blk2 = packed + (int64_t)eid * ROWS * STRIDE
+                                + (int64_t)(rowblk + ncol) * STRIDE + kb2 * 74;
             const uint16_t cd = (uint16_t)(blk2[2 + ci2 * 2] | (blk2[3 + ci2 * 2] << 8));
             const int64_t g = grid[cd & 511];
             const int32_t sb = ksigns[cd >> 9];
@@ -90,12 +93,13 @@ iq2_mma16_kernel(
             dump_buf[1] = c[0];
         }
 
+        const float sc = d * (0.5f + nib) * 0.25f;
         const float xs0 = xs[xsbase + (int64_t)lg * (COLS / 32) + k16 / 2];
         const float xs1 = xs[xsbase + (int64_t)(lg + 8) * (COLS / 32) + k16 / 2];
-        facc[0] += (float)c[0];
-        facc[1] += (float)c[1];
-        facc[2] += (float)c[2];
-        facc[3] += (float)c[3];
+        facc[0] += (float)c[0] * sc * xs0;
+        facc[1] += (float)c[1] * sc * xs0;
+        facc[2] += (float)c[2] * sc * xs1;
+        facc[3] += (float)c[3] * sc * xs1;
     }
     const int64_t obase = (int64_t)e * 16 * ROWS + rowblk;
     out[obase + (int64_t)lg * ROWS + l4 * 2] = facc[0];
