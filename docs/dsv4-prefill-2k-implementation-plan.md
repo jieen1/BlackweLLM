@@ -1,6 +1,8 @@
 # DSV4 单卡 prefill ≥2000 tok/s：架构与实施计划
 
-> 状态：**可执行实施合同；Phase 2 exact 路径已触发性能 kill gate，唯一主线为单卡 Phase 2B**
+> 状态：**可执行实施合同；Phase 2B-0 direct-folding 已触发性能 kill gate 并失败
+> （9.97 ms gate+up vs 2.4 ms 目标，4.2×），I2F 前提被 Nsight 证伪；下一步按 §4.3
+> 进入 two-plane candidate 或重新核算单卡 2K 预算**
 >
 > 日期：2026-08-11
 >
@@ -72,7 +74,6 @@ SGLang 是本方案的**执行图和 operator 组织基线**，不是可以直�
 - commit `a0a76e4485`：BCG prefill 中允许 alt-stream 的最小改动。
 
 ### 2026-08-11 已完成的 Phase 2B 数值预筛
-
 以下是本机单卡、真实 GGUF `blk.4.ffn_gate_exps.weight` expert 0、M=24、seed=20260811
 的预筛结果。A/W 都在 K-group 内做对称 INT8 共尺度；它只证明候选值得写 CUDA kernel，
 **不等于真实 route、完整 MoE 或端到端质量已经通过**。
@@ -88,6 +89,31 @@ SGLang 是本方案的**执行图和 operator 组织基线**，不是可以直�
 `cos_min=0.9998977`、K64/K32 为 `0.9998817`、K128/K128 为 `0.9998198`。
 所以实现必须同时保留 K32/K64/K128 recipe，并在**真实 top-6 加权归并之后**选择；不能因为
 单矩阵 K128 通过就把它写死为 production 默认。
+
+### 2026-08-11 已完成的 Phase 2B-0 CUDA 实测（direct-folding）
+
+表示证明已在真实 GGUF（blk.4，M=24）验证 K32 是满足 quality gate 的最大
+K-group（全链路 down cos 0.9999）。`iq2_mma16_tc.cu` 实现 K-group=32
+scale folding，数值 vs exact oracle 全部 `>=0.9999`。
+
+**性能（E=256，M_PAD=32，真实 1024-token 路由）**：gate+up 9.97 ms、
+down ~5 ms —— **kill gate（2.4/1.3 ms）未达（4.2×）**。
+
+Nsight 证据：
+- tensor core 仅 1.2%（指令），ALU 1.69G（decode 位操作）是最大单项；
+- SM throughput 64.6%，tensor 12% —— 指令流水近饱和但 tensor 饿死；
+- 纯 mma 下限（无 decode/staging）4.72 ms，仍超 2.4 ms kill gate 2×；
+- K32 mma 减半 tensor 指令（100M→50M）但总时间反升（A 片段寄存器 + 发射率），回退；
+- `__launch_bounds__` 压寄存器 → spill → 更慢，回退。
+
+**结论**：§4.3 "I2F 串行依赖是主瓶颈" 前提被实测证伪——瓶颈是 decode 的
+ALU 指令量和 L1TEX/smem 流量，不是 I2F。four 轮优化（spill 消除 → 直接
+global decode → fused decode/fold → 模板 M_PAD）把 24 ms 降到 9.97 ms，
+但**即使 decode 完美消除（5.89 ms 下限）也超 kill gate**。two-plane 预解码
+codebook 预计 ~6-8 ms，仍超 2.4 ms。这是单卡 IQ2_XS Tensor-Core 路径的
+现实下限，需重新核算 6.5 ms/layer MoE 预算或转向 §9 的 "停止 2K 承诺" 分支。
+
+详见 `notes/2026-08-11-dsv4-phase2b-scale-amortized-falsified.md`。
 
 ### 下一个提交必须交付什么
 

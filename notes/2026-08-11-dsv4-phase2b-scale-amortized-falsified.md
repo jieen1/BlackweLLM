@@ -76,3 +76,31 @@ occupancy                            24.9%  (smem 23168B → 3 blocks/SM)
 ## 6. 相关提交
 
 - `cc3e35c` Phase 2B-0: 表示证明 + tc kernel（数值通过，性能不达标）
+
+## 7. 优化迭代与 K32 mma 探索（2026-08-11 续）
+
+从 24 ms 到 ~10 ms 的四轮实测优化（E=256 M_PAD=32 真实路由）：
+1. M_PAD 编译期模板 → facc 寄存器驻留，消除 48% L2 的 register spill
+   （24 → 16 ms）
+2. direct-global decode（去掉 smem raw staging pass）：16 → 13 ms
+3. fused decode+fold 单 pass：13 → 10 ms
+4. m16n8k32 mma（每 K-group 1 条指令）：tensor 指令减半（100M→50M）但
+   总时间反升（10 → 12.8 ms），A 片段 4 寄存器 + tensor 利用率 12%→5.7%，
+   回退
+
+下限测量：
+- 纯 mma（无 decode/staging，const B）：4.72 ms
+- nodecode（decode 用常量）：5.89 ms
+- fold kernel：9.97 ms
+
+**结论**：即使 decode/staging 完美消除，纯 mma + scale + sid 读已 4.7 ms，
+仍超 kill gate（2.4 ms）2 倍。mma 指令发射本身（每 block 768 mma × 16384
+blocks）是下限。two-plane（预解码 codebook）最多把 ALU 1.69G 砍到 ~0.3G，
+预计 ~6-8 ms，仍超 2.4 ms。
+
+**必须重新评估**：单卡 IQ2_XS Tensor-Core MoE 在 M_PAD=32、E=256、6144
+routes 下，gate+up 的现实下限 ~5 ms（纯 mma）。kill gate 2.4 ms 需要 mma
+指令量降 2 倍（更大 M 或不同 mma 形状）且 decode 近零。文档 §9 的
+"两轮都失败则停止单卡 2K 承诺" 条件已接近触发；在转向 checkpoint format
+前，剩余高 ROI 路径是增大每 block 的 N（行）以摊薄 decode，或接受
+10 ms gate+up 并重新核算 6.5 ms/layer 预算。
