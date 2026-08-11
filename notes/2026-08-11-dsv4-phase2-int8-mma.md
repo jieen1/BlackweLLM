@@ -1,13 +1,20 @@
 # Phase 2 进展：IQ2 INT8 Tensor-Core grouped MoE（2026-08-11）
 
 > 状态：手写 `mma.sync.m16n8k16` 数值**已全对**（cos 1.0，maxrel ~1e-6），
-> B 布局谜底已解（PTX ISA 文档布局即硬件布局；之前"CUTLASS 提取"结论是
-> 探针符号扩展 bug 的假象）。kernel 内两个真 bug（B 列 + per-K16 scale 行）
-> 已修。下一步：dual gate/up + SwiGLU + down 融合、grouped 接入、性能 kill gate。
+> exact dual gate/up 与 Python grouped-routed prototype 已落地；真实 1024-token 形状 gate+up
+> 14.8 ms、routed pipeline 32 ms（router/shared expert 未包含），已触发 router+routed+shared
+> `<=6.5 ms/layer` 性能 kill gate。exact kernel 冻结为
+> correctness oracle；下一条候选验证转为 scale-amortized INT8 MMA，详见实施计划 Phase 2B。
+>
+> 阅读说明：§1–3 记录按时间推进的探针过程，其中若干“下一步”已被后续 §3c 取代；
+> 当前决策以本段、§3c 和实施计划最新状态为准。
 >
 > 计划：`docs/dsv4-prefill-2k-implementation-plan.md` Phase 2。
 
 ## 1. 已验证的 tensor-core 收益（真实 GGUF/SM120，gate 路径）
+
+> **SUPERSEDED 性能投影**：本节只证明 Tensor Core 有速度空间。BR=32 路径随后实测
+> gate cosine 0.47，未过数值门禁；本节的 4.6 ms 推算不能作为 Phase 2 达标证据。
 
 | kernel | E=200 M_PAD=8 | 相对 dp4a |
 |---|---|---|
@@ -16,8 +23,8 @@
 | 同上 BR=16 | 2.84ms | 2.3× |
 | 同上 **BR=32** | **2.06ms** | **3.2×** |
 
-- **BR=32 真实 M=4.5**：gate 单 ~1.16ms；gate+up+SwiGLU+down ≈ **4.6ms/层**，
-  **达标 Phase 2 kill gate ≤6.5ms**（当前 dp4a 6.8ms/层 @ M=64）。
+- **BR=32 真实 M=4.5**：gate 单 ~1.16ms；当时投影 gate+up+SwiGLU+down
+  ≈ **4.6ms/层**，只通过速度估算，随后因 gate cosine 0.47 被否决。
 - 更大 BR 更好（join 摊销 + MMA 并行），BR=32 已是 kernel 内反量化的实际上限；
   手写 CUDA（无 Triton join 开销）预期再 1.5-2×。
 
@@ -39,13 +46,13 @@ C 每 lane 4×.s32 = c0→C[lg, l4*2]、c1→C[lg, l4*2+1]、c2→C[lg+8, l4*2]�
 mma 组合所有 lane 的 b0 成完整 B 矩阵再归约，单 lane 无法独立控制）——**B fragment
 布局必须按 CUTLASS `mma_tensor_op` 的线程映射精确构造**（`b12x/_lib/intrinsics.py`
 m16n8k32 模式 + CUTLASS `mma_sm80.h` m16n8k16 s8 instruction 的 warp 布局）。
-作为 Phase 2 的过渡，Triton `tl.dot`（K32，per-K16 近似 scale）已验证 3.2× 且
-kill gate ≤6.5ms/layer 达标——exact 手写 mma 是后续优化。
+作为 Phase 2 的过渡，Triton `tl.dot`（K32，per-K16 近似 scale）曾测得 3.2×；后续
+gate cosine 0.47 已否决“kill gate 达标”结论，exact 手写 mma 才是有效 oracle。
 **B 布局假设**（B[lg*4+j, l4*2] 等）**全部实测失败**（0/32）；b12x 的 m16n8k32 mma
 用 `frag_layout_swizzle_16b_to_8b`（fragment 字节 swizzle）构造 B——**B 的线程映射 +
 字节 swizzle 必须照搬 b12x/CUTLASS**（`b12x/attention/nsa_indexer/kernel.py` 的
-`frag_layout_swizzle_16b_to_8b`），不能手推。Phase 2 下一步：Triton tl.dot 的
-gate/up/down + SwiGLU 端到端接入（过渡），exact 手写 mma 并行跟进。
+`frag_layout_swizzle_16b_to_8b`），不能手推。当时计划接入 Triton tl.dot 过渡路径；该计划
+已被后面的 cos 0.47 和 exact CUDA 结果取代。
 **数值状态（2026-08-11）**：Triton tl.dot（kernel 内反量化，BR=32）gate cos **0.47**
 （远低于 0.9999）——w32 的 join 组装字节序或 K32 scale 近似错误；预解码版 cos 0.018
 （构造无 scale，不能作参考）。排查顺序：先用无 scale 的 kernel 输出 vs torch mag×xq
@@ -57,7 +64,7 @@ scale）、无张量标量索引/切片（无法提取 codes/mag 的列）、无
 Phase 2 的正解是**手写 CUDA m16n8k16**（`runtime/kernels/iq2_mma16.cu`，A/C 已实测确认：
 a0→A[lg,l4*4+0..3]、a1→A[lg+8,...]、c0→C[lg,l4*2]、c1→C[lg,l4*2+1]、c2→C[lg+8,l4*2]、
 c3→C[lg+8,l4*2+1]）——数值 + 性能都需在 CUDA 侧完成。Triton tl.dot
-仅作过渡速度验证（3.3×，kill gate ≤6.5ms 达标，数值不达标）。
+仅作过渡速度验证（3.3×；数值不达标，因此不算 kill gate 通过）。
 **B 布局最终结论（2026-08-11）**：b0 的 4 字节 → B 的 (k,n) 映射是 mma 硬件布局硬编码的；
 所有手推假设（n=lg、n=l4*2、k=l4*4+j、k=lg*4+j）实测均失败（c0 恒为固定 B 列或边界
 lane 漂移）——**必须从 CUTLASS `mma_tensor_op.h` 的 `IteratorB`（
@@ -92,7 +99,7 @@ scale）、无张量标量索引/切片（无法提取 codes/mag 的列）、无
 Phase 2 的正解是**手写 CUDA m16n8k16**（`runtime/kernels/iq2_mma16.cu`，A/C 已实测确认：
 a0→A[lg,l4*4+0..3]、a1→A[lg+8,...]、c0→C[lg,l4*2]、c1→C[lg,l4*2+1]、c2→C[lg+8,l4*2]、
 c3→C[lg+8,l4*2+1]）——数值 + 性能都需在 CUDA 侧完成。Triton tl.dot
-仅作过渡速度验证（3.3×，kill gate ≤6.5ms 达标，数值不达标）。
+仅作过渡速度验证（3.3×；数值不达标，因此不算 kill gate 通过）。
 **B 布局最终结论（2026-08-11）**：b0 的 4 字节 → B 的 (k,n) 映射是 mma 硬件布局硬编码的；
 所有手推假设（n=lg、n=l4*2、k=l4*4+j、k=lg*4+j）实测均失败（c0 恒为固定 B 列或边界
 lane 漂移）——**必须从 CUTLASS `mma_tensor_op.h` 的 `IteratorB`（

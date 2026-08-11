@@ -44,7 +44,7 @@
 | `2026-08-10-m1-decode-deep-dive.md` | **M=1 decode 深度调研结论总览**——四路交叉印证：q8_0 对齐是根因（非 latency）、ds4 实测数字、行动清单按 ROI |
 | `2026-08-10-dsv4-q8-warprow-gate-regression.md` | **DSV4 Q8_0 warp-per-row 优化未过门禁的完整说明**——单 kernel 正确（与 tl.dot maxdiff 0）但门禁 3-workload 漂移（0.99903 vs 基线 0.99999988）。含现象、已确证事实、尝试方案、未解疑点（soa_planes 懒构建与 graph pool 交互、逐层定位建议）。已回滚，门禁 PASS。**接手者先读此文档** |
 | `2026-08-10-dsv4-prefill-moe-kernel-deep-dive.md` |
-| `2026-08-11-dsv4-phase2-int8-mma.md` | **Phase 2：IQ2 INT8 Tensor-Core grouped MoE**——tensor-core 收益实测（预解码 10.9×、kernel 内反量化 BR=32 3.2× → gate+up+down ≈4.6ms/层 达标 kill gate ≤6.5ms）；确认 nibble scale 每 8 值变化 → exact 需手写 mma.sync.m16n8k16（K16=2 code scale 统一 lo/hi）；Triton tl.dot 的 K≥32 限制与无切片约束已记录 | **DSV4 prefill MoE kernel 性能深挖**——dp4a 已落地并将 76 提到 129 tok/s；2026-08-11 复测 64-row 稳态 131.8–133.3 tok/s。MoE 占 M32 chunk 83%，route-M1 IQ2 解码已接近指令流上限；warp-row 只再快 1.2×。达到几千 tok/s 必须改为 layer-major superchunk + expert-grouped Tensor-Core 路线，实施合同见 `../docs/dsv4-prefill-2k-implementation-plan.md`。含长上下文状态和显存边界。 |
+| `2026-08-11-dsv4-phase2-int8-mma.md` | **Phase 2：IQ2 INT8 Tensor-Core grouped MoE**——exact `mma.sync.m16n8k16` 已落地并达到 cos 1.0；真实 1024-token 形状 gate+up 14.8 ms、grouped routed pipeline 32 ms（router/shared expert 未包含），未过 router+routed+shared `<=6.5 ms/layer` kill gate。exact 路径保留为 oracle，下一条候选验证为 scale-amortized INT8 MMA Phase 2B；旧 Triton 4.6ms 估算因数值不合格不再作为可达性证据 | **DSV4 prefill MoE kernel 性能深挖**——dp4a 已落地并将 76 提到 129 tok/s；2026-08-11 复测 64-row 稳态 131.8–133.3 tok/s。MoE 占 M32 chunk 83%，route-M1 IQ2 解码已接近指令流上限；warp-row 只再快 1.2×。达到几千 tok/s 必须改为 layer-major superchunk + expert-grouped Tensor-Core 路线，实施合同见 `../docs/dsv4-prefill-2k-implementation-plan.md`。含长上下文状态和显存边界。 |
 
 ## 2. 已定案的根因分析 🟢
 

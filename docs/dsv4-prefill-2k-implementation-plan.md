@@ -1,6 +1,6 @@
 # DSV4 单卡 prefill ≥2000 tok/s：架构与实施计划
 
-> 状态：**待实施**
+> 状态：**实施中；Phase 0/1 原型已完成，Phase 2 exact 路径触发性能 kill gate，已转入 Phase 2B**
 >
 > 日期：2026-08-11
 >
@@ -11,6 +11,23 @@
 本文是达到 2000 tok/s 的执行合同，不是对当前 129–133 tok/s 路径的小幅调优清单。
 现状证据与已排除方案见
 [`../notes/2026-08-10-dsv4-prefill-moe-kernel-deep-dive.md`](../notes/2026-08-10-dsv4-prefill-moe-kernel-deep-dive.md)。
+
+## 0. 2026-08-11 最新代码审计
+
+审计基线为本地 `main@0e3e10a`。该分支工作区干净，较 `origin/main@da9c5aa` 超前 5 个提交。
+从本文初版 `c24d93b` 到当前 HEAD 共 25 个 Phase 0–2 提交，最新代码已经不是“完全待实施”：
+
+| 阶段 | 已有事实 | 尚未完成 / 阻塞 |
+|---|---|---|
+| Phase 0 | `bfdiag/prefill_profile.py` 已实测 64 tokens 为 134.9–137 tok/s；MoE 约 71%，wall 与 profiler GPU 合计差 35.8% | 仍是独立脚本，不是 bfdiag provider operation；原定 `<5%` 分项闭合未达成 |
+| Phase 1 | `_prefill_superchunk_logits` 已完成 64/65/256/1024 parity；cos 0.9972–1.0，greedy 5/5 | production 入口仍调用 `_prefill_logits`；当前 prototype 一次保留整个 prompt，不是 1024-row 有界 superchunk，也未覆盖 prefix hit/checkpoint/stats |
+| Phase 2 exact | `iq2_mma16.cu` 已完成 exact IQ2_XS、dual gate/up、smem decode、4-way ILP；kernel cos 1.0、maxrel 约 1e-6 | 真实 1024-token 形状 gate+up 14.8 ms、grouped routed pipeline 32 ms（尚不含 router/shared expert），已经超过整层 router+routed+shared MoE 6.5 ms 预算约 4.9×；未接入 `Dsv4MoE.forward` |
+| Phase 2 Python prototype | `grouped_moe_prefill` 已串起 group→gate/up→SwiGLU→down→reduce | 仍有 `counts.max().item()` host sync、运行时分配和 PyTorch scatter/sort；测试名声称 reference parity，但当前断言只检查 finite/nonzero |
+| Phase 3–5 | 无 production 变更 | HC/attention 预算、全模型 512 ms、4K/16K/128K 服务门禁均未开始 |
+
+因此当前 production 吞吐仍是约 130 tok/s，不能把“代码已存在”解释成“服务路径已提速”。
+`0e3e10a` 的 exact kernel 是重要的正确性 oracle 和性能拆账工具，但它已经用实测证明：
+**逐 K16 做 I2F+FFMA 的 exact 累加组织本身不能完成 2K 目标。**
 
 ## 1. 目标与验收
 
@@ -78,15 +95,15 @@ routed expert packed 权重约 74.58 GiB。1024-token superchunk 若每层大致
 
 | 模块 | 每层预算 | 43 层预算 |
 |---|---:|---:|
-| routed + shared MoE | ≤6.5 ms | ≤279.5 ms |
+| router + routed + shared MoE | ≤6.5 ms | ≤279.5 ms |
 | attention | ≤3.5 ms | ≤150.5 ms |
 | 两段 HC + norm | ≤1.4 ms | ≤60.2 ms |
-| embed/head/route/checkpoint/余量 | — | ≤21.8 ms |
+| embed/head/checkpoint/余量 | — | ≤21.8 ms |
 | 总计 | ≤11.91 ms | ≤512 ms |
 
 每个模块都有独立 kill gate；不能用一个模块的 microbenchmark 掩盖另一个模块超预算。
 
-## 4. 目标架构
+## 4. 更新后的目标架构
 
 ```text
 1024 tokens
@@ -97,7 +114,7 @@ routed expert packed 权重约 74.58 GiB。1024-token superchunk 若每层大致
        HC post over 1024 rows
        HC-FFN pre + norm over 1024 rows
        route all rows and group by expert
-       exact IQ2_XS tile decode -> INT8 Tensor-Core grouped MoE
+       IQ2_XS scale-amortized decode -> INT8 Tensor-Core grouped MoE
        stable top-6 reduction + HC post
   -> HC head + LM head for the final token only
 ```
@@ -119,33 +136,80 @@ routed expert packed 权重约 74.58 GiB。1024-token superchunk 若每层大致
 64 tokens 时平均只有 `64×6/256=1.5` routes/expert；1024 tokens 时平均为
 `1024×6/256=24`，使一个 IQ2 weight tile 能被约 24 行 activation 复用。这是数量级提升的来源。
 
-### 4.2 Exact IQ2_XS → INT8 Tensor-Core grouped MoE
+### 4.2 Exact kernel 的新定位：oracle，不是 production recipe
 
-权重继续以 IQ2_XS 常驻；禁止 resident W8A8、NVFP4 或 BF16 副本。SparkInfer 新增语义：
+权重继续以 IQ2_XS 常驻；禁止 resident W8A8、NVFP4 或 BF16 副本。当前 exact kernel 每个
+K16 partial 都把 INT32 转 FP32 并乘独立 scale。它已经达到 cos 1.0，但 E=256、6144 routes
+形状下 gate+up 为 13.4–14.8 ms、grouped routed pipeline 为 32 ms；后者还没有包含 router
+和 shared expert。即使 scheduler 零开销，也不可能满足 router+routed+shared MoE 的 6.5 ms/layer。
+
+所以 exact kernel 保留用于：
+
+- 新 recipe 的 single-layer 数值 oracle；
+- 逐项定位 scale folding、route grouping 和 reduction 误差；
+- 当性能门禁关闭时提供 debug fallback，但 fallback 运行不计入 2K 验收。
+
+Phase 2B 的候选 recipe 接口暂定为；在 kernel gate 通过前，它不是 production 默认：
 
 ```text
 source_format = gguf_iq2_xs
-quant_mode    = iq2_w8a8
-execution     = expert-grouped, fixed M buckets
+quant_mode    = iq2_tc_scale_amortized
+execution     = expert-grouped, fixed M buckets, caller-owned scratch
 ```
 
-每个 CTA：
+### 4.3 Phase 2B：scale-amortized INT8 MMA 候选验证
+
+新路径的核心不是放宽 2K 目标，而是消掉已证实的 I2F 串行依赖。以下算法均为
+**[待验证]**，必须同时验证
+`K_SCALE_GROUP={32,64,128,256}`，选择满足质量门禁的最大 group：
+
+1. IQ2_XS 的 `d`、nibble scale、grid magnitude 和 sign 仍是唯一权重来源；
+2. 把多个 K16 的 scale 因子折入 INT8 B fragment/codebook lookup，在 INT32 中累加一个
+   K-scale group 后只做一次 I2F+FFMA；
+3. activation scale 同步从 K32 向 K64/K128/K256 做 A/B，不能只优化权重侧而保留同量级
+   的 per-K32 float dependency；
+4. exact `iq2_mma16` 逐层比较，禁止用随机小矩阵替代真实 route 和真实权重；
+5. direct-packed 先测；若 74-byte AoS decode/对齐仍超预算，loader 做**等驻留大小** SoA：
+   64-byte code plane + 10-byte scale/meta plane，替换 raw storage，不同时常驻两份；
+6. gate/up、SwiGLU、down 和 stable reduction 必须作为一个 fused/grouped budget 测量。
+
+进入 CUDA 实现前必须先提交表示证明：INT8 fragment 的取值范围不会溢出；folding/two-plane
+对 `d × (0.5+nibble) × magnitude × sign` 的重构公式明确；activation K-group 变大后的量化
+误差有真实 layer 分布统计；MMA 数、I2F 数、decode 指令数给出可复核的每层下界。缺任一项，
+该候选只算实验，不得称为 production recipe。
+
+优先实现两级数值方案：
+
+- **TC64/TC128 scale folding**：首选，目标是在可接受量化误差下把 I2F 次数降低 4–8×；
+- **two-plane integer decomposition**：若直接 folding 误差过大，把 IQ2 magnitude×scale-index
+  分成两个 signed-INT8 fragment，在 INT32 合并后统一缩放；它增加 MMA 数量，但保留更多
+  IQ2 数值信息，仍避免逐 K16 I2F。
+
+这两条都保持原始 2-bit 级 resident footprint。W4A8/NVFP4 resident repack 仍然拒绝，因为
+74.58 GiB routed weights 放大到 4-bit 后无法在 96 GB 卡上与 2×128K KV、decode graph 共存。
+
+每个 grouped CTA/cluster：
 
 1. 读取某 expert 的 IQ2_XS K×N tile；
-2. 把 codebook magnitude/sign 精确解码为 int8，只落 shared/register；
-3. activation 按 K=32 量化为 int8 + per-row scale；
-4. 使用 SM120 `mma.sync` INT8×INT8→INT32 做 K32 partial MMA；
-5. 每个 partial 应用 activation scale 和 IQ2 的 `d × (0.5+nibble) × 0.25`；
-6. FP32 累加，FC1 同时计算 gate/up，接 SwiGLU，再运行 FC2；
+2. codebook magnitude/sign 与 scale folding 只落 shared/register；
+3. activation 使用选定的固定 K-scale group 量化；
+4. 使用 SM120 `mma.sync` INT8×INT8→INT32，跨多个 K16 partial 保持 INT32；
+5. 每个 K-scale group 只做一次 FP32 scale/accumulate；
+6. FC1 dual gate/up 后立刻 SwiGLU，再进 down，避免 `[E,M,N]` FP32 全局中间张量；
 7. 按 stable expert-id/top-slot 顺序归并。
 
-IQ2_XS 的 nibble scale 覆盖连续 32 values，正好匹配 K32 partial。权重无需重新量化，差异仅来自
-accumulation order。
+### 4.4 device-side grouping 与固定 scratch
 
-SparkInfer 已有 grouped routing、caller-owned scratch、W4A8/MXFP8 和 SM120 inline-MMA 骨架，
-但没有现成 IQ2/INT8 grouped kernel；这是新 kernel 项目，不是 API 接线。
+当前 `grouped_moe_prefill` 只是功能原型，不可直接接入生产。production grouping 必须：
 
-### 4.3 HC 与 attention
+- 固定 `{16,32,48,64}` M-tile buckets，1024 tokens 的 6144 routes 全在 device 上分桶；
+- route count `>64` 的热点 expert 拆成多个固定 tile，不能截断；trace 单独报告 overflow 比例；
+- 无 `.item()`、无动态 `torch.empty/zeros/arange/sort`、无 Python per-expert loop；
+- backend 启动时一次性分配 `<=256 MiB` scratch，并 prewarm 所有 bucket；
+- 直接写 gate/up 的 BF16 或 fused SwiGLU staging；禁止当前 `[E,M_PAD,N]` 双 FP32 输出；
+- trace 记录 active experts、bucket distribution、padding ratio、recipe 和 fallback reason。
+
+### 4.5 HC 与 attention
 
 MoE 之外，HC+attention 旧 profile 已约 30 ms/M32 chunk，也必须大批次化：
 
@@ -172,6 +236,8 @@ MoE 之外，HC+attention 旧 profile 已约 30 ms/M32 chunk，也必须大批�
 - 不得产生 model-sized second representation；
 - grouped MoE scratch 上限 256 MiB；
 - 若需要 SoA repack，必须在 streaming loader 中替换 raw storage，不能同时常驻两份；
+- SoA 不是 kernel 局部优化：必须增加显式 layout descriptor，并同步迁移 loader、dequant oracle、
+  prefill kernel、decode kernel 和 fallback tests；decode 未保持当前性能/正确性前不得替换 AoS；
 - 必须保持 2 slots×128K + decode graph 在 96 GB 内。
 
 ### 运行时
@@ -182,59 +248,99 @@ MoE 之外，HC+attention 旧 profile 已约 30 ms/M32 chunk，也必须大批�
 - trace 必须记录 selected recipe、bucket、fallback reason 和分阶段 GPU 时间；
 - 任何 fallback 都让 2K 性能门禁失败，不能静默回旧 kernel。
 
-## 6. 实施阶段
+## 6. 从当前 HEAD 继续的实施阶段
 
-### Phase 0：冻结观测和基线
+### Phase 0：冻结观测和基线 — **部分完成**
 
-- 给 bfdiag DSV4 provider 增加 `prefill_profile` operation；
+- 把现有 `bfdiag/prefill_profile.py` 接入 DSV4 provider operation；
 - 记录每层 MoE/attention/HC GPU 时间和 real route histogram；
 - 固化 4K/16K/128K token fixtures；
 - 同一配置复现 129–133 tok/s，profile 分项与 wall time 差异 <5%。
 
 改动面：`bfdiag/daemon/`、`bfprobe/`、`docs/diagnostics-guide.md`。
 
-### Phase 1：正确性优先的 layer-major scheduler
+### Phase 1：有界 layer-major scheduler — **prototype 完成，production 未接线**
 
-- 在 `runtime/backends/dsv4.py` 增加 `_prefill_superchunk_logits`；
+- 把现有 `_prefill_superchunk_logits` 改为 `(start_base, <=1024 rows)` 有界入口；
+- outer prefill 逐 1024 rows 调用，attention 使用绝对位置 `start_base+tile_offset`；
+- 补齐 prefix full/partial hit、256-token checkpoint、stats/trace、slot reset/reuse；
 - attention 支持 caller-owned tiled output；
 - HC/MoE 增加 large-M 固定形状入口；
 - 旧 IQ2 kernel 暂时作为 reference，不以速度验收；
 - 验证 1/63/64/65/255/256/1023/1024/1025 tokens 的 logits 和所有层状态。
 
-### Phase 2：单层 IQ2 Tensor-Core kill gate
+### Phase 2A：exact IQ2 Tensor-Core — **数值完成，性能 kill gate 失败**
 
-SparkInfer 改动面：
+已完成：exact dual gate/up kernel、wrapper、build provenance、CUDA tests。实测 grouped routed
+pipeline 32 ms（router/shared expert 未包含），不再继续用 A-smem/launch 微调追逐 6.5 ms；该路径
+冻结为 oracle。
 
-- `b12x/moe/_shared/execution.py`：新增 `gguf_iq2_xs`/`iq2_w8a8`；
-- 新增 `b12x/moe/_shared/kernels/iq2xs_w8a8.py`；
-- 复用 device-side grouping 和 planned scratch；
-- 首版直接读取 74-byte block；只有 profiler 证明 alignment 是瓶颈才做等大小 SoA。
+### Phase 2B-0：表示证明与 routed microkernel — **当前最高优先级**
 
-真实 layer、真实 1024-token routes 必须满足：
+第一轮不接 backend，只做真实权重/真实 route capture 上的 routed microkernel：
 
-- gate+up+SwiGLU+down+stable reduction p50 `<=6.5 ms`、p90 `<=7.0 ms`；
+- 先完成 INT8 range、folding/two-plane 重构公式、误差界和指令下界；
+- 实现 K32/64/128/256 scale-amortization sweep；
+- 先测 direct-packed；仅在 profiler 证明 AoS decode/transaction 是 blocker 后启动独立 SoA migration；
+- 与 exact kernel 比较 gate/up/down 输出；
+- 报告 gate+up、SwiGLU、down、group/reduce 四段独立 GPU 时间；
+- Nsight 记录 MMA、I2F、整数 decode、DRAM 和 occupancy，不用 wall time猜瓶颈。
+
+6.5 ms 是 router+routed+shared MoE 的完整预算，不只是新 kernel 的预算。Phase 2B 的目标拆账如下；
+这些是 **[待验证目标]**，不是当前实测：
+
+| 子阶段 | p50 目标 |
+|---|---:|
+| router score/top-k | ≤0.3 ms |
+| device route/group/gather + A quant | ≤0.5 ms |
+| dual gate/up | ≤2.4 ms |
+| SwiGLU + down-input quant | ≤0.4 ms |
+| down | ≤1.3 ms |
+| stable route reduction | ≤0.3 ms |
+| shared expert | ≤1.0 ms |
+| 余量 | ≥0.3 ms |
+| router+routed+shared MoE 总计 | ≤6.5 ms |
+
+Phase 2B-0 kernel gate：
+
+- dual gate/up p50 `<=2.4 ms`，down p50 `<=1.3 ms`；
 - 连续 100 replay 无 host sync、allocation、JIT；
-- kernel cosine `>=0.9999`；
+- gate/up/down 各自相对 exact oracle cosine `>=0.9999`；
 - scratch `<=256 MiB`。
 
-direct-packed 和等大小 SoA 两轮都失败，则停止单卡 2K 承诺，转向新 checkpoint format、较小
-模型或多 GPU；不得回到 route-M1 小修。
+### Phase 2B-1：完整 MoE operator gate
 
-### Phase 3：HC/attention 预算闭环
+只有 Phase 2B-0 通过后，才接 device route/group/gather、SwiGLU、stable reduction 和 shared
+expert。真实 layer、真实 1024-token routes 必须满足：
+
+- router + routed pipeline + shared expert p50 `<=6.5 ms`、p90 `<=7.0 ms`；
+- 连续 100 replay 无 host sync、allocation、JIT；
+- 完整 MoE 输出相对旧路径 cosine `>=0.9999`；
+- scratch `<=256 MiB`，无 model-sized second representation。
+
+full-model worst logits cosine和 greedy 39/39 属于 Phase 4 集成门禁，不前置伪装成 kernel-only
+证据。
+
+所有 K-scale group 与 two-plane decomposition 都失败时，才停止当前 IQ2 checkpoint 的单卡 2K
+承诺，转向新的 2-bit Tensor-Core-native checkpoint format、较小模型或多 GPU；不得回到
+route-M1 小修，也不得把 100–500 tok/s 宣布为完成。
+
+### Phase 3：HC/attention 预算闭环 — **未开始**
 
 - HC+norm `<=1.4 ms/layer`；
 - attention `<=3.5 ms/layer`；
 - 验证 64/128-row attention tile 的性能、状态和显存；
 - 未同时达标不得进入全模型集成。
 
-### Phase 4：全模型集成和预热
+### Phase 4：全模型集成和预热 — **未开始**
 
 - backend 生产默认 superchunk=1024；
 - prewarm 64/128/256/512/1024 buckets 和 gate/up/down 三种 shape；
 - decode 继续使用旧路径；
 - 1024-token full-model `<=512 ms`；任何 fallback 直接失败。
+- full-model worst logits cosine `>=0.99`，greedy `39/39`；
 
-### Phase 5：服务发布门禁
+### Phase 5：服务发布门禁 — **未开始**
 
 按以下顺序运行：unit/kernel → real single-layer → fresh 4K → fresh 16K → fresh 128K →
 2-slot/128K/decode graph/slot reuse。先 `bf diff`，失败先读 trace，不盲目重跑。
@@ -254,7 +360,8 @@ direct-packed 和等大小 SoA 两轮都失败，则停止单卡 2K 承诺，转
 ### CUDA/kernel
 
 - 512 grid codes、128 sign patterns、所有 scale nibbles；
-- M=1/8/16/24/32/64，生产 K/N=4096/2048；
+- M=1/8/16/24/32/48/64，生产 K/N=4096/2048；
+- K-scale group 32/64/128/256 的误差、I2F 次数和性能曲线；
 - gate/up dual、SwiGLU clamp、down、router weight；
 - Nsight 确认实际发射 Tensor Core 指令；
 - 100 replay 无 allocation/sync/JIT。
@@ -276,16 +383,31 @@ direct-packed 和等大小 SoA 两轮都失败，则停止单卡 2K 承诺，转
 | 全局 dequant BF16 + cuBLAS | 拒绝；GiB 级中间写流量，已有实测更慢 |
 | 改 top-k/层数 | 拒绝；改变模型语义 |
 | exact K32 scale/累加 | 高风险；由 Phase 2 数值+性能 kill gate 控制 |
+| 继续优化 exact per-K16 I2F 路径 | 拒绝作为 production 主线；routed pipeline 32 ms 且未含 router/shared expert，已触发 kill gate，保留为 oracle |
+| 直接接入当前 `grouped_moe_prefill` | 拒绝；存在 host sync、动态分配、FP32 大中间张量且没有 reference parity 断言 |
+| scale-amortized IQ2 Tensor Core | 当前主线；必须同时通过 6.5 ms、cos/greedy、96 GB 三重门禁 |
 | attention causal state | 高风险；Phase 1 boundary parity 前置 |
 | 2K 未达成 | 不降低门槛宣布成功；按超预算模块继续优化或更换约束 |
 
-## 9. 当前过渡修正
+## 9. 当前结论与下一个可提交里程碑
 
 2026-08-11 已把 server/bfdiag 的旧 `max_q_rows=32` 默认统一为实测最佳的 64，并补齐
 provider/parser 一致性测试。它把稳态约 90–105 提到 131.8–133.3 tok/s，且 2-slot×128K
 decode graph 捕获成功。
 
 该改动只建立更好的实施基线，不计入 2K 目标完成度。
+
+截至 `0e3e10a`，可以计入完成度的是“观测工具、scheduler parity prototype、exact kernel
+oracle”；不能计入的是 production throughput。下一个里程碑必须是一个窄提交，且同时包含：
+
+1. K32/64/128/256 或 two-plane 的真实单层曲线；
+2. 至少一个 recipe 达到 router+routed+shared MoE p50 `<=6.5 ms`；
+3. exact-oracle single-layer cosine `>=0.9999`；
+4. 无 host sync/allocation 的证据；
+5. 明确的 resident scratch/weight bytes。
+
+该里程碑不达成前，不把 prototype 接到 production prefill；避免把 128K correctness、prefix
+cache 和 slot 状态风险叠加到一个尚未过性能门的 kernel 上。
 
 ## 10. 外部依据
 
