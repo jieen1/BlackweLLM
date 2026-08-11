@@ -70,6 +70,10 @@ c0→C[lg,l4*2]、c1→C[lg,l4*2+1]、c2/c3→C[lg+8,...]），且 b0 的字节�
 意味着每 warp 一次 mma 同时算 2 个输出行）。**需按 CUTLASS `mma_tensor_op` 的
 FragmentB 精确布局（2 列 × 2 k）重写 B 打包与输出 scatter**。Phase 2 数值+完整 kernel
 未达之前不进入 Phase 3。
+**决定性（2026-08-11 深夜）**：b0=B[l4*4+j,lg] 时 c0==ΣB[:,l4*2] 达 **32/32**（c0 的 B
+列 = l4*2 完全确认），但 b0 的字节值（B[k,lg]）与 c0 的归约（ΣB[:,l4*2]）矛盾——说明
+**mma 的 b0 字节→(k, n) 映射有独立的 k 重排**（非 l4*4+j），必须从 CUTLASS
+TensorOpMultiplicandCrosswise128x4（sm80）的 k_index/bank 公式逐字节提取。
 **进一步定位（2026-08-11 晚）**：无 scale kernel 与 torch mag×xq 的 maxdiff 仍大；
 早期 dump 的 codes/g 对比错是 **kb 不对齐**（kernel dump 落在 kb=15，torch 参考用 kb=0）
 + codes 逐字节读取。已改 uint16 读取（`+1` 跳过 d），ROWS/STRIDE/`eid*ROWS*STRIDE`
@@ -95,7 +99,11 @@ c0→C[lg,l4*2]、c1→C[lg,l4*2+1]、c2/c3→C[lg+8,...]），且 b0 的字节�
 （C 列 l4*2 → out 行）与 B 列的权重行（lg）之间的硬件映射尚未厘清（c0/c1 共享 b0
 意味着每 warp 一次 mma 同时算 2 个输出行）。**需按 CUTLASS `mma_tensor_op` 的
 FragmentB 精确布局（2 列 × 2 k）重写 B 打包与输出 scatter**。Phase 2 数值+完整 kernel
-未达之前不进入 Phase 3。K16 内 2 个连续 code 共享同一
+未达之前不进入 Phase 3。
+**决定性（2026-08-11 深夜）**：b0=B[l4*4+j,lg] 时 c0==ΣB[:,l4*2] 达 **32/32**（c0 的 B
+列 = l4*2 完全确认），但 b0 的字节值（B[k,lg]）与 c0 的归约（ΣB[:,l4*2]）矛盾——说明
+**mma 的 b0 字节→(k, n) 映射有独立的 k 重排**（非 l4*4+j），必须从 CUTLASS
+TensorOpMultiplicandCrosswise128x4（sm80）的 k_index/bank 公式逐字节提取。K16 内 2 个连续 code 共享同一
 nibble（偶数→lo、奇数→hi）已确认 → per-K16 scale 精确。剩余：B 布局定位、fp32 累积、
 per-token xscale 的 C 映射（c0/c1 用 token lg、c2/c3 用 token lg+8）、16×8 全输出、
 多 warp/grouped 接入、launch wrapper + 数值验证。
