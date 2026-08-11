@@ -44,7 +44,12 @@ kill gate ≤6.5ms/layer 达标——exact 手写 mma 是后续优化。
 用 `frag_layout_swizzle_16b_to_8b`（fragment 字节 swizzle）构造 B——**B 的线程映射 +
 字节 swizzle 必须照搬 b12x/CUTLASS**（`b12x/attention/nsa_indexer/kernel.py` 的
 `frag_layout_swizzle_16b_to_8b`），不能手推。Phase 2 下一步：Triton tl.dot 的
-gate/up/down + SwiGLU 端到端接入（过渡），exact 手写 mma 并行跟进。K16 内 2 个连续 code 共享同一
+gate/up/down + SwiGLU 端到端接入（过渡），exact 手写 mma 并行跟进。
+**数值状态（2026-08-11）**：Triton tl.dot（kernel 内反量化，BR=32）gate cos **0.47**
+（远低于 0.9999）——w32 的 join 组装字节序或 K32 scale 近似错误；预解码版 cos 0.018
+（构造无 scale，不能作参考）。排查顺序：先用无 scale 的 kernel 输出 vs torch mag×xq
+定位 w32 组装；再修 K32 scale（4 code 的 lo/lo/hi/hi 无法在 tl.dot 内 per-code，需
+确认是否可接受近似或改用每 K32 单独 mma）。Phase 2 数值未达之前不进入 Phase 3。K16 内 2 个连续 code 共享同一
 nibble（偶数→lo、奇数→hi）已确认 → per-K16 scale 精确。剩余：B 布局定位、fp32 累积、
 per-token xscale 的 C 映射（c0/c1 用 token lg、c2/c3 用 token lg+8）、16×8 全输出、
 多 warp/grouped 接入、launch wrapper + 数值验证。
