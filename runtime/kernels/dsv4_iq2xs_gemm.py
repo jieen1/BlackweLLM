@@ -966,7 +966,12 @@ def _iq2xs_dequant_gemm_indexed_dp4a_kernel(
     acc = tl.zeros((BR,), dtype=tl.float32)
     for kb in range(0, K, 256):
         kb_block = kb // 256
-        base = w_ptr + eid.to(tl.int64) * ROWS * W_ROW_STRIDE + r.to(tl.int64) * W_ROW_STRIDE + kb_block * 74
+        base = (
+            w_ptr
+            + eid.to(tl.int64) * ROWS * W_ROW_STRIDE
+            + r.to(tl.int64) * W_ROW_STRIDE
+            + kb_block * 74
+        )
         lo = tl.load(base[:, None] + 2 + c32[None, :] * 2).to(tl.uint32)
         hi = tl.load(base[:, None] + 2 + c32[None, :] * 2 + 1).to(tl.uint32)
         codes = (lo | (hi << 8)) & 0xFFFF
@@ -987,7 +992,10 @@ def _iq2xs_dequant_gemm_indexed_dp4a_kernel(
                 jj = half * 4 + j
                 mag = ((g >> (8 * jj)) & 0xFF).to(tl.int32)
                 mag = tl.where((sb & (1 << jj)) != 0, -mag, mag) & 0xFF
-                xv = tl.load(xq_ptr + pid_e.to(tl.int64) * K + kb + c32 * 8 + jj).to(tl.int32) & 0xFF
+                xv = (
+                    tl.load(xq_ptr + pid_e.to(tl.int64) * K + kb + c32 * 8 + jj).to(tl.int32)
+                    & 0xFF
+                )
                 wp = wp | (mag << (8 * j))
                 xp = xp | (xv << (8 * j))
             xpb = tl.broadcast_to(xp[None, :], (BR, 32))
@@ -1030,8 +1038,18 @@ def _iq2xs_dequant_gemm_indexed_dual_dp4a_kernel(
     up_acc = tl.zeros((BR,), dtype=tl.float32)
     for kb in range(0, K, 256):
         kb_block = kb // 256
-        gate_base = gate_w_ptr + eid.to(tl.int64) * ROWS * W_ROW_STRIDE + r.to(tl.int64) * W_ROW_STRIDE + kb_block * 74
-        up_base = up_w_ptr + eid.to(tl.int64) * ROWS * W_ROW_STRIDE + r.to(tl.int64) * W_ROW_STRIDE + kb_block * 74
+        gate_base = (
+            gate_w_ptr
+            + eid.to(tl.int64) * ROWS * W_ROW_STRIDE
+            + r.to(tl.int64) * W_ROW_STRIDE
+            + kb_block * 74
+        )
+        up_base = (
+            up_w_ptr
+            + eid.to(tl.int64) * ROWS * W_ROW_STRIDE
+            + r.to(tl.int64) * W_ROW_STRIDE
+            + kb_block * 74
+        )
         g_lo = tl.load(gate_base[:, None] + 2 + c32[None, :] * 2).to(tl.uint32)
         g_hi = tl.load(gate_base[:, None] + 2 + c32[None, :] * 2 + 1).to(tl.uint32)
         g_codes = (g_lo | (g_hi << 8)) & 0xFFFF
@@ -1070,7 +1088,10 @@ def _iq2xs_dequant_gemm_indexed_dual_dp4a_kernel(
                 g_mag = tl.where((g_sb & (1 << jj)) != 0, -g_mag, g_mag) & 0xFF
                 u_mag = ((u_g >> (8 * jj)) & 0xFF).to(tl.int32)
                 u_mag = tl.where((u_sb & (1 << jj)) != 0, -u_mag, u_mag) & 0xFF
-                xv = tl.load(xq_ptr + pid_e.to(tl.int64) * K + kb + c32 * 8 + jj).to(tl.int32) & 0xFF
+                xv = (
+                    tl.load(xq_ptr + pid_e.to(tl.int64) * K + kb + c32 * 8 + jj).to(tl.int32)
+                    & 0xFF
+                )
                 g_wp = g_wp | (g_mag << (8 * j))
                 u_wp = u_wp | (u_mag << (8 * j))
                 xp = xp | (xv << (8 * j))
