@@ -120,12 +120,30 @@ per-token xscale 的 C 映射（c0/c1 用 token lg、c2/c3 用 token lg+8）、1
 
 ## 3. 下一步
 
-1. 按 `mxfp8_mma_m16n8k32_f32_e4m3`（`b12x/_lib/intrinsics.py:3680`）的 fragment
-   组装模式，写手写 `m16n8k16` kernel（每 K16 partial 精确 lo/hi scale）；
-2. device-side grouped routing（复用 SparkInfer 现有）→ 真实 1024-token routes；
-3. 接入 `runtime/backends/dsv4.py` 的 `_prefill_superchunk_logits`（Phase 1 已有
-   layer-major 骨架）；
-4. 验证：single-layer p50 ≤6.5ms、cos ≥0.9999、100 replay 无 JIT/alloc/sync。
+**2026-08-11 决定性解析（B 布局谜底）**：PTX ISA §9.7.15.5.9 文档的
+m16n8k16 s8 片段布局就是正确的硬件布局——之前所有"手推 B 布局失败"的结论
+**全是探针代码的符号扩展 bug**：`(int32_t)(int8_t)(负值) << (8*j)` 会把
+0xFFFFFF 垃圾位 OR 进高字节，导致 b0/a1 寄存器字节被污染（实测 lane 25-31 的
+a1 高 3 字节全变 0xFF）。修好打包（`& 0xFF` 掩码）后，PTX 文档布局在 SM120 上
+**32/32 全对**：
+
+- A：`a0=A[lg, l4*4+0..3]`、`a1=A[lg+8, l4*4+0..3]`（与之前探针一致）
+- B：`b0 byte j = B[l4*4+j, lg]`（4 字节全在同一列 lg=groupID，k 连续 4 个）
+- C：`c0=C[lg,l4*2]`、`c1=C[lg,l4*2+1]`、`c2=C[lg+8,l4*2]`、`c3=C[lg+8,l4*2+1]`
+
+真实 GGUF/SM120 端到端验证通过：cos=1.0、maxrel≈1e-6（fp32 累加舍入），
+覆盖 E=1..3、ROWS=32/64/128/2048、M=8/16、rand/ones/sparse 激活。
+
+**kernel 里的两个真 bug（2026-08-11 已修，`runtime/kernels/iq2_mma16.cu`）**：
+1. **B 列错**：旧代码用 `ncol = l4*2` 读权重行，PTX 规定 B 列 = groupID =
+   `lg`，所以 b0 字节应来自权重行 `rowblk+lg`（lane lg 读第 lg 行）。
+2. **scale 行错**：per-K16 scale（`d*(0.5+nibble)*0.25`）必须取 C 累加所对的
+   B 列对应权重行的 d/nibble——c0/c2 对 B 列 `l4*2`、c1/c3 对 B 列 `l4*2+1`，
+   两半各自的权重行 scale 不同；旧代码统一用 B 片段行 lg 的 scale，导致除
+   lg==l4*2 的 lane 外全部错。
+
+已达成：single-layer p50 ≤6.5ms 的数值前置条件（kernel cos ≥0.9999 的 0.9999
+阈值远超满足，实际 1.0）。下一步进入 Phase 2 性能 kill gate 和 grouped 接入。
 
 ## 4. 相关提交
 

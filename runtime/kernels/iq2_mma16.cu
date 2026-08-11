@@ -1,7 +1,9 @@
 // Phase 2: IQ2_XS in-kernel decode -> INT8 MMA (m16n8k16) grouped MoE, SM120.
 // Exact IQ2: two codes of a K16 partial share one nibble (even->lo, odd->hi)
 // so per-K16 scale = d*(0.5+nibble)*0.25*actscale is exact.
-// Fragment layouts (m16n8k16 s8, 32 lanes) -- all probe-confirmed:
+// Fragment layouts (m16n8k16 s8, 32 lanes) -- PTX-ISA documented, verified
+// 32/32 on SM120 with a full-warp A/B probe (2026-08-11; earlier "hardware-
+// hardcoded B" conclusion was a probe sign-extension artifact, see notes):
 //   A row-major [16,16]: a0=A[lg, l4*4+0..3], a1=A[lg+8, l4*4+0..3]
 //   B col-major [16,8]:  b0 byte j = B[l4*4+j, lg]
 //   C [16,8] s32: c0=C[lg,l4*2], c1=C[lg,l4*2+1], c2=C[lg+8,l4*2], c3=C[lg+8,l4*2+1]
@@ -37,22 +39,30 @@ iq2_mma16_kernel(
     const int eid = (int)eids[e];
     const int lane = threadIdx.x;
     const int l4 = lane % 4, lg = lane / 4;
-    const int k0 = l4 * 4, n0 = l4 * 2;   // B column (output row) = l4*2 (probe-confirmed)
+    const int k0 = l4 * 4;   // k index within the K16 partial
 
-    const uint8_t* wp = packed + (int64_t)eid * ROWS * STRIDE
-                       + (int64_t)(rowblk + l4 * 2) * STRIDE;
     const int64_t xbase = (int64_t)e * 16 * COLS;
     const int64_t xsbase = (int64_t)e * 16 * (COLS / 32);
 
     float facc[4] = {0.f, 0.f, 0.f, 0.f};
     for (int k16 = 0; k16 < COLS / 16; ++k16) {
-        const int code_a = k16 * 2;
-        const int kb = code_a / 32, ci = code_a % 32;
-        const uint8_t* blk = wp + (int64_t)kb * 74;
-        const __half d_h = *(const __half*)blk;
-        const float d = __half2float(d_h);
-        const uint8_t scv = blk[66 + ci / 4];
-        const float nib = (ci % 4) < 2 ? (float)(scv & 0xF) : (float)(scv >> 4);
+        // Per-K16 scale of B column n = weight row (rowblk+n)'s d/nibble.
+        // c0/c2 accumulate over B column l4*2 ; c1/c3 over column l4*2+1,
+        // so the two halves use different weight rows' scales.
+        float sc[2];
+#pragma unroll
+        for (int col = 0; col < 2; ++col) {
+            const int nrow = l4 * 2 + col;
+            const int code_a = k16 * 2;
+            const int kb = code_a / 32, ci = code_a % 32;
+            const uint8_t* blk = packed + (int64_t)eid * ROWS * STRIDE
+                               + (int64_t)(rowblk + nrow) * STRIDE + (int64_t)kb * 74;
+            const __half d_h = *(const __half*)blk;
+            const float d = __half2float(d_h);
+            const uint8_t scv = blk[66 + ci / 4];
+            const float nib = (ci % 4) < 2 ? (float)(scv & 0xF) : (float)(scv >> 4);
+            sc[col] = d * (0.5f + nib) * 0.25f;
+        }
 
         // A = activation [M16, K16]: a0/a1 = xq[token, k0+0..3].
         int32_t a[2];
@@ -66,12 +76,11 @@ iq2_mma16_kernel(
             a[reg] = ab;
         }
 
-        // B = weight [K16, N8]: b0 byte j holds B[k, n] with n = l4*2 (j<2)
-        // or l4*2+1 (j>=2), k = l4*4 + j (probe: one b0 feeds both c0 and c1).
+        // B = weight [K16, N8]: b0 byte j = B[l4*4+j, lg] (PTX: col=groupID).
         int32_t b = 0;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const int ncol = l4 * 2 + (j >= 2 ? 1 : 0);
+            const int ncol = lg;
             const int kk = k0 + j;
             const int code = k16 * 2 + kk / 8;
             const int jj = kk % 8;
@@ -93,13 +102,12 @@ iq2_mma16_kernel(
             dump_buf[1] = c[0];
         }
 
-        const float sc = d * (0.5f + nib) * 0.25f;
         const float xs0 = xs[xsbase + (int64_t)lg * (COLS / 32) + k16 / 2];
         const float xs1 = xs[xsbase + (int64_t)(lg + 8) * (COLS / 32) + k16 / 2];
-        facc[0] += (float)c[0] * sc * xs0;
-        facc[1] += (float)c[1] * sc * xs0;
-        facc[2] += (float)c[2] * sc * xs1;
-        facc[3] += (float)c[3] * sc * xs1;
+        facc[0] += (float)c[0] * sc[0] * xs0;
+        facc[1] += (float)c[1] * sc[1] * xs0;
+        facc[2] += (float)c[2] * sc[0] * xs1;
+        facc[3] += (float)c[3] * sc[1] * xs1;
     }
     const int64_t obase = (int64_t)e * 16 * ROWS + rowblk;
     out[obase + (int64_t)lg * ROWS + l4 * 2] = facc[0];
