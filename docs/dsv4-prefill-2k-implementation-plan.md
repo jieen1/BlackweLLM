@@ -1,6 +1,6 @@
 # DSV4 单卡 prefill ≥2000 tok/s：架构与实施计划
 
-> 状态：**实施中；Phase 0/1 原型已完成，Phase 2 exact 路径触发性能 kill gate，已转入 Phase 2B**
+> 状态：**可执行实施合同；Phase 2 exact 路径已触发性能 kill gate，唯一主线为单卡 Phase 2B**
 >
 > 日期：2026-08-11
 >
@@ -12,10 +12,102 @@
 现状证据与已排除方案见
 [`../notes/2026-08-10-dsv4-prefill-moe-kernel-deep-dive.md`](../notes/2026-08-10-dsv4-prefill-moe-kernel-deep-dive.md)。
 
+## 执行摘要：后续工程师从这里开始
+
+### 不可改变的约束
+
+- **只有一张** RTX PRO 6000 Blackwell Max-Q，96 GB，SM120，300 W；
+- 保持 `TP=PP=EP=1`，多卡、换卡和远程 prefill 节点均不在本方案范围；
+- 使用当前 DeepSeek-V4-Flash GGUF，routed experts 常驻格式为 IQ2_XS；
+- 不降低 top-k、层数、上下文长度或质量门禁；
+- 目标是无 prefix hit 的真实服务 prefill：4K、16K、128K median 均 `>=2000 tok/s`；
+- 不能常驻第二份 W4/W8/BF16 routed weights，临时 scratch 上限 `256 MiB`。
+
+任何后续方案若以“增加 GPU”作为达标条件，直接判为**越界**，不进入评审。
+
+### 唯一实施顺序
+
+```text
+真实 GGUF 单层 route capture
+  -> Phase 2B-0: IQ2 K-group 共尺度 Tensor-Core microkernel
+       gate+up <=2.4 ms, down <=1.3 ms, cosine 达标
+  -> Phase 2B-1: device-side route/group + fused SwiGLU/down/reduce
+       router+routed+shared <=6.5 ms/layer
+  -> Phase 1 production: 1024-token bounded layer-major superchunk
+       full model <=512 ms/1024 tokens
+  -> Phase 3: mHC/attention 按 SGLang DSV4 的融合和 overlap 结构收口
+       HC <=1.4 ms/layer, attention <=3.5 ms/layer
+  -> 4K -> 16K -> 128K 冷进程服务验收
+```
+
+顺序不能颠倒。当前 dormant superchunk 最终必须接入，但在新 MoE operator 通过
+`6.5 ms/layer` 之前接 production 没有性能意义：它仍会调用
+`Dsv4MoE._route_expanded_prefill()`，继续把 1024×top-6 展成 route-M1 dp4a。
+
+### SGLang DSV4 怎么参考
+
+SGLang 是本方案的**执行图和 operator 组织基线**，不是可以直接加载当前 GGUF 的现成后端。
+调研固定基线为 `/home/bot/project/sglang` 的 `origin/main@2d193077f7`（2026-08-11）。
+
+| SGLang 已验证结构 | 本项目的落点 | 迁移方式 |
+|---|---|---|
+| 4096-token chunked prefill；breakable/piecewise graph 的 1024-token bucket | `runtime/backends/dsv4.py` | 采用 1024 bounded superchunk 和固定 tail buckets；不复制 TP/DP 调度 |
+| DSV4 attention 的 Q/KV、compressor、indexer 多流 overlap | `runtime/model/dsv4_attn_kernel.py`、`runtime/backends/dsv4.py` | 在单流正确性通过后增加 3 条预分配 stream 和显式 event 依赖 |
+| `mhc_fused_post_pre` | `runtime/kernels/dsv4_mhc.py`、`runtime/model/dsv4_model.py` | 合并相邻层 post/pre、norm 和中间写回 |
+| device-side MoE align/dispatch/combine | `runtime/model/dsv4_model.py` + 新 grouped operator | 复用固定 bucket、device counts/offsets、stable combine 的组织方式 |
+| MegaMoE 的 dispatch + GEMM + activation + combine 融合边界 | 新 IQ2 grouped operator | 复用 operator 边界，不复制 MXFP4 算术 |
+| prefill alt-stream 只在 breakable graph/capture 条件下开启 | DSV4 prefill recipe selector | 只作为 kernel 达标后的 overlap 优化，不能用于掩盖单 kernel 超预算 |
+
+必须明确区分：SGLang 官方 RTX PRO 6000 路径是 MXFP4、`TP=2`；其
+`flashinfer_mxfp4`/MegaMoE kernel 不能读取 74-byte/256-value IQ2_XS block。本项目直接复用的
+是调度、融合、dispatch/combine 和 overlap 结构；唯一必须自建的核心是
+**IQ2_XS on-the-fly Tensor-Core MoE**。
+
+上游对照文件：
+
+- `python/sglang/srt/models/deepseek_v4.py`：mHC、attention 多流、BCG prefill；
+- `python/sglang/kernels/ops/moe/moe_align_small_numel.py`：单 launch device align；
+- `test/registered/models_e2e/test_deepseek_v4_flash_fp4_b200.py`：4096 chunk、breakable graph、
+  1024 piecewise bucket 的组合门禁；
+- commit `a0a76e4485`：BCG prefill 中允许 alt-stream 的最小改动。
+
+### 2026-08-11 已完成的 Phase 2B 数值预筛
+
+以下是本机单卡、真实 GGUF `blk.4.ffn_gate_exps.weight` expert 0、M=24、seed=20260811
+的预筛结果。A/W 都在 K-group 内做对称 INT8 共尺度；它只证明候选值得写 CUDA kernel，
+**不等于真实 route、完整 MoE 或端到端质量已经通过**。
+
+| K group | gate projection `cos_min` | `cos_mean` | `rel_l2_max` |
+|---:|---:|---:|---:|
+| 32 | 0.9999694 | 0.9999718 | 0.00801 |
+| 64 | 0.9999603 | 0.9999639 | 0.00898 |
+| 128 | 0.9999508 | 0.9999552 | 0.00993 |
+| 256 | 0.9999375 | 0.9999461 | 0.01118 |
+
+同一 expert 的 gate+up→SwiGLU→down 误差会累积：K32/K32 的单 route
+`cos_min=0.9998977`、K64/K32 为 `0.9998817`、K128/K128 为 `0.9998198`。
+所以实现必须同时保留 K32/K64/K128 recipe，并在**真实 top-6 加权归并之后**选择；不能因为
+单矩阵 K128 通过就把它写死为 production 默认。
+
+### 下一个提交必须交付什么
+
+下一位实现者不要先改 backend。第一个可合并提交只允许完成 Phase 2B-0，并必须同时提供：
+
+1. 新的独立 candidate artifact，例如 `runtime/kernels/iq2_mma16_tc.{cu,py}`；现有
+   `iq2_mma16` exact kernel 保持不变，继续作为 oracle；
+2. K32/K64/K128 的真实 layer、真实权重、真实 route 数据；
+3. gate、up、down 各自相对 exact oracle 的 cosine 和误差分位；
+4. gate+up p50/p90、down p50/p90，100 次 replay；
+5. Nsight 中的 MMA、I2F、integer decode、DRAM、occupancy 证据；
+6. 运行期零 `.item()`、零分配、零 JIT，以及 scratch byte 数；
+7. 明确结论：通过 kill gate 继续 Phase 2B-1，或失败后进入 two-plane candidate；不得接旧
+   grouped prototype 凑端到端数字。
+
 ## 0. 2026-08-11 最新代码审计
 
-审计基线为本地 `main@0e3e10a`。该分支工作区干净，较 `origin/main@da9c5aa` 超前 5 个提交。
-从本文初版 `c24d93b` 到当前 HEAD 共 25 个 Phase 0–2 提交，最新代码已经不是“完全待实施”：
+代码审计基线为本地 `main@93aa25a`，审计时与 `origin/main` 一致；本文后续文档改动不改变该
+代码基线。
+从本文初版 `c24d93b` 到当前 HEAD，最新代码已经不是“完全待实施”：
 
 | 阶段 | 已有事实 | 尚未完成 / 阻塞 |
 |---|---|---|
@@ -178,6 +270,24 @@ execution     = expert-grouped, fixed M buckets, caller-owned scratch
 误差有真实 layer 分布统计；MMA 数、I2F 数、decode 指令数给出可复核的每层下界。缺任一项，
 该候选只算实验，不得称为 production recipe。
 
+第一版 direct-folding 的明确公式如下；实现不得自行替换成另一种未记录的近似：
+
+```text
+delta_j = d * (0.5 + nibble_j) * 0.25       # IQ2 每 K16 权重 scale
+sA      = max(abs(A[K-group])) / 127
+sB      = 43 * max_j(abs(delta_j)) / 127    # IQ2 magnitude 只有 8/25/43
+qA      = round(A / sA)
+qB      = sign * round(magnitude * delta_j / sB)
+acc32   = sum_{K-group}(qA * qB)
+partial = float(acc32) * sA * sB
+```
+
+对 `K-group<=256`，最坏 INT32 partial 为
+`127*127*256=4,129,024`，远小于 `INT32_MAX`；这只证明 accumulator 不溢出，不证明数值质量。
+每个 K16 的 `{8,25,43}` 三档 q-magnitude 应只计算一次并供 codebook lookup 复用，禁止逐权重
+执行 float scale。K32/K64/K128 必须编译成独立固定 recipe，运行时 selector 只选已 prewarm 的
+artifact，不能把 group size 作为会触发重编译的动态参数。
+
 优先实现两级数值方案：
 
 - **TC64/TC128 scale folding**：首选，目标是在可接受量化误差下把 I2F 次数降低 4–8×；
@@ -250,6 +360,23 @@ MoE 之外，HC+attention 旧 profile 已约 30 ms/M32 chunk，也必须大批�
 
 ## 6. 从当前 HEAD 继续的实施阶段
 
+章节编号保留历史 Phase 名称，但**实际提交顺序**固定为
+`Phase 0观测闭合 -> Phase 2B-0 -> Phase 2B-1 -> Phase 1 production接线 -> Phase 3 -> Phase 4 -> Phase 5`。
+
+### 文件改动面与所有权
+
+| 工作包 | 允许修改的主要文件 | 明确不做 |
+|---|---|---|
+| 2B-0 candidate kernel | 新建 `runtime/kernels/iq2_mma16_tc.cu`、`.py`、`.exports`；Makefile 独立 build target；新 CUDA tests | 不改 `dsv4.py`，不替换 exact artifact，不接 production |
+| 2B-0 真实单层 gate | `bfdiag/daemon/provider.py` 或可复用 bfdiag operation、trace schema | 不在 `benchmarks/` 增加一次性脚本，不加载全模型只为取一层 |
+| 2B-1 grouping/operator | `runtime/model/dsv4_model.py`；必要时新建 grouped scratch/operator 模块 | 不调用 `.item()`，不使用 Python per-expert loop，不输出双 FP32 大 staging |
+| Phase 1 scheduler | `runtime/backends/dsv4.py`、prefix/checkpoint/trace 对应测试 | 新 MoE 未过 6.5ms gate 前不接默认生产入口 |
+| Phase 3 mHC/attention | `runtime/kernels/dsv4_mhc.py`、`runtime/model/dsv4_attn_kernel.py`、`runtime/backends/dsv4.py` | 不先开多流再补同步；不改变 compressor/indexer 状态语义 |
+| Phase 4/5 serving | server config、prewarm、bfdiag 冷测 operation、文档 | 不用 warm daemon 代替冷 prefill/显存验收 |
+
+每个工作包独立提交、独立回滚。若同时修改候选 kernel、production scheduler 和 prefix state，
+视为不可评审的大提交，必须拆分。
+
 ### Phase 0：冻结观测和基线 — **部分完成**
 
 - 把现有 `bfdiag/prefill_profile.py` 接入 DSV4 provider operation；
@@ -321,8 +448,9 @@ expert。真实 layer、真实 1024-token routes 必须满足：
 full-model worst logits cosine和 greedy 39/39 属于 Phase 4 集成门禁，不前置伪装成 kernel-only
 证据。
 
-所有 K-scale group 与 two-plane decomposition 都失败时，才停止当前 IQ2 checkpoint 的单卡 2K
-承诺，转向新的 2-bit Tensor-Core-native checkpoint format、较小模型或多 GPU；不得回到
+所有 K-scale group 与 two-plane decomposition 都失败时，才停止**当前 IQ2_XS 表示**的 2K
+承诺，转向新的、仍能单卡常驻的 2-bit Tensor-Core-native checkpoint format；若模型/权重格式
+也不允许改变，则如实记录目标在当前约束下未证可达。多 GPU 不属于本项目 fallback。不得回到
 route-M1 小修，也不得把 100–500 tok/s 宣布为完成。
 
 ### Phase 3：HC/attention 预算闭环 — **未开始**
@@ -374,6 +502,46 @@ route-M1 小修，也不得把 100–500 tok/s 宣布为完成。
 - logits、greedy、long-context NaN、prefix checkpoint；
 - `ruff check .`、torch-free pytest、full pytest、`git diff --check`。
 
+### 接手者逐阶段执行命令
+
+Phase 2B-0 的提交必须新增独立 target 和 test 文件。以下名称是本实施合同的一部分，接手者应按
+此命名落地，避免复用 exact artifact 后无法区分结果：
+
+```bash
+# Phase 2B-0：candidate kernel。以下 target/test 由该提交新增。
+make build-iq2-mma16-tc
+make verify-iq2-mma16-tc
+~/.venvs/vllm/bin/python -m pytest -q tests/test_iq2_mma16_tc_kernel.py
+
+# 每次候选提交都必须确认 exact oracle 没有被破坏。
+make build-iq2-mma16
+~/.venvs/vllm/bin/python -m pytest -q tests/test_iq2_mma16_kernel.py
+
+# Phase 1/2B-1/3 的局部回归。
+~/.venvs/vllm/bin/python -m pytest -q \
+  tests/test_dsv4_chunked_prefill.py \
+  tests/test_dsv4_backend.py \
+  tests/test_dsv4_slots.py \
+  tests/test_dsv4_slot_arena.py
+
+# 合并前的仓库门禁。
+ruff check .
+/tmp/ci-sim/bin/python -m pytest -q
+~/.venvs/vllm/bin/python -m pytest -q
+git diff --check
+```
+
+性能运行不得只留下终端文本。Phase 2B-0/2B-1 的真实 layer operation 必须产生 bfdiag run
+record；Phase 4/5 必须为每个 fresh-process 4K/16K/128K 测试分别产生 run id。比较流程固定为：
+
+```bash
+bf show <run-id>
+bf diff <baseline-run-id> <candidate-run-id>
+bf trace show <candidate-run-id>
+```
+
+若 `bf diff` 判定不可比，结果作废；若性能失败，先读已有 trace，不为得到更好数字盲目重跑。
+
 ## 8. 拒绝项与风险
 
 | 项目 | 决策 |
@@ -397,17 +565,18 @@ decode graph 捕获成功。
 
 该改动只建立更好的实施基线，不计入 2K 目标完成度。
 
-截至 `0e3e10a`，可以计入完成度的是“观测工具、scheduler parity prototype、exact kernel
+截至 `93aa25a`，可以计入完成度的是“观测工具、scheduler parity prototype、exact kernel
 oracle”；不能计入的是 production throughput。下一个里程碑必须是一个窄提交，且同时包含：
 
-1. K32/64/128/256 或 two-plane 的真实单层曲线；
-2. 至少一个 recipe 达到 router+routed+shared MoE p50 `<=6.5 ms`；
-3. exact-oracle single-layer cosine `>=0.9999`；
-4. 无 host sync/allocation 的证据；
-5. 明确的 resident scratch/weight bytes。
+1. K32/64/128/256 或 two-plane 的真实单层 gate/up/down 曲线；
+2. 至少一个 recipe 达到 gate+up p50 `<=2.4 ms`、down p50 `<=1.3 ms`；
+3. gate/up/down 各自 exact-oracle cosine `>=0.9999`，并报告 propagated route 误差；
+4. 100 replay 无 host sync/allocation/JIT 的证据；
+5. 明确的 scratch/weight resident bytes，且 scratch `<=256 MiB`。
 
-该里程碑不达成前，不把 prototype 接到 production prefill；避免把 128K correctness、prefix
-cache 和 slot 状态风险叠加到一个尚未过性能门的 kernel 上。
+完成该 microkernel 里程碑后才进入 Phase 2B-1；只有完整
+`router+routed+shared <=6.5 ms/layer` 后，才允许把 superchunk 接到 production prefill，避免把
+128K correctness、prefix cache 和 slot 状态风险叠加到一个尚未过性能门的 kernel 上。
 
 ## 10. 外部依据
 
@@ -415,3 +584,6 @@ cache 和 slot 状态风险叠加到一个尚未过性能门的 kernel 上。
 - [NVIDIA RTX Blackwell PRO GPU Architecture](https://www.nvidia.com/content/dam/en-zz/Solutions/design-visualization/quadro-product-literature/pdf/NVIDIA-RTX-Blackwell-PRO-GPU-Architecture-v1_1.pdf)
 - [CUTLASS integer sub-byte types](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/integer_subbyte.h)
 - [CUTLASS mixed-dtype GEMM example](https://github.com/NVIDIA/cutlass/blob/main/examples/55_hopper_mixed_dtype_gemm/55_hopper_mixed_dtype_gemm.cu)
+- [SGLang DeepSeek-V4 deployment and recipes](https://github.com/sgl-project/sglang/blob/main/docs/cookbook/autoregressive/DeepSeek/DeepSeek-V4.mdx)
+- [SGLang DeepSeek-V4 model execution graph](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/models/deepseek_v4.py)
+- [SGLang DSV4 FP4 B200 end-to-end gates](https://github.com/sgl-project/sglang/blob/main/test/registered/models_e2e/test_deepseek_v4_flash_fp4_b200.py)
