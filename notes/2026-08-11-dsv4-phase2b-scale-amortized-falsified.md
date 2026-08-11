@@ -104,3 +104,17 @@ routes 下，gate+up 的现实下限 ~5 ms（纯 mma）。kill gate 2.4 ms 需�
 "两轮都失败则停止单卡 2K 承诺" 条件已接近触发；在转向 checkpoint format
 前，剩余高 ROI 路径是增大每 block 的 N（行）以摊薄 decode，或接受
 10 ms gate+up 并重新核算 6.5 ms/layer 预算。
+
+## 8. N_ROWS=128 探索（2026-08-11 续）
+
+尝试每 block 128 行（4 warp × 4 N8-tile）摊薄 decode 固定成本：
+
+- v1（b_g[4][2]+sB[4][2] 全寄存器）：147 regs + 128B stack → 数值错（cos 0.5）
+- **根因**：facc 缺 tile 维，4 个 tile 共享累加器 + scatter 同一值写 4 tile
+- v3（tile 最外层循环 + facc[4][M][4]）：cos 0.99999 正确，但 216 regs + 512B stack，
+  E=32 实测 2.79ms vs n32 1.39ms（0.5x）——寄存器压力 + smem 16K→64K 抵消 decode 收益
+
+**结论**：增大 N 摊薄 decode 的方向失败。pure-mma 4.72ms 下限中 decode 非唯一瓶颈；
+mma + sB 重算 + facc 伴随指令是主项。two-plane 预解码 + 预存 sB 是唯一能同时消
+decode 和 sB 重算的路径，但其上限 = pure-mma ≈ 4.72ms（mma 指令量由问题形状决定，
+two-plane 不改变），仍超 kill gate 2.4ms 约 2 倍。
