@@ -679,6 +679,49 @@ class DeepseekV4Backend:
         h = model.hc_head(h)
         return model.lm_head(rms_norm(h, model.norm_weight, model.eps))
 
+    def _prefill_superchunk_logits(
+        self, slot: int, prompt_ids: list[int], *, tile: int = 64
+    ) -> torch.Tensor:
+        """Phase 1: layer-major superchunk prefill (correctness-first).
+
+        Processes the whole prompt layer-by-layer with HC/norm/MoE batched
+        over all rows; the causal attention is still stepped in ``tile``-row
+        tiles so compressor/indexer/window state advances exactly as the
+        chunk-major path.  Only the final token's logits are returned; the
+        last tile carries it.
+        """
+        if self._kv_len[slot] != 0:
+            raise RuntimeError(
+                f"slot {slot} is at kv_len={self._kv_len[slot]}; the caller must reset_slot first"
+            )
+        n = len(prompt_ids)
+        model, layers = self.model, self.slot_layers
+        ids = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
+        h = model.embed(ids)
+        h = h.unsqueeze(2).repeat(1, 1, model.hc_mult, 1)
+        for i, block in enumerate(model.blocks):
+            residual = h
+            x, post, comb = block.hc_pre(
+                h, block.hc_attn_fn, block.hc_attn_scale, block.hc_attn_base
+            )
+            x = rms_norm(x, block.attn_norm_weight, block.eps)
+            outs = []
+            for start in range(0, n, tile):
+                end = min(start + tile, n)
+                outs.append(layers[i](x[:, start:end], start, slot=slot))
+            x = torch.cat(outs, dim=1)
+            x = block.hc_post(x, residual, post, comb)
+            residual = x
+            x, post, comb = block.hc_pre(
+                x, block.hc_ffn_fn, block.hc_ffn_scale, block.hc_ffn_base
+            )
+            x = rms_norm(x, block.ffn_norm_weight, block.eps)
+            x = block.moe(x, ids)
+            x = block.hc_post(x, residual, post, comb)
+            h = x
+        h = model.hc_head(h)
+        return model.lm_head(rms_norm(h, model.norm_weight, model.eps))
+
     def _forward_decode_batch(
         self,
         input_ids: torch.Tensor,
