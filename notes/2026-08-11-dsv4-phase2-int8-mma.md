@@ -53,9 +53,15 @@ gate/up/down + SwiGLU 端到端接入（过渡），exact 手写 mma 并行跟�
 **关键结论（2026-08-11 终）**：Triton 的 `tl.dot` 有硬约束——K≥32（无法 per-code K8/K16
 scale）、无张量标量索引/切片（无法提取 codes/mag 的列）、无 per-code 位移（w32 组装只能
 用 join，j 字节序需 bit-reverse）——**kernel 内反量化的 exact 数值在 Triton 内不可行**。
-Phase 2 的正解是**手写 CUDA m16n8k16**（`runtime/kernels/iq2_mma16.cu`，B 布局从 CUTLASS
-`mma_tensor_op` 提取，A/C 已实测确认）——数值 + 性能都需在 CUDA 侧完成。Triton tl.dot
+Phase 2 的正解是**手写 CUDA m16n8k16**（`runtime/kernels/iq2_mma16.cu`，A/C 已实测确认：
+a0→A[lg,l4*4+0..3]、a1→A[lg+8,...]、c0→C[lg,l4*2]、c1→C[lg,l4*2+1]、c2→C[lg+8,l4*2]、
+c3→C[lg+8,l4*2+1]）——数值 + 性能都需在 CUDA 侧完成。Triton tl.dot
 仅作过渡速度验证（3.3×，kill gate ≤6.5ms 达标，数值不达标）。
+**B 布局最终结论（2026-08-11）**：b0 的 4 字节 → B 的 (k,n) 映射是 mma 硬件布局硬编码的；
+所有手推假设（n=lg、n=l4*2、k=l4*4+j、k=lg*4+j）实测均失败（c0 恒为固定 B 列或边界
+lane 漂移）——**必须从 CUTLASS `mma_tensor_op.h` 的 `IteratorB`（
+MmaTensorOpMultiplicandTileIterator，ThreadCount=32，MatrixShape<K,N>）的线程映射逐字节
+提取**。这是 Phase 2 剩余的唯一步骤，之后按 notes 完成 fp32 累积 + per-token scale + 全输出 + 接入。
 **进一步定位（2026-08-11 晚）**：无 scale kernel 与 torch mag×xq 的 maxdiff 仍大；
 早期 dump 的 codes/g 对比错是 **kb 不对齐**（kernel dump 落在 kb=15，torch 参考用 kb=0）
 + codes 逐字节读取。已改 uint16 读取（`+1` 跳过 d），ROWS/STRIDE/`eid*ROWS*STRIDE`
@@ -65,9 +71,15 @@ tl.dot int8 本身已验证正确（构造数据 maxdiff 0）。Phase 2 数值�
 **关键结论（2026-08-11 终）**：Triton 的 `tl.dot` 有硬约束——K≥32（无法 per-code K8/K16
 scale）、无张量标量索引/切片（无法提取 codes/mag 的列）、无 per-code 位移（w32 组装只能
 用 join，j 字节序需 bit-reverse）——**kernel 内反量化的 exact 数值在 Triton 内不可行**。
-Phase 2 的正解是**手写 CUDA m16n8k16**（`runtime/kernels/iq2_mma16.cu`，B 布局从 CUTLASS
-`mma_tensor_op` 提取，A/C 已实测确认）——数值 + 性能都需在 CUDA 侧完成。Triton tl.dot
-仅作过渡速度验证（3.3×，kill gate ≤6.5ms 达标，数值不达标）。K16 内 2 个连续 code 共享同一
+Phase 2 的正解是**手写 CUDA m16n8k16**（`runtime/kernels/iq2_mma16.cu`，A/C 已实测确认：
+a0→A[lg,l4*4+0..3]、a1→A[lg+8,...]、c0→C[lg,l4*2]、c1→C[lg,l4*2+1]、c2→C[lg+8,l4*2]、
+c3→C[lg+8,l4*2+1]）——数值 + 性能都需在 CUDA 侧完成。Triton tl.dot
+仅作过渡速度验证（3.3×，kill gate ≤6.5ms 达标，数值不达标）。
+**B 布局最终结论（2026-08-11）**：b0 的 4 字节 → B 的 (k,n) 映射是 mma 硬件布局硬编码的；
+所有手推假设（n=lg、n=l4*2、k=l4*4+j、k=lg*4+j）实测均失败（c0 恒为固定 B 列或边界
+lane 漂移）——**必须从 CUTLASS `mma_tensor_op.h` 的 `IteratorB`（
+MmaTensorOpMultiplicandTileIterator，ThreadCount=32，MatrixShape<K,N>）的线程映射逐字节
+提取**。这是 Phase 2 剩余的唯一步骤，之后按 notes 完成 fp32 累积 + per-token scale + 全输出 + 接入。K16 内 2 个连续 code 共享同一
 nibble（偶数→lo、奇数→hi）已确认 → per-K16 scale 精确。剩余：B 布局定位、fp32 累积、
 per-token xscale 的 C 映射（c0/c1 用 token lg、c2/c3 用 token lg+8）、16×8 全输出、
 多 warp/grouped 接入、launch wrapper + 数值验证。
