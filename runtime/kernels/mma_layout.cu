@@ -19,12 +19,13 @@ mma_layout_kernel(int32_t* out /* [16,8] */) {
     const int lane = threadIdx.x;
     const int l4 = lane % 4, lg = lane / 4;
     // a0 -> A[lg, l4*4 + 0..3], a1 -> A[lg+8, l4*4 + 0..3]
-    int32_t a[2] = {0x01010101, 0x01010101};  // A all ones -> C[m,n] = sum_k B[k,n]
-    // hypothesis: b0 -> B[k = l4*4 + 0..3, n = l4*2]
+    // A[m,k] = m*16+k (unique per (m,k)); a0 = A[lg, l4*4+0..3], a1 = A[lg+8, ...]
+    int32_t a[2] = {0x01010101, 0x01010101};
+    // hypothesis: b0 -> B[k = l4*4 + 0..3, n = lg] (hardware col-major)
     int32_t b = 0;
 #pragma unroll
     for (int j = 0; j < 4; ++j)
-        b |= (int32_t)(int8_t)((l4 * 4 + j) * 8 + l4 * 2) << (8 * j);
+        b |= (int32_t)(int8_t)((l4 * 4 + j) * 8 + lg) << (8 * j);
     int32_t c[4] = {0, 0, 0, 0};
     mma16(c, a, &b);
 #pragma unroll
