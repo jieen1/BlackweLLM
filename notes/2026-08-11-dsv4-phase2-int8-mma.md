@@ -39,7 +39,12 @@ mma 组合所有 lane 的 b0 成完整 B 矩阵再归约，单 lane 无法独立
 布局必须按 CUTLASS `mma_tensor_op` 的线程映射精确构造**（`b12x/_lib/intrinsics.py`
 m16n8k32 模式 + CUTLASS `mma_sm80.h` m16n8k16 s8 instruction 的 warp 布局）。
 作为 Phase 2 的过渡，Triton `tl.dot`（K32，per-K16 近似 scale）已验证 3.2× 且
-kill gate ≤6.5ms/layer 达标——exact 手写 mma 是后续优化。K16 内 2 个连续 code 共享同一
+kill gate ≤6.5ms/layer 达标——exact 手写 mma 是后续优化。
+**B 布局假设**（B[lg*4+j, l4*2] 等）**全部实测失败**（0/32）；b12x 的 m16n8k32 mma
+用 `frag_layout_swizzle_16b_to_8b`（fragment 字节 swizzle）构造 B——**B 的线程映射 +
+字节 swizzle 必须照搬 b12x/CUTLASS**（`b12x/attention/nsa_indexer/kernel.py` 的
+`frag_layout_swizzle_16b_to_8b`），不能手推。Phase 2 下一步：Triton tl.dot 的
+gate/up/down + SwiGLU 端到端接入（过渡），exact 手写 mma 并行跟进。K16 内 2 个连续 code 共享同一
 nibble（偶数→lo、奇数→hi）已确认 → per-K16 scale 精确。剩余：B 布局定位、fp32 累积、
 per-token xscale 的 C 映射（c0/c1 用 token lg、c2/c3 用 token lg+8）、16×8 全输出、
 多 warp/grouped 接入、launch wrapper + 数值验证。
