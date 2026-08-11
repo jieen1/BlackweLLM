@@ -21,7 +21,7 @@ mma_layout_kernel(int32_t* out /* [16,8] */) {
     // a0 -> A[lg, l4*4 + 0..3], a1 -> A[lg+8, l4*4 + 0..3]
     // A[m,k] = m*16+k (unique per (m,k)); a0 = A[lg, l4*4+0..3], a1 = A[lg+8, ...]
     int32_t a[2] = {0x01010101, 0x01010101};
-    // hypothesis: b0 -> B[k = l4*4 + 0..3, n = lg] (hardware col-major)
+    // standard col-major B: b0 byte j = B[l4*4+j, lg]
     int32_t b = 0;
 #pragma unroll
     for (int j = 0; j < 4; ++j)
