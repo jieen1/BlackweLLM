@@ -174,6 +174,38 @@ I2F+FFMA 转换。I2F 在 ALU pipe，与 mma 结果串行依赖，占指令流 ~
 exact per-K16 scale 的 float 转换指令成本，方向明确（A smem 化 + 更大 N tile +
 合并 xs 到 scale），不是架构死路。
 
+## 3c. 已落地：runtime 内 exact tensor-core grouped gate/up（2026-08-11）
+
+`runtime/kernels/iq2_mma16.cu` + `iq2_mma16.py` wrapper + Makefile
+`build-iq2-mma16` 目标。最终结构（4-way ILP + smem int8 预解码 + B-decode
+reuse + dual gate/up）：
+
+- grid `(E, ROWS/32)`，block 128（4 warps，各算 N8 行的 8 行）
+- 每 kblock（256 值）staged 74-byte blocks 进 smem → 解码 int8 → 16 K16 mma
+- 每 K16：B 片段从 smem int32 读（4 连续字节）、A 从 global、per-K16 fp32
+  scale（c0/c2 → B 列 l4*2、c1/c3 → B 列 l4*2+1，各自权重行的 d/nibble）
+
+**修过的两个 grouped 特有 bug**（smem 版本独有，sd/单矩阵版本没有）：
+1. **B 片段行偏移缺 `warp*8`**：lane 的 B 行是 `warp*8 + lg`，scale 行是
+   `warp*8 + l4*2 + col`；旧代码漏了 warp 偏移，4 warps 全读前 8 行。
+2. **scale 折叠 xs 只算了 token-lg 侧**：c0/c2（token lg）用 xs0，c1/c3
+   （token lg+8）用 xs1，合并 `sg*xs` 时两半要用各自的 xs；退回逐项乘。
+
+**实测（SM120，6144-route 真实 1024-token 形状，E=256 M_PAD=32）**：
+| 路径 | gate+up | 相对 dp4a |
+|---|---:|---:|
+| dp4a（现状） | 68.8 ms | 1× |
+| **iq2_mma16（exact tensor-core）** | **13.4 ms** | **5.1×** |
+
+- E=64: 3.13ms · E=128: 6.61ms · E=192: 10.0ms · E=256: 13.4ms（线性）
+- correctness：cos=1.0，maxrel≈1e-6，E=1..4 × M_PAD=16/32/64 全过
+- 相比 dp4a 是**数量级正确性相同、吞吐 5×**；但离 Phase 2 kill gate
+  （gate+up+SwiGLU+down ≤6.5ms）仍有 gap：需 down 接入 + 继续降 I2F。
+
+下一步：down kernel 接入（同 kernel，ROWS=4096/COLS=2048）、device-side
+grouping（复用 `_route_expanded_prefill` 的 eids）、SwiGLU、stable reduction，
+然后测真实单层 p50。
+
 ## 4. 相关提交
 
 - `1eb2c0a` Phase 0 prefill_profile（137 tok/s 基线 + 分项 + route histogram）
