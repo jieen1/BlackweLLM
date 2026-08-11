@@ -31,12 +31,15 @@
   （`[:, j]`、`[:, :1]` 均报错）——所以 **exact 版本必须手写
   `mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32`**（计划 4.2 的 inline PTX）。
 
-手写 `runtime/kernels/iq2_mma16.cu`（sm_120 编译通过）：A/B/C fragment 布局已按
-mma.m16n8k16 标准推导（A [16,16] int8 每 lane 2×.b32 = a0→A[l/4, (l%4)*4+0..3]、
-a1→A[l/4+8, ...]；B [16,8] 每 lane 1×.b32 = B[(l%4)*4+0..3, l/4]；C/D 4×.s32），
-K16 内 2 个连续 code 共享同一 nibble（偶数 code→lo、奇数→hi）已确认 → per-K16
-scale 精确。剩余：fp32 累积（当前 int32 截断）、per-token xscale 的 C-fragment
-映射、16×8 全输出与多 warp/grouped 接入、launch wrapper + 数值验证。
+手写 `runtime/kernels/iq2_mma16.cu`（sm_120 编译通过）。**A/C fragment 布局已用唯一值
+mma 实测确认**（`runtime/kernels/mma_layout.cu`）：a0→A[lg, l4*4+0..3]、a1→A[lg+8, ...]；
+C 每 lane 4×.s32 = c0→C[lg, l4*2]、c1→C[lg, l4*2+1]、c2→C[lg+8, l4*2]、c3→C[lg+8, l4*2+1]。
+**B 的字节→(k,n) 映射仍需精确**（用 B 列=lg 与 l4*2 两种假设构造 b0，c0 都显示
+"Bcol l4*2"，说明 mma 内部对 b0 字节的 k/n 归约与构造方式无关——需 CUTLASS/PTX 文档
+的 m16n8k16 s8 B fragment 布局或逐字节探针定位）。K16 内 2 个连续 code 共享同一
+nibble（偶数→lo、奇数→hi）已确认 → per-K16 scale 精确。剩余：B 布局定位、fp32 累积、
+per-token xscale 的 C 映射（c0/c1 用 token lg、c2/c3 用 token lg+8）、16×8 全输出、
+多 warp/grouped 接入、launch wrapper + 数值验证。
 
 ## 3. 下一步
 
