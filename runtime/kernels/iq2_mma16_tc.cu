@@ -18,7 +18,8 @@
 #include <cstdint>
 
 #define MAX_MTILES 8    // M_PAD <= 128
-#define MAX_MTILES_2 8
+
+
 #define KG 32           // K-scale group (2 K16)
 
 __device__ __forceinline__ void mma16(
@@ -32,7 +33,8 @@ __device__ __forceinline__ void mma16(
 #endif
 }
 
-extern "C" __global__ void __launch_bounds__(128)
+template <int M_PAD_C>
+__global__ void __launch_bounds__(128)
 iq2_mma16_tc_kernel(
     const int8_t* __restrict__ xq,
     const float* __restrict__ xs,
@@ -54,96 +56,60 @@ iq2_mma16_tc_kernel(
     const int row0 = rowbase + warp * 8;
     const int l4 = lane % 4, lg = lane / 4;
     const int k0 = l4 * 4;
-    const int n_mtiles = M_PAD / 16;
+    const int n_mtiles = M_PAD_C / 16;
     const int n_kblocks = COLS / 256;
     const int n_groups = COLS / KG;          // K-groups per row
 
     extern __shared__ uint8_t sraw[];
-    uint8_t* sg0 = &sraw[0];
-    uint8_t* su0 = &sraw[32 * 74];
-    float* sdelta = (float*)(sraw + 2 * 32 * 74);    // [2][32][32] per-code delta
-    int8_t* sid = (int8_t*)(sraw + 2 * 32 * 74 + 2 * 32 * 32 * 4);  // [2][32][256] folded qB
+    int8_t* sid = (int8_t*)sraw;  // [2][32][256] folded qB
 
     const int64_t xbase = (int64_t)e * M_PAD * COLS;
     const int64_t xsbase = (int64_t)e * M_PAD * (COLS / 32);
 
-    float facc_g[MAX_MTILES][4] = {};
-    float facc_u[MAX_MTILES][4] = {};
+    float facc_g[M_PAD_C / 16][4] = {};
+    float facc_u[M_PAD_C / 16][4] = {};
 
     const uint8_t* wg_base = packed_gate + (int64_t)eid * ROWS * STRIDE + (int64_t)rowbase * STRIDE;
     const uint8_t* wu_base = packed_up + (int64_t)eid * ROWS * STRIDE + (int64_t)rowbase * STRIDE;
 
     for (int kb = 0; kb < n_kblocks; ++kb) {
-        // ---- stage raw 74-byte blocks for gate and up (32 rows) ----
+        // Fused decode+fold reads weights directly from global (no raw staging).
+        // Fused decode+fold: per (mat,row,group) thread decodes 4 codes and
+        // folds delta into qB in one pass.  2 mats*32 rows*8 groups = 512.
         {
-            const uint8_t* wg = wg_base + (int64_t)kb * 74;
-            const uint8_t* wu = wu_base + (int64_t)kb * 74;
-            const int r = lane;
-            const uint8_t* sr_g = wg + (int64_t)r * STRIDE;
-            const uint8_t* sr_u = wu + (int64_t)r * STRIDE;
-            uint8_t* dg = sg0 + (int64_t)r * 74;
-            uint8_t* du = su0 + (int64_t)r * 74;
-#pragma unroll
-            for (int i = 0; i < 74; ++i) { dg[i] = sr_g[i]; du[i] = sr_u[i]; }
-        }
-        __syncthreads();
-
-        // ---- decode to per-code delta + folded qB ----
-        // 2 mats * 32 rows * 32 codes = 2048; 128 threads -> 16 each.
-        {
-            for (int t = tid; t < 2 * 32 * 32; t += 128) {
-                const int mat = t / (32 * 32);
-                const int r = (t / 32) % 32;
-                const int ci = t % 32;
-                const uint8_t* blk = (mat == 0 ? sg0 : su0) + (int64_t)r * 74;
-                const uint16_t cd = (uint16_t)(blk[2 + ci * 2] | (blk[3 + ci * 2] << 8));
-                const int64_t g = grid[cd & 511];
-                const int32_t sb = ksigns[cd >> 9];
-                const __half d_h = *(const __half*)blk;
-                const float d = __half2float(d_h);
-                const uint8_t scv = blk[66 + ci / 4];
-                // code's nibble: lo if ci%4 < 2 else hi
-                const float nib = (ci % 4) < 2 ? (float)(scv & 0xF) : (float)(scv >> 4);
-                const float delta = d * (0.5f + nib) * 0.25f;
-                sdelta[(mat * 32 + r) * 32 + ci] = delta;
-                // raw signed magnitudes (unfolded) stay in sid for now; the
-                // fold pass below rewrites sid to qB.
-                int8_t* dst = &sid[(mat * 32 + r) * 256 + ci * 8];
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    int m = (int)((g >> (8 * j)) & 0xFF);
-                    if (sb & (1 << j)) m = -m;
-                    dst[j] = (int8_t)m;
-                }
-            }
-            __syncthreads();
-        }
-
-        // ---- fold: per K-group of 4 codes (KG=32 -> 4 codes), compute
-        //      sB = 43*max|delta|/127 and rewrite sid as qB.
-        //      Each warp owns 8 rows; each lane handles one (row, code).
-        //      n_groups per row within this kblock = 256/32 = 8 groups.
-        {
-            for (int t = tid; t < 2 * 32 * 8; t += 128) {  // per (mat,row,group)
+            for (int t = tid; t < 2 * 32 * 8; t += 128) {
                 const int mat = t / (32 * 8);
                 const int r = (t / 8) % 32;
-                const int grp = t % 8;                       // group within kblock
-                // max |delta| over the 4 codes [grp*4 .. grp*4+4)
+                const int grp = t % 8;
+                const uint8_t* blk = (mat == 0 ? wg_base : wu_base)
+                                    + (int64_t)kb * 74 + (int64_t)r * STRIDE;
+                const __half d_h = *(const __half*)blk;
+                const float d = __half2float(d_h);
+                // max |delta| over the 4 codes
                 float mx = 0.f;
 #pragma unroll
                 for (int c = 0; c < 4; ++c) {
-                    mx = fmaxf(mx, fabsf(sdelta[(mat * 32 + r) * 32 + grp * 4 + c]));
+                    const uint8_t scv = blk[66 + (grp * 4 + c) / 4];
+                    const float nib = ((grp * 4 + c) % 4) < 2 ? (float)(scv & 0xF) : (float)(scv >> 4);
+                    mx = fmaxf(mx, fabsf(d * (0.5f + nib) * 0.25f));
                 }
                 const float sB = 43.0f * mx / 127.0f;
                 const float inv_sB = (sB > 1e-12f) ? (1.0f / sB) : 0.f;
 #pragma unroll
                 for (int c = 0; c < 4; ++c) {
-                    const float dd = sdelta[(mat * 32 + r) * 32 + grp * 4 + c];
-                    const int8_t* src = &sid[(mat * 32 + r) * 256 + (grp * 4 + c) * 8];
+                    const uint16_t cd = (uint16_t)(blk[2 + (grp * 4 + c) * 2]
+                                                 | (blk[3 + (grp * 4 + c) * 2] << 8));
+                    const int64_t g = grid[cd & 511];
+                    const int32_t sb = ksigns[cd >> 9];
+                    const uint8_t scv = blk[66 + (grp * 4 + c) / 4];
+                    const float nib = ((grp * 4 + c) % 4) < 2 ? (float)(scv & 0xF) : (float)(scv >> 4);
+                    const float dd = d * (0.5f + nib) * 0.25f;
                     int8_t* dst = &sid[(mat * 32 + r) * 256 + (grp * 4 + c) * 8];
 #pragma unroll
                     for (int j = 0; j < 8; ++j) {
-                        const float v = (float)src[j] * dd * inv_sB;
+                        int m = (int)((g >> (8 * j)) & 0xFF);
+                        if (sb & (1 << j)) m = -m;
+                        const float v = (float)m * dd * inv_sB;
                         dst[j] = (int8_t)lrintf(v);
                     }
                 }
@@ -151,7 +117,7 @@ iq2_mma16_tc_kernel(
             __syncthreads();
         }
 
-        // ---- mma: K-group = 2 K16, INT32 accumulate, ONE scale per group ----
+                // ---- mma: K-group = 2 K16, INT32 accumulate, ONE scale per group ----
         const int kb_groups = 8;   // 256 values / 32
 #pragma unroll 1
         for (int grp = 0; grp < kb_groups; ++grp) {
@@ -176,11 +142,19 @@ iq2_mma16_tc_kernel(
             for (int col = 0; col < 2; ++col) {
                 const int wrow_g = warp * 8 + l4 * 2 + col;
                 const int wrow_u = warp * 8 + l4 * 2 + col;
+                const uint8_t* blkg = wg_base + (int64_t)kb * 74 + (int64_t)wrow_g * STRIDE;
+                const uint8_t* blku = wu_base + (int64_t)kb * 74 + (int64_t)wrow_u * STRIDE;
+                const float dg_ = __half2float(*(const __half*)blkg);
+                const float du_ = __half2float(*(const __half*)blku);
                 float mxg = 0.f, mxu = 0.f;
 #pragma unroll
                 for (int c = 0; c < 4; ++c) {
-                    mxg = fmaxf(mxg, fabsf(sdelta[(0 * 32 + wrow_g) * 32 + grp * 4 + c]));
-                    mxu = fmaxf(mxu, fabsf(sdelta[(1 * 32 + wrow_u) * 32 + grp * 4 + c]));
+                    const uint8_t svg = blkg[66 + (grp * 4 + c) / 4];
+                    const float ng = ((grp * 4 + c) % 4) < 2 ? (float)(svg & 0xF) : (float)(svg >> 4);
+                    mxg = fmaxf(mxg, fabsf(dg_ * (0.5f + ng) * 0.25f));
+                    const uint8_t svu = blku[66 + (grp * 4 + c) / 4];
+                    const float nu = ((grp * 4 + c) % 4) < 2 ? (float)(svu & 0xF) : (float)(svu >> 4);
+                    mxu = fmaxf(mxu, fabsf(du_ * (0.5f + nu) * 0.25f));
                 }
                 sB_g[col] = 43.0f * mxg / 127.0f;
                 sB_u[col] = 43.0f * mxu / 127.0f;
@@ -239,14 +213,32 @@ extern "C" QSR_EXPORT void iq2_mma16_tc_launch(
     const int32_t* ksigns, float* out_gate, float* out_up,
     int E, int ROWS, int COLS, int STRIDE, int M_PAD)
 {
-    const int smem_bytes = 2 * 32 * 74                       // raw blocks
-                         + 2 * 32 * 32 * 4                    // sdelta per-code floats
-                         + 2 * 32 * 256;                      // folded qB int8
-    cudaFuncSetAttribute(iq2_mma16_tc_kernel,
+    const int smem_bytes = 2 * 32 * 256;                      // folded qB int8
+    cudaFuncSetAttribute((const void*)iq2_mma16_tc_kernel<16>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    cudaFuncSetAttribute((const void*)iq2_mma16_tc_kernel<32>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    cudaFuncSetAttribute((const void*)iq2_mma16_tc_kernel<48>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    cudaFuncSetAttribute((const void*)iq2_mma16_tc_kernel<64>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     dim3 block(128);
     dim3 gridc(E, ROWS / 32);
-    iq2_mma16_tc_kernel<<<gridc, block, smem_bytes>>>(
-        xq, xs, packed_gate, packed_up, eids, grid, ksigns,
-        out_gate, out_up, E, ROWS, COLS, STRIDE, M_PAD);
+    if (M_PAD == 16) {
+        iq2_mma16_tc_kernel<16><<<gridc, block, smem_bytes>>>(
+            xq, xs, packed_gate, packed_up, eids, grid, ksigns,
+            out_gate, out_up, E, ROWS, COLS, STRIDE, M_PAD);
+    } else if (M_PAD == 32) {
+        iq2_mma16_tc_kernel<32><<<gridc, block, smem_bytes>>>(
+            xq, xs, packed_gate, packed_up, eids, grid, ksigns,
+            out_gate, out_up, E, ROWS, COLS, STRIDE, M_PAD);
+    } else if (M_PAD == 48) {
+        iq2_mma16_tc_kernel<48><<<gridc, block, smem_bytes>>>(
+            xq, xs, packed_gate, packed_up, eids, grid, ksigns,
+            out_gate, out_up, E, ROWS, COLS, STRIDE, M_PAD);
+    } else {
+        iq2_mma16_tc_kernel<64><<<gridc, block, smem_bytes>>>(
+            xq, xs, packed_gate, packed_up, eids, grid, ksigns,
+            out_gate, out_up, E, ROWS, COLS, STRIDE, M_PAD);
+    }
 }
