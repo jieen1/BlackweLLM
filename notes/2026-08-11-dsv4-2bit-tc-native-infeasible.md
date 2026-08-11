@@ -71,3 +71,21 @@ IQ2_XS 用 9-bit grid 索引 + 3-bit sign 编码 8 值（实际 12-bit/8 值）�
 
 - `/tmp/opencode/feas_lin2bit.py`、`feas_kbit.py`、`feas_gridsize.py`
 - `notes/2026-08-11-dsv4-phase2b-scale-amortized-falsified.md`（Phase 2B-0 全链证据）
+
+## 7. 补充：int8 codebook DRAM 死结（2026-08-11 续）
+
+方案 (a) 的最后尝试：N256 block（每 block 256 行，8 warp）减少 codebook 重复
+读。实测：
+
+| 指标 | n32 tp | n256 tp |
+|---|---:|---:|
+| E=64 gate+up | 2.094 ms | 2.259 ms |
+| DRAM (E=64) | — | 1.31 GB |
+| L2 hit | 84% | 52% |
+
+**int8 codebook 放大 3.46x 后超出 L2 容量**（8 experts × 16MB = 128MB ≈ L2 上限），
+每个 block 读都 DRAM miss，DRAM 100% 饱和。增大 block N 不能救——codebook 太大
+是根本。这与 2-bit 驻留约束是同一硬币两面：**不放大（2-bit）→ decode 成本；放大
+（int8）→ DRAM 饱和**。中间没有安全区。
+
+方案 (a) 彻底闭合。
