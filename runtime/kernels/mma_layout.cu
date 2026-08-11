@@ -20,7 +20,12 @@ mma_layout_kernel(int32_t* out /* [16,8] */) {
     const int l4 = lane % 4, lg = lane / 4;
     // a0 -> A[lg, l4*4 + 0..3], a1 -> A[lg+8, l4*4 + 0..3]
     // A[m,k] = m*16+k (unique per (m,k)); a0 = A[lg, l4*4+0..3], a1 = A[lg+8, ...]
-    int32_t a[2] = {0x01010101, 0x01010101};
+    int32_t a[2] = {0, 0};
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        a[0] |= (int32_t)(int8_t)(lg * 16 + l4 * 4 + j) << (8 * j);
+        a[1] |= (int32_t)(int8_t)((lg + 8) * 16 + l4 * 4 + j) << (8 * j);
+    }
     // hardware hypothesis: b0 = [B[k,2n], B[k,2n+1], B[k+8,2n], B[k+8,2n+1]], k=l%8, n=l/8
     const int kk = lane % 8, nn = lane / 8;
     int32_t b = ((int32_t)(int8_t)(kk * 8 + 2 * nn))
