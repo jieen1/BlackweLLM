@@ -31,9 +31,12 @@
   （`[:, j]`、`[:, :1]` 均报错）——所以 **exact 版本必须手写
   `mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32`**（计划 4.2 的 inline PTX）。
 
-手写骨架已在 `runtime/kernels/iq2_mma16.cu`（A/B fragment 布局待按
-`b12x/_lib/intrinsics.py` 的 m16n8k32 模式推导；A [16,16] int8 每 lane 2×.b32，
-B [16,8] 每 lane 1×.b32，C/D [16,8] 每 lane 4×.s32）。
+手写 `runtime/kernels/iq2_mma16.cu`（sm_120 编译通过）：A/B/C fragment 布局已按
+mma.m16n8k16 标准推导（A [16,16] int8 每 lane 2×.b32 = a0→A[l/4, (l%4)*4+0..3]、
+a1→A[l/4+8, ...]；B [16,8] 每 lane 1×.b32 = B[(l%4)*4+0..3, l/4]；C/D 4×.s32），
+K16 内 2 个连续 code 共享同一 nibble（偶数 code→lo、奇数→hi）已确认 → per-K16
+scale 精确。剩余：fp32 累积（当前 int32 截断）、per-token xscale 的 C-fragment
+映射、16×8 全输出与多 warp/grouped 接入、launch wrapper + 数值验证。
 
 ## 3. 下一步
 
