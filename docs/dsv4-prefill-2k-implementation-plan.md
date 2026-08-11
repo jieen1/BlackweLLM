@@ -441,32 +441,39 @@ pipeline 32 ms（router/shared expert 未包含），不再继续用 A-smem/laun
 - 报告 gate+up、SwiGLU、down、group/reduce 四段独立 GPU 时间； ✓ gate+up / down
 - Nsight 记录 MMA、I2F、整数 decode、DRAM 和 occupancy，不用 wall time猜瓶颈。 ✓
 
-**2026-08-11 实测结论（两分支均失败，§9 停止条件已触发）**：
+**2026-08-11 实测结论（两分支均失败，§9 停止条件已触发，分支 (a) 已调研闭合）**：
 
 `iq2_mma16_tc.cu` 实现 K-group=32 scale folding（数值全部 >=0.9999），优化
 （模板 M_PAD → direct-global decode → fused decode/fold → smem-sB）从 24 ms
-降到 **7.00 ms gate+up**（E=256 M_PAD=32 真实路由）。Nsight 证据：
+降到 **6.93 ms gate+up**（E=256 M_PAD=32 真实路由）。Nsight 证据：
 
 - tensor core 仅 1.2% 指令；ALU 1.69G（decode 位操作）是最大单项；
 - SM throughput 64.6%，tensor 12% —— 指令流水近饱和但 tensor 饿死；
 - 纯 mma 下限 4.72 ms；nodecode（decode 全消）3.21 ms；nodecode+nofacc 2.17 ms；
 - **two-plane 上限实测 = nodecode 3.21 ms，仍超 2.4 ms gate 1.34x**；
-- **真实 two-plane（int8 codebook 从 global 读）10.21 ms——DRAM 饱和**；
-- down 实测 6.44 ms vs 1.3 ms gate（5x 超）；
-- N_ROWS=128 每 block 摊薄 decode：寄存器压力抵消收益（E=64 0.53x），失败；
+- **真实 two-plane（int8 codebook 从 global 读）10.57 ms——DRAM 饱和**；
+- down 实测 6.92 ms vs 1.3 ms gate（5x 超）；
+- N_ROWS=64/128/256 每 block 摊薄：occupancy 损失始终大于 codebook 读次减少
+  （n64 11.17 / n128 0.53x / n256 11.48 ms），增 N 方向整体失败；
 - facc scale 占 34% 且不可消除（K32 是数值 gate 最大可行 group，K64 down
   cos 0.99987 失败）。
 
 **§9 判定**：所有 K-scale group 与 two-plane decomposition 均失败 → 停止当前
 IQ2_XS 表示的 2K 承诺。剩余选项：
-(a) 新 2-bit Tensor-Core-native checkpoint format（§9 指定方向）；
+(a) 新 2-bit Tensor-Core-native checkpoint format（§9 指定方向）—— **已调研闭合**；
 (b) 重新核算 6.5ms/layer MoE 预算；
 (c) 如实记录"未证可达"。详见
-`notes/2026-08-11-dsv4-phase2b-scale-amortized-falsified.md`。
+`notes/2026-08-11-dsv4-phase2b-scale-amortized-falsified.md` 和
+`notes/2026-08-11-dsv4-2bit-tc-native-infeasible.md`。
+
+**分支 (a) 调研结论（已闭合）**：在"2-bit 驻留 + cos>=0.9999 + SM120 s8 mma"
+三重约束下不存在 mma-ready 2-bit 格式。实测：线性码本 2-6 bit 只到 cos
+0.92-0.996；IQ2 512-grid 全用满不可缩小；int8 codebook 放大 3.46x 超出 L2
+导致 DRAM 饱和（10.57ms）。§9 预测"若权重格式不允许改变则记录未证可达"命中。
 
 **决策点（已实测闭合）**：two-plane 已实测（nodecode 上限 3.21ms 超 2.4ms；
-N_ROWS=128 更大 N 组织 0.53x 失败），两个待核选项均已实测否定 → 按 §9
-触发"停止单卡 2K 承诺"分支。
+N_ROWS=64/128/256 增 N 组织均更慢），三个待核选项均已实测处理 → 按 §9
+触发"停止单卡 2K 承诺"分支。下一步由 (b)/(c) 定夺：重核算预算或记录未证可达。
 
 6.5 ms 是 router+routed+shared MoE 的完整预算，不只是新 kernel 的预算。Phase 2B 的目标拆账如下；
 这些是 **[待验证目标]**，不是当前实测：
