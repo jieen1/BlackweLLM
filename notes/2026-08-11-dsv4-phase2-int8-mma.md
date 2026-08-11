@@ -34,9 +34,12 @@
 手写 `runtime/kernels/iq2_mma16.cu`（sm_120 编译通过）。**A/C fragment 布局已用唯一值
 mma 实测确认**（`runtime/kernels/mma_layout.cu`）：a0→A[lg, l4*4+0..3]、a1→A[lg+8, ...]；
 C 每 lane 4×.s32 = c0→C[lg, l4*2]、c1→C[lg, l4*2+1]、c2→C[lg+8, l4*2]、c3→C[lg+8, l4*2+1]。
-**B 的字节→(k,n) 映射仍需精确**（用 B 列=lg 与 l4*2 两种假设构造 b0，c0 都显示
-"Bcol l4*2"，说明 mma 内部对 b0 字节的 k/n 归约与构造方式无关——需 CUTLASS/PTX 文档
-的 m16n8k16 s8 B fragment 布局或逐字节探针定位）。K16 内 2 个连续 code 共享同一
+**B 是 warp 级归约**（逐字节探针：任意 lane 单字节 b0 探针下 c0..c3 恒为 4，即
+mma 组合所有 lane 的 b0 成完整 B 矩阵再归约，单 lane 无法独立控制）——**B fragment
+布局必须按 CUTLASS `mma_tensor_op` 的线程映射精确构造**（`b12x/_lib/intrinsics.py`
+m16n8k32 模式 + CUTLASS `mma_sm80.h` m16n8k16 s8 instruction 的 warp 布局）。
+作为 Phase 2 的过渡，Triton `tl.dot`（K32，per-K16 近似 scale）已验证 3.2× 且
+kill gate ≤6.5ms/layer 达标——exact 手写 mma 是后续优化。K16 内 2 个连续 code 共享同一
 nibble（偶数→lo、奇数→hi）已确认 → per-K16 scale 精确。剩余：B 布局定位、fp32 累积、
 per-token xscale 的 C 映射（c0/c1 用 token lg、c2/c3 用 token lg+8）、16×8 全输出、
 多 warp/grouped 接入、launch wrapper + 数值验证。

@@ -20,11 +20,8 @@ mma_layout_kernel(int32_t* out /* [16,8] */) {
     const int l4 = lane % 4, lg = lane / 4;
     // a0 -> A[lg, l4*4 + 0..3], a1 -> A[lg+8, l4*4 + 0..3]
     int32_t a[2] = {0x01010101, 0x01010101};  // A all ones -> C[m,n] = sum_k B[k,n]
-    // hypothesis: b0 -> B[k = l4*4 + 0..3, n = lg]
-    int32_t b = 0;
-#pragma unroll
-    for (int j = 0; j < 4; ++j)
-        b |= (int32_t)(int8_t)((l4 * 4 + j) * 8 + lg) << (8 * j);
+    // probe: b0 byte (l4%4) = 1, others 0. A=ones.
+    int32_t b = 1 << (8 * (l4 % 4));
     int32_t c[4] = {0, 0, 0, 0};
     mma16(c, a, &b);
 #pragma unroll
