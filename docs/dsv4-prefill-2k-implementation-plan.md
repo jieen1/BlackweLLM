@@ -428,16 +428,38 @@ MoE 之外，HC+attention 旧 profile 已约 30 ms/M32 chunk，也必须大批�
 pipeline 32 ms（router/shared expert 未包含），不再继续用 A-smem/launch 微调追逐 6.5 ms；该路径
 冻结为 oracle。
 
-### Phase 2B-0：表示证明与 routed microkernel — **当前最高优先级**
+### Phase 2B-0：表示证明与 routed microkernel — **direct-folding 已实测失败，9.97 ms vs 2.4 ms gate**
 
 第一轮不接 backend，只做真实权重/真实 route capture 上的 routed microkernel：
 
-- 先完成 INT8 range、folding/two-plane 重构公式、误差界和指令下界；
-- 实现 K32/64/128/256 scale-amortization sweep；
+- 先完成 INT8 range、folding/two-plane 重构公式、误差界和指令下界； ✓ 已提交
+  （`tools/prescreen_iq2_kgroup_fold.py`，真实 GGUF blk.4，K32..K256 sweep）
+- 实现 K32/64/128/256 scale-amortization sweep； ✓ K32 通过 quality gate，
+  K64/128/256 单调退化
 - 先测 direct-packed；仅在 profiler 证明 AoS decode/transaction 是 blocker 后启动独立 SoA migration；
-- 与 exact kernel 比较 gate/up/down 输出；
+- 与 exact kernel 比较 gate/up/down 输出； ✓ cos 0.99999/0.99999/0.99993
 - 报告 gate+up、SwiGLU、down、group/reduce 四段独立 GPU 时间；
-- Nsight 记录 MMA、I2F、整数 decode、DRAM 和 occupancy，不用 wall time猜瓶颈。
+- Nsight 记录 MMA、I2F、整数 decode、DRAM 和 occupancy，不用 wall time猜瓶颈。 ✓
+
+**2026-08-11 实测结论（direct-folding 失败，kill gate 未达）**：
+
+`iq2_mma16_tc.cu` 实现 K-group=32 scale folding（数值全部 >=0.9999），四轮
+优化（模板 M_PAD 消除 spill → direct-global decode → fused decode/fold）
+从 24 ms 降到 **9.97 ms gate+up**（E=256 M_PAD=32 真实路由）。Nsight 证据：
+
+- tensor core 仅 1.2% 指令；ALU 1.69G（decode 位操作）是最大单项；
+- SM throughput 64.6%，tensor 12% —— 指令流水近饱和但 tensor 饿死；
+- **纯 mma 下限（无 decode/staging）4.72 ms，仍超 2.4 ms gate 2×**；
+- K32 mma 减半 tensor 指令但总时间反升（寄存器/发射），回退。
+
+**这证伪了 §4.3 "I2F 串行依赖是主瓶颈" 的前提**：瓶颈是 decode 的 ALU
+指令量和 L1TEX/smem 流量。two-plane 预解码 codebook 预计 ~6-8 ms，仍超
+2.4 ms。单卡 IQ2_XS Tensor-Core gate+up 在本 block 组织下现实下限 ~5 ms。
+
+**决策点**：在投入 two-plane 前需重新核算——(a) 6.5 ms/layer MoE 预算是否
+基于不现实的 gate+up 2.4 ms；(b) 是否有不同的 block 组织（更大 N/流式）
+能把纯 mma 4.7 ms 降到 2.4 ms 以下。若两者都否定，则按 §9 触发"停止单卡
+2K 承诺"分支。详见 `notes/2026-08-11-dsv4-phase2b-scale-amortized-falsified.md`。
 
 6.5 ms 是 router+routed+shared MoE 的完整预算，不只是新 kernel 的预算。Phase 2B 的目标拆账如下；
 这些是 **[待验证目标]**，不是当前实测：
