@@ -74,6 +74,11 @@ FragmentB 精确布局（2 列 × 2 k）重写 B 打包与输出 scatter**。Pha
 列 = l4*2 完全确认），但 b0 的字节值（B[k,lg]）与 c0 的归约（ΣB[:,l4*2]）矛盾——说明
 **mma 的 b0 字节→(k, n) 映射有独立的 k 重排**（非 l4*4+j），必须从 CUTLASS
 TensorOpMultiplicandCrosswise128x4（sm80）的 k_index/bank 公式逐字节提取。
+**b12x 参考**：`frag_layout_swizzle_16b_to_8b`（b12x/_lib/intrinsics.py:3916）用
+`shuffle_sync_bfly(offset 1,2) + byte_perm(0x5410/0x3276)` 做 m16n8k32 B fragment 的
+lane 间字节重排（16b→8b）；m16n8k16 s8 的 B fragment 需要类似的 lane 间 k/n 映射
+（可直接用此 swizzle 的 offset=1,2 版本 + int8 字节）。这是 Phase 2 手写 kernel 的
+最后一块。
 **进一步定位（2026-08-11 晚）**：无 scale kernel 与 torch mag×xq 的 maxdiff 仍大；
 早期 dump 的 codes/g 对比错是 **kb 不对齐**（kernel dump 落在 kb=15，torch 参考用 kb=0）
 + codes 逐字节读取。已改 uint16 读取（`+1` 跳过 d），ROWS/STRIDE/`eid*ROWS*STRIDE`
@@ -103,7 +108,12 @@ FragmentB 精确布局（2 列 × 2 k）重写 B 打包与输出 scatter**。Pha
 **决定性（2026-08-11 深夜）**：b0=B[l4*4+j,lg] 时 c0==ΣB[:,l4*2] 达 **32/32**（c0 的 B
 列 = l4*2 完全确认），但 b0 的字节值（B[k,lg]）与 c0 的归约（ΣB[:,l4*2]）矛盾——说明
 **mma 的 b0 字节→(k, n) 映射有独立的 k 重排**（非 l4*4+j），必须从 CUTLASS
-TensorOpMultiplicandCrosswise128x4（sm80）的 k_index/bank 公式逐字节提取。K16 内 2 个连续 code 共享同一
+TensorOpMultiplicandCrosswise128x4（sm80）的 k_index/bank 公式逐字节提取。
+**b12x 参考**：`frag_layout_swizzle_16b_to_8b`（b12x/_lib/intrinsics.py:3916）用
+`shuffle_sync_bfly(offset 1,2) + byte_perm(0x5410/0x3276)` 做 m16n8k32 B fragment 的
+lane 间字节重排（16b→8b）；m16n8k16 s8 的 B fragment 需要类似的 lane 间 k/n 映射
+（可直接用此 swizzle 的 offset=1,2 版本 + int8 字节）。这是 Phase 2 手写 kernel 的
+最后一块。K16 内 2 个连续 code 共享同一
 nibble（偶数→lo、奇数→hi）已确认 → per-K16 scale 精确。剩余：B 布局定位、fp32 累积、
 per-token xscale 的 C 映射（c0/c1 用 token lg、c2/c3 用 token lg+8）、16×8 全输出、
 多 warp/grouped 接入、launch wrapper + 数值验证。
