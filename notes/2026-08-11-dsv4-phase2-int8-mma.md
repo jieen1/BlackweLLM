@@ -51,10 +51,11 @@ gate/up/down + SwiGLU 端到端接入（过渡），exact 手写 mma 并行跟�
 定位 w32 组装；再修 K32 scale（4 code 的 lo/lo/hi/hi 无法在 tl.dot 内 per-code，需
 确认是否可接受近似或改用每 K32 单独 mma）。Phase 2 数值未达之前不进入 Phase 3。
 **进一步定位（2026-08-11 晚）**：无 scale kernel 与 torch mag×xq 的 maxdiff 仍大；
-dump 显示 kernel 的 codes/g 与 torch 完全不同（kernel codes [63002,47616,...] vs torch
-[14157,6635,...]；kernel g 是 int32 小值 vs torch int64 大值）——**kernel 的 code 字节
-读取偏移错位**（c4/kb/base 的偏移与 torch 的 blocks 视图不一致），需逐字节核对
-`base + 2 + c4*2` 的读取。tl.dot int8 本身已验证正确（构造数据 maxdiff 0）。K16 内 2 个连续 code 共享同一
+早期 dump 的 codes/g 对比错是 **kb 不对齐**（kernel dump 落在 kb=15，torch 参考用 kb=0）
++ codes 逐字节读取。已改 uint16 读取（`+1` 跳过 d），ROWS/STRIDE/`eid*ROWS*STRIDE`
+dump 正确（12124160）。**剩余疑点**：kernel 全 kb 累加的 acc 与 torch 全 cols mag×xq
+maxdiff 仍大，需 kb 对齐的 codes dump 逐块核对（或 w32 的 join 在非 kz=0 时的字节序）。
+tl.dot int8 本身已验证正确（构造数据 maxdiff 0）。Phase 2 数值未达之前不进入 Phase 3。K16 内 2 个连续 code 共享同一
 nibble（偶数→lo、奇数→hi）已确认 → per-K16 scale 精确。剩余：B 布局定位、fp32 累积、
 per-token xscale 的 C 映射（c0/c1 用 token lg、c2/c3 用 token lg+8）、16×8 全输出、
 多 warp/grouped 接入、launch wrapper + 数值验证。
