@@ -62,6 +62,8 @@ iq2_mma16_tc_kernel(
 
     extern __shared__ uint8_t sraw[];
     int8_t* sid = (int8_t*)sraw;  // [2][32][256] folded qB
+    float* sB_g_s = (float*)(sraw + 2 * 32 * 256);   // [32][8] per (row,grp)
+    float* sB_u_s = sB_g_s + 32 * 8;
 
     const int64_t xbase = (int64_t)e * M_PAD * COLS;
     const int64_t xsbase = (int64_t)e * M_PAD * (COLS / 32);
@@ -95,6 +97,8 @@ iq2_mma16_tc_kernel(
                 }
                 const float sB = 43.0f * mx / 127.0f;
                 const float inv_sB = (sB > 1e-12f) ? (1.0f / sB) : 0.f;
+                if (mat == 0) sB_g_s[r * 8 + grp] = sB;
+                else          sB_u_s[r * 8 + grp] = sB;
 #pragma unroll
                 for (int c = 0; c < 4; ++c) {
                     const uint16_t cd = (uint16_t)(blk[2 + (grp * 4 + c) * 2]
@@ -138,27 +142,10 @@ iq2_mma16_tc_kernel(
             // sB per C-output row: c0/c2 -> B column l4*2, c1/c3 -> column l4*2+1.
             // Each B column is a weight row (row_lg for c0/c2, row_lg+1 for c1/c3).
             float sB_g[2], sB_u[2];
-#pragma unroll
-            for (int col = 0; col < 2; ++col) {
-                const int wrow_g = warp * 8 + l4 * 2 + col;
-                const int wrow_u = warp * 8 + l4 * 2 + col;
-                const uint8_t* blkg = wg_base + (int64_t)kb * 74 + (int64_t)wrow_g * STRIDE;
-                const uint8_t* blku = wu_base + (int64_t)kb * 74 + (int64_t)wrow_u * STRIDE;
-                const float dg_ = __half2float(*(const __half*)blkg);
-                const float du_ = __half2float(*(const __half*)blku);
-                float mxg = 0.f, mxu = 0.f;
-#pragma unroll
-                for (int c = 0; c < 4; ++c) {
-                    const uint8_t svg = blkg[66 + (grp * 4 + c) / 4];
-                    const float ng = ((grp * 4 + c) % 4) < 2 ? (float)(svg & 0xF) : (float)(svg >> 4);
-                    mxg = fmaxf(mxg, fabsf(dg_ * (0.5f + ng) * 0.25f));
-                    const uint8_t svu = blku[66 + (grp * 4 + c) / 4];
-                    const float nu = ((grp * 4 + c) % 4) < 2 ? (float)(svu & 0xF) : (float)(svu >> 4);
-                    mxu = fmaxf(mxu, fabsf(du_ * (0.5f + nu) * 0.25f));
-                }
-                sB_g[col] = 43.0f * mxg / 127.0f;
-                sB_u[col] = 43.0f * mxu / 127.0f;
-            }
+            sB_g[0] = sB_g_s[(warp * 8 + l4 * 2) * 8 + grp];
+            sB_g[1] = sB_g_s[(warp * 8 + l4 * 2 + 1) * 8 + grp];
+            sB_u[0] = sB_u_s[(warp * 8 + l4 * 2) * 8 + grp];
+            sB_u[1] = sB_u_s[(warp * 8 + l4 * 2 + 1) * 8 + grp];
             // activation per token (c0/c2 -> token lg, c1/c3 -> token lg+8)
 #pragma unroll
             for (int mt = 0; mt < n_mtiles; ++mt) {
@@ -213,7 +200,7 @@ extern "C" QSR_EXPORT void iq2_mma16_tc_launch(
     const int32_t* ksigns, float* out_gate, float* out_up,
     int E, int ROWS, int COLS, int STRIDE, int M_PAD)
 {
-    const int smem_bytes = 2 * 32 * 256;                      // folded qB int8
+    const int smem_bytes = 2 * 32 * 256 + 2 * 32 * 8 * 4;        // sid + sB planes
     cudaFuncSetAttribute((const void*)iq2_mma16_tc_kernel<16>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     cudaFuncSetAttribute((const void*)iq2_mma16_tc_kernel<32>,
