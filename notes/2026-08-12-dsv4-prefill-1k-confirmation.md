@@ -134,3 +134,30 @@ eff_pad 拆分（32）可救性能，但 row-scale 的数值损失是表示的�
 **最终判定**：1K 目标的 K32 complete MoE 与 CTA-local row-W8 **均无完整
 （性能+数值）已证路径**。§9 的 CTA-local reopen 条件（routed cos>=0.9990）
 不满足。需用户重新定夺：放宽数值门禁、或接受当前性能、或探索新组织。
+
+## 9. K32 split complete MoE 落地（质量优先，2026-08-12）
+
+实现 `grouped_moe_prefill_k32`（iq2_mma16_tc.py）：
+- K32 scale-amortized kernel（routed cos 0.999896，≥0.9990 达标）；
+- single-output down（单输出 kernel，正式 build target + wrapper + 测试）；
+- eff_pad=32 固定 + 超 32 routes 的 expert 拆第二批（11 experts, 13 over-32）。
+
+真实 256 experts / 1024 tok / top-6 实测：
+
+| 阶段 | CUDA 时间 |
+|---|---:|
+| gate+up kernel<32> | 7.0 ms |
+| single kernel<32> | 5.47 ms |
+| batch2 kernels | 0.56 ms |
+| glue CUDA（index/scatter/sort 等） | ~2 ms |
+| **纯 GPU** | ~14.9 ms |
+| **wall（含 host sync）** | **25.86 ms** |
+| exact 基线 | 32.65 ms |
+
+**关键**：kernel 13.03ms 已接近 14ms（§9 CTA-local core 线）；完整 MoE 25.86ms
+超 17ms all-in 主要因 **~11ms host sync**（glue 的多 torch kernel launch 间隙）。
+CUDA graph 捕获失败（grouped_moe_prefill_k32 有动态 allocation / 不定形状，
+即文档 §5.1 禁止项）。
+
+**下一步**：消除 glue 动态 allocation（固定 bucket + 预分配），使 CUDA graph
+可捕获 → host sync 归零。kernel 13ms 本身接近达标，glue 是主缺口。
