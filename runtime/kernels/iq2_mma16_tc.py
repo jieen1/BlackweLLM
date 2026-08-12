@@ -35,6 +35,7 @@ class IQ2MMA16TCManifest:
     abi_version: int
     target_sm: str
     library_sha256: str
+    source_sha256: str | None = None
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> IQ2MMA16TCManifest:
@@ -43,6 +44,7 @@ class IQ2MMA16TCManifest:
                 abi_version=int(value["abi_version"]),
                 target_sm=str(value["target_sm"]),
                 library_sha256=str(value["library_sha256"]),
+                source_sha256=str(value.get("source_sha256")),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise IQ2MMA16TCError("invalid IQ2 MMA16 TC manifest") from error
@@ -91,6 +93,15 @@ class NativeIQ2MMA16TCLibrary:
             raise IQ2MMA16TCError("IQ2 MMA16 TC target mismatch")
         if _sha256(_LIBRARY_PATH) != manifest.library_sha256:
             raise IQ2MMA16TCError("IQ2 MMA16 TC library SHA256 does not match its manifest")
+        _source_path = _KERNEL_DIR / "iq2_mma16_tc.cu"
+        source_sha = getattr(manifest, "source_sha256", None)
+        if source_sha is None:
+            raise IQ2MMA16TCError("IQ2 MMA16 TC manifest is missing source_sha256")
+        if _source_path.is_file() and _sha256(_source_path) != source_sha:
+            raise IQ2MMA16TCError(
+                "IQ2 MMA16 TC source changed after artifact build; rebuild with "
+                "`make build-iq2-mma16-tc` (stale artifact guard)"
+            )
         try:
             library = ctypes.CDLL(str(_LIBRARY_PATH))
         except OSError as error:

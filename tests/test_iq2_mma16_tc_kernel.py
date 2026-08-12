@@ -10,8 +10,16 @@ torch = pytest.importorskip("torch")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
+import hashlib  # noqa: E402
+import json  # noqa: E402
+from pathlib import Path  # noqa: E402
+
 from loader.gguf_quant_tables import IQ2XS_GRID, KSIGNS_IQ2XS  # noqa: E402
-from runtime.kernels.iq2_mma16_tc import IQ2MMA16TCError, NativeIQ2MMA16TCLibrary  # noqa: E402
+from runtime.kernels.iq2_mma16_tc import (  # noqa: E402
+    _MANIFEST_PATH,
+    IQ2MMA16TCError,
+    NativeIQ2MMA16TCLibrary,
+)
 from runtime.model.dsv4_quant import dequantize_iq2_xs  # noqa: E402
 
 IQ2 = 256
@@ -33,6 +41,24 @@ def _make_packed(rows: int, cols: int, generator) -> torch.Tensor:
 @pytest.fixture(scope="module")
 def library():
     return NativeIQ2MMA16TCLibrary.load()
+
+
+def test_stale_artifact_guard():
+    """load() must reject a manifest whose source_sha256 differs from the .cu."""
+    kernel_dir = Path(__file__).resolve().parent.parent / "runtime" / "kernels"
+    source = kernel_dir / "iq2_mma16_tc.cu"
+    manifest = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
+    if "source_sha256" not in manifest:
+        pytest.skip("manifest has no source_sha256")
+    current = hashlib.sha256(source.read_bytes()).hexdigest()
+    if manifest["source_sha256"] != current:
+        # artifact is genuinely stale; load must fail loudly
+        with pytest.raises(IQ2MMA16TCError):
+            NativeIQ2MMA16TCLibrary.load()
+    else:
+        # artifact matches source; load must succeed and be loadable
+        lib = NativeIQ2MMA16TCLibrary.load()
+        assert lib is not None
 
 
 def test_matches_dequant_e2_m32(library):
