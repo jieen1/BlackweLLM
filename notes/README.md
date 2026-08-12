@@ -1,6 +1,6 @@
 # notes/ 索引
 
-> 编制日期：2026-08-12 · 共 223 篇（`git ls-files notes | wc -l`，包含本次新增）
+> 编制日期：2026-08-12 · 共 224 篇（`git ls-files notes | wc -l`，包含本次新增）
 
 `notes/` 是**调查记录与证据档案**，不是文档。它的价值在于：当一个结论被
 质疑时，能翻出当初的实测数据、复现命令和被排除的假设。
@@ -46,6 +46,7 @@
 | `2026-08-10-dsv4-prefill-moe-kernel-deep-dive.md` | **DSV4 prefill MoE kernel 性能深挖**——dp4a 已落地并将 76 提到 129 tok/s；2026-08-11 复测 64-row 稳态 131.8–133.3 tok/s。MoE 占 M32 chunk 83%，route-M1 IQ2 解码已接近指令流上限；warp-row 只再快 1.2×。达到 1K 必须改为 bounded superchunk + expert-grouped Tensor-Core 路线。含长上下文状态和显存边界。 |
 | `2026-08-11-dsv4-phase2-int8-mma.md` | **Phase 2：IQ2 INT8 Tensor-Core grouped MoE**——exact `mma.sync.m16n8k16` 已落地并达到 cos 1.0；真实 1024-token 形状 gate+up 14.8 ms、grouped routed pipeline 32 ms（router/shared expert 未包含），未过旧 2K 的 router+routed+shared `<=6.5 ms/layer` kill gate。exact 路径保留为 oracle；K32 在 1K 新预算下重新成为主线，当前合同见 `../docs/dsv4-prefill-1k-implementation-plan.md`。 |
 | `2026-08-12-dsv4-prefill-row-w8-replan-evidence.md` | **DSV4 单卡 2K row-W8 路线最终失败证据**——审计 `main@882d209`，记录 128 MiB L2、row-W8/A8 数值预筛、global W8 流量账，以及 C0 最终 gate+up 28.2 ms、W8 resident 6.4 GB、consumer L2 hit 23% 的三重失败。新 1K 合同只保留严格条件下的 CTA-local 研究门，不复活 global/circular W8。 |
+| `2026-08-12-dsv4-4x256k-capacity-plan.md` | **DSV4 单卡 4×256K 显存容量实施规划**——严格核对当前双份主 compressor 历史、逐层 RoPE 和第五 CG 槽；主路线保留 packed pages、删除 5.40625 GiB BF16 主缓存镜像并把 RoPE 收敛为两份，目标已知持久占用 `86.52000322565436 GiB`；定义四槽、图池、prefix 和 fresh-process 实机验收门槛。 |
 
 ## 2. 已定案的根因分析 🟢
 
