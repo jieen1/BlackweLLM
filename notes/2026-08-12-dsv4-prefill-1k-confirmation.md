@@ -52,3 +52,30 @@ MoE 17ms 预算，glue/combine 另加 4.9ms。
 
 **1K 主线（Phase B all-in gate）尚未达标**；single-down 是唯一已确认的
 正向回收。见 `docs/dsv4-prefill-1k-implementation-plan.md` §5.3。
+
+## 6. 最终判定：K32 all-in MoE 预算失败
+
+真实 256 experts + eff_pad=48 + 1024 token + top-6：
+
+| 项 | 实测 | 预算 |
+|---|---:|---:|
+| gate+up kernel | 8.81 ms | — |
+| down (single) kernel | 8.25 ms | — |
+| **K32 kernel core** | **17.06 ms** | MoE all-in <=17 ms |
+| glue (sort/group/quant/scatter/combine) | ~4.9 ms | 含在 MoE 内 |
+| **完整 MoE layer (无 shared/attention)** | **21.97 ms** | layer <=22.5 ms |
+
+**判定**：K32 kernel core（17.06ms）已占满 MoE 17ms 预算，glue 使完整 MoE
+21.97ms 超预算。按评审指令"不能进入 17-18ms 应立即判失败"，**1K 主线
+Phase B all-in gate 触发失败**。single-output down（2x）是唯一已确认的正向
+回收，但不足以弥合缺口。
+
+**根因**：文档 13.85ms core 基于 eff_pad=32 + 复制权重（32 unique × 8），
+低估真实 eff_pad=48 + 256 unique 权重的 decode/DRAM 成本。gate+up 在
+eff_pad=48 是 8.81ms（vs 文档 6.93），down single 8.25ms。
+
+**剩余选项**（§11/§9）：
+1. eff_pad 从 48 压到 32（max_routes 上限收紧，需 route 拆分，代价是多次
+   launch）——可测，但 max_routes=42 是真实分布；
+2. gate+up decode 优化（增大每 block ROWS 摊薄 decode 权重读，N128 曾失败）；
+3. 接受 1K 目标需要进一步预算放宽（如 20ms/layer 级 MoE）。
