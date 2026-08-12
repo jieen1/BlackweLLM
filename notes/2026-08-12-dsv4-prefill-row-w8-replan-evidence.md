@@ -137,3 +137,25 @@ transcode）使 transcode 成为 per-token 瓶颈（24ms），常驻 W8 超内�
 这与 Phase 2B 的 int8-codebook DRAM 死结是同一结构：**放大驻留（W8）换取
 零 decode，代价是内存/带宽，最终都撞墙**。row-W8 只是把 decode 成本换成
 了 transcode+W8 带宽成本。
+
+## 补充 3：C0 生死门最终判定（2026-08-12）
+
+端到端 tile_E=4 circular 流程实测：transcode 4 experts gate → W8 scratch →
+GEMM = **0.220ms/tile**，x64 tiles = **14.1ms（gate alone）/ 28.2ms（gate+up）**。
+C0 kill gate 2.4ms 超 11.8x。
+
+构成：transcode 0.163ms/tile（74%）、GEMM 0.057ms/tile（26%）。
+
+**C0 判定：失败。** 三个致命约束在 row-W8 上同时成立：
+1. **per-token transcode 是主瓶颈**（circular scratch 每 tile 重新 transcode，
+   W8 写 32MB/tile 的 DRAM 成本 28ms/全量）；transcode 已接近 DRAM 理论下限
+   （decode kernel 77% SM throughput），无数量级优化空间。
+2. **W8 常驻 6.4GB 超内存**（gate+up+down 全部 256 experts），与 256MiB
+   scratch 和 2×128K KV 无法共存。
+3. **GEMM L2 hit 23%**（B 分片消费，tile_E=4/8 均无跨 GEMM 复用），DRAM-bound。
+
+row-W8 表示本身可行（GEMM 121 TFLOPS），但与 Phase 2B int8-codebook 是同一
+结构死结：**放大驻留换零 decode，代价是带宽/内存，最终撞墙**。
+
+**§9 分支 (b)/(c) 待用户定夺**：重新核算 6.5ms/layer 预算，或如实记录
+"当前 IQ2_XS + 单 SM120 + 质量/容量约束下 2K 无已知可实现路径"。
