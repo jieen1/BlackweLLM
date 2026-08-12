@@ -161,3 +161,16 @@ CUDA graph 捕获失败（grouped_moe_prefill_k32 有动态 allocation / 不定�
 
 **下一步**：消除 glue 动态 allocation（固定 bucket + 预分配），使 CUDA graph
 可捕获 → host sync 归零。kernel 13ms 本身接近达标，glue 是主缺口。
+
+## 10. K32 MoE 优化与 graph 捕获障碍（2026-08-12）
+
+- `_into` 变体（caller-owned buffer）：完整 MoE 25.86 → **22.26ms**（质量不变
+  0.999896）；
+- **CUDA graph 捕获失败**：glue 的 `torch.nonzero`/`argsort` 动态形状
+  （文档 §5.1 禁止的"动态 sort"）；torch.compile 更慢（102ms，ctypes 不可优化）；
+- **结论**：进 17ms 必须 device-side grouping（固定 bucket 的 device
+  route/counts/offsets/gather），即 SparkInfer recipe 工程（C1/C2 范围）；
+  当前 ds4_router.py 有 device top-k 可作基础。
+
+**当前状态**：K32 完整 MoE 质量达标、性能 22.26ms（vs exact 32.65，1.47x）。
+device-side grouping 是唯一明确的剩余路径。
