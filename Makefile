@@ -152,6 +152,19 @@ build-iq2-mma16-tc: ## Build the Phase 2B-0 scale-amortized IQ2 MMA16 artifact
 	@$(PYTHON) -c 'import hashlib,json,subprocess,sys; from pathlib import Path; library=Path(sys.argv[1]); manifest=Path(sys.argv[2]); source=Path(sys.argv[3]); flags=sys.argv[4]; payload={"abi_version":1,"target_sm":"sm_120f","nvcc":subprocess.check_output([sys.argv[5],"--version"],text=True).strip(),"ptxas":subprocess.check_output(["ptxas","--version"],text=True).strip(),"compile_flags":flags,"source_sha256":hashlib.sha256(source.read_bytes()).hexdigest(),"runtime_git_sha":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"library_sha256":hashlib.sha256(library.read_bytes()).hexdigest(),"provenance":{"license":"Apache-2.0","upstream":"self-owned runtime/kernels/iq2_mma16_tc.cu","specialization":"DSV4 IQ2_XS K-group=32 scale-amortized m16n8k16 INT8 MMA"}}; temporary=manifest.with_suffix(".tmp"); temporary.write_text(json.dumps(payload,indent=2,sort_keys=True)+"\n"); temporary.replace(manifest)' "$(IQ2_MMA16_TC_LIBRARY)" "$(IQ2_MMA16_TC_MANIFEST)" "$(IQ2_MMA16_TC_SOURCE)" "$(IQ2_MMA16_TC_FLAGS)" "$(NVCC)"
 	@$(MAKE) verify-iq2-mma16-tc
 
+IQ2_MMA16_TC_SINGLE_SOURCE = runtime/kernels/iq2_mma16_tc_single.cu
+IQ2_MMA16_TC_SINGLE_EXPORTS = runtime/kernels/iq2_mma16_tc_single.exports
+IQ2_MMA16_TC_SINGLE_LIBRARY = $(IQ2_MMA16_TC_GENERATED_DIR)/iq2_mma16_tc_single.so
+IQ2_MMA16_TC_SINGLE_MANIFEST = $(IQ2_MMA16_TC_GENERATED_DIR)/iq2_mma16_tc_single.manifest.json
+IQ2_MMA16_TC_SINGLE_FLAGS = -std=c++17 -O3 --shared -Xcompiler -fPIC -Xcompiler -fvisibility=hidden -gencode arch=compute_120f,code=sm_120f -cudart static -Xlinker --version-script=$(IQ2_MMA16_TC_SINGLE_EXPORTS)
+
+build-iq2-mma16-tc-single: ## Build the single-output IQ2_K32 GEMM artifact (down)
+	@mkdir -p $(IQ2_MMA16_TC_GENERATED_DIR)
+	@set -eu; tmp_library="$(IQ2_MMA16_TC_SINGLE_LIBRARY).tmp"; \
+	$(NVCC) $(IQ2_MMA16_TC_SINGLE_FLAGS) $(IQ2_MMA16_TC_SINGLE_SOURCE) -o "$$tmp_library"; \
+	mv "$$tmp_library" "$(IQ2_MMA16_TC_SINGLE_LIBRARY)"
+	@$(PYTHON) -c 'import hashlib,json,subprocess,sys; from pathlib import Path; library=Path(sys.argv[1]); manifest=Path(sys.argv[2]); source=Path(sys.argv[3]); flags=sys.argv[4]; payload={"abi_version":1,"target_sm":"sm_120f","nvcc":subprocess.check_output([sys.argv[5],"--version"],text=True).strip(),"ptxas":subprocess.check_output(["ptxas","--version"],text=True).strip(),"compile_flags":flags,"source_sha256":hashlib.sha256(source.read_bytes()).hexdigest(),"runtime_git_sha":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"library_sha256":hashlib.sha256(library.read_bytes()).hexdigest(),"provenance":{"license":"Apache-2.0","upstream":"self-owned runtime/kernels/iq2_mma16_tc_single.cu","specialization":"DSV4 IQ2_XS single-output K-group=32 m16n8k16 INT8 MMA (down)"}}; temporary=manifest.with_suffix(".tmp"); temporary.write_text(json.dumps(payload,indent=2,sort_keys=True)+"\n"); temporary.replace(manifest)' "$(IQ2_MMA16_TC_SINGLE_LIBRARY)" "$(IQ2_MMA16_TC_SINGLE_MANIFEST)" "$(IQ2_MMA16_TC_SINGLE_SOURCE)" "$(IQ2_MMA16_TC_SINGLE_FLAGS)" "$(NVCC)"
+
 verify-iq2-mma16-tc: ## Verify the generated IQ2 MMA16 TC ABI and dynamic dependencies
 	@test -f $(IQ2_MMA16_TC_LIBRARY)
 	@test -f $(IQ2_MMA16_TC_MANIFEST)

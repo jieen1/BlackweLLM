@@ -99,3 +99,27 @@ def test_rejects_noncontiguous(library):
     with pytest.raises(IQ2MMA16TCError):
         library.grouped_gate_up(xq, xs, pg, pg, eids, grid, ksigns,
                                 rows=2048, cols=4096, stride=1184, m_pad=32)
+
+
+def test_single_down_matches_dual_first(library):
+    """single_down output must equal grouped_gate_up's first output."""
+    E, ROWS, COLS, M_PAD = 1, 2048, 4096, 32
+    STRIDE = (COLS // IQ2) * 74
+    gen = torch.Generator().manual_seed(88)
+    pg = _make_packed(E * ROWS, COLS, gen).cuda()
+    eids = torch.arange(E, dtype=torch.int64, device="cuda")
+    x = (torch.randn(E, M_PAD, COLS, generator=gen) * 0.1).cuda()
+    xr = x.reshape(E, M_PAD, COLS // 32, 32)
+    xs = (xr.abs().max(-1, keepdim=True).values / 127.0).clamp(min=1e-8)
+    xq = (xr / xs).round().clamp(-128, 127).to(torch.int8).reshape(E, M_PAD, COLS)
+    xs = xs.reshape(E, M_PAD, COLS // 32)
+    grid = torch.tensor(IQ2XS_GRID, dtype=torch.int64, device="cuda")
+    ksigns = torch.tensor(KSIGNS_IQ2XS, dtype=torch.int32, device="cuda")
+    # dual: gate=up=pg, take first output
+    g, _ = library.grouped_gate_up(xq, xs, pg, pg, eids, grid, ksigns,
+                                   rows=ROWS, cols=COLS, stride=STRIDE, m_pad=M_PAD)
+    # single: same packed
+    d = library.single_down(xq, xs, pg, eids, grid, ksigns,
+                            rows=ROWS, cols=COLS, stride=STRIDE, m_pad=M_PAD)
+    cos = (g * d).sum() / (g.norm() * d.norm() + 1e-9)
+    assert cos.item() >= 0.9999, f"single vs dual first cos {cos.item()} < 0.9999"
