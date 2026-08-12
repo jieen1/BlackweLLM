@@ -108,3 +108,29 @@ per-K32 facc 链）：
 剩余判断：1K 目标在"gate+up+down core <=14ms"（含质量 0.9999）约束下，
 现有 IQ2 decode-to-smem + mma 组织在真实 256 experts + eff_pad=48 下
 不可达。需用户重新定夺预算或探索其他组织。
+
+## 8. CTA-local 最终判定：性能可行但数值不达标
+
+CTA-local row-W8 的完整评估：
+
+| 指标 | CTA-local row-W8 | K32 | 门禁 |
+|---|---|---|---|
+| core @eff_pad=48（真实） | 15.47 ms | 17.06 ms | <=14 ms |
+| core @eff_pad=32（拆分） | 11.56 ms | — | <=14 ms |
+| **routed MoE out cos** | **0.99965** | **0.99990** | >=0.9990 |
+| down cos | 0.99965 | 0.99987 | >=0.9990 |
+
+**关键**：row-W8 的整行 scale（K=4096/2048）使 down 数值 0.99965，直接导致
+routed MoE 输出 cos 0.99965 < 0.9990 门禁。K32 数值达标（0.99990）但
+eff_pad=48 性能 17.06ms 超 14ms。
+
+**两难**：
+- CTA-local：性能可行（eff_pad=32 拆分 ~13.5ms）但数值 down 0.99965 不达标；
+- K32：数值达标（0.99990）但性能 17.06ms 不达标。
+
+eff_pad 拆分（32）可救性能，但 row-scale 的数值损失是表示的固有属性
+（prescreen K4096 down 0.99965 已证实）。
+
+**最终判定**：1K 目标的 K32 complete MoE 与 CTA-local row-W8 **均无完整
+（性能+数值）已证路径**。§9 的 CTA-local reopen 条件（routed cos>=0.9990）
+不满足。需用户重新定夺：放宽数值门禁、或接受当前性能、或探索新组织。
