@@ -191,3 +191,18 @@ python glue 22.26ms**（质量 0.999896 达标）。
 **最终状态**：K32 完整 MoE（质量优先）22.26ms vs exact 32.65ms（1.47x）。
 进 17ms 需消除 ~5.3ms host sync，路径是完整 device pipeline（SparkInfer
 recipe 工程），当前未达成。
+
+## 12. 关键瓶颈：CPU-bound glue（2026-08-12）
+
+torch profiler：K32 MoE 3 calls → **CPU self 101ms/call，CUDA 16ms/call**。
+GPU 只 16ms，但 CPU 101ms 驱动它，wall 22.26ms 是 CPU 追赶 GPU。
+
+最大 CPU 单项：`aten::index`（高级索引 scatter）24ms/call。
+
+**结论**：即使 kernel 全优化，Python glue 的 CPU 开销（每 torch op 的
+launch/Python 开销）是墙。**唯一解法是 device-side 全 pipeline（CUDA
+graph 消除 CPU 101ms）**，但 batch2 动态 n_over 阻止 graph。
+
+**质量优先路径的最终判断**：kernel 13ms 达标（质量 0.999896），但完整
+MoE 22.26ms 被 CPU-bound glue（~6ms host sync + Python 开销）拖住。
+device-side pipeline 是唯一剩余路径，需解决 batch2 固定形状。
