@@ -136,6 +136,41 @@ class NativeIQ2MMA16TCLibrary:
                 raise IQ2MMA16TCError(f"{name} must be contiguous")
         out_gate = torch.empty((E, m_pad, rows), dtype=torch.float32, device=xq.device)
         out_up = torch.empty((E, m_pad, rows), dtype=torch.float32, device=xq.device)
+        self.grouped_gate_up_into(xq, xs, packed_gate, packed_up, eids, grid, ksigns,
+                                  out_gate, out_up, rows=rows, cols=cols, stride=stride,
+                                  m_pad=m_pad)
+        return out_gate, out_up
+
+    def grouped_gate_up_into(
+        self,
+        xq,
+        xs,
+        packed_gate,
+        packed_up,
+        eids,
+        grid,
+        ksigns,
+        out_gate,
+        out_up,
+        *,
+        rows: int,
+        cols: int,
+        stride: int,
+        m_pad: int,
+    ):
+        """Like ``grouped_gate_up`` but writes into caller-owned buffers.
+
+        No internal allocation, so it is safe inside a CUDA graph capture.
+        """
+
+        if xq.device.type != "cuda":
+            raise IQ2MMA16TCError("iq2_mma16_tc requires CUDA tensors")
+        E = int(eids.numel())
+        for name, t in [("xq", xq), ("xs", xs), ("packed_gate", packed_gate),
+                        ("packed_up", packed_up), ("eids", eids), ("grid", grid),
+                        ("ksigns", ksigns), ("out_gate", out_gate), ("out_up", out_up)]:
+            if not t.is_contiguous():
+                raise IQ2MMA16TCError(f"{name} must be contiguous")
         self._launch(
             ctypes.c_void_p(xq.data_ptr()),
             ctypes.c_void_p(xs.data_ptr()),
@@ -193,6 +228,47 @@ class NativeIQ2MMA16TCLibrary:
         ]
         launch.restype = None
         out = torch.empty((E, m_pad, rows), dtype=torch.float32, device=xq.device)
+        self.single_down_into(xq, xs, packed, eids, grid, ksigns, out,
+                              rows=rows, cols=cols, stride=stride, m_pad=m_pad)
+        return out
+
+    def single_down_into(
+        self,
+        xq,
+        xs,
+        packed,
+        eids,
+        grid,
+        ksigns,
+        out,
+        *,
+        rows: int,
+        cols: int,
+        stride: int,
+        m_pad: int,
+    ):
+        """Like ``single_down`` but writes into a caller-owned buffer (graph-safe)."""
+
+        if not _SINGLE_LIBRARY_PATH.is_file():
+            raise IQ2MMA16TCError(
+                f"IQ2 MMA16 TC single library is missing: {_SINGLE_LIBRARY_PATH}"
+            )
+        if xq.device.type != "cuda":
+            raise IQ2MMA16TCError("iq2_mma16_tc single requires CUDA tensors")
+        E = int(eids.numel())
+        for name, t in [("xq", xq), ("xs", xs), ("packed", packed),
+                        ("eids", eids), ("grid", grid), ("ksigns", ksigns), ("out", out)]:
+            if not t.is_contiguous():
+                raise IQ2MMA16TCError(f"{name} must be contiguous")
+        library = ctypes.CDLL(str(_SINGLE_LIBRARY_PATH))
+        launch = library.iq2_mma16_tc_launch_single
+        launch.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ]
+        launch.restype = None
         launch(
             ctypes.c_void_p(xq.data_ptr()),
             ctypes.c_void_p(xs.data_ptr()),
@@ -288,8 +364,10 @@ def grouped_moe_prefill_k32(
     xq[e1, within1] = xq_flat[rt[gidx1]]
     xs[e1, within1] = xs_flat[rt[gidx1]]
     w[e1, within1] = rw[gidx1]
-    gate, up = library.grouped_gate_up(
-        xq, xs, gate_packed, up_packed, eids, grid, ksigns,
+    gate = torch.empty(n_experts, bucket, inter, dtype=torch.float32, device=flat.device)
+    up = torch.empty_like(gate)
+    library.grouped_gate_up_into(
+        xq, xs, gate_packed, up_packed, eids, grid, ksigns, gate, up,
         rows=inter, cols=hidden, stride=stride_g, m_pad=bucket,
     )
     h = torch.nn.functional.silu(torch.clamp(gate, max=swiglu_limit)) * \
@@ -297,8 +375,9 @@ def grouped_moe_prefill_k32(
     hq, hs = _preq(h.reshape(-1, inter))
     hq = hq.reshape(n_experts, bucket, inter)
     hs = hs.reshape(n_experts, bucket, inter // 32)
-    down = library.single_down(
-        hq, hs, down_packed, eids, grid, ksigns,
+    down = torch.empty(n_experts, bucket, hidden, dtype=torch.float32, device=flat.device)
+    library.single_down_into(
+        hq, hs, down_packed, eids, grid, ksigns, down,
         rows=hidden, cols=inter, stride=stride_d, m_pad=bucket,
     )
     contrib[gidx1] = (down * w.unsqueeze(-1))[e1, within1]
@@ -324,17 +403,20 @@ def grouped_moe_prefill_k32(
         xq[e2, within2] = xq_flat[rt[gidx2]]
         xs[e2, within2] = xs_flat[rt[gidx2]]
         w[e2, within2] = rw[gidx2]
-        gate, up = library.grouped_gate_up(
-            xq, xs, gate_packed, up_packed, over_eids, grid, ksigns,
+        gate2 = torch.empty(n_over, b2_bucket, inter, dtype=torch.float32, device=flat.device)
+        up2 = torch.empty_like(gate2)
+        library.grouped_gate_up_into(
+            xq, xs, gate_packed, up_packed, over_eids, grid, ksigns, gate2, up2,
             rows=inter, cols=hidden, stride=stride_g, m_pad=b2_bucket,
         )
-        h = torch.nn.functional.silu(torch.clamp(gate, max=swiglu_limit)) * \
-            torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+        h = torch.nn.functional.silu(torch.clamp(gate2, max=swiglu_limit)) * \
+            torch.clamp(up2, min=-swiglu_limit, max=swiglu_limit)
         hq, hs = _preq(h.reshape(-1, inter))
         hq = hq.reshape(n_over, b2_bucket, inter)
         hs = hs.reshape(n_over, b2_bucket, inter // 32)
-        down = library.single_down(
-            hq, hs, down_packed, over_eids, grid, ksigns,
+        down = torch.empty(n_over, b2_bucket, hidden, dtype=torch.float32, device=flat.device)
+        library.single_down_into(
+            hq, hs, down_packed, over_eids, grid, ksigns, down,
             rows=hidden, cols=inter, stride=stride_d, m_pad=b2_bucket,
         )
         contrib[gidx2] = (down * w.unsqueeze(-1))[e2, within2]
