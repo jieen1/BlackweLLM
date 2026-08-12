@@ -2,8 +2,10 @@
 
 > 日期：2026-08-12
 >
-> 状态：**已完成规划评审，待实施。K32 grouped IQ2 Tensor-Core MoE 是唯一主线；
-> 旧 global/circular row-W8 路线保持关闭。**
+> 状态：**Phase B 预检失败（2026-08-12）：K32 真实 core 17.06 ms 占满 MoE 17 ms
+> 预算，完整 MoE layer 21.97 ms。single-output down 已落地（~2x 于 down 段），
+> 但 gate+up 与 glue 仍超。K32 主线触发失败，§9 CTA-local reopen 是剩余候选。
+> 证据见 `../notes/2026-08-12-dsv4-prefill-1k-confirmation.md`。**
 >
 > 代码基线：`qwen-sm120-runtime main@6be316f`，与 `origin/main` 一致。
 >
@@ -79,10 +81,17 @@ full-model stage gate    = 990 ms
 ```
 
 旧 2K 计划每层只有 `11.91 ms`，所以 K32 candidate 的 gate+up `6.93 ms` + down
-`6.92 ms` 必然失败。目标改为 1K 后，同一 `13.85 ms` kernel core 第一次进入
-`22.50 ms/layer` 的可行区。因此这不是把旧失败改名，而是重新核算后改变候选排序。
+`6.92 ms` 必然失败。目标改为 1K 后，同一候选第一次进入 `22.50 ms/layer` 的
+可行区。因此这不是把旧失败改名，而是重新核算后改变候选排序。
 
-这些数字仍是 candidate measurement，尚无 bfdiag run record，不能当作完整 MoE 已通过。
+**2026-08-12 实测修正**（见 `notes/2026-08-12-dsv4-prefill-1k-confirmation.md`）：
+- 文档引用的 `13.85 ms`（gate+up 6.93 + down 6.92）基于 eff_pad=32 + 复制
+  权重（32 unique × 8），**低估真实成本**；
+- 真实 256 unique experts + eff_pad=48：gate+up **8.81 ms**、single-output
+  down **8.25 ms**、**K32 kernel core 17.06 ms**（已占满 MoE 17 ms 预算）；
+- 完整 MoE layer（无 shared/attention）实测 **21.97 ms**；
+- single-output down 已落地（11.45→5.73 ms @ eff_pad=32，~2x），但不足以
+  弥合缺口。**K32 all-in gate 已触发失败**，见 §7 Phase B。
 
 ### 2.3 每层预算
 
@@ -246,8 +255,11 @@ effective hit、anchor、recurrent/window state 与旧路径一致。
 - 接 SparkInfer 的现有 planned/bind surface，只补 IQ2 lowering/kernel；
 - 达到 §5.3 all-in gate。
 
-失败处理：冻结 trace/profile，停止 K32。只有此时才允许按 §9 CTA-local reopen contract
-重新评审，不自动切换。
+**2026-08-12 预检失败**：真实 256 experts + eff_pad=48 下，仅 gate+up（8.81 ms）
++ single-output down（8.25 ms）已 **17.06 ms**，占满 MoE 17 ms 预算；完整 MoE
+layer（无 shared/attention）21.97 ms。按评审"不能进入 17-18 ms 应立即判失败"
+触发。失败处理：冻结 trace/profile，停止 K32。只有此时才允许按 §9 CTA-local
+reopen contract 重新评审，不自动切换。
 
 ### Phase C：bounded superchunk correctness
 
