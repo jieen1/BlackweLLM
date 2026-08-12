@@ -128,6 +128,7 @@ iq2_mma16_tc_single_kernel(
                 facc[mt][3] += (float)cg[3] * sB[1] * xs1;
             }
         }
+        __syncthreads();   // all warps done reading sid/sB before next kb decode
     }
 
 #pragma unroll 1
