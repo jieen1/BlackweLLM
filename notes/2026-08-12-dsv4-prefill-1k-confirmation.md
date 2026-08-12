@@ -206,3 +206,19 @@ graph 消除 CPU 101ms）**，但 batch2 动态 n_over 阻止 graph。
 **质量优先路径的最终判断**：kernel 13ms 达标（质量 0.999896），但完整
 MoE 22.26ms 被 CPU-bound glue（~6ms host sync + Python 开销）拖住。
 device-side pipeline 是唯一剩余路径，需解决 batch2 固定形状。
+
+## 13. K32 kernel race 修复 + CUDA graph 状态（2026-08-12）
+
+修复 `iq2_mma16_tc.cu` / `iq2_mma16_tc_single.cu` 缺 `__syncthreads` 的
+smem race（racecheck 2.2M hazards → 0）。修复后 eager K32 MoE **cos 1.0**
+（bit-exact vs python grouped）。加确定性 within（argsort-based，graph-safe）。
+
+**CUDA graph 捕获**：完整 MoE（batch1+batch2）捕获成功，replay **15.7-16.5ms
+< 17ms 达标**。但 **down 输出 graph != eager**（cos 0.565），即使 hq1/hs1/
+gate 全 graph==eager。单 kernel 单独 graph==eager；组合中 down 错。
+
+**分析**：down 是 pipeline 第二个 kernel，graph 捕获后执行与 eager 不同，
+疑似 CUDA graph 对自定义 kernel 的指令序列化差异。**标记未完成**。
+
+**当前交付**：eager K32 完整 MoE cos 1.0，22.26ms（质量优先、正确）。
+CUDA graph 16ms 需进一步调试（可能需 kernel 级改造）。
