@@ -174,3 +174,20 @@ CUDA graph 捕获失败（grouped_moe_prefill_k32 有动态 allocation / 不定�
 
 **当前状态**：K32 完整 MoE 质量达标、性能 22.26ms（vs exact 32.65，1.47x）。
 device-side grouping 是唯一明确的剩余路径。
+
+## 11. device-side grouping 探索（2026-08-12）
+
+实现 Triton device counts/within/fill kernel（`dsv4_grouping.py`）：
+- counts/within 正确（eager 全 256 expert 校验通过），CUDA graph 可捕获
+  （5 replay 一致）；
+- **device-group eager 25.56ms 不优于 python glue 22.26ms**：每调用新建
+  buffers + atomic kernel 开销；
+- **batch2 动态 n_over 阻止完整 graph 捕获**（固定 [256,16] 全跑浪费 6.59ms）。
+
+**结论**：device grouping 的 graph 潜力（~15ms）需完整重构（固定 batch2
+上限 + 消除所有 alloc），工程量大且 batch2 动态性是障碍。**当前最优仍是
+python glue 22.26ms**（质量 0.999896 达标）。
+
+**最终状态**：K32 完整 MoE（质量优先）22.26ms vs exact 32.65ms（1.47x）。
+进 17ms 需消除 ~5.3ms host sync，路径是完整 device pipeline（SparkInfer
+recipe 工程），当前未达成。
