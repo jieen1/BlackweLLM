@@ -116,3 +116,24 @@ compute_120f 不可用。故手写 m16n8k16.s8.s8.s32 GEMM（指令峰值实测 
 需要更大的 N-per-block（整 B 一次读）或 persistent kernel + 显式 L2 管理，
 超出当前原型范围。真实 IQ2 转码的 circular scratch 可能改善局部性，但
 当前证据不支撑 >=90% 目标。
+
+## 补充 2：transcode 与 W8 缓存矛盾（2026-08-12，C0 生死门判定）
+
+实现并验证了 IQ2→row-W8 transcode（两 pass 并行，32us/expert，数值正确：
+scale/w8 与 python 逐行 1.0000 匹配）。GEMM 原型 M=512 达 121 TFLOPS。
+
+**但组合暴露 C0 致命矛盾**：
+1. W8 每 expert 8MB（gate 或 up 单矩阵）。全 256 experts × 3（gate/up/down）=
+   6GB W8。超出 C0 scratch 上限 256MiB（文档 §4.2）。
+2. 若每 token 重新 transcode：256 experts × 32us = 8.1ms/矩阵种类，
+   gate+up+down = 24ms。远超 2.4/1.3ms。
+3. 只有 transcode 一次性（启动 prewarm）才可行，但 W8 6GB 无地可放。
+
+**C0 判定**：row-W8 表示本身可行（GEMM 121 TFLOPS、transcode 正确），但
+**W8 的"生成一次 vs 常驻"矛盾无解**——circular scratch（每 tile 重新
+transcode）使 transcode 成为 per-token 瓶颈（24ms），常驻 W8 超内存。
+加上 L2 hit 23%（B 分片消费），C0 的 2.4/1.3ms 和 >=90% L2 门禁均未达。
+
+这与 Phase 2B 的 int8-codebook DRAM 死结是同一结构：**放大驻留（W8）换取
+零 decode，代价是内存/带宽，最终都撞墙**。row-W8 只是把 decode 成本换成
+了 transcode+W8 带宽成本。
