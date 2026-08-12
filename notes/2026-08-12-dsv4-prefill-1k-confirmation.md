@@ -222,3 +222,15 @@ gate 全 graph==eager。单 kernel 单独 graph==eager；组合中 down 错。
 
 **当前交付**：eager K32 完整 MoE cos 1.0，22.26ms（质量优先、正确）。
 CUDA graph 16ms 需进一步调试（可能需 kernel 级改造）。
+
+## 14. CUDA graph 修复：ctypes kernel 依赖缺失（2026-08-12）
+
+**根因**：`grouped_gate_up_into`/`single_down_into` 用 `tensor.data_ptr()`
+（ctypes）launch，torch 不知道 kernel 读输入 → CUDA graph 捕获时**无依赖边**，
+down 可能与 preq_out 并发读旧 hq1。
+
+**修复**：每个 ctypes kernel 前加 `dep.copy_(输入.sum())` 建立依赖（graph-safe
+固定形状）。**graph replay cos 1.0（bit-exact），17.24ms**。
+
+**当前状态**：CUDA graph 完整 K32 MoE **cos 1.0, 17.24ms**（vs eager 22.26ms，
+1.29x；vs exact 32.65ms，1.89x）。略超 17ms 目标 1.4%，可精简 dep 优化。
