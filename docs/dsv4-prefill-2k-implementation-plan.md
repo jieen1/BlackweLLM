@@ -1,6 +1,9 @@
 # DSV4 单卡 prefill ≥2000 tok/s：2026-08-12 重设计与实施合同
 
-> 状态：**Phase 2B 已关闭；新的唯一候选是 L2-resident、按专家小分块的 transient row-W8A8 路径。**
+> 状态：**Phase 2B 已关闭；row-W8A8 候选 Phase C0 已实测并判定失败（circular
+> transcode 28ms gate+up vs 2.4ms 门禁，W8 常驻 6.4GB 超内存，L2 hit 23%）。
+> §9 分支 (b)/(c) 待用户定夺：重新核算 6.5ms/layer 预算，或如实记录 2K 在当前
+> 约束下无已知可实现路径。**
 >
 > 本文基线：`qwen-sm120-runtime main@882d209`，审计时与 `origin/main` 一致。
 >
@@ -274,52 +277,23 @@ Phase C0 的后端选择固定，不留给实现者二次选型：
 
 ## 7. 实施阶段
 
-### Phase C0：representation 与 L2 生死门
+### Phase C0：representation 与 L2 生死门 — **已实测，判定失败**
 
-只做 real-layer candidate，不改 backend。
+2026-08-12 实测完成（见 `notes/2026-08-12-dsv4-prefill-row-w8-replan-evidence.md`）：
+- 手写 s8×s8→s32 W8A8 GEMM（CUTLASS 4.6.1 SM120 无 s8 builder，TCGEN05 s8
+  在 compute_120f 不可用，故手写 m16n8k16）验证正确，M=512 达 121 TFLOPS；
+- IQ2→row-W8 transcode 两 pass 并行实现，数值与 oracle 逐行 1.0000 匹配；
+- **端到端 tile_E=4 circular：0.220ms/tile × 64 = 14.1ms（gate alone），
+  28.2ms gate+up，超 2.4ms 门禁 11.8x**。
 
-必须交付：
+**判定失败的三重约束**：
+1. per-token transcode 主瓶颈（74%），已近 DRAM 下限，无数量级优化空间；
+2. W8 常驻 6.4GB（gate+up+down × 256 experts）超内存，与 256MiB scratch
+   和 2×128K KV 冲突；
+3. GEMM L2 hit 23%（B 分片消费），DRAM-bound。
 
-1. 真实 GGUF 多层、多 expert、真实 1024-token route capture；
-2. row-W8/per-token-A8 的 projection、routed MoE、layer 输出误差分布；gate/up projection
-   各自 `cos_min >=0.9999`，routed MoE 和完整 layer 各自 `cos >=0.9990`；
-3. `tile_E={1,2,4,8}` 的 transcode、GEMM、combined p50/p90；
-4. gate+up `<=2.4 ms`、down `<=1.3 ms`；
-5. W8 consumer L2 hit rate `>=90%`；
-6. gate+up DRAM 总流量 `<2.0 GiB`，down `<1.0 GiB`；
-7. 100 replay 无 allocation、host sync、JIT；
-8. scratch 总量 `<=256 MiB`、hot W8 working set `<=80 MiB`；
-9. bfdiag run id、`bf diff` 和 trace；失败时附 Nsight breakdown。
-
-第 2–8 项任一失败即 C0 失败，不进入 C1。C0 的观测来源固定为：
-
-| 证据 | 唯一来源 |
-|---|---|
-| config、route capture、p50/p90、quality、scratch bytes | bfdiag reusable operation + run record |
-| `dram__bytes_read/write`、L2 hit、tensor/SM throughput | Nsight Compute，成功和失败都必须保存 `.ncu-rep` |
-| replay 区间内 D2H、`cudaDeviceSynchronize` | Nsight Systems NVTX capture，成功和失败都必须保存 `.nsys-rep` |
-| allocation | replay 前后 `torch.cuda.memory_stats()` delta + operation 内 allocator counter |
-| JIT | candidate `.so`/manifest 在 run 前存在；100 replay 区间不得出现 compiler 子进程或 cache miss |
-
-计数器采集命令合同如下；`<replay-command>` 由 C0 bfdiag operation 的 run record 原样记录，
-不得另写一次性 benchmark：
-
-```bash
-ncu --target-processes all --kernel-name-base function \
-  --kernel-name 'regex:iq2_row_w8_transcode|w8a8_grouped_sm120' \
-  --metrics gpu__time_duration.sum,dram__bytes_read.sum,dram__bytes_write.sum,lts__t_sector_hit_rate.pct,sm__throughput.avg.pct_of_peak_sustained_elapsed \
-  -o <run-id>-c0 -- <replay-command>
-
-nsys profile --trace=cuda,nvtx --capture-range=nvtx --capture-range-end=stop \
-  -o <run-id>-c0-sync -- <replay-command>
-```
-
-`.ncu-rep` / `.nsys-rep` 的绝对路径和 SHA256 写入对应 bfdiag run record；不能只在 note 中抄
-几个 counter。若本机 Nsight 版本的 metric 名称变化，先用 `ncu --query-metrics` 解析等价项，
-并把最终名称写入 run config。
-
-`tile_E=8` 预期因超过 L2 working set 变差，是验证假设的负对照。若 `tile_E=2/4` 仍产生接近
-逻辑 W8 大小的 DRAM 写回，或 combined kernel 仍超 2.4/1.3 ms，本路线立即关闭。
+row-W8 与 Phase 2B int8-codebook 同构死结：放大驻留换零 decode，代价是
+带宽/内存。**§9 分支 (b)/(c) 待定夺：重新核算预算或记录未证可达。**
 
 ### Phase C1：candidate kernel
 
@@ -444,20 +418,19 @@ C0/C1 必须新增自己的 build target 和严格质量 test；不得继续复�
 
 ## 11. 下一个可提交里程碑
 
-下一个提交只能是 **Phase C0 feasibility package**，不能改 production backend。它必须同时包含：
+**Phase C0 已实测并判定失败**（2026-08-12，见 §7）。C0 的第 8 项"二选一结论"
+已落到**未通过分支**：
 
-1. 可复用的 real-route bfdiag operation；
-2. row-W8/per-token-A8 多层质量 sweep；
-3. 基于 CUTLASS 4.6.1、固定 M_PAD=32 的独立 transcode + W8A8 candidate artifact；
-4. `tile_E=1/2/4/8` circular scratch benchmark；
-5. gate+up/down p50/p90 与 DRAM/L2 counters；
-6. 100 replay、scratch bytes、无 sync/allocation/JIT 证据；
-7. bfdiag baseline/candidate run ids 与 `bf diff`，以及两份 Nsight report 的 SHA256；
-8. 一个二选一结论：
-   - 通过 `2.4/1.3 ms` 和质量门禁，进入 C1；
-   - 未通过，正式记录“当前 IQ2_XS + 单 SM120 + 当前质量/容量约束下 2K 无已知可实现路径”。
+- 手写 s8 W8A8 GEMM 正确（cos 0.999998）且 M=512 达 121 TFLOPS；
+- IQ2→row-W8 transcode 正确（逐行 1.0000 匹配）；
+- 但端到端 circular tile_E=4 实测 28.2ms gate+up（超 2.4ms 门禁 11.8x），
+  W8 常驻 6.4GB 超内存，GEMM L2 hit 23%。
 
-在 C0 有证据前，不再接受新的 IQ2 microkernel 猜测分支。
+在 C0 判定后，不再接受新的 IQ2 microkernel 或 W8/W4 transient 猜测分支。
+下一步是 **§9 分支 (b)/(c) 的用户定夺**：
+- (b) 重新核算 6.5ms/layer MoE 预算（接受 gate+up ~28ms 现实）；
+- (c) 如实记录"当前 IQ2_XS + 单 SM120 + 质量/容量约束下 2K 无已知可实现路径"，
+  把 2K 目标降级或改为服务层决策。
 
 ## 12. 外部依据
 
