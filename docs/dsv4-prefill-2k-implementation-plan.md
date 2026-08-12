@@ -1,4 +1,8 @@
-# DSV4 单卡 prefill ≥2000 tok/s：2026-08-12 重设计与实施合同
+# DSV4 单卡 prefill >=2000 tok/s：历史失败合同
+
+> **SUPERSEDED（2026-08-12）**：用户将发布目标调整为 `>=1000 tok/s`。当前实施合同是
+> [`dsv4-prefill-1k-implementation-plan.md`](dsv4-prefill-1k-implementation-plan.md)。
+> 本文保留 2K 路线的失败证据和决策过程，不再用于安排新开发。
 
 > 状态：**Phase 2B 已关闭；row-W8A8 候选 Phase C0 已实测并判定失败（circular
 > transcode 28ms gate+up vs 2.4ms 门禁，W8 常驻 6.4GB 超内存，L2 hit 23%）。
