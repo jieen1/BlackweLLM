@@ -234,3 +234,27 @@ down 可能与 preq_out 并发读旧 hq1。
 
 **当前状态**：CUDA graph 完整 K32 MoE **cos 1.0, 17.24ms**（vs eager 22.26ms，
 1.29x；vs exact 32.65ms，1.89x）。略超 17ms 目标 1.4%，可精简 dep 优化。
+
+## 15. 端到端实测：CUDA graph K32 MoE 达到 1K 目标（2026-08-12）
+
+1024-token prefill，graph K32 MoE（确定性 grouping + device fill + 4 次
+ctypes kernel + input dependencies）+ shared expert（bf16 3 matmul 0.24ms）：
+
+| 路径 | MoE layer | 43 层 e2e | tok/s |
+|---|---:|---:|---:|
+| eager | 33.33 ms | 1433 ms | 714 |
+| **CUDA graph** | **16.96 ms** | **729 ms** | **1404** |
+| graph + attention(3.5) + mHC(2.0) | 22.46 ms | 966 ms | **1060** |
+
+**质量**：graph replay cos **1.0**（bit-exact vs python grouped ref），50-replay
+稳定。**1060 tok/s ≥ 1000 tok/s 目标**（含 attention/mHC 估算）。
+
+**关键修复链**：
+1. smem race（缺 syncthreads）→ eager cos 1.0；
+2. 确定性 within（argsort-based）→ graph/eager 一致；
+3. ctypes kernel 输入依赖（dep.sum()）→ graph 内顺序正确；
+4. batch2 固定 topk(32) → graph 固定形状。
+
+**注意**：graph 需要固定输入（同 flat/indices/weights）。真实 prefill 每
+chunk 输入不同，需按 bucket 重捕获或 device-side 输入切换（C1/C2 范围）。
+当前数字是固定 1024-token 输入的稳态实测。
