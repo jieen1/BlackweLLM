@@ -79,3 +79,32 @@ eff_pad=48 是 8.81ms（vs 文档 6.93），down single 8.25ms。
    launch）——可测，但 max_routes=42 是真实分布；
 2. gate+up decode 优化（增大每 block ROWS 摊薄 decode 权重读，N128 曾失败）；
 3. 接受 1K 目标需要进一步预算放宽（如 20ms/layer 级 MoE）。
+
+## 7. CTA-local row-W8 探索（§9 reopen 候选）
+
+K32 失败后按 §9 探索 CTA-local row-W8（decode-to-smem + 整行 scale，消除
+per-K32 facc 链）：
+
+| 变体 | E=256 eff_pad=48 | 说明 |
+|---|---:|---|
+| K32 gate+up（facc 链） | 8.81 ms | 基线 |
+| K32 down single | 8.25 ms | 已落地 |
+| row-W8 no-facc down | 6.48 ms | facc 消除 |
+| row-W8 no-facc gate+up（合并） | 8.50 ms | 共享 decode |
+| **CTA-local core（no-facc）** | **15.21 ms** | 目标 <=14 |
+
+- facc 消除带来 17.06 → 15.21 ms（1.12x）；
+- **仍超 14 ms 目标 8%**，且用 placeholder row scale（真实 Phase 1 扫全行
+  scale 有额外成本）；
+- **数值**：row-W8 down cos 0.99965（prescreen 实测），<0.9999 kernel gate，
+  仅满足 >=0.9990 routed gate；
+- Phase 1（整行 scale）的 atomicMax 正确性调试未完成（smem atomicMax 行为
+  异常，改用归约需额外工作）。
+
+**结论**：CTA-local row-W8 接近但不达标——core 15.21 vs 14，数值 down
+0.99965。**两个候选（K32 17.06、CTA-local 15.21）均未满足 §5.3/§9 门禁**。
+当前 1K 目标的 K32 complete MoE 与 CTA-local row-W8 都无已证路径。
+
+剩余判断：1K 目标在"gate+up+down core <=14ms"（含质量 0.9999）约束下，
+现有 IQ2 decode-to-smem + mma 组织在真实 256 experts + eff_pad=48 下
+不可达。需用户重新定夺预算或探索其他组织。
