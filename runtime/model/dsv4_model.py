@@ -579,7 +579,22 @@ class Dsv4MoE(nn.Module):
                 routed = self._batch_expert_gemm(self.down_exps, eids, h)
                 y = (routed * wts[:, None, None]).sum(dim=0).to(torch.float32)
             else:
-                y = self._route_expanded_prefill(flat, weights, indices)
+                from runtime.kernels.iq2_mma16_tc import grouped_moe_prefill_k32
+
+                grid_t, ksigns_t, _ = self.gate_exps.tables()
+                y = grouped_moe_prefill_k32(
+                    flat,
+                    weights,
+                    indices,
+                    self.gate_exps.packed,
+                    self.up_exps.packed,
+                    self.down_exps.packed,
+                    grid_t,
+                    ksigns_t,
+                    inter=self.gate_exps.rows,
+                    hidden=self.gate_exps.cols,
+                    swiglu_limit=limit,
+                )
         else:
             # CPU fallback: per-expert eager dequant (small/rare path)
             routed_ids = torch.unique(indices.reshape(-1))
