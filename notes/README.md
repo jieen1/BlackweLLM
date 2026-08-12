@@ -1,6 +1,6 @@
 # notes/ 索引
 
-> 编制日期：2026-08-01 · 共 123 篇（`git ls-files notes | wc -l`）
+> 编制日期：2026-08-12 · 共 223 篇（`git ls-files notes | wc -l`，包含本次新增）
 
 `notes/` 是**调查记录与证据档案**，不是文档。它的价值在于：当一个结论被
 质疑时，能翻出当初的实测数据、复现命令和被排除的假设。
@@ -45,6 +45,7 @@
 | `2026-08-10-dsv4-q8-warprow-gate-regression.md` | **DSV4 Q8_0 warp-per-row 优化未过门禁的完整说明**——单 kernel 正确（与 tl.dot maxdiff 0）但门禁 3-workload 漂移（0.99903 vs 基线 0.99999988）。含现象、已确证事实、尝试方案、未解疑点（soa_planes 懒构建与 graph pool 交互、逐层定位建议）。已回滚，门禁 PASS。**接手者先读此文档** |
 | `2026-08-10-dsv4-prefill-moe-kernel-deep-dive.md` |
 | `2026-08-11-dsv4-phase2-int8-mma.md` | **Phase 2：IQ2 INT8 Tensor-Core grouped MoE**——exact `mma.sync.m16n8k16` 已落地并达到 cos 1.0；真实 1024-token 形状 gate+up 14.8 ms、grouped routed pipeline 32 ms（router/shared expert 未包含），未过 router+routed+shared `<=6.5 ms/layer` kill gate。exact 路径保留为 oracle，下一条候选验证为 scale-amortized INT8 MMA Phase 2B；旧 Triton 4.6ms 估算因数值不合格不再作为可达性证据 | **DSV4 prefill MoE kernel 性能深挖**——dp4a 已落地并将 76 提到 129 tok/s；2026-08-11 复测 64-row 稳态 131.8–133.3 tok/s。MoE 占 M32 chunk 83%，route-M1 IQ2 解码已接近指令流上限；warp-row 只再快 1.2×。达到几千 tok/s 必须改为 layer-major superchunk + expert-grouped Tensor-Core 路线，实施合同见 `../docs/dsv4-prefill-2k-implementation-plan.md`。含长上下文状态和显存边界。 |
+| `2026-08-12-dsv4-prefill-row-w8-replan-evidence.md` | **DSV4 单卡 2K prefill 重规划证据**——审计 `main@882d209`，记录 128 MiB L2、可复现的 row-W8/per-token-A8 single-expert 数值预筛、global W8 流量下限和证据缺口；只授予 Phase C0 可行性验证资格，不构成性能通过结论。 |
 
 ## 2. 已定案的根因分析 🟢
 
