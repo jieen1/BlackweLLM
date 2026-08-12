@@ -2,9 +2,10 @@
 
 > 日期：2026-08-12
 >
-> 状态：**Phase B 预检失败（2026-08-12）：K32 真实 core 17.06 ms 占满 MoE 17 ms
-> 预算，完整 MoE layer 21.97 ms。single-output down 已落地（~2x 于 down 段），
-> 但 gate+up 与 glue 仍超。K32 主线触发失败，§9 CTA-local reopen 是剩余候选。
+> 状态：**Phase B 预检失败（2026-08-12）；CTA-local row-W8（§9 reopen）也已实测
+> 判定失败——性能可行（eff_pad=32 拆分 core 11.56ms）但整行 scale 使 down/
+> routed cos 0.99965 < 0.9990 门禁。K32（数值 0.99990 ✓ 但 core 17.06ms ✗）与
+> CTA-local（性能 ✓ 但数值 ✗）各缺一半，均无完整已证路径。**
 > 证据见 `../notes/2026-08-12-dsv4-prefill-1k-confirmation.md`。**
 >
 > 代码基线：`qwen-sm120-runtime main@6be316f`，与 `origin/main` 一致。
@@ -341,6 +342,15 @@ MoE 未过 §5.3 时，新的设计同时满足以下条件，才允许重新进
 - NCU 直接证明 DRAM write、L2、SM/instruction counters，而不是从 wall time 推断。
 
 当前 `/tmp` probe 的 6.42/6.35 ms 只证明这种组织值得保留为研究线索，不满足重开条件。
+
+**2026-08-12 实测判定**：CTA-local row-W8 已按此合同实测——
+- 性能：eff_pad=32（route 拆分）core 11.56 ms 达标，但 eff_pad=48（真实）15.47 ms；
+- **数值失败**：整行 scale 使 down cos 0.99965、routed MoE out cos 0.99965，
+  <0.9990 门禁（prescreen 实测，row-scale 是表示固有属性）；
+- Phase 1 整行 scale 的 smem atomicMax 归约需额外正确性工作。
+
+**CTA-local 因数值不达标排除**。K32 因性能不达标（17.06 ms）排除。两者互补
+但无完整已证路径。
 
 ## 10. ADR
 
