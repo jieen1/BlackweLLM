@@ -97,3 +97,22 @@ gate/up per-row cosine 过 0.9999、传播后 cosine 仍高于 0.999；最终仍
 因此下一步只能执行
 [`../docs/dsv4-prefill-2k-implementation-plan.md`](../docs/dsv4-prefill-2k-implementation-plan.md)
 的 Phase C0，不能接 production backend，也不能宣称 2K 已证可达。
+
+## 补充：手写 W8A8 GEMM 原型（2026-08-12）
+
+CUTLASS 4.6.1 的 SM120 builder 只支持 F8F6F4 MMA（无 s8），TCGEN05 s8 在
+compute_120f 不可用。故手写 m16n8k16.s8.s8.s32 GEMM（指令峰值实测 198 TOPS）。
+
+手写 kernel（/tmp/opencode/iq2_w8a8_probe.cu）已正确（cos 0.999998）：
+- BLOCK_M=32、cp.async A + 预转置 n-major B staging
+- M=512 shared-B 达 121 TFLOPS；batched B 73 TFLOPS @ M=256
+- gate+up 估计 2.75-3.67ms（target 2.4）、down 1.34-2.7ms（target 1.3）
+
+**关键失败点：L2 hit 只有 23%**（C0 门禁要求 >=90%）。原因：B 的 N=128
+分片消费，B 在 L2 中未被充分复用；tile_E=4（B=64MB）和 tile_E=8（B=128MB）
+都只有 ~23% hit。DRAM 100% 饱和。
+
+结论：**C0 的 L2 生死门（>=90% hit）在现 kernel 结构下失败**。B 的 L2 复用
+需要更大的 N-per-block（整 B 一次读）或 persistent kernel + 显式 L2 管理，
+超出当前原型范围。真实 IQ2 转码的 circular scratch 可能改善局部性，但
+当前证据不支撑 >=90% 目标。
