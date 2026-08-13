@@ -15,6 +15,7 @@
 // verified in tools/prescreen_iq2_kgroup_fold.py: K32 gate cos >= 0.9999.
 #define QSR_EXPORT __attribute__((visibility("default")))
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cstdint>
 
 #define MAX_MTILES 8    // M_PAD <= 128
@@ -280,7 +281,7 @@ extern "C" QSR_EXPORT void moe_group_launch(
 // ---------------------------------------------------------------------------
 __global__ void moe_gather_xq_kernel(
     const int8_t* __restrict__ xq_flat,   // [M, COLS]
-    const float* __restrict__ xs_flat,   // [M, COLS/32]
+    const __nv_bfloat16* __restrict__ xs_flat,   // [M, COLS/32]
     const int32_t* __restrict__ compact_route,  // [R]
     int8_t* __restrict__ compact_xq,     // [R, COLS]
     float* __restrict__ compact_xs,      // [R, COLS/32]
@@ -290,15 +291,15 @@ __global__ void moe_gather_xq_kernel(
     if (i >= R) return;
     const int token = compact_route[i];
     const int8_t* sxq = xq_flat + (int64_t)token * COLS;
-    const float* sxs = xs_flat + (int64_t)token * (COLS / 32);
+    const __nv_bfloat16* sxs = xs_flat + (int64_t)token * (COLS / 32);
     int8_t* dxq = compact_xq + (int64_t)i * COLS;
     float* dxs = compact_xs + (int64_t)i * (COLS / 32);
     for (int c = 0; c < COLS; ++c) dxq[c] = sxq[c];
-    for (int c = 0; c < COLS / 32; ++c) dxs[c] = sxs[c];
+    for (int c = 0; c < COLS / 32; ++c) dxs[c] = __bfloat162float(sxs[c]);
 }
 
 extern "C" QSR_EXPORT void moe_gather_xq_launch(
-    const int8_t* xq_flat, const float* xs_flat, const int32_t* compact_route,
+    const int8_t* xq_flat, const __nv_bfloat16* xs_flat, const int32_t* compact_route,
     int8_t* compact_xq, float* compact_xs, int R, int COLS, cudaStream_t stream)
 {
     const int block = 256;
@@ -377,7 +378,7 @@ iq2_mma16_tc_dynamic_kernel(
     const int row0 = rowbase + warp * 8;
     const int l4 = lane % 4, lg = lane / 4;
     const int k0 = l4 * 4;
-    constexpr int M_PAD_C = 64;
+    constexpr int M_PAD_C = 512;
     const int n_mtiles = M_PAD_C / 16;
     const int n_kblocks = COLS / 256;
 
@@ -390,8 +391,8 @@ iq2_mma16_tc_dynamic_kernel(
     const int64_t xsbase = (int64_t)expert_bounds[e] * (COLS / 32);
     const int route_hi = expert_bounds[e + 1];
 
-    float facc_g[4][4] = {};
-    float facc_u[4][4] = {};
+    float facc_g[32][4] = {};
+    float facc_u[32][4] = {};
 
     const uint8_t* wg_base = packed_gate + (int64_t)eid * ROWS * STRIDE + (int64_t)rowbase * STRIDE;
     const uint8_t* wu_base = packed_up + (int64_t)eid * ROWS * STRIDE + (int64_t)rowbase * STRIDE;

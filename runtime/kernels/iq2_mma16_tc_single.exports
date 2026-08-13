@@ -1,5 +1,6 @@
 {
   global:
     iq2_mma16_tc_launch_single;
+    iq2_mma16_tc_launch_single_dynamic;
   local: *;
 };

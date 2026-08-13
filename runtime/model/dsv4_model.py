@@ -604,6 +604,30 @@ class Dsv4MoE(nn.Module):
         y = y + self._shared_forward(flat)
         return y.to(x.dtype).reshape(*x.shape[:-1], y.shape[-1])
 
+    def forward_dynamic(self, x: torch.Tensor, input_ids: torch.Tensor | None) -> torch.Tensor:
+        """Prefill MoE using per-expert compact dynamic GEMMs (llama.cpp style)."""
+        flat = x.reshape(-1, x.shape[-1])
+        weights, indices = self.gate(flat, input_ids.reshape(-1) if input_ids is not None else None)
+        limit = self.config.swiglu_limit
+        from runtime.kernels.iq2_mma16_tc import grouped_moe_prefill_k32_dynamic
+
+        grid_t, ksigns_t, _ = self.gate_exps.tables()
+        y = grouped_moe_prefill_k32_dynamic(
+            flat,
+            weights,
+            indices,
+            self.gate_exps.packed,
+            self.up_exps.packed,
+            self.down_exps.packed,
+            grid_t,
+            ksigns_t,
+            inter=self.gate_exps.rows,
+            hidden=self.gate_exps.cols,
+            swiglu_limit=limit,
+        )
+        y = y + self._shared_forward(flat)
+        return y.to(x.dtype).reshape(*x.shape[:-1], y.shape[-1])
+
     def _batch_expert_gemm(
         self,
         exps: PackedIQ2_XSExperts,

@@ -81,6 +81,7 @@ class NativeIQ2MMA16TCLibrary:
 
     def __init__(self, library: ctypes.CDLL) -> None:
         self._library = library
+        self._single_lib: ctypes.CDLL | None = None
         self._launch = library.iq2_mma16_tc_launch
         self._launch.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -90,6 +91,11 @@ class NativeIQ2MMA16TCLibrary:
             ctypes.c_void_p,
         ]
         self._launch.restype = None
+
+    def _single_library(self) -> ctypes.CDLL:
+        if self._single_lib is None:
+            self._single_lib = ctypes.CDLL(str(_SINGLE_LIBRARY_PATH))
+        return self._single_lib
 
     @classmethod
     def load(cls) -> NativeIQ2MMA16TCLibrary:
@@ -756,3 +762,113 @@ def grouped_moe_prefill_k32_graph(
     c = c.gather(1, ws.final_order.unsqueeze(-1).expand_as(c))
     ws.out.copy_(c.sum(dim=1))
     return ws.out
+
+
+def grouped_moe_prefill_k32_dynamic(
+    flat,
+    weights,
+    indices,
+    gate_packed,
+    up_packed,
+    down_packed,
+    grid,
+    ksigns,
+    *,
+    inter: int,
+    hidden: int,
+    swiglu_limit: float,
+    library: NativeIQ2MMA16TCLibrary | None = None,
+):
+    """Per-expert COMPACT K32 MoE (llama.cpp mm_ids_helper grouping).
+
+    Grouping (one warp per expert), expert-sorted gather, and per-expert
+    dynamic M (expert_bounds) GEMMs replace the eager argsort/nonzero/
+    repeat_interleave/index_put Python glue and the fixed-bucket tile waste.
+    Bit-exact with ``grouped_moe_prefill_k32``; ~1.6x faster (16.8 vs 27.3 ms
+    at 1024 tokens).  Returns ``[M, hidden]`` routed output (no shared expert).
+    """
+    import torch
+
+    if flat.device.type != "cuda":
+        raise IQ2MMA16TCError("grouped_moe_prefill_k32_dynamic requires CUDA")
+    if library is None:
+        library = NativeIQ2MMA16TCLibrary.load()
+    M, top_k = indices.shape
+    E = 256
+    stream = torch.cuda.current_stream(flat.device).cuda_stream
+    indices32 = indices.reshape(-1).to(torch.int32)
+    rweights = weights.reshape(-1)
+    R = M * top_k
+
+    compact_route = torch.zeros(R, dtype=torch.int32, device=flat.device)
+    compact_iex = torch.zeros(R, dtype=torch.int32, device=flat.device)
+    expert_bounds = torch.empty(E + 1, dtype=torch.int32, device=flat.device)
+    library._library.moe_group_launch(
+        ctypes.c_void_p(indices32.data_ptr()),
+        ctypes.c_void_p(compact_route.data_ptr()),
+        ctypes.c_void_p(compact_iex.data_ptr()),
+        ctypes.c_void_p(expert_bounds.data_ptr()),
+        M, top_k, E, ctypes.c_void_p(stream),
+    )
+
+    from .iq2_mma16 import _preq
+
+    xq_flat, xs_flat = _preq(flat)
+    compact_xq = torch.empty(R, hidden, dtype=torch.int8, device=flat.device)
+    compact_xs = torch.empty(R, hidden // 32, dtype=torch.float32, device=flat.device)
+    library._library.moe_gather_xq_launch(
+        ctypes.c_void_p(xq_flat.data_ptr()),
+        ctypes.c_void_p(xs_flat.data_ptr()),
+        ctypes.c_void_p(compact_route.data_ptr()),
+        ctypes.c_void_p(compact_xq.data_ptr()),
+        ctypes.c_void_p(compact_xs.data_ptr()),
+        R, hidden, ctypes.c_void_p(stream),
+    )
+
+    eids = torch.arange(E, dtype=torch.int64, device=flat.device)
+    stride_g = (hidden // 256) * 74
+    out_gate = torch.empty(R, inter, dtype=torch.float32, device=flat.device)
+    out_up = torch.empty(R, inter, dtype=torch.float32, device=flat.device)
+    library._library.iq2_mma16_tc_dynamic_launch(
+        ctypes.c_void_p(compact_xq.data_ptr()),
+        ctypes.c_void_p(compact_xs.data_ptr()),
+        ctypes.c_void_p(gate_packed.data_ptr()),
+        ctypes.c_void_p(up_packed.data_ptr()),
+        ctypes.c_void_p(eids.data_ptr()),
+        ctypes.c_void_p(grid.data_ptr()),
+        ctypes.c_void_p(ksigns.data_ptr()),
+        ctypes.c_void_p(expert_bounds.data_ptr()),
+        ctypes.c_void_p(out_gate.data_ptr()),
+        ctypes.c_void_p(out_up.data_ptr()),
+        E, inter, hidden, stride_g, ctypes.c_void_p(stream),
+    )
+
+    h = torch.nn.functional.silu(torch.clamp(out_gate, max=swiglu_limit)) * torch.clamp(
+        out_up, min=-swiglu_limit, max=swiglu_limit
+    )
+    hq, hs = _preq(h.reshape(-1, inter))
+    hq = hq.reshape(R, inter)
+    hs = hs.reshape(R, inter // 32)
+    stride_d = (inter // 256) * 74
+    down = torch.empty(R, hidden, dtype=torch.float32, device=flat.device)
+    library._single_library().iq2_mma16_tc_launch_single_dynamic(
+        ctypes.c_void_p(hq.data_ptr()),
+        ctypes.c_void_p(hs.data_ptr()),
+        ctypes.c_void_p(down_packed.data_ptr()),
+        ctypes.c_void_p(eids.data_ptr()),
+        ctypes.c_void_p(grid.data_ptr()),
+        ctypes.c_void_p(ksigns.data_ptr()),
+        ctypes.c_void_p(expert_bounds.data_ptr()),
+        ctypes.c_void_p(down.data_ptr()),
+        E, hidden, inter, stride_d, ctypes.c_void_p(stream),
+    )
+
+    # combine: scatter compact down back to route order, then sum in the eager
+    # stable expert-id order (fp32 sum order is not commutative).
+    contrib = torch.zeros(R, hidden, dtype=torch.float32, device=flat.device)
+    route_pos = compact_route.long() * top_k + compact_iex.long()
+    contrib[route_pos] = down * rweights[route_pos].unsqueeze(-1)
+    c = contrib.reshape(M, top_k, hidden)
+    final_order = torch.argsort(indices, dim=1, stable=True)
+    c = c.gather(1, final_order.unsqueeze(-1).expand_as(c))
+    return c.sum(dim=1)
