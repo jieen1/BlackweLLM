@@ -403,9 +403,14 @@ class ServerEngine:
         #   slots.  After capture the slot is reset before real use.
         # - DFlash draft/verify CGs use shared scratch buffers and replay
         #   sequentially per slot; they do NOT need extra physical slots.
-        # So: +1 slot for decode CG warmup (non-DFlash only), +0 for DFlash.
+        # - DSV4 decode CG is a shared batched driver (B=1/2/4) whose slot ids
+        #   and positions are persistent tensor inputs, so it is NOT bound to
+        #   a concrete slot and needs no dedicated warmup slot (capacity plan
+        #   Phase 2: cg_extra=0, exactly num_slots=capacity).
+        # So: +1 slot for decode CG warmup (non-DFlash non-DSV4 only),
+        # +0 for DFlash and DSV4.
         cg_extra = 0
-        if enable_cudagraph and not enable_dflash:
+        if enable_cudagraph and not enable_dflash and backend != "deepseek_v4":
             cg_extra = 1  # single warmup slot for M=1 decode CG capture
         if production:
             min_slots = capacity + cg_extra
@@ -858,6 +863,24 @@ class ServerEngine:
             max_q_rows=int(os.environ.get("QSR_DSV4_PREFILL_ROWS", "64")),
             device="cuda",
         )
+        # Serving-inactive memory release, BEFORE decode-graph capture: the
+        # kernel-path RoPE tables must be shared with the eager graph's BEFORE
+        # capture so every captured kernel reads the shared buffer address
+        # (sharing after capture would leave the graph pointing at storage
+        # that gets GC'd -- measured 2026-08-13: graph replay returns garbage
+        # tokens like 124208 ' buruj' instead of the eager EOS).  The eager
+        # oracle KV arenas are freed AFTER capture (capture never touches
+        # them; freeing them only gives prefill scratch headroom).
+        try:
+            freed_freqs = self.runner._share_rope_freqs()  # noqa: SLF001
+            freed_freqs_bytes = freed_freqs.get("kernel_freqs", 0)
+            if freed_freqs_bytes:
+                logger.info(
+                    "DeepSeek-V4 shared RoPE tables: %.2f GiB reclaimed",
+                    freed_freqs_bytes / 2**30,
+                )
+        except Exception:  # pragma: no cover - release must not block startup
+            logger.exception("DeepSeek-V4 RoPE table sharing failed")
         if self._enable_cudagraph:
             graph_batches = self.runner.capture_decode_cuda_graph()
             if graph_batches is not None:
@@ -870,6 +893,23 @@ class ServerEngine:
                     "DeepSeek-V4 decode CUDA Graph capture failed or unavailable; "
                     "falling back to eager decode"
                 )
+        try:
+            freed = self.runner._free_eager_oracle_caches()  # noqa: SLF001
+            freed_kv_bytes = freed.get("eager_oracle_kv", 0)
+            if freed_kv_bytes:
+                logger.info(
+                    "DeepSeek-V4 freed eager-oracle KV: %.2f GiB reclaimed",
+                    freed_kv_bytes / 2**30,
+                )
+        except Exception:  # pragma: no cover - release must not block startup
+            logger.exception("DeepSeek-V4 eager-oracle KV release failed")
+        if self._enable_cudagraph:
+            try:
+                prefill_graph_ok = self.runner.capture_prefill_cuda_graph()
+                if prefill_graph_ok:
+                    logger.info("DeepSeek-V4 prefill CUDA Graph captured (43-layer K32 MoE)")
+            except Exception:  # pragma: no cover - must not block startup
+                logger.exception("DeepSeek-V4 prefill CUDA Graph capture failed")
         logger.info(
             "DeepSeek-V4-Flash model loaded on engine thread: num_slots=%d "
             "max_context=%d tokens/slot",

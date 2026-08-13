@@ -834,6 +834,16 @@ async def debug_stats():
     backend_stats = getattr(engine.runner, "stats", None)
     if backend_stats is not None:
         engine.stats["_backend_stats_dbg"] = dict(backend_stats)
+    # Memory probe: per-category CUDA byte accounting from the backend.  Only
+    # present when the backend implements it (DeepseekV4Backend does); the
+    # field is omitted entirely otherwise so this endpoint stays truthful for
+    # backends that have not opted in.
+    memory_breakdown = getattr(engine.runner, "memory_breakdown", None)
+    if memory_breakdown is not None:
+        try:
+            engine.stats["_memory_breakdown_dbg"] = memory_breakdown()
+        except Exception:  # pragma: no cover - observability must not die
+            logger.exception("memory breakdown failed; reporting without it")
     return engine.stats
 
 

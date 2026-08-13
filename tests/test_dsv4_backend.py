@@ -613,3 +613,94 @@ def test_prefill_chunked_step_returns_done() -> None:
     backend = _make_backend()
     state = backend.prefill_chunked_begin([0], [[1]])
     assert backend.prefill_chunked_step(state) is True
+
+
+# -- prefill CUDA-graph dispatch (tail-chunk fallback) -----------------------
+
+
+class _IdentityAttnLayer:
+    """Stands in for Dsv4AttnKernelLayer: the kernel stack needs real 512-dim
+    shapes, but ``_forward``'s MoE dispatch is shape-independent."""
+
+    def __call__(self, x: torch.Tensor, start_pos: int, slot: int = 0) -> torch.Tensor:
+        return x
+
+
+class _FakePrefillGraph:
+    """Mimics Dsv4PrefillGraphDriver's fixed-M replay surface."""
+
+    def __init__(self, m: int = 64) -> None:
+        self.m = m
+        self.calls: list[tuple[int, int]] = []
+
+    def replay_layer(self, layer_id: int, flat: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+        self.calls.append((layer_id, flat.shape[0]))
+        return torch.zeros_like(flat)
+
+
+def _backend_with_prefill_graph(max_q_rows: int = 64) -> DeepseekV4Backend:
+    """Tiny zeroed backend with a fake prefill graph and identity attention,
+    so ``_forward`` runs on a 1-layer model without the 512-dim kernel stack."""
+    model = _zeroed_model()
+    backend = DeepseekV4Backend(
+        model, TINY, num_slots=1, max_seq_len=64, max_q_rows=max_q_rows, device="cuda"
+    )
+    backend.slot_layers = [_IdentityAttnLayer()]
+    backend._prefill_graph = _FakePrefillGraph(m=max_q_rows)
+    return backend
+
+
+def test_prefill_graph_used_only_at_exact_m_rows() -> None:
+    backend = _backend_with_prefill_graph(max_q_rows=64)
+    graph = backend._prefill_graph
+    assert isinstance(graph, _FakePrefillGraph)
+
+    # A full 64-row chunk goes through the CUDA graph.
+    backend._forward(0, torch.tensor([[7] * 64], dtype=torch.long, device="cuda"), 0)
+    assert graph.calls == [(0, 64)]
+
+
+def test_prefill_tail_chunk_falls_back_to_eager_moe() -> None:
+    backend = _backend_with_prefill_graph(max_q_rows=64)
+    graph = backend._prefill_graph
+    assert isinstance(graph, _FakePrefillGraph)
+    block = backend.model.blocks[0]
+    orig_forward = block.moe.forward
+    eager_calls: list[int] = []
+
+    def spy_moe(x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        eager_calls.append(input_ids.shape[1])
+        return orig_forward(x, input_ids)
+
+    block.moe.forward = spy_moe  # type: ignore[method-assign]
+    try:
+        # A short tail chunk (10 rows, prompt not a multiple of 64) must NOT
+        # hit the graph: the graph's replay contract is fixed (M, H).
+        backend._forward(0, torch.tensor([[3] * 10], dtype=torch.long, device="cuda"), 64)
+        assert graph.calls == []
+        assert eager_calls == [10]
+    finally:
+        block.moe.forward = orig_forward  # type: ignore[method-assign]
+
+
+def test_prefill_graph_dispatch_handles_m1_decode_fallback() -> None:
+    backend = _backend_with_prefill_graph(max_q_rows=64)
+    graph = backend._prefill_graph
+    assert isinstance(graph, _FakePrefillGraph)
+    block = backend.model.blocks[0]
+    orig_forward = block.moe.forward
+    eager_calls: list[int] = []
+
+    def spy_moe(x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        eager_calls.append(input_ids.shape[1])
+        return orig_forward(x, input_ids)
+
+    block.moe.forward = spy_moe  # type: ignore[method-assign]
+    try:
+        # The serial decode fallback also funnels through ``_forward`` with a
+        # single-row input; it must stay on the eager path.
+        backend._forward(0, torch.tensor([[9]], dtype=torch.long, device="cuda"), 74)
+        assert graph.calls == []
+        assert eager_calls == [1]
+    finally:
+        block.moe.forward = orig_forward  # type: ignore[method-assign]

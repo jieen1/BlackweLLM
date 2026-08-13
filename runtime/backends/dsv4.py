@@ -32,6 +32,10 @@ from runtime.backends.protocol import (
     SlotSnapshot,
 )
 from runtime.block_pool import ChunkedPrefillState
+from runtime.kernels.iq2_mma16_tc import (
+    Dsv4PrefillMoEWorkspace,
+    grouped_moe_prefill_k32_graph,
+)
 from runtime.logprobs import compute_logprobs
 from runtime.model.dsv4_attn_kernel import Dsv4AttnKernelLayer
 from runtime.model.dsv4_config import Dsv4Config
@@ -188,6 +192,9 @@ class DeepseekV4Backend:
             # the official-reference oracle.
             _enable_serving_q8_kernels(model)
         self._native_decode_batch_available = self._native_decode_batch_contract_supported()
+        self._freed_eager_oracle_kv = 0
+        self._freed_eager_freqs = 0
+        self._prefill_graph: Dsv4PrefillGraphDriver | None = None
         self._kv_len = [0] * num_slots
         self._committed: list[list[int]] = [[] for _ in range(num_slots)]
         self._cg_status: dict[str, str] = {}
@@ -220,8 +227,162 @@ class DeepseekV4Backend:
         }
         self.cg_fallback_reasons: dict[str, int] = {}
 
+    def _share_rope_freqs(self) -> dict[str, int]:
+        """Collapse the per-layer RoPE tables into two regime-shared tables.
+
+        Every layer computes ``freqs_cis`` with parameters that depend only on
+        ``layer_ratio``: ratio-4 and ratio-128 layers both use the compressed
+        regime (``compress_rope_theta`` + YaRN), and the two window-only layers
+        use the base regime.  The 43 per-layer tables are therefore 41
+        bit-identical copies of one compressed table plus 2 copies of one
+        window table (verified 2026-08-13: ``torch.equal`` across all layers in
+        each regime).  The eager graph and the kernel-path layers each hold
+        their own copies, so this collapses 43 + 43 = 86 tables to 2.
+
+        The kernel-path layer keeps the buffer registered (its
+        ``named_buffers`` still enumerate it) so capture and forward are
+        untouched; only the backing storage is shared.  This MUST run before
+        decode-graph capture: the capture bakes in the shared buffer address,
+        and sharing afterward would leave the graph pointing at storage that
+        gets GC'd (measured 2026-08-13: graph replay returns garbage tokens).
+        """
+        freed = 0
+        if not self.slot_layers or not self.model.blocks:
+            return {"kernel_freqs": 0}
+
+        # -- resolve the two regime-canonical tables (eager graph copies) ---
+        def regime(layer) -> str:
+            return "window" if getattr(layer, "ratio", 0) == 0 else "compressed"
+
+        canonical: dict[str, torch.Tensor] = {}
+        for block in self.model.blocks:
+            attn = getattr(block, "attn", None)
+            freqs = getattr(attn, "freqs_cis", None)
+            if freqs is None or not isinstance(freqs, torch.Tensor):
+                continue
+            key = regime(attn)
+            if key not in canonical:
+                canonical[key] = freqs
+
+        # -- re-point every eager layer's table at its regime canonical -----
+        for block in self.model.blocks:
+            attn = getattr(block, "attn", None)
+            freqs = getattr(attn, "freqs_cis", None)
+            if freqs is None or not isinstance(freqs, torch.Tensor):
+                continue
+            key = regime(attn)
+            target = canonical[key]
+            if freqs.data_ptr() == target.data_ptr():
+                continue
+            if freqs.shape != target.shape:
+                raise RuntimeError(
+                    f"layer {attn.layer_id} RoPE shape mismatch in regime "
+                    f"{key!r}: {tuple(freqs.shape)} vs {tuple(target.shape)}"
+                )
+            freed += freqs.numel() * freqs.element_size()
+            attn.register_buffer("freqs_cis", target, persistent=False)
+            # The eager layer's compressor/indexer hold a reference to the old
+            # table (Dsv4Attention._wire_subcaches); re-point them too or the
+            # old storage never releases.
+            for sub in (
+                getattr(attn, "compressor", None),
+                getattr(attn, "indexer", None),
+            ):
+                if sub is not None and getattr(sub, "freqs_cis", None) is not None:
+                    sub.freqs_cis = target
+
+        # -- point the kernel-path layers + their subcaches at the same ------
+        for layer in self.slot_layers:
+            eager_freqs = getattr(self.model.blocks[layer.layer_id].attn, "freqs_cis", None)
+            kernel_freqs = getattr(layer, "freqs_cis", None)
+            if eager_freqs is None or kernel_freqs is None:
+                continue
+            if kernel_freqs.data_ptr() == eager_freqs.data_ptr():
+                continue
+            if kernel_freqs.shape != eager_freqs.shape:
+                raise RuntimeError(
+                    f"layer {layer.layer_id} RoPE shape mismatch: kernel "
+                    f"{tuple(kernel_freqs.shape)} vs eager {tuple(eager_freqs.shape)}"
+                )
+            freed += kernel_freqs.numel() * kernel_freqs.element_size()
+            layer.register_buffer("freqs_cis", eager_freqs, persistent=False)
+            # The layer's compressor/indexer captured the OLD kernel table by
+            # reference at construction (dsv4_attn_kernel.py sets
+            # ``compressor.freqs_cis = self.freqs_cis``); re-point them at the
+            # shared eager table so they do not dangle after the old storage
+            # is released by the register_buffer swap.
+            for sub in (
+                getattr(layer, "compressor", None),
+                getattr(layer, "indexer", None),
+            ):
+                if sub is not None and getattr(sub, "freqs_cis", None) is not None:
+                    sub.freqs_cis = eager_freqs
+            if getattr(layer, "indexer", None) is not None:
+                icomp = getattr(layer.indexer, "compressor", None)
+                if icomp is not None and getattr(icomp, "freqs_cis", None) is not None:
+                    icomp.freqs_cis = eager_freqs
+        self._freed_eager_freqs = freed
+        return {"kernel_freqs": freed}
+
+    def _free_eager_oracle_caches(self) -> dict[str, int]:
+        """Release the eager graph's per-layer KV arenas (oracle-only).
+
+        The eager ``Dsv4Transformer`` exists as the load-time weight holder
+        and the parity oracle; the serving path computes attention through
+        ``slot_layers`` (kernel-path ``Dsv4AttnKernelLayer``) with its own
+        page buffers and compressor arenas.  The eager graph's own
+        ``kv_cache`` / ``kv_state`` / ``score_state`` buffers are therefore
+        dead weight during serving -- freed here, after CG capture and any
+        eager warmup, so the freed bytes become available to prefill
+        scratch.  Returns bytes freed per category for the memory probe.
+
+        Any caller that later invokes ``model.forward()`` (oracle/parity
+        scripts) must re-create these buffers; the serving backend never
+        does.
+        """
+        freed: dict[str, int] = {"eager_oracle_kv": 0}
+        for block in self.model.blocks:
+            attn = getattr(block, "attn", None)
+            if attn is None:
+                continue
+            compressor = getattr(attn, "compressor", None)
+            if compressor is not None:
+                # The compressor's kv_cache is a view of attn.kv_cache; drop
+                # the reference first so the storage actually releases.
+                kv_view = getattr(compressor, "kv_cache", None)
+                if isinstance(kv_view, torch.Tensor):
+                    compressor.kv_cache = None
+                for name in ("kv_state", "score_state"):
+                    tensor = getattr(compressor, name, None)
+                    if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                        freed["eager_oracle_kv"] += tensor.numel() * tensor.element_size()
+                        delattr(compressor, name)
+            for name in ("kv_cache",):
+                tensor = getattr(attn, name, None)
+                if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                    freed["eager_oracle_kv"] += tensor.numel() * tensor.element_size()
+                    delattr(attn, name)
+            indexer = getattr(attn, "indexer", None)
+            if indexer is not None:
+                icomp = getattr(indexer, "compressor", None)
+                if icomp is not None:
+                    kv_view = getattr(icomp, "kv_cache", None)
+                    if isinstance(kv_view, torch.Tensor):
+                        icomp.kv_cache = None
+                    for name in ("kv_state", "score_state"):
+                        tensor = getattr(icomp, name, None)
+                        if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                            freed["eager_oracle_kv"] += tensor.numel() * tensor.element_size()
+                            delattr(icomp, name)
+                for name in ("kv_cache",):
+                    tensor = getattr(indexer, name, None)
+                    if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                        freed["eager_oracle_kv"] += tensor.numel() * tensor.element_size()
+                        delattr(indexer, name)
+        self._freed_eager_oracle_kv = freed["eager_oracle_kv"]
+        return freed
+
     def _native_decode_batch_contract_supported(self) -> bool:
-        """Preflight every production compressor shape before state mutation."""
         if self._forward_fn is not None or not self.slot_layers:
             return False
         from runtime.kernels.dsv4_compressor import (
@@ -333,6 +494,130 @@ class DeepseekV4Backend:
             runtime_stats=tuple(sorted(self.stats.items())),
             cg_fallback_reasons=tuple(sorted(self.cg_fallback_reasons.items())),
         )
+
+    # -- memory probe ------------------------------------------------------
+
+    def memory_breakdown(self) -> dict[str, int]:
+        """Byte-level accounting of every CUDA tensor this backend holds.
+
+        Categories (all bytes, ``torch`` storage accounting -- views share
+        their base storage and are counted once via ``data_ptr``):
+        ``weights``: all eager-graph parameters/buffers (the packed IQ2_XS /
+        Q8_0 checkpoint); ``eager_oracle_kv``: the eager attention graph's
+        own window+compressed KV arena and indexer scoring caches (kept as
+        the load-time oracle; the serving path does NOT read them);
+        ``kernel_kv_pages``: per-slot FP8 page buffers in ``slot_layers``
+        (window/prefill/csa/hca); ``kernel_compressor_kv``: per-slot bf16
+        compressor + indexer raw KV arenas; ``kernel_recursive_state``:
+        fp32 compressor/indexer decode state; ``mla_scratch``: the shared
+        backend-owned MLA arena; ``prefix_checkpoint``: retained prefix
+        checkpoint clones; ``graph_buffers``: decode CUDA-Graph driver
+        input/logits scratch (driver-owned, outside the graph pool).
+        """
+        if torch.device(self.device).type != "cuda":
+            return {}
+        # Compare device TYPE (not full device): tensors live on ``cuda:0``
+        # while ``torch.device("cuda")`` carries index None, so a full
+        # equality check silently excludes every tensor.
+        device_type = torch.device(self.device).type
+
+        # One storage is counted once, no matter how many views name it.
+        seen: set[int] = set()
+        totals: dict[str, int] = {
+            "weights": 0,
+            "eager_oracle_kv": 0,
+            "kernel_kv_pages": 0,
+            "kernel_compressor_kv": 0,
+            "kernel_recursive_state": 0,
+            "mla_scratch": 0,
+            "prefix_checkpoint": 0,
+            "graph_buffers": 0,
+            "rope_freqs": 0,
+        }
+
+        def add(target: str, tensor: torch.Tensor | None) -> None:
+            if tensor is None:
+                return
+            if tensor.device.type != device_type:
+                return
+            key = tensor.data_ptr()
+            if key in seen:
+                return
+            seen.add(key)
+            totals[target] += tensor.numel() * tensor.element_size()
+
+        # -- weights: eager graph owns every checkpoint tensor --------------
+        for name, tensor in self.model.named_parameters():
+            add("weights", tensor)
+        for name, tensor in self.model.named_buffers():
+            key = tensor.data_ptr()
+            if key in seen:
+                continue
+            if ".kv_cache" in name or ".kv_state" in name or ".score_state" in name:
+                add("eager_oracle_kv", tensor)
+            elif name.endswith("freqs_cis") or ".freqs_cis" in name:
+                add("rope_freqs", tensor)
+            else:
+                add("weights", tensor)
+
+        # -- kernel-path slot layers ----------------------------------------
+        for layer in self.slot_layers:
+            for name, tensor in layer.named_buffers():
+                if name.endswith("_pages") or "pages" in name:
+                    add("kernel_kv_pages", tensor)
+                elif "kv_cache" in name:
+                    add("kernel_compressor_kv", tensor)
+                elif "kv_state" in name or "score_state" in name:
+                    add("kernel_recursive_state", tensor)
+                elif name == "freqs_cis" or name.endswith("freqs_cis"):
+                    # Kernel-layer RoPE table duplicates the eager graph's --
+                    # candidates for sharing.
+                    add("rope_freqs", tensor)
+                else:
+                    # norm weights, sink, etc. -- real allocations but tiny.
+                    add("weights", tensor)
+            # compressor.kv_cache is a plain attribute (not a buffer).
+            compressor = getattr(layer, "compressor", None)
+            if compressor is not None:
+                add("kernel_compressor_kv", getattr(compressor, "kv_cache", None))
+            indexer = getattr(layer, "indexer", None)
+            if indexer is not None:
+                add("kernel_compressor_kv", getattr(indexer, "kv_cache", None))
+
+        add("mla_scratch", self._shared_mla_scratch)
+
+        # -- prefix checkpoint clones ---------------------------------------
+        for checkpoint in self._prefix_checkpoint_tensors:
+            if checkpoint is None:
+                continue
+            for row in checkpoint:
+                for tensor in row:
+                    add("prefix_checkpoint", tensor)
+        for windows in self._prefix_window_tensors:
+            if windows is None:
+                continue
+            for tensor in windows:
+                add("prefix_checkpoint", tensor)
+        for anchor in self._prefix_anchor_logits:
+            add("prefix_checkpoint", anchor)
+
+        # -- decode graph driver scratch (outside the graph pool) -----------
+        for driver in self._decode_graphs.values():
+            for name, tensor in vars(driver).items():
+                if isinstance(tensor, torch.Tensor) and tensor.device.type == device_type:
+                    add("graph_buffers", tensor)
+
+        totals["torch_allocated"] = torch.cuda.memory_allocated(device_type)
+        totals["torch_reserved"] = torch.cuda.memory_reserved(device_type)
+        totals["freed_eager_oracle_kv"] = getattr(self, "_freed_eager_oracle_kv", 0)
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device_type)
+            totals["driver_free_bytes"] = int(free_bytes)
+            totals["driver_total_bytes"] = int(total_bytes)
+            totals["driver_used_bytes"] = int(total_bytes - free_bytes)
+        except Exception:  # pragma: no cover - best-effort
+            pass
+        return totals
 
     # -- retained-slot prefix cache -----------------------------------------
 
@@ -611,37 +896,56 @@ class DeepseekV4Backend:
         if cached_anchor is not None:
             self.stats["prefill_calls"] += 1
             return cached_anchor
-        chunk = max(1, min(self.max_q_rows, 128))
-        logits = None
-        chunks = 0
-        for start in range(prefix_len, len(prompt_ids), chunk):
-            ids = prompt_ids[start : start + chunk]
-            trace_row = bfdiag_trace.begin_round(slot, start) if bfdiag_trace.TRACE_ENABLED else -1
-            logits = self._forward(
-                slot,
-                torch.tensor([ids], dtype=torch.long, device=self.device),
-                start,
-            )
-            if bfdiag_trace.TRACE_ENABLED:
-                end = start + len(ids)
-                bfdiag_trace.finish_dsv4_prefill_chunk(
-                    trace_row,
-                    position=start,
-                    row_count=len(ids),
-                    compressor_ratio=-1,
-                    window_entries=min(end, self.config.window_size),
-                    ratio4_entries=(end // 4 if 4 in self._trace_compressor_ratios else 0),
-                    ratio128_entries=(end // 128 if 128 in self._trace_compressor_ratios else 0),
+        if self._forward_fn is not None or not self.slot_layers:
+            # Test-injected forward stub (no kernel-path stack): keep the
+            # chunk-major loop, whose ``_forward`` short-circuits to the stub.
+            chunk = max(1, min(self.max_q_rows, 128))
+            logits = None
+            chunks = 0
+            for start in range(prefix_len, len(prompt_ids), chunk):
+                ids = prompt_ids[start : start + chunk]
+                trace_row = (
+                    bfdiag_trace.begin_round(slot, start) if bfdiag_trace.TRACE_ENABLED else -1
                 )
-            end = start + len(ids)
-            if end % DSV4_PREFIX_BLOCK_SIZE == 0:
-                self._capture_prefix_checkpoint(slot, end, prompt_ids, logits)
-            chunks += 1
-        assert logits is not None
+                logits = self._forward(
+                    slot,
+                    torch.tensor([ids], dtype=torch.long, device=self.device),
+                    start,
+                )
+                if bfdiag_trace.TRACE_ENABLED:
+                    end = start + len(ids)
+                    bfdiag_trace.finish_dsv4_prefill_chunk(
+                        trace_row,
+                        position=start,
+                        row_count=len(ids),
+                        compressor_ratio=-1,
+                        window_entries=min(end, self.config.window_size),
+                        ratio4_entries=(end // 4 if 4 in self._trace_compressor_ratios else 0),
+                        ratio128_entries=(
+                            end // 128 if 128 in self._trace_compressor_ratios else 0
+                        ),
+                    )
+                if (start + len(ids)) % DSV4_PREFIX_BLOCK_SIZE == 0:
+                    self._capture_prefix_checkpoint(slot, start + len(ids), prompt_ids, logits)
+                chunks += 1
+            assert logits is not None
+            self._kv_len[slot] = len(prompt_ids)
+            self._committed[slot] = list(prompt_ids)
+            self.stats["prefill_calls"] += 1
+            self.stats["prefill_chunks"] += chunks
+            self.stats["prefill_tokens"] += len(prompt_ids) - prefix_len
+            return logits
+        # Layer-major superchunk: attention stepped in GPU-position tiles,
+        # MoE eager over the whole suffix.  This replaces the old chunk-major
+        # 43-layer loop (its 64-token MoE chunks under-utilised the GEMMs and
+        # the ratio-4 compressor's Python loop dominated the CPU).
+        logits = self._prefill_superchunk_logits(
+            slot, prompt_ids, tile=self.max_q_rows, prefix_len=prefix_len
+        )
         self._kv_len[slot] = len(prompt_ids)
         self._committed[slot] = list(prompt_ids)
         self.stats["prefill_calls"] += 1
-        self.stats["prefill_chunks"] += chunks
+        self.stats["prefill_chunks"] += 1
         self.stats["prefill_tokens"] += len(prompt_ids) - prefix_len
         return logits
 
@@ -673,30 +977,50 @@ class DeepseekV4Backend:
             residual = x
             x, post, comb = block.hc_pre(x, block.hc_ffn_fn, block.hc_ffn_scale, block.hc_ffn_base)
             x = rms_norm(x, block.ffn_norm_weight, block.eps)
-            x = block.moe(x, input_ids)
+            if self._prefill_graph is not None and input_ids.shape[1] == self._prefill_graph.m:
+                # CUDA-graph MoE: flat [M, H] -> routed+shared [M, H] bf16,
+                # then reshape back to [1, M, H] for hc_post.  Only exact-M
+                # rows go through the graph: a shorter tail chunk (or the
+                # M=1 decode fallback, which shares this forward) would trip
+                # the graph's fixed (M, H) replay contract, so those fall
+                # back to eager ``block.moe`` -- correctness first, the tail
+                # is one chunk out of many.
+                x_flat = x.reshape(-1, x.shape[-1])
+                ids_flat = input_ids.reshape(-1)
+                out = self._prefill_graph.replay_layer(i, x_flat, ids_flat)
+                x = out.to(x.dtype).reshape(x.shape)
+            else:
+                x = block.moe(x, input_ids)
             x = block.hc_post(x, residual, post, comb)
             h = x
         h = model.hc_head(h)
         return model.lm_head(rms_norm(h, model.norm_weight, model.eps))
 
     def _prefill_superchunk_logits(
-        self, slot: int, prompt_ids: list[int], *, tile: int = 64
+        self, slot: int, prompt_ids: list[int], *, tile: int = 64, prefix_len: int = 0
     ) -> torch.Tensor:
-        """Phase 1: layer-major superchunk prefill (correctness-first).
+        """Layer-major superchunk prefill (fast path).
 
-        Processes the whole prompt layer-by-layer with HC/norm/MoE batched
-        over all rows; the causal attention is still stepped in ``tile``-row
-        tiles so compressor/indexer/window state advances exactly as the
-        chunk-major path.  Only the final token's logits are returned; the
-        last tile carries it.
+        Processes the whole prompt layer-by-layer: HC/norm/MoE batched over
+        all rows, causal attention stepped in ``tile``-row tiles through the
+        GPU-position ``forward_graph_prefill`` (which removes the ratio-4
+        compressor's per-token Python loop -- the dominant prefill CPU cost).
+        MoE stays eager over the full prompt (its dynamic batch-2 split is the
+        only correct handling of DSV4's skewed routing; a fixed-bucket graph
+        cannot cover max route ~384).  ``prefix_len`` continues a restored
+        prefix: rows are processed starting at that absolute position.  Only
+        the final token's logits are returned.
         """
-        if self._kv_len[slot] != 0:
+        if self._kv_len[slot] != 0 and prefix_len == 0:
             raise RuntimeError(
                 f"slot {slot} is at kv_len={self._kv_len[slot]}; the caller must reset_slot first"
             )
-        n = len(prompt_ids)
+        suffix = prompt_ids[prefix_len:]
+        n = len(suffix)
+        if n == 0:
+            raise ValueError("superchunk prefill needs a non-empty suffix")
         model, layers = self.model, self.slot_layers
-        ids = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
+        ids = torch.tensor([suffix], dtype=torch.long, device=self.device)
         h = model.embed(ids)
         h = h.unsqueeze(2).repeat(1, 1, model.hc_mult, 1)
         for i, block in enumerate(model.blocks):
@@ -708,7 +1032,7 @@ class DeepseekV4Backend:
             outs = []
             for start in range(0, n, tile):
                 end = min(start + tile, n)
-                outs.append(layers[i](x[:, start:end], start, slot=slot))
+                outs.append(layers[i](x[:, start:end], prefix_len + start, slot=slot))
             x = torch.cat(outs, dim=1)
             x = block.hc_post(x, residual, post, comb)
             residual = x
@@ -857,6 +1181,78 @@ class DeepseekV4Backend:
         finally:
             for slot in range(self.num_slots):
                 self.reset_slot(slot)
+
+    def capture_prefill_cuda_graph(self) -> bool:
+        """Capture the 43-layer K32 MoE prefill CUDA graphs (Phase 1K).
+
+        Must run before slot admission and after ``capture_decode_cuda_graph``.
+        Failure is non-fatal: falls back to eager ``block.moe`` prefill.
+
+        Memory guard: capture freezes every temporary tensor of the 43-layer
+        body into CUDA-graph pool memory (measured ~10 GiB on top of the 82
+        GiB weights + KV envelope), and a failed capture leaves that pool
+        reserved.  We check free memory before starting and call
+        ``empty_cache`` after a failure so a thin-margin card falls back to
+        eager MoE cleanly instead of wedging every later request with a dead
+        reserved pool (2026-08-13: 2x64K service OOM'd on reset_slot because
+        of exactly this residue).
+        """
+        if self._prefill_graph is not None:
+            return True
+        if self._forward_fn is not None or not self.slot_layers:
+            return False
+        if torch.device(self.device).type != "cuda":
+            return False
+        busy = any(self._kv_len[s] != 0 or self._committed[s] for s in range(self.num_slots))
+        if busy:
+            raise RuntimeError(
+                "DSV4 prefill CUDA Graph capture must run before slot admission"
+            )
+        # Estimate the capture pool delta before allocating: the graph body's
+        # intermediates are frozen into graph memory per layer.  If we do not
+        # have a comfortable margin over the resident weights+KV envelope,
+        # skip capture now -- eager MoE is the safe path and the failed pool
+        # would otherwise eat the headroom every later request needs.
+        try:
+            free_bytes, _total = torch.cuda.mem_get_info(self.device)
+        except Exception:  # pragma: no cover - best-effort guard
+            free_bytes = 0
+        # The 43 layers share ONE CUDA graph memory pool (Dsv4PrefillGraphDriver
+        # reuses the first layer's pool), so the frozen intermediate delta is
+        # roughly one layer's worth, not 43x.  Measured 2026-08-13 at 128K:
+        # reserved delta 1.14 GiB, free delta 1.31 GiB.  Reserve a 2 GiB
+        # envelope plus slack for driver/allocator overhead.
+        ENVELOPE = 2.5 * 2**30
+        if free_bytes < ENVELOPE:
+            import logging
+
+            logging.getLogger("qwen_sm120_runtime.dsv4").warning(
+                "DSV4 prefill CUDA Graph capture skipped: %.1f GiB free < "
+                "%.1f GiB needed; falling back to eager MoE prefill",
+                free_bytes / 2**30,
+                ENVELOPE / 2**30,
+            )
+            self._cg_status["prefill"] = "skipped-low-memory"
+            return False
+        try:
+            driver = Dsv4PrefillGraphDriver(self, m=self.max_q_rows)
+            driver.capture()
+            self._prefill_graph = driver
+            self._cg_status["prefill"] = "captured"
+            return True
+        except Exception:
+            import logging
+
+            logging.getLogger("qwen_sm120_runtime.dsv4").exception(
+                "DSV4 prefill CUDA Graph capture failed; falling back to eager MoE"
+            )
+            self._prefill_graph = None
+            self._cg_status["prefill"] = "failed"
+            # The failed capture may have grown a CUDA-graph pool that torch
+            # keeps reserved but idle.  Release it so the serving path does
+            # not inherit a dead reservation it can never use.
+            torch.cuda.empty_cache()
+            return False
 
     def prefill(self, slot: int, prompt_ids: list[int]) -> int:
         """Cold prefill of ``prompt_ids``; greedy first token (server contract)."""
@@ -1055,3 +1451,184 @@ def load_deepseek_v4_backend(
         device=device,
     )
     return backend
+
+
+def _prefill_bucket_for_rows(m: int, top_k: int, n_experts: int) -> int:
+    """Pick the MoE tile bucket for a prefill chunk of ``m`` rows.
+
+    The graph now runs TWO fixed batches (bucket + overflow bucket), covering
+    up to ``2 * bucket`` routes per expert, so the base bucket stays small
+    (32) for fast tile GEMMs while the overflow batch absorbs the hash layers'
+    skewed route distribution (max route ~51 at 128 tokens).  bucket=32 is
+    ~35% faster than bucket=64 for the same chunk (measured 14.9 vs 22.8 ms).
+    """
+    return 32
+
+
+class Dsv4PrefillGraphDriver:
+    """CUDA-graph-captured 43-layer K32 MoE prefill (Phase 1K service path).
+
+    Each of the 43 layers gets its OWN graph capturing ``router -> K32
+    grouped MoE`` for a fixed 64-token chunk (the service prefill chunk
+    size).  The surrounding HC/norm/attention stay eager; the MoE was the
+    dominant CPU cost (profile 2026-08-12: ~2.4 s CPU vs ~270 ms GPU per
+    chunk, most of it MoE Python glue), so removing the 43-layer MoE launch
+    storm is the largest single lever without re-architecting attention.
+
+    Replay contract:
+      - ``capture()`` must run on the engine thread after slot layers exist
+        and before any request; it warmups each layer's kernels eagerly.
+      - ``replay_layer(i, flat, ids)`` writes ``flat`` [M, H] and ``ids``
+        [M] into layer ``i``'s workspace (contents only), replays its graph,
+        and returns the routed MoE output [M, H].
+      - Workspaces are caller-owned; no allocation inside a graph body.
+    """
+
+    def __init__(
+        self,
+        backend: DeepseekV4Backend,
+        *,
+        m: int = 64,
+        bucket: int | None = None,
+    ) -> None:
+        if not backend.slot_layers:
+            raise RuntimeError("Dsv4PrefillGraphDriver needs kernel-path slot layers")
+        self.backend = backend
+        self.model = backend.model
+        self.layers = backend.slot_layers
+        self.m = m
+        self.top_k = backend.model.config.n_activated_experts
+        self.hidden = backend.model.config.hidden_size
+        self.inter = backend.model.config.moe_intermediate_size
+        self.n_experts = backend.model.config.n_routed_experts
+        self.device = backend.device
+        # The graph's tile is [n_experts, bucket, ...]; bucket must cover the
+        # max routes a single expert receives in one chunk, but a fixed 64
+        # wastes the tile when the chunk is small.  Measured 2026-08-13 at
+        # m=64: max route 14 (p99 13) over 300 samples, so bucket=32 gives a
+        # 2x margin and is 35% faster than bucket=64 (14.9 vs 22.8 ms).  A
+        # 64-token chunk never needs bucket=64 -- that sizing came from the
+        # 1024-token superchunk distribution (max route ~83), wrongly applied
+        # to the 64-token chunk in the first wiring.
+        if bucket is None:
+            bucket = _prefill_bucket_for_rows(m, self.top_k, self.n_experts)
+        self.bucket = bucket
+        # ONE shared workspace: layers run serially, so every layer graph may
+        # capture the same buffer addresses and overwrite their contents
+        # between replays.  Allocating per-layer workspaces would cost
+        # ~43 x 1 GiB and OOM the 96 GB card alongside the 82 GiB weights.
+        self.workspace = Dsv4PrefillMoEWorkspace(
+            device=self.device,
+            hidden=self.hidden,
+            inter=self.inter,
+            m=m,
+            top_k=self.top_k,
+            n_experts=self.n_experts,
+            bucket=self.bucket,
+        )
+        self.graphs: list[torch.cuda.CUDAGraph | None] = [None] * len(self.layers)
+        self._captured = False
+        # per-layer input staging (written by replay_layer, read inside graph)
+        self._flat_in = torch.empty(m, self.hidden, dtype=torch.bfloat16, device=self.device)
+        self._ids_in = torch.empty(m, dtype=torch.long, device=self.device)
+
+    def _layer_router(self, layer_id: int) -> Any:
+        return self.model.blocks[layer_id].moe.gate
+
+    def _layer_packed(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        moe = self.model.blocks[layer_id].moe
+        grid, ksigns, _ = moe.gate_exps.tables()
+        return moe.gate_exps.packed, moe.up_exps.packed, moe.down_exps.packed, grid, ksigns
+
+    def _layer_body(self, layer_id: int, ws: Dsv4PrefillMoEWorkspace) -> torch.Tensor:
+        """One layer's graph body: router -> K32 grouped MoE (single chunk).
+
+        Reads ONLY ``ws.flat`` (caller writes it before replay) plus the
+        driver's ``_ids_in`` (copied per replay); returns the routed output
+        written into ``ws.out``.
+        """
+        gate = self._layer_router(layer_id)
+        flat = ws.flat
+        ids = self._ids_in
+        # router: [M, H] -> weights [M, top_k], indices [M, top_k]
+        weights, indices = gate(flat, ids)
+        ws.weights.copy_(weights)
+        ws.indices.copy_(indices)
+        gate_packed, up_packed, down_packed, grid, ksigns = self._layer_packed(layer_id)
+        # Routed MoE ONLY inside the graph; the shared Q8_0 expert stays
+        # eager in replay_layer (adding it here aliases ws.out and the
+        # read-write on the same buffer is not graph-stable).
+        return grouped_moe_prefill_k32_graph(
+            ws,
+            flat,
+            ws.indices,
+            ws.weights,
+            gate_packed,
+            up_packed,
+            down_packed,
+            grid,
+            ksigns,
+            inter=self.inter,
+            hidden=self.hidden,
+            swiglu_limit=self.model.config.swiglu_limit,
+        )
+
+    def capture(self) -> None:
+        if self._captured:
+            return
+        ws = self.workspace
+        # ONE shared CUDA graph memory pool across all 43 layers.  Without it
+        # every layer's graph freezes its own copy of the body's intermediate
+        # tensors into graph-pool memory (~10 GiB measured at 2x64K, which
+        # OOM'd the 96 GB card alongside the 82 GiB weights).  With a shared
+        # pool the layers run serially and reuse the same addresses, so the
+        # frozen delta collapses to roughly one layer's worth.
+        pool = None
+        # Warmup inputs must look like real routing: an all-zeros ``flat``
+        # collapses the router's softmax and can send every route to one
+        # expert (``within`` overflows the bucket and trips a device assert in
+        # the tile fill).  Use a seeded random batch so the warmup exercises a
+        # representative route spread; the captured graph reads whatever
+        # contents ``replay_layer`` writes, so warmup values never leak into
+        # serving output.
+        warm_gen = torch.Generator(device=self.device).manual_seed(20260813)
+        warm_flat = torch.randn(
+            self.m, self.hidden, dtype=torch.bfloat16, device=self.device, generator=warm_gen
+        ) * 0.3
+        warm_ids = torch.randint(
+            0, 1000, (self.m,), dtype=torch.long, device=self.device, generator=warm_gen
+        )
+        for layer_id in range(len(self.layers)):
+            # warmup on a side stream (JIT kernels are not capturable)
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                ws.flat.copy_(warm_flat)
+                self._ids_in.copy_(warm_ids)
+                for _ in range(3):
+                    self._layer_body(layer_id, ws)
+            torch.cuda.current_stream().wait_stream(side)
+            # capture on the current stream, into the shared pool
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool):
+                self._layer_body(layer_id, ws)
+            if pool is None:
+                pool = graph.pool()
+            self.graphs[layer_id] = graph
+        self._captured = True
+
+    def replay_layer(self, layer_id: int, flat: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+        """Run layer ``layer_id``'s graph on ``flat`` [M, H] and ``ids`` [M]."""
+        if not self._captured:
+            raise RuntimeError("prefill graph replay before capture")
+        if tuple(flat.shape) != (self.m, self.hidden):
+            raise ValueError(
+                f"prefill graph expects flat {(self.m, self.hidden)}, got {tuple(flat.shape)}"
+            )
+        self.workspace.flat.copy_(flat)
+        self._ids_in.copy_(ids)
+        self.graphs[layer_id].replay()
+        # shared Q8_0 expert (eager, cheap 3 GEMMs) -- the routed result in
+        # workspace.out gets the shared expert added, matching Dsv4MoE.forward.
+        moe = self.model.blocks[layer_id].moe
+        return self.workspace.out + moe._shared_forward(self.workspace.flat)  # noqa: SLF001
