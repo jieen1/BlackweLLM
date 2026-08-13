@@ -864,6 +864,157 @@ class Dsv4AttnKernelLayer(nn.Module):
             o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         return self.wo_b(o.flatten(2))
 
+    def forward_graph_prefill(
+        self,
+        x: torch.Tensor,
+        pos_tensor: torch.Tensor,
+        *,
+        slot: int = 0,
+        graph_max_index_entries: int | None = None,
+    ) -> torch.Tensor:
+        """Capture-safe prefill tile (mid-sequence): ``seqlen`` rows at GPU
+        position.  Replaces the eager per-token compressor Python loop with
+        the batched-GEMM fused-kernel path; must be bit-exact with ``forward``
+        for start_pos>0.  The first cold-prefill tile (pos 0) must still go
+        through ``forward`` (its prefill-page packing differs)."""
+        self._require_slot(slot)
+        bsz, seqlen, _ = x.shape
+        assert bsz == 1
+        ratio, rd = self.ratio, self.rope_head_dim
+        win = self.window
+        pos_idx = pos_tensor + torch.arange(seqlen, dtype=torch.int64, device=x.device)
+        freqs = self.freqs_cis[pos_idx]
+
+        qr = rms_norm(self.wq_a(x), self.q_norm_weight, self.eps)
+        q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+        apply_rotary_emb(q[..., -rd:], freqs)
+        q_kernel = q.reshape(seqlen, self.n_heads, self.head_dim).to(torch.bfloat16)
+
+        kv = self.kv_norm(self.wkv(x))
+        apply_rotary_emb(kv[..., -rd:], freqs)
+        kv_row = kv.reshape(seqlen, self.head_dim)
+
+        window_base = self._slot_raw_base(slot, self.window_pages, DSV4_PAGE_SIZE)
+        pack_latent_kv(
+            kv_row,
+            self._flat_pages(self.window_pages),
+            (pos_idx % win) + window_base,
+            page_size=DSV4_PAGE_SIZE,
+            validate_ids=False,
+        )
+
+        comp_pages: torch.Tensor | None = None
+        comp_page_size: int | None = None
+        if ratio:
+            entry = self.compressor.forward_graph_prefill(x, pos_tensor, slot=slot)
+            comp_arena, comp_page_size = self._comp_pages()
+            comp_base = self._slot_raw_base(slot, comp_arena, comp_page_size)
+            n_comp = entry.shape[1]
+            first = (pos_tensor + seqlen) // ratio - n_comp
+            ids = torch.arange(n_comp, dtype=torch.int64, device=x.device) + first + comp_base
+            pack_latent_kv(
+                entry.reshape(n_comp, self.head_dim),
+                self._flat_pages(comp_arena),
+                ids,
+                page_size=comp_page_size,
+                validate_ids=False,
+            )
+            comp_pages = self._flat_pages(comp_arena)
+
+        rows = pos_idx.unsqueeze(1)
+        cols = torch.arange(win, device=x.device).unsqueeze(0)
+        first = (rows - win + 1).clamp_min(0)
+        swa = first + cols
+        swa = torch.where(swa <= rows, swa, torch.full_like(swa, -1))
+        swa = torch.where(swa >= 0, swa % win, swa)
+        swa_idx = swa.int()
+        swa_idx = self._offset_valid_ids(swa_idx, window_base)
+        swa_len = (swa_idx >= 0).sum(dim=-1).to(torch.int32)
+
+        comp_idx: torch.Tensor | None = None
+        comp_len: torch.Tensor | None = None
+        if ratio:
+            if self.indexer is not None:
+                comp_idx = self.indexer.forward_graph_prefill(
+                    x, qr, pos_tensor, slot=slot, max_entries=graph_max_index_entries or 512
+                ).reshape(seqlen, -1)
+                comp_arena2, comp_page_sz2 = self._comp_pages()
+                comp_idx = self._offset_valid_ids(
+                    comp_idx, self._slot_raw_base(slot, comp_arena2, comp_page_sz2)
+                )
+                comp_len = (comp_idx >= 0).sum(dim=-1).to(torch.int32)
+            else:
+                # ratio-128: every compressed entry up to each row's position.
+                # Width must be the LIVE entry count (n_entries), padded to a
+                # 64-entry bucket -- matching eager's _pad_prefill_index_width
+                # -- not the full capacity, or the MLA run width drifts.
+                if graph_max_index_entries is None:
+                    n_entries = self.freqs_cis.shape[0] // ratio
+                else:
+                    n_entries = graph_max_index_entries
+                max_comp = n_entries
+                n_valid = (pos_idx + 1) // ratio
+                col = torch.arange(max_comp, device=x.device).unsqueeze(0)
+                comp = col.repeat(seqlen, 1)
+                comp = torch.where(comp < n_valid.unsqueeze(1), comp, torch.full_like(comp, -1))
+                comp_idx = comp.int()
+                bucket = min(
+                    self.freqs_cis.shape[0] // ratio,
+                    ((max_comp + 63) // 64) * 64,
+                )
+                if max_comp < bucket:
+                    comp_idx = torch.nn.functional.pad(comp_idx, (0, bucket - max_comp), value=-1)
+                comp_arena2, comp_page_sz2 = self._comp_pages()
+                comp_idx = self._offset_valid_ids(
+                    comp_idx, self._slot_raw_base(slot, comp_arena2, comp_page_sz2)
+                )
+                comp_len = (comp_idx >= 0).sum(dim=-1).to(torch.int32)
+
+        from b12x.attention.compressed_mla import run
+
+        binding = self._mla_plan.bind(
+            scratch=self._require_mla_scratch(),
+            q=q_kernel.contiguous(),
+            swa_indices=swa_idx,
+            swa_lengths=swa_len,
+            indexed_indices=comp_idx,
+            indexed_lengths=comp_len,
+            indexed_page_table=None,
+        )
+        out = run(
+            swa_k_cache=self._flat_pages(self.window_pages),
+            binding=binding,
+            swa_page_size=DSV4_PAGE_SIZE,
+            indexed_k_cache=comp_pages,
+            indexed_page_size=comp_page_size,
+            attn_sink=self.attn_sink,
+            sm_scale=self.softmax_scale,
+            forced_num_splits=None,
+            forced_dsv4_h16=None,
+        )
+        o = out.reshape(bsz, seqlen, self.n_heads, self.head_dim)
+        apply_rotary_emb(o[..., -rd:], freqs, inverse=True)
+        o = o.view(bsz, seqlen, self.n_groups, -1)
+        if self.wo_a.fused_q8:
+            from runtime.kernels.dsv4_q8_gemm import q8_0_grouped_dequant_gemm
+
+            d_k = o.shape[-1]
+            x2 = o.permute(2, 0, 1, 3).reshape(self.n_groups * bsz * seqlen, d_k)
+            res = q8_0_grouped_dequant_gemm(
+                x2,
+                self.wo_a.packed,
+                num_groups=self.n_groups,
+                group_size=self.o_lora_rank,
+                in_features=d_k,
+                rows_per_group=bsz * seqlen,
+            )
+            o = res.reshape(self.n_groups, bsz, seqlen, self.o_lora_rank).permute(1, 2, 0, 3)
+        else:
+            wo_a = self.wo_a.dequantized().to(x.dtype).view(self.n_groups, self.o_lora_rank, -1)
+            o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        return self.wo_b(o.flatten(2))
+
     def forward_decode_batch(
         self,
         x: torch.Tensor,

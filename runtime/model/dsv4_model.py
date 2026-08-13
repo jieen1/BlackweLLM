@@ -1145,6 +1145,103 @@ class Dsv4Compressor(nn.Module):
             return None
         return torch.cat(emitted, dim=1)
 
+    def forward_graph_prefill(
+        self, x: torch.Tensor, pos_tensor: torch.Tensor, *, slot: int = 0
+    ) -> torch.Tensor:
+        """Capture-safe prefill chunk: ``seqlen`` rows at GPU position.
+
+        Keeps wkv/wgate GEMMs batched and drives the per-token state machine
+        with the fused decode kernel (ONE launch per token instead of the
+        eager ~10-op Python loop).  Returns only the compress-boundary NEW
+        entries, exactly like ``forward``'s ``emitted`` list -- re-packing an
+        existing entry would re-quantise an already-FP8 page.  Tiles are
+        64-aligned so ``pos_tensor % ratio == 0`` and the boundary rows are
+        the fixed ``i % ratio == ratio - 1``.
+        """
+        bsz, seqlen, _ = x.shape
+        assert bsz == 1
+        ratio = self.ratio
+        xf = x.float()
+        kv = self.wkv(xf)
+        score = self.wgate(xf)
+        kv_state_slot = self._slot_view(self.kv_state, slot)
+        score_state_slot = self._slot_view(self.score_state, slot)
+        kv_cache_slot = self._slot_cache(slot)
+        from runtime.kernels.dsv4_compressor import (
+            fused_decode_postgemv,
+            fused_indexer_decode_postgemv,
+            supports_fused_decode_postgemv,
+            supports_fused_indexer_decode_postgemv,
+        )
+
+        emitted = []
+        host_pos = int(pos_tensor.reshape(-1)[0].item())
+        for i in range(seqlen):
+            pos_i = pos_tensor + i
+            kv_i = kv[:, i : i + 1]
+            score_i = score[:, i : i + 1]
+            out = self._graph_entry_scratch.narrow(0, 0, 1)
+            if supports_fused_decode_postgemv(
+                ratio=ratio,
+                rotate=self.rotate,
+                quantize=self.quantize,
+                device=x.device,
+                batch_size=1,
+                seq_len=1,
+                head_dim=self.head_dim,
+                rope_head_dim=self.rope_head_dim,
+            ):
+                e = fused_decode_postgemv(
+                    kv_i=kv_i,
+                    score_i=score_i,
+                    pos=pos_i,
+                    ratio=ratio,
+                    head_dim=self.head_dim,
+                    rope_head_dim=self.rope_head_dim,
+                    overlap=self.overlap,
+                    ape=self.ape,
+                    norm_weight=self.norm_weight,
+                    freqs_cis=self.freqs_cis,
+                    kv_state=kv_state_slot,
+                    score_state=score_state_slot,
+                    kv_cache=kv_cache_slot,
+                    out=out,
+                    eps=self.eps,
+                )
+            elif supports_fused_indexer_decode_postgemv(
+                ratio=ratio,
+                rotate=self.rotate,
+                quantize=self.quantize,
+                device=x.device,
+                batch_size=1,
+                seq_len=1,
+                head_dim=self.head_dim,
+                rope_head_dim=self.rope_head_dim,
+            ):
+                e = fused_indexer_decode_postgemv(
+                    kv_i=kv_i,
+                    score_i=score_i,
+                    pos=pos_i,
+                    ape=self.ape,
+                    norm_weight=self.norm_weight,
+                    freqs_cis=self.freqs_cis,
+                    kv_state=kv_state_slot,
+                    score_state=score_state_slot,
+                    kv_cache=kv_cache_slot,
+                    out=out,
+                    eps=self.eps,
+                )
+            else:
+                raise RuntimeError(
+                    f"compressor forward_graph_prefill has no fused kernel for "
+                    f"ratio={ratio} rotate={self.rotate} quantize={self.quantize}"
+                )
+            if (host_pos + i) % ratio == ratio - 1:
+                emitted.append(e.clone())
+        if not emitted:
+            return torch.zeros(1, 0, self.head_dim, dtype=x.dtype, device=x.device)
+        return torch.cat(emitted, dim=1)
+
 
 class Dsv4Indexer(nn.Module):
     """Selects top-k compressed-KV positions for CSA layers (ratio 4).
@@ -1387,6 +1484,57 @@ class Dsv4Indexer(nn.Module):
         k = self.index_topk
         topk_idxs = index_score.topk(k, dim=-1)[1]
         topk_idxs = torch.where(topk_idxs >= limit, -1, topk_idxs).to(torch.int32)
+        return topk_idxs
+
+    def forward_graph_prefill(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        pos_tensor: torch.Tensor,
+        *,
+        slot: int = 0,
+        max_entries: int,
+    ) -> torch.Tensor:
+        """Capture-safe prefill indexer: ``seqlen`` rows at GPU position.
+
+        Scores EXACTLY the live ``max_entries`` (= n_entries) so the topk tie
+        order matches eager, then pads to a 64-entry bucket (the run width).
+        Advances the indexer's own compressor via its batched graph prefill.
+        """
+        assert self.kv_cache is not None and self.freqs_cis is not None
+        bsz, seqlen, _ = x.shape
+        ratio = self.compressor.ratio
+        if self.compressor.kv_cache is None:
+            self.compressor.kv_cache = self.kv_cache
+            self.compressor.freqs_cis = self.freqs_cis
+        self.compressor.forward_graph_prefill(x, pos_tensor, slot=slot)
+
+        pos_idx = pos_tensor + torch.arange(seqlen, dtype=torch.int64, device=x.device)
+        freqs = self.freqs_cis[pos_idx]
+        q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
+        apply_rotary_emb(q[..., -self.rope_head_dim :], freqs)
+        if q.device.type == "cuda":
+            from runtime.kernels.dsv4_compressor import hadamard_fp4_query
+
+            q = hadamard_fp4_query(q)
+        else:
+            q = hadamard_transform(q, self.head_dim**-0.5)
+            q = fp4_act_quant_simulate(q, 32)
+        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
+        index_score = self._score_entries(q, weights, max_entries, slot=slot)
+
+        bounds = (pos_tensor + torch.arange(1, seqlen + 1, device=x.device)) // ratio
+        causal = torch.arange(max_entries, device=x.device).unsqueeze(0).repeat(seqlen, 1)
+        index_score = index_score + torch.where(
+            causal >= bounds.unsqueeze(1), float("-inf"), 0.0
+        )
+        k = min(self.index_topk, max_entries)
+        topk_idxs = index_score.topk(k, dim=-1)[1]
+        invalid = topk_idxs >= bounds.unsqueeze(1)
+        topk_idxs = torch.where(invalid, -1, topk_idxs).to(torch.int32)
+        bucket = min(self.index_topk, ((max_entries + 63) // 64) * 64)
+        if k < bucket:
+            topk_idxs = torch.nn.functional.pad(topk_idxs, (0, bucket - k), value=-1)
         return topk_idxs
 
     def forward_graph_batch(

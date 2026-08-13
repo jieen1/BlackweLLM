@@ -1032,7 +1032,21 @@ class DeepseekV4Backend:
             outs = []
             for start in range(0, n, tile):
                 end = min(start + tile, n)
-                outs.append(layers[i](x[:, start:end], prefix_len + start, slot=slot))
+                abs_pos = prefix_len + start
+                if abs_pos == 0:
+                    # First cold-prefill tile: eager start_pos==0 batch branch
+                    # (its prefill-page packing differs from the mid-sequence
+                    # ring path forward_graph_prefill targets).
+                    outs.append(layers[i](x[:, start:end], 0, slot=slot))
+                else:
+                    ratio = getattr(layers[i], "ratio", 0)
+                    n_entries = (abs_pos + (end - start)) // ratio if ratio else 0
+                    pos_t = torch.tensor([abs_pos], dtype=torch.long, device=self.device)
+                    outs.append(
+                        layers[i].forward_graph_prefill(
+                            x[:, start:end], pos_t, slot=slot, graph_max_index_entries=n_entries
+                        )
+                    )
             x = torch.cat(outs, dim=1)
             x = block.hc_post(x, residual, post, comb)
             residual = x
