@@ -73,9 +73,7 @@ class PackedQ8_0Weight(nn.Module):
         nb = self.in_features // 32
         q = self.qcode.view(self.out_features, nb, 32)
         d = self.qscale.view(self.out_features, nb, 1)
-        out = torch.empty(
-            (self.out_features, nb, 34), dtype=torch.uint8, device=self.qcode.device
-        )
+        out = torch.empty((self.out_features, nb, 34), dtype=torch.uint8, device=self.qcode.device)
         out[:, :, :2].view(torch.float16).copy_(d)
         out[:, :, 2:].copy_(q)
         return out.reshape(-1)
@@ -507,12 +505,7 @@ class Dsv4MoE(nn.Module):
             preq_activation,
         )
 
-        xr = (
-            flat.unsqueeze(1)
-            .expand(n_tokens, top_k, hidden)
-            .reshape(routes, hidden)
-            .contiguous()
-        )
+        xr = flat.unsqueeze(1).expand(n_tokens, top_k, hidden).reshape(routes, hidden).contiguous()
         xq, xs = preq_activation(xr)
         gate, up = iq2xs_dequant_gemm_indexed_dual_dp4a(
             xq,
@@ -749,7 +742,7 @@ class Dsv4Compressor(nn.Module):
             "_graph_entry_scratch",
             torch.zeros(
                 num_slots,
-                1,
+                16,
                 self.head_dim,
                 dtype=torch.bfloat16,
                 device=device,
@@ -845,7 +838,7 @@ class Dsv4Compressor(nn.Module):
                     kv_state=kv_state_slot,
                     score_state=score_state_slot,
                     kv_cache=kv_cache_slot,
-                    out=self._graph_entry_scratch.narrow(0, 0, 1),
+                    out=self._graph_entry_scratch.narrow(0, 0, 1).narrow(1, 0, 1),
                     eps=self.eps,
                 )
             if supports_fused_indexer_decode_postgemv(
@@ -868,7 +861,7 @@ class Dsv4Compressor(nn.Module):
                     kv_state=kv_state_slot,
                     score_state=score_state_slot,
                     kv_cache=kv_cache_slot,
-                    out=self._graph_entry_scratch.narrow(0, 0, 1),
+                    out=self._graph_entry_scratch.narrow(0, 0, 1).narrow(1, 0, 1),
                     eps=self.eps,
                 )
         pos0 = pos  # [1] int64
@@ -956,7 +949,7 @@ class Dsv4Compressor(nn.Module):
         xf = x.float()
         kv = self.wkv(xf)
         score = self.wgate(xf)
-        out = self._graph_entry_scratch.narrow(0, 0, bsz)
+        out = self._graph_entry_scratch.narrow(0, 0, bsz).narrow(1, 0, 1)
         from runtime.kernels.dsv4_compressor import (
             fused_decode_postgemv_batch,
             fused_indexer_decode_postgemv_batch,
@@ -1168,9 +1161,46 @@ class Dsv4Compressor(nn.Module):
         score_state_slot = self._slot_view(self.score_state, slot)
         kv_cache_slot = self._slot_cache(slot)
         from runtime.kernels.dsv4_compressor import (
-            fused_decode_postgemv,
-            fused_indexer_decode_postgemv,
+            fused_decode_postgemv_seq,
             supports_fused_decode_postgemv,
+        )
+
+        if supports_fused_decode_postgemv(
+            ratio=ratio,
+            rotate=self.rotate,
+            quantize=self.quantize,
+            device=x.device,
+            batch_size=1,
+            seq_len=1,
+            head_dim=self.head_dim,
+            rope_head_dim=self.rope_head_dim,
+        ):
+            host_pos = int(pos_tensor.reshape(-1)[0].item())
+            n_boundaries = (host_pos + seqlen) // ratio - host_pos // ratio
+            out = self._graph_entry_scratch.narrow(0, 0, 1).narrow(1, 0, max(1, n_boundaries))
+            result = fused_decode_postgemv_seq(
+                kv=kv,
+                score=score,
+                pos0=pos_tensor,
+                ratio=ratio,
+                head_dim=self.head_dim,
+                rope_head_dim=self.rope_head_dim,
+                overlap=self.overlap,
+                ape=self.ape,
+                norm_weight=self.norm_weight,
+                freqs_cis=self.freqs_cis,
+                kv_state=kv_state_slot,
+                score_state=score_state_slot,
+                kv_cache=kv_cache_slot,
+                out=out,
+                eps=self.eps,
+            )
+            return result.narrow(1, 0, n_boundaries)
+
+        # Indexer compressor (ratio-4 head_dim=128 rotate+quantize): keep the
+        # per-token fused loop until its own seq kernel lands.
+        from runtime.kernels.dsv4_compressor import (
+            fused_indexer_decode_postgemv,
             supports_fused_indexer_decode_postgemv,
         )
 
@@ -1180,8 +1210,8 @@ class Dsv4Compressor(nn.Module):
             pos_i = pos_tensor + i
             kv_i = kv[:, i : i + 1]
             score_i = score[:, i : i + 1]
-            out = self._graph_entry_scratch.narrow(0, 0, 1)
-            if supports_fused_decode_postgemv(
+            out = self._graph_entry_scratch.narrow(0, 0, 1).narrow(1, 0, 1)
+            if not supports_fused_indexer_decode_postgemv(
                 ratio=ratio,
                 rotate=self.rotate,
                 quantize=self.quantize,
@@ -1191,51 +1221,23 @@ class Dsv4Compressor(nn.Module):
                 head_dim=self.head_dim,
                 rope_head_dim=self.rope_head_dim,
             ):
-                e = fused_decode_postgemv(
-                    kv_i=kv_i,
-                    score_i=score_i,
-                    pos=pos_i,
-                    ratio=ratio,
-                    head_dim=self.head_dim,
-                    rope_head_dim=self.rope_head_dim,
-                    overlap=self.overlap,
-                    ape=self.ape,
-                    norm_weight=self.norm_weight,
-                    freqs_cis=self.freqs_cis,
-                    kv_state=kv_state_slot,
-                    score_state=score_state_slot,
-                    kv_cache=kv_cache_slot,
-                    out=out,
-                    eps=self.eps,
-                )
-            elif supports_fused_indexer_decode_postgemv(
-                ratio=ratio,
-                rotate=self.rotate,
-                quantize=self.quantize,
-                device=x.device,
-                batch_size=1,
-                seq_len=1,
-                head_dim=self.head_dim,
-                rope_head_dim=self.rope_head_dim,
-            ):
-                e = fused_indexer_decode_postgemv(
-                    kv_i=kv_i,
-                    score_i=score_i,
-                    pos=pos_i,
-                    ape=self.ape,
-                    norm_weight=self.norm_weight,
-                    freqs_cis=self.freqs_cis,
-                    kv_state=kv_state_slot,
-                    score_state=score_state_slot,
-                    kv_cache=kv_cache_slot,
-                    out=out,
-                    eps=self.eps,
-                )
-            else:
                 raise RuntimeError(
                     f"compressor forward_graph_prefill has no fused kernel for "
                     f"ratio={ratio} rotate={self.rotate} quantize={self.quantize}"
                 )
+            e = fused_indexer_decode_postgemv(
+                kv_i=kv_i,
+                score_i=score_i,
+                pos=pos_i,
+                ape=self.ape,
+                norm_weight=self.norm_weight,
+                freqs_cis=self.freqs_cis,
+                kv_state=kv_state_slot,
+                score_state=score_state_slot,
+                kv_cache=kv_cache_slot,
+                out=out,
+                eps=self.eps,
+            )
             if (host_pos + i) % ratio == ratio - 1:
                 emitted.append(e.clone())
         if not emitted:
@@ -1399,9 +1401,7 @@ class Dsv4Indexer(nn.Module):
         elif start_pos == 0:
             causal = torch.arange(seqlen // ratio, device=x.device).repeat(seqlen, 1)
             causal = causal >= torch.arange(1, seqlen + 1, device=x.device).unsqueeze(1) // ratio
-            index_score = index_score + torch.where(
-                causal, float("-inf"), 0.0
-            )
+            index_score = index_score + torch.where(causal, float("-inf"), 0.0)
         k = min(self.index_topk, end_pos // ratio)
         topk_idxs = index_score.topk(k, dim=-1)[1]
         if seqlen > 1:
@@ -1525,9 +1525,7 @@ class Dsv4Indexer(nn.Module):
 
         bounds = (pos_tensor + torch.arange(1, seqlen + 1, device=x.device)) // ratio
         causal = torch.arange(max_entries, device=x.device).unsqueeze(0).repeat(seqlen, 1)
-        index_score = index_score + torch.where(
-            causal >= bounds.unsqueeze(1), float("-inf"), 0.0
-        )
+        index_score = index_score + torch.where(causal >= bounds.unsqueeze(1), float("-inf"), 0.0)
         k = min(self.index_topk, max_entries)
         topk_idxs = index_score.topk(k, dim=-1)[1]
         invalid = topk_idxs >= bounds.unsqueeze(1)

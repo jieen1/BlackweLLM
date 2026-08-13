@@ -1590,3 +1590,209 @@ def compile_fused_indexer_decode_postgemv_batch_sm120(
             options={"num_warps": migrate_num_warps, "num_stages": migrate_num_stages},
         ),
     )
+
+
+@triton.jit
+def _decode_postgemv_seq_kernel(
+    kv_ptr,
+    score_ptr,
+    pos0_ptr,
+    ape_ptr,
+    norm_weight_ptr,
+    freqs_ri_ptr,
+    kv_state_ptr,
+    score_state_ptr,
+    kv_cache_ptr,
+    out_ptr,
+    kv_col_stride,
+    score_col_stride,
+    ape_row_stride,
+    kv_state_row_stride,
+    score_state_row_stride,
+    kv_cache_row_stride,
+    out_row_stride,
+    freqs_row_stride,
+    eps,
+    SEQ_LEN: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    FULL_DIM: tl.constexpr,
+    RATIO: tl.constexpr,
+    OVERLAP: tl.constexpr,
+):
+    pos0 = tl.load(pos0_ptr)
+    offs_full = tl.arange(0, FULL_DIM)
+    offs_head = tl.arange(0, HEAD_DIM)
+    offs_pair = tl.arange(0, HEAD_DIM // 2)
+    for i in range(SEQ_LEN):
+        pos = pos0 + i
+        slot = pos % RATIO
+        kv_i = tl.load(kv_ptr + i * kv_col_stride + offs_full).to(tl.float32)
+        score_i = tl.load(score_ptr + i * score_col_stride + offs_full).to(tl.float32)
+        score_i += tl.load(ape_ptr + slot * ape_row_stride + offs_full).to(tl.float32)
+        state_row = tl.where(OVERLAP, RATIO + slot, slot)
+        tl.store(kv_state_ptr + state_row * kv_state_row_stride + offs_full, kv_i)
+        tl.store(score_state_ptr + state_row * score_state_row_stride + offs_full, score_i)
+        tl.debug_barrier()
+        max_score = tl.full((HEAD_DIM,), float("-inf"), tl.float32)
+        for r in range(RATIO):
+            score_a = tl.load(score_state_ptr + r * score_state_row_stride + offs_head).to(
+                tl.float32
+            )
+            if not OVERLAP:
+                cur_a = tl.load(score_ptr + i * score_col_stride + offs_head).to(tl.float32)
+                cur_a += tl.load(ape_ptr + slot * ape_row_stride + offs_head).to(tl.float32)
+                score_a = tl.where(slot == r, cur_a, score_a)
+            max_score = tl.maximum(max_score, score_a)
+            if OVERLAP:
+                score_b = tl.load(
+                    score_state_ptr + (RATIO + r) * score_state_row_stride + HEAD_DIM + offs_head
+                ).to(tl.float32)
+                cur_b = tl.load(score_ptr + i * score_col_stride + HEAD_DIM + offs_head).to(
+                    tl.float32
+                )
+                cur_b += tl.load(ape_ptr + slot * ape_row_stride + HEAD_DIM + offs_head).to(
+                    tl.float32
+                )
+                score_b = tl.where(slot == r, cur_b, score_b)
+                max_score = tl.maximum(max_score, score_b)
+        denom = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+        pooled = tl.zeros((HEAD_DIM,), dtype=tl.float32)
+        for r in range(RATIO):
+            score_a = tl.load(score_state_ptr + r * score_state_row_stride + offs_head).to(
+                tl.float32
+            )
+            value_a = tl.load(kv_state_ptr + r * kv_state_row_stride + offs_head).to(tl.float32)
+            if not OVERLAP:
+                cur_a = tl.load(score_ptr + i * score_col_stride + offs_head).to(tl.float32)
+                cur_a += tl.load(ape_ptr + slot * ape_row_stride + offs_head).to(tl.float32)
+                cur_v = tl.load(kv_ptr + i * kv_col_stride + offs_head).to(tl.float32)
+                score_a = tl.where(slot == r, cur_a, score_a)
+                value_a = tl.where(slot == r, cur_v, value_a)
+            exp_a = tl.exp(score_a - max_score)
+            denom += exp_a
+            pooled += value_a * exp_a
+            if OVERLAP:
+                score_b = tl.load(
+                    score_state_ptr + (RATIO + r) * score_state_row_stride + HEAD_DIM + offs_head
+                ).to(tl.float32)
+                value_b = tl.load(
+                    kv_state_ptr + (RATIO + r) * kv_state_row_stride + HEAD_DIM + offs_head
+                ).to(tl.float32)
+                cur_b = tl.load(score_ptr + i * score_col_stride + HEAD_DIM + offs_head).to(
+                    tl.float32
+                )
+                cur_b += tl.load(ape_ptr + slot * ape_row_stride + HEAD_DIM + offs_head).to(
+                    tl.float32
+                )
+                cur_v = tl.load(kv_ptr + i * kv_col_stride + HEAD_DIM + offs_head).to(tl.float32)
+                score_b = tl.where(slot == r, cur_b, score_b)
+                value_b = tl.where(slot == r, cur_v, value_b)
+                exp_b = tl.exp(score_b - max_score)
+                denom += exp_b
+                pooled += value_b * exp_b
+        pooled = pooled / denom
+        should_compress = ((pos + 1) % RATIO) == 0
+        if OVERLAP:
+            for r in range(RATIO):
+                upper_kv = tl.load(kv_state_ptr + (RATIO + r) * kv_state_row_stride + offs_full).to(
+                    tl.float32
+                )
+                upper_score = tl.load(
+                    score_state_ptr + (RATIO + r) * score_state_row_stride + offs_full
+                ).to(tl.float32)
+                lower_kv = tl.load(kv_state_ptr + r * kv_state_row_stride + offs_full).to(
+                    tl.float32
+                )
+                lower_score = tl.load(score_state_ptr + r * score_state_row_stride + offs_full).to(
+                    tl.float32
+                )
+                tl.store(
+                    kv_state_ptr + r * kv_state_row_stride + offs_full,
+                    tl.where(should_compress, upper_kv, lower_kv),
+                )
+                tl.store(
+                    score_state_ptr + r * score_state_row_stride + offs_full,
+                    tl.where(should_compress, upper_score, lower_score),
+                )
+        pooled = pooled.to(tl.bfloat16).to(tl.float32)
+        inv_rms = tl.rsqrt(tl.sum(pooled * pooled, axis=0) / HEAD_DIM + eps)
+        nw = tl.load(norm_weight_ptr + offs_head).to(tl.float32)
+        normed = pooled * inv_rms * nw
+        nb16 = normed.to(tl.bfloat16)
+        pe, po = tl.split(tl.reshape(nb16, (HEAD_DIM // 2, 2)))
+        rps = (HEAD_DIM - ROPE_DIM) // 2
+        rm = offs_pair >= rps
+        rp = offs_pair - rps
+        fb = tl.maximum(pos + 1 - RATIO, 0) * freqs_row_stride
+        cos = tl.load(freqs_ri_ptr + fb + 2 * rp, mask=rm, other=1.0).to(tl.float32)
+        sin = tl.load(freqs_ri_ptr + fb + 2 * rp + 1, mask=rm, other=0.0).to(tl.float32)
+        pef = pe.to(tl.float32)
+        pof = po.to(tl.float32)
+        ne = tl.where(rm, pef * cos - pof * sin, pef).to(tl.bfloat16)
+        no = tl.where(rm, pof * cos + pef * sin, pof).to(tl.bfloat16)
+        rel = (pos // RATIO) - (pos0 // RATIO)
+        cb = (pos0 // RATIO) * kv_cache_row_stride + rel * kv_cache_row_stride
+        ob = rel * out_row_stride
+        existing_e = tl.load(kv_cache_ptr + cb + 2 * offs_pair)
+        existing_o = tl.load(kv_cache_ptr + cb + 2 * offs_pair + 1)
+        me = tl.where(should_compress, ne, existing_e)
+        mo = tl.where(should_compress, no, existing_o)
+        tl.store(kv_cache_ptr + cb + 2 * offs_pair, me)
+        tl.store(kv_cache_ptr + cb + 2 * offs_pair + 1, mo)
+        tl.store(out_ptr + ob + 2 * offs_pair, me)
+        tl.store(out_ptr + ob + 2 * offs_pair + 1, mo)
+
+
+def fused_decode_postgemv_seq(
+    *,
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    pos0: torch.Tensor,
+    ratio: int,
+    head_dim: int,
+    rope_head_dim: int,
+    overlap: bool,
+    ape: torch.Tensor,
+    norm_weight: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    kv_cache: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    seq_len = kv.shape[1]
+    coeff = 2 if overlap else 1
+    full_dim = coeff * head_dim
+    freqs_ri = torch.view_as_real(freqs_cis).reshape(freqs_cis.shape[0], rope_head_dim)
+    num_warps = 16 if ratio == 128 else 8
+    _decode_postgemv_seq_kernel[(1,)](
+        kv,
+        score,
+        pos0,
+        ape,
+        norm_weight,
+        freqs_ri,
+        kv_state,
+        score_state,
+        kv_cache,
+        out,
+        kv.stride(1),
+        score.stride(1),
+        ape.stride(0),
+        kv_state.stride(1),
+        score_state.stride(1),
+        kv_cache.stride(1),
+        out.stride(1),
+        freqs_ri.stride(0),
+        eps,
+        SEQ_LEN=seq_len,
+        HEAD_DIM=head_dim,
+        ROPE_DIM=rope_head_dim,
+        FULL_DIM=full_dim,
+        RATIO=ratio,
+        OVERLAP=overlap,
+        num_warps=num_warps,
+    )
+    return out

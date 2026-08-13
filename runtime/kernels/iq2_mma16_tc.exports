@@ -1,5 +1,8 @@
 {
   global:
     iq2_mma16_tc_launch;
+    moe_group_launch;
+    moe_gather_xq_launch;
+    iq2_mma16_tc_dynamic_launch;
   local: *;
 };
