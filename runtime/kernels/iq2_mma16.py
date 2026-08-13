@@ -298,3 +298,22 @@ def _preq(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     scale = torch.clamp(scale, min=1e-8)
     xq = (xr / scale).round().clamp(-128, 127).to(torch.int8)
     return xq.reshape_as(x), scale.reshape(*shape[:-1], k // 32)
+
+
+def _preq_into(x: torch.Tensor, xq_out: torch.Tensor, xs_out: torch.Tensor) -> None:
+    """Caller-owned int8 per-32 quantization (CUDA-graph safe).
+
+    Same math as :func:`_preq` but writes into preallocated buffers instead
+    of allocating: ``xq_out`` ``[..., K]`` int8, ``xs_out`` ``[..., K//32]``
+    fp32 -- both flat.  No allocation, no dynamic shape, safe inside a CUDA
+    graph capture body.
+    """
+    import torch
+
+    shape = x.shape
+    k = shape[-1]
+    xr = x.reshape(-1, k // 32, 32)
+    scale = xr.abs().max(-1, keepdim=True).values / 127.0
+    scale = torch.clamp(scale, min=1e-8)
+    xq_out.view(-1).copy_((xr / scale).round().clamp(-128, 127).to(torch.int8).reshape(-1))
+    xs_out.view(-1).copy_(scale.reshape(-1))

@@ -199,7 +199,7 @@ extern "C" QSR_EXPORT void iq2_mma16_tc_launch(
     const int8_t* xq, const float* xs, const uint8_t* packed_gate,
     const uint8_t* packed_up, const int64_t* eids, const int64_t* grid,
     const int32_t* ksigns, float* out_gate, float* out_up,
-    int E, int ROWS, int COLS, int STRIDE, int M_PAD)
+    int E, int ROWS, int COLS, int STRIDE, int M_PAD, cudaStream_t stream)
 {
     const int smem_bytes = 2 * 32 * 256 + 2 * 32 * 8 * 4;        // sid + sB planes
     cudaFuncSetAttribute((const void*)iq2_mma16_tc_kernel<16>,
@@ -212,21 +212,23 @@ extern "C" QSR_EXPORT void iq2_mma16_tc_launch(
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     dim3 block(128);
     dim3 gridc(E, ROWS / 32);
+    // Launch on the GIVEN stream (torch's capture stream), never the legacy
+    // default stream: torch.cuda.graph captures on a private stream, and a
+    // `<<<...>>>` launch lands on the default stream and silently drops out
+    // of the capture -- the kernel then never re-executes on replay.
+    void* args16[] = {&xq, &xs, &packed_gate, &packed_up, &eids, &grid, &ksigns,
+                      &out_gate, &out_up, &E, &ROWS, &COLS, &STRIDE, &M_PAD};
     if (M_PAD == 16) {
-        iq2_mma16_tc_kernel<16><<<gridc, block, smem_bytes>>>(
-            xq, xs, packed_gate, packed_up, eids, grid, ksigns,
-            out_gate, out_up, E, ROWS, COLS, STRIDE, M_PAD);
+        cudaLaunchKernel((const void*)iq2_mma16_tc_kernel<16>, gridc, block, args16,
+                         smem_bytes, stream);
     } else if (M_PAD == 32) {
-        iq2_mma16_tc_kernel<32><<<gridc, block, smem_bytes>>>(
-            xq, xs, packed_gate, packed_up, eids, grid, ksigns,
-            out_gate, out_up, E, ROWS, COLS, STRIDE, M_PAD);
+        cudaLaunchKernel((const void*)iq2_mma16_tc_kernel<32>, gridc, block, args16,
+                         smem_bytes, stream);
     } else if (M_PAD == 48) {
-        iq2_mma16_tc_kernel<48><<<gridc, block, smem_bytes>>>(
-            xq, xs, packed_gate, packed_up, eids, grid, ksigns,
-            out_gate, out_up, E, ROWS, COLS, STRIDE, M_PAD);
+        cudaLaunchKernel((const void*)iq2_mma16_tc_kernel<48>, gridc, block, args16,
+                         smem_bytes, stream);
     } else {
-        iq2_mma16_tc_kernel<64><<<gridc, block, smem_bytes>>>(
-            xq, xs, packed_gate, packed_up, eids, grid, ksigns,
-            out_gate, out_up, E, ROWS, COLS, STRIDE, M_PAD);
+        cudaLaunchKernel((const void*)iq2_mma16_tc_kernel<64>, gridc, block, args16,
+                         smem_bytes, stream);
     }
 }

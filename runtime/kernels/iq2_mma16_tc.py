@@ -16,6 +16,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import torch
+
+from runtime.kernels.dsv4_grouping import (
+    device_group_counts_into,
+)
+from runtime.kernels.iq2_mma16 import _preq_into
+
 ABI_VERSION = 1
 TARGET_SM = "sm_120f"
 ACCEPTED_TARGET_SM = ("sm_120f", "sm_120a")
@@ -80,6 +87,7 @@ class NativeIQ2MMA16TCLibrary:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p,
         ]
         self._launch.restype = None
 
@@ -182,6 +190,7 @@ class NativeIQ2MMA16TCLibrary:
             ctypes.c_void_p(out_gate.data_ptr()),
             ctypes.c_void_p(out_up.data_ptr()),
             E, rows, cols, stride, m_pad,
+            ctypes.c_void_p(torch.cuda.current_stream(xq.device).cuda_stream),
         )
         return out_gate, out_up
 
@@ -267,6 +276,7 @@ class NativeIQ2MMA16TCLibrary:
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p,
         ]
         launch.restype = None
         launch(
@@ -278,6 +288,7 @@ class NativeIQ2MMA16TCLibrary:
             ctypes.c_void_p(ksigns.data_ptr()),
             ctypes.c_void_p(out.data_ptr()),
             E, rows, cols, stride, m_pad,
+            ctypes.c_void_p(torch.cuda.current_stream(xq.device).cuda_stream),
         )
         return out
 
@@ -362,7 +373,7 @@ def grouped_moe_prefill_k32(
     xs = torch.zeros(n_experts, bucket, hidden // 32, dtype=torch.float32, device=flat.device)
     w = torch.zeros(n_experts, bucket, dtype=torch.float32, device=flat.device)
     xq[e1, within1] = xq_flat[rt[gidx1]]
-    xs[e1, within1] = xs_flat[rt[gidx1]]
+    xs[e1, within1] = xs_flat[rt[gidx1]].to(torch.float32)
     w[e1, within1] = rw[gidx1]
     gate = torch.empty(n_experts, bucket, inter, dtype=torch.float32, device=flat.device)
     up = torch.empty_like(gate)
@@ -382,7 +393,11 @@ def grouped_moe_prefill_k32(
     )
     contrib[gidx1] = (down * w.unsqueeze(-1))[e1, within1]
 
-    # batch 2: remainder of over-bucket experts (up to 16 routes each)
+    # batch 2: remainder of over-bucket experts.  ``b2_bucket`` must cover
+    # the FULL over-run (up to the largest route count in the chunk), not a
+    # fixed 16 -- a 64-token chunk can route hundreds of slots to one expert
+    # (e.g. hash layers, or a dominant token), and truncating the batch
+    # would both OOB the scatter below and drop routes.
     over = counts > bucket
     n_over = int(over.sum().item())
     if n_over:
@@ -395,31 +410,53 @@ def grouped_moe_prefill_k32(
         e2_global = torch.repeat_interleave(torch.arange(n_experts, device=flat.device),
                                             counts)[gidx2]
         e2 = g2l[e2_global]
-        b2_bucket = 16
         within2 = within[gidx2] - bucket
-        xq = torch.zeros(n_over, b2_bucket, hidden, dtype=torch.int8, device=flat.device)
-        xs = torch.zeros(n_over, b2_bucket, hidden // 32, dtype=torch.float32, device=flat.device)
-        w = torch.zeros(n_over, b2_bucket, dtype=torch.float32, device=flat.device)
-        xq[e2, within2] = xq_flat[rt[gidx2]]
-        xs[e2, within2] = xs_flat[rt[gidx2]]
-        w[e2, within2] = rw[gidx2]
-        gate2 = torch.empty(n_over, b2_bucket, inter, dtype=torch.float32, device=flat.device)
-        up2 = torch.empty_like(gate2)
-        library.grouped_gate_up_into(
-            xq, xs, gate_packed, up_packed, over_eids, grid, ksigns, gate2, up2,
-            rows=inter, cols=hidden, stride=stride_g, m_pad=b2_bucket,
-        )
-        h = torch.nn.functional.silu(torch.clamp(gate2, max=swiglu_limit)) * \
-            torch.clamp(up2, min=-swiglu_limit, max=swiglu_limit)
-        hq, hs = _preq(h.reshape(-1, inter))
-        hq = hq.reshape(n_over, b2_bucket, inter)
-        hs = hs.reshape(n_over, b2_bucket, inter // 32)
-        down = torch.empty(n_over, b2_bucket, hidden, dtype=torch.float32, device=flat.device)
-        library.single_down_into(
-            hq, hs, down_packed, over_eids, grid, ksigns, down,
-            rows=hidden, cols=inter, stride=stride_d, m_pad=b2_bucket,
-        )
-        contrib[gidx2] = (down * w.unsqueeze(-1))[e2, within2]
+        # The over-run can exceed the kernel's M_PAD cap for a dominant
+        # token, but DSV4's real 64-token route distribution tops out around
+        # 21 over-routes (max route ~53, bucket=32).  Use a single batch2
+        # kernel sized to the actual over-run (clamped to the kernel's 48-row
+        # support) so the common case is ONE extra kernel per over-expert,
+        # not a per-48-row segment loop.
+        B2_MAX = 48
+        over_run = int(within2.max().item()) + 1 if within2.numel() else 0
+        for lo in range(0, over_run, B2_MAX):
+            hi = min(lo + B2_MAX, over_run)
+            seg_mask = (within2 >= lo) & (within2 < hi)
+            gs = gidx2[seg_mask]
+            if not gs.numel():
+                continue
+            # The kernel only instantiates M_PAD in {16, 32, 48, 64}; a raw
+            # segment width like 28 falls through to the <64> template and
+            # reads/writes past the real [n_over, 28, ...] buffer.  Pad the
+            # segment bucket UP to the next supported width (<=64).
+            seg_bucket = min(64, ((hi - lo) + 15) // 16 * 16)
+            e2s = e2[seg_mask]
+            within2s = within2[seg_mask] - lo
+            xq = torch.zeros(n_over, seg_bucket, hidden, dtype=torch.int8, device=flat.device)
+            xs = torch.zeros(
+                n_over, seg_bucket, hidden // 32, dtype=torch.float32, device=flat.device
+            )
+            w = torch.zeros(n_over, seg_bucket, dtype=torch.float32, device=flat.device)
+            xq[e2s, within2s] = xq_flat[rt[gs]]
+            xs[e2s, within2s] = xs_flat[rt[gs]].to(torch.float32)
+            w[e2s, within2s] = rw[gs]
+            gate2 = torch.empty(n_over, seg_bucket, inter, dtype=torch.float32, device=flat.device)
+            up2 = torch.empty_like(gate2)
+            library.grouped_gate_up_into(
+                xq, xs, gate_packed, up_packed, over_eids, grid, ksigns, gate2, up2,
+                rows=inter, cols=hidden, stride=stride_g, m_pad=seg_bucket,
+            )
+            h = torch.nn.functional.silu(torch.clamp(gate2, max=swiglu_limit)) * \
+                torch.clamp(up2, min=-swiglu_limit, max=swiglu_limit)
+            hq, hs = _preq(h.reshape(-1, inter))
+            hq = hq.reshape(n_over, seg_bucket, inter)
+            hs = hs.reshape(n_over, seg_bucket, inter // 32)
+            down = torch.empty(n_over, seg_bucket, hidden, dtype=torch.float32, device=flat.device)
+            library.single_down_into(
+                hq, hs, down_packed, over_eids, grid, ksigns, down,
+                rows=hidden, cols=inter, stride=stride_d, m_pad=seg_bucket,
+            )
+            contrib[gs] = (down * w.unsqueeze(-1))[e2s, within2s]
 
     # unsort to original route order, reshape, reduce in stable expert-id order
     inv = torch.argsort(order)
@@ -427,3 +464,295 @@ def grouped_moe_prefill_k32(
     final_order = torch.argsort(indices, dim=1, stable=True)
     c = c.gather(1, final_order.unsqueeze(-1).expand_as(c))
     return c.sum(dim=1)
+
+
+# ---------------------------------------------------------------------------
+# CUDA-graph-safe complete K32 MoE (Phase 1K service path)
+# ---------------------------------------------------------------------------
+#
+# The eager ``grouped_moe_prefill_k32`` above spends ~2.4 s of CPU per
+# 64-token chunk on Python glue (argsort/nonzero/repeat_interleave/scatter,
+# measured 2026-08-12) against ~270 ms of GPU kernels -- CPU-bound.  This
+# graph-safe sibling replaces every dynamic-shape Python op with fixed-shape
+# device kernels and caller-owned buffers so the whole 43-layer MoE body can
+# be captured in one CUDA graph and replayed with per-chunk input contents.
+#
+# ``Dsv4PrefillMoEWorkspace`` owns every intermediate buffer; the run function
+# performs zero allocations and zero dynamic branching, so it is capturable.
+# BUCKET=64 covers DSV4's real 64-token route distribution (measured max
+# route ~53) in a SINGLE batch -- no over-bucket split in the common case --
+# matching what the decode-side kernels already assume.
+_GRAPH_BUCKET = 64
+
+
+@dataclass
+class Dsv4PrefillMoEWorkspace:
+    """Caller-owned fixed-shape buffers for one graph-captured K32 MoE run.
+
+    Shapes are pinned to a 64-token chunk: ``M`` rows, top-k 6, 256 experts,
+    ``bucket`` 64.  ``flat``/``indices``/``weights`` contents change between
+    replays; everything else is a reusable scratch area.
+    """
+
+    device: str
+    hidden: int
+    inter: int
+    m: int = 64
+    top_k: int = 6
+    n_experts: int = 256
+    bucket: int = _GRAPH_BUCKET
+
+    def __post_init__(self) -> None:
+        d = torch.device(self.device)
+        self.flat = torch.empty(self.m, self.hidden, dtype=torch.bfloat16, device=d)
+        self.indices = torch.empty(self.m, self.top_k, dtype=torch.int64, device=d)
+        self.weights = torch.empty(self.m, self.top_k, dtype=torch.float32, device=d)
+        r = self.m * self.top_k
+        # quantized activations of the M input rows (flat, NOT route-expanded)
+        self.xq_flat = torch.empty(self.m, self.hidden, dtype=torch.int8, device=d)
+        self.xs_flat = torch.empty(self.m, self.hidden // 32, dtype=torch.float32, device=d)
+        # route-expanded activations [R, hidden] gathered from xq_flat by rt
+        self.xq_route = torch.empty(r, self.hidden, dtype=torch.int8, device=d)
+        self.xs_route = torch.empty(r, self.hidden // 32, dtype=torch.float32, device=d)
+        # SwiGLU output quantized (flat [E*BUCKET, inter])
+        self.hq_flat = torch.empty(
+            self.n_experts * self.bucket * self.inter, dtype=torch.int8, device=d
+        )
+        self.hs_flat = torch.empty(
+            self.n_experts * self.bucket * (self.inter // 32), dtype=torch.float32, device=d
+        )
+        # device grouping (fixed shape)
+        self.routes = torch.empty(r, dtype=torch.int32, device=d)
+        self.rweights = torch.empty(r, dtype=torch.float32, device=d)
+        self.counts = torch.empty(self.n_experts, dtype=torch.int32, device=d)
+        self.within = torch.empty(r, dtype=torch.int32, device=d)
+        # overflow-batch within: (within - bucket) for within >= bucket, the
+        # second fixed batch's slot index (graph-safe; see batch2 split below).
+        self.within2 = torch.empty(r, dtype=torch.int32, device=d)
+        self.offsets = torch.empty(self.n_experts, dtype=torch.int32, device=d)
+        # arange carrier for device_group_counts_into: must be >= R = m*top_k.
+        # Sizing it to n_experts would silently resize during graph capture.
+        self.cursor = torch.empty(r, dtype=torch.int32, device=d)
+        self.rt = torch.empty(r, dtype=torch.int64, device=d)  # token index per route
+        # batch tile (single BUCKET, covers real 64-token distribution)
+        self.xq = torch.empty(
+            self.n_experts, self.bucket, self.hidden, dtype=torch.int8, device=d
+        )
+        self.xs = torch.empty(
+            self.n_experts, self.bucket, self.hidden // 32, dtype=torch.float32, device=d
+        )
+        self.w = torch.empty(self.n_experts, self.bucket, dtype=torch.float32, device=d)
+        self.gate = torch.empty(
+            self.n_experts, self.bucket, self.inter, dtype=torch.float32, device=d
+        )
+        self.up = torch.empty_like(self.gate)
+        self.hq = torch.empty(
+            self.n_experts, self.bucket, self.inter, dtype=torch.int8, device=d
+        )
+        self.hs = torch.empty(
+            self.n_experts, self.bucket, self.inter // 32, dtype=torch.float32, device=d
+        )
+        self.down = torch.empty(
+            self.n_experts, self.bucket, self.hidden, dtype=torch.float32, device=d
+        )
+        self.contrib = torch.empty(r, self.hidden, dtype=torch.float32, device=d)
+        self.eids = torch.arange(self.n_experts, dtype=torch.int64, device=d)
+        self.out = torch.empty(self.m, self.hidden, dtype=torch.float32, device=d)
+        # flattened (expert, within) index for 1D tile scatter (graph-safe)
+        self.flat_idx = torch.empty(r, dtype=torch.int64, device=d)
+        # 0..R-1 route positions for combine (graph-safe)
+        self.route_range = torch.arange(r, dtype=torch.int64, device=d)
+        # stable expert-id order of each token's top-k slots (graph-safe);
+        # the combine must sum in this order to be bit-exact with the eager
+        # path (which gathers on argsort(indices) before summing -- the sum
+        # order matters for fp32 accumulation, and a mismatch leaks ~1e-5
+        # that the sparse-attention topk then amplifies into token drift).
+        self.final_order = torch.empty(self.m, self.top_k, dtype=torch.int64, device=d)
+        # ctypes-launched kernels read raw pointers, so torch knows no
+        # dependency edge; a tiny scalar copy bridges each kernel to its
+        # inputs so CUDA graph capture orders them correctly (same pattern as
+        # the decode driver's input dependencies).
+        self.dep_gate = torch.empty(1, dtype=torch.float32, device=d)
+        self.dep_down = torch.empty(1, dtype=torch.float32, device=d)
+
+
+def _preq_flat_into(x: torch.Tensor, xq_out: torch.Tensor, xs_out: torch.Tensor) -> None:
+    """Quantize ``[R, K]`` into caller-owned flat buffers (graph-safe)."""
+    _preq_into(x, xq_out, xs_out)
+
+
+def grouped_moe_prefill_k32_graph(
+    ws: Dsv4PrefillMoEWorkspace,
+    flat: torch.Tensor,
+    indices: torch.Tensor,
+    weights: torch.Tensor,
+    gate_packed: torch.Tensor,
+    up_packed: torch.Tensor,
+    down_packed: torch.Tensor,
+    grid: torch.Tensor,
+    ksigns: torch.Tensor,
+    *,
+    inter: int,
+    hidden: int,
+    swiglu_limit: float,
+    library: NativeIQ2MMA16TCLibrary | None = None,
+) -> torch.Tensor:
+    """Graph-capturable complete K32 MoE for one fixed 64-token chunk.
+
+    Zero allocations, zero dynamic shapes: device grouping replaces the
+    Python argsort/nonzero glue, and the fixed ``bucket=64`` single batch
+    covers DSV4's real route distribution.  ``ws`` owns every intermediate;
+    ``flat``/``indices``/``weights`` are copied into it (contents-only, shape
+    must match the workspace).  Returns ``[M, hidden]`` routed output.
+    """
+    if library is None:
+        library = NativeIQ2MMA16TCLibrary.load()
+    if flat.shape != (ws.m, hidden) or indices.shape != (ws.m, ws.top_k):
+        raise ValueError(
+            f"graph MoE expects flat {tuple((ws.m, hidden))} indices "
+            f"{tuple((ws.m, ws.top_k))}, got {tuple(flat.shape)} {tuple(indices.shape)}"
+        )
+    # The caller pre-loads ws.flat/ws.indices/ws.weights BEFORE capture (and
+    # mutates them between replays).  The graph body reads ONLY ws buffers so
+    # a replay needs no parameter round-trip and new inputs take effect by
+    # writing into the workspace.  ``flat``/``indices``/``weights`` are
+    # accepted for shape validation only and are copied by the caller into
+    # the workspace (they are captured as graph inputs, so the copy here
+    # would otherwise pin the capture-time contents into every replay).
+    ws.routes.copy_(ws.indices.reshape(-1).to(torch.int32))
+    ws.rweights.copy_(ws.weights.reshape(-1))
+    ws.rt.copy_(torch.arange(ws.m, device=ws.device).repeat_interleave(ws.top_k))
+
+    # device grouping (fixed-shape atomics)
+    device_group_counts_into(ws.routes, ws.counts, ws.within, ws.offsets, ws.cursor)
+
+    # quantize activations of the M input rows, then expand to R routes
+    _preq_flat_into(ws.flat, ws.xq_flat, ws.xs_flat)
+    ws.xq_route.copy_(ws.xq_flat[ws.rt])
+    ws.xs_route.copy_(ws.xs_flat[ws.rt])
+
+    stride_g = (hidden // 256) * 74
+    stride_d = (inter // 256) * 74
+    # Two fixed batches cover up to 2*bucket routes per expert.  The eager
+    # path splits exactly this way (bucket first, then an overflow batch) --
+    # a single batch cannot cover the hash layers' route distribution (max
+    # route ~51 at 128 tokens, ~315 at 2048), and clamping the overflow into
+    # slot bucket-1 silently corrupts the output (measured cos 0.995 -> token
+    # drift).  Batch 1 takes within < bucket; batch 2 takes the remainder with
+    # within2 = within - bucket.  Each fill masks the OTHER batch's routes to
+    # zero and uses accumulate so the masked routes add nothing.
+    ws.contrib.zero_()
+    bucket = ws.bucket
+    b1 = ws.within < bucket  # [R] bool, fixed shape
+    w1 = ws.within.clamp(max=bucket - 1)
+
+    # ---- batch 1 ---------------------------------------------------------
+    ws.xq.zero_()
+    ws.xs.zero_()
+    ws.w.zero_()
+    ws.xq.index_put_(
+        (ws.routes.long(), w1),
+        torch.where(b1.unsqueeze(-1), ws.xq_route, torch.zeros_like(ws.xq_route)),
+        accumulate=True,
+    )
+    ws.xs.index_put_(
+        (ws.routes.long(), w1),
+        torch.where(b1.unsqueeze(-1), ws.xs_route, torch.zeros_like(ws.xs_route)),
+        accumulate=True,
+    )
+    ws.w.index_put_(
+        (ws.routes.long(), w1),
+        torch.where(b1, ws.rweights, torch.zeros_like(ws.rweights)),
+        accumulate=True,
+    )
+    ws.dep_gate.copy_(ws.xq.sum().to(torch.float32) + ws.xs.sum())
+    library.grouped_gate_up_into(
+        ws.xq, ws.xs, gate_packed, up_packed, ws.eids, grid, ksigns,
+        ws.gate, ws.up, rows=inter, cols=hidden, stride=stride_g, m_pad=bucket,
+    )
+    h = torch.nn.functional.silu(torch.clamp(ws.gate, max=swiglu_limit)) * torch.clamp(
+        ws.up, min=-swiglu_limit, max=swiglu_limit
+    )
+    _preq_flat_into(h.reshape(-1, inter), ws.hq_flat, ws.hs_flat)
+    ws.hq.view(ws.n_experts, bucket, inter).copy_(
+        ws.hq_flat.view(ws.n_experts, bucket, inter)
+    )
+    ws.hs.view(ws.n_experts, bucket, inter // 32).copy_(
+        ws.hs_flat.view(ws.n_experts, bucket, inter // 32)
+    )
+    ws.dep_down.copy_(ws.hq.sum().to(torch.float32) + ws.hs.sum())
+    library.single_down_into(
+        ws.hq, ws.hs, down_packed, ws.eids, grid, ksigns, ws.down,
+        rows=hidden, cols=inter, stride=stride_d, m_pad=bucket,
+    )
+    ws.contrib.index_put_(
+        (ws.route_range,),
+        torch.where(
+            b1.unsqueeze(-1),
+            ws.down[ws.routes.long(), w1] * ws.rweights.unsqueeze(-1),
+            torch.zeros((ws.m * ws.top_k, hidden), dtype=torch.float32, device=ws.down.device),
+        ),
+        accumulate=True,
+    )
+
+    # ---- batch 2 (overflow) ---------------------------------------------
+    b2 = ws.within >= bucket
+    ws.within2.copy_((ws.within - bucket).clamp(min=0, max=bucket - 1))
+    ws.xq.zero_()
+    ws.xs.zero_()
+    ws.w.zero_()
+    ws.xq.index_put_(
+        (ws.routes.long(), ws.within2),
+        torch.where(b2.unsqueeze(-1), ws.xq_route, torch.zeros_like(ws.xq_route)),
+        accumulate=True,
+    )
+    ws.xs.index_put_(
+        (ws.routes.long(), ws.within2),
+        torch.where(b2.unsqueeze(-1), ws.xs_route, torch.zeros_like(ws.xs_route)),
+        accumulate=True,
+    )
+    ws.w.index_put_(
+        (ws.routes.long(), ws.within2),
+        torch.where(b2, ws.rweights, torch.zeros_like(ws.rweights)),
+        accumulate=True,
+    )
+    ws.dep_gate.copy_(ws.xq.sum().to(torch.float32) + ws.xs.sum())
+    library.grouped_gate_up_into(
+        ws.xq, ws.xs, gate_packed, up_packed, ws.eids, grid, ksigns,
+        ws.gate, ws.up, rows=inter, cols=hidden, stride=stride_g, m_pad=bucket,
+    )
+    h = torch.nn.functional.silu(torch.clamp(ws.gate, max=swiglu_limit)) * torch.clamp(
+        ws.up, min=-swiglu_limit, max=swiglu_limit
+    )
+    _preq_flat_into(h.reshape(-1, inter), ws.hq_flat, ws.hs_flat)
+    ws.hq.view(ws.n_experts, bucket, inter).copy_(
+        ws.hq_flat.view(ws.n_experts, bucket, inter)
+    )
+    ws.hs.view(ws.n_experts, bucket, inter // 32).copy_(
+        ws.hs_flat.view(ws.n_experts, bucket, inter // 32)
+    )
+    ws.dep_down.copy_(ws.hq.sum().to(torch.float32) + ws.hs.sum())
+    library.single_down_into(
+        ws.hq, ws.hs, down_packed, ws.eids, grid, ksigns, ws.down,
+        rows=hidden, cols=inter, stride=stride_d, m_pad=bucket,
+    )
+    ws.contrib.index_put_(
+        (ws.route_range,),
+        torch.where(
+            b2.unsqueeze(-1),
+            ws.down[ws.routes.long(), ws.within2] * ws.rweights.unsqueeze(-1),
+            torch.zeros((ws.m * ws.top_k, hidden), dtype=torch.float32, device=ws.down.device),
+        ),
+        accumulate=True,
+    )
+
+    # combine: contrib[route r] = sum over its (expert, within) batches.
+    # The eager path gathers on argsort(indices) BEFORE summing its top-k
+    # contributions; sum order is not numerically commutative in fp32, so
+    # reproduce the exact same order here or the ~1e-5 mismatch is amplified
+    # into token drift by the sparse-attention topk across 43 layers.
+    c = ws.contrib.reshape(ws.m, ws.top_k, hidden)
+    ws.final_order.copy_(ws.indices.argsort(dim=1, stable=True))
+    c = c.gather(1, ws.final_order.unsqueeze(-1).expand_as(c))
+    ws.out.copy_(c.sum(dim=1))
+    return ws.out

@@ -145,7 +145,7 @@ extern "C" QSR_EXPORT void iq2_mma16_tc_launch_single(
     const int8_t* xq, const float* xs, const uint8_t* packed,
     const int64_t* eids, const int64_t* grid,
     const int32_t* ksigns, float* out,
-    int E, int ROWS, int COLS, int STRIDE, int M_PAD)
+    int E, int ROWS, int COLS, int STRIDE, int M_PAD, cudaStream_t stream)
 {
     const int smem_bytes = 32 * 256 + 32 * 8 * 4;
     cudaFuncSetAttribute((const void*)iq2_mma16_tc_single_kernel<16>,
@@ -158,17 +158,21 @@ extern "C" QSR_EXPORT void iq2_mma16_tc_launch_single(
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     dim3 block(128);
     dim3 gridc(E, ROWS / 32);
+    // Launch on the GIVEN stream (torch's capture stream); see the dual
+    // launch's comment -- a `<<<...>>>` launch escapes CUDA graph capture.
+    void* args[] = {&xq, &xs, &packed, &eids, &grid, &ksigns, &out,
+                    &E, &ROWS, &COLS, &STRIDE, &M_PAD};
     if (M_PAD == 16) {
-        iq2_mma16_tc_single_kernel<16><<<gridc, block, smem_bytes>>>(
-            xq, xs, packed, eids, grid, ksigns, out, E, ROWS, COLS, STRIDE, M_PAD);
+        cudaLaunchKernel((const void*)iq2_mma16_tc_single_kernel<16>, gridc, block, args,
+                         smem_bytes, stream);
     } else if (M_PAD == 32) {
-        iq2_mma16_tc_single_kernel<32><<<gridc, block, smem_bytes>>>(
-            xq, xs, packed, eids, grid, ksigns, out, E, ROWS, COLS, STRIDE, M_PAD);
+        cudaLaunchKernel((const void*)iq2_mma16_tc_single_kernel<32>, gridc, block, args,
+                         smem_bytes, stream);
     } else if (M_PAD == 48) {
-        iq2_mma16_tc_single_kernel<48><<<gridc, block, smem_bytes>>>(
-            xq, xs, packed, eids, grid, ksigns, out, E, ROWS, COLS, STRIDE, M_PAD);
+        cudaLaunchKernel((const void*)iq2_mma16_tc_single_kernel<48>, gridc, block, args,
+                         smem_bytes, stream);
     } else {
-        iq2_mma16_tc_single_kernel<64><<<gridc, block, smem_bytes>>>(
-            xq, xs, packed, eids, grid, ksigns, out, E, ROWS, COLS, STRIDE, M_PAD);
+        cudaLaunchKernel((const void*)iq2_mma16_tc_single_kernel<64>, gridc, block, args,
+                         smem_bytes, stream);
     }
 }

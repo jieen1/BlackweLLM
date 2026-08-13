@@ -62,27 +62,73 @@ def _fill_kernel(
     for r in range(pid, R, step):
         e = tl.load(routes_ptr + r)
         w = tl.load(within_ptr + r)
-        if w >= 0 and w < BUCKET:
-            for h in tl.static_range(H // 16):
-                v = tl.load(src_ptr + r * H + h * 16, boundary_check=None)
-                tl.store(tile_ptr + e * BUCKET * H + w * H + h * 16, v)
+        if w < BUCKET:
+            offs = tl.arange(0, 32)
+            base = e * BUCKET * H + w * H
+            src = r * H
+            for h in tl.static_range(H // 32):
+                v = tl.load(src_ptr + src + h * 32 + offs, boundary_check=None)
+                tl.store(tile_ptr + base + h * 32 + offs, v)
 
 
 def device_group_counts(routes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Counts per expert and within indices.  Fixed shape, graph-safe."""
+    """Counts per expert and within indices.  Fixed shape, graph-safe.
+
+    Allocates its scratch buffers per call -- safe for eager use, but NOT
+    for inside a CUDA graph capture body.  Use
+    :func:`device_group_counts_into` with caller-owned buffers there.
+    """
     R = routes.numel()
     E = 256
     counts = torch.zeros(E, dtype=torch.int32, device=routes.device)
     within = torch.zeros(R, dtype=torch.int32, device=routes.device)
     offsets = torch.zeros(E, dtype=torch.int32, device=routes.device)
-    cursor = torch.zeros(E, dtype=torch.int32, device=routes.device)
-    # zero inside graph each replay so atomics accumulate from a clean state
+    # arange carrier must be >= R (see device_group_counts_into's contract)
+    cursor = torch.zeros(max(E, R), dtype=torch.int32, device=routes.device)
+    return device_group_counts_into(routes, counts, within, offsets, cursor)
+
+
+def device_group_counts_into(
+    routes: torch.Tensor,
+    counts: torch.Tensor,
+    within: torch.Tensor,
+    offsets: torch.Tensor,
+    cursor: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Caller-owned variant: writes into preallocated buffers (graph-safe).
+
+    Deterministic (unlike the atomic-cursor variant): routes are sorted
+    stably, so ``within[r]`` is a pure function of the route order.  This is
+    what makes the result reproducible across CUDA-graph replays -- atomics
+    give a different slot order every replay, which corrupts the combine.
+
+    ``cursor`` must be at least ``R = routes.numel()`` elements long: it is
+    used as the ``torch.arange(R)`` output carrier.  It is NOT a per-expert
+    buffer here (that role died with the atomic variant); sizing it to
+    ``n_experts`` resizes it on the first call, which breaks CUDA-graph
+    capture's fixed-shape contract.
+    """
+    R = routes.numel()
+    if cursor.numel() < R:
+        raise ValueError(
+            f"cursor must hold R={R} arange elements, got {cursor.numel()}"
+        )
+    # stable sort routes -> sorted_eids, order
+    sorted_eids, order = torch.sort(routes, stable=True)
+    # per-expert counts via scatter-add of a ones vector into counts
     counts.zero_()
-    _count_kernel[(64,)](routes, counts, R)
+    counts.scatter_add_(0, sorted_eids, torch.ones_like(sorted_eids))
+    # exclusive per-expert offsets: cumsum - counts
     torch.cumsum(counts, 0, out=offsets)
     offsets.sub_(counts)
-    cursor.copy_(offsets)   # cursor starts at each expert's base
-    _within_kernel[(64,)](routes, offsets, cursor, within, R)
+    # within[r] = position among same-expert routes = arange(R) - base[expert]
+    base = offsets[sorted_eids]  # exclusive start of this route's expert
+    torch.arange(R, device=routes.device, out=cursor)
+    within.copy_(cursor - base)  # in sorted order, then unsort by `order`
+    # unsort within back to original route order
+    inv = torch.empty_like(order)
+    inv[order] = torch.arange(R, device=routes.device)
+    within.copy_(within[inv])
     return counts, within, offsets
 
 
@@ -95,74 +141,3 @@ def device_group_fill(
     R = routes.numel()
     H = tile.shape[-1]
     _fill_kernel[(64,)](src, routes, within, tile, R, H=H, BUCKET=tile.shape[1])
-
-
-@triton.jit
-def _fill_tiles_kernel(
-    xq_ptr,        # [R, H] int8 (pre-gathered per-route activations)
-    xs_ptr,        # [R, H/32] float32
-    w_ptr,         # [R] float32
-    routes_ptr,    # [R] int32
-    within_ptr,    # [R] int32
-    xq_tile_ptr,   # [E, BUCKET, H] int8
-    xs_tile_ptr,   # [E, BUCKET, H/32] float32
-    w_tile_ptr,    # [E, BUCKET] float32
-    R,
-    E,
-    BUCKET: tl.constexpr,
-    H: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    step = tl.num_programs(0)
-    HS = H // 32
-    for r in range(pid, R, step):
-        e = tl.load(routes_ptr + r)
-        w = tl.load(within_ptr + r)
-        if w >= 0 and w < BUCKET:
-            for h in tl.range(0, H):
-                vq = tl.load(xq_ptr + r * H + h)
-                tl.store(xq_tile_ptr + e * BUCKET * H + w * H + h, vq)
-            for h in tl.range(0, HS):
-                vxs = tl.load(xs_ptr + r * HS + h)
-                tl.store(xs_tile_ptr + e * BUCKET * HS + w * HS + h, vxs)
-            vw = tl.load(w_ptr + r)
-            tl.store(w_tile_ptr + e * BUCKET + w, vw)
-
-
-def device_fill_tiles(
-    xq_per_route,  # [R, H] int8
-    xs_per_route,  # [R, H/32] float32
-    rw,            # [R] float32
-    routes,        # [R] int32
-    within,        # [R] int32
-    xq_tile,       # [E, BUCKET, H] int8
-    xs_tile,       # [E, BUCKET, H/32]
-    w_tile,        # [E, BUCKET]
-):
-    R = routes.numel()
-    E = xq_tile.shape[0]
-    _fill_tiles_kernel[(64,)](xq_per_route, xs_per_route, rw, routes, within,
-                              xq_tile, xs_tile, w_tile, R, E,
-                              BUCKET=xq_tile.shape[1], H=xq_tile.shape[2])
-
-
-def device_group_counts_deterministic(routes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Deterministic per-expert counts and within indices (argsort-based).
-
-    Unlike the atomic-claim version, the within index of every route is a pure
-    function of ``routes``, so CUDA-graph replay reproduces eager output
-    exactly.  All operations are fixed-shape and graph-safe.
-    """
-    R = routes.numel()
-    E = 256
-    counts = torch.zeros(E, dtype=torch.int32, device=routes.device)
-    within = torch.empty(R, dtype=torch.int32, device=routes.device)
-    sorted_idx = torch.argsort(routes, stable=True)
-    sr = routes[sorted_idx]
-    counts.zero_()
-    _count_kernel[(64,)](routes, counts, R)
-    starts = torch.cumsum(counts, 0) - counts
-    start_r = starts[sr]
-    within_sorted = (torch.arange(R, device=routes.device) - start_r).to(torch.int32)
-    within.scatter_(0, sorted_idx, within_sorted)
-    return counts, within, starts

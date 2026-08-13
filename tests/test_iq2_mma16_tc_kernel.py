@@ -123,3 +123,48 @@ def test_single_down_matches_dual_first(library):
                             rows=ROWS, cols=COLS, stride=STRIDE, m_pad=M_PAD)
     cos = (g * d).sum() / (g.norm() * d.norm() + 1e-9)
     assert cos.item() >= 0.9999, f"single vs dual first cos {cos.item()} < 0.9999"
+
+
+def test_graph_complete_moe_matches_eager(library):
+    """The graph-capturable complete K32 MoE must equal the eager split-batch
+    path bit-exactly on the same 64-row chunk (real DSV4 route distribution:
+    max routes/expert well under the graph's fixed bucket=64)."""
+    from runtime.kernels.iq2_mma16_tc import (
+        Dsv4PrefillMoEWorkspace,
+        grouped_moe_prefill_k32,
+        grouped_moe_prefill_k32_graph,
+    )
+
+    E, H, INTER, M, TOPK = 64, 256, 256, 64, 2
+    gen = torch.Generator().manual_seed(7)
+    # gate/up per-expert weights are [INTER, H]; down per-expert is [H, INTER]
+    pg = _make_packed(E * INTER, H, gen).cuda()
+    pu = _make_packed(E * INTER, H, gen).cuda()
+    pd = _make_packed(E * H, INTER, gen).cuda()
+    grid = torch.tensor(IQ2XS_GRID, dtype=torch.int64, device="cuda")
+    ksigns = torch.tensor(KSIGNS_IQ2XS, dtype=torch.int32, device="cuda")
+
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    scores = torch.rand(M, E, generator=gen, device="cuda")
+    indices = scores.topk(TOPK, dim=-1)[1]
+    weights = torch.softmax(scores, dim=-1).gather(1, indices)
+    flat = (torch.randn(M, H, generator=gen, device="cuda") * 0.1).bfloat16()
+    assert torch.bincount(indices.reshape(-1), minlength=E).max().item() <= 64
+
+    eager = grouped_moe_prefill_k32(
+        flat, weights, indices, pg, pu, pd, grid, ksigns,
+        inter=INTER, hidden=H, swiglu_limit=10.0, bucket=32, library=library,
+    )
+    ws = Dsv4PrefillMoEWorkspace(
+        device="cuda", hidden=H, inter=INTER, m=M, top_k=TOPK, n_experts=E, bucket=64
+    )
+    ws.flat.copy_(flat)
+    ws.indices.copy_(indices)
+    ws.weights.copy_(weights)
+    graph = grouped_moe_prefill_k32_graph(
+        ws, flat, indices, weights, pg, pu, pd, grid, ksigns,
+        inter=INTER, hidden=H, swiglu_limit=10.0, library=library,
+    )
+    cos = (eager * graph).sum() / (eager.norm() * graph.norm() + 1e-9)
+    assert cos.item() == 1.0, f"graph vs eager cos {cos.item()}"
+    assert torch.equal(eager, graph)
