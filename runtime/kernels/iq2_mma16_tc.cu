@@ -378,7 +378,7 @@ iq2_mma16_tc_dynamic_kernel(
     const int row0 = rowbase + warp * 8;
     const int l4 = lane % 4, lg = lane / 4;
     const int k0 = l4 * 4;
-    constexpr int M_PAD_C = 512;
+    constexpr int M_PAD_C = 128;
     const int n_mtiles = M_PAD_C / 16;
     const int n_kblocks = COLS / 256;
 
@@ -391,8 +391,8 @@ iq2_mma16_tc_dynamic_kernel(
     const int64_t xsbase = (int64_t)expert_bounds[e] * (COLS / 32);
     const int route_hi = expert_bounds[e + 1];
 
-    float facc_g[32][4] = {};
-    float facc_u[32][4] = {};
+    float facc_g[8][4] = {};
+    float facc_u[8][4] = {};
 
     const uint8_t* wg_base = packed_gate + (int64_t)eid * ROWS * STRIDE + (int64_t)rowbase * STRIDE;
     const uint8_t* wu_base = packed_up + (int64_t)eid * ROWS * STRIDE + (int64_t)rowbase * STRIDE;
