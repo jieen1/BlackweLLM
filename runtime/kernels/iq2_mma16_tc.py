@@ -826,7 +826,11 @@ class DynamicMoEWorkspace:
             device = torch.device("cuda", torch.cuda.current_device())
         actual = (m, top_k, hidden, inter, device)
         expected = (self.m, self.top_k, self.hidden, self.inter, self.device)
-        if actual != expected:
+        # A workspace sized for a larger M may serve any smaller M: the chunked
+        # prefill path sizes the workspace once for the chunk width and reuses
+        # it across chunk calls (the buffers are row-addressable by M and every
+        # kernel indexes them by the runtime M argument).
+        if actual != expected and not (self.m >= m and actual[1:] == expected[1:]):
             raise IQ2MMA16TCError(
                 f"dynamic MoE workspace {expected} cannot serve {actual}"
             )
@@ -855,6 +859,15 @@ def grouped_moe_prefill_k32_dynamic(
     repeat_interleave/index_put Python glue and the fixed-bucket tile waste.
     Bit-exact with ``grouped_moe_prefill_k32``; ~1.6x faster (16.8 vs 27.3 ms
     at 1024 tokens).  Returns ``[M, hidden]`` routed output (no shared expert).
+
+    Chunking: when ``workspace.m < M`` (or no workspace is supplied and ``M``
+    exceeds ``DYNAMIC_MOE_CHUNK``), the batch is processed in consecutive
+    ``workspace.m``-wide row chunks, each reusing the same workspace.  This
+    bounds the workspace at the chunk width instead of the full prompt length
+    (a 128K-token DSV4 prefill would otherwise need a ~31 GiB workspace for
+    the gate/up/down route buffers).  Chunks are row-local -- grouping,
+    expert GEMM, and combine never read across rows -- so the split is
+    bit-exact with the single-shot call for any ``M % chunk == 0`` tail.
     """
     import torch
 
@@ -872,16 +885,124 @@ def grouped_moe_prefill_k32_dynamic(
         )
     E = 256
     stream = torch.cuda.current_stream(flat.device).cuda_stream
-    rweights = weights.reshape(-1)
-    R = M * top_k
     if workspace is None:
-        workspace = DynamicMoEWorkspace.create(M, top_k, hidden, inter, flat.device)
-    else:
+        chunk_m = min(M, DYNAMIC_MOE_CHUNK)
+        workspace = DynamicMoEWorkspace.create(chunk_m, top_k, hidden, inter, flat.device)
+        ws = workspace
+        library = library or ws.library
+        out = torch.empty(M, hidden, dtype=torch.float32, device=flat.device)
+        for start in range(0, M, chunk_m):
+            _run_dynamic_chunk(
+                flat[start : start + chunk_m],
+                weights[start : start + chunk_m],
+                indices[start : start + chunk_m],
+                gate_packed,
+                up_packed,
+                down_packed,
+                grid,
+                ksigns,
+                ws,
+                library,
+                E,
+                stream,
+                inter,
+                hidden,
+                swiglu_limit,
+                out_view=out[start : start + chunk_m],
+            )
+        return out
+    if M <= workspace.m:
         workspace.validate(M, top_k, hidden, inter, flat.device)
+        return _run_dynamic_chunk(
+            flat,
+            weights,
+            indices,
+            gate_packed,
+            up_packed,
+            down_packed,
+            grid,
+            ksigns,
+            workspace,
+            library,
+            E,
+            stream,
+            inter,
+            hidden,
+            swiglu_limit,
+            out_view=workspace.out[:M],
+        )
+    # Caller supplied a workspace smaller than M: chunk over it, writing each
+    # chunk's combine result into a full-width ``out``.
     ws = workspace
+    library = library or ws.library
+    out = torch.empty(M, hidden, dtype=torch.float32, device=flat.device)
+    for start in range(0, M, ws.m):
+        _run_dynamic_chunk(
+            flat[start : start + ws.m],
+            weights[start : start + ws.m],
+            indices[start : start + ws.m],
+            gate_packed,
+            up_packed,
+            down_packed,
+            grid,
+            ksigns,
+            ws,
+            library,
+            E,
+            stream,
+            inter,
+            hidden,
+            swiglu_limit,
+            out_view=out[start : start + ws.m],
+        )
+    return out
+
+
+#: Default chunk width for the dynamic MoE workspace when the caller does not
+#: supply one: bounds the route buffers (out_gate/out_up/down are
+#: ``[routes, inter]``) to ~0.25 GiB at M=1024 instead of the full-prompt
+#: ~31 GiB at M=131072.  A long DSV4 prefill runs ~128 such chunks serially.
+DYNAMIC_MOE_CHUNK = 2048
+
+
+def _run_dynamic_chunk(
+    flat,
+    weights,
+    indices,
+    gate_packed,
+    up_packed,
+    down_packed,
+    grid,
+    ksigns,
+    ws,
+    library,
+    E,
+    stream,
+    inter,
+    hidden,
+    swiglu_limit,
+    *,
+    out_view,
+) -> torch.Tensor:
+    """One dynamic-MoE batch over a workspace-sized row slice.
+
+    ``flat``/``weights``/``indices`` are the chunk's row views (``M`` rows);
+    ``ws`` is the shared workspace (``ws.m >= M``).  ``out_view`` is where the
+    chunk's combine result lands (``[M, hidden]``) -- ``ws.out`` for a
+    single-shot call, or a slice of the caller's full-width ``out`` when
+    chunking.  The chunk is row-local, so grouping/expert-GEMM/combine never
+    cross chunk boundaries and the result is bit-exact with a single shot.
+    """
+    M, top_k = indices.shape
+    R = M * top_k
+    rweights = weights.reshape(-1)
     if library is None:
         library = ws.library
-    ws.indices32.copy_(indices.reshape(-1))
+    # ``ws`` is sized for the workspace's chunk width, which may exceed this
+    # call's M (the tail chunk of a split batch).  Every kernel below takes the
+    # runtime M (or R) as its element count and only touches the buffer's first
+    # M rows, so copy the chunk's own rows into the workspace's leading slice.
+    ws.indices32[:R].copy_(indices.reshape(-1))
     library._library.moe_group_launch(
         ctypes.c_void_p(ws.indices32.data_ptr()),
         ctypes.c_void_p(ws.compact_route.data_ptr()),
@@ -949,7 +1070,7 @@ def grouped_moe_prefill_k32_dynamic(
         ctypes.c_void_p(ws.indices32.data_ptr()),
         ctypes.c_void_p(ws.compact_route.data_ptr()),
         ctypes.c_void_p(ws.route_to_compact.data_ptr()),
-        ctypes.c_void_p(ws.out.data_ptr()),
+        ctypes.c_void_p(out_view.data_ptr()),
         M, top_k, hidden, ctypes.c_void_p(stream),
     )
-    return ws.out
+    return out_view

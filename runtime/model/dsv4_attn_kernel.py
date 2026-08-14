@@ -139,7 +139,14 @@ class Dsv4AttnKernelLayer(nn.Module):
             self.kv_norm_weight = shared_from.kv_norm_weight
             self.attn_sink = shared_from.attn_sink
             self.compressor = (
-                Dsv4Compressor(config, layer_id, num_slots=num_slots, quantize=False, device=device)
+                Dsv4Compressor(
+                    config,
+                    layer_id,
+                    num_slots=num_slots,
+                    quantize=False,
+                    bounded_cache=True,
+                    device=device,
+                )
                 if self.ratio
                 else None
             )
@@ -315,13 +322,13 @@ class Dsv4AttnKernelLayer(nn.Module):
                 torch.empty(num_slots, 0, 0, dtype=torch.uint8, device=device),
             )
 
-        # compressor writes its raw entries here (quantize=False); the layer
-        # packs them into the FP8 pages. Sized for the whole sequence so the
-        # prefill emit (one big write) is in bounds.
+        # Main serving compression retains only the current raw entry. The
+        # layer immediately packs emitted rows into authoritative FP8 pages;
+        # the indexer keeps its separate full BF16 scoring cache.
         if self.compressor is not None:
             self.compressor.kv_cache = torch.empty(
                 num_slots,
-                max_seq_len // self.ratio,
+                1 if self.compressor.bounded_cache else max_seq_len // self.ratio,
                 self.head_dim,
                 dtype=torch.bfloat16,
                 device=device,
@@ -747,7 +754,11 @@ class Dsv4AttnKernelLayer(nn.Module):
             self.hca_pages[destination_slot, :page_count].copy_(
                 self.hca_pages[source_slot, :page_count]
             )
-        if self.compressor is not None and self.compressor.kv_cache is not None:
+        if (
+            self.compressor is not None
+            and self.compressor.kv_cache is not None
+            and not getattr(self.compressor, "bounded_cache", False)
+        ):
             entries = length // self.ratio
             self.compressor.kv_cache[destination_slot, :entries].copy_(
                 self.compressor.kv_cache[source_slot, :entries]
@@ -768,7 +779,11 @@ class Dsv4AttnKernelLayer(nn.Module):
             self.csa_pages[slot, page_count:].zero_()
         elif self.ratio == 128:
             self.hca_pages[slot, page_count:].zero_()
-        if self.compressor is not None and self.compressor.kv_cache is not None:
+        if (
+            self.compressor is not None
+            and self.compressor.kv_cache is not None
+            and not getattr(self.compressor, "bounded_cache", False)
+        ):
             entries = length // self.ratio
             self.compressor.kv_cache[slot, entries:].zero_()
         if self.indexer is not None:

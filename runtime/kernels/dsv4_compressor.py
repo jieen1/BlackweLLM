@@ -151,10 +151,22 @@ def _check_main_batch_contract(
         "freqs_cis": freqs_cis,
         "kv_state": kv_state,
         "score_state": score_state,
-        "kv_cache": kv_cache,
         "out": out,
     }.items():
         _require_contiguous_exact(name, tensor)
+    # Serving main-compressor caches use one BF16 entry per slot. A zero row
+    # stride makes every entry-slot address resolve to that current entry;
+    # the Triton kernels still receive the explicit stride and keep their
+    # existing merge logic. The indexer/full-history oracle cache remains the
+    # ordinary contiguous layout.
+    if not (
+        kv_cache.ndim == 3
+        and kv_cache.shape[1] == 1
+        and kv_cache.stride(1) == 0
+        and kv_cache.stride(2) == 1
+        and kv_cache.stride(0) == head_dim
+    ):
+        _require_contiguous_exact("kv_cache", kv_cache)
     # CUDA Graph replay packs the three dynamic integer inputs into one
     # allocation and exposes row slices here.  Triton receives each view's
     # already-offset data pointer, so a non-zero storage offset is valid; only

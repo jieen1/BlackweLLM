@@ -234,3 +234,50 @@ def test_dynamic_moe_tiles_expert_routes_over_64(library):
 
     assert torch.isfinite(dynamic).all()
     assert torch.equal(reference, dynamic)
+
+
+def test_dynamic_moe_chunks_bit_exact(library):
+    """Chunking a large M over a small workspace must match the single shot.
+
+    The chunked path (workspace.m < M) processes consecutive row slices with
+    the same grouping/expert-GEMM/combine kernels; every step is row-local, so
+    the result must be bit-exact with one workspace-sized-for-M call.  This
+    guards the bounded-workspace prefill path used to fit a 128K-token DSV4
+    prompt on a 96 GiB card (a full-M dynamic workspace is ~31 GiB at M=131072).
+    """
+    from runtime.kernels.iq2_mma16_tc import (
+        DynamicMoEWorkspace,
+        grouped_moe_prefill_k32_dynamic,
+    )
+
+    E, H, INTER, M = 256, 256, 256, 267
+    gen = torch.Generator().manual_seed(82)
+    pg = _make_packed(E * INTER, H, gen).cuda()
+    pu = _make_packed(E * INTER, H, gen).cuda()
+    pd = _make_packed(E * H, INTER, gen).cuda()
+    grid = torch.tensor(IQ2XS_GRID, dtype=torch.int64, device="cuda")
+    ksigns = torch.tensor(KSIGNS_IQ2XS, dtype=torch.int32, device="cuda")
+
+    cuda_gen = torch.Generator(device="cuda").manual_seed(82)
+    flat = (torch.randn(M, H, generator=cuda_gen, device="cuda") * 0.1).bfloat16()
+    scores = torch.rand(M, E, generator=cuda_gen, device="cuda")
+    indices = scores.topk(6, dim=-1)[1]
+    weights = torch.softmax(scores, dim=-1).gather(1, indices)
+
+    full_ws = DynamicMoEWorkspace.create(M, 6, H, INTER, flat.device)
+    single = grouped_moe_prefill_k32_dynamic(
+        flat, weights, indices, pg, pu, pd, grid, ksigns,
+        inter=INTER, hidden=H, swiglu_limit=10.0,
+        library=library, workspace=full_ws,
+    )
+    chunk_ws = DynamicMoEWorkspace.create(89, 6, H, INTER, flat.device)
+    chunked = grouped_moe_prefill_k32_dynamic(
+        flat, weights, indices, pg, pu, pd, grid, ksigns,
+        inter=INTER, hidden=H, swiglu_limit=10.0,
+        library=library, workspace=chunk_ws,
+    )
+
+    assert torch.isfinite(chunked).all()
+    assert torch.equal(single, chunked), (
+        "chunked dynamic MoE diverges from the single shot"
+    )

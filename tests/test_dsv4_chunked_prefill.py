@@ -106,7 +106,10 @@ def _make_compressor(ratio: int = 4) -> Dsv4Compressor:
         qs = torch.randint(-3, 4, (n_blocks, 32), dtype=torch.int8)
         d = torch.full((n_blocks, 1), 1.0, dtype=torch.float16)
         packed = torch.cat([d.view(torch.uint8), qs.view(torch.uint8)], dim=1)
-        mod.packed.copy_(packed.reshape(-1))
+        # ``packed`` is a read-only compatibility getter (rebuilds the
+        # interleaved layout from the resident SoA planes); assign through the
+        # setter so qcode/qscale actually receive the payload.
+        mod.packed = packed.reshape(-1)
     comp.kv_cache = torch.zeros(1, 64, cfg.head_dim, dtype=torch.bfloat16)
     comp.freqs_cis = torch.zeros(64, cfg.rope_head_dim // 2, dtype=torch.bfloat16)
     comp.ape.normal_()  # uninitialized buffer in the real graph; filled by GGUF
@@ -138,8 +141,8 @@ def test_compressor_chunk_equals_sequential_overlap() -> None:
 def _check_chunk_vs_sequential(ratio: int, start_pos: int = 10) -> None:
     comp_a = _make_compressor(ratio)  # chunked
     comp_b = _make_compressor(ratio)  # sequential
-    comp_b.wkv.packed.copy_(comp_a.wkv.packed)
-    comp_b.wgate.packed.copy_(comp_a.wgate.packed)
+    comp_b.wkv.packed = comp_a.wkv.packed
+    comp_b.wgate.packed = comp_a.wgate.packed
     comp_b.ape.copy_(comp_a.ape)
     comp_b.norm_weight.copy_(comp_a.norm_weight)
 
@@ -233,43 +236,58 @@ def test_compress_indices_chunk_matches_single_shot() -> None:
 def test_indexer_chunk_equals_sequential() -> None:
     """The indexer's per-row top-k for a mid-sequence chunk must equal the
     single-shot prefill's rows for the same absolute positions."""
+    from dataclasses import replace
+
     from runtime.model.dsv4_model import Dsv4Indexer
 
+    # ``wq_b`` is a Q8_0 linear of ``q_lora_rank`` inputs; the tiny config's
+    # rank 16 is below the 32-element Q8_0 block, so its dequant would view
+    # zero blocks.  Use a 32-multiple rank for the indexer's query projection.
+    INDEXER_CFG = replace(TINY, q_lora_rank=32)
+
     def _make_indexer() -> Dsv4Indexer:
-        idx = Dsv4Indexer(TINY, 0, max_seq_len=64, device="cpu")
+        idx = Dsv4Indexer(INDEXER_CFG, 0, max_seq_len=64, device="cpu")
         for mod in (idx.wq_b, idx.weights_proj):
-            mod.packed.copy_(
-                torch.randint(-3, 4, mod.packed.shape, dtype=torch.int8).view(torch.uint8)
+            mod.qcode.copy_(
+                torch.randint(-3, 4, mod.qcode.shape, dtype=torch.int8).view(torch.uint8)
             )
+            if mod.qscale.numel():
+                mod.qscale.copy_(
+                    torch.full_like(mod.qscale, 1.0, dtype=torch.float16)
+                )
         for mod in (idx.compressor.wkv, idx.compressor.wgate):
             n_blocks = mod.packed.numel() // 34
             qs = torch.randint(-3, 4, (n_blocks, 32), dtype=torch.int8)
             d = torch.full((n_blocks, 1), 1.0, dtype=torch.float16)
             packed = torch.cat([d.view(torch.uint8), qs.view(torch.uint8)], dim=1)
-            mod.packed.copy_(packed.reshape(-1))
+            mod.packed = packed.reshape(-1)
         idx.compressor.ape.normal_()
         idx.compressor.norm_weight.normal_()
         # wire the compressor into the indexer's scoring cache (the model
         # graph does this in _wire_subcaches)
         idx.compressor.kv_cache = idx.kv_cache
         idx.compressor.freqs_cis = torch.zeros(
-            64, TINY.rope_head_dim // 2, dtype=torch.bfloat16
+            64, INDEXER_CFG.rope_head_dim // 2, dtype=torch.bfloat16
         )
         idx.freqs_cis = idx.compressor.freqs_cis
         return idx
 
     idx_a = _make_indexer()
     idx_b = _make_indexer()
-    idx_b.wq_b.packed.copy_(idx_a.wq_b.packed)
-    idx_b.weights_proj.packed.copy_(idx_a.weights_proj.packed)
-    idx_b.compressor.wkv.packed.copy_(idx_a.compressor.wkv.packed)
-    idx_b.compressor.wgate.packed.copy_(idx_a.compressor.wgate.packed)
+    idx_b.wq_b.qcode.copy_(idx_a.wq_b.qcode)
+    if idx_a.wq_b.qscale.numel():
+        idx_b.wq_b.qscale.copy_(idx_a.wq_b.qscale)
+    idx_b.weights_proj.qcode.copy_(idx_a.weights_proj.qcode)
+    if idx_a.weights_proj.qscale.numel():
+        idx_b.weights_proj.qscale.copy_(idx_a.weights_proj.qscale)
+    idx_b.compressor.wkv.packed = idx_a.compressor.wkv.packed
+    idx_b.compressor.wgate.packed = idx_a.compressor.wgate.packed
     idx_b.compressor.ape.copy_(idx_a.compressor.ape)
     idx_b.compressor.norm_weight.copy_(idx_a.compressor.norm_weight)
 
     start_pos, seqlen = 8, 6
     x = _rand_x(seqlen)  # hidden_size
-    qr = torch.randn(1, seqlen, TINY.q_lora_rank, dtype=torch.bfloat16)
+    qr = torch.randn(1, seqlen, INDEXER_CFG.q_lora_rank, dtype=torch.bfloat16)
     for p in range(start_pos):
         xp = _rand_x(1)
         idx_a.compressor(xp, p)

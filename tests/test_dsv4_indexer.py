@@ -223,7 +223,16 @@ def _run_parity(ref_idx, ours) -> None:
         qr1 = torch.randn(1, 1, 1024, generator=gen, device="cuda", dtype=torch.bfloat16) * 0.05
         r = ref_idx(x1, qr1, pos, offset)
         o = ours(x1, qr1, pos, offset)
-        assert torch.equal(o, r), f"decode idx differ at pos {pos}"
+        # The eager path may return the selected entries in physical order
+        # (padded to the fixed graph width) while the reference topk returns
+        # them score-sorted; the SELECTED SET is what attention consumes and
+        # must match exactly.  Normalize to sorted valid entries before
+        # comparing.
+        def _valid_set(t):
+            t = t.reshape(-1)
+            return sorted(int(v) for v in t if v >= 0)
+
+        assert _valid_set(o) == _valid_set(r), f"decode idx differ at pos {pos}"
         assert torch.equal(ours.kv_cache, ref_idx.kv_cache)
         # every returned index must point past the window offset or be -1
         assert ((o == -1) | (o >= offset)).all()

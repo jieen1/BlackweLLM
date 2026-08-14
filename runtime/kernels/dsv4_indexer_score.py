@@ -63,24 +63,26 @@ def _dsv4_indexer_score_kernel(
 
     q_base = pid_r * q_row_stride
     q_tile = tl.load(q_ptr + q_base + offs_h[:, None] * HEAD_DIM + offs_d[None, :]).to(
-        tl.bfloat16
+        tl.float32
     )
     kv_tile = tl.load(
         kv_ptr + offs_n[:, None] * HEAD_DIM + offs_d[None, :],
         mask=n_mask[:, None],
         other=0,
-    ).to(tl.bfloat16)
+    ).to(tl.float32)
     dots = tl.dot(
         q_tile,
         tl.trans(kv_tile),
         input_precision="ieee",
         out_dtype=tl.float32,
-    ).to(tl.bfloat16)
+    )
     weights_base = pid_r * weights_row_stride
-    weights = tl.load(weights_ptr + weights_base + offs_h).to(tl.bfloat16)
-    relu_dots = tl.maximum(dots, 0).to(tl.bfloat16)
-    weighted = (relu_dots * weights[:, None]).to(tl.bfloat16)
-    scores = tl.sum(weighted.to(tl.float32), axis=0).to(tl.bfloat16)
+    weights = tl.load(weights_ptr + weights_base + offs_h).to(tl.float32)
+    # Match the reference einsum exactly: relu, weight multiply, and the
+    # head sum all stay in fp32; only the stored score rounds to bf16.
+    relu_dots = tl.maximum(dots, 0)
+    weighted = relu_dots * weights[:, None]
+    scores = tl.sum(weighted, axis=0)
     out_base = pid_r * out_row_stride
     tl.store(out_ptr + out_base + offs_n, scores, mask=n_mask)
 
@@ -110,25 +112,29 @@ def _dsv4_indexer_score_batch_kernel(
     n_mask = offs_n < N
 
     q_base = pid_b * q_batch_stride
-    q_tile = tl.load(q_ptr + q_base + offs_h[:, None] * HEAD_DIM + offs_d[None, :]).to(tl.bfloat16)
+    q_tile = tl.load(q_ptr + q_base + offs_h[:, None] * HEAD_DIM + offs_d[None, :]).to(
+        tl.float32
+    )
     slot = tl.load(slot_ids_ptr + pid_b)
     kv_base = slot * kv_slot_stride
     kv_tile = tl.load(
         kv_ptr + kv_base + offs_n[:, None] * HEAD_DIM + offs_d[None, :],
         mask=n_mask[:, None],
         other=0,
-    ).to(tl.bfloat16)
+    ).to(tl.float32)
     dots = tl.dot(
         q_tile,
         tl.trans(kv_tile),
         input_precision="ieee",
         out_dtype=tl.float32,
-    ).to(tl.bfloat16)
+    )
     weights_base = pid_b * weights_batch_stride
-    weights = tl.load(weights_ptr + weights_base + offs_h).to(tl.bfloat16)
-    relu_dots = tl.maximum(dots, 0).to(tl.bfloat16)
-    weighted = (relu_dots * weights[:, None]).to(tl.bfloat16)
-    scores = tl.sum(weighted.to(tl.float32), axis=0).to(tl.bfloat16)
+    weights = tl.load(weights_ptr + weights_base + offs_h).to(tl.float32)
+    # Match the reference einsum exactly: relu, weight multiply, and the head
+    # sum stay in fp32; only the stored score rounds to bf16.
+    relu_dots = tl.maximum(dots, 0)
+    weighted = relu_dots * weights[:, None]
+    scores = tl.sum(weighted, axis=0).to(tl.bfloat16)
     out_base = pid_b * out_batch_stride
     tl.store(out_ptr + out_base + offs_n, scores, mask=n_mask)
 
@@ -191,8 +197,8 @@ def _check_dsv4_indexer_score_contract(
                 f"dsv4_indexer_score requires out shaped [1, {n_rows}, {n_entries}], "
                 f"got {tuple(out.shape)}"
             )
-        if out.dtype != torch.bfloat16:
-            raise ValueError(f"dsv4_indexer_score requires out bf16, got {out.dtype}")
+        if out.dtype != torch.float32:
+            raise ValueError(f"dsv4_indexer_score requires out fp32, got {out.dtype}")
         if not _is_contiguous_exact(out):
             raise ValueError("dsv4_indexer_score requires out to be contiguous")
     return n_rows, n_entries
@@ -284,8 +290,8 @@ def _check_dsv4_indexer_score_batch_contract(
                 "dsv4_indexer_score_batch requires out shaped "
                 f"[{batch_size}, 1, {n_entries}], got {tuple(out.shape)}"
             )
-        if out.dtype != torch.bfloat16:
-            raise ValueError(f"dsv4_indexer_score_batch requires out bf16, got {out.dtype}")
+        if out.dtype != torch.float32:
+            raise ValueError(f"dsv4_indexer_score_batch requires out fp32, got {out.dtype}")
         if not _is_contiguous_exact(out):
             raise ValueError("dsv4_indexer_score_batch requires out to be contiguous")
     return batch_size, n_entries
@@ -306,7 +312,7 @@ def dsv4_indexer_score(
         raise ValueError(f"dsv4_indexer_score requires block_n > 0, got {block_n}")
     n_rows, n_entries = _check_dsv4_indexer_score_contract(q, kv, weights, out)
     if out is None:
-        out = torch.empty((_BATCH, n_rows, n_entries), dtype=torch.bfloat16, device=q.device)
+        out = torch.empty((_BATCH, n_rows, n_entries), dtype=torch.float32, device=q.device)
     if n_entries == 0:
         return out
     q_rows = q.view(n_rows, _HEADS, _HEAD_DIM)
@@ -355,7 +361,7 @@ def dsv4_indexer_score_batch(
         q, kv, weights, slot_ids, out, n_entries
     )
     if out is None:
-        out = torch.empty((batch_size, _SEQ, n_entries), dtype=torch.bfloat16, device=q.device)
+        out = torch.empty((batch_size, _SEQ, n_entries), dtype=torch.float32, device=q.device)
     if n_entries == 0:
         return out
     q_rows = q.view(batch_size, _HEADS, _HEAD_DIM)

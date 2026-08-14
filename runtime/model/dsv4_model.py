@@ -611,7 +611,16 @@ class Dsv4MoE(nn.Module):
         *,
         workspace=None,
     ) -> torch.Tensor:
-        """Prefill MoE using per-expert compact dynamic GEMMs (llama.cpp style)."""
+        """Prefill MoE using per-expert compact dynamic GEMMs (llama.cpp style).
+
+        The routed expert call stays a single invocation: its per-expert
+        compact dynamic GEMMs are processed in bounded workspace chunks inside
+        ``grouped_moe_prefill_k32_dynamic`` (bit-exact, verified) so the routed
+        numerics are unchanged.  The shared expert is row-local and chunked
+        separately when the batch is large so its full-M gate/up/down
+        activations stay bounded (measured shared full-vs-chunk maxdiff
+        ~1.75e-5 on real weights -- routed path is the exact oracle).
+        """
         flat = x.reshape(-1, x.shape[-1])
         weights, indices = self.gate(flat, input_ids.reshape(-1) if input_ids is not None else None)
         limit = self.config.swiglu_limit
@@ -632,8 +641,29 @@ class Dsv4MoE(nn.Module):
             swiglu_limit=limit,
             workspace=workspace,
         )
-        y = y + self._shared_forward(flat)
+        shared = self._shared_chunked(flat)
+        y = y + shared
         return y.to(x.dtype).reshape(*x.shape[:-1], y.shape[-1])
+
+    def _shared_chunked(self, flat: torch.Tensor) -> torch.Tensor:
+        """Shared-expert forward with bounded full-M activations.
+
+        The shared gate/up/down are ``[M, inter]`` FP32 GEMMs; at a 128K
+        prompt they alone reach ~6 GiB of transient activations.  The expert
+        is row-local, so splitting the batch into fixed tiles keeps every
+        intermediate at tile width while changing only the GEMM's M shape
+        (measured maxdiff ~1.75e-5).  Small batches pass through unchanged.
+        """
+        from runtime.kernels.iq2_mma16_tc import DYNAMIC_MOE_CHUNK
+
+        m = flat.shape[0]
+        if m <= DYNAMIC_MOE_CHUNK:
+            return self._shared_forward(flat)
+        out = torch.empty_like(flat, dtype=torch.float32)
+        for start in range(0, m, DYNAMIC_MOE_CHUNK):
+            end = min(start + DYNAMIC_MOE_CHUNK, m)
+            out[start:end] = self._shared_forward(flat[start:end])
+        return out
 
     def _batch_expert_gemm(
         self,
@@ -721,6 +751,7 @@ class Dsv4Compressor(nn.Module):
         head_dim: int | None = None,
         rotate: bool = False,
         quantize: bool = True,
+        bounded_cache: bool = False,
         device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
@@ -735,6 +766,10 @@ class Dsv4Compressor(nn.Module):
         # quantized by the pack kernel (dsv4_kv_pack), so the compressor emits
         # the raw normed/rotated entry and the QAT simulation moves downstream.
         self.quantize = quantize
+        # Serving main-attention compressors only need the current emitted
+        # entry as a merge source; the eager oracle and indexer retain their
+        # historical cache layouts.
+        self.bounded_cache = bounded_cache
         self.head_dim = head_dim if head_dim is not None else config.head_dim
         self.rope_head_dim = config.rope_head_dim
         self.eps = config.norm_eps
@@ -780,6 +815,22 @@ class Dsv4Compressor(nn.Module):
             ),
             persistent=False,
         )
+        # Batch decode (B=1/2/4) needs a contiguous [bsz, 1, head_dim] out
+        # slice with zero storage offset for the Triton contract check.
+        # _graph_entry_scratch is [num_slots, 16, head_dim] (the seq-prefill
+        # kernel's up-to-16 boundary rows), so its [bsz, 1, head_dim] view is
+        # non-contiguous for B>1 and must not be reused here.
+        self.register_buffer(
+            "_decode_batch_out_scratch",
+            torch.zeros(
+                num_slots,
+                1,
+                self.head_dim,
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            persistent=False,
+        )
         # Shared across slots on purpose: Phase A still captures one
         # slot-bound graph at a time, so the address may be reused safely.
         self.freqs_cis: torch.Tensor | None = None
@@ -797,7 +848,23 @@ class Dsv4Compressor(nn.Module):
                 "compressor kv_cache slot arena shape does not match num_slots: "
                 f"{self.kv_cache.shape[0]} vs {self.num_slots}"
             )
+        if self.bounded_cache:
+            return self.kv_cache.as_strided(
+                (1, 1, self.head_dim),
+                (self.head_dim, 0, 1),
+                storage_offset=slot * self.head_dim,
+            )
         return self._slot_view(self.kv_cache, slot)
+
+    def _batch_cache(self) -> torch.Tensor:
+        """Return the cache view used by the B=1/2/4 decode kernels."""
+        assert self.kv_cache is not None
+        if self.bounded_cache:
+            return self.kv_cache.as_strided(
+                (self.num_slots, 1, self.head_dim),
+                (self.head_dim, 0, 1),
+            )
+        return self.kv_cache
 
     def reset_slot(self, slot: int) -> None:
         self._slot_view(self.kv_state, slot).zero_()
@@ -987,7 +1054,7 @@ class Dsv4Compressor(nn.Module):
         xf = x.float()
         kv = self.wkv(xf)
         score = self.wgate(xf)
-        out = self._graph_entry_scratch.narrow(0, 0, bsz).narrow(1, 0, 1)
+        out = self._decode_batch_out_scratch.narrow(0, 0, bsz)
         from runtime.kernels.dsv4_compressor import (
             fused_decode_postgemv_batch,
             fused_indexer_decode_postgemv_batch,
@@ -1005,7 +1072,7 @@ class Dsv4Compressor(nn.Module):
             "freqs_cis": self.freqs_cis,
             "kv_state": self.kv_state,
             "score_state": self.score_state,
-            "kv_cache": self.kv_cache,
+            "kv_cache": self._batch_cache(),
             "out": out,
             "eps": self.eps,
         }
@@ -1103,6 +1170,62 @@ class Dsv4Compressor(nn.Module):
         kv_state_slot = self._slot_view(self.kv_state, slot)
         score_state_slot = self._slot_view(self.score_state, slot)
         kv_cache_slot = self._slot_cache(slot)
+        if start_pos == 0 and seqlen < ratio:
+            # A cold start of fewer than ``ratio`` tokens cannot form a
+            # compression group yet.  Run them through the per-token state
+            # machine instead of the bulk branch: the bulk formula assumes
+            # complete ratio-blocks and would leave the lower state half
+            # empty, producing 0/0 NaN on the next decode step.  This is
+            # exactly L sequential decode steps at pos 0..L-1, matching the
+            # decode-oracle contract.
+            emitted: list[torch.Tensor] = []
+            for i in range(seqlen):
+                pos = start_pos + i
+                kv_i = kv[:, i : i + 1]
+                score_i = score[:, i : i + 1]
+                should_compress = (pos + 1) % ratio == 0
+                score_i = score_i + self.ape[pos % ratio]
+                if overlap:
+                    kv_state_slot[:bsz, ratio + pos % ratio] = kv_i.squeeze(1)
+                    score_state_slot[:bsz, ratio + pos % ratio] = score_i.squeeze(1)
+                    if should_compress:
+                        kv_state = torch.cat(
+                            [
+                                kv_state_slot[:bsz, :ratio, : self.head_dim],
+                                kv_state_slot[:bsz, ratio:, self.head_dim :],
+                            ],
+                            dim=1,
+                        )
+                        score_state = torch.cat(
+                            [
+                                score_state_slot[:bsz, :ratio, : self.head_dim],
+                                score_state_slot[:bsz, ratio:, self.head_dim :],
+                            ],
+                            dim=1,
+                        )
+                        kv_c = (kv_state * score_state.softmax(dim=1)).sum(
+                            dim=1, keepdim=True
+                        )
+                        kv_state_slot[:bsz, :ratio] = kv_state_slot[:bsz, ratio:]
+                        score_state_slot[:bsz, :ratio] = score_state_slot[:bsz, ratio:]
+                else:
+                    kv_state_slot[:bsz, pos % ratio] = kv_i.squeeze(1)
+                    score_state_slot[:bsz, pos % ratio] = score_i.squeeze(1)
+                    if should_compress:
+                        kv_c = (
+                            kv_state_slot[:bsz] * score_state_slot[:bsz].softmax(dim=1)
+                        ).sum(dim=1, keepdim=True)
+                if not should_compress:
+                    continue
+                kv_c = self._finalize(kv_c, 0, dtype, pos)
+                if self.bounded_cache:
+                    kv_cache_slot[:bsz, :1].copy_(kv_c)
+                else:
+                    kv_cache_slot[:bsz, pos // ratio] = kv_c.squeeze(1)
+                emitted.append(kv_c)
+            if not emitted:
+                return None
+            return torch.cat(emitted, dim=1)
         if start_pos == 0:
             should_compress = seqlen >= ratio
             remainder = seqlen % ratio
@@ -1127,7 +1250,10 @@ class Dsv4Compressor(nn.Module):
             if not should_compress:
                 return None
             kv = self._finalize(kv, cutoff, dtype, start_pos)
-            kv_cache_slot[:bsz, : seqlen // ratio] = kv
+            if self.bounded_cache:
+                kv_cache_slot[:bsz, :1].copy_(kv[:, -1:])
+            else:
+                kv_cache_slot[:bsz, : seqlen // ratio] = kv
             return kv
         # decode / mid-sequence prefill chunk: step the per-token state
         # machine `seqlen` times (a chunk is L sequential decode steps --
@@ -1170,7 +1296,10 @@ class Dsv4Compressor(nn.Module):
             if not should_compress:
                 continue
             kv_c = self._finalize(kv_c, 0, dtype, pos)
-            kv_cache_slot[:bsz, pos // ratio] = kv_c.squeeze(1)
+            if self.bounded_cache:
+                kv_cache_slot[:bsz, :1].copy_(kv_c)
+            else:
+                kv_cache_slot[:bsz, pos // ratio] = kv_c.squeeze(1)
             emitted.append(kv_c)
         if not emitted:
             return None
@@ -1398,19 +1527,16 @@ class Dsv4Indexer(nn.Module):
         *,
         slot: int = 0,
     ) -> torch.Tensor:
-        """Score the live compressed-KV prefix without changing BF16 semantics."""
+        """Score the live compressed-KV prefix in fp32.
+
+        The eager path must reproduce the reference einsum bit-for-bit
+        (``einsum -> relu -> weights -> sum`` all fp32) so that top-k ordering
+        is identical; the CUDA kernel path is only used by the fixed-shape
+        graph scorer (``forward_graph``) where the reference is the CG's own
+        oracle, not the reference module.
+        """
         bsz, seqlen = q.shape[:2]
         kv = self._slot_cache(slot)[:bsz, :n_entries]
-        if (
-            q.device.type == "cuda"
-            and q.shape[0] == 1
-            and 1 <= q.shape[1] <= 32
-            and q.shape[2:] == (self.n_heads, self.head_dim)
-            and weights.shape == (1, q.shape[1], self.n_heads)
-        ):
-            from runtime.kernels.dsv4_indexer_score import dsv4_indexer_score
-
-            return dsv4_indexer_score(q, kv[0], weights)
         score = torch.einsum("bshd,btd->bsht", q, kv)
         return (score.relu() * weights.unsqueeze(-1)).sum(dim=2)
 
@@ -1434,12 +1560,12 @@ class Dsv4Indexer(nn.Module):
         if not compressor_precomputed:
             self.compressor(x, start_pos, slot=slot)
 
-        # Until the compressed history exceeds index_topk, selection is an
-        # identity operation: every live entry is attended.  Returning the
-        # canonical physical order avoids a numerically meaningless topk
-        # permutation and skips both indexer projections plus the score scan.
-        # This is decode-only; multi-row prefill retains its per-row causal
-        # construction below.
+        # Until the compressed history exceeds index_topk, every live entry is
+        # attended.  Return the canonical physical order padded to the fixed
+        # graph width without scoring: the topk over all-positive scores
+        # selects exactly these rows, and the graph scorer must stay fixed
+        # shape.  (The set of selected entries is what matters for attention;
+        # the reference module's topk may return them in a different order.)
         live_entries = end_pos // ratio
         if seqlen == 1 and start_pos > 0 and live_entries <= self.index_topk:
             indices = torch.arange(self.index_topk, dtype=torch.int64, device=x.device)

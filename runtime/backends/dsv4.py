@@ -17,6 +17,7 @@ cache remain conservative follow-ups with their own gates.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -649,6 +650,11 @@ class DeepseekV4Backend:
         tensors: list[torch.Tensor] = []
         if layer.compressor is not None:
             tensors.extend((layer.compressor.kv_state[slot], layer.compressor.score_state[slot]))
+            if getattr(layer.compressor, "bounded_cache", False):
+                # The historical main-compressor arena is gone; retain the
+                # current raw entry alongside recurrent state for prefix
+                # restores and non-boundary decode continuation.
+                tensors.append(layer.compressor.kv_cache[slot])
         if layer.indexer is not None:
             compressor = layer.indexer.compressor
             tensors.extend((compressor.kv_state[slot], compressor.score_state[slot]))
@@ -1021,13 +1027,20 @@ class DeepseekV4Backend:
         if n == 0:
             raise ValueError("superchunk prefill needs a non-empty suffix")
         model, layers = self.model, self.slot_layers
-        ids = torch.tensor([suffix], dtype=torch.long, device=self.device)
-        h = model.embed(ids)
-        h = h.unsqueeze(2).repeat(1, 1, model.hc_mult, 1)
         from runtime.kernels.iq2_mma16_tc import DynamicMoEWorkspace
 
+        # Bounded dynamic-MoE workspace: the per-expert route buffers
+        # (out_gate/out_up/down) scale with the processed row count, so sizing
+        # them for the whole prompt is a full-sequence allocation (~31 GiB at
+        # 131072 tokens -- enough to OOM a 96 GiB card alongside the weights).
+        # ``grouped_moe_prefill_k32_dynamic`` chunks over the workspace width,
+        # so create it once for a fixed chunk (capacity plan: bounded emit
+        # scratch, classified as runtime dynamic memory) and let every layer
+        # reuse it.  Kept on the backend so the buffers persist across the 43
+        # serial layers without a fresh allocation per layer.
+        moe_chunk = int(os.environ.get("QSR_DSV4_MOE_CHUNK", "2048"))
         workspace_key = (
-            n,
+            moe_chunk,
             model.config.n_activated_experts,
             model.config.hidden_size,
             model.config.moe_intermediate_size,
@@ -1040,9 +1053,20 @@ class DeepseekV4Backend:
             )
             self._dynamic_moe_workspace = cached_workspace
         dynamic_moe_workspace = cached_workspace[1]
-        # Materialize all GPU positions once.  Constructing a one-element CUDA
-        # tensor from ``abs_pos`` inside the layer/tile loop performs a
-        # synchronous pageable H2D copy (43 layers * 15 mid tiles at M=1024).
+
+        # Process the suffix token-chunk-major so the full-sequence activation
+        # (embed x hc_mult) is never resident at once: ``h`` for a whole 128K
+        # prompt would be ~16 GiB before the first layer, plus per-layer
+        # intermediates.  Each chunk carries its own ``[1, chunk, 4, hidden]``
+        # embedding, runs the full 43-layer stack, and only the final logits
+        # are kept; attention tiles and the bounded MoE workspace stay inside.
+        # Compressor/indexer state advances by absolute position across chunks,
+        # exactly as the layer-major loop did.
+        chunk_rows = max(1, min(n, moe_chunk))
+        superchunk_graph = self._superchunk_prefill_graph
+        # Materialize absolute GPU positions for the whole suffix once; chunk
+        # loops slice into it instead of building a CUDA tensor per tile (a
+        # synchronous pageable H2D copy -- 43 layers * many tiles otherwise).
         tile_positions = torch.arange(
             prefix_len,
             prefix_len + n,
@@ -1050,65 +1074,84 @@ class DeepseekV4Backend:
             dtype=torch.long,
             device=self.device,
         )
-        parallel_compressors = prefix_len == 0 and tile == 64 and n >= 128 and n % 128 == 0
-        superchunk_graph = self._superchunk_prefill_graph
-        use_superchunk_graph = superchunk_graph is not None and superchunk_graph.matches(
-            slot=slot,
-            prefix_len=prefix_len,
-            tile=tile,
-            rows=n,
-        )
-        for i, block in enumerate(model.blocks):
-            residual = h
-            x, post, comb = block.hc_pre(
-                h, block.hc_attn_fn, block.hc_attn_scale, block.hc_attn_base
+        chunk_logits = None
+        for cstart in range(0, n, chunk_rows):
+            cend = min(cstart + chunk_rows, n)
+            cids = suffix[cstart:cend]
+            ids = torch.tensor([cids], dtype=torch.long, device=self.device)
+            h = model.embed(ids)
+            h = h.unsqueeze(2).repeat(1, 1, model.hc_mult, 1)
+            c_abs = prefix_len + cstart
+            cn = cend - cstart
+            use_superchunk_graph = superchunk_graph is not None and superchunk_graph.matches(
+                slot=slot,
+                prefix_len=c_abs,
+                tile=tile,
+                rows=cn,
             )
-            x = rms_norm(x, block.attn_norm_weight, block.eps)
-            if use_superchunk_graph:
-                x = superchunk_graph.replay_layer(i, x)
-            else:
-                outs = []
-                for start in range(0, n, tile):
-                    end = min(start + tile, n)
-                    abs_pos = prefix_len + start
-                    if abs_pos == 0:
-                        # First cold-prefill tile: eager start_pos==0 batch branch
-                        # (its prefill-page packing differs from the mid-sequence
-                        # ring path forward_graph_prefill targets).
-                        outs.append(layers[i](x[:, start:end], 0, slot=slot))
-                        if parallel_compressors:
-                            layers[i].precompute_cold_prefill_compressors(
-                                x,
-                                completed_rows=end,
-                                slot=slot,
-                            )
-                    else:
-                        ratio = getattr(layers[i], "ratio", 0)
-                        n_entries = (abs_pos + (end - start)) // ratio if ratio else 0
-                        tile_index = start // tile
-                        pos_t = tile_positions[tile_index : tile_index + 1]
-                        outs.append(
-                            layers[i].forward_graph_prefill(
-                                x[:, start:end],
-                                pos_t,
-                                slot=slot,
-                                graph_max_index_entries=n_entries,
-                                host_start_pos=abs_pos,
-                                compressors_precomputed=parallel_compressors,
-                            )
-                        )
-                x = torch.cat(outs, dim=1)
-            x = block.hc_post(x, residual, post, comb)
-            residual = x
-            x, post, comb = block.hc_pre(
-                x, block.hc_ffn_fn, block.hc_ffn_scale, block.hc_ffn_base
+            parallel_compressors = (
+                c_abs == 0
+                and tile == 64
+                and cn >= 128
+                and cn % 128 == 0
+                and not any(
+                    getattr(getattr(layer, "compressor", None), "bounded_cache", False)
+                    for layer in layers
+                )
             )
-            x = rms_norm(x, block.ffn_norm_weight, block.eps)
-            x = block.moe.forward_dynamic(x, ids, workspace=dynamic_moe_workspace)
-            x = block.hc_post(x, residual, post, comb)
-            h = x
-        h = model.hc_head(h)
-        return model.lm_head(rms_norm(h, model.norm_weight, model.eps))
+            for i, block in enumerate(model.blocks):
+                residual = h
+                x, post, comb = block.hc_pre(
+                    h, block.hc_attn_fn, block.hc_attn_scale, block.hc_attn_base
+                )
+                x = rms_norm(x, block.attn_norm_weight, block.eps)
+                if use_superchunk_graph:
+                    x = superchunk_graph.replay_layer(i, x)
+                else:
+                    outs = []
+                    for start in range(0, cn, tile):
+                        end = min(start + tile, cn)
+                        abs_pos = c_abs + start
+                        if abs_pos == 0:
+                            # First cold-prefill tile: eager start_pos==0 batch branch
+                            # (its prefill-page packing differs from the mid-sequence
+                            # ring path forward_graph_prefill targets).
+                            outs.append(layers[i](x[:, start:end], 0, slot=slot))
+                            if parallel_compressors:
+                                layers[i].precompute_cold_prefill_compressors(
+                                    x,
+                                    completed_rows=end,
+                                    slot=slot,
+                                )
+                        else:
+                            ratio = getattr(layers[i], "ratio", 0)
+                            n_entries = (abs_pos + (end - start)) // ratio if ratio else 0
+                            tile_index = (cstart + start) // tile
+                            pos_t = tile_positions[tile_index : tile_index + 1]
+                            outs.append(
+                                layers[i].forward_graph_prefill(
+                                    x[:, start:end],
+                                    pos_t,
+                                    slot=slot,
+                                    graph_max_index_entries=n_entries,
+                                    host_start_pos=abs_pos,
+                                    compressors_precomputed=parallel_compressors,
+                                )
+                            )
+                    x = torch.cat(outs, dim=1)
+                x = block.hc_post(x, residual, post, comb)
+                residual = x
+                x, post, comb = block.hc_pre(
+                    x, block.hc_ffn_fn, block.hc_ffn_scale, block.hc_ffn_base
+                )
+                x = rms_norm(x, block.ffn_norm_weight, block.eps)
+                x = block.moe.forward_dynamic(x, ids, workspace=dynamic_moe_workspace)
+                x = block.hc_post(x, residual, post, comb)
+                h = x
+            h = model.hc_head(h)
+            chunk_logits = model.lm_head(rms_norm(h, model.norm_weight, model.eps))
+        assert chunk_logits is not None
+        return chunk_logits
 
     def _forward_decode_batch(
         self,
