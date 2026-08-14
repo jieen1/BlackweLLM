@@ -225,3 +225,68 @@ attention kernels         ~61.0 ms
 1000 tok/s。下一步必须优先批量化 attention 中 tile-invariant 的 Q/KV 与输出投影
 （当前 3425+688 次 Q8 kernel），并继续攻 routed MoE 的 604.8 ms；attention 本体即使
 完全消失也不足以达到 1000 tok/s。
+
+## 第三阶段：attention 投影批量化实验（已回退）
+
+上一节把 attention 的 Q/KV 与输出投影批量化列为下一步，2026-08-14 实机验证后该
+判断只成立一半，不能作为默认实现：
+
+- 1024 行一次完成 `wq_a/wq_b/wkv`，MLA 仍按 64 行 tile，单层 ratio-0/4/128
+  与旧路径逐元素相等；全模型固定 prompt 的 16-token greedy 序列也逐项相同。
+- 如果把 grouped `wo_a` 也合成 1024 行，真实 profile 中 dense Q8 从约
+  `287 ms` 降到 `231 ms`，但 grouped Q8 从约 `55 ms` 升到 `214 ms`。固定 prompt
+  同进程交替 A/B 只有 eager `497.1` → graph `571.2 tok/s`（+14.9%），显著低于
+  旧 attention graph 的配对中位 `759.9 tok/s`。
+- 改成“Q/KV 批量、`wo_a/wo_b` 仍逐 tile”的混合结构后保持 bit-exact，但 capture
+  pool 把进程推到显存边缘：PyTorch `reserved=92.44 GiB`、GPU 仅余约 `0.16 GiB`；
+  开关图两侧随后都出现 5–11 秒尖峰。`empty_cache()` 后也只恢复到约 0.87 GiB，
+  无法形成可信稳定 E2E，更不满足生产余量。
+- 中途发现并修正了一个诊断原型错误：b12x MLA 返回复用 scratch 的视图，把 16 个
+  raw tile 存入列表会被后续调用覆盖；逐 tile 物化后 ratio-0/4/128 均恢复
+  `max_diff=0`。该修正只证明原型数值语义，不改变上述性能/显存否决。
+
+结论：projection 调用数减少并不等于 E2E 关键路径缩短。1024-row grouped `wo_a` 的
+tile 选择明显不适合该形状，而 Q/KV 批量又扩大 graph 中间量生命周期和 capture pool。
+整条代码分支已回退，当前默认仍是 16×64 attention graph。下一步应优先把现有
+attention + HC + dynamic MoE 串入完整 block graph，同时保持 tile 局部中间量生命周期；
+若再碰 Q8，只做 dominant-shape 的 kernel/selector 调优，不再用全序列批量化硬换 launch
+数。
+
+## 第四阶段：完整 block CUDA Graph 实验（已回退）
+
+为验证上一阶段的最后一个结构性假设，原型将每层完整 block 捕获进 graph：
+`HC-attn pre/norm -> 16×64 attention -> HC post -> HC-FFN pre/norm -> dynamic MoE -> HC post`。
+固定 `M=1024, tile=64, slot=0, prefix=0`，43 层共享 graph pool；eager 与 graph
+共用同一个 dynamic MoE workspace。
+
+- 真实模型 capture 8.69 s，43 graphs，reserved 增量 1.506 GiB、allocated 增量
+  1.311 GiB，捕获后 driver free 3.93 GiB。
+- 固定 prompt 的 16-token greedy 输出仍逐项等于上面的 hard sequence，所有 logits
+  finite；因此本次否决是性能结论，不是 correctness 失败。
+- 在同一 daemon 同时保留完整 block graph 与旧 attention-only graph，预热后做 12 对
+  交替 A/B：完整 block median `1.272965 s = 804.4 tok/s`，attention-only median
+  `1.274406 s = 803.5 tok/s`，完整 block 仅快 **0.11%**，属于零收益。
+- profiler 复核也一致：完整 block / attention-only 的 self CUDA 总时分别
+  `1.238 s / 1.240 s`。主要 kernel 几乎不变：
+
+```text
+                              block graph   attention-only
+iq2 gate/up dynamic             376.2 ms       375.7 ms
+Q8 SoA dense                    282.2 ms       288.8 ms
+iq2 down dynamic                231.7 ms       232.0 ms
+Q8 SoA grouped                   54.6 ms        55.4 ms
+attention shared kernels        ~49.7 ms       ~49.3 ms
+```
+
+结论：此前把 profiler 中 host/launch 汇总空洞直接换算成 `170-230 ms` E2E 收益是错误
+外推；attention graph 之后，剩余 host 提交已被 GPU 工作覆盖，不在关键路径上。完整
+block graph 多占约 1.5 GiB 显存、扩大固定形状特殊分支，却没有 E2E 收益，因此代码和
+测试原型均已回退。
+
+当前 `~760 tok/s` 的干净配对基线已经超过本轮同权重 llama.cpp `567.8 tok/s` 的实测
+参考；同一高度预热 daemon 可到约 `804 tok/s`，但不把它替代冷净进程基线。要达到
+`1000 tok/s`，从 `1.273 s` 仍需减少约 `249 ms`，而仅 routed MoE 就占约 `608 ms`。
+下一阶段若继续，必须是能让 IQ2 gate/up/down **实际少做指令或改用更高吞吐格式**的
+kernel/权重格式工程；再消 launch、再扩大 graph、或只融合仅 `2.8 ms` 的 SwiGLU
+epilogue 都不可能补足差额。Q8 dominant-shape 调优仍可作为几十毫秒级边际实验，但
+没有证据支持它单独达到 1000 tok/s。
