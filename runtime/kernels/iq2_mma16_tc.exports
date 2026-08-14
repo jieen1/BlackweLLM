@@ -3,6 +3,11 @@
     iq2_mma16_tc_launch;
     moe_group_launch;
     moe_gather_xq_launch;
+    moe_gather_xq_launch_coop4;
+    moe_gather_xq_launch_serial;
+    moe_preq_bf16_launch;
+    moe_swiglu_preq_launch;
+    moe_combine_launch;
     iq2_mma16_tc_dynamic_launch;
   local: *;
 };

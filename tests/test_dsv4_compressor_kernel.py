@@ -13,6 +13,7 @@ from runtime.kernels.dsv4_compressor import (  # noqa: E402
     fused_decode_postgemv_batch,
     fused_indexer_decode_postgemv,
     fused_indexer_decode_postgemv_batch,
+    fused_indexer_decode_postgemv_seq,
     hadamard_fp4_query,
     supports_fused_decode_postgemv,
     supports_fused_decode_postgemv_batch,
@@ -702,6 +703,84 @@ def test_fused_indexer_decode_postgemv_matches_torch_state_machine() -> None:
         assert torch.equal(kernel_kv_state, oracle_kv_state), position
         assert torch.equal(kernel_score_state, oracle_score_state), position
         assert torch.equal(kernel_cache, oracle_cache), position
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs exclusive GPU")
+def test_fused_indexer_postgemv_seq_matches_per_token_kernel_bit_exactly() -> None:
+    device = torch.device("cuda")
+    ratio, head_dim, full_dim, rows = 4, 128, 256, 8
+    generator = torch.Generator(device=device).manual_seed(20260814)
+    ape = torch.randn(ratio, full_dim, generator=generator, device=device)
+    norm_weight = torch.randn(head_dim, generator=generator, device=device)
+    freqs_cis = precompute_freqs_cis(
+        64,
+        384,
+        original_seq_len=0,
+        base=160000.0,
+        factor=1.0,
+        beta_fast=32,
+        beta_slow=1,
+        device=device,
+    )
+    kv = torch.randn(1, rows, full_dim, generator=generator, device=device)
+    score = torch.randn(1, rows, full_dim, generator=generator, device=device)
+    initial_kv_state = torch.randn(1, 8, full_dim, generator=generator, device=device)
+    initial_score_state = torch.full(
+        (1, 8, full_dim), float("-inf"), device=device, dtype=torch.float32
+    )
+    initial_score_state[:, :4] = torch.randn(
+        1, 4, full_dim, generator=generator, device=device
+    )
+    initial_cache = torch.randn(
+        1, rows // ratio, head_dim, generator=generator, device=device, dtype=torch.bfloat16
+    )
+
+    old_kv_state = initial_kv_state.clone()
+    old_score_state = initial_score_state.clone()
+    old_cache = initial_cache.clone()
+    old_rows = []
+    scratch = torch.empty(1, 1, head_dim, device=device, dtype=torch.bfloat16)
+    for position in range(rows):
+        result = fused_indexer_decode_postgemv(
+            kv_i=kv[:, position : position + 1],
+            score_i=score[:, position : position + 1],
+            pos=torch.tensor([position], device=device, dtype=torch.int64),
+            ape=ape,
+            norm_weight=norm_weight,
+            freqs_cis=freqs_cis,
+            kv_state=old_kv_state,
+            score_state=old_score_state,
+            kv_cache=old_cache,
+            out=scratch,
+            eps=1e-6,
+        )
+        if position % ratio == ratio - 1:
+            old_rows.append(result.clone())
+
+    new_kv_state = initial_kv_state.clone()
+    new_score_state = initial_score_state.clone()
+    new_cache = initial_cache.clone()
+    new_out = torch.empty(1, rows // ratio, head_dim, device=device, dtype=torch.bfloat16)
+    actual = fused_indexer_decode_postgemv_seq(
+        kv=kv,
+        score=score,
+        pos0=torch.tensor([0], device=device, dtype=torch.int64),
+        host_start_pos=0,
+        ape=ape,
+        norm_weight=norm_weight,
+        freqs_cis=freqs_cis,
+        kv_state=new_kv_state,
+        score_state=new_score_state,
+        kv_cache=new_cache,
+        out=new_out,
+        eps=1e-6,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual, torch.cat(old_rows, dim=1))
+    assert torch.equal(new_kv_state, old_kv_state)
+    assert torch.equal(new_score_state, old_score_state)
+    assert torch.equal(new_cache, old_cache)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs exclusive GPU")

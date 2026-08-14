@@ -1461,6 +1461,273 @@ def fused_indexer_decode_postgemv(
     return out
 
 
+@triton.jit
+def _indexer_postgemv_seq_state_kernel(
+    kv_ptr,
+    score_ptr,
+    pos0_ptr,
+    ape_ptr,
+    norm_weight_ptr,
+    freqs_ri_ptr,
+    kv_state_ptr,
+    score_state_ptr,
+    post_rope_ptr,
+    kv_col_stride,
+    score_col_stride,
+    ape_row_stride,
+    kv_state_row_stride,
+    score_state_row_stride,
+    post_rope_row_stride,
+    freqs_row_stride,
+    eps,
+    SEQ_LEN: tl.constexpr,
+):
+    """Sequential ratio-4 indexer state machine for one prefill tile.
+
+    A single CTA is intentional: the old four-CTA decode kernel needs a
+    second launch after every token to provide a grid-wide barrier before
+    migrating overlap state.  Keeping the token loop in one CTA preserves
+    that ordering while reducing 2*SEQ_LEN launches to this state launch plus
+    one independent Hadamard/FP4 launch for all compression boundaries.
+    """
+    ratio: tl.constexpr = 4
+    head_dim: tl.constexpr = 128
+    rope_dim: tl.constexpr = 64
+    full_dim: tl.constexpr = 256
+    pos0 = tl.load(pos0_ptr)
+    offs_full = tl.arange(0, full_dim)
+    offs_head = tl.arange(0, head_dim)
+    offs_pair = tl.arange(0, head_dim // 2)
+
+    for i in tl.range(0, SEQ_LEN, num_stages=1):
+        pos = pos0 + i
+        slot = pos % ratio
+        should_compress = ((pos + 1) % ratio) == 0
+        kv_full = tl.load(kv_ptr + i * kv_col_stride + offs_full).to(tl.float32)
+        score_full = tl.load(score_ptr + i * score_col_stride + offs_full).to(tl.float32)
+        score_full += tl.load(ape_ptr + slot * ape_row_stride + offs_full).to(tl.float32)
+        state_row = ratio + slot
+        tl.store(kv_state_ptr + state_row * kv_state_row_stride + offs_full, kv_full)
+        tl.store(score_state_ptr + state_row * score_state_row_stride + offs_full, score_full)
+        tl.debug_barrier()
+
+        current_score_b = tl.load(
+            score_ptr + i * score_col_stride + head_dim + offs_head
+        ).to(tl.float32)
+        current_score_b += tl.load(
+            ape_ptr + slot * ape_row_stride + head_dim + offs_head
+        ).to(tl.float32)
+        current_value_b = tl.load(
+            kv_ptr + i * kv_col_stride + head_dim + offs_head
+        ).to(tl.float32)
+        max_score = tl.full((head_dim,), float("-inf"), tl.float32)
+        for r in range(ratio):
+            score_a = tl.load(
+                score_state_ptr + r * score_state_row_stride + offs_head
+            ).to(tl.float32)
+            score_b = tl.load(
+                score_state_ptr + (ratio + r) * score_state_row_stride + head_dim + offs_head
+            ).to(tl.float32)
+            score_b = tl.where(slot == r, current_score_b, score_b)
+            max_score = tl.maximum(max_score, score_a)
+            max_score = tl.maximum(max_score, score_b)
+
+        denom = tl.zeros((head_dim,), tl.float32)
+        pooled = tl.zeros((head_dim,), tl.float32)
+        for r in range(ratio):
+            score_a = tl.load(
+                score_state_ptr + r * score_state_row_stride + offs_head
+            ).to(tl.float32)
+            value_a = tl.load(
+                kv_state_ptr + r * kv_state_row_stride + offs_head
+            ).to(tl.float32)
+            score_b = tl.load(
+                score_state_ptr + (ratio + r) * score_state_row_stride + head_dim + offs_head
+            ).to(tl.float32)
+            value_b = tl.load(
+                kv_state_ptr + (ratio + r) * kv_state_row_stride + head_dim + offs_head
+            ).to(tl.float32)
+            score_b = tl.where(slot == r, current_score_b, score_b)
+            value_b = tl.where(slot == r, current_value_b, value_b)
+            exp_a = tl.exp(score_a - max_score)
+            exp_b = tl.exp(score_b - max_score)
+            denom += exp_a
+            pooled += value_a * exp_a
+            denom += exp_b
+            pooled += value_b * exp_b
+        pooled = pooled / denom
+
+        pooled = pooled.to(tl.bfloat16).to(tl.float32)
+        inv_rms = tl.rsqrt(tl.sum(pooled * pooled, axis=0) / head_dim + eps)
+        norm_weight = tl.load(norm_weight_ptr + offs_head).to(tl.float32)
+        normed = (pooled * inv_rms * norm_weight).to(tl.bfloat16)
+        pair_even, pair_odd = tl.split(tl.reshape(normed, (head_dim // 2, 2)))
+        rope_pair_start = (head_dim - rope_dim) // 2
+        rope_mask = offs_pair >= rope_pair_start
+        rope_pair = offs_pair - rope_pair_start
+        freq_base = tl.maximum(pos + 1 - ratio, 0) * freqs_row_stride
+        cos = tl.load(
+            freqs_ri_ptr + freq_base + 2 * rope_pair,
+            mask=rope_mask,
+            other=1.0,
+        ).to(tl.float32)
+        sin = tl.load(
+            freqs_ri_ptr + freq_base + 2 * rope_pair + 1,
+            mask=rope_mask,
+            other=0.0,
+        ).to(tl.float32)
+        pair_even_fp32 = pair_even.to(tl.float32)
+        pair_odd_fp32 = pair_odd.to(tl.float32)
+        post_even = tl.where(
+            rope_mask,
+            pair_even_fp32 * cos - pair_odd_fp32 * sin,
+            pair_even_fp32,
+        ).to(tl.bfloat16)
+        post_odd = tl.where(
+            rope_mask,
+            pair_odd_fp32 * cos + pair_even_fp32 * sin,
+            pair_odd_fp32,
+        ).to(tl.bfloat16)
+        post_rope = tl.reshape(tl.join(post_even, post_odd), (head_dim,))
+        tl.store(post_rope_ptr + i * post_rope_row_stride + offs_head, post_rope)
+
+        for r in range(ratio):
+            upper_kv = tl.load(
+                kv_state_ptr + (ratio + r) * kv_state_row_stride + offs_full
+            )
+            upper_score = tl.load(
+                score_state_ptr + (ratio + r) * score_state_row_stride + offs_full
+            )
+            lower_kv = tl.load(kv_state_ptr + r * kv_state_row_stride + offs_full)
+            lower_score = tl.load(score_state_ptr + r * score_state_row_stride + offs_full)
+            tl.store(
+                kv_state_ptr + r * kv_state_row_stride + offs_full,
+                tl.where(should_compress, upper_kv, lower_kv),
+            )
+            tl.store(
+                score_state_ptr + r * score_state_row_stride + offs_full,
+                tl.where(should_compress, upper_score, lower_score),
+            )
+        tl.debug_barrier()
+
+
+@triton.jit
+def _indexer_postgemv_seq_quant_kernel(
+    post_rope_ptr,
+    pos0_ptr,
+    kv_cache_ptr,
+    out_ptr,
+    post_rope_row_stride,
+    kv_cache_row_stride,
+    out_row_stride,
+):
+    boundary = tl.program_id(0)
+    block = tl.program_id(1)
+    ratio: tl.constexpr = 4
+    head_dim: tl.constexpr = 128
+    pos0 = tl.load(pos0_ptr)
+    first = (ratio - 1 - (pos0 % ratio)) % ratio
+    row = first + boundary * ratio
+    pos = pos0 + row
+    offs_head = tl.arange(0, head_dim)
+    post_rope = tl.load(post_rope_ptr + row * post_rope_row_stride + offs_head).to(
+        tl.float32
+    )
+
+    out_offs = block * 32 + tl.arange(0, 32)
+    had_in = offs_head[:, None]
+    had_out = out_offs[None, :]
+    parity = had_in & had_out
+    parity = parity ^ (parity >> 4)
+    parity = parity ^ (parity >> 2)
+    parity = parity ^ (parity >> 1)
+    signs = 1.0 - 2.0 * (parity & 1).to(tl.float32)
+    rotated = tl.sum(post_rope[:, None] * signs, axis=0) * 0.08838834764831845
+    rotated = rotated.to(tl.bfloat16).to(tl.float32)
+
+    amax = tl.maximum(tl.max(tl.abs(rotated), axis=0), 6.0 * 1.1754943508222875e-38)
+    v = amax * (1.0 / 6.0)
+    bits = v.to(tl.uint32, bitcast=True)
+    exp_bits = (bits >> 23) & 0xFF
+    mant = bits & 0x7FFFFF
+    exponent = exp_bits.to(tl.int32) - 127 + tl.where(mant != 0, 1, 0)
+    scale_bits = (exponent + 127).to(tl.uint32) << 23
+    scale = scale_bits.to(tl.float32, bitcast=True)
+    scaled = rotated / scale
+    magnitude = tl.minimum(tl.abs(scaled), 6.0)
+    snapped = tl.full(magnitude.shape, 6.0, tl.float32)
+    snapped = tl.where(magnitude <= 5.0, 4.0, snapped)
+    snapped = tl.where(magnitude < 3.5, 3.0, snapped)
+    snapped = tl.where(magnitude <= 2.5, 2.0, snapped)
+    snapped = tl.where(magnitude < 1.75, 1.5, snapped)
+    snapped = tl.where(magnitude <= 1.25, 1.0, snapped)
+    snapped = tl.where(magnitude < 0.75, 0.5, snapped)
+    snapped = tl.where(magnitude <= 0.25, 0.0, snapped)
+    quantized = (snapped * tl.where(scaled < 0, -1.0, 1.0) * scale).to(tl.bfloat16)
+
+    cache_base = (pos // ratio) * kv_cache_row_stride
+    out_base = boundary * out_row_stride
+    tl.store(kv_cache_ptr + cache_base + out_offs, quantized)
+    tl.store(out_ptr + out_base + out_offs, quantized)
+
+
+def fused_indexer_decode_postgemv_seq(
+    *,
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    pos0: torch.Tensor,
+    host_start_pos: int,
+    ape: torch.Tensor,
+    norm_weight: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    kv_cache: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Run a ratio-4 indexer compressor tile in two kernel launches."""
+    seq_len = kv.shape[1]
+    n_boundaries = (host_start_pos + seq_len) // 4 - host_start_pos // 4
+    if out.shape[1] < max(1, n_boundaries):
+        raise ValueError(f"out has {out.shape[1]} rows, needs {max(1, n_boundaries)}")
+    post_rope = torch.empty((seq_len, 128), dtype=torch.bfloat16, device=kv.device)
+    freqs_ri = torch.view_as_real(freqs_cis).reshape(freqs_cis.shape[0], 64)
+    _indexer_postgemv_seq_state_kernel[(1,)](
+        kv,
+        score,
+        pos0,
+        ape,
+        norm_weight,
+        freqs_ri,
+        kv_state,
+        score_state,
+        post_rope,
+        kv.stride(1),
+        score.stride(1),
+        ape.stride(0),
+        kv_state.stride(1),
+        score_state.stride(1),
+        post_rope.stride(0),
+        freqs_ri.stride(0),
+        eps,
+        SEQ_LEN=seq_len,
+        num_warps=8,
+    )
+    if n_boundaries:
+        _indexer_postgemv_seq_quant_kernel[(n_boundaries, 4)](
+            post_rope,
+            pos0,
+            kv_cache,
+            out,
+            post_rope.stride(0),
+            kv_cache.stride(1),
+            out.stride(1),
+            num_warps=8,
+        )
+    return out.narrow(1, 0, n_boundaries)
+
+
 def compile_fused_decode_postgemv_batch_sm120(
     *,
     ratio: int,
@@ -1796,3 +2063,200 @@ def fused_decode_postgemv_seq(
         num_warps=num_warps,
     )
     return out
+
+
+@triton.jit
+def _cold_prefill_postgemv_parallel_kernel(
+    kv_ptr,
+    score_ptr,
+    ape_ptr,
+    norm_weight_ptr,
+    freqs_ri_ptr,
+    kv_cache_ptr,
+    kv_col_stride,
+    score_col_stride,
+    ape_row_stride,
+    kv_cache_row_stride,
+    freqs_row_stride,
+    eps,
+    FIRST_BOUNDARY: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    FULL_DIM: tl.constexpr,
+    RATIO: tl.constexpr,
+    OVERLAP: tl.constexpr,
+):
+    """Parallel cold-prefill entries with seq-kernel-identical reductions.
+
+    Once the complete layer input is available, compression boundaries are
+    independent: a non-overlap entry reads its current RATIO-row block, while
+    an overlap entry reads the previous block's first half and the current
+    block's second half.  Keep the max/sum loop order identical to
+    ``_decode_postgemv_seq_kernel`` so this is a scheduling change only.
+    """
+    boundary = tl.program_id(0) + FIRST_BOUNDARY
+    offs_head = tl.arange(0, HEAD_DIM)
+    offs_pair = tl.arange(0, HEAD_DIM // 2)
+
+    max_score = tl.full((HEAD_DIM,), float("-inf"), tl.float32)
+    for r in range(RATIO):
+        if OVERLAP:
+            row_a = (boundary - 1) * RATIO + r
+            score_a = tl.load(
+                score_ptr + row_a * score_col_stride + offs_head
+            ).to(tl.float32)
+            score_a += tl.load(ape_ptr + r * ape_row_stride + offs_head).to(tl.float32)
+            row_b = boundary * RATIO + r
+            score_b = tl.load(
+                score_ptr + row_b * score_col_stride + HEAD_DIM + offs_head
+            ).to(tl.float32)
+            score_b += tl.load(
+                ape_ptr + r * ape_row_stride + HEAD_DIM + offs_head
+            ).to(tl.float32)
+            max_score = tl.maximum(max_score, tl.maximum(score_a, score_b))
+        else:
+            row_a = boundary * RATIO + r
+            score_a = tl.load(
+                score_ptr + row_a * score_col_stride + offs_head
+            ).to(tl.float32)
+            score_a += tl.load(ape_ptr + r * ape_row_stride + offs_head).to(tl.float32)
+            max_score = tl.maximum(max_score, score_a)
+
+    denom = tl.zeros((HEAD_DIM,), tl.float32)
+    pooled = tl.zeros((HEAD_DIM,), tl.float32)
+    for r in range(RATIO):
+        if OVERLAP:
+            row_a = (boundary - 1) * RATIO + r
+            score_a = tl.load(
+                score_ptr + row_a * score_col_stride + offs_head
+            ).to(tl.float32)
+            score_a += tl.load(ape_ptr + r * ape_row_stride + offs_head).to(tl.float32)
+            value_a = tl.load(kv_ptr + row_a * kv_col_stride + offs_head).to(tl.float32)
+            row_b = boundary * RATIO + r
+            score_b = tl.load(
+                score_ptr + row_b * score_col_stride + HEAD_DIM + offs_head
+            ).to(tl.float32)
+            score_b += tl.load(
+                ape_ptr + r * ape_row_stride + HEAD_DIM + offs_head
+            ).to(tl.float32)
+            value_b = tl.load(
+                kv_ptr + row_b * kv_col_stride + HEAD_DIM + offs_head
+            ).to(tl.float32)
+            exp_a = tl.exp(score_a - max_score)
+            exp_b = tl.exp(score_b - max_score)
+            denom += exp_a + exp_b
+            pooled += value_a * exp_a + value_b * exp_b
+        else:
+            row_a = boundary * RATIO + r
+            score_a = tl.load(
+                score_ptr + row_a * score_col_stride + offs_head
+            ).to(tl.float32)
+            score_a += tl.load(ape_ptr + r * ape_row_stride + offs_head).to(tl.float32)
+            value_a = tl.load(kv_ptr + row_a * kv_col_stride + offs_head).to(tl.float32)
+            exp_a = tl.exp(score_a - max_score)
+            denom += exp_a
+            pooled += value_a * exp_a
+
+    pooled = (pooled / denom).to(tl.bfloat16).to(tl.float32)
+    inv_rms = tl.rsqrt(tl.sum(pooled * pooled, axis=0) / HEAD_DIM + eps)
+    nw = tl.load(norm_weight_ptr + offs_head).to(tl.float32)
+    nb16 = (pooled * inv_rms * nw).to(tl.bfloat16)
+    pair_even, pair_odd = tl.split(tl.reshape(nb16, (HEAD_DIM // 2, 2)))
+    rope_pair_start = (HEAD_DIM - ROPE_DIM) // 2
+    rope_mask = offs_pair >= rope_pair_start
+    rope_pair = offs_pair - rope_pair_start
+    freq_base = boundary * RATIO * freqs_row_stride
+    cos = tl.load(
+        freqs_ri_ptr + freq_base + 2 * rope_pair,
+        mask=rope_mask,
+        other=1.0,
+    ).to(tl.float32)
+    sin = tl.load(
+        freqs_ri_ptr + freq_base + 2 * rope_pair + 1,
+        mask=rope_mask,
+        other=0.0,
+    ).to(tl.float32)
+    even = pair_even.to(tl.float32)
+    odd = pair_odd.to(tl.float32)
+    post_even = tl.where(rope_mask, even * cos - odd * sin, even).to(tl.bfloat16)
+    post_odd = tl.where(rope_mask, odd * cos + even * sin, odd).to(tl.bfloat16)
+    cache_base = boundary * kv_cache_row_stride
+    tl.store(kv_cache_ptr + cache_base + 2 * offs_pair, post_even)
+    tl.store(kv_cache_ptr + cache_base + 2 * offs_pair + 1, post_odd)
+
+
+def fused_cold_prefill_postgemv_parallel(
+    *,
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    completed_rows: int,
+    ratio: int,
+    head_dim: int,
+    rope_head_dim: int,
+    overlap: bool,
+    ape: torch.Tensor,
+    norm_weight: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    kv_state: torch.Tensor,
+    score_state: torch.Tensor,
+    kv_cache: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Precompute cold-prefill compressor entries after a verified prefix.
+
+    ``completed_rows`` is the prefix already advanced by the normal path.
+    Only complete compression boundaries are emitted; callers retain the
+    normal tiled path for non-cold and non-64-aligned requests.
+    """
+    seq_len = int(kv.shape[1])
+    if (
+        completed_rows <= 0
+        or seq_len % ratio != 0
+        or (overlap and completed_rows % ratio != 0)
+    ):
+        raise ValueError(
+            "parallel cold prefill requires positive ratio-aligned completed_rows "
+            f"and seq_len, got {completed_rows}, {seq_len}, ratio={ratio}"
+        )
+    if ratio not in (4, 128) or head_dim != 512 or rope_head_dim != 64:
+        raise ValueError("unsupported parallel cold-prefill compressor contract")
+    if overlap != (ratio == 4):
+        raise ValueError("parallel cold-prefill overlap contract mismatch")
+    first_boundary = completed_rows // ratio
+    n_boundaries = seq_len // ratio
+    if first_boundary >= n_boundaries:
+        return kv_cache[:, 0:0]
+    freqs_ri = torch.view_as_real(freqs_cis).reshape(freqs_cis.shape[0], rope_head_dim)
+    _cold_prefill_postgemv_parallel_kernel[(n_boundaries - first_boundary,)](
+        kv,
+        score,
+        ape,
+        norm_weight,
+        freqs_ri,
+        kv_cache,
+        kv.stride(1),
+        score.stride(1),
+        ape.stride(0),
+        kv_cache.stride(1),
+        freqs_ri.stride(0),
+        eps,
+        FIRST_BOUNDARY=first_boundary,
+        HEAD_DIM=head_dim,
+        ROPE_DIM=rope_head_dim,
+        FULL_DIM=kv.shape[-1],
+        RATIO=ratio,
+        OVERLAP=overlap,
+        num_warps=16 if ratio == 128 else 8,
+    )
+
+    # Restore the state that the serial tile oracle leaves at an exact
+    # boundary.  Future decode overwrites the upper overlap half gradually,
+    # so retaining the last complete group in both halves is intentional.
+    last_kv = kv[:, seq_len - ratio : seq_len]
+    last_score = score[:, seq_len - ratio : seq_len] + ape
+    kv_state[:, :ratio].copy_(last_kv)
+    score_state[:, :ratio].copy_(last_score)
+    if overlap:
+        kv_state[:, ratio:].copy_(last_kv)
+        score_state[:, ratio:].copy_(last_score)
+    return kv_cache[:, first_boundary:n_boundaries]

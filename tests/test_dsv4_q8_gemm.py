@@ -22,6 +22,8 @@ from runtime.kernels.dsv4_q8_gemm import (  # noqa: E402
     q8_0_dequant_gemv_fp32,
     q8_0_dequant_gemv_warp_row_bf16,
     q8_0_grouped_dequant_gemm,
+    q8_0_soa_dequant_gemm,
+    q8_0_soa_grouped_dequant_gemm,
     repack_q8_0_soa,
 )
 from runtime.loading.gguf import GgufTensor  # noqa: E402
@@ -80,7 +82,8 @@ def test_fused_q8_fp32_is_decode_bf16_only(
     dtype: torch.dtype,
 ) -> None:
     linear = PackedQ8_0Linear(64, 64, device="cuda")
-    linear.packed.zero_()
+    linear.qcode.zero_()
+    linear.qscale.zero_()
     linear.fused_q8_fp32 = True
 
     def fail_if_called(*args, **kwargs):
@@ -204,6 +207,19 @@ def test_q8_gemm_multi_token() -> None:
 
 
 @CUDA_REQUIRED
+def test_q8_soa_gemm_is_bit_exact_with_interleaved_kernel() -> None:
+    out, inp, rows = 1024, 512, 17
+    packed = _random_packed(out, inp, "cuda")
+    q, d = repack_q8_0_soa(packed, out, inp)
+    x = torch.randn(rows, inp, device="cuda", dtype=torch.bfloat16)
+
+    expect = q8_0_dequant_gemm(x, packed, out_features=out, in_features=inp)
+    got = q8_0_soa_dequant_gemm(x, q, d, out_features=out, in_features=inp)
+
+    assert torch.equal(got, expect)
+
+
+@CUDA_REQUIRED
 @pytest.mark.parametrize("out,inp", [(1024, 512), (1030, 512), (4096, 2048)])
 def test_q8_gemv_fp32_matches_eager(out: int, inp: int) -> None:
     dev = "cuda"
@@ -251,3 +267,31 @@ def test_q8_grouped_gemm_matches_eager(groups: int, gsize: int, inp: int, rows_p
         expect[g * rows_per_g : (g + 1) * rows_per_g] = xg @ w[g].t()
     rel = (got - expect).abs().max().item() / (expect.abs().max().item() + 1e-9)
     assert rel < 1e-2, f"groups={groups} rel={rel:.2e}"
+
+
+@CUDA_REQUIRED
+def test_q8_soa_grouped_gemm_is_bit_exact_with_interleaved_kernel() -> None:
+    groups, group_size, inp, rows_per_group = 2, 64, 64, 17
+    packed = _random_packed(groups * group_size, inp, "cuda")
+    q, d = repack_q8_0_soa(packed, groups * group_size, inp)
+    x = torch.randn(groups * rows_per_group, inp, device="cuda", dtype=torch.bfloat16)
+
+    expect = q8_0_grouped_dequant_gemm(
+        x,
+        packed,
+        num_groups=groups,
+        group_size=group_size,
+        in_features=inp,
+        rows_per_group=rows_per_group,
+    )
+    got = q8_0_soa_grouped_dequant_gemm(
+        x,
+        q,
+        d,
+        num_groups=groups,
+        group_size=group_size,
+        in_features=inp,
+        rows_per_group=rows_per_group,
+    )
+
+    assert torch.equal(got, expect)

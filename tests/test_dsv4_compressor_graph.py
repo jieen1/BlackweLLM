@@ -143,6 +143,32 @@ def test_forward_graph_cpu_keeps_oracle_path(
     compressor.forward_graph(x, torch.tensor([1], dtype=torch.int64))
 
 
+def test_forward_graph_prefill_uses_known_host_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compressor = _compressor()
+    x = torch.randn(1, 4, CONFIG.hidden_size, dtype=torch.bfloat16)
+    opaque_device_position = object()
+
+    from runtime.kernels import dsv4_compressor
+
+    monkeypatch.setattr(dsv4_compressor, "supports_fused_decode_postgemv", lambda **_: True)
+
+    def fused_seq(**kwargs) -> torch.Tensor:
+        assert kwargs["pos0"] is opaque_device_position
+        return kwargs["out"].zero_()
+
+    monkeypatch.setattr(dsv4_compressor, "fused_decode_postgemv_seq", fused_seq)
+
+    result = compressor.forward_graph_prefill(
+        x,
+        opaque_device_position,  # type: ignore[arg-type]
+        host_start_pos=4,
+    )
+
+    assert result.shape == (1, 1, CONFIG.head_dim)
+
+
 def test_capture_pack_uses_current_compressed_slot(monkeypatch: pytest.MonkeyPatch) -> None:
     from runtime.model import dsv4_attn_kernel
 

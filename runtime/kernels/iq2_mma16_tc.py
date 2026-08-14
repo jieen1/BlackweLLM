@@ -764,6 +764,74 @@ def grouped_moe_prefill_k32_graph(
     return ws.out
 
 
+@dataclass
+class DynamicMoEWorkspace:
+    """Buffers shared by the 43 serial DSV4 routed-MoE layers."""
+
+    m: int
+    top_k: int
+    hidden: int
+    inter: int
+    device: Any
+    indices32: Any
+    compact_route: Any
+    route_to_compact: Any
+    expert_bounds: Any
+    xq_flat: Any
+    xs_flat: Any
+    compact_xq: Any
+    compact_xs: Any
+    eids: Any
+    out_gate: Any
+    out_up: Any
+    hq: Any
+    hs: Any
+    down: Any
+    out: Any
+    library: Any
+
+    @classmethod
+    def create(cls, m: int, top_k: int, hidden: int, inter: int, device: Any):
+        r = m * top_k
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        return cls(
+            m=m,
+            top_k=top_k,
+            hidden=hidden,
+            inter=inter,
+            device=device,
+            indices32=torch.empty(r, dtype=torch.int32, device=device),
+            compact_route=torch.empty(r, dtype=torch.int32, device=device),
+            route_to_compact=torch.empty(r, dtype=torch.int32, device=device),
+            expert_bounds=torch.empty(257, dtype=torch.int32, device=device),
+            xq_flat=torch.empty(m, hidden, dtype=torch.int8, device=device),
+            xs_flat=torch.empty(m, hidden // 32, dtype=torch.bfloat16, device=device),
+            compact_xq=torch.empty(r, hidden, dtype=torch.int8, device=device),
+            compact_xs=torch.empty(r, hidden // 32, dtype=torch.float32, device=device),
+            eids=torch.arange(256, dtype=torch.int64, device=device),
+            out_gate=torch.empty(r, inter, dtype=torch.float32, device=device),
+            out_up=torch.empty(r, inter, dtype=torch.float32, device=device),
+            hq=torch.empty(r, inter, dtype=torch.int8, device=device),
+            hs=torch.empty(r, inter // 32, dtype=torch.float32, device=device),
+            down=torch.empty(r, hidden, dtype=torch.float32, device=device),
+            out=torch.empty(m, hidden, dtype=torch.float32, device=device),
+            library=NativeIQ2MMA16TCLibrary.load(),
+        )
+
+    def validate(self, m: int, top_k: int, hidden: int, inter: int, device: Any) -> None:
+        device = torch.device(device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        actual = (m, top_k, hidden, inter, device)
+        expected = (self.m, self.top_k, self.hidden, self.inter, self.device)
+        if actual != expected:
+            raise IQ2MMA16TCError(
+                f"dynamic MoE workspace {expected} cannot serve {actual}"
+            )
+
+
 def grouped_moe_prefill_k32_dynamic(
     flat,
     weights,
@@ -778,6 +846,7 @@ def grouped_moe_prefill_k32_dynamic(
     hidden: int,
     swiglu_limit: float,
     library: NativeIQ2MMA16TCLibrary | None = None,
+    workspace: DynamicMoEWorkspace | None = None,
 ):
     """Per-expert COMPACT K32 MoE (llama.cpp mm_ids_helper grouping).
 
@@ -791,84 +860,96 @@ def grouped_moe_prefill_k32_dynamic(
 
     if flat.device.type != "cuda":
         raise IQ2MMA16TCError("grouped_moe_prefill_k32_dynamic requires CUDA")
-    if library is None:
-        library = NativeIQ2MMA16TCLibrary.load()
+    if flat.dtype != torch.bfloat16:
+        raise IQ2MMA16TCError(
+            "grouped_moe_prefill_k32_dynamic requires bfloat16 activations"
+        )
     M, top_k = indices.shape
+    if top_k != 6:
+        raise IQ2MMA16TCError(
+            "grouped_moe_prefill_k32_dynamic is specialized for DSV4 top_k=6, "
+            f"got {top_k}"
+        )
     E = 256
     stream = torch.cuda.current_stream(flat.device).cuda_stream
-    indices32 = indices.reshape(-1).to(torch.int32)
     rweights = weights.reshape(-1)
     R = M * top_k
-
-    compact_route = torch.zeros(R, dtype=torch.int32, device=flat.device)
-    compact_iex = torch.zeros(R, dtype=torch.int32, device=flat.device)
-    expert_bounds = torch.empty(E + 1, dtype=torch.int32, device=flat.device)
+    if workspace is None:
+        workspace = DynamicMoEWorkspace.create(M, top_k, hidden, inter, flat.device)
+    else:
+        workspace.validate(M, top_k, hidden, inter, flat.device)
+    ws = workspace
+    if library is None:
+        library = ws.library
+    ws.indices32.copy_(indices.reshape(-1))
     library._library.moe_group_launch(
-        ctypes.c_void_p(indices32.data_ptr()),
-        ctypes.c_void_p(compact_route.data_ptr()),
-        ctypes.c_void_p(compact_iex.data_ptr()),
-        ctypes.c_void_p(expert_bounds.data_ptr()),
+        ctypes.c_void_p(ws.indices32.data_ptr()),
+        ctypes.c_void_p(ws.compact_route.data_ptr()),
+        ctypes.c_void_p(ws.route_to_compact.data_ptr()),
+        ctypes.c_void_p(ws.expert_bounds.data_ptr()),
         M, top_k, E, ctypes.c_void_p(stream),
     )
 
-    from .iq2_mma16 import _preq
-
-    xq_flat, xs_flat = _preq(flat)
-    compact_xq = torch.empty(R, hidden, dtype=torch.int8, device=flat.device)
-    compact_xs = torch.empty(R, hidden // 32, dtype=torch.float32, device=flat.device)
+    library._library.moe_preq_bf16_launch(
+        ctypes.c_void_p(flat.data_ptr()),
+        ctypes.c_void_p(ws.xq_flat.data_ptr()),
+        ctypes.c_void_p(ws.xs_flat.data_ptr()),
+        M * hidden, ctypes.c_void_p(stream),
+    )
     library._library.moe_gather_xq_launch(
-        ctypes.c_void_p(xq_flat.data_ptr()),
-        ctypes.c_void_p(xs_flat.data_ptr()),
-        ctypes.c_void_p(compact_route.data_ptr()),
-        ctypes.c_void_p(compact_xq.data_ptr()),
-        ctypes.c_void_p(compact_xs.data_ptr()),
+        ctypes.c_void_p(ws.xq_flat.data_ptr()),
+        ctypes.c_void_p(ws.xs_flat.data_ptr()),
+        ctypes.c_void_p(ws.compact_route.data_ptr()),
+        ctypes.c_void_p(ws.compact_xq.data_ptr()),
+        ctypes.c_void_p(ws.compact_xs.data_ptr()),
         R, hidden, ctypes.c_void_p(stream),
     )
 
-    eids = torch.arange(E, dtype=torch.int64, device=flat.device)
     stride_g = (hidden // 256) * 74
-    out_gate = torch.empty(R, inter, dtype=torch.float32, device=flat.device)
-    out_up = torch.empty(R, inter, dtype=torch.float32, device=flat.device)
     library._library.iq2_mma16_tc_dynamic_launch(
-        ctypes.c_void_p(compact_xq.data_ptr()),
-        ctypes.c_void_p(compact_xs.data_ptr()),
+        ctypes.c_void_p(ws.compact_xq.data_ptr()),
+        ctypes.c_void_p(ws.compact_xs.data_ptr()),
         ctypes.c_void_p(gate_packed.data_ptr()),
         ctypes.c_void_p(up_packed.data_ptr()),
-        ctypes.c_void_p(eids.data_ptr()),
+        ctypes.c_void_p(ws.eids.data_ptr()),
         ctypes.c_void_p(grid.data_ptr()),
         ctypes.c_void_p(ksigns.data_ptr()),
-        ctypes.c_void_p(expert_bounds.data_ptr()),
-        ctypes.c_void_p(out_gate.data_ptr()),
-        ctypes.c_void_p(out_up.data_ptr()),
+        ctypes.c_void_p(ws.expert_bounds.data_ptr()),
+        ctypes.c_void_p(ws.out_gate.data_ptr()),
+        ctypes.c_void_p(ws.out_up.data_ptr()),
         E, inter, hidden, stride_g, ctypes.c_void_p(stream),
     )
 
-    h = torch.nn.functional.silu(torch.clamp(out_gate, max=swiglu_limit)) * torch.clamp(
-        out_up, min=-swiglu_limit, max=swiglu_limit
+    library._library.moe_swiglu_preq_launch(
+        ctypes.c_void_p(ws.out_gate.data_ptr()),
+        ctypes.c_void_p(ws.out_up.data_ptr()),
+        ctypes.c_void_p(ws.hq.data_ptr()),
+        ctypes.c_void_p(ws.hs.data_ptr()),
+        R * inter, ctypes.c_float(swiglu_limit), ctypes.c_void_p(stream),
     )
-    hq, hs = _preq(h.reshape(-1, inter))
-    hq = hq.reshape(R, inter)
-    hs = hs.reshape(R, inter // 32)
     stride_d = (inter // 256) * 74
-    down = torch.empty(R, hidden, dtype=torch.float32, device=flat.device)
     library._single_library().iq2_mma16_tc_launch_single_dynamic(
-        ctypes.c_void_p(hq.data_ptr()),
-        ctypes.c_void_p(hs.data_ptr()),
+        ctypes.c_void_p(ws.hq.data_ptr()),
+        ctypes.c_void_p(ws.hs.data_ptr()),
         ctypes.c_void_p(down_packed.data_ptr()),
-        ctypes.c_void_p(eids.data_ptr()),
+        ctypes.c_void_p(ws.eids.data_ptr()),
         ctypes.c_void_p(grid.data_ptr()),
         ctypes.c_void_p(ksigns.data_ptr()),
-        ctypes.c_void_p(expert_bounds.data_ptr()),
-        ctypes.c_void_p(down.data_ptr()),
+        ctypes.c_void_p(ws.expert_bounds.data_ptr()),
+        ctypes.c_void_p(ws.down.data_ptr()),
         E, hidden, inter, stride_d, ctypes.c_void_p(stream),
     )
 
-    # combine: scatter compact down back to route order, then sum in the eager
-    # stable expert-id order (fp32 sum order is not commutative).
-    contrib = torch.zeros(R, hidden, dtype=torch.float32, device=flat.device)
-    route_pos = compact_route.long() * top_k + compact_iex.long()
-    contrib[route_pos] = down * rweights[route_pos].unsqueeze(-1)
-    c = contrib.reshape(M, top_k, hidden)
-    final_order = torch.argsort(indices, dim=1, stable=True)
-    c = c.gather(1, final_order.unsqueeze(-1).expand_as(c))
-    return c.sum(dim=1)
+    # Fuse inverse-route lookup, route-weight multiply, stable expert-id order,
+    # and top-k reduction.  This removes the route-sized scatter/argsort/gather
+    # chain while preserving the eager fp32 reduction order.
+    library._library.moe_combine_launch(
+        ctypes.c_void_p(ws.down.data_ptr()),
+        ctypes.c_void_p(rweights.data_ptr()),
+        ctypes.c_void_p(ws.indices32.data_ptr()),
+        ctypes.c_void_p(ws.compact_route.data_ptr()),
+        ctypes.c_void_p(ws.route_to_compact.data_ptr()),
+        ctypes.c_void_p(ws.out.data_ptr()),
+        M, top_k, hidden, ctypes.c_void_p(stream),
+    )
+    return ws.out

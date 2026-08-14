@@ -1,87 +1,227 @@
-# DSV4 动态 MoE NaN Bug（2026-08-14）
+# DSV4 动态 MoE routes>64 修复（2026-08-14）
 
-## 问题描述
+## 状态与结论
 
-`iq2_mma16_tc_dynamic_launch` kernel 在处理 routes 数 > 64 的 expert 时产生 NaN。
+**已修复。** `iq2_mma16_tc_dynamic_launch` 和 down 侧
+`iq2_mma16_tc_launch_single_dynamic` 现在由每个 expert 的 CTA 在设备端按 64 routes
+循环，最后一个 tile 继续使用原来的 route mask。真实权重和合成回归均确认：超过
+64 的 tail 不再保留未初始化值，动态路径与旧的分批参考逐元素相等。
 
-## 复现
+最初记录的“第一个 64-route tile 已经产生 NaN”不是 kernel 算术故障，而是诊断调用
+违反了 launcher 的索引契约：诊断构造了全局 `expert_bounds[245:247]` 和
+`eids=[245]`，却以 `E=1` 启动。kernel 的 `e=blockIdx.x` 同时索引 `eids[e]` 和
+`expert_bounds[e:e+2]`，因此该调用读取的是 `expert_bounds[0:2] == 0`，没有处理任何
+route；随后读取 `torch.empty` 输出，把未初始化显存误判成了 kernel 写出的 NaN。
 
-```python
-# expert 245 有 81 routes（lo=2063, hi=2144）
-# 第一个 tile（routes 0-63）就产生 NaN
-tile_eb[245] = 2063  # 正确
-tile_eb[246] = 2127  # 正确
-# 但 out_gate[2063:2144] 全是 NaN
-```
+## 实际缺陷
 
-## 已排查
+旧动态 kernel 固定 `M_PAD_C=64`，只从 `expert_bounds[e]` 处理一个 tile。Python
+wrapper 每次只 launch 一次，也没有传入 tile offset。因此 routes>64 时：
 
-| 检查项 | 结果 |
-|--------|------|
-| compact_xq 输入 | 无 NaN，norm=7882 |
-| compact_xs 输入 | 无 NaN，norm=0.11 |
-| gate_packed | 无 NaN，norm=3491431 |
-| tile_eb | 正确（tile_eb[245]=2063, tile_eb[246]=2127）|
-| 第一个 tile 输出 | NaN |
+- 前 64 行计算正确；
+- 第 65 行起从未写入；
+- 后续 SwiGLU/down/scatter 消费 `torch.empty` 中的未初始化值，可能表现为 NaN。
 
-## 根因分析
+这也解释了为何问题严格跨过 64-route 边界才出现。`compact_xq`、`compact_xs`、
+packed weights 和全局 `expert_bounds` 本身没有问题。
 
-`iq2_mma16_tc_dynamic_launch` kernel 使用 `M_PAD_C=64`，只能处理 64 routes。
-对于 routes > 64 的 expert，需要分多次调用（每次 64 routes）。
+## 修复结构
 
-但即使第一个 tile（routes 0-63）也产生 NaN，说明问题不在分 tile，
-而在 kernel 本身对 `expert_bounds` 的处理。
+gate/up 与 down kernel 均使用相同结构：
 
-## 关键发现
-
-`tile_eb` 的结构：
-- `tile_eb[0..244] = 0`（其他 expert 无 routes）
-- `tile_eb[245] = 2063`（expert 245 的起始 offset）
-- `tile_eb[246] = 2127`（expert 245 的结束 offset）
-- `tile_eb[247..256] = 2127`（后续 expert 无 routes）
-
-kernel 用 `expert_bounds[e]` 计算 `xbase`：
 ```cuda
-const int64_t xbase = (int64_t)expert_bounds[e] * COLS;
+const int route_begin = expert_bounds[e];
+const int route_hi = expert_bounds[e + 1];
+
+for (int route_lo = route_begin; route_lo < route_hi; route_lo += 64) {
+    // 只保留 64-route 的 accumulator；每个 tile 独立跑完整 K loop。
+    // 最后一个 tile 由 route_lo + row < route_hi 掩码。
+}
 ```
 
-对于 expert 245，`xbase = 2063 * COLS`。但 `compact_xq` 的总大小是 `R * COLS = 2184 * COLS`。
-所以 `xbase = 2063 * COLS` 是有效的（< 2184 * COLS）。
+选择 device-side loop，而不是 Python 分段 launch，是为了保留一次 launch、避免读取
+route 计数造成主机同步，同时把累加器限制在已验证的 M=64 资源规模。gate/up 动态
+kernel 的资源与固定 M=64 路径相同：96 registers、128-byte stack、0 local memory；
+down 动态 kernel 为 64 registers、80-byte stack、0 local memory。
 
-但 kernel 的 grid 是 `(E, ROWS/32) = (256, inter/32)`，每个 CTA 处理一个 expert。
-对于 expert 245，kernel 读取 `compact_xq[2063:2127]`（64 routes）。
+Python wrapper 还显式拒绝非 BF16 activation。`_preq(flat)` 的 scale dtype 跟随
+`flat`，而 gather CUDA ABI 按 BF16 读取原 scale、再写入 FP32 compact scale；显式检查
+避免未来传入 FP32 时发生静默 reinterpret。
 
-但问题是：kernel 的 `route_hi = expert_bounds[e+1] = 2127`，
-而 `v0 = (expert_bounds[e] + mt * 16 + lg) < route_hi`。
+## 正确性证据
 
-对于 mt=0, lg=0..7：`v0 = (2063 + 0 + lg) < 2127 = true`。
-对于 mt=1, lg=0..7：`v0 = (2063 + 16 + lg) < 2127 = true`。
-...
-对于 mt=3, lg=0..7：`v0 = (2063 + 48 + lg) < 2127 = true`（lg=0..7 → 2111..2118 < 2127）。
+### 合成回归
 
-所以所有 64 routes 都是有效的。但输出是 NaN。
+`tests/test_iq2_mma16_tc_kernel.py::test_dynamic_moe_tiles_expert_routes_over_64`
+构造 256 experts：expert 0 先占 8 条 compact routes，expert 245 再占 81 条，覆盖
+“非零 compact offset + 超过 64”的组合。完整 gate/up → SwiGLU → down → combine
+动态路径与 `grouped_moe_prefill_k32(bucket=64)` 分批参考逐元素相等且全有限。
 
-## 可能的根因
+```text
+6 passed in 2.60s
+```
 
-1. **kernel 的 `xbase` 计算错误**：`xbase = expert_bounds[e] * COLS` 可能溢出或计算错误。
-2. **kernel 的 `route_hi` 计算错误**：`route_hi = expert_bounds[e+1]` 可能读取错误的值。
-3. **kernel 的 `v0` 掩码计算错误**：`v0 = (expert_bounds[e] + mt * 16 + lg) < route_hi` 可能计算错误。
-4. **kernel 的 `facc` 累加错误**：`facc[mt][0] += (float)cg[0] * sB_g[0] * xs0` 可能溢出。
+### 真实 DSV4 权重
 
-## 下一步
+在常驻 `bf` engine 中使用第 0 层真实 GGUF packed weights，expert 245 接收 81
+routes，并保留生产复现中的非零 compact offset。前 64 行和 tail 分别对拍：
 
-1. 在 kernel 中添加 debug 输出，打印 `xbase`, `route_hi`, `v0` 的值。
-2. 检查 `xbase` 是否溢出（`2063 * 4096 = 8450048`，int64 不会溢出）。
-3. 检查 `route_hi` 是否正确（应该是 2127）。
-4. 检查 `v0` 是否正确（应该是 true）。
-5. 检查 `facc` 是否溢出（`cg[0] * sB_g[0] * xs0` 可能溢出）。
+```text
+ref_finite=true
+dyn_finite_first64=true
+dyn_finite_tail=true
+first64_maxdiff=0.0
+tail_maxdiff=0.0
+all_equal=true
+```
 
-## 临时解决方案
+### 端到端同 prompt A/B
 
-回退到 eager MoE（`grouped_moe_prefill_k32`），性能 161 tok/s。
+同一常驻模型、同一 prompt、greedy 单 token，原位 monkey-patch eager/dynamic MoE；
+两条路径输出 token 相同。以下是 warm-engine 比较，能说明实现差异，但不是 cold-prefill
+正式基线：
 
-## 长期方案
+| prompt | eager | dynamic | 加速 |
+|---:|---:|---:|---:|
+| 512 tokens | 146.4 tok/s | 233.5 tok/s | 1.595x |
+| 1024 tokens | 157.7 tok/s | 249.5 tok/s | 1.582x |
 
-1. 修复 `iq2_mma16_tc_dynamic_launch` kernel 的 NaN bug。
-2. 实现 tile-loop 结构，处理 routes > 64 的 expert。
-3. 预期性能：MoE 2.19s → ~1.0s，整体 161 → ~400 tok/s。
+## 性能跟进：从 249.5 到 509.2 tok/s
+
+后续优化没有把单个 microbenchmark 直接外推到 E2E，而是在同一 warm engine 中交错
+A/B，并以冷重启后的 production profile 收口。固定配置为同一 GGUF、SM120、
+`M=1024`、prefill tile 64、无 CUDA Graph、无 canary；prompt 是固定自然文本，交替修改
+首 token 避免误用 prefix cache。
+
+### 已保留的优化
+
+1. **一次物化 GPU positions。** 原路径在 43 层 × 15 个 mid tiles 中重复
+   `torch.tensor([abs_pos], device="cuda")`，profile 显示 647 次
+   `cudaStreamSynchronize`。传入已知 host position 并一次创建 positions vector 后，
+   sync 647→2（最终 profile 为 1）、`_local_scalar_dense` 931→0；同进程 A/B
+   238.7→309.4 tok/s（+29.6%）。
+2. **Q8_0 直接读常驻 SoA。** 旧 M>1 路径每次 projection 都把 `qcode/qscale`
+   拼回 34-byte interleaved layout。1024-token profile 中，仅三组 code-plane copy
+   就是 139.8 ms，scale copy 另 28.5 ms。新 dense/grouped Triton GEMM 直接读 SoA；
+   `aten::copy_` GPU 时间 265.7→69.0 ms，整模型 logits 逐 bit 相等。同进程 10 对
+   A/B：300.3→342.4 tok/s，平均省 0.420 s，8/10 对为正。
+3. **tile 级 indexer compressor。** 旧 ratio-4 indexer 每 token 发 postgemv + migrate
+   两个 kernel，整次 profile 各 20,160 launches。新路径用一个顺序 state/finalize
+   kernel 加一个并行 Hadamard/FP4 kernel 处理整 tile：两者各 315 launches，GPU 时间
+   从 82.2 ms 降到 24.3 ms。总 launch 由 `80,354 + 48,331` 降到
+   `59,879 + 8,641`（-46.8%）；独立状态机和完整 1024-token logits 均逐 bit 相等。
+   15 轮均值 354.6→468.4 tok/s（+32.1%）。
+4. **cooperative route gather。** 4 threads/route + 16-byte vector copy 将 gather GPU
+   时间 87.1→0.584 ms。它在旧的 CPU-submit-bound 路径中被提交空洞掩盖，首次 12 对
+   A/B 甚至表现为 E2E 负收益；indexer 将 launch 数减半后重新测试，12 对中 10 对
+   为正，483.5→502.3 tok/s，平均省 79.3 ms，因此才切为默认。serial symbol 保留供
+   诊断回退。
+5. **共享 dynamic MoE workspace/native handle。** 43 层复用同一套 route/output
+   buffers；native library 也随 workspace 缓存，避免每层重复 manifest/hash/CDLL
+   设置（实测 43 次 load 约 28.0 ms）。
+
+### 冷启动最终结果与 llama.cpp 对照
+
+从磁盘冷重启 daemon（不依赖热重绑定/monkeypatch），一次 JIT warmup 后运行 20 次：
+
+| 指标 | 本 runtime | llama.cpp `llama-bench` |
+|---|---:|---:|
+| mean | **509.2 tok/s** | **567.8 tok/s** |
+| median | **541.3 tok/s** | 567.8 tok/s（3-run mean） |
+| 2-side trimmed mean | **519.0 tok/s** | — |
+| min / max | 392.3 / 563.9 tok/s | 558.8 / 576.7 tok/s |
+
+本 runtime 的 mean 仍落后 10.3%，trimmed mean 落后 8.6%；最好一轮已接近，但尾部
+抖动显著，不能宣称追平。20/20 首 token 相同，所有 logits finite。最终冷启动
+profile 确认 production 路径实际使用：
+
+```text
+iq2 gate/up dynamic       362.383 ms / 43
+iq2 down dynamic          222.630 ms / 43
+main compressor seq       279.546 ms / 615
+Q8 SoA dense+grouped      328.869 ms / 4113
+indexer seq state+quant    24.285 ms / 630
+cooperative gather          0.584 ms / 43
+cudaStreamSynchronize            1
+_local_scalar_dense              0
+```
+
+### 已证伪/暂不默认的路线
+
+- 根据真实 43 层 route histogram，`ceil(routes/16)` 的理论 padding 仅 22.7%，但把
+  `n_mtiles` 改成 runtime loop bound 会破坏编译器展开，gate microbenchmark
+  8.77→11.25 ms；固定四段加 runtime predicate 也无收益（8.354→8.371 ms）。tail
+  优化需要真正的 template bucket dispatch/worklist，不能只加分支。
+- cooperative gather 的第一次 E2E 负结果不是其 GPU profile 错误，而是 CPU 尚未提交
+  完后续工作，87 ms GPU 工作落在非临界路径。只有先消除 40k indexer launches 后，
+  它才成为可测的端到端收益。这是本轮最重要的“micro 快、E2E 不动”因果解释。
+
+## 被推翻的判断与剩余工作
+
+- **推翻：** “第一个 tile NaN，tile-loop 也无效。”第一 tile 诊断实际没有执行 kernel。
+- **确认：** routes>64 的真实 bug 是 tail 未写，device tile-loop 已关闭该缺陷。
+- **已更新：** 249.5 tok/s 是只完成 NaN/tile-loop 后的历史节点，不是当前结果；完成
+  position sync、SoA Q8、tile-indexer 和 cooperative gather 后，冷启动 20-run mean 为
+  509.2 tok/s。仍不得用最好一轮 563.9 宣称追平 llama.cpp。
+- 下一阶段的硬目标是收敛 392–564 tok/s 的尾部抖动，并继续减少剩余 68,520 次
+  launches；GPU 大头仍是 routed MoE（gate/up+down 585.0 ms）、main compressor
+  279.5 ms 和 Q8 SoA projection 328.9 ms。完整 layer/prefill CUDA Graph 或进一步融合
+  必须先证明状态/KV 写入和 graph memory 的正确性，不能只按 launch 数外推。
+
+## 第二阶段：并行 compressor 与整层 attention graph
+
+### cold-prefill compressor 并行化
+
+对固定 `prefix=0, M=1024, tile=64` 路径，首 tile 仍按已验证的顺序状态机执行，
+后续 compression boundary 在 GPU 上并行生成，并单独恢复与 64-token oracle 一致的
+`kv_state/score_state`。固定 prompt 的 16-token greedy 序列逐项相同。20 次 prefill-only
+实测如下：
+
+| 指标 | 串行 compressor 基线 | 并行 compressor |
+|---|---:|---:|
+| mean | 509.2 tok/s | **560.9 tok/s** |
+| median | 541.3 tok/s | **567.5 tok/s** |
+| trimmed mean | 519.0 tok/s | **565.1 tok/s** |
+| fastest | 563.9 tok/s | **603.9 tok/s** |
+
+profile 中 main compressor 从 `279.5 ms / 615` 降为 `1.36 ms / 41`，但 E2E 只提升约
+10%：被删掉的 compressor kernels 之前大量与 CPU submit 空洞及其他 GPU 工作重叠，
+不在完整关键路径上。这个差异正是不能用 micro/profile total 直接预测 E2E 的证据。
+
+### dynamic MoE route bucket 实验（已回退）
+
+设备端把 experts 分为 `<=16/<=32/<=48/>48` 四组、gate/down 各发四个模板 kernel。
+输出逐 token 相同，但 20 次 E2E 从并行-compressor 基线的 560.9/567.5 tok/s
+降为 532.7/538.9 tok/s（mean/median）。真实 profile 只省了 gate 约 10.5 ms，down 反而
+慢约 5.7 ms，每层多 6 次 launch 的代价最终导致约 5% E2E 回归。该改动已完全回退。
+
+### 整层 attention tile-loop CUDA Graph
+
+将每层 16 个 attention tiles（包括首 tile、并行 compressor 预计算和后续 15 tiles）
+捕获为一个 graph，43 层共享 graph pool。捕获严格限定在
+`num_slots=1, slot=0, prefix=0, M=1024, tile=64`，其他形状回退 eager tile-loop。
+
+- 43 层 capture 耗时 9.76 s；reserved 增量 1.10 GiB，allocated 增量 1.02 GiB。
+- 固定 prompt 的 16-token greedy 输出与基线逐项相同：
+  `[5148, 16, 223, 455, 2502, 344, 260, 73615, 45750, 22891, 12275, 418, 12529, 5148, 16, 455]`。
+- 20 次 graph-on prefill-only：mean 714.2、median 752.0、trimmed 730.2、fastest
+  785.0 tok/s。20/20 首 token 为 5148。
+- 同一进程内交替 graph off/on 的 12 对对照：off median 534.7 tok/s，on median
+  **759.9 tok/s**，完整 E2E 提升 **42.1%**。因 graph pool 常驻且 prompt/输出相同，
+  这个 A/B 排除了冷启、内存配置和测试口径差异。
+
+graph-on 的真实 profile 仍显示主要 GPU 时间在 MoE/Q8，而不是 attention：
+
+```text
+iq2 gate/up dynamic       372.6 ms / 43
+Q8 SoA dense              287.1 ms / 3425
+iq2 down dynamic          232.2 ms / 43
+Q8 SoA grouped             55.1 ms / 688
+HC + dense CUTLASS       ~109.8 ms
+attention kernels         ~61.0 ms
+```
+
+因此当前可对外声称的是“从稳定约 565 提到配对中位约 760 tok/s”，不是
+1000 tok/s。下一步必须优先批量化 attention 中 tile-invariant 的 Q/KV 与输出投影
+（当前 3425+688 次 Q8 kernel），并继续攻 routed MoE 的 604.8 ms；attention 本体即使
+完全消失也不足以达到 1000 tok/s。

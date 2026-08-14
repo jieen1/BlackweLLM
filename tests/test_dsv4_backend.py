@@ -11,6 +11,9 @@ chunked no-op surfaces, and the engine call sequence.
 
 from __future__ import annotations
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -704,3 +707,247 @@ def test_prefill_graph_dispatch_handles_m1_decode_fallback() -> None:
         assert eager_calls == [1]
     finally:
         block.moe.forward = orig_forward  # type: ignore[method-assign]
+
+
+class _FakeSuperchunkLayer:
+    def __init__(self) -> None:
+        self.ratio = 4
+        self.eager_calls: list[tuple[int, int, int]] = []
+        self.prefill_calls: list[tuple[int | None, int | None, bool, int]] = []
+        self.precompute_calls: list[tuple[int, int]] = []
+        self.reset_calls = 0
+
+    def __call__(self, x: torch.Tensor, start_pos: int, slot: int = 0) -> torch.Tensor:
+        self.eager_calls.append((start_pos, x.shape[1], slot))
+        return x
+
+    def precompute_cold_prefill_compressors(
+        self,
+        x: torch.Tensor,
+        *,
+        completed_rows: int,
+        slot: int = 0,
+    ) -> None:
+        self.precompute_calls.append((completed_rows, slot))
+
+    def forward_graph_prefill(
+        self,
+        x: torch.Tensor,
+        pos_t: torch.Tensor,
+        *,
+        slot: int = 0,
+        graph_max_index_entries: int | None = None,
+        host_start_pos: int | None = None,
+        compressors_precomputed: bool = False,
+    ) -> torch.Tensor:
+        self.prefill_calls.append(
+            (int(pos_t.reshape(-1)[0]), host_start_pos, compressors_precomputed, slot)
+        )
+        return x
+
+    def reset_caches(self, slot: int = 0) -> None:
+        self.reset_calls += 1
+
+
+class _FakeSuperchunkMoE:
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[int, ...], tuple[int, ...], object]] = []
+
+    def forward_dynamic(
+        self,
+        x: torch.Tensor,
+        ids: torch.Tensor,
+        *,
+        workspace: object | None = None,
+    ) -> torch.Tensor:
+        self.calls.append((tuple(x.shape), tuple(ids.shape), workspace))
+        return x
+
+
+class _FakeSuperchunkBlock:
+    def __init__(self, hidden: int) -> None:
+        self.eps = 1e-6
+        self.hc_attn_fn = None
+        self.hc_attn_scale = 1.0
+        self.hc_attn_base = 0.0
+        self.hc_ffn_fn = None
+        self.hc_ffn_scale = 1.0
+        self.hc_ffn_base = 0.0
+        self.attn_norm_weight = torch.ones(hidden)
+        self.ffn_norm_weight = torch.ones(hidden)
+        self.moe = _FakeSuperchunkMoE()
+
+    def hc_pre(
+        self,
+        h: torch.Tensor,
+        _fn: object,
+        _scale: float,
+        _base: float,
+    ) -> tuple[torch.Tensor, None, None]:
+        return h.flatten(2) if h.ndim == 4 else h, None, None
+
+    def hc_post(
+        self,
+        x: torch.Tensor,
+        _residual: torch.Tensor,
+        _post: None,
+        _comb: None,
+    ) -> torch.Tensor:
+        return x
+
+
+class _FakeSuperchunkModel:
+    def __init__(self, hidden: int = 8) -> None:
+        self.hc_mult = 1
+        self.norm_weight = torch.ones(hidden)
+        self.eps = 1e-6
+        self.config = SimpleNamespace(
+            hidden_size=hidden,
+            n_activated_experts=2,
+            moe_intermediate_size=16,
+        )
+        self.blocks = [_FakeSuperchunkBlock(hidden)]
+
+    def embed(self, ids: torch.Tensor) -> torch.Tensor:
+        return torch.zeros(1, ids.shape[1], self.config.hidden_size, dtype=torch.bfloat16)
+
+    def hc_head(self, h: torch.Tensor) -> torch.Tensor:
+        return h.flatten(2)
+
+    def lm_head(self, h: torch.Tensor) -> torch.Tensor:
+        return h.float()
+
+
+class _FakeDynamicWorkspace:
+    @staticmethod
+    def create(*_args: object, **_kwargs: object) -> object:
+        return object()
+
+
+class _FakeSuperchunkGraph:
+    def __init__(self, *, rows: int = 1024, tile: int = 64, prefix_len: int = 0) -> None:
+        self.m = rows
+        self.tile = tile
+        self.prefix_len = prefix_len
+        self.calls: list[tuple[int, tuple[int, ...]]] = []
+
+    def matches(self, *, slot: int, prefix_len: int, tile: int, rows: int) -> bool:
+        return slot == 0 and prefix_len == self.prefix_len and tile == self.tile and rows == self.m
+
+    def replay_layer(self, layer_id: int, x: torch.Tensor) -> torch.Tensor:
+        self.calls.append((layer_id, tuple(x.shape)))
+        return x + 1
+
+
+def _make_fake_superchunk_backend() -> tuple[DeepseekV4Backend, _FakeSuperchunkLayer]:
+    backend = DeepseekV4Backend.__new__(DeepseekV4Backend)
+    backend.model = _FakeSuperchunkModel()
+    backend.config = backend.model.config
+    backend.num_slots = 1
+    backend.max_seq_len = 2048
+    backend.max_q_rows = 64
+    backend.device = "cpu"
+    backend._forward_fn = None
+    layer = _FakeSuperchunkLayer()
+    backend.slot_layers = [layer]
+    backend._kv_len = [0]
+    backend._committed = [[]]
+    backend._cg_status = {}
+    backend._prefill_graph = None
+    backend._superchunk_prefill_graph = None
+    return backend, layer
+
+
+def test_superchunk_prefill_graph_replays_only_on_exact_shape_and_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend, layer = _make_fake_superchunk_backend()
+    graph = _FakeSuperchunkGraph()
+    backend._superchunk_prefill_graph = graph
+    monkeypatch.setitem(
+        sys.modules,
+        "runtime.kernels.iq2_mma16_tc",
+        SimpleNamespace(DynamicMoEWorkspace=_FakeDynamicWorkspace),
+    )
+
+    logits = backend._prefill_superchunk_logits(0, list(range(1024)), tile=64, prefix_len=0)
+
+    assert tuple(logits.shape) == (1, 1024, backend.model.config.hidden_size)
+    assert graph.calls == [(0, (1, 1024, backend.model.config.hidden_size))]
+    assert layer.eager_calls == []
+    assert layer.prefill_calls == []
+    assert layer.precompute_calls == []
+    assert len(backend.model.blocks[0].moe.calls) == 1
+
+
+def test_superchunk_prefill_graph_mismatch_falls_back_to_tile_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend, layer = _make_fake_superchunk_backend()
+    backend._superchunk_prefill_graph = _FakeSuperchunkGraph(rows=1024, tile=64, prefix_len=0)
+    monkeypatch.setitem(
+        sys.modules,
+        "runtime.kernels.iq2_mma16_tc",
+        SimpleNamespace(DynamicMoEWorkspace=_FakeDynamicWorkspace),
+    )
+
+    logits = backend._prefill_superchunk_logits(0, list(range(960)), tile=64, prefix_len=0)
+
+    assert tuple(logits.shape) == (1, 960, backend.model.config.hidden_size)
+    assert layer.eager_calls == [(0, 64, 0)]
+    assert [call[:3] for call in layer.prefill_calls] == [
+        (64, 64, False),
+        (128, 128, False),
+        (192, 192, False),
+        (256, 256, False),
+        (320, 320, False),
+        (384, 384, False),
+        (448, 448, False),
+        (512, 512, False),
+        (576, 576, False),
+        (640, 640, False),
+        (704, 704, False),
+        (768, 768, False),
+        (832, 832, False),
+        (896, 896, False),
+    ]
+    assert layer.precompute_calls == []
+
+
+def test_capture_prefill_cuda_graph_uses_superchunk_driver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = DeepseekV4Backend.__new__(DeepseekV4Backend)
+    backend._superchunk_prefill_graph = None
+    legacy_graph = object()
+    backend._prefill_graph = legacy_graph
+    backend._forward_fn = None
+    backend.slot_layers = [object()]
+    backend.device = "cuda"
+    backend.num_slots = 1
+    backend.max_q_rows = 64
+    backend._kv_len = [0]
+    backend._committed = [[]]
+    backend._cg_status = {}
+
+    captures: list[DeepseekV4Backend] = []
+
+    class FakeDriver:
+        def __init__(self, arg_backend: DeepseekV4Backend) -> None:
+            captures.append(arg_backend)
+
+        def capture(self) -> None:
+            captures.append(backend)
+
+    monkeypatch.setattr("runtime.backends.dsv4.Dsv4SuperchunkPrefillGraphDriver", FakeDriver)
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda _device: (int(4 * 2**30), int(8 * 2**30)),
+    )
+
+    assert backend.capture_prefill_cuda_graph() is True
+    assert captures == [backend, backend]
+    assert isinstance(backend._superchunk_prefill_graph, FakeDriver)
+    assert backend._prefill_graph is legacy_graph
+    assert backend._cg_status["prefill"] == "captured"

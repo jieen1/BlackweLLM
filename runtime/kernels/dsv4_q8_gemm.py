@@ -282,6 +282,98 @@ def q8_0_dequant_gemm(
 
 
 @triton.jit
+def _q8_0_soa_dequant_gemm_tc_kernel(
+    x_ptr,
+    q_ptr,
+    d_ptr,
+    out_ptr,
+    M,
+    K: tl.constexpr,
+    OUT: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLK_ELEMS: tl.constexpr,
+):
+    """Packed-kernel math over the resident aligned Q8_0 SoA planes."""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < M
+    n_mask = offs_n < OUT
+    n_blocks = K // BLK_ELEMS
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLK_ELEMS):
+        kb = k // BLK_ELEMS
+        elems = tl.arange(0, BLK_ELEMS)
+        a_u16 = (x_ptr + offs_m[:, None] * K + k + elems[None, :]).to(
+            tl.pointer_type(tl.uint16)
+        )
+        a_tile = (tl.load(a_u16, mask=m_mask[:, None], other=0).to(tl.uint32) << 16).to(
+            tl.float32, bitcast=True
+        )
+        qs = tl.load(
+            q_ptr + offs_n[:, None] * K + k + elems[None, :],
+            mask=n_mask[:, None],
+            other=0,
+        ).to(tl.int8, bitcast=True).to(tl.float32)
+        scale = tl.load(
+            d_ptr + offs_n * n_blocks + kb,
+            mask=n_mask,
+            other=0,
+        ).to(tl.float16).to(tl.float32)
+        weight = (qs * scale[:, None]).to(tl.bfloat16)
+        acc = tl.dot(a_tile.to(tl.bfloat16), tl.trans(weight), acc)
+
+    tl.store(
+        out_ptr + offs_m[:, None] * OUT + offs_n[None, :],
+        acc,
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+def q8_0_soa_dequant_gemm(
+    x: torch.Tensor,
+    q: torch.Tensor,
+    d: torch.Tensor,
+    *,
+    out_features: int,
+    in_features: int,
+    BLOCK_M: int | None = None,
+    BLOCK_N: int | None = None,
+) -> torch.Tensor:
+    """Q8_0 tensor-core GEMM directly from resident code/scale planes."""
+    M = x.shape[0]
+    if BLOCK_M is None:
+        BLOCK_M = _select_q8_0_block_m(M, in_features, out_features)
+    if BLOCK_N is None:
+        BLOCK_N = _select_q8_0_block_n(M, in_features, out_features)
+    x = x.to(torch.bfloat16).contiguous()
+    if q.numel() != out_features * in_features:
+        raise ValueError(f"q has {q.numel()} elements, expected {out_features * in_features}")
+    if d.numel() != out_features * (in_features // 32):
+        raise ValueError(
+            f"d has {d.numel()} elements, expected {out_features * (in_features // 32)}"
+        )
+    out = torch.empty((M, out_features), dtype=torch.float32, device=x.device)
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(out_features, BLOCK_N))
+    _q8_0_soa_dequant_gemm_tc_kernel[grid](
+        x,
+        q,
+        d,
+        out,
+        M,
+        K=in_features,
+        OUT=out_features,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLK_ELEMS=32,
+    )
+    return out
+
+
+@triton.jit
 def _q8_0_grouped_dequant_gemm_tc_kernel(
     x_ptr,  # [G * ROWS_PER_G, K] bf16 activations, group-contiguous
     w_ptr,  # [G * R, in] Q8_0 packed, w_row_stride bytes/row
@@ -420,6 +512,109 @@ def q8_0_grouped_dequant_gemm(
         BLOCK_N=BLOCK_N,
         BLK_ELEMS=32,
         BLK_BYTES=34,
+    )
+    return out
+
+
+@triton.jit
+def _q8_0_soa_grouped_dequant_gemm_tc_kernel(
+    x_ptr,
+    q_ptr,
+    d_ptr,
+    out_ptr,
+    GROUP_SIZE: tl.constexpr,
+    ROWS_PER_G: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLK_ELEMS: tl.constexpr,
+):
+    pid_g = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_n = tl.program_id(2)
+    local_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_m = pid_g * ROWS_PER_G + local_m
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = local_m < ROWS_PER_G
+    n_mask = offs_n < GROUP_SIZE
+    w_rows = pid_g * GROUP_SIZE + offs_n
+    n_blocks = K // BLK_ELEMS
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLK_ELEMS):
+        kb = k // BLK_ELEMS
+        elems = tl.arange(0, BLK_ELEMS)
+        a_u16 = (x_ptr + offs_m[:, None] * K + k + elems[None, :]).to(
+            tl.pointer_type(tl.uint16)
+        )
+        a_tile = (tl.load(a_u16, mask=m_mask[:, None], other=0).to(tl.uint32) << 16).to(
+            tl.float32, bitcast=True
+        )
+        qs = tl.load(
+            q_ptr + w_rows[:, None] * K + k + elems[None, :],
+            mask=n_mask[:, None],
+            other=0,
+        ).to(tl.int8, bitcast=True).to(tl.float32)
+        scale = tl.load(
+            d_ptr + w_rows * n_blocks + kb,
+            mask=n_mask,
+            other=0,
+        ).to(tl.float16).to(tl.float32)
+        weight = (qs * scale[:, None]).to(tl.bfloat16)
+        acc = tl.dot(a_tile.to(tl.bfloat16), tl.trans(weight), acc)
+
+    tl.store(
+        out_ptr + offs_m[:, None] * GROUP_SIZE + offs_n[None, :],
+        acc,
+        mask=m_mask[:, None] & n_mask[None, :],
+    )
+
+
+def q8_0_soa_grouped_dequant_gemm(
+    x: torch.Tensor,
+    q: torch.Tensor,
+    d: torch.Tensor,
+    *,
+    num_groups: int,
+    group_size: int,
+    in_features: int,
+    rows_per_group: int = 1,
+    BLOCK_M: int | None = None,
+    BLOCK_N: int | None = None,
+) -> torch.Tensor:
+    """Grouped MLA output GEMM directly from resident Q8_0 SoA planes."""
+    M = x.shape[0]
+    if M != num_groups * rows_per_group:
+        raise ValueError(f"x has {M} rows, expected {num_groups * rows_per_group}")
+    if BLOCK_M is None:
+        BLOCK_M = _select_q8_0_grouped_block_m(rows_per_group)
+    if BLOCK_N is None:
+        BLOCK_N = _select_q8_0_grouped_block_n(rows_per_group)
+    x = x.to(torch.bfloat16).contiguous()
+    weight_rows = num_groups * group_size
+    if q.numel() != weight_rows * in_features:
+        raise ValueError(f"q has {q.numel()} elements, expected {weight_rows * in_features}")
+    if d.numel() != weight_rows * (in_features // 32):
+        raise ValueError(
+            f"d has {d.numel()} elements, expected {weight_rows * (in_features // 32)}"
+        )
+    out = torch.empty((M, group_size), dtype=torch.float32, device=x.device)
+    grid = (
+        num_groups,
+        triton.cdiv(rows_per_group, BLOCK_M),
+        triton.cdiv(group_size, BLOCK_N),
+    )
+    _q8_0_soa_grouped_dequant_gemm_tc_kernel[grid](
+        x,
+        q,
+        d,
+        out,
+        GROUP_SIZE=group_size,
+        ROWS_PER_G=rows_per_group,
+        K=in_features,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLK_ELEMS=32,
     )
     return out
 

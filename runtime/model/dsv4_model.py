@@ -47,9 +47,8 @@ class PackedQ8_0Weight(nn.Module):
         self.fused_q8 = False
         # SoA planes are the resident storage: code [out, in] int8 + scale
         # [out, in/32] fp16 (total bytes == the interleaved 34B layout, so
-        # no extra residency).  The interleaved `packed` view is rebuilt
-        # lazily only for the M>1 tensor-core path / eager oracle that read
-        # the old layout.
+        # no extra residency).  The interleaved `packed` compatibility view
+        # is rebuilt lazily only for eager oracles and legacy callers.
         nb = in_features // 32
         self.register_buffer(
             "qcode", torch.empty(out_features * in_features, dtype=torch.uint8, device=device)
@@ -65,10 +64,9 @@ class PackedQ8_0Weight(nn.Module):
     def packed(self) -> torch.Tensor:
         """Rebuild the interleaved 34B layout from the SoA planes.
 
-        Compatibility view for the M>1 tensor-core kernel / eager oracle /
-        tests that read the original GGUF block layout.  Allocates a
-        [out*in/32*34] buffer each call -- used only on the M>1 (prefill)
-        path, never the M=1 warp-row decode hot path.
+        Compatibility view for eager oracles and tests that read the original
+        GGUF block layout. Allocates a [out*in/32*34] buffer each call; serving
+        GEMM/GEMV paths consume the resident SoA planes directly.
         """
         nb = self.in_features // 32
         q = self.qcode.view(self.out_features, nb, 32)
@@ -164,8 +162,8 @@ class PackedQ8_0Linear(PackedQ8_0Weight):
             return out.reshape(*leading, self.out_features)
         if self.fused_q8 and x.device.type == "cuda":
             from runtime.kernels.dsv4_q8_gemm import (
-                q8_0_dequant_gemm,
                 q8_0_dequant_gemv_warp_row_bf16,
+                q8_0_soa_dequant_gemm,
             )
 
             leading = x.shape[:-1]
@@ -184,9 +182,11 @@ class PackedQ8_0Linear(PackedQ8_0Weight):
                     in_features=self.in_features,
                 )
             else:
-                out = q8_0_dequant_gemm(
+                q, d = self.soa_planes()
+                out = q8_0_soa_dequant_gemm(
                     x2,
-                    self.packed,
+                    q,
+                    d,
                     out_features=self.out_features,
                     in_features=self.in_features,
                 )
@@ -604,7 +604,13 @@ class Dsv4MoE(nn.Module):
         y = y + self._shared_forward(flat)
         return y.to(x.dtype).reshape(*x.shape[:-1], y.shape[-1])
 
-    def forward_dynamic(self, x: torch.Tensor, input_ids: torch.Tensor | None) -> torch.Tensor:
+    def forward_dynamic(
+        self,
+        x: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        *,
+        workspace=None,
+    ) -> torch.Tensor:
         """Prefill MoE using per-expert compact dynamic GEMMs (llama.cpp style)."""
         flat = x.reshape(-1, x.shape[-1])
         weights, indices = self.gate(flat, input_ids.reshape(-1) if input_ids is not None else None)
@@ -624,6 +630,7 @@ class Dsv4MoE(nn.Module):
             inter=self.gate_exps.rows,
             hidden=self.gate_exps.cols,
             swiglu_limit=limit,
+            workspace=workspace,
         )
         y = y + self._shared_forward(flat)
         return y.to(x.dtype).reshape(*x.shape[:-1], y.shape[-1])
@@ -822,9 +829,16 @@ class Dsv4Compressor(nn.Module):
         assert self.kv_cache is not None and self.freqs_cis is not None
         ratio, overlap = self.ratio, self.overlap
         dtype = x.dtype
-        xf = x.float()
-        kv = self.wkv(xf)
-        score = self.wgate(xf)
+        # Keep the Q8 projection's M=64 execution shape: changing it to one
+        # M=1024 GEMM changes Tensor-Core rounding before the overlap softmax.
+        full_dim = self.coeff * self.head_dim
+        kv = torch.empty((1, x.shape[1], full_dim), dtype=torch.float32, device=x.device)
+        score = torch.empty_like(kv)
+        for start in range(0, x.shape[1], 64):
+            end = start + 64
+            xf = x[:, start:end].float()
+            kv[:, start:end].copy_(self.wkv(xf))
+            score[:, start:end].copy_(self.wgate(xf))
         bsz, seqlen, _ = x.shape
         assert seqlen == 1, "forward_graph is the 1-token decode step"
         kv_state_slot = self._slot_view(self.kv_state, slot)
@@ -1163,17 +1177,22 @@ class Dsv4Compressor(nn.Module):
         return torch.cat(emitted, dim=1)
 
     def forward_graph_prefill(
-        self, x: torch.Tensor, pos_tensor: torch.Tensor, *, slot: int = 0
+        self,
+        x: torch.Tensor,
+        pos_tensor: torch.Tensor,
+        *,
+        slot: int = 0,
+        host_start_pos: int | None = None,
     ) -> torch.Tensor:
         """Capture-safe prefill chunk: ``seqlen`` rows at GPU position.
 
-        Keeps wkv/wgate GEMMs batched and drives the per-token state machine
-        with the fused decode kernel (ONE launch per token instead of the
-        eager ~10-op Python loop).  Returns only the compress-boundary NEW
-        entries, exactly like ``forward``'s ``emitted`` list -- re-packing an
-        existing entry would re-quantise an already-FP8 page.  Tiles are
-        64-aligned so ``pos_tensor % ratio == 0`` and the boundary rows are
-        the fixed ``i % ratio == ratio - 1``.
+        Keeps wkv/wgate GEMMs batched. Main compressors use one sequential
+        tile kernel; ratio-4 indexer compressors use one state/finalize kernel
+        plus one Hadamard/FP4 kernel for all boundaries. Returns only the
+        compress-boundary NEW entries, exactly like ``forward``'s ``emitted``
+        list -- re-packing an existing entry would re-quantise an already-FP8
+        page. Tiles are 64-aligned so ``pos_tensor % ratio == 0`` and the
+        boundary rows are the fixed ``i % ratio == ratio - 1``.
         """
         bsz, seqlen, _ = x.shape
         assert bsz == 1
@@ -1199,7 +1218,11 @@ class Dsv4Compressor(nn.Module):
             head_dim=self.head_dim,
             rope_head_dim=self.rope_head_dim,
         ):
-            host_pos = int(pos_tensor.reshape(-1)[0].item())
+            host_pos = (
+                int(pos_tensor.reshape(-1)[0].item())
+                if host_start_pos is None
+                else host_start_pos
+            )
             n_boundaries = (host_pos + seqlen) // ratio - host_pos // ratio
             out = self._graph_entry_scratch.narrow(0, 0, 1).narrow(1, 0, max(1, n_boundaries))
             result = fused_decode_postgemv_seq(
@@ -1221,52 +1244,71 @@ class Dsv4Compressor(nn.Module):
             )
             return result.narrow(1, 0, n_boundaries)
 
-        # Indexer compressor (ratio-4 head_dim=128 rotate+quantize): keep the
-        # per-token fused loop until its own seq kernel lands.
-        from runtime.kernels.dsv4_compressor import (
-            fused_indexer_decode_postgemv,
-            supports_fused_indexer_decode_postgemv,
+        # Indexer compressor (ratio-4 head_dim=128 rotate+quantize): advance
+        # the whole tile in two launches (state/finalize + Hadamard/FP4).
+        from runtime.kernels.dsv4_compressor import fused_indexer_decode_postgemv_seq
+
+        host_pos = (
+            int(pos_tensor.reshape(-1)[0].item()) if host_start_pos is None else host_start_pos
+        )
+        n_boundaries = (host_pos + seqlen) // ratio - host_pos // ratio
+        out = self._graph_entry_scratch.narrow(0, 0, 1).narrow(1, 0, max(1, n_boundaries))
+        return fused_indexer_decode_postgemv_seq(
+            kv=kv,
+            score=score,
+            pos0=pos_tensor,
+            host_start_pos=host_pos,
+            ape=self.ape,
+            norm_weight=self.norm_weight,
+            freqs_cis=self.freqs_cis,
+            kv_state=kv_state_slot,
+            score_state=score_state_slot,
+            kv_cache=kv_cache_slot,
+            out=out,
+            eps=self.eps,
         )
 
-        emitted = []
-        host_pos = int(pos_tensor.reshape(-1)[0].item())
-        for i in range(seqlen):
-            pos_i = pos_tensor + i
-            kv_i = kv[:, i : i + 1]
-            score_i = score[:, i : i + 1]
-            out = self._graph_entry_scratch.narrow(0, 0, 1).narrow(1, 0, 1)
-            if not supports_fused_indexer_decode_postgemv(
-                ratio=ratio,
-                rotate=self.rotate,
-                quantize=self.quantize,
-                device=x.device,
-                batch_size=1,
-                seq_len=1,
-                head_dim=self.head_dim,
-                rope_head_dim=self.rope_head_dim,
-            ):
-                raise RuntimeError(
-                    f"compressor forward_graph_prefill has no fused kernel for "
-                    f"ratio={ratio} rotate={self.rotate} quantize={self.quantize}"
-                )
-            e = fused_indexer_decode_postgemv(
-                kv_i=kv_i,
-                score_i=score_i,
-                pos=pos_i,
-                ape=self.ape,
-                norm_weight=self.norm_weight,
-                freqs_cis=self.freqs_cis,
-                kv_state=kv_state_slot,
-                score_state=score_state_slot,
-                kv_cache=kv_cache_slot,
-                out=out,
-                eps=self.eps,
+    def forward_cold_prefill_parallel(
+        self,
+        x: torch.Tensor,
+        *,
+        completed_rows: int,
+        slot: int = 0,
+    ) -> torch.Tensor:
+        """Precompute suffix entries while preserving the 64-row oracle.
+
+        The caller has already advanced ``completed_rows`` through the normal
+        cold-prefill path.  Projection is batched over the complete sequence;
+        compression boundaries after that prefix run independently on GPU.
+        """
+        if x.device.type != "cuda" or x.shape[0] != 1:
+            raise ValueError("parallel cold prefill requires one CUDA batch")
+        if completed_rows != 64 or x.shape[1] % 128 != 0:
+            raise ValueError(
+                "parallel cold prefill currently requires completed_rows=64 "
+                f"and a 128-row-aligned sequence, got {completed_rows}, {x.shape[1]}"
             )
-            if (host_pos + i) % ratio == ratio - 1:
-                emitted.append(e.clone())
-        if not emitted:
-            return torch.zeros(1, 0, self.head_dim, dtype=x.dtype, device=x.device)
-        return torch.cat(emitted, dim=1)
+        xf = x.float()
+        kv = self.wkv(xf)
+        score = self.wgate(xf)
+        from runtime.kernels.dsv4_compressor import fused_cold_prefill_postgemv_parallel
+
+        return fused_cold_prefill_postgemv_parallel(
+            kv=kv,
+            score=score,
+            completed_rows=completed_rows,
+            ratio=self.ratio,
+            head_dim=self.head_dim,
+            rope_head_dim=self.rope_head_dim,
+            overlap=self.overlap,
+            ape=self.ape,
+            norm_weight=self.norm_weight,
+            freqs_cis=self.freqs_cis,
+            kv_state=self._slot_view(self.kv_state, slot),
+            score_state=self._slot_view(self.score_state, slot),
+            kv_cache=self._slot_cache(slot),
+            eps=self.eps,
+        )
 
 
 class Dsv4Indexer(nn.Module):
@@ -1373,7 +1415,14 @@ class Dsv4Indexer(nn.Module):
         return (score.relu() * weights.unsqueeze(-1)).sum(dim=2)
 
     def forward(
-        self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int, *, slot: int = 0
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        start_pos: int,
+        offset: int,
+        *,
+        slot: int = 0,
+        compressor_precomputed: bool = False,
     ) -> torch.Tensor:
         assert self.kv_cache is not None and self.freqs_cis is not None
         bsz, seqlen, _ = x.shape
@@ -1382,7 +1431,8 @@ class Dsv4Indexer(nn.Module):
         if self.compressor.kv_cache is None:
             self.compressor.kv_cache = self.kv_cache
             self.compressor.freqs_cis = self.freqs_cis
-        self.compressor(x, start_pos, slot=slot)
+        if not compressor_precomputed:
+            self.compressor(x, start_pos, slot=slot)
 
         # Until the compressed history exceeds index_topk, selection is an
         # identity operation: every live entry is attended.  Returning the
@@ -1518,6 +1568,8 @@ class Dsv4Indexer(nn.Module):
         *,
         slot: int = 0,
         max_entries: int,
+        host_start_pos: int | None = None,
+        compressor_precomputed: bool = False,
     ) -> torch.Tensor:
         """Capture-safe prefill indexer: ``seqlen`` rows at GPU position.
 
@@ -1531,7 +1583,13 @@ class Dsv4Indexer(nn.Module):
         if self.compressor.kv_cache is None:
             self.compressor.kv_cache = self.kv_cache
             self.compressor.freqs_cis = self.freqs_cis
-        self.compressor.forward_graph_prefill(x, pos_tensor, slot=slot)
+        if not compressor_precomputed:
+            self.compressor.forward_graph_prefill(
+                x,
+                pos_tensor,
+                slot=slot,
+                host_start_pos=host_start_pos,
+            )
 
         pos_idx = pos_tensor + torch.arange(seqlen, dtype=torch.int64, device=x.device)
         freqs = self.freqs_cis[pos_idx]

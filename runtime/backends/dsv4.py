@@ -195,6 +195,7 @@ class DeepseekV4Backend:
         self._freed_eager_oracle_kv = 0
         self._freed_eager_freqs = 0
         self._prefill_graph: Dsv4PrefillGraphDriver | None = None
+        self._superchunk_prefill_graph: Dsv4SuperchunkPrefillGraphDriver | None = None
         self._kv_len = [0] * num_slots
         self._committed: list[list[int]] = [[] for _ in range(num_slots)]
         self._cg_status: dict[str, str] = {}
@@ -1023,38 +1024,87 @@ class DeepseekV4Backend:
         ids = torch.tensor([suffix], dtype=torch.long, device=self.device)
         h = model.embed(ids)
         h = h.unsqueeze(2).repeat(1, 1, model.hc_mult, 1)
+        from runtime.kernels.iq2_mma16_tc import DynamicMoEWorkspace
+
+        workspace_key = (
+            n,
+            model.config.n_activated_experts,
+            model.config.hidden_size,
+            model.config.moe_intermediate_size,
+        )
+        cached_workspace = getattr(self, "_dynamic_moe_workspace", None)
+        if cached_workspace is None or cached_workspace[0] != workspace_key:
+            cached_workspace = (
+                workspace_key,
+                DynamicMoEWorkspace.create(*workspace_key, self.device),
+            )
+            self._dynamic_moe_workspace = cached_workspace
+        dynamic_moe_workspace = cached_workspace[1]
+        # Materialize all GPU positions once.  Constructing a one-element CUDA
+        # tensor from ``abs_pos`` inside the layer/tile loop performs a
+        # synchronous pageable H2D copy (43 layers * 15 mid tiles at M=1024).
+        tile_positions = torch.arange(
+            prefix_len,
+            prefix_len + n,
+            tile,
+            dtype=torch.long,
+            device=self.device,
+        )
+        parallel_compressors = prefix_len == 0 and tile == 64 and n >= 128 and n % 128 == 0
+        superchunk_graph = self._superchunk_prefill_graph
+        use_superchunk_graph = superchunk_graph is not None and superchunk_graph.matches(
+            slot=slot,
+            prefix_len=prefix_len,
+            tile=tile,
+            rows=n,
+        )
         for i, block in enumerate(model.blocks):
             residual = h
             x, post, comb = block.hc_pre(
                 h, block.hc_attn_fn, block.hc_attn_scale, block.hc_attn_base
             )
             x = rms_norm(x, block.attn_norm_weight, block.eps)
-            outs = []
-            for start in range(0, n, tile):
-                end = min(start + tile, n)
-                abs_pos = prefix_len + start
-                if abs_pos == 0:
-                    # First cold-prefill tile: eager start_pos==0 batch branch
-                    # (its prefill-page packing differs from the mid-sequence
-                    # ring path forward_graph_prefill targets).
-                    outs.append(layers[i](x[:, start:end], 0, slot=slot))
-                else:
-                    ratio = getattr(layers[i], "ratio", 0)
-                    n_entries = (abs_pos + (end - start)) // ratio if ratio else 0
-                    pos_t = torch.tensor([abs_pos], dtype=torch.long, device=self.device)
-                    outs.append(
-                        layers[i].forward_graph_prefill(
-                            x[:, start:end], pos_t, slot=slot, graph_max_index_entries=n_entries
+            if use_superchunk_graph:
+                x = superchunk_graph.replay_layer(i, x)
+            else:
+                outs = []
+                for start in range(0, n, tile):
+                    end = min(start + tile, n)
+                    abs_pos = prefix_len + start
+                    if abs_pos == 0:
+                        # First cold-prefill tile: eager start_pos==0 batch branch
+                        # (its prefill-page packing differs from the mid-sequence
+                        # ring path forward_graph_prefill targets).
+                        outs.append(layers[i](x[:, start:end], 0, slot=slot))
+                        if parallel_compressors:
+                            layers[i].precompute_cold_prefill_compressors(
+                                x,
+                                completed_rows=end,
+                                slot=slot,
+                            )
+                    else:
+                        ratio = getattr(layers[i], "ratio", 0)
+                        n_entries = (abs_pos + (end - start)) // ratio if ratio else 0
+                        tile_index = start // tile
+                        pos_t = tile_positions[tile_index : tile_index + 1]
+                        outs.append(
+                            layers[i].forward_graph_prefill(
+                                x[:, start:end],
+                                pos_t,
+                                slot=slot,
+                                graph_max_index_entries=n_entries,
+                                host_start_pos=abs_pos,
+                                compressors_precomputed=parallel_compressors,
+                            )
                         )
-                    )
-            x = torch.cat(outs, dim=1)
+                x = torch.cat(outs, dim=1)
             x = block.hc_post(x, residual, post, comb)
             residual = x
             x, post, comb = block.hc_pre(
                 x, block.hc_ffn_fn, block.hc_ffn_scale, block.hc_ffn_base
             )
             x = rms_norm(x, block.ffn_norm_weight, block.eps)
-            x = block.moe(x, ids)
+            x = block.moe.forward_dynamic(x, ids, workspace=dynamic_moe_workspace)
             x = block.hc_post(x, residual, post, comb)
             h = x
         h = model.hc_head(h)
@@ -1197,10 +1247,10 @@ class DeepseekV4Backend:
                 self.reset_slot(slot)
 
     def capture_prefill_cuda_graph(self) -> bool:
-        """Capture the 43-layer K32 MoE prefill CUDA graphs (Phase 1K).
+        """Capture the 1024-token superchunk attention CUDA graphs.
 
         Must run before slot admission and after ``capture_decode_cuda_graph``.
-        Failure is non-fatal: falls back to eager ``block.moe`` prefill.
+        Failure is non-fatal: falls back to eager superchunk prefill.
 
         Memory guard: capture freezes every temporary tensor of the 43-layer
         body into CUDA-graph pool memory (measured ~10 GiB on top of the 82
@@ -1211,11 +1261,14 @@ class DeepseekV4Backend:
         reserved pool (2026-08-13: 2x64K service OOM'd on reset_slot because
         of exactly this residue).
         """
-        if self._prefill_graph is not None:
+        if self._superchunk_prefill_graph is not None:
             return True
         if self._forward_fn is not None or not self.slot_layers:
             return False
         if torch.device(self.device).type != "cuda":
+            return False
+        if self.num_slots != 1 or self.max_q_rows != 64:
+            self._cg_status["prefill"] = "unsupported"
             return False
         busy = any(self._kv_len[s] != 0 or self._committed[s] for s in range(self.num_slots))
         if busy:
@@ -1249,9 +1302,9 @@ class DeepseekV4Backend:
             self._cg_status["prefill"] = "skipped-low-memory"
             return False
         try:
-            driver = Dsv4PrefillGraphDriver(self, m=self.max_q_rows)
+            driver = Dsv4SuperchunkPrefillGraphDriver(self)
             driver.capture()
-            self._prefill_graph = driver
+            self._superchunk_prefill_graph = driver
             self._cg_status["prefill"] = "captured"
             return True
         except Exception:
@@ -1260,7 +1313,7 @@ class DeepseekV4Backend:
             logging.getLogger("qwen_sm120_runtime.dsv4").exception(
                 "DSV4 prefill CUDA Graph capture failed; falling back to eager MoE"
             )
-            self._prefill_graph = None
+            self._superchunk_prefill_graph = None
             self._cg_status["prefill"] = "failed"
             # The failed capture may have grown a CUDA-graph pool that torch
             # keeps reserved but idle.  Release it so the serving path does
@@ -1465,6 +1518,142 @@ def load_deepseek_v4_backend(
         device=device,
     )
     return backend
+
+
+class Dsv4SuperchunkPrefillGraphDriver:
+    """Per-layer CUDA graphs for the fixed 1024x64 cold superchunk attention loop.
+
+    Capture is intentionally narrow: slot 0, one slot total, prefix_len=0,
+    1024 suffix rows, 64-row tiles.  The graph owns only the attention tile
+    loop from ``_prefill_superchunk_logits``:
+      - tile 0 runs the eager start_pos==0 path
+      - the driver precomputes later compressor state once
+      - tiles 1..15 replay ``forward_graph_prefill(..., compressors_precomputed=True)``
+    """
+
+    def __init__(
+        self,
+        backend: DeepseekV4Backend,
+        *,
+        m: int = 1024,
+        tile: int = 64,
+        slot: int = 0,
+        prefix_len: int = 0,
+    ) -> None:
+        if not backend.slot_layers:
+            raise RuntimeError("superchunk prefill graph needs kernel-path slot layers")
+        self.backend = backend
+        self.layers = backend.slot_layers
+        self.device = backend.device
+        self.model = backend.model
+        self.m = m
+        self.tile = tile
+        self.slot = slot
+        self.prefix_len = prefix_len
+        self.hidden = backend.model.config.hidden_size
+        self.graphs: list[torch.cuda.CUDAGraph | None] = [None] * len(self.layers)
+        self._captured = False
+        self._x_in = torch.empty(1, m, self.hidden, dtype=torch.bfloat16, device=self.device)
+        self._out = torch.empty_like(self._x_in)
+        self._tile_positions = torch.arange(
+            prefix_len,
+            prefix_len + m,
+            tile,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+    def matches(self, *, slot: int, prefix_len: int, tile: int, rows: int) -> bool:
+        return (
+            slot == self.slot
+            and prefix_len == self.prefix_len
+            and tile == self.tile
+            and rows == self.m
+        )
+
+    def _reset_layer(self, layer_id: int) -> None:
+        self.layers[layer_id].reset_caches(self.slot)
+
+    def _layer_body(self, layer_id: int) -> None:
+        outs = []
+        layer = self.layers[layer_id]
+        for start in range(0, self.m, self.tile):
+            end = start + self.tile
+            if start == 0:
+                outs.append(layer(self._x_in[:, :end], 0, slot=self.slot))
+                layer.precompute_cold_prefill_compressors(
+                    self._x_in,
+                    completed_rows=end,
+                    slot=self.slot,
+                )
+                continue
+            pos_t = self._tile_positions[start // self.tile : start // self.tile + 1]
+            ratio = getattr(layer, "ratio", 0)
+            n_entries = end // ratio if ratio else 0
+            outs.append(
+                layer.forward_graph_prefill(
+                    self._x_in[:, start:end],
+                    pos_t,
+                    slot=self.slot,
+                    graph_max_index_entries=n_entries,
+                    host_start_pos=start,
+                    compressors_precomputed=True,
+                )
+            )
+        self._out.copy_(torch.cat(outs, dim=1))
+
+    def capture(self) -> None:
+        if self._captured:
+            return
+        if self.backend.num_slots != 1:
+            raise RuntimeError("superchunk prefill graph requires num_slots=1")
+        torch.cuda.synchronize(self.device)
+        pool = None
+        with torch.inference_mode():
+            warm_gen = torch.Generator(device=self.device).manual_seed(20260814)
+            warm_x = torch.randn(
+                1,
+                self.m,
+                self.hidden,
+                dtype=torch.bfloat16,
+                device=self.device,
+                generator=warm_gen,
+            ) * 0.25
+            for layer_id in range(len(self.layers)):
+                self._reset_layer(layer_id)
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    self._x_in.copy_(warm_x)
+                    for _ in range(3):
+                        self._layer_body(layer_id)
+                torch.cuda.current_stream().wait_stream(side)
+                torch.cuda.synchronize(self.device)
+                self._reset_layer(layer_id)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=pool):
+                    self._layer_body(layer_id)
+                if pool is None:
+                    pool = graph.pool()
+                self.graphs[layer_id] = graph
+                torch.cuda.synchronize(self.device)
+                self._reset_layer(layer_id)
+        torch.cuda.synchronize(self.device)
+        self._captured = True
+
+    def replay_layer(self, layer_id: int, x: torch.Tensor) -> torch.Tensor:
+        if not self._captured:
+            raise RuntimeError("superchunk prefill graph replay before capture")
+        if tuple(x.shape) != (1, self.m, self.hidden):
+            raise ValueError(
+                "superchunk prefill graph expects "
+                f"{(1, self.m, self.hidden)}, got {tuple(x.shape)}"
+            )
+        with torch.inference_mode():
+            self._reset_layer(layer_id)
+            self._x_in.copy_(x)
+            self.graphs[layer_id].replay()
+        return self._out
 
 
 def _prefill_bucket_for_rows(m: int, top_k: int, n_experts: int) -> int:

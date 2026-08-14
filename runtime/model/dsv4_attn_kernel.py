@@ -561,6 +561,7 @@ class Dsv4AttnKernelLayer(nn.Module):
         *,
         pos_tensor: torch.Tensor | None = None,
         graph_max_index_entries: int | None = None,
+        indexer_compressor_precomputed: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """swa idx/len, compressed idx/len (kernel flat-id spaces).
 
@@ -632,7 +633,14 @@ class Dsv4AttnKernelLayer(nn.Module):
         comp_len: torch.Tensor | None = None
         if self.ratio:
             if self.indexer is not None:
-                comp = self.indexer(x, qr, start_pos, offset=0, slot=slot).int()
+                comp = self.indexer(
+                    x,
+                    qr,
+                    start_pos,
+                    offset=0,
+                    slot=slot,
+                    compressor_precomputed=indexer_compressor_precomputed,
+                ).int()
                 comp = comp.reshape(seqlen, -1)
                 comp = _pad_prefill_index_width(comp, self.indexer.index_topk)
             else:
@@ -654,6 +662,46 @@ class Dsv4AttnKernelLayer(nn.Module):
 
     def kv_norm(self, x: torch.Tensor) -> torch.Tensor:
         return rms_norm(x, self.kv_norm_weight, self.eps)
+
+    def precompute_cold_prefill_compressors(
+        self,
+        x: torch.Tensor,
+        *,
+        completed_rows: int,
+        slot: int = 0,
+    ) -> None:
+        """Fill compressed caches for later 64-row attention tiles."""
+        if self.compressor is None:
+            return
+        entries = self.compressor.forward_cold_prefill_parallel(
+            x,
+            completed_rows=completed_rows,
+            slot=slot,
+        )
+        if entries.shape[1]:
+            self._pack_compressed(
+                slot,
+                entries,
+                completed_rows,
+                x.shape[1] - completed_rows,
+            )
+        if self.indexer is not None:
+            if self.indexer.compressor.kv_cache is None:
+                self.indexer.compressor.kv_cache = self.indexer.kv_cache
+                self.indexer.compressor.freqs_cis = self.indexer.freqs_cis
+            self.indexer.compressor(x, 0, slot=slot)
+            # At an exact boundary the serial overlap machine retains the
+            # last complete group in both halves.  The cold bulk formula only
+            # needs/populates the lower half, so mirror it for decode parity.
+            ratio = self.indexer.compressor.ratio
+            kv_state = self.indexer.compressor._slot_view(  # noqa: SLF001
+                self.indexer.compressor.kv_state, slot
+            )
+            score_state = self.indexer.compressor._slot_view(  # noqa: SLF001
+                self.indexer.compressor.score_state, slot
+            )
+            kv_state[:, ratio:].copy_(kv_state[:, :ratio])
+            score_state[:, ratio:].copy_(score_state[:, :ratio])
 
     def reset_caches(self, slot: int = 0) -> None:
         """Zero recursive state while retaining prefix-addressable KV bytes."""
@@ -738,6 +786,7 @@ class Dsv4AttnKernelLayer(nn.Module):
         capture: bool = False,
         pos_tensor: torch.Tensor | None = None,
         graph_max_index_entries: int | None = None,
+        compressors_precomputed: bool = False,
     ) -> torch.Tensor:
         self._require_slot(slot)
         bsz, seqlen, _ = x.shape
@@ -781,7 +830,7 @@ class Dsv4AttnKernelLayer(nn.Module):
             capture=capture,
             pos_tensor=pos_tensor,
         )
-        if ratio:
+        if ratio and not compressors_precomputed:
             if capture:
                 entry = self.compressor.forward_graph(x, pos, slot=slot)
             else:
@@ -804,6 +853,7 @@ class Dsv4AttnKernelLayer(nn.Module):
             x,
             pos_tensor=pos_tensor,
             graph_max_index_entries=graph_max_index_entries,
+            indexer_compressor_precomputed=compressors_precomputed,
         )
         if comp_idx is not None and comp_idx.shape[1] == 0:
             # no compressed entries exist yet (early prefill / empty slot):
@@ -844,15 +894,17 @@ class Dsv4AttnKernelLayer(nn.Module):
         apply_rotary_emb(o[..., -rd:], freqs, inverse=True)
         o = o.view(bsz, seqlen, self.n_groups, -1)
         if self.wo_a.fused_q8:
-            from runtime.kernels.dsv4_q8_gemm import q8_0_grouped_dequant_gemm
+            from runtime.kernels.dsv4_q8_gemm import q8_0_soa_grouped_dequant_gemm
 
             # Group-major rows: [G, bs*seq, d] flattened to [G*bs*seq, d],
             # the wo_a einsum contraction per group, no dequant material.
             d_k = o.shape[-1]
             x2 = o.permute(2, 0, 1, 3).reshape(self.n_groups * bsz * seqlen, d_k)
-            res = q8_0_grouped_dequant_gemm(
+            qcode, qscale = self.wo_a.soa_planes()
+            res = q8_0_soa_grouped_dequant_gemm(
                 x2,
-                self.wo_a.packed,
+                qcode,
+                qscale,
                 num_groups=self.n_groups,
                 group_size=self.o_lora_rank,
                 in_features=d_k,
@@ -871,6 +923,8 @@ class Dsv4AttnKernelLayer(nn.Module):
         *,
         slot: int = 0,
         graph_max_index_entries: int | None = None,
+        host_start_pos: int | None = None,
+        compressors_precomputed: bool = False,
     ) -> torch.Tensor:
         """Capture-safe prefill tile (mid-sequence): ``seqlen`` rows at GPU
         position.  Replaces the eager per-token compressor Python loop with
@@ -907,19 +961,27 @@ class Dsv4AttnKernelLayer(nn.Module):
         comp_pages: torch.Tensor | None = None
         comp_page_size: int | None = None
         if ratio:
-            entry = self.compressor.forward_graph_prefill(x, pos_tensor, slot=slot)
+            entry = None
+            if not compressors_precomputed:
+                entry = self.compressor.forward_graph_prefill(
+                    x,
+                    pos_tensor,
+                    slot=slot,
+                    host_start_pos=host_start_pos,
+                )
             comp_arena, comp_page_size = self._comp_pages()
-            comp_base = self._slot_raw_base(slot, comp_arena, comp_page_size)
-            n_comp = entry.shape[1]
-            first = (pos_tensor + seqlen) // ratio - n_comp
-            ids = torch.arange(n_comp, dtype=torch.int64, device=x.device) + first + comp_base
-            pack_latent_kv(
-                entry.reshape(n_comp, self.head_dim),
-                self._flat_pages(comp_arena),
-                ids,
-                page_size=comp_page_size,
-                validate_ids=False,
-            )
+            if entry is not None:
+                comp_base = self._slot_raw_base(slot, comp_arena, comp_page_size)
+                n_comp = entry.shape[1]
+                first = (pos_tensor + seqlen) // ratio - n_comp
+                ids = torch.arange(n_comp, dtype=torch.int64, device=x.device) + first + comp_base
+                pack_latent_kv(
+                    entry.reshape(n_comp, self.head_dim),
+                    self._flat_pages(comp_arena),
+                    ids,
+                    page_size=comp_page_size,
+                    validate_ids=False,
+                )
             comp_pages = self._flat_pages(comp_arena)
 
         rows = pos_idx.unsqueeze(1)
@@ -937,7 +999,13 @@ class Dsv4AttnKernelLayer(nn.Module):
         if ratio:
             if self.indexer is not None:
                 comp_idx = self.indexer.forward_graph_prefill(
-                    x, qr, pos_tensor, slot=slot, max_entries=graph_max_index_entries or 512
+                    x,
+                    qr,
+                    pos_tensor,
+                    slot=slot,
+                    max_entries=graph_max_index_entries or 512,
+                    host_start_pos=host_start_pos,
+                    compressor_precomputed=compressors_precomputed,
                 ).reshape(seqlen, -1)
                 comp_arena2, comp_page_sz2 = self._comp_pages()
                 comp_idx = self._offset_valid_ids(
@@ -997,13 +1065,15 @@ class Dsv4AttnKernelLayer(nn.Module):
         apply_rotary_emb(o[..., -rd:], freqs, inverse=True)
         o = o.view(bsz, seqlen, self.n_groups, -1)
         if self.wo_a.fused_q8:
-            from runtime.kernels.dsv4_q8_gemm import q8_0_grouped_dequant_gemm
+            from runtime.kernels.dsv4_q8_gemm import q8_0_soa_grouped_dequant_gemm
 
             d_k = o.shape[-1]
             x2 = o.permute(2, 0, 1, 3).reshape(self.n_groups * bsz * seqlen, d_k)
-            res = q8_0_grouped_dequant_gemm(
+            qcode, qscale = self.wo_a.soa_planes()
+            res = q8_0_soa_grouped_dequant_gemm(
                 x2,
-                self.wo_a.packed,
+                qcode,
+                qscale,
                 num_groups=self.n_groups,
                 group_size=self.o_lora_rank,
                 in_features=d_k,
@@ -1149,13 +1219,15 @@ class Dsv4AttnKernelLayer(nn.Module):
         apply_rotary_emb(o[..., -rd:], freqs, inverse=True)
         o = o.view(bsz, 1, self.n_groups, -1)
         if self.wo_a.fused_q8:
-            from runtime.kernels.dsv4_q8_gemm import q8_0_grouped_dequant_gemm
+            from runtime.kernels.dsv4_q8_gemm import q8_0_soa_grouped_dequant_gemm
 
             d_k = o.shape[-1]
             x2 = o.permute(2, 0, 1, 3).reshape(self.n_groups * bsz, d_k)
-            res = q8_0_grouped_dequant_gemm(
+            qcode, qscale = self.wo_a.soa_planes()
+            res = q8_0_soa_grouped_dequant_gemm(
                 x2,
-                self.wo_a.packed,
+                qcode,
+                qscale,
                 num_groups=self.n_groups,
                 group_size=self.o_lora_rank,
                 in_features=d_k,

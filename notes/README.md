@@ -47,6 +47,7 @@
 | `2026-08-11-dsv4-phase2-int8-mma.md` | **Phase 2：IQ2 INT8 Tensor-Core grouped MoE**——exact `mma.sync.m16n8k16` 已落地并达到 cos 1.0；真实 1024-token 形状 gate+up 14.8 ms、grouped routed pipeline 32 ms（router/shared expert 未包含），未过旧 2K 的 router+routed+shared `<=6.5 ms/layer` kill gate。exact 路径保留为 oracle；K32 在 1K 新预算下重新成为主线，当前合同见 `../docs/dsv4-prefill-1k-implementation-plan.md`。 |
 | `2026-08-12-dsv4-prefill-row-w8-replan-evidence.md` | **DSV4 单卡 2K row-W8 路线最终失败证据**——审计 `main@882d209`，记录 128 MiB L2、row-W8/A8 数值预筛、global W8 流量账，以及 C0 最终 gate+up 28.2 ms、W8 resident 6.4 GB、consumer L2 hit 23% 的三重失败。新 1K 合同只保留严格条件下的 CTA-local 研究门，不复活 global/circular W8。 |
 | `2026-08-12-dsv4-4x256k-capacity-plan.md` | **DSV4 单卡 4×256K 显存容量实施规划**——严格核对当前双份主 compressor 历史、逐层 RoPE 和第五 CG 槽；主路线保留 packed pages、删除 5.40625 GiB BF16 主缓存镜像并把 RoPE 收敛为两份，目标已知持久占用 `86.52000322565436 GiB`；定义四槽、图池、prefix 和 fresh-process 实机验收门槛。 |
+| `2026-08-14-dsv4-dynamic-moe-nan-bug.md` | **DSV4 routes>64 NaN 已修复，1024-token cold mean 达 509.2 tok/s**——device tile-loop 关闭未写 tail；position sync 647→1、Q8 直接读 SoA、indexer launches 40,320→630、cooperative gather 87.1→0.584 ms。20-run median 541.3 / trimmed 519.0，最好 563.9 接近 llama.cpp 567.8，但 mean 仍差 10.3% 且尾部抖动未解决。 |
 
 ## 2. 已定案的根因分析 🟢
 

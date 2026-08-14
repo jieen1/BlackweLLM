@@ -168,3 +168,69 @@ def test_graph_complete_moe_matches_eager(library):
     cos = (eager * graph).sum() / (eager.norm() * graph.norm() + 1e-9)
     assert cos.item() == 1.0, f"graph vs eager cos {cos.item()}"
     assert torch.equal(eager, graph)
+
+
+def test_dynamic_moe_tiles_expert_routes_over_64(library):
+    """The compact path must write every route when one expert exceeds a tile.
+
+    Expert 245 receives 81 routes after routes for lower-numbered experts,
+    matching both the non-zero compact offset and the overflow shape from
+    production.  Six routes per token also exercises the top-k=6 grouping
+    specialization used by DSV4.
+    The split-batch implementation is the established bit-exact reference for
+    the same K32 gate/up and down kernels.
+    """
+    from runtime.kernels.iq2_mma16_tc import (
+        DynamicMoEWorkspace,
+        grouped_moe_prefill_k32,
+        grouped_moe_prefill_k32_dynamic,
+    )
+
+    E, H, INTER, M = 256, 256, 256, 89
+    gen = torch.Generator().manual_seed(81)
+    pg = _make_packed(E * INTER, H, gen).cuda()
+    pu = _make_packed(E * INTER, H, gen).cuda()
+    pd = _make_packed(E * H, INTER, gen).cuda()
+    grid = torch.tensor(IQ2XS_GRID, dtype=torch.int64, device="cuda")
+    ksigns = torch.tensor(KSIGNS_IQ2XS, dtype=torch.int32, device="cuda")
+
+    cuda_gen = torch.Generator(device="cuda").manual_seed(81)
+    flat = (torch.randn(M, H, generator=cuda_gen, device="cuda") * 0.1).bfloat16()
+    indices = torch.arange(6, dtype=torch.int64, device="cuda").repeat(M, 1)
+    indices[8:, 0] = 245
+    weights = torch.full((M, 6), 1.0 / 6.0, dtype=torch.float32, device="cuda")
+
+    reference = grouped_moe_prefill_k32(
+        flat,
+        weights,
+        indices,
+        pg,
+        pu,
+        pd,
+        grid,
+        ksigns,
+        inter=INTER,
+        hidden=H,
+        swiglu_limit=10.0,
+        bucket=64,
+        library=library,
+    )
+    workspace = DynamicMoEWorkspace.create(M, 6, H, INTER, flat.device)
+    dynamic = grouped_moe_prefill_k32_dynamic(
+        flat,
+        weights,
+        indices,
+        pg,
+        pu,
+        pd,
+        grid,
+        ksigns,
+        inter=INTER,
+        hidden=H,
+        swiglu_limit=10.0,
+        library=library,
+        workspace=workspace,
+    )
+
+    assert torch.isfinite(dynamic).all()
+    assert torch.equal(reference, dynamic)
