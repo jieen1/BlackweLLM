@@ -777,11 +777,33 @@ class DeepseekV4EngineProvider:
         if on_stage is not None:
             on_stage("after_target_backend")
         stage_started = time.perf_counter()
+        self._backend._share_rope_freqs()
+        self._load_timings_s["rope_sharing"] = time.perf_counter() - stage_started
+        if on_stage is not None:
+            on_stage("after_rope_sharing")
+        stage_started = time.perf_counter()
         if self._enable_cudagraph:
             self._backend.capture_decode_cuda_graph()
-        self._load_timings_s["cuda_graph_capture"] = time.perf_counter() - stage_started
+        self._load_timings_s["decode_cuda_graph_capture"] = (
+            time.perf_counter() - stage_started
+        )
         if on_stage is not None:
             on_stage("after_decode_cuda_graphs")
+        stage_started = time.perf_counter()
+        self._backend._free_eager_oracle_caches()
+        self._load_timings_s["eager_oracle_release"] = (
+            time.perf_counter() - stage_started
+        )
+        if on_stage is not None:
+            on_stage("after_eager_oracle_release")
+        stage_started = time.perf_counter()
+        if self._enable_cudagraph:
+            self._backend.capture_prefill_cuda_graph()
+        self._load_timings_s["prefill_cuda_graph_capture"] = (
+            time.perf_counter() - stage_started
+        )
+        if on_stage is not None:
+            on_stage("after_prefill_cuda_graph")
         self.reset()
         self._load_timings_s["total"] = time.perf_counter() - load_started
         if on_stage is not None:

@@ -1063,6 +1063,13 @@ class DeepseekV4Backend:
         # Compressor/indexer state advances by absolute position across chunks,
         # exactly as the layer-major loop did.
         chunk_rows = max(1, min(n, moe_chunk))
+        if chunk_rows >= DSV4_PREFIX_BLOCK_SIZE:
+            # End every full superchunk on a publishable prefix boundary.
+            # This leaves the measured 2048-row default unchanged while also
+            # making non-default workspace sizes deterministic.
+            chunk_rows = (
+                chunk_rows // DSV4_PREFIX_BLOCK_SIZE * DSV4_PREFIX_BLOCK_SIZE
+            )
         superchunk_graph = self._superchunk_prefill_graph
         # Materialize absolute GPU positions for the whole suffix once; chunk
         # loops slice into it instead of building a CUDA tensor per tile (a
@@ -1150,6 +1157,19 @@ class DeepseekV4Backend:
                 h = x
             h = model.hc_head(h)
             chunk_logits = model.lm_head(rms_norm(h, model.norm_weight, model.eps))
+            absolute_end = prefix_len + cend
+            if absolute_end % DSV4_PREFIX_BLOCK_SIZE == 0:
+                # The live recurrent/window state represents this exact
+                # boundary only here.  Publishing after the whole prompt
+                # would lose the last complete block of a non-aligned prompt.
+                # The checkpoint tensors are reused in place, so repeated
+                # publication does not grow memory with prompt length.
+                self._capture_prefix_checkpoint(
+                    slot,
+                    absolute_end,
+                    prompt_ids,
+                    chunk_logits,
+                )
         assert chunk_logits is not None
         return chunk_logits
 

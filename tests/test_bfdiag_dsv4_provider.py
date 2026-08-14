@@ -29,6 +29,10 @@ class _FakeBackend:
         self.prefill_calls: list[tuple[int, list[int]]] = []
         self.decode_calls: list[tuple[list[int], list[int], list[int]]] = []
         self.capture_calls = 0
+        self.prefill_capture_calls = 0
+        self.share_calls = 0
+        self.release_calls = 0
+        self.lifecycle: list[str] = []
         self.kv_len = {0: 0, 1: 0}
         self.committed = {0: [], 1: []}
         self._decode_outputs = [102, 103]
@@ -48,7 +52,23 @@ class _FakeBackend:
 
     def capture_decode_cuda_graph(self) -> int:
         self.capture_calls += 1
+        self.lifecycle.append("capture_decode")
         return 2
+
+    def capture_prefill_cuda_graph(self) -> bool:
+        self.prefill_capture_calls += 1
+        self.lifecycle.append("capture_prefill")
+        return True
+
+    def _share_rope_freqs(self) -> dict[str, int]:
+        self.share_calls += 1
+        self.lifecycle.append("share_rope")
+        return {"kernel_freqs": 1}
+
+    def _free_eager_oracle_caches(self) -> dict[str, int]:
+        self.release_calls += 1
+        self.lifecycle.append("release_eager")
+        return {"eager_oracle_kv": 1}
 
     def reset_slot(self, slot: int) -> None:
         self.reset_calls.append(slot)
@@ -183,11 +203,23 @@ def test_deepseek_provider_load_describe_namespace_and_snapshot_fields(
         }
     ]
     assert backend.capture_calls == 1
+    assert backend.prefill_capture_calls == 1
+    assert backend.share_calls == 1
+    assert backend.release_calls == 1
+    assert backend.lifecycle == [
+        "share_rope",
+        "capture_decode",
+        "release_eager",
+        "capture_prefill",
+    ]
     assert tokenizer_loader.calls == [str(tokenizer_dir)]
     assert stages == [
         "after_tokenizer",
         "after_target_backend",
+        "after_rope_sharing",
         "after_decode_cuda_graphs",
+        "after_eager_oracle_release",
+        "after_prefill_cuda_graph",
         "after_reset",
     ]
     assert backend.reset_calls == [0, 1]

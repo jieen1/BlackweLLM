@@ -855,6 +855,7 @@ def _make_fake_superchunk_backend() -> tuple[DeepseekV4Backend, _FakeSuperchunkL
     backend._cg_status = {}
     backend._prefill_graph = None
     backend._superchunk_prefill_graph = None
+    backend._capture_prefix_checkpoint = lambda *_args: None
     return backend, layer
 
 
@@ -893,25 +894,56 @@ def test_superchunk_prefill_graph_mismatch_falls_back_to_tile_loop(
 
     logits = backend._prefill_superchunk_logits(0, list(range(960)), tile=64, prefix_len=0)
 
-    assert tuple(logits.shape) == (1, 960, backend.model.config.hidden_size)
+    # The final non-aligned tail is a separate superchunk so the preceding
+    # 768-token boundary can be published as a restorable prefix checkpoint.
+    assert tuple(logits.shape) == (1, 192, backend.model.config.hidden_size)
     assert layer.eager_calls == [(0, 64, 0)]
     assert [call[:3] for call in layer.prefill_calls] == [
-        (64, 64, False),
-        (128, 128, False),
-        (192, 192, False),
-        (256, 256, False),
-        (320, 320, False),
-        (384, 384, False),
-        (448, 448, False),
-        (512, 512, False),
-        (576, 576, False),
-        (640, 640, False),
-        (704, 704, False),
+        (64, 64, True),
+        (128, 128, True),
+        (192, 192, True),
+        (256, 256, True),
+        (320, 320, True),
+        (384, 384, True),
+        (448, 448, True),
+        (512, 512, True),
+        (576, 576, True),
+        (640, 640, True),
+        (704, 704, True),
         (768, 768, False),
         (832, 832, False),
         (896, 896, False),
     ]
-    assert layer.precompute_calls == []
+    assert layer.precompute_calls == [(64, 0)]
+
+
+def test_kernel_superchunk_prefill_publishes_last_aligned_prefix_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend, _layer = _make_fake_superchunk_backend()
+    backend.stats = {"prefill_calls": 0, "prefill_chunks": 0, "prefill_tokens": 0}
+    captures: list[tuple[int, int, list[int], tuple[int, ...]]] = []
+    monkeypatch.setattr(backend, "_apply_same_slot_prefix", lambda _slot, _ids: (0, None))
+    monkeypatch.setattr(
+        backend,
+        "_capture_prefix_checkpoint",
+        lambda slot, length, token_ids, logits: captures.append(
+            (slot, length, list(token_ids), tuple(logits.shape))
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "runtime.kernels.iq2_mma16_tc",
+        SimpleNamespace(DynamicMoEWorkspace=_FakeDynamicWorkspace),
+    )
+    monkeypatch.setenv("QSR_DSV4_MOE_CHUNK", "256")
+    prompt = list(range(384))
+
+    backend._prefill_logits(0, prompt)
+
+    assert captures == [(0, 256, prompt, (1, 256, backend.model.config.hidden_size))]
+    assert backend._kv_len == [384]
+    assert backend._committed == [prompt]
 
 
 def test_capture_prefill_cuda_graph_uses_superchunk_driver(

@@ -207,13 +207,34 @@ WARM2: wall=1144s  prompt=524288/524288  gen=798   mean_ttft=903.7s
 
 ### 9.3 遗留问题
 
-1. **端到端 decode 1.07 tok/s ≪ CG 探针 53 tok/s**：服务层每轮 decode 慢约 50 倍，
-   疑似 128K 时 indexer `max_index_entries` 需 32768 超 `_INDEX_ENTRY_BUCKETS` 上限，
-   decode 走 eager 或每轮大量 Python 调度；需定位 `decode_batch_sampled` 的
-   graph bucket 命中与轮次开销（服务 stats `decode_graph_replays 1251 / 771 rounds`）。
-2. **WARM 未命中 prefix cache**（hits=0 restores=0）：COLD 后 checkpoint 未生效，
-   128K WARM TTFT 仍 ~900s；需查 `_capture_prefix_checkpoint` 在 chunk-major prefill
-   下的 checkpoint 时机（`DSV4_PREFIX_BLOCK_SIZE` 对齐）。
+1. **端到端 decode 1.07 tok/s ≪ CG 探针 53 tok/s**：后续实测已排除
+   128K bucket 溢出和 backend replay 本身；`32768` 本来就在 bucket 表中，
+   position=131071 的 B1 graph replay 为 46.11 ms，100 轮完整
+   `decode_batch_sampled` 中位数 45.69 ms，且 eager fallback=0。剩余差距必须从
+   服务请求时间口径、admission 和 active batch 分布取证，不能再归因于 bucket。
+2. **WARM prefix cache 已修复**：根因是 production superchunk 只在整段 prompt
+   完全对齐时才发布 checkpoint；修复后每个对齐 superchunk 边界就地覆盖
+   同一份 checkpoint，不随 prompt 长度增长显存。
 3. chunk=4096 时 4 槽 64K 异常慢（177 tok/s）+ 加载 93.86 GiB 贴边；chunk=2048 是
    当前 4 槽甜点。
 4. prefill 128K 单请求 ~5-6 分钟，属 DSV4 MoE 全量 prefill 现状，无投机加速。
+
+### 9.4 prefix 修复与生产生命周期对齐实测
+
+`bfdiag` 的 DSV4 provider 原先只 capture decode graph，没有执行生产服务的
+`share RoPE -> capture decode -> free eager oracle KV -> capture prefill` 顺序。
+这会让热引擎显存和 prefill 数据与生产服务不可比。对齐后的单槽 128K
+新进程数据：
+
+```text
+RoPE resident       2.6875 -> 0.0625 GiB
+eager oracle KV     0.8565 -> 0 GiB
+prefill graph       captured
+driver used/free    89.10 / 6.50 GiB
+1024 cold prefill   1.3825 s = 740.7 tok/s
+1024 warm restore   3.32 ms, anchor identical, checkpoint=1024
+384 cold/warm       1.0368 s -> 0.3600 s, anchor identical, checkpoint=256
+```
+
+384-token 用例是非对齐 prompt，证明现在会保留最后一个完整 256-token
+prefix block，而不是只修复了“整段恰好对齐”的简单情形。
