@@ -325,6 +325,12 @@ class Qwen36MTPEngine:
                 pool_bundles=backend.pool.pool_bundles if dynamic else None,
                 page_table=backend.pool._global_page_table if dynamic else None,  # noqa: SLF001
             )
+            if dynamic:
+                # Register the pooled MTP KV as the 17th atomic COW family
+                # (plan §4.8): MTP shares the backbone's bundle mapping, so a
+                # partial-page COW detach must clone MTP bytes too, or the
+                # MTP prefix half is lost while the backbone stays intact.
+                backend.pool.register_mtp_kv(self.mtp_k_pool, self.mtp_v_pool)
             self.scratch_row = backend.num_slots
             # Historical `_mtp_sync_and_propose_batch` is also the B=1
             # production path.  Keep one static bucket for that shape so a

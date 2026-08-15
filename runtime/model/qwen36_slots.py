@@ -201,6 +201,12 @@ class Qwen36SlotPool:
         self.conv_pools: list[torch.Tensor | None] = [None] * self.num_layers
         self.recurrent_pools: list[torch.Tensor | None] = [None] * self.num_layers
         self.attn_outputs: list[torch.Tensor | None] = [None] * self.num_layers
+        #: Optional pooled MTP self-attention KV, registered by the MTP
+        #: engine in dynamic arena mode (plan §4.8). MTP shares the
+        #: backbone's global bundle mapping; a COW detach must clone MTP
+        #: bytes too, or a partial-page suffix write loses the MTP prefix
+        #: half while the backbone stays byte-identical.
+        self._mtp_cow_family: tuple[torch.Tensor, torch.Tensor] | None = None
         #: batch size -> shared attention driver for a decode step of that
         #: size. Eager drivers are built on demand; a graph driver replaces
         #: the eager one for a batch size only once its graph is captured.
@@ -673,6 +679,47 @@ class Qwen36SlotPool:
         physical_page = self._page_table_host[slot][kv_len // self.page_size]
         return physical_page * self.page_size + kv_len % self.page_size
 
+    def register_mtp_kv(self, k_pool: torch.Tensor, v_pool: torch.Tensor) -> None:
+        """Register the pooled MTP KV as an atomic COW family (plan §4.8).
+
+        Dynamic arena only: the MTP pools span the same global bundle
+        count as the backbone pools and share the bundle mapping, so
+        every COW detach must clone both. Called by the MTP engine
+        immediately after it builds its pooled caches, before any prefix
+        sharing can exist.
+        """
+        if not self.dynamic_arena:
+            raise RuntimeError("register_mtp_kv requires dynamic_arena=True")
+        if k_pool.shape[0] != self.pool_bundles or v_pool.shape[0] != self.pool_bundles:
+            raise ValueError(
+                f"MTP pools span {k_pool.shape[0]} bundles, expected the "
+                f"backbone pool's {self.pool_bundles}"
+            )
+        self._mtp_cow_family = (k_pool, v_pool)
+
+    def _clone_cow_pages(self, replacements: list[tuple[int, int, int]]) -> None:
+        """Clone COW source bytes into every KV family (backbone + MTP).
+
+        A shared bundle detached for a partial-page suffix write must be
+        copied across all 17 KV families (16 backbone + pooled MTP, plan
+        §4.8); skipping any family loses that family's prefix half while
+        the others stay byte-identical. ``source_page == 0`` means a
+        null -> fresh bundle hand-out with nothing to clone.
+        """
+        for _logical_page, source_page, target_page in replacements:
+            if source_page == 0:
+                continue
+            for k_pool, v_pool in zip(self.k_pools, self.v_pools, strict=True):
+                if k_pool is None:
+                    continue
+                assert v_pool is not None
+                k_pool[target_page].copy_(k_pool[source_page])
+                v_pool[target_page].copy_(v_pool[source_page])
+            if self._mtp_cow_family is not None:
+                mtp_k, mtp_v = self._mtp_cow_family
+                mtp_k[target_page].copy_(mtp_k[source_page])
+                mtp_v[target_page].copy_(mtp_v[source_page])
+
     def prepare_kv_writes(self, slot: int, start: int, length: int) -> None:
         """Make every page touched by a pending write private to ``slot``.
 
@@ -721,16 +768,7 @@ class Qwen36SlotPool:
                     self._slot_bundles[slot].add(target_page)
             if not replacements:
                 return
-            for _logical_page, source_page, target_page in replacements:
-                for k_pool, v_pool in zip(self.k_pools, self.v_pools, strict=True):
-                    if k_pool is None:
-                        continue
-                    assert v_pool is not None
-                    if source_page != 0:
-                        # COW clone: copy the shared page's bytes so the
-                        # untouched prefix half stays valid.
-                        k_pool[target_page].copy_(k_pool[source_page])
-                        v_pool[target_page].copy_(v_pool[source_page])
+            self._clone_cow_pages(replacements)
             self._arena.drain_pending_cow()
             self.set_page_table_row(slot, row)
             return
@@ -988,13 +1026,7 @@ class Qwen36SlotPool:
                 self._slot_bundles[slot].add(target_page)
             if not replacements:
                 return False
-            for _logical_page, source_page, target_page in replacements:
-                for k_pool, v_pool in zip(self.k_pools, self.v_pools, strict=True):
-                    if k_pool is None:
-                        continue
-                    assert v_pool is not None
-                    k_pool[target_page].copy_(k_pool[source_page])
-                    v_pool[target_page].copy_(v_pool[source_page])
+            self._clone_cow_pages(replacements)
             self._arena.drain_pending_cow()
             self.set_page_table_row(slot, row)
             return True
