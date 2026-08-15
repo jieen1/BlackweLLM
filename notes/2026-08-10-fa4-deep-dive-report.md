@@ -1,5 +1,11 @@
 # FA4 深度调研报告 —— Blackwell 注意力内核设计穷尽式拆解（面向 SM120 M=1 Decode / MLA / MoE）
 
+> **2026-08-15 时效更新**：本文的算法拆解仍有效，但上游能力快照已从早期 commit 更新到
+> `fa4-v4.0.0.beta26`。beta21 已加入 SM120 Pack-GQA；beta26 的 SM120 forward 仍复用 SM80
+> `mma.sync`，仍不支持 paged KV、SplitKV 和 FP8 KV，不能直接承载 Qwen3.8 的生产形状。
+> 最新的 Qwen3.8 显存/性能映射和实施门禁见
+> [`../docs/qwen38-sm120-cuda133-fa4-optimization-plan.md`](../docs/qwen38-sm120-cuda133-fa4-optimization-plan.md)。
+
 > 日期：2026-08-10
 > 资料来源：`/home/bot/project/fa4-latest`（Dao-AILab/flash-attention，commit `c75d019`，
 > main 落后 origin 12 个 commit，可 fast-forward，与工作树内容一致），
@@ -18,8 +24,8 @@
    `FlashAttentionBackwardSm80` 的子类，只把共享内存容量从 163KB 改成 99KB、把
    `self.arch` 强制成 `sm_80`，MMA 用 `warp.MmaF16BF16Op(...,(16,8,16))`（`flash_fwd.py:589-599`）。
    与我们 runtime 用的标准 `mma.sync` 指令**完全同族**。所以 FA4 对 SM120 没有直接可复制的
-   SM100 kernel，但它的**全部工程思想**（warp specialization、tmem 当中间缓冲、软 exp2、
-   条件 rescale、LPT 调度、TMA multicast、2-CTA 协作模式）都能映射到 SM120。
+   SM100 kernel。可迁移的是 warp specialization、软 exp2、条件 rescale、LPT、TMA pipeline 等
+   算法/调度思想；依赖 `tcgen05`、TMEM 和 2-CTA joint UMMA 的数据流**不能**映射成等价实现。
 
 2. **FA4 论文三大核心**（`assets/fa4_paper.pdf`）：
    - 针对 Blackwell **非对称硬件扩展**（tensor core 吞吐翻倍，smem 带宽与 MUFU 吞吐没涨）重排
@@ -38,8 +44,8 @@
    ——FA4 的 mma 循环把 QK 与 PV 两个 GEMM 交错发射，天然适合 decode 的每步单 token；
    ② **P 写成输入 dtype 而非 FP32**（`tSrP_r2t` recast 成 q_dtype 再写回 tmem/smem）——
    直接砍掉 PV GEMM 的 B 流量一半，bandwidth-bound 的 M=1 decode 收益极大；
-   ③ **软 exp2 模拟 + f32x2 packed FMA**（`utils.py:760-820`）——SM120 的 MUFU 吞吐更低，
-   exp 更容易成为瓶颈，这是纯数学不依赖硬件；
+   ③ **软 exp2 模拟 + f32x2 packed FMA**（`utils.py:760-820`）——数学结构可迁移，但没有
+   可靠公开证据证明 SM120 MUFU 比 SM100 更慢，只有 profiler 显示 MUFU 饱和时才实施；
    ④ **条件 rescale 跳过 online rescale**——省掉 O 的向量乘（对 M=1 是整条 512 宽的行）；
    ⑤ **LPT 调度 + 头部 swizzle**（`tile_scheduler.py:393-647`）——decoding 不同请求 KV 长度
    差异大时减少负载不均衡，FA 作者实测 MQA 场景 7-14% 提升。
@@ -47,8 +53,9 @@
 4. **SM100 专属、完全不能移植的**：tcgen05.mma（`tcgen05.mma.cta_group::N` 指令，MLA 用
    cta_group::2）、tmem 及 `tcgen05.copy.Ld32x32bOp/St32x32bOp`、`ld.red` rowmax 硬件归约
    （`use_ldred_rowmax`，SM103 专属）、smem descriptor（`mma_sm100_desc.py` 的 idesc/smem_desc
-   64/32 位打包）、TMA multicast（依赖 tcgen05 的数据通路）、DSMEM（分布式共享内存，cluster
-   MMA 用）。这些的**理念**（把中间量留在片上、降低每字节开销）可借鉴，**指令**不可用。
+   64/32 位打包）和 2-CTA joint UMMA。**更正**：SM120 支持普通 thread-block cluster/DSMEM；
+   TMA multicast 在 PTX 功能上也可用，但官方优化/建议 target 不含 SM120，并警告其他 target
+   可能显著降速。因此两者是“可实验但不能复刻 FA4 数据流”，不是物理缺失。
 
 ---
 
@@ -345,13 +352,13 @@ cpasync_load = (12,13,14,15)（仅 use_cpasync_load_KV 时，即 topk/paged 路�
 
 | 技术 | SM100 实现 | 可移植的理念（SM120） |
 |---|---|---|
-| 2-CTA MMA | `tcgen05.mma.cta_group::2`，M=256 输出拆两 CTA、B 按 N 分半（论文 §2.2） | **TMA multicast / 数据复用**：同 cluster 的 CTA 共享 KV 加载，省一半带宽。SM120 无 cluster MMA，但可以「一个 CTA 负责 load + 把 KV 写进 DSMEM/smem、另一个 CTA 读」或用 `cluster.sync` + 分布式 smem 做手动分片（SM120 支持 cluster 与 DSMEM，只是 MMA 指令单 CTA） |
+| 2-CTA MMA | `tcgen05.mma.cta_group::2`，M=256 输出拆两 CTA、B 按 N 分半（论文 §2.2） | SM120 无 joint MMA；只能用普通 cluster/DSMEM 做数据共享。TMA multicast 功能存在但不是 SM120 官方优化 target，必须与两个 CTA 各自 TMA + L2 reuse 实测，不能预设省一半带宽 |
 | tmem 中间缓冲 | S/P/O 全放 tmem，FP32 累加器只占 128 列/片 | **中间量留在片上不落寄存器/不反复重读**。SM120 无 tmem，等价物是：**寄存器里保持 O 累加 + P 用输入 dtype 存 smem**；或者复用我们已有的 CUDA Graph + persistent smem 缓冲 |
 | 全异步 MMA 流水 | MMA 异步写 tmem，软 warp 不阻塞 | **软流水发射**：SM120 的 `mma.sync` 是同步的，但可以用 2 个独立 Q tile / 2 个 KV stage 交错，让 softmax 与下一个 QK 重叠（FA4 的 ping-pong 结构不依赖具体 MMA 指令） |
-| 软 exp2 | `utils.py:760-820` 多项式 + MUFU 混用 | **纯数学，直接可移植**。SM120 MUFU 吞吐只会更低，收益更大 |
+| 软 exp2 | `utils.py:760-820` 多项式 + MUFU 混用 | **纯数学，直接可移植**。SM120 的真实收益未知；仅在 MUFU/SFU profile 证明热点后启用 |
 | 条件 rescale | `softmax.py:293-297` + `vote_ballot` | **直接可移植**，只是把 tmem 上的 O 换成本地寄存器 O 累加 |
 | FP8/FP16 P 写入 | `apply_exp2_convert` recast 输入 dtype 再 St32 | **直接可移植**：P 在 smem/寄存器里用输入 dtype（FP8/FP16/BF16），PV GEMM 的 B 读流量减半 |
-| split_P_arrive | 先写 3/4 P 就发 mbarrier | **直接可移植**：先写够 PV 能起算的 P 段，触发 PV，再算剩余段 |
+| split_P_arrive | 先写 3/4 P 就发 mbarrier | **不能直接移植**：FA4 依赖异步 UMMA + TMEM consumer；SM120 register-local P 没有可提前唤醒的独立消费者，需先重构跨 warp P staging |
 | LPT 调度 | `tile_scheduler.py:393-647` | **直接可移植**（纯 host/device 端调度逻辑，不碰指令） |
 | pack_gqa | 头部折叠进 seqlen 维 | **直接可移植** |
 | 每线程整行 softmax | 128 线程 × 每线程一整行，免 inter-warp shuffle | **直接可移植**，M=1 时天然成立 |
@@ -381,9 +388,10 @@ cpasync_load = (12,13,14,15)（仅 use_cpasync_load_KV 时，即 topk/paged 路�
 1. **tcgen05.mma 指令族**（`tcgen05.mma.cta_group::N`，`blackwell_helpers.py:503`）——SM120 无。
 2. **tmem 及 tcgen05.copy（Ld/St/LdRed）**（`softmax_step` 的 tmem→reg、reg→tmem）——SM120 无。
 3. **smem descriptor / idesc 位打包**（`mma_sm100_desc.py`）——依赖 UMMA 的 smem desc 寻址。
-4. **TMA multicast**（`tma_partition(..., mcast_id, ...)`）——cluster 广播数据通路，与
-   tcgen05 绑定；SM120 的 TMA 无 multicast。
-5. **DSMEM 分布式共享内存交换**（bwd dQ 的 2-CTA 交换，论文 §3.2.3）——cluster MMA 配套。
+4. **FA4 的 TMA multicast + 2-CTA UMMA 数据流**（`tma_partition(..., mcast_id, ...)`）——
+   SM120 没有 joint UMMA；multicast 功能虽存在，但不是官方优化 target，不能作为等价迁移。
+5. **FA4 的 DSMEM + 2-CTA joint-MMA 归约协议**（bwd dQ，论文 §3.2.3）——普通 DSMEM 在
+   SM120 可用，但没有配套 joint MMA，只能另行设计并实测 remote-SMEM/barrier 成本。
 6. **ld.red 硬件 rowmax**（`use_ldred_rowmax`，SM103）——tcgen05.ld.red。
 7. **2-CTA tmem 分配/回收协议**（`TmemAllocator(is_two_cta=...)`，`flash_fwd_sm100.py:910-916`）。
 8. **16 warps / 512 线程的大 warpgroup 结构**——不是指令问题，但 SM120 的 99KB smem 和
@@ -417,12 +425,12 @@ rescale_threshold 容忍行 max 滞后。
 
 ### ③ 软 exp2 模拟（`utils.py:760-820`，Cody-Waite + degree-3 多项式 + f32x2 packed FMA）
 
-纯数学、零硬件依赖。SM120 的 MUFU 吞吐（大概率 16/clk，甚至更低）对比 tensor core
-更快拉开，exp 是我们 MLA decode 的隐藏瓶颈。实现层面有三档可抄：
+纯数学、零硬件依赖。SM120 的 MUFU 吞吐没有足够公开证据支持具体数字；只有 profiler 证明
+MUFU/SFU 饱和后，才能把 exp 判成 decode 瓶颈。实现层面有三档可抄：
 `ex2_emulation_2`（`760-777`，2 元素包装）、`e2e_asm2`（`781-820`，`fma.rn.ftz.f32x2`
 手写 SASS）、以及 `flash_fwd_sm100.py:99-110` 的**混用调参表**（freq=10~32、
 res=6~8、start_frg，只模拟 10-25% 元素，保住寄存器）。注意 B300 系列 MUFU 翻倍到
-32/clk，所以在 SM120 上软 exp2 的收益系数要实测，但方向确定。
+32/clk，所以在 SM120 上软 exp2 的收益和方向都要用软/硬混合 A/B 决定，不能预设正收益。
 
 ### ④ 条件 rescale：跳过 online softmax 的 O 重标定（`softmax.py:293-297` + `2542`）
 

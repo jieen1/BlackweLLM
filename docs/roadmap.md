@@ -997,14 +997,14 @@ drafter + 投机专用 `kv_cache_dtype`）读代码后发现**不完全对**—�
 - TURBO_ATTN（FP8 QK MMA）的质量回归修复：per-head descale / Hadamard 旋转 /
   自适应 FP8-BF16 切换。收益 +6%，但 code 工作负载接受率会从 97.8% 掉到 58.6%，
   当前默认关闭。
-- FA4 技法用于 prefill / extend 路径（TMA、persistent scheduler、FP8 softmax）。
-  **T0 触发条件**（`investigation-queue.md` D-6，**保持观察，不要提前动**）：FlashAttention
-  维护者已合入 sm120 PR（#2413，"WIP"），并有面向 5090 的 TMA + warp specialization PR
-  在做（#2440，正是这里计划要移植的技法）。但 FA4 算法本体上不了 SM120（缺 tcgen05/TMEM）；
-  当前 sm120 路径只有 FP16/BF16、`main` 上部分路径仍报错、在 5090 上比 FA2 **慢约 5%**。
-  触发条件是"那批 PR 落到 main 且在 sm120 上跑赢 FA2"——到那时才从"自己移植"变成
-  "评估采纳"。
-- FP8 attention 的 `num_stages≥2`（SMEM 36 KB « 99 KB，有余量）。
+- FA4 技法用于 Qwen3.8 attention / prefill / extend。**2026-08-15 更新**：先按 SM100/SM120 物理
+  能力过滤——不尝试 `tcgen05`/TMEM/2-CTA joint UMMA；保留普通 TMA、cluster/DSMEM、CLC、
+  conditional rescale、packed arithmetic、调度和软件流水。b12x 已实现 TMA、Pack-GQA、BF16 P、
+  SplitKV 和近似 exp2，下一批按真实 profile 补 conditional rescale、SplitKV/tile/stage 联合调优、
+  page metadata 复用和 producer-ahead。见
+  [`qwen38-sm120-cuda133-fa4-optimization-plan.md`](qwen38-sm120-cuda133-fa4-optimization-plan.md)。
+- FP8 attention 的 `num_stages=1/2` A/B：hd256 两级虽然可能装进 99 KiB，但可能损失 2 CTA/SM
+  residency；不再把 `num_stages≥2` 预设为必然收益。
 - MoE 输出中心并行（Warp Decode 类方案），2–4 周量级，长期备选。
 - GDN kernel 自研（依赖 Track B 的 profiling 结论）。
 - **NVFP4 per-token online MoE 量化**（`investigation-queue.md` D-7，vLLM v0.26.0 +

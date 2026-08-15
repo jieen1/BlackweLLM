@@ -877,13 +877,15 @@ DSpark）。**分两步，先做便宜的那步**：
 **结论：D-5 从待办清单移除，不是降级，是核实后发现已经做到。**
 
 - [ ] **F3** TURBO_ATTN 质量回归修复（per-head descale / Hadamard 旋转 / 自适应切换）：收益 +6%，但 code 接受率 97.8% → 58.6%，当前默认关闭
-- [ ] **F4** FA4 技法用于 prefill / extend（TMA、persistent scheduler、FP8 softmax）。
-  **T0 触发条件**（`investigation-queue.md` D-6）：FlashAttention 维护者已合入 sm120 PR（#2413）且有
-  面向 5090 的 TMA + warp specialization PR 在做（#2440），但 FA4 本体上不了 SM120（缺 tcgen05/TMEM），
-  当前 sm120 路径只有 FP16/BF16、`main` 部分路径仍报错、在 5090 上比 FA2 **慢约 5%**。**保持观察，
-  不要提前动**——触发条件是"那批 PR 落到 main 且在 sm120 上跑赢 FA2"，到那时才从"自己移植"变成
-  "评估采纳"
-- [ ] **F5** FP8 attention `num_stages ≥ 2`（SMEM 36 KB « 99 KB）
+- [~] **F4** 把 FA4 的可迁移技法用于 Qwen3.8/b12x，而非评估整包替换。**2026-08-15 已先完成
+  SM100/SM120 硬件拆分**：SM120 物理缺失的是 `tcgen05`/TMEM/2-CTA joint UMMA；普通 TMA、
+  cluster/DSMEM、CLC 可用，TMA multicast 功能存在但不是 SM120 官方优化 target。b12x 已有 TMA、
+  Pack-GQA、BF16 P、SplitKV 和近似 exp2；下一批按 profile 做 conditional rescale、packed `f32x2`、
+  SplitKV/tile/stage 联合调优和 page metadata 复用。完整迁移矩阵与门禁见
+  [`qwen38-sm120-cuda133-fa4-optimization-plan.md`](qwen38-sm120-cuda133-fa4-optimization-plan.md)。
+- [ ] **F5** Qwen3.8 FP8 attention `num_stages=1/2` profile-driven A/B。不能再用“理论 SMEM 有余量”直接
+  推导 `num_stages≥2`：hd256 两级约 72–80 KiB，可能把 2 CTA/SM 降为 1；只有 NCU 证明 TMA/long
+  scoreboard stall 主导才实施。
 - [ ] **F6** sparkinfer 剩余 9 处 gate（`7a1d69d` 只放宽 13 处中的 4 处，其余是**刻意留下**的 scope 限制）
   - ⚠️ **硬风险**：`planner.py` 的 grid occupancy 预算常量按 `num_kv_heads=4` 推导，用到 8 **需重新推导**，不是放宽谓词就够
   - ⚠️ sparkinfer 源码改动写清楚交给该团队，不直接改
