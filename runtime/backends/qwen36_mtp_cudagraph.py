@@ -417,6 +417,16 @@ class Qwen36MTPVerifyCudaGraph:
         self.qo_len = engine.k + 1
         self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._hidden: dict[int, torch.Tensor] = {}
+        #: One shared graph-private memory pool for every batch bucket in
+        #: this family (plan §4.6 P0-M3): the B=1..num_slots verify graphs
+        #: are mutually exclusive (exactly one replays per round, and its
+        #: pool-owned hidden/logits are consumed by acceptance before the
+        #: next replay), so they can share one pool exactly the way
+        #: ``Qwen36Backend._capture_decode_graphs`` shares ``_graph_pool``
+        #: across the main decode buckets. NOT shared with the draft/sync
+        #: families: this family's hidden/logits are still referenced by
+        #: the acceptance path when other families replay.
+        self._graph_pool: object | None = None
         #: Graph-owned ``[B, qo_len, vocab]`` lm_head output captured
         #: alongside the verify body.  ``compute_logits`` used to run
         #: outside the graph and allocate an ~8 MiB logits tensor every
@@ -631,9 +641,11 @@ class Qwen36MTPVerifyCudaGraph:
 
                 self._fill(slots, [[0] * self.qo_len for _ in slots], [0] * batch_size)
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
+                with torch.cuda.graph(graph, pool=self._graph_pool):
                     hidden = self.model.verify_batch(batch)
                     logits = self.model.compute_logits(hidden)
+                if self._graph_pool is None:
+                    self._graph_pool = graph.pool()
                 self._graphs[batch_size] = graph
                 self._hidden[batch_size] = hidden
                 self._logits[batch_size] = logits
@@ -734,6 +746,12 @@ class Qwen36MTPDraftCudaGraph:
             self._page_table_slots[batch] = None
         self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._draft_tokens: dict[int, torch.Tensor] = {}  # B -> [B, K-1]
+        #: One shared graph-private memory pool for every batch bucket in
+        #: this family (plan §4.6 P0-M3): the B=1..num_slots draft graphs
+        #: are mutually exclusive (exactly one replays per round, and its
+        #: pool-owned draft-token rows are consumed by the same round's
+        #: verify fill), same sharing discipline as the main decode graphs.
+        self._graph_pool: object | None = None
         self._captured = False
 
     def _fill(
@@ -891,8 +909,10 @@ class Qwen36MTPDraftCudaGraph:
 
             self._fill(slots, [0] * batch, zeros, [0] * batch)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, pool=self._graph_pool):
                 self._draft_tokens[batch] = self._forward_all_steps(batch)
+            if self._graph_pool is None:
+                self._graph_pool = graph.pool()
             self._graphs[batch] = graph
         self._captured = True
         for cache in self.engine._caches:
@@ -989,6 +1009,15 @@ class Qwen36MTPBatchedSync:
         self._verify_attn_outputs: dict[tuple[int, int], torch.Tensor] = {}
         self._verify_page_table_slots: dict[tuple[int, int], tuple[object, ...] | None] = {}
         self._verify_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        #: One shared graph-private memory pool for ALL sync + sync-verify
+        #: buckets in this family (plan §4.6 P0-M3, the 28->1 merge): every
+        #: graph body here writes its results into the pre-allocated
+        #: ``_step_tokens``/``_step_hidden`` buffers, so nothing a graph
+        #: produces lives in the pool -- pool contents are pure
+        #: intermediates, and only one bucket replays per round. Kept
+        #: separate from the verify/draft families on purpose (their
+        #: pool-owned outputs are consumed across family boundaries).
+        self._graph_pool: object | None = None
         self._step_tokens: dict[int, torch.Tensor] = {}
         self._step_hidden: dict[int, torch.Tensor] = {}
         self._verify_supported = hasattr(self.mtp_layer.self_attn, "verify_batch")
@@ -1387,8 +1416,10 @@ class Qwen36MTPBatchedSync:
                             self._forward_all_steps(batch, query_len)
                     torch.cuda.current_stream().wait_stream(side)
                     graph = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph):
+                    with torch.cuda.graph(graph, pool=self._graph_pool):
                         self._forward_all_steps(batch, query_len)
+                    if self._graph_pool is None:
+                        self._graph_pool = graph.pool()
                     self._graphs[(batch, query_len)] = graph
                     if self._verify_supported and query_len > 1:
                         zero_rows = [zeros[row : row + 1, :query_len] for row in range(batch)]
@@ -1399,7 +1430,7 @@ class Qwen36MTPBatchedSync:
                             [0] * batch,
                         )
                         verify_graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(verify_graph):
+                        with torch.cuda.graph(verify_graph, pool=self._graph_pool):
                             self._forward_verify_body(batch, query_len)
                         self._verify_graphs[(batch, query_len)] = verify_graph
         except Exception:
