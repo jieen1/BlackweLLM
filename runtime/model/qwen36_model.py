@@ -3477,6 +3477,11 @@ class Qwen36MLP(nn.Module):
             block_expert_ids=buffers.block_expert_ids,
             packed_route_count=buffers.packed_route_count,
             expert_offsets=buffers.expert_offsets,
+            # Without this the route-packing path falls back to a fresh
+            # torch.empty per call -- invisible in eager mode, fatal under
+            # CUDA Graph capture (measured 2026-08-16: MTP verify capture
+            # failed, decode degraded to eager, 108 -> 15.8 tok/s).
+            expert_counts=buffers.expert_counts,
             fast_math=True,
         )
         return out.reshape(*orig_shape[:-1], self.hidden_size)
