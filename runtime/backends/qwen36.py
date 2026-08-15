@@ -1978,6 +1978,25 @@ class Qwen36Backend:
         try:
             captured_batch = self._capture_decode_graphs()
             self.cg_status["decode"] = "captured" if captured_batch else "failed"
+            if captured_batch == self.num_slots:
+                # Plan §4.5 P0-M2 steps 2-3: every batch size now replays a
+                # captured graph, so the eager batched drivers and the shared
+                # decode-mode attention arena are dead residency. Both rebuild
+                # lazily if a degraded path ever needs them again. The decode
+                # arena is kept while any MTP graph is unhealthy: the eager
+                # MTP fallback still decodes through the per-layer path.
+                released = self.pool.release_eager_decode_drivers()
+                dropped = 0
+                mtp_healthy = self._mtp is None or self._mtp.cuda_graphs_healthy()
+                if mtp_healthy:
+                    dropped = self.model.release_decode_workspaces()
+                logger.info(
+                    "Qwen3.6 decode graphs complete: released %d eager drivers, "
+                    "%d shared decode workspace(s) (mtp_healthy=%s)",
+                    released,
+                    dropped,
+                    mtp_healthy,
+                )
             return captured_batch
         except Exception:  # pragma: no cover - depends on driver/kernel support
             logger.exception("Qwen3.6 decode CUDA Graph capture failed; falling back to eager")

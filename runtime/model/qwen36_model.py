@@ -1825,6 +1825,21 @@ def _shared_attention_workspace_key(
     )
 
 
+def release_shared_decode_workspaces() -> int:
+    """Drop every shared ``mode="decode"`` workspace (plan §4.5 P0-M2
+    step 3).
+
+    Decode is CUDA-graph-replayed in production once capture succeeds; the
+    eager per-layer decode path (serial control group, capture-failure
+    fallback) is the only consumer left, and a later call rebuilds a
+    workspace on demand. Returns the number of workspaces dropped.
+    """
+    decode_keys = [key for key in _SHARED_ATTN_WORKSPACES if key[0] == "decode"]
+    for key in decode_keys:
+        del _SHARED_ATTN_WORKSPACES[key]
+    return len(decode_keys)
+
+
 class Qwen36BatchedDecodeAttention:
     """One shared paged-attention driver for a whole batched decode step (B2).
 
@@ -4396,6 +4411,28 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
                 )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
+
+    def release_decode_workspaces(self) -> int:
+        """Release the shared decode-mode attention arenas (plan §4.5
+        P0-M2 step 3).
+
+        Production decode is CUDA-graph-replayed; the eager decode path
+        (serial control group / capture-failure fallback) is the only
+        consumer of the ``mode="decode"`` workspace, and every layer also
+        caches a per-layer reference that must be dropped for the arena to
+        actually become collectable. A later eager decode rebuilds the
+        workspace on demand. Returns the number of shared workspaces
+        dropped.
+        """
+        dropped = release_shared_decode_workspaces()
+        layers = list(self.model.layers)
+        if self.mtp is not None:
+            layers.extend(self.mtp.layers)
+        for layer in layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None:
+                attn._decode_workspace = None
+        return dropped
 
     def forward(
         self,

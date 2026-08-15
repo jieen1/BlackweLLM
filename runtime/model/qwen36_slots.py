@@ -1692,3 +1692,22 @@ class Qwen36SlotPool:
         """
         for batch in range(1, max_batch + 1):
             self.attention_driver(batch)
+
+    def release_eager_decode_drivers(self) -> int:
+        """Drop the eager batched-decode drivers (plan §4.5 P0-M2 step 2).
+
+        Called once every batch size has a captured decode graph: from then
+        on :meth:`attention_driver` always returns the graph driver, so the
+        eager drivers' fixed-capacity sparkinfer workspaces are dead
+        residency. The release is safe rather than final -- a batch size
+        that ever needs an eager driver again rebuilds it lazily (paying
+        the one-time compile again, which only a degraded fallback path
+        would). Returns the number of drivers released.
+        """
+        released = len(self.decode_attn)
+        if not released:
+            return 0
+        self.decode_attn.clear()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+        return released
