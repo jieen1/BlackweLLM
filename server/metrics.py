@@ -289,6 +289,43 @@ def record_slot_kv_usage(slot: int, used_blocks: int, total_blocks: int) -> None
         _slot_kv_usage[slot] = used_blocks / max(total_blocks, 1)
 
 
+#: Phase 0 KV capacity snapshot (`.omx/plans/qwen38-dynamic-context-vllm-plan.md`
+#: Phase 0 -- "显存、页池、前缀缓存、admission 的状态必须可观测、可诊断").
+#: Populated by the /metrics handler from the backend's
+#: ``kv_capacity_snapshot()`` so the Prometheus surface and the startup log
+#: report the same numbers. Key names mirror
+#: :meth:`runtime.model.qwen36_slots.Qwen36SlotPool.capacity_snapshot`.
+_qwen_kv_capacity: dict[str, float] = {}
+
+
+def record_qwen_kv_capacity(snapshot: dict[str, int]) -> None:
+    """Record the Qwen KV capacity snapshot for the /metrics gauges."""
+    with _LOCK:
+        _qwen_kv_capacity.clear()
+        _qwen_kv_capacity.update(snapshot)
+
+
+def _render_qwen_kv_capacity(lines: list[str], model_name: str) -> None:
+    with _LOCK:
+        snap = dict(_qwen_kv_capacity)
+    if not snap:
+        return
+    keys = [
+        ("qwen_kv_pool_bytes", "Total Qwen KV tensor storage bytes (formula)"),
+        ("qwen_kv_pool_bytes_measured", "Total Qwen KV tensor storage bytes (measured)"),
+        ("qwen_kv_scratch_row_bytes", "Qwen scratch-row KV bytes (reclaim target)"),
+        ("qwen_kv_total_bundles", "Physical KV pages allocated (slots + scratch)"),
+        ("qwen_kv_pages_per_slot", "Logical pages per slot"),
+        ("qwen_kv_slots", "Configured slot count"),
+        ("qwen_kv_full_attention_layers", "Full-attention layers feeding the KV pool"),
+        ("qwen_kv_gdn_layers", "GDN/recurrent layers"),
+    ]
+    for key, help_text in keys:
+        lines.append(f"# HELP blackwellm:{key} {help_text}")
+        lines.append(f"# TYPE blackwellm:{key} gauge")
+        lines.append(f'blackwellm:{key}{{model_name="{model_name}"}} {snap.get(key, -1)}')
+
+
 def render_d2_metrics(model_name: str = "qwen3.6-27b") -> str:
     """Render D2 metrics in Prometheus exposition format."""
     lines: list[str] = []

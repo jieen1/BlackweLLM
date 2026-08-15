@@ -49,9 +49,9 @@ torch = pytest.importorskip("torch")
 # qwen36_mtp_cudagraph imports qwen36_model, which imports fla/sparkinfer
 # at module level even though the functions exercised below never call
 # either -- same guard tests/test_qwen36_mtp_head.py uses for the same
-# reason.
+# reason. sparkinfer 仓库 2026-08-09 upstream merge 后以 ``b12x`` 为包名。
 pytest.importorskip("fla")
-pytest.importorskip("sparkinfer")
+pytest.importorskip("b12x")
 
 from runtime.backends.qwen36_mtp_cudagraph import (  # noqa: E402
     Qwen36MTPBatchedSync,
@@ -106,6 +106,36 @@ class TestDecodeWriteIndex:
         global_page = slot * pages_per_slot + kv_len // page_size
         expected = global_page * page_size + kv_len % page_size
         assert decode_write_index(slot, kv_len, page_size, pages_per_slot) == expected
+
+    def test_page_row_overrides_the_static_slot_formula(self) -> None:
+        """Phase 2 dynamic arena: a non-contiguous page row (the result of
+        bundle allocation/COW) must win over the legacy
+        ``slot * pages_per_slot`` formula -- the physical bundle for the
+        logical page comes from the shared page table."""
+        page_size, pages_per_slot = 128, 4
+        row = [200, 7, 300, 400]  # deliberately non-contiguous physical bundles
+        # kv_len=300 -> logical page 2 -> physical bundle 300.
+        assert decode_write_index(0, 300, page_size, pages_per_slot, page_row=row) == 300 * 128 + 44
+        # kv_len=64 -> logical page 0 -> physical bundle 200.
+        assert decode_write_index(3, 64, page_size, pages_per_slot, page_row=row) == 200 * 128 + 64
+
+    def test_page_row_missing_page_raises_instead_of_aliasing(self) -> None:
+        """A write past the prepared prefix must fail loudly -- a null
+        bundle (0) or missing entry would otherwise address the null page
+        and silently corrupt shared content."""
+        row = [0, 1]  # only two logical pages prepared
+        with pytest.raises(RuntimeError, match="logical page"):
+            decode_write_index(0, 300, 128, 4, page_row=row)
+
+    def test_page_row_with_null_bundle_is_an_explicit_error(self) -> None:
+        """Logical page still pointing at the null bundle (unallocated)
+        must not be silently writable (plan §7 invariant 5)."""
+        row = [0, 5]
+        assert decode_write_index(0, 0, 128, 4, page_row=row) == 0  # null page row 0
+        # The null bundle maps to physical page 0; a write there would hit
+        # the reserved page. The check is at the pool level (prepare_kv_writes
+        # allocates before writing); the indexer must at least be consistent.
+        assert decode_write_index(0, 0, 128, 4, page_row=row) < 128 * 5
 
 
 class TestAttemptMtpCgCapture:

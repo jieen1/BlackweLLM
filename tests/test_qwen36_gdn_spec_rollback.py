@@ -19,7 +19,7 @@ torch = pytest.importorskip("torch")
 # kernels + paged attention), even though this file's own tests never call
 # either -- same guard tests/test_qwen36_slot_pool.py uses for the same reason.
 pytest.importorskip("fla")
-pytest.importorskip("sparkinfer")
+pytest.importorskip("b12x")
 
 from runtime.model import qwen36_model as qwen36_model_module  # noqa: E402
 from runtime.model.qwen36_model import (  # noqa: E402

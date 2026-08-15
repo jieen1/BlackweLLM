@@ -16,7 +16,7 @@ torch = pytest.importorskip("torch", reason="torch-free CI job")
 # qwen36_model imports fla and sparkinfer at module scope; the cpu-torch CI
 # job has neither, so self-skip there like the sibling qwen36 tests.
 pytest.importorskip("fla")
-pytest.importorskip("sparkinfer")
+pytest.importorskip("b12x")
 
 from runtime.model.compressed_tensors_linear import CompressedTensorsFP8ChannelLinear  # noqa: E402
 from runtime.model.qwen36_model import _bmm_project  # noqa: E402

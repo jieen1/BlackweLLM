@@ -116,6 +116,7 @@ from runtime.backends.protocol import (
 )
 from runtime.block_pool import ChunkedPrefillState
 from runtime.logprobs import compute_logprobs
+from runtime.model.qwen36_kv_arena import BlockKey
 from runtime.model.qwen36_model import Qwen36ForCausalLMSelfBuilt
 from runtime.model.qwen36_slots import Qwen36SlotPool
 from runtime.recurrent_state_pool import RecurrentStatePool
@@ -180,6 +181,34 @@ def _prefix_hash(token_ids: list[int], length: int) -> str:
     if sys.byteorder != "little":
         ids.byteswap()
     return hashlib.blake2b(ids.tobytes(), digest_size=16).hexdigest()
+
+
+def _chained_block_keys(
+    token_ids: list[int], kv_len: int, block_size: int
+) -> list[BlockKey]:
+    """Chained 128-bit block hashes for the committed prefix.
+
+    Phase 3: the arena's prefix cache is keyed per HASH BLOCK (the
+    checkpoint/block boundary, ``block_size``=64 in practice) by a chained
+    hash over ``[0, (i+1)*block_size)`` (``runtime.block_pool.hash_block_tokens``
+    shape -- block i's hash depends on the whole prefix, so a divergence at
+    any earlier token changes every later block's hash and lookup can stop
+    at the first miss). One physical KV page (``page_size``=128) carries two
+    hash blocks, both pointing at the same bundle -- vLLM's
+    ``hash_block_size < block_size`` fine-grained lookup (plan §5.1C:
+    finalized *blocks* enter the cache, including a page whose second half
+    is still empty). ``BlockKey.num_tokens`` carries the whole-prefix token
+    count at each block boundary, the arena's hit boundary.
+    """
+    from runtime.block_pool import hash_block_tokens
+
+    keys: list[BlockKey] = []
+    parent: int | None = None
+    for end in range(block_size, kv_len + 1, block_size):
+        value = hash_block_tokens(parent, token_ids[:end], ())
+        keys.append(BlockKey(value=value, num_tokens=end))
+        parent = value
+    return keys
 
 
 @dataclass
@@ -250,6 +279,9 @@ class Qwen36Backend:
         checkpoint_byte_budget: int | None = None,
         checkpoint_budget_multiple: int | None = None,
         batched_decode: bool = True,
+        dynamic_arena: bool = False,
+        pool_bundles: int | None = None,
+        watermark_bundles: int = 0,
     ) -> None:
         # Verify-attention numerics-mode policy (2026-08-07, five-way A/B in
         # notes/2026-08-06-128k-c4-parity-profiling.md S19): the DEFAULT is
@@ -297,6 +329,20 @@ class Qwen36Backend:
             else enable_persistent_prefix_cache
         )
         self.batched_decode = batched_decode
+        # Phase 3 dynamic arena: the persistent scratch-arena cache still
+        # addresses a fixed physical scratch row (``_persistent_free_scratch_pages``
+        # + ``scratch_row * pages_per_slot`` offsets), which does not exist in
+        # dynamic mode -- KV pages are handed out per bundle. Dynamic mode's
+        # prefix cache is the Phase 3 arena-owned CACHED_REF0 path
+        # (publish_committed_blocks / restore_prefix_from_arena); the scratch
+        # arena is refused explicitly rather than silently addressing pages
+        # it does not own.
+        if dynamic_arena and self.enable_persistent_prefix_cache:
+            logger.warning(
+                "Qwen3.6 dynamic KV arena: persistent scratch-arena prefix cache disabled "
+                "(dynamic mode uses the arena's CACHED_REF0 prefix cache instead)"
+            )
+            self.enable_persistent_prefix_cache = False
 
         self.pool = Qwen36SlotPool(
             model,
@@ -304,7 +350,44 @@ class Qwen36Backend:
             max_seq_len=max_seq_len,
             device=device,
             dtype=dtype,
+            dynamic_arena=dynamic_arena,
+            pool_bundles=pool_bundles,
+            watermark_bundles=watermark_bundles,
         )
+        # Phase 0 contract assertion: the formula-based KV capacity must
+        # equal the actual tensor storage before anything downstream starts
+        # reporting either number (`.omx/plans/qwen38-dynamic-context-vllm-plan.md`
+        # Phase 0 -- "启动日志给出公式化 KV bytes,与实际 tensor storage bytes
+        # 完全一致"). Refuses construction rather than logging a number that
+        # disagrees with the tensors it describes.
+        self.pool.assert_kv_storage_consistent()
+        snap = self.pool.capacity_snapshot()
+        if self.device.type == "cuda":
+            # Cold-start point 2: after KV allocation. Graph capture happens
+            # later on the explicit capture path, which logs its own memory
+            # step (point 3); the 4-slot full-context state (point 4) is a
+            # request-time property recorded per round, not a load-time one.
+            # Reported in GiB so a startup log and `nvidia-smi` stay
+            # comparable, alongside the raw byte count for exact math.
+            _gib = 1024 * 1024 * 1024
+            logger.info(
+                "Qwen3.6 KV arena allocated: formula=%d bytes (%.3f GiB), "
+                "measured=%d bytes (%.3f GiB), rows=%d (slots=%d + scratch=%d), "
+                "pages_per_slot=%d, kv_bytes_per_slot=%d bytes (%.3f GiB), "
+                "recurrent_bytes_per_slot=%d bytes (%.3f GiB)",
+                snap["kv_bytes_total"],
+                snap["kv_bytes_total"] / _gib,
+                snap["kv_bytes_measured"],
+                snap["kv_bytes_measured"] / _gib,
+                snap["total_rows"],
+                snap["num_slots"],
+                snap["scratch_row"],
+                snap["pages_per_slot"],
+                snap["kv_bytes_per_slot"],
+                snap["kv_bytes_per_slot"] / _gib,
+                snap["recurrent_bytes_per_slot"],
+                snap["recurrent_bytes_per_slot"] / _gib,
+            )
         if self.pool.page_size % block_size != 0:
             # §1.7 of the A3 design says this divisibility holds today by
             # coincidence of two independently chosen defaults and must be
@@ -509,6 +592,17 @@ class Qwen36Backend:
             dflash_cg_status=tuple(sorted(cg_status.items())),
         )
 
+    def kv_capacity_snapshot(self) -> dict[str, int]:
+        """Read-only KV capacity/geometry snapshot for ``/debug/stats``.
+
+        Phase 0 evidence surface (``.omx/plans/qwen38-dynamic-context-vllm-plan.md``
+        Phase 0): the formula capacity, the measured tensor storage, and the
+        physical row layout are all reported together so a startup log, the
+        debug endpoint, and a GPU verification script cannot disagree about
+        what was allocated. Keys match :meth:`Qwen36SlotPool.capacity_snapshot`.
+        """
+        return self.pool.capacity_snapshot()
+
     def reset_slot(self, slot: int) -> None:
         """Release ``slot``, saving its prefix cache; zero its GDN state.
 
@@ -529,7 +623,29 @@ class Qwen36Backend:
             self._prefix_cache_kv_len[slot] = self.pool.slot_kv_len[slot]
             if self._mtp is not None:
                 self._mtp.preserve_prefix(slot, self.pool.slot_kv_len[slot])
-            self._store_persistent_prefix(slot)
+            if self.pool.dynamic_arena:
+                # Phase 3: publish the committed prefix's full pages into the
+                # arena BEFORE the reset releases the bundles. The hashes are
+                # keyed on live ownership; reset's decref then parks them at
+                # ref_cnt=0 (CACHED_REF0, LRU tail) where prefix lookup can
+                # revive them -- the prefix KV survives the slot, owned by
+                # the arena, evicted only on real pressure (plan §6.4).
+                try:
+                    keys = _chained_block_keys(
+                        self.pool.slot_committed_tokens[slot],
+                        self.pool.slot_kv_len[slot],
+                        self.block_size,
+                    )
+                    self.pool.publish_committed_blocks(
+                        slot, self.pool.slot_kv_len[slot], keys, self.block_size
+                    )
+                except RuntimeError:
+                    # A partial page or an allocation gap: publish what is
+                    # safely full; the rest stays private and is simply not
+                    # cached (a compute miss on restore, never corruption).
+                    pass
+            else:
+                self._store_persistent_prefix(slot)
         self.pool.reset_slot(slot)
         self._pending_prefix_hits.pop(slot, None)
         self._pending_cached_hidden.pop(slot, None)
@@ -1626,7 +1742,18 @@ class Qwen36Backend:
             # overwritten.  Its checkpoint must disappear in lockstep;
             # otherwise a later token comparison could bless unrelated KV.
             self.drop_prefix_cache(slot)
-            self.pool.share_prefix_kv(source_slot, slot, length)
+            if self.pool.dynamic_arena:
+                # Phase 3: revive the prefix KV from the arena's cached
+                # blocks instead of aliasing the source slot's pages (which
+                # dynamic reset returns to the arena). Look up the request's
+                # chained hashes, touch the cached bundles (CACHED_REF0 ->
+                # LIVE_SHARED), and point the slot's row at them.
+                keys = _chained_block_keys(prompt_ids, length, self.block_size)
+                restored, _bundle_ids = self.pool.restore_prefix_from_arena(slot, length, keys)
+                if restored < length:
+                    return 0
+            else:
+                self.pool.share_prefix_kv(source_slot, slot, length)
             self.stats["prefix_cross_slot_restores"] += 1
         self.pool.restore_recurrent_state(slot, tensors)
         self.pool.rewind_slot(slot, length)

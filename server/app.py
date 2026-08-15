@@ -844,6 +844,17 @@ async def debug_stats():
             engine.stats["_memory_breakdown_dbg"] = memory_breakdown()
         except Exception:  # pragma: no cover - observability must not die
             logger.exception("memory breakdown failed; reporting without it")
+    # Phase 0 KV capacity evidence (`.omx/plans/qwen38-dynamic-context-vllm-plan.md`):
+    # formula KV bytes, measured tensor storage, and physical row layout from
+    # the Qwen pool, present only when the backend opted in. This is the
+    # load-time-config surface -- pool size, scratch row, per-slot geometry --
+    # that cannot be inferred from a warm engine.
+    kv_capacity = getattr(engine.runner, "kv_capacity_snapshot", None)
+    if kv_capacity is not None:
+        try:
+            engine.stats["_qwen_kv_capacity_dbg"] = kv_capacity()
+        except Exception:  # pragma: no cover - observability must not die
+            logger.exception("KV capacity snapshot failed; reporting without it")
     return engine.stats
 
 
@@ -1592,6 +1603,18 @@ async def metrics_endpoint():
 
     # D2: runtime-internal metrics (MTP acceptance, prefix cache depth, per-slot KV)
     lines.append(metrics.render_d2_metrics(engine.MODEL))
+
+    # Phase 0 Qwen KV capacity gauges: load-time pool geometry, measured only
+    # when the backend opted in (kv_capacity_snapshot). Absent for Laguna, so
+    # this surface never claims a Qwen-only number for another backend.
+    kv_capacity = getattr(runner, "kv_capacity_snapshot", None)
+    if kv_capacity is not None:
+        try:
+            metrics.record_qwen_kv_capacity(kv_capacity())
+        except Exception:  # pragma: no cover - observability must not die
+            logger.exception("KV capacity snapshot failed; omitting Qwen gauges")
+        _render_kv = getattr(metrics, "_render_qwen_kv_capacity")
+        _render_kv(lines, engine.MODEL)
 
     # D3: request-level tracing stats
     lines.append(tracer.render_prometheus(engine.MODEL))

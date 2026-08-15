@@ -113,6 +113,26 @@ def record(name: str, ok: bool, detail: str = "") -> None:
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f" -- {detail}" if detail else ""))
 
 
+def _backend_kwargs(args) -> dict:
+    """Shared Qwen36Backend constructor kwargs.
+
+    Phase 2: ``--dynamic-arena`` switches the pool to the global page-bundle
+    arena. Strict-mode pool sizing is the default there: full concurrent
+    capacity (num_slots x pages_per_slot) plus a small COW reserve, which at
+    the B2 default geometry (1 slot x 4 pages at 512 tokens) is trivially
+    sufficient and makes the same gates run on the dynamic ownership path.
+    """
+    kwargs = {
+        "num_slots": args.slots,
+        "max_seq_len": args.max_seq_len,
+        "device": "cuda",
+        "dtype": torch.bfloat16,
+    }
+    if getattr(args, "dynamic_arena", False):
+        kwargs["dynamic_arena"] = True
+    return kwargs
+
+
 # ---------------------------------------------------------------------------
 # Reference: B1's eager path, verbatim.
 # ---------------------------------------------------------------------------
@@ -168,15 +188,8 @@ def logit_diff(a: torch.Tensor, b: torch.Tensor) -> str:
 
 def check_serial_matches_b1(model, prompts, steps, args) -> None:
     print("\n== 1. serial serving vs B1 eager (bit-exact gate) ==")
-    backend = Qwen36Backend(
-        model,
-        num_slots=args.slots,
-        max_seq_len=args.max_seq_len,
-        device="cuda",
-        dtype=torch.bfloat16,
-        batched_decode=False,
-        enable_prefix_cache=False,
-    )
+    backend = Qwen36Backend(model, batched_decode=False, enable_prefix_cache=False,
+                             **_backend_kwargs(args))
     for i, ids in enumerate(prompts):
         ref_tokens, ref_logits = b1_eager_greedy(model, ids, steps)
         got = backend_greedy(backend, i % args.slots, ids, steps)
@@ -195,28 +208,14 @@ def check_serial_matches_b1(model, prompts, steps, args) -> None:
 
 def check_batched_matches_serial(model, prompts, steps, args) -> None:
     print("\n== 2. batched decode vs serial decode ==")
-    serial = Qwen36Backend(
-        model,
-        num_slots=args.slots,
-        max_seq_len=args.max_seq_len,
-        device="cuda",
-        dtype=torch.bfloat16,
-        batched_decode=False,
-        enable_prefix_cache=False,
-    )
+    serial = Qwen36Backend(model, batched_decode=False, enable_prefix_cache=False,
+                            **_backend_kwargs(args))
     ref = [backend_greedy(serial, 0, ids, steps) for ids in prompts]
     del serial
     torch.cuda.empty_cache()
 
-    batched = Qwen36Backend(
-        model,
-        num_slots=args.slots,
-        max_seq_len=args.max_seq_len,
-        device="cuda",
-        dtype=torch.bfloat16,
-        batched_decode=True,
-        enable_prefix_cache=False,
-    )
+    batched = Qwen36Backend(model, batched_decode=True, enable_prefix_cache=False,
+                             **_backend_kwargs(args))
     for i, ids in enumerate(prompts):
         got = backend_greedy(batched, 0, ids, steps)
         same = got == ref[i]
@@ -231,15 +230,8 @@ def check_batched_matches_serial(model, prompts, steps, args) -> None:
 
 def check_concurrency(model, prompts, steps, args) -> None:
     print(f"\n== 3. concurrency: {args.slots} slots in one round, slot isolation ==")
-    backend = Qwen36Backend(
-        model,
-        num_slots=args.slots,
-        max_seq_len=args.max_seq_len,
-        device="cuda",
-        dtype=torch.bfloat16,
-        batched_decode=True,
-        enable_prefix_cache=False,
-    )
+    backend = Qwen36Backend(model, batched_decode=True, enable_prefix_cache=False,
+                             **_backend_kwargs(args))
     use = prompts[: args.slots]
     alone = [backend_greedy(backend, i, ids, steps) for i, ids in enumerate(use)]
     for s in range(len(use)):
@@ -306,16 +298,11 @@ def check_solo_throughput(backend, prompts, steps) -> float:
 
 def check_prefix_cache(model, prompts, steps, args, tokenizer) -> None:
     print("\n== 5. prefix cache: (kv_hit, state_hit) and a real resume ==")
-    backend = Qwen36Backend(
-        model,
-        num_slots=args.slots,
-        max_seq_len=args.max_seq_len,
-        device="cuda",
-        dtype=torch.bfloat16,
-        batched_decode=True,
-        enable_prefix_cache=True,
-        block_size=args.block_size,
-    )
+    # Phase 3: dynamic arena has its own prefix cache (arena-owned CACHED_REF0
+    # blocks via publish_committed_blocks / restore_prefix_from_arena); the
+    # same resume checks run against it.
+    backend = Qwen36Backend(model, batched_decode=True, enable_prefix_cache=True,
+                             block_size=args.block_size, **_backend_kwargs(args))
     base = prompts[0]
     # Grow the first prompt until it is long enough to cross a block boundary
     # during decode, which is when a checkpoint gets taken.
@@ -387,15 +374,8 @@ def check_prefix_cache(model, prompts, steps, args, tokenizer) -> None:
 
 def check_cuda_graph(model, prompts, steps, args) -> None:
     print("\n== 4. CUDA Graph decode capture + replay ==")
-    backend = Qwen36Backend(
-        model,
-        num_slots=args.slots,
-        max_seq_len=args.max_seq_len,
-        device="cuda",
-        dtype=torch.bfloat16,
-        batched_decode=True,
-        enable_prefix_cache=False,
-    )
+    backend = Qwen36Backend(model, batched_decode=True, enable_prefix_cache=False,
+                             **_backend_kwargs(args))
     eager_ref = [backend_greedy(backend, 0, ids, steps) for ids in prompts[:2]]
     for s in range(args.slots):
         backend.reset_slot(s)
@@ -475,6 +455,16 @@ def main() -> None:
         "--uniform-prefill",
         action="store_true",
         help="make the first two B2 prompts same-length to exercise B×Q prefill",
+    )
+    ap.add_argument(
+        "--dynamic-arena",
+        action="store_true",
+        help=(
+            "Phase 2: run every check against the dynamic page-bundle arena "
+            "(Qwen36SlotPool(dynamic_arena=True)) instead of the legacy fixed-row "
+            "layout. Same prompts, same gates -- this is the A/B the plan's "
+            "Phase 2 acceptance matrix is built on."
+        ),
     )
     ap.add_argument("--model-path", type=str, default=DEFAULT_MODEL_PATH)
     args = ap.parse_args()

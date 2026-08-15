@@ -34,7 +34,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("fla")
-pytest.importorskip("sparkinfer")
+pytest.importorskip("b12x")
 
 from runtime.backends.qwen36 import Qwen36Backend  # noqa: E402
 from runtime.backends.qwen36_mtp import Qwen36MTPEngine, Qwen36MTPGDNRows  # noqa: E402

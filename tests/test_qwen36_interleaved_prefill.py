@@ -38,7 +38,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("fla")
-pytest.importorskip("sparkinfer")
+pytest.importorskip("b12x")
 
 from runtime.backends.qwen36 import Qwen36Backend  # noqa: E402
 from runtime.sampling import SamplingParams  # noqa: E402

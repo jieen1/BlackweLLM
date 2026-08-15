@@ -53,10 +53,12 @@ assignment supports, and it is what the prefix-cache path below implements.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
 
+from runtime.model.qwen36_kv_arena import BlockKey
 from runtime.model.qwen36_model import (
     _PAGED_ATTENTION_PAGE_SIZE,
     GdnLayerState,
@@ -108,6 +110,18 @@ class SlotPoolGeometry:
     #: ``notes/prefix-cache-design.md``'s "~151MB/checkpoint".
     recurrent_bytes_per_slot: int
     kv_bytes_per_slot: int
+    #: Physical KV rows actually allocated: ``num_slots`` real slots + one
+    #: scratch row. ``kv_bytes_total`` is the formula equivalent of the
+    #: actual tensor storage (per-layer ``total_rows * pages_per_slot *
+    #: page_size * kv_heads * head_dim * element_size * 2`` summed over
+    #: full-attention layers); :meth:`Qwen36SlotPool.kv_storage_bytes`
+    #: reports the measured tensor storage, and the two must agree. This is
+    #: the number Phase 0 of ``.omx/plans/qwen38-dynamic-context-vllm-plan.md``
+    #: locks before any ownership change: current layout with the scratch row
+    #: is 45 GiB-equivalent at 4×256K, and the dynamic arena's first win is
+    #: the 9 GiB scratch row.
+    total_rows: int
+    kv_bytes_total: int
 
 
 class Qwen36SlotPool:
@@ -130,6 +144,9 @@ class Qwen36SlotPool:
         max_seq_len: int,
         device: torch.device | str = "cuda",
         dtype: torch.dtype = torch.bfloat16,
+        dynamic_arena: bool = False,
+        pool_bundles: int | None = None,
+        watermark_bundles: int = 0,
     ) -> None:
         if num_slots < 1:
             raise ValueError(f"num_slots must be >= 1, got {num_slots}")
@@ -143,6 +160,39 @@ class Qwen36SlotPool:
         #: Rows are ``num_slots`` real slots + one scratch row (class docstring).
         self._num_rows = num_slots + 1
         self.scratch_row = num_slots
+        #: Phase 2 dynamic arena (`.omx/plans/qwen38-dynamic-context-vllm-plan.md`
+        #: Phase 2, "接入全局物理 arena,先完成 strict 模式"): when enabled, KV
+        #: tensors span a GLOBAL physical bundle pool sized by ``pool_bundles``
+        #: instead of ``(num_slots + 1) * pages_per_slot`` fixed rows. Every
+        #: logical slot row keeps its fixed ``pages_per_slot`` width but starts
+        #: empty (all entries point at the null bundle 0); bundles are handed
+        #: out on demand by :meth:`prepare_kv_writes` and returned by
+        #: :meth:`reset_slot`. Legacy mode (default) is byte-identical to the
+        #: historical fixed-row layout and remains the A/B baseline.
+        self.dynamic_arena = dynamic_arena
+        if dynamic_arena:
+            if pool_bundles is None:
+                # strict-mode default: full concurrent capacity (one full
+                # sequence per slot) plus a small COW/emergency reserve.
+                pool_bundles = num_slots * self.pages_per_slot + 8
+            self.pool_bundles = pool_bundles
+            self.watermark_bundles = watermark_bundles
+            from runtime.model.qwen36_kv_arena import QwenPageBundlePool
+
+            self._arena = QwenPageBundlePool(
+                pool_bundles,
+                watermark_bundles=watermark_bundles,
+                assert_invariants=True,
+            )
+            #: slot -> set of physical bundle ids it currently references.
+            #: Mirrors vLLM ``req_to_blocks``; ``reset_slot`` decrefs them all
+            #: (plan §7 invariant 7: slot reset leaves no old-epoch ownership).
+            self._slot_bundles: list[set[int]] = [set() for _ in range(self._num_rows)]
+        else:
+            self.pool_bundles = self._num_rows * self.pages_per_slot
+            self.watermark_bundles = 0
+            self._arena = None
+            self._slot_bundles = [set() for _ in range(self._num_rows)]
 
         layers = model.model.layers
         self.num_layers = len(layers)
@@ -177,7 +227,7 @@ class Qwen36SlotPool:
         kv_bytes = 0
         num_recurrent = 0
         num_paged = 0
-        total_pages = self._num_rows * self.pages_per_slot
+        total_pages = self.pool_bundles
 
         for layer in layers:
             i = layer.layer_idx
@@ -232,6 +282,15 @@ class Qwen36SlotPool:
                     * self.page_size
                     * (attn.num_kv_heads * attn.head_dim * k.element_size())
                 )
+                # Actual per-layer physical storage (K + V), which is what
+                # ``kv_bytes_total`` must reproduce exactly -- even when the
+                # dynamic arena's pool size is not a multiple of
+                # ``pages_per_slot`` (strict 4x256K + reserve is).
+                kv_bytes_actual = getattr(self, "_kv_bytes_actual", 0)
+                kv_bytes_actual += 2 * total_pages * self.page_size * (
+                    attn.num_kv_heads * attn.head_dim * k.element_size()
+                )
+                self._kv_bytes_actual = kv_bytes_actual
                 self.attn_outputs[i] = _mark_static(
                     torch.zeros(
                         self._num_rows,
@@ -289,6 +348,13 @@ class Qwen36SlotPool:
             num_paged_kv_layers=num_paged,
             recurrent_bytes_per_slot=recurrent_bytes,
             kv_bytes_per_slot=kv_bytes,
+            # Per-layer KV storage is ``physical_bundles * page_size *
+            # kv_heads * head_dim * element_size`` per tensor (K and V), so
+            # the whole-pool formula is per-slot bytes scaled by the physical
+            # bundle count. Legacy: ``num_rows`` rows of ``pages_per_slot``.
+            # Dynamic arena (Phase 2): the configured global pool size.
+            total_rows=self._num_rows,
+            kv_bytes_total=getattr(self, "_kv_bytes_actual", kv_bytes * self._num_rows),
         )
 
         # One logical-to-physical page-table row per slot.  The initial
@@ -296,35 +362,60 @@ class Qwen36SlotPool:
         # attention path reads this table now: B=1, B×1 decode, B×Q prefill,
         # MTP graph metadata.  Future prefix-cache allocation can therefore
         # replace entries without changing the model's addressing contract.
-        self._global_page_table = _mark_static(
-            torch.arange(
-                self._num_rows * self.pages_per_slot, dtype=torch.int32, device=self.device
-            ).view(self._num_rows, self.pages_per_slot)
-        )
+        if self.dynamic_arena:
+            # Phase 2 dynamic arena: every logical row starts EMPTY, all
+            # entries pointing at the null bundle (0). Bundles are handed out
+            # on demand by prepare_kv_writes. The device table is still
+            # created once at a stable address so CUDA Graph capture sees a
+            # fixed tensor; only its contents change.
+            self._global_page_table = _mark_static(
+                torch.zeros(
+                    self._num_rows, self.pages_per_slot, dtype=torch.int32, device=self.device
+                )
+            )
+        else:
+            self._global_page_table = _mark_static(
+                torch.arange(
+                    self._num_rows * self.pages_per_slot, dtype=torch.int32, device=self.device
+                ).view(self._num_rows, self.pages_per_slot)
+            )
         # Host-side mirror for write-index construction.  Attention metadata
         # consumes the device table, while decode/prefill must know the same
         # physical page ids before their kernels run.  Keeping a small Python
         # mirror avoids a device-to-host synchronisation on every decode
         # round; all future remapping goes through ``set_page_table_row`` so
         # the two representations change atomically.
-        self._page_table_host = [
-            [slot * self.pages_per_slot + page for page in range(self.pages_per_slot)]
-            for slot in range(self._num_rows)
-        ]
+        if self.dynamic_arena:
+            self._page_table_host = [
+                [0] * self.pages_per_slot for _ in range(self._num_rows)
+            ]
+        else:
+            self._page_table_host = [
+                [slot * self.pages_per_slot + page for page in range(self.pages_per_slot)]
+                for slot in range(self._num_rows)
+            ]
         # Graph wrappers cache a copied page-table row by slot identity.  A
         # monotonic version makes that cache safe once a logical row is
         # remapped for prefix sharing without forcing every stable replay to
         # copy its whole table again.
         self._page_table_versions = [0] * self._num_rows
-        # Every physical page starts owned by exactly one logical row.  A
-        # cross-slot prefix restore can replace a target's prefix pages with
-        # aliases of a retained source; the displaced pages become the small
-        # free reserve used for copy-on-write before either sharer writes.
-        # This is intentionally fixed-capacity: it reuses the allocation the
-        # backend already owns and never asks a shared single GPU for more
-        # KV memory at admission time.
-        self._page_refcounts = [1] * (self._num_rows * self.pages_per_slot)
-        self._free_physical_pages: set[int] = set()
+        if self.dynamic_arena:
+            # Legacy refcount bookkeeping is unused in dynamic mode: the
+            # arena owns ownership. Keep the fields at None so any legacy
+            # code path that touches them fails loudly instead of silently
+            # tracking a second truth.
+            self._page_refcounts = None  # type: ignore[assignment]
+            self._free_physical_pages = None  # type: ignore[assignment]
+        else:
+            # Every physical page starts owned by exactly one logical row.  A
+            # cross-slot prefix restore can replace a target's prefix pages with
+            # aliases of a retained source; the displaced pages become the small
+            # free reserve used for copy-on-write before either sharer writes.
+            # This is intentionally fixed-capacity: it reuses the allocation the
+            # backend already owns and never asks a shared single GPU for more
+            # KV memory at admission time.
+            self._page_refcounts = [1] * (self._num_rows * self.pages_per_slot)
+            self._free_physical_pages: set[int] = set()
 
         # -- per-slot single-sequence views (the B1-identical path) --------
         self._slot_states: list[Qwen36GenerationState] = [
@@ -390,6 +481,84 @@ class Qwen36SlotPool:
         self.slot_kv_len = [0] * self._num_rows
         self.slot_committed_tokens: list[list[int]] = [[] for _ in range(self._num_rows)]
 
+    # -- Phase 0 capacity evidence (read-only) ------------------------------
+
+    def kv_storage_bytes(self) -> int:
+        """Measured device storage of every backbone KV tensor in the pool.
+
+        Sums ``torch.Tensor.numel() * element_size`` over the K/V pools of
+        all full-attention layers -- the ground truth that
+        ``geometry.kv_bytes_total``'s formula must reproduce. Phase 0 locks
+        ``formula == measured`` before any ownership change can move either
+        number.
+        """
+        total = 0
+        for k_pool, v_pool in zip(self.k_pools, self.v_pools, strict=True):
+            if k_pool is None:
+                assert v_pool is None
+                continue
+            assert v_pool is not None
+            total += k_pool.numel() * k_pool.element_size()
+            total += v_pool.numel() * v_pool.element_size()
+        return total
+
+    def capacity_snapshot(self) -> dict[str, int]:
+        """Read-only geometry/capacity snapshot, reported not re-derived.
+
+        ``/debug/stats`` and the GPU verification scripts both state what
+        was actually allocated; deriving it a second time from the model is
+        how two numbers that must agree stop agreeing. Keys are stable and
+        unit-annotated so a startup log and a metrics gauge stay comparable.
+        The ``qwen_kv_*`` keys are the Prometheus-facing names used by
+        ``server/metrics.py``; the plain names remain for the startup log.
+        """
+        return {
+            "num_slots": self.num_slots,
+            "max_seq_len": self.max_seq_len,
+            "page_size": self.page_size,
+            "pages_per_slot": self.pages_per_slot,
+            "total_rows": self._num_rows,
+            "scratch_row": self.scratch_row,
+            "num_full_attention_layers": self.geometry.num_paged_kv_layers,
+            "num_gdn_layers": self.geometry.num_recurrent_layers,
+            "kv_bytes_per_slot": self.geometry.kv_bytes_per_slot,
+            "kv_bytes_total": self.geometry.kv_bytes_total,
+            "kv_bytes_measured": self.kv_storage_bytes(),
+            "kv_bytes_scratch_row": self.geometry.kv_bytes_per_slot,
+            "recurrent_bytes_per_slot": self.geometry.recurrent_bytes_per_slot,
+            # Prometheus-facing aliases (Phase 0 gauges).
+            "qwen_kv_pool_bytes": self.geometry.kv_bytes_total,
+            "qwen_kv_pool_bytes_measured": self.kv_storage_bytes(),
+            "qwen_kv_scratch_row_bytes": self.geometry.kv_bytes_per_slot,
+            "qwen_kv_total_bundles": self.pool_bundles,
+            "qwen_kv_pages_per_slot": self.pages_per_slot,
+            "qwen_kv_slots": self.num_slots,
+            "qwen_kv_full_attention_layers": self.geometry.num_paged_kv_layers,
+            "qwen_kv_gdn_layers": self.geometry.num_recurrent_layers,
+            "qwen_kv_mode": 1 if self.dynamic_arena else 0,
+        }
+
+    def assert_kv_storage_consistent(self) -> None:
+        """Refuse to run when the formula and the tensors disagree.
+
+        The formula and the measured storage are computed from the same
+        loops in ``__init__``, so a mismatch means either this method or the
+        geometry is no longer derived from the actual allocation -- exactly
+        the class of drift Phase 0 exists to catch before it becomes a
+        memory claim. Mirrors the existing "reported, not re-derived"
+        contract of :class:`SlotPoolGeometry`.
+        """
+        measured = self.kv_storage_bytes()
+        if measured != self.geometry.kv_bytes_total:
+            raise RuntimeError(
+                "Qwen3.6 KV capacity formula disagrees with actual tensor storage: "
+                f"formula={self.geometry.kv_bytes_total}, measured={measured}; "
+                "fix the geometry derivation before trusting either number"
+            )
+
+    # -- per-slot single-sequence views (the B1-identical path) ------------
+    # (init code: _slot_states is built in __init__ after the page tables)
+
     # -- construction helpers ---------------------------------------------
 
     def _build_slot_state(self, row: int) -> Qwen36GenerationState:
@@ -437,6 +606,12 @@ class Qwen36SlotPool:
         decode/prefill construct write rows from the host mirror; updating
         only one of those two would produce a valid-looking but corrupted KV
         cache.
+
+        Dynamic-arena mode: ownership bookkeeping belongs to the arena, so
+        this method only syncs the two representations. Callers that change a
+        row's ownership must go through :meth:`prepare_kv_writes` /
+        :meth:`share_prefix_kv` / :meth:`reset_slot`, which update the arena
+        refcounts and then call this for the device copy.
         """
         if not 0 <= slot < self._num_rows:
             raise ValueError(f"slot {slot} is outside the pool")
@@ -444,19 +619,32 @@ class Qwen36SlotPool:
             raise ValueError(
                 f"slot {slot} needs {self.pages_per_slot} physical pages, got {len(physical_pages)}"
             )
-        total_pages = self._num_rows * self.pages_per_slot
-        if len(set(physical_pages)) != len(physical_pages) or any(
-            page < 0 or page >= total_pages for page in physical_pages
-        ):
-            raise ValueError("a page-table row must contain distinct in-range physical pages")
-        old_pages = self._page_table_host[slot]
-        for page in old_pages:
-            self._page_refcounts[page] -= 1
-            if self._page_refcounts[page] == 0:
-                self._free_physical_pages.add(page)
-        for page in physical_pages:
-            self._page_refcounts[page] += 1
-            self._free_physical_pages.discard(page)
+        total_pages = self.pool_bundles
+        if any(page < 0 or page >= total_pages for page in physical_pages):
+            raise ValueError("a page-table row must contain in-range physical pages")
+        if not self.dynamic_arena:
+            # Legacy: rows must be bijective (each slot owns distinct pages).
+            if len(set(physical_pages)) != len(physical_pages):
+                raise ValueError("a page-table row must contain distinct physical pages")
+        else:
+            # Dynamic: repeated null bundles (0) are legal -- an empty row is
+            # all zeros. Non-null entries must still be distinct: two logical
+            # pages cannot alias one physical bundle unless share_prefix_kv
+            # incref'd it (which it does before remapping).
+            non_null = [p for p in physical_pages if p != 0]
+            if len(set(non_null)) != len(non_null):
+                raise ValueError(
+                    "a dynamic page-table row must not repeat non-null bundles"
+                )
+        if not self.dynamic_arena:
+            old_pages = self._page_table_host[slot]
+            for page in old_pages:
+                self._page_refcounts[page] -= 1
+                if self._page_refcounts[page] == 0:
+                    self._free_physical_pages.add(page)
+            for page in physical_pages:
+                self._page_refcounts[page] += 1
+                self._free_physical_pages.discard(page)
         self._page_table_host[slot] = list(physical_pages)
         self._global_page_table[slot].copy_(
             torch.tensor(physical_pages, dtype=torch.int32, device=self.device)
@@ -496,6 +684,45 @@ class Qwen36SlotPool:
             (start + length - 1) // self.page_size + 1,
         )
         row = list(self._page_table_host[slot])
+        if self.dynamic_arena:
+            # Phase 2 dynamic arena: hand out physical bundles on demand.
+            # A null entry (0) gets a fresh private bundle; a shared entry
+            # (arena refcnt > 1) is COW-cloned. Private entries (refcnt == 1)
+            # are already writable and left alone. All bookkeeping stays in
+            # the arena; the device table is synced once at the end (one
+            # copy per chunk, not per token -- plan §6.6).
+            replacements: list[tuple[int, int, int]] = []
+            for logical_page in logical_pages:
+                source_page = row[logical_page]
+                if source_page == 0:
+                    target_page = self._arena.allocate(1, owner=f"slot-{slot}")[0]
+                    replacements.append((logical_page, source_page, target_page))
+                    row[logical_page] = target_page
+                    self._slot_bundles[slot].add(target_page)
+                elif self._arena.bundles[source_page].ref_cnt > 1:
+                    # COW detach: the slot transfers its reference from the
+                    # shared source to a fresh private clone.
+                    target_page = self._arena.ensure_writable(source_page)
+                    self._arena.decref([source_page], owner=f"slot-{slot}")
+                    self._slot_bundles[slot].discard(source_page)
+                    replacements.append((logical_page, source_page, target_page))
+                    row[logical_page] = target_page
+                    self._slot_bundles[slot].add(target_page)
+            if not replacements:
+                return
+            for _logical_page, source_page, target_page in replacements:
+                for k_pool, v_pool in zip(self.k_pools, self.v_pools, strict=True):
+                    if k_pool is None:
+                        continue
+                    assert v_pool is not None
+                    if source_page != 0:
+                        # COW clone: copy the shared page's bytes so the
+                        # untouched prefix half stays valid.
+                        k_pool[target_page].copy_(k_pool[source_page])
+                        v_pool[target_page].copy_(v_pool[source_page])
+            self._arena.drain_pending_cow()
+            self.set_page_table_row(slot, row)
+            return
         replacements: list[tuple[int, int, int]] = []
         for logical_page in logical_pages:
             source_page = row[logical_page]
@@ -547,6 +774,16 @@ class Qwen36SlotPool:
             raise ValueError(f"prefix length {kv_len} is outside pool capacity {self.max_seq_len}")
 
         pages = (kv_len + self.page_size - 1) // self.page_size
+        if self.dynamic_arena:
+            # Copy, not alias (legacy semantics preserved): the target must
+            # own its physical pages, so allocate fresh bundles for the
+            # copied range first.
+            for logical_page in range(pages):
+                if self._page_table_host[target_slot][logical_page] == 0:
+                    fresh = self._arena.allocate(1, owner=f"slot-{target_slot}")[0]
+                    self._page_table_host[target_slot][logical_page] = fresh
+                    self._slot_bundles[target_slot].add(fresh)
+            self.set_page_table_row(target_slot, self._page_table_host[target_slot])
         source_pages = self._global_page_table[source_slot, :pages].to(dtype=torch.long)
         target_pages = self._global_page_table[target_slot, :pages].to(dtype=torch.long)
         for k_pool, v_pool in zip(self.k_pools, self.v_pools, strict=True):
@@ -578,7 +815,28 @@ class Qwen36SlotPool:
             raise ValueError(f"prefix length {kv_len} is outside pool capacity {self.max_seq_len}")
         shared_pages = (kv_len + self.page_size - 1) // self.page_size
         target_row = list(self._page_table_host[target_slot])
-        target_row[:shared_pages] = self._page_table_host[source_slot][:shared_pages]
+        if self.dynamic_arena:
+            # Alias the source's prefix bundles and register the target's
+            # references with the arena (vLLM ``touch``): each aliased entry
+            # raises the bundle's refcnt, so the source stays alive while
+            # either sharer holds it (INV9). ``prepare_kv_writes`` COW-detaches
+            # before the target's first suffix write.
+            for logical_page in range(shared_pages):
+                src = self._page_table_host[source_slot][logical_page]
+                if src == 0:
+                    raise RuntimeError(
+                        f"source slot {source_slot} has no bundle at page {logical_page} "
+                        "to share; prefill must have written the prefix first"
+                    )
+                target_row[logical_page] = src
+            self._arena.incref(
+                self._page_table_host[source_slot][:shared_pages], owner=f"slot-{target_slot}"
+            )
+            self._slot_bundles[target_slot].update(
+                self._page_table_host[source_slot][:shared_pages]
+            )
+        else:
+            target_row[:shared_pages] = self._page_table_host[source_slot][:shared_pages]
         self.set_page_table_row(target_slot, target_row)
 
     def copy_prefix_to_scratch(
@@ -598,14 +856,24 @@ class Qwen36SlotPool:
         if not 0 < kv_len <= self.max_seq_len:
             raise ValueError(f"prefix length {kv_len} is outside pool capacity {self.max_seq_len}")
         pages = (kv_len + self.page_size - 1) // self.page_size
-        if scratch_pages is None:
+        if self.dynamic_arena:
+            # Phase 2: the scratch row's prefix pages are arena bundles like
+            # any other; allocate fresh ones so the snapshot owns its bytes
+            # (a copy, not an alias -- the originating slot may be reused).
+            scratch_pages = self._arena.allocate(pages, owner="scratch")
+            self._slot_bundles[self.scratch_row].update(scratch_pages)
+            row = list(self._page_table_host[self.scratch_row])
+            row[:pages] = scratch_pages
+            self._page_table_host[self.scratch_row] = row
+        elif scratch_pages is None:
             scratch_pages = self._page_table_host[self.scratch_row][:pages]
         if len(scratch_pages) != pages or len(set(scratch_pages)) != pages:
             raise ValueError("scratch prefix needs one distinct physical page per logical page")
-        scratch_lo = self.scratch_row * self.pages_per_slot
-        scratch_hi = scratch_lo + self.pages_per_slot
-        if any(page < scratch_lo or page >= scratch_hi for page in scratch_pages):
-            raise ValueError("scratch prefix pages must belong to the scratch arena")
+        if not self.dynamic_arena:
+            scratch_lo = self.scratch_row * self.pages_per_slot
+            scratch_hi = scratch_lo + self.pages_per_slot
+            if any(page < scratch_lo or page >= scratch_hi for page in scratch_pages):
+                raise ValueError("scratch prefix pages must belong to the scratch arena")
         source_pages = self._global_page_table[source_slot, :pages].to(dtype=torch.long)
         scratch_page_tensor = torch.tensor(scratch_pages, dtype=torch.long, device=self.device)
         for k_pool, v_pool in zip(self.k_pools, self.v_pools, strict=True):
@@ -614,6 +882,8 @@ class Qwen36SlotPool:
             assert v_pool is not None
             k_pool[scratch_page_tensor] = k_pool[source_pages]
             v_pool[scratch_page_tensor] = v_pool[source_pages]
+        if self.dynamic_arena:
+            self.set_page_table_row(self.scratch_row, self._page_table_host[self.scratch_row])
 
     def share_scratch_prefix(
         self, target_slot: int, kv_len: int, *, scratch_pages: list[int] | None = None
@@ -634,12 +904,16 @@ class Qwen36SlotPool:
             scratch_pages = self._page_table_host[self.scratch_row][:shared_pages]
         if len(scratch_pages) != shared_pages or len(set(scratch_pages)) != shared_pages:
             raise ValueError("scratch prefix needs one distinct physical page per logical page")
-        scratch_lo = self.scratch_row * self.pages_per_slot
-        scratch_hi = scratch_lo + self.pages_per_slot
-        if any(page < scratch_lo or page >= scratch_hi for page in scratch_pages):
-            raise ValueError("scratch prefix pages must belong to the scratch arena")
+        if not self.dynamic_arena:
+            scratch_lo = self.scratch_row * self.pages_per_slot
+            scratch_hi = scratch_lo + self.pages_per_slot
+            if any(page < scratch_lo or page >= scratch_hi for page in scratch_pages):
+                raise ValueError("scratch prefix pages must belong to the scratch arena")
         target_row = list(self._page_table_host[target_slot])
         target_row[:shared_pages] = scratch_pages
+        if self.dynamic_arena:
+            self._arena.incref(scratch_pages, owner=f"slot-{target_slot}")
+            self._slot_bundles[target_slot].update(scratch_pages)
         self.set_page_table_row(target_slot, target_row)
 
     def detach_scratch_aliases(self, slot: int, kv_len: int, *, scratch_pages: set[int]) -> bool:
@@ -675,6 +949,41 @@ class Qwen36SlotPool:
             raise ValueError(f"slot {slot} is not a live slot")
         if not 0 < kv_len <= self.max_seq_len:
             raise ValueError(f"prefix length {kv_len} is outside pool capacity {self.max_seq_len}")
+        if self.dynamic_arena:
+            # Phase 2: scratch pages are arena bundles; detach by COW-cloning
+            # each aliased committed page into a fresh private bundle and
+            # releasing the scratch reference (same discipline as
+            # prepare_kv_writes).
+            logical_pages = range((kv_len + self.page_size - 1) // self.page_size)
+            committed_pages = (self.slot_kv_len[slot] + self.page_size - 1) // self.page_size
+            row = list(self._page_table_host[slot])
+            replacements: list[tuple[int, int, int]] = []
+            for logical_page in logical_pages:
+                if committed_pages and logical_page >= committed_pages:
+                    break
+                source_page = row[logical_page]
+                if source_page not in scratch_pages:
+                    continue
+                if self._arena.bundles[source_page].ref_cnt <= 1:
+                    continue
+                target_page = self._arena.ensure_writable(source_page)
+                self._arena.decref([source_page], owner=f"slot-{slot}")
+                self._slot_bundles[slot].discard(source_page)
+                replacements.append((logical_page, source_page, target_page))
+                row[logical_page] = target_page
+                self._slot_bundles[slot].add(target_page)
+            if not replacements:
+                return False
+            for _logical_page, source_page, target_page in replacements:
+                for k_pool, v_pool in zip(self.k_pools, self.v_pools, strict=True):
+                    if k_pool is None:
+                        continue
+                    assert v_pool is not None
+                    k_pool[target_page].copy_(k_pool[source_page])
+                    v_pool[target_page].copy_(v_pool[source_page])
+            self._arena.drain_pending_cow()
+            self.set_page_table_row(slot, row)
+            return True
         scratch_lo = self.scratch_row * self.pages_per_slot
         scratch_hi = scratch_lo + self.pages_per_slot
         if any(not 0 <= page < self.pages_per_slot for page in scratch_pages):
@@ -817,6 +1126,15 @@ class Qwen36SlotPool:
         see the module docstring's point 2) and clears the length
         bookkeeping. Does **not** zero KV bytes: past ``kv_len`` they are
         never read, and below it they are the prefix cache.
+
+        Dynamic-arena mode additionally returns every bundle this slot
+        referenced to the arena (``decref``), so a slot reset/reuse leaks no
+        old-epoch page ownership (plan §7 invariant 7). A bundle whose hash
+        was published by :meth:`publish_committed_blocks` stays reachable at
+        ``ref_cnt == 0`` (CACHED_REF0, LRU tail) -- that is the Phase 3
+        prefix cache: the KV survives the slot, owned by the arena, evicted
+        only on real pressure. The page-table row is reset to all-null so
+        the next sequence starts from empty.
         """
         state = self._slot_states[slot]
         for gdn in state.gdn_states:
@@ -831,6 +1149,100 @@ class Qwen36SlotPool:
         state.num_tokens_seen = 0
         self.slot_kv_len[slot] = 0
         self.slot_committed_tokens[slot] = []
+        if self.dynamic_arena:
+            owned = self._slot_bundles[slot]
+            if owned:
+                self._arena.decref(sorted(owned), owner=f"slot-{slot}")
+                owned.clear()
+            if any(self._page_table_host[slot]):
+                self.set_page_table_row(slot, [0] * self.pages_per_slot)
+
+    # -- Phase 3: prefix cache as arena-owned cached blocks ----------------
+
+    def publish_committed_blocks(
+        self, slot: int, kv_len: int, keys: Sequence[BlockKey], block_size: int
+    ) -> int:
+        """Publish hashes for ``slot``'s committed blocks to the arena.
+
+        Phase 3 (``.omx/plans/qwen38-dynamic-context-vllm-plan.md`` §6.4):
+        the prefix KV survives a slot reset as an arena CACHED_REF0 block
+        instead of a fixed scratch row. Call BEFORE ``reset_slot`` (while
+        the slot still holds its bundles at ``ref_cnt > 0``) so the hashes
+        are published against live ownership; the reset's ``decref`` then
+        parks each hashed bundle at the LRU tail where prefix lookup can
+        revive it (vLLM ``cache_full_blocks`` before ``free_blocks``).
+
+        ``keys`` are the request's CHAINED BLOCK hashes at ``block_size``
+        boundaries (vLLM ``hash_block_size``); one physical page holds
+        ``page_size // block_size`` of them, all pointing at the same
+        bundle (vLLM fine-grained lookup). Only blocks fully covered by
+        committed tokens are published -- a final partial block stays
+        private (plan §5.1C). Returns the number of blocks published.
+        """
+        if not self.dynamic_arena:
+            return 0
+        if not 0 <= slot < self.num_slots:
+            raise ValueError(f"slot {slot} is not a live slot")
+        if kv_len < 0 or kv_len > self.max_seq_len:
+            raise ValueError(f"prefix length {kv_len} is outside pool capacity")
+        if block_size <= 0 or self.page_size % block_size != 0:
+            raise ValueError("block_size must divide the page size")
+        row = self._page_table_host[slot]
+        published = 0
+        for key in keys:
+            end = key.num_tokens
+            if end > kv_len:
+                break  # not committed yet
+            if end % block_size != 0:
+                continue  # not a block boundary
+            logical_page = (end - 1) // self.page_size
+            bundle_id = row[logical_page]
+            if bundle_id == 0:
+                raise RuntimeError(
+                    f"slot {slot} has no bundle for block ending at {end}; "
+                    "prefill must have written it first"
+                )
+            self._arena.publish_full_block(bundle_id, key)
+            published += 1
+        return published
+
+    def restore_prefix_from_arena(
+        self, slot: int, kv_len: int, keys: Sequence[BlockKey]
+    ) -> tuple[int, list[int]]:
+        """Revive the deepest arena-cached prefix into ``slot``.
+
+        Phase 3 prefix restore: looks up the request's chained hashes in the
+        arena and, on a hit, ``incref``s (vLLM ``touch``) the cached bundles
+        so they are LIVE_SHARED again, then points ``slot``'s page-table row
+        at them. Returns ``(published_tokens, bundle_ids)``; the caller must
+        still restore the recurrent checkpoint at the matching boundary
+        (plan §5.1D invariant 9 -- this method owns KV blocks only).
+        """
+        if not self.dynamic_arena:
+            return 0, []
+        if not 0 <= slot < self.num_slots:
+            raise ValueError(f"slot {slot} is not a live slot")
+        hit = self._arena.lookup_longest_prefix(keys)
+        if not hit.hit or not hit.bundle_ids:
+            return 0, []
+        bundle_ids = list(hit.bundle_ids)
+        # Multiple hash blocks (block_size boundaries) share one physical
+        # page, so the hit's bundle list is denser than the page row. The
+        # bundle is the physical ownership unit: dedup before incref, or a
+        # two-block page would be referenced twice and never reach ref_cnt 0
+        # on release (vLLM touches one KVCacheBlock per block; here one
+        # bundle IS the page, one reference).
+        unique_bundles = list(dict.fromkeys(bundle_ids))
+        self._arena.incref(unique_bundles, owner=f"slot-{slot}")
+        self._slot_bundles[slot].update(unique_bundles)
+        row = list(self._page_table_host[slot])
+        # Write each page's bundle once: the page covering hash-block ``i``
+        # is ``(keys[i].num_tokens - 1) // page_size``.
+        for i, bundle_id in enumerate(bundle_ids):
+            logical_page = (keys[i].num_tokens - 1) // self.page_size
+            row[logical_page] = bundle_id
+        self.set_page_table_row(slot, row)
+        return hit.effective_tokens, unique_bundles
 
     def reset_all(self) -> None:
         for row in range(self._num_rows):

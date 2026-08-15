@@ -62,7 +62,7 @@ torch = pytest.importorskip("torch")
 # tests/test_qwen36_mtp_head.py and tests/test_qwen36_slot_pool.py use for
 # the same reason.
 pytest.importorskip("fla")
-pytest.importorskip("sparkinfer")
+pytest.importorskip("b12x")
 
 from runtime.model.qwen36_model import (  # noqa: E402
     Qwen36Attention,

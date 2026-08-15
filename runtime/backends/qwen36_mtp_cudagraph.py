@@ -86,7 +86,7 @@ already-proven-correct path, not a suspect one.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -134,7 +134,13 @@ def attempt_mtp_cg_capture(name: str, capture_fn: Callable[[], None], *, strict:
         return "failed"
 
 
-def decode_write_index(slot: int, kv_len: int, page_size: int, pages_per_slot: int) -> int:
+def decode_write_index(
+    slot: int,
+    kv_len: int,
+    page_size: int,
+    pages_per_slot: int,
+    page_row: Sequence[int] | None = None,
+) -> int:
     """Row into a pooled ``[total_pages, page_size, ...]`` KV tensor's
     flattened ``view(-1, kv_heads, head_dim)`` for the token about to be
     written at ``(slot, kv_len)``.
@@ -148,13 +154,34 @@ def decode_write_index(slot: int, kv_len: int, page_size: int, pages_per_slot: i
     INV-A3-1 warns about, and precisely the kind of bug that would go
     unnoticed until a long-running conversation on an adjacent slot
     started producing wrong tokens.
+
+    Phase 2 dynamic arena: ``page_row`` (the slot's logical-to-physical
+    bundle row) overrides the static ``slot * pages_per_slot`` formula --
+    the physical bundle for the logical page is looked up in the shared
+    page table, exactly as ``Qwen36SlotPool.write_index`` does. ``None``
+    keeps the legacy contiguous-row behavior.
     """
-    global_page = slot * pages_per_slot + kv_len // page_size
+    if page_row is None:
+        global_page = slot * pages_per_slot + kv_len // page_size
+    else:
+        logical_page = kv_len // page_size
+        if logical_page >= len(page_row):
+            raise RuntimeError(
+                f"MTP write at {kv_len} needs logical page {logical_page} "
+                f"but the page row has {len(page_row)} entries"
+            )
+        global_page = page_row[logical_page]
     return global_page * page_size + kv_len % page_size
 
 
 def build_pooled_mtp_caches(
-    model, *, num_slots: int, device: torch.device, dtype: torch.dtype
+    model,
+    *,
+    num_slots: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    pool_bundles: int | None = None,
+    page_table: torch.Tensor | None = None,
 ) -> tuple[list[Qwen36PagedAttentionCache], torch.Tensor, torch.Tensor, int, int]:
     """Build ``num_slots + 1`` (the ``+1`` scratch row, matching
     ``Qwen36SlotPool``'s own capture-safety reasoning) per-slot MTP
@@ -171,12 +198,23 @@ def build_pooled_mtp_caches(
     ``caches[0:num_slots]`` as the real per-slot caches (indexed exactly
     as the old per-slot allocation was) and ``caches[num_slots]`` as the
     scratch row used only for capture-time warmup.
+
+    Phase 2 dynamic arena (``pool_bundles`` given): the MTP KV pool spans
+    the same GLOBAL physical bundle count as the backbone, and every row's
+    page table aliases the backbone's ``page_table`` rows -- the bundle
+    mapping (allocate/COW/evict) is shared, so MTP KV and backbone KV are
+    lock-step by construction (plan §6.1). Legacy (``pool_bundles=None``):
+    the historical ``(num_slots + 1) * pages_per_slot`` fixed rows with
+    identity mapping.
     """
     mtp_attn = model.mtp.layers[0].self_attn
     page_size = _PAGED_ATTENTION_PAGE_SIZE
     pages_per_slot = (mtp_attn.max_seq_len + page_size - 1) // page_size
     num_rows = num_slots + 1
-    total_pages = num_rows * pages_per_slot
+    if pool_bundles is None:
+        total_pages = num_rows * pages_per_slot
+    else:
+        total_pages = pool_bundles
     kv_shape = (total_pages, page_size, mtp_attn.num_kv_heads, mtp_attn.head_dim)
     k_pool = torch.zeros(kv_shape, dtype=mtp_attn.kv_cache_dtype, device=device)
     v_pool = torch.zeros(kv_shape, dtype=mtp_attn.kv_cache_dtype, device=device)
@@ -184,14 +222,30 @@ def build_pooled_mtp_caches(
     if marker is not None:  # pragma: no branch - present in every supported torch
         marker(k_pool)
         marker(v_pool)
-    caches = [
-        Qwen36PagedAttentionCache.wrap(
-            k_cache=k_pool[row * pages_per_slot : (row + 1) * pages_per_slot],
-            v_cache=v_pool[row * pages_per_slot : (row + 1) * pages_per_slot],
-            page_size=page_size,
-        )
-        for row in range(num_rows)
-    ]
+    if pool_bundles is not None:
+        if page_table is None or page_table.shape[0] < num_rows:
+            raise ValueError(
+                "dynamic MTP caches need a backbone page table with >= "
+                f"{num_rows} rows"
+            )
+        caches = [
+            Qwen36PagedAttentionCache.wrap(
+                k_cache=k_pool,
+                v_cache=v_pool,
+                page_size=page_size,
+                page_table=page_table[row : row + 1],
+            )
+            for row in range(num_rows)
+        ]
+    else:
+        caches = [
+            Qwen36PagedAttentionCache.wrap(
+                k_cache=k_pool[row * pages_per_slot : (row + 1) * pages_per_slot],
+                v_cache=v_pool[row * pages_per_slot : (row + 1) * pages_per_slot],
+                page_size=page_size,
+            )
+            for row in range(num_rows)
+        ]
     return caches, k_pool, v_pool, page_size, pages_per_slot
 
 
@@ -620,12 +674,21 @@ class Qwen36MTPDraftCudaGraph:
         hidden_size = model.model.hidden_size
 
         pages_per_slot = engine.mtp_pages_per_slot
-        page_ids = torch.arange(
-            (engine.backend.num_slots + 1) * pages_per_slot,
-            dtype=torch.int32,
-            device=self.device,
-        )
-        self._page_table_by_slot = page_ids.reshape(engine.backend.num_slots + 1, pages_per_slot)
+        if getattr(engine.backend.pool, "dynamic_arena", False):
+            # Phase 2 dynamic arena: MTP shares the backbone's bundle
+            # mapping. Each draft graph's page-table row source aliases the
+            # backbone pool's device page table (a stable, graph-compatible
+            # tensor; only its contents change at replay).
+            self._page_table_by_slot = engine.backend.pool._global_page_table  # noqa: SLF001
+        else:
+            page_ids = torch.arange(
+                (engine.backend.num_slots + 1) * pages_per_slot,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._page_table_by_slot = page_ids.reshape(
+                engine.backend.num_slots + 1, pages_per_slot
+            )
         self._inputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._host_inputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._host_input_views: dict[int, tuple[object, object, object]] = {}
@@ -739,6 +802,7 @@ class Qwen36MTPDraftCudaGraph:
         attn_output = self._attn_outputs[batch]
         draft_tokens: list[torch.Tensor] = []
         driver.cache_seqlens.copy_(start_pos)
+        dynamic = getattr(self.engine.backend.pool, "dynamic_arena", False)
         for step in range(self.steps):
             pos = start_pos + step
             embeds = self.engine.model.model.embed_tokens(next_input)
@@ -753,9 +817,22 @@ class Qwen36MTPDraftCudaGraph:
 
             residual = hidden
             hidden = self.mtp_layer.input_layernorm(hidden)
-            write_index = (slot_buf * pages_per_slot + pos // page_size) * page_size + (
-                pos % page_size
-            )
+            if dynamic:
+                # Phase 2 dynamic arena: the physical bundle for each logical
+                # page comes from the shared page table (same bundle mapping
+                # as the backbone). ``driver.page_table`` is [B, pages_per_slot]
+                # and was already filled by ``_fill`` for this round's slots;
+                # gather is graph-capturable (a pure device tensor op).
+                batch_idx = torch.arange(batch, device=self.device)
+                logical_page = pos // page_size
+                physical_page = driver.page_table[
+                    batch_idx, logical_page.clamp(max=pages_per_slot - 1)
+                ]
+                write_index = physical_page * page_size + pos % page_size
+            else:
+                write_index = (slot_buf * pages_per_slot + pos // page_size) * page_size + (
+                    pos % page_size
+                )
             driver.cache_seqlens.add_(1)
             hidden = self.mtp_layer.self_attn.decode_batch(
                 hidden,
@@ -871,11 +948,16 @@ class Qwen36MTPBatchedSync:
         self.mtp_head = engine.model.mtp
         self.mtp_layer = engine.model.mtp.layers[0]
         attn = self.mtp_layer.self_attn
-        self._page_table_by_slot = torch.arange(
-            (engine.backend.num_slots + 1) * engine.mtp_pages_per_slot,
-            dtype=torch.int32,
-            device=self.device,
-        ).reshape(engine.backend.num_slots + 1, engine.mtp_pages_per_slot)
+        if getattr(engine.backend.pool, "dynamic_arena", False):
+            # Phase 2 dynamic arena: same shared-bundle page table as the
+            # backbone (see Qwen36MTPDraftCudaGraph.__init__).
+            self._page_table_by_slot = engine.backend.pool._global_page_table  # noqa: SLF001
+        else:
+            self._page_table_by_slot = torch.arange(
+                (engine.backend.num_slots + 1) * engine.mtp_pages_per_slot,
+                dtype=torch.int32,
+                device=self.device,
+            ).reshape(engine.backend.num_slots + 1, engine.mtp_pages_per_slot)
         self._inputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._host_inputs: dict[
             int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
@@ -1136,6 +1218,11 @@ class Qwen36MTPBatchedSync:
                 start + offset,
                 self.engine.mtp_page_size,
                 self.engine.mtp_pages_per_slot,
+                page_row=(
+                    self.engine.backend.pool._page_table_host[slot]  # noqa: SLF001
+                    if getattr(self.engine.backend.pool, "dynamic_arena", False)
+                    else None
+                ),
             )
             for slot, start in zip(slots, start_positions, strict=True)
             for offset in range(query_len)
@@ -1180,9 +1267,19 @@ class Qwen36MTPBatchedSync:
             hidden = self.mtp_head.fc(fused)
             residual = hidden
             hidden = self.mtp_layer.input_layernorm(hidden)
-            write_index = (slot_buf * pages_per_slot + positions // page_size) * page_size + (
-                positions % page_size
-            )
+            if getattr(self.engine.backend.pool, "dynamic_arena", False):
+                # Phase 2 dynamic arena: same shared-bundle page-table gather
+                # as Qwen36MTPDraftCudaGraph._forward_all_steps.
+                batch_idx = torch.arange(batch, device=self.device)
+                logical_page = positions // page_size
+                physical_page = driver.page_table[
+                    batch_idx, logical_page.clamp(max=pages_per_slot - 1)
+                ]
+                write_index = physical_page * page_size + positions % page_size
+            else:
+                write_index = (slot_buf * pages_per_slot + positions // page_size) * page_size + (
+                    positions % page_size
+                )
             driver.cache_seqlens.add_(1)
             hidden = self.mtp_layer.self_attn.decode_batch(
                 hidden,

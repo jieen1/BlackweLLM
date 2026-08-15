@@ -26,7 +26,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("fla")
-pytest.importorskip("sparkinfer")
+# sparkinfer 仓库 2026-08-09 upstream merge 后以 ``b12x`` 为包名
+# (AGENTS.md: "the runtime imports b12x.*")。旧包名 ``sparkinfer`` 已不存在。
+pytest.importorskip("b12x")
 
 from runtime.model.qwen36_slots import Qwen36SlotPool  # noqa: E402
 
@@ -553,3 +555,61 @@ class TestRewind:
         pool = _pool(max_seq_len=256)
         with pytest.raises(ValueError):
             pool.rewind_slot(0, 257)
+
+
+class TestPhase0CapacityEvidence:
+    """Phase 0 of .omx/plans/qwen38-dynamic-context-vllm-plan.md: lock the
+    formula == measured KV capacity before any ownership change. All read-only.
+    """
+
+    def test_kv_storage_bytes_matches_tensor_storage(self) -> None:
+        pool = _pool(num_slots=3, max_seq_len=256)
+        measured = pool.kv_storage_bytes()
+        # One full-attention layer: rows(4) * pages_per_slot(2) * page(128) *
+        # kv_heads(2) * head_dim(4) * 4 bytes, times K and V.
+        rows = 4
+        pages = 2
+        per_tensor = rows * pages * 128 * _KV_HEADS * _HEAD_DIM * 4
+        assert measured == 2 * per_tensor
+
+    def test_capacity_snapshot_reports_formula_measured_and_layout(self) -> None:
+        pool = _pool(num_slots=3, max_seq_len=256)
+        snap = pool.capacity_snapshot()
+        assert snap["num_slots"] == 3
+        assert snap["total_rows"] == 4
+        assert snap["scratch_row"] == 3
+        assert snap["kv_bytes_total"] == snap["kv_bytes_measured"]
+        assert snap["qwen_kv_pool_bytes"] == snap["kv_bytes_total"]
+        assert snap["qwen_kv_total_bundles"] == 4 * 2
+        assert snap["qwen_kv_pages_per_slot"] == 2
+        assert snap["qwen_kv_full_attention_layers"] == 1
+
+    def test_formula_and_measured_agree(self) -> None:
+        pool = _pool()
+        pool.assert_kv_storage_consistent()  # raises on mismatch
+
+    def test_scratch_row_is_explicitly_the_reclaim_target(self) -> None:
+        # The whole Phase 0-3 memory story is "drop the scratch row's full
+        # physical pages". The snapshot must expose it as a distinct number.
+        pool = _pool(num_slots=3, max_seq_len=256)
+        assert pool.capacity_snapshot()["kv_bytes_scratch_row"] == pool.geometry.kv_bytes_per_slot
+
+    def test_fp8_kv_halves_every_snapshot_byte_count(self) -> None:
+        # Mirror of TestFP8KvPoolUsesExactlyHalfTheBytesOfBf16 for the whole-
+        # pool Phase 0 numbers (total + scratch), not just per-slot. Both
+        # pools must declare their KV dtype explicitly: without
+        # kv_cache_dtype the stub falls back to the pool's fp32 compute dtype,
+        # which would make this a 4x comparison instead of the 2x it asserts.
+        model_fp8 = _stub_model(["full_attention", "linear_attention", "linear_attention"])
+        model_fp8.model.layers[0].self_attn.kv_cache_dtype = torch.float8_e4m3fn
+        model_bf16 = _stub_model(["full_attention", "linear_attention", "linear_attention"])
+        model_bf16.model.layers[0].self_attn.kv_cache_dtype = torch.bfloat16
+        fp8 = Qwen36SlotPool(
+            model_fp8, num_slots=2, max_seq_len=128, device="cpu", dtype=torch.float32
+        )
+        bf16 = Qwen36SlotPool(
+            model_bf16, num_slots=2, max_seq_len=128, device="cpu", dtype=torch.float32
+        )
+        assert fp8.capacity_snapshot()["kv_bytes_total"] * 2 == bf16.capacity_snapshot()[
+            "kv_bytes_total"
+        ]

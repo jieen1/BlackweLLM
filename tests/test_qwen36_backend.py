@@ -27,7 +27,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 pytest.importorskip("fla")
-pytest.importorskip("sparkinfer")
+pytest.importorskip("b12x")
 
 from runtime.backends.protocol import (  # noqa: E402
     BackendCapabilities,

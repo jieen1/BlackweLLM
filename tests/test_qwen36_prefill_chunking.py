@@ -45,7 +45,7 @@ torch = pytest.importorskip("torch", reason="torch-free CI job")
 # exactly like its sibling qwen36 tests -- even though the test body itself
 # is CPU-only fake-model logic.
 pytest.importorskip("fla")
-pytest.importorskip("sparkinfer")
+pytest.importorskip("b12x")
 
 from runtime.backends.qwen36 import (  # noqa: E402
     _PREFERRED_PREFILL_CHUNK_TOKENS,

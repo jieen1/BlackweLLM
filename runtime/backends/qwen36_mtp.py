@@ -304,6 +304,13 @@ class Qwen36MTPEngine:
             #: independently-allocated per-slot cache could only ever be
             #: replayed correctly for the ONE slot it was captured
             #: against).
+            #
+            # Phase 2 dynamic arena: MTP shares the backbone's global
+            # bundle pool and page table (plan §6.1 -- the bundle's MTP
+            # K/V pages live at the same logical-to-physical mapping as
+            # the backbone's), so backbone and MTP KV are lock-step by
+            # construction.
+            dynamic = getattr(backend.pool, "dynamic_arena", False)
             (
                 self._caches,
                 self.mtp_k_pool,
@@ -311,7 +318,12 @@ class Qwen36MTPEngine:
                 self.mtp_page_size,
                 self.mtp_pages_per_slot,
             ) = build_pooled_mtp_caches(
-                model, num_slots=backend.num_slots, device=self.device, dtype=self.dtype
+                model,
+                num_slots=backend.num_slots,
+                device=self.device,
+                dtype=self.dtype,
+                pool_bundles=backend.pool.pool_bundles if dynamic else None,
+                page_table=backend.pool._global_page_table if dynamic else None,  # noqa: SLF001
             )
             self.scratch_row = backend.num_slots
             # Historical `_mtp_sync_and_propose_batch` is also the B=1
@@ -486,6 +498,41 @@ class Qwen36MTPEngine:
             raise RuntimeError(f"slot {slot} has no retained MTP prefix of length {kv_len}")
         self._caches[slot].seq_len = kv_len
         self._sync_len[slot] = kv_len
+
+    def mtp_write_index(self, slot: int, kv_len: int) -> int:
+        """Physical flattened KV row for one logical MTP token position.
+
+        Legacy (fixed rows): the historical ``slot * pages_per_slot``
+        formula. Phase 2 dynamic arena: the bundle mapping is shared with
+        the backbone, so the physical page comes from the backbone pool's
+        host page-table row (``Qwen36SlotPool.write_index`` on the MTP
+        pool would be wrong -- MTP KV is a separate tensor; what is shared
+        is the bundle *mapping*). Raises if the logical page has no bundle
+        yet (writes must have been prepared first).
+        """
+        if self.mtp_page_size is None or self.mtp_pages_per_slot is None:
+            raise RuntimeError("MTP KV geometry not configured")
+        dynamic = getattr(self.backend.pool, "dynamic_arena", False)
+        if not dynamic:
+            from runtime.backends.qwen36_mtp_cudagraph import decode_write_index
+
+            return decode_write_index(
+                slot, kv_len, self.mtp_page_size, self.mtp_pages_per_slot
+            )
+        row = self.backend.pool._page_table_host[slot]  # noqa: SLF001
+        logical_page = kv_len // self.mtp_page_size
+        if logical_page >= len(row):
+            raise RuntimeError(
+                f"MTP write at {kv_len} needs logical page {logical_page} "
+                f"but the page row has {len(row)} entries"
+            )
+        physical_page = row[logical_page]
+        if physical_page == 0:
+            raise RuntimeError(
+                f"MTP write at {slot}:{kv_len} has no physical bundle for logical page "
+                f"{logical_page}; prepare backbone KV writes first (bundle mapping is shared)"
+            )
+        return physical_page * self.mtp_page_size + kv_len % self.mtp_page_size
 
     def copy_prefix(self, source_slot: int, target_slot: int, kv_len: int) -> None:
         """Copy a retained causal MTP prefix into another slot.
