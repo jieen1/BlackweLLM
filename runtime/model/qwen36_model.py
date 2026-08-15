@@ -2856,7 +2856,13 @@ def _w4a4_all_rows_enabled() -> bool:
     win includes the raw packed-weight residency, and the measured
     small-M bandwidth deficit (~330-440 vs ~830 GB/s) does not survive
     the fused-round accounting. ``QSR_QWEN36_MLP_W4A4_ALL=0`` stays the
-    diagnostic fallback."""
+    diagnostic fallback.
+
+    Since 2026-08-15 (plan §4.4 P0-M1) this flag also switches the
+    prepare lifecycle: all-W4A4 prepares the W4A4 operands directly and
+    never builds the independent W4A16 repack (~7.84 GiB) or its per-M
+    graph runtime buffers; setting it to 0 restores the historical
+    W4A16-first layout for the fresh-process small-M A/B."""
     return (
         os.environ.get("QSR_QWEN36_MLP_W4A4_ALL", "1") != "0"
         or os.environ.get("QSR_QWEN36_HIST_KERNELS") == "1"
@@ -3393,9 +3399,24 @@ class Qwen36MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._nvfp4_fused:
+            if _w4a4_all_rows_enabled() and _mlp_w4a4_prefill_enabled():
+                # W4A4-only residency (plan §4.4 P0-M1): every row -- decode,
+                # verify, and prefill -- goes through the W4A4 blockscaled
+                # path, so the independent W4A16 repack (~7.84 GiB) and its
+                # per-M graph runtime buffers are never built. The raw NVFP4
+                # Parameters stay resident because the W4A4 operands alias
+                # them (one weight residency). The historical behavior -- W4A16
+                # first, then W4A4 on top -- stays reachable with
+                # ``QSR_QWEN36_MLP_W4A4_ALL=0`` for the fresh-process
+                # W4A16 small-M performance/quality comparison.
+                self._ensure_w4a4_ready()
+                if self._w4a4_prepared is not None:
+                    return self._forward_w4a4_blockscaled(x)
+                # Checkpoint lacks activation global scales: W4A16 fallback.
+                return self._forward_w4a16_fused(x)
             if _mlp_w4a4_prefill_enabled() and self._w4a4_prepared is not None:
                 rows = x.reshape(-1, x.shape[-1]).shape[0]
-                if _w4a4_all_rows_enabled() or rows >= _W4A4_PREFILL_MIN_ROWS:
+                if rows >= _W4A4_PREFILL_MIN_ROWS:
                     return self._forward_w4a4_blockscaled(x)
             return self._forward_w4a16_fused(x)
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
