@@ -272,6 +272,12 @@ MTP：新页丢失 prefix 半页
 若 W4 重复布局和 eager workspace 的静态上限确实被回收，strict 启动可能进入约 65–70 GiB 区间；graph
 private pool 的收益仍 unknown。**必须 fresh process 分阶段测量，不能把推算写成实测。**
 
+**2026-08-15 已实测**（P0-M1/M2/M3/C 落地后）：
+[`../notes/2026-08-15-strict-4x256k-startup-acceptance.md`](../notes/2026-08-15-strict-4x256k-startup-acceptance.md)
+—— fresh process 完整启动序列峰值 **NVML 64.09 GiB，driver free 31.51 GiB**，优于上面预估区间；
+KV 合计 36.0 GiB 与 §4.1 精算吻合；decode graph 捕获阶段 Δallocated≈0（P0-M2 step 2-3 的释放
+抵消了 graph pool 增量）。
+
 阶段验收目标：
 
 - strict 4×256K 可启动并完成逐槽增长，不 OOM；
@@ -505,16 +511,25 @@ CC12.x strided broadcast 读越界条件和 PDL alpha/beta WAR。算法选择在
 - [ ] `QSR_PROFILE_ROUNDS=2` 解释 ≥90% round wall；
 - [ ] post-fix 128K exact-prefix repeat；
 - [ ] K=1/2/3 content-matched sweep；
-- [ ] 修 MTP partial-page COW，先钉 regression；
-- [ ] 分阶段显存采样：weights → W4 prepare → attention warmup → GDN K3 expand → 每个 graph family → strict KV。
+- [x] 修 MTP partial-page COW，先钉 regression（2026-08-15，`c1f2f11`：MTP pooled KV
+      注册为第 17 个原子 COW family，CPU 回归 + GPU dynamic-arena 注册探针）；
+- [x] 分阶段显存采样：weights → W4 prepare → attention warmup → GDN K3 expand → 每个
+      graph family → strict KV（2026-08-15，
+      [`../notes/2026-08-15-strict-4x256k-startup-acceptance.md`](../notes/2026-08-15-strict-4x256k-startup-acceptance.md)
+      的 fresh-process 分阶段表）。
 
 ### Phase 1M：显存 P0（2–5 天）
 
-- [ ] all-W4A4 直接 prepare，跳过 W4A16 dead rep/runtime；
-- [ ] 跨层共享 extend/decode eager arena，并延迟无用 fallback arena；
-- [ ] MTP graph pool 按 target/draft/sync family 共享；
+- [x] all-W4A4 直接 prepare，跳过 W4A16 dead rep/runtime（2026-08-15，`5abe5a2`：
+      实测省 7.883 GiB allocated / 8.252 GiB reserved）；
+- [x] 跨层共享 extend/decode eager arena，并延迟无用 fallback arena（2026-08-15，
+      `382e8f2` + `a1c0c89`：同 mode 共享注册表 + 全量捕获后释放 eager drivers 与
+      decode arena）；
+- [x] MTP graph pool 按 target/draft/sync family 共享（2026-08-15，`8bc886d`：
+      4→1 / 4→1 / 28→1，family 间不共池）；
 - [ ] persistent GDN checkpoint hard pool 与原子淘汰；
-- [ ] strict 8201-bundle fresh-process 启动/逐槽增长验收。
+- [x] strict 8201-bundle fresh-process 启动/逐槽增长验收（2026-08-15 实测通过：
+      峰值 64.09 GiB，driver free 31.51 GiB，短请求 1 bundle，逐槽增长成比例）。
 
 ### Phase 1R：runtime 性能（2–7 天，按 profile 选前两项）
 

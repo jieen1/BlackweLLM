@@ -1,6 +1,6 @@
 # notes/ 索引
 
-> 编制日期：2026-08-15 · 共 225 篇（`git ls-files notes | wc -l`，包含本次新增）
+> 编制日期：2026-08-15 · 共 232 篇（`git ls-files notes | wc -l`，包含本次新增）
 
 `notes/` 是**调查记录与证据档案**，不是文档。它的价值在于：当一个结论被
 质疑时，能翻出当初的实测数据、复现命令和被排除的假设。
@@ -123,6 +123,7 @@ Track F（性能，机会主义）的输入。
 
 | 文件 | 内容 |
 |---|---|
+| `2026-08-15-strict-4x256k-startup-acceptance.md` | 🟢 **strict 4×256K fresh-process 启动验证实测通过**（规划 §4.9 门禁）：P0-M1/M2/M3/C 落地后，8201-bundle strict pool 完整启动序列峰值 **NVML 64.09 GiB / driver free 31.51 GiB**（优于规划 65–70 GiB 预估）；KV 合计 36.0 GiB 与代码精算 36.04 吻合；5-token 短请求只占 1 bundle；逐槽增长严格成比例（每 128 tokens 1 bundle）；decode graph 捕获阶段 Δallocated≈0，直接证明 P0-M2 step 2-3 释放抵消了 graph pool 增量 |
 | `2026-07-31-session-summary.md` | **当前最佳配置与性能基线**（4K 353–401 tok/s、64K 353–368、接受率 96.3–100%） |
 | `2026-07-29-perf-optimization-results.md` / `-perf-profiling-analysis.md` | 优化结果与 profiling |
 | `2026-07-29-acceptance-regression-baseline.md` | 接受率回归基线 |
