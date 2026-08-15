@@ -1472,18 +1472,20 @@ class Qwen36AttentionWorkspace:
     **What is scoped out of this port, and why that's a real gap, not
     laziness**: Laguna shares ONE ``SparkinferPrefillWorkspace`` across an
     entire *group* of layers with matching shapes (all its full-attention
-    layers at once). This class is instead constructed **per layer**
-    (``Qwen36Attention.__init__`` builds its own) -- correct (each
+    layers at once). This class was originally constructed **per layer**
+    (``Qwen36Attention._workspace_for`` built its own) -- correct (each
     instance's fixed capacity is still honored, and sparkinfer's own
     compile cache is keyed by shape parameters below the level of this
     Python object, so cross-layer compiles very likely still dedupe), but
-    it allocates ``Qwen36Attention.num_layers``-times the scratch memory a
-    single shared instance would. Given all 16 full-attention layers in
-    this checkpoint share identical
-    ``num_q_heads``/``num_kv_heads``/``head_dim``/``page_size``, sharing
-    one instance across all of them the way Laguna does is a real,
-    concrete follow-up -- not attempted here because it was not needed to
-    fix the actual bug within this pass's time budget.
+    it allocated ``Qwen36Attention.num_layers``-times the scratch memory a
+    single shared instance would. **2026-08-15 (plan §4.5 P0-M2 step 1):
+    closed.** Given all 16 full-attention layers in this checkpoint share
+    identical ``num_q_heads``/``num_kv_heads``/``head_dim``/``page_size``,
+    ``_workspace_for`` now resolves through the module-level
+    ``_SHARED_ATTN_WORKSPACES`` registry keyed by full geometry, so one
+    arena per mode serves the whole group (recovering ~795 MiB of
+    duplicate scratch); the per-layer K/V descale is handed in at
+    ``forward`` time because it is the one per-layer input.
 
     **The second, independent axis: ``cta_tile_q`` (2026-08-02)**. The
     fixed-capacity workspace above pins every *buffer* shape, and that is
@@ -1743,13 +1745,21 @@ class Qwen36AttentionWorkspace:
         page_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
+        k_descale: torch.Tensor | None = None,
+        v_descale: torch.Tensor | None = None,
     ) -> None:
         """Run attention, writing into ``output`` in place. First call
         against this instance pays sparkinfer's one-time CuTe compile
         (or hits its on-disk cache from a prior process); every later
         call at any shape within this instance's declared capacity reuses
         it -- including query lengths never seen before, which is what
-        ``plan_budget`` buys (class docstring)."""
+        ``plan_budget`` buys (class docstring).
+
+        ``k_descale``/``v_descale`` (2026-08-15, plan §4.5 P0-M2): the
+        workspace is shared across layers with identical geometry, so the
+        per-layer FP8 K/V scales are passed in per call instead of being
+        captured at construction. ``None`` falls back to the descale the
+        workspace was built with (the harmless 1.0 no-op for BF16 KV)."""
         plan = create_paged_plan(
             q,
             k_cache,
@@ -1773,10 +1783,46 @@ class Qwen36AttentionWorkspace:
             k_cache=k_cache,
             v_cache=v_cache,
             output=output,
-            k_descale=self._k_descale,
-            v_descale=self._v_descale,
+            k_descale=k_descale if k_descale is not None else self._k_descale,
+            v_descale=v_descale if v_descale is not None else self._v_descale,
         )
         paged_attention_forward(binding=binding)
+
+
+#: Shared fixed-capacity attention workspaces (plan §4.5 P0-M2 step 1).
+#: All 16 full-attention layers of this checkpoint share one geometry
+#: (``num_q_heads``/``num_kv_heads``/``head_dim``/``page_size``/capacity),
+#: so one workspace per (mode, geometry, device, verify-capacity) suffices
+#: instead of a per-layer arena; the workspace itself is layer-agnostic --
+#: k/v descale and the real k/v caches are handed in per call. Keyed by
+#: every input that fixes the arena's capacity, so a layer that diverges
+#: (different max_seq_len, different verify capacity, FP8 vs BF16 KV)
+#: simply gets its own entry.
+_SHARED_ATTN_WORKSPACES: dict[tuple[object, ...], Qwen36AttentionWorkspace] = {}
+
+
+def _shared_attention_workspace_key(
+    *,
+    mode: str,
+    layer: Qwen36Attention,
+    cache: Qwen36PagedAttentionCache,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[object, ...]:
+    return (
+        mode,
+        layer.num_heads,
+        layer.num_kv_heads,
+        layer.head_dim,
+        cache.page_size,
+        layer.max_seq_len,
+        cache.num_pages,
+        cache.physical_num_pages,
+        dtype,
+        cache.k_cache.dtype,
+        device,
+        layer._max_verify_query_len,  # noqa: SLF001
+    )
 
 
 class Qwen36BatchedDecodeAttention:
@@ -2441,6 +2487,14 @@ class Qwen36Attention(nn.Module):
         # model instance with a different max_seq_len gets its own
         # Qwen36Attention layers, hence its own workspaces). See
         # Qwen36AttentionWorkspace's docstring for why this exists.
+        #
+        # 2026-08-15 (plan §4.5 P0-M2 step 1): the three per-layer
+        # attributes below are retired in favor of the shared module-level
+        # registry ``_SHARED_ATTN_WORKSPACES`` -- all 16 full-attention
+        # layers share one workspace per mode, recovering ~795 MiB of
+        # duplicate scratch. The attributes are kept as the *cache* of the
+        # shared instance for this layer's own fast path; ``_workspace_for``
+        # resolves through the registry keyed by full geometry.
         self._extend_workspace: Qwen36AttentionWorkspace | None = None
         self._decode_workspace: Qwen36AttentionWorkspace | None = None
         # Speculative verify (K>1 tokens against an existing KV span) is a
@@ -2485,28 +2539,41 @@ class Qwen36Attention(nn.Module):
         existing = getattr(self, attr)
         if existing is not None:
             return existing
-        workspace = Qwen36AttentionWorkspace(
+        # Shared registry (plan §4.5 P0-M2 step 1): every layer with the
+        # same geometry and capacity reuses the same fixed-capacity arena;
+        # per-layer K/V descale is passed at forward time.
+        key = _shared_attention_workspace_key(
             mode=mode,
-            num_q_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim,
-            page_size=cache.page_size,
-            max_total_q=self.max_seq_len,
-            max_page_table_width=cache.num_pages,
-            num_cache_pages=cache.physical_num_pages,
+            layer=self,
+            cache=cache,
             dtype=dtype,
-            kv_dtype=cache.k_cache.dtype,
             device=device,
-            # None when FP8 KV is disabled -- Qwen36AttentionWorkspace
-            # treats None as "use the harmless 1.0 no-op descale", same
-            # as before this parameter existed.
-            k_descale=self.k_scale,
-            v_descale=self.v_scale,
-            # Only consulted for mode="verify"; see _verify_capacity.
-            max_verify_query_len=self._max_verify_query_len,
-            k_cache=cache.k_cache,
-            v_cache=cache.v_cache,
         )
+        workspace = _SHARED_ATTN_WORKSPACES.get(key)
+        if workspace is None:
+            workspace = Qwen36AttentionWorkspace(
+                mode=mode,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                page_size=cache.page_size,
+                max_total_q=self.max_seq_len,
+                max_page_table_width=cache.num_pages,
+                num_cache_pages=cache.physical_num_pages,
+                dtype=dtype,
+                kv_dtype=cache.k_cache.dtype,
+                device=device,
+                # None when FP8 KV is disabled -- Qwen36AttentionWorkspace
+                # treats None as "use the harmless 1.0 no-op descale", same
+                # as before this parameter existed.
+                k_descale=self.k_scale,
+                v_descale=self.v_scale,
+                # Only consulted for mode="verify"; see _verify_capacity.
+                max_verify_query_len=self._max_verify_query_len,
+                k_cache=cache.k_cache,
+                v_cache=cache.v_cache,
+            )
+            _SHARED_ATTN_WORKSPACES[key] = workspace
         setattr(self, attr, workspace)
         return workspace
 
@@ -2599,6 +2666,8 @@ class Qwen36Attention(nn.Module):
             page_table=cache.page_table,
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
+            k_descale=self.k_scale,
+            v_descale=self.v_scale,
         )
 
         attn_out = output.reshape(batch_size, seq_len, -1).contiguous()
