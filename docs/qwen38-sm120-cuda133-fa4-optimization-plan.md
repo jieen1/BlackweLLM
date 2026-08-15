@@ -346,8 +346,12 @@ setup -> verify_replay -> accept_gpu_wait -> commit_loop
 
 ### 6.3 P1-R：无需新 attention kernel 的高价值项
 
-1. **W4A4-all vs W4A16 小 M 路由**：decode、verify、prefill 分开。W4A4 是三次 blockscaled GEMM+
-   activation quant，W4A16 是 fused dense-as-one-expert；Qwen3.8 128K 的最优点不能继承 Qwen3.6 旧结论。
+1. **W4A4-all vs W4A16 小 M 路由**：**已实测（2026-08-16）——保留
+   all-W4A4 默认**。W4A16 小 M 在 B1 慢 24%（82.5 vs ~109 tok/s），B4 仅
+   +5%（70.0 vs 66.4 tok/s/req），且需 +7.88 GiB W4A16 rep——与 4×256K
+   显存目标冲突，不值。Qwen3.6 旧结论不迁移到 Qwen3.8。前置修复
+   `116ec2c`（expert_counts）让 W4A16 路径重新可服务，保留为诊断对照。
+   见 [`../notes/2026-08-16-w4a4-vs-w4a16-small-m-ab.md`](../notes/2026-08-16-w4a4-vs-w4a16-small-m-ab.md)。
 2. **ragged MTP sync 分桶**：仅当 `sync_gpu_ms >= 8–10% round`，比较当前 padded single graph 与按
    q=1/2/3/4 分桶；看整 round，不看单 sync kernel。
 3. **fused KV quant+scatter**：Qwen full-attention 当前 scale/cast/K scatter/V scatter 是多个小 kernel；
