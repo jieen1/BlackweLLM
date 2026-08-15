@@ -425,8 +425,7 @@ class QwenPageBundlePool:
         if owner_reserved:
             if count > owner_reserved:
                 raise RuntimeError(
-                    f"owner {owner!r} requested {count} bundles with only "
-                    f"{owner_reserved} reserved"
+                    f"owner {owner!r} requested {count} bundles with only {owner_reserved} reserved"
                 )
         else:
             unreserved = self._unreserved_free_bundles()
@@ -479,9 +478,7 @@ class QwenPageBundlePool:
                 raise RuntimeError(
                     f"bundle {bundle_id} is out of range (num_bundles={self.num_bundles})"
                 )
-        revivals = sum(
-            1 for bundle_id in bundle_ids if self.bundles[bundle_id].ref_cnt == 0
-        )
+        revivals = sum(1 for bundle_id in bundle_ids if self.bundles[bundle_id].ref_cnt == 0)
         owner_reserved = self._reservations.get(owner, 0)
         if (
             revivals > owner_reserved
@@ -494,9 +491,7 @@ class QwenPageBundlePool:
             )
         for bundle_id in bundle_ids:
             if bundle_id < self.reserved:
-                raise RuntimeError(
-                    f"INV7: cannot reference reserved bundle {bundle_id}"
-                )
+                raise RuntimeError(f"INV7: cannot reference reserved bundle {bundle_id}")
             if bundle_id >= self.num_bundles:
                 raise RuntimeError(
                     f"bundle {bundle_id} is out of range (num_bundles={self.num_bundles})"
@@ -546,9 +541,7 @@ class QwenPageBundlePool:
                 )
             bundle = self.bundles[bundle_id]
             if bundle.ref_cnt <= 0:
-                raise RuntimeError(
-                    f"double-free of bundle {bundle_id} (ref_cnt={bundle.ref_cnt})"
-                )
+                raise RuntimeError(f"double-free of bundle {bundle_id} (ref_cnt={bundle.ref_cnt})")
             bundle.ref_cnt -= 1
             if bundle.ref_cnt == 0:
                 if bundle.block_hash is not None:
@@ -599,9 +592,7 @@ class QwenPageBundlePool:
         if bundle_id < self.reserved:
             raise RuntimeError(f"INV7: cannot cache reserved bundle {bundle_id}")
         if bundle.ref_cnt < 1:
-            raise RuntimeError(
-                f"cannot publish a hash for free bundle {bundle_id} (ref_cnt=0)"
-            )
+            raise RuntimeError(f"cannot publish a hash for free bundle {bundle_id} (ref_cnt=0)")
         self._publish(bundle, key)
         self._maybe_invariant_check()
 
@@ -610,7 +601,22 @@ class QwenPageBundlePool:
         if len(keys) != len(bundle_ids):
             raise ValueError("keys and bundle_ids must have equal length")
         for key, bundle_id in zip(keys, bundle_ids, strict=True):
-            self.publish_full_block(bundle_id, key)
+            if bundle_id >= self.num_bundles:
+                raise RuntimeError(
+                    f"bundle {bundle_id} is out of range (num_bundles={self.num_bundles})"
+                )
+            bundle = self.bundles[bundle_id]
+            if bundle.is_null:
+                raise RuntimeError("null bundle can never be cached (INV5)")
+            if bundle_id < self.reserved:
+                raise RuntimeError(f"INV7: cannot cache reserved bundle {bundle_id}")
+            if bundle.ref_cnt < 1:
+                raise RuntimeError(f"cannot publish a hash for free bundle {bundle_id} (ref_cnt=0)")
+            self._publish(bundle, key)
+        # The single-key API checks after every mutation. A run is one
+        # transaction, so checking once avoids O(keys * pool_bundles) work
+        # when invariant assertions are enabled on a 128K diagnostic run.
+        self._maybe_invariant_check()
 
     def lookup_longest_prefix(
         self, keys: Sequence[BlockKey], *, max_blocks: int | None = None
@@ -724,8 +730,7 @@ class QwenPageBundlePool:
         # owners' promises are unavailable even though those pages have not
         # necessarily been materialized yet.
         available = self._free_len - sum(
-            count for reserved_owner, count in self._reservations.items()
-            if reserved_owner != owner
+            count for reserved_owner, count in self._reservations.items() if reserved_owner != owner
         )
         if include_watermark:
             available -= self._watermark_bundles
@@ -790,7 +795,5 @@ class QwenPageBundlePool:
     def _unreserved_free_bundles(self) -> int:
         return max(
             0,
-            self._free_len
-            - sum(self._reservations.values())
-            - self._watermark_bundles,
+            self._free_len - sum(self._reservations.values()) - self._watermark_bundles,
         )

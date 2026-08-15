@@ -57,9 +57,33 @@ from runtime.backends.qwen36_mtp_cudagraph import (  # noqa: E402
     Qwen36MTPBatchedSync,
     Qwen36MTPDraftCudaGraph,
     Qwen36MTPVerifyCudaGraph,
+    _page_table_slot_key,
     attempt_mtp_cg_capture,
     decode_write_index,
 )
+
+
+class TestPageTableSlotKey:
+    def test_dynamic_key_changes_when_the_same_slot_is_remapped(self) -> None:
+        pool = type(
+            "Pool",
+            (),
+            {
+                "dynamic_arena": True,
+                "versions": [3, 7],
+                "page_table_version": lambda self, slot: self.versions[slot],
+            },
+        )()
+
+        before = _page_table_slot_key(pool, [0])
+        pool.versions[0] += 1
+
+        assert before == ((0, 3),)
+        assert _page_table_slot_key(pool, [0]) == ((0, 4),)
+
+    def test_legacy_key_only_tracks_slot_membership(self) -> None:
+        pool = type("Pool", (), {"dynamic_arena": False})()
+        assert _page_table_slot_key(pool, [2, 0]) == (2, 0)
 
 
 class TestDecodeWriteIndex:

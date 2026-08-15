@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -217,11 +218,42 @@ def snapshot_stats(stats: dict) -> dict:
     out["requests_completed"] = stats.get("requests_completed", 0)
     out["prefix_cache_hits"] = stats.get("prefix_cache_hits", 0)
     out["prefix_cache_misses"] = stats.get("prefix_cache_misses", 0)
+    out["mtp_acceptance_histogram"] = list(stats.get("mtp_acceptance_histogram", []))
     return out
 
 
 def diff_stats(before: dict, after: dict) -> dict:
-    return {k: int(after.get(k, 0)) - int(before.get(k, 0)) for k in before}
+    out = {}
+    for key, before_value in before.items():
+        after_value = after.get(key, [] if isinstance(before_value, list) else 0)
+        if isinstance(before_value, list):
+            width = max(len(before_value), len(after_value))
+            before_hist = [*before_value, *([0] * (width - len(before_value)))]
+            after_hist = [*after_value, *([0] * (width - len(after_value)))]
+            out[key] = [int(a) - int(b) for a, b in zip(after_hist, before_hist)]
+        else:
+            out[key] = int(after_value) - int(before_value)
+
+    hist = out.get("mtp_acceptance_histogram", [])
+    mtp_rounds = sum(hist)
+    mtp_accepted = sum(index * count for index, count in enumerate(hist))
+    out["mtp_rounds"] = mtp_rounds
+    out["mtp_accepted_tokens"] = mtp_accepted
+    out["mtp_committed_tokens"] = mtp_rounds + mtp_accepted
+    out["mtp_mean_accepted_per_round"] = round(mtp_accepted / mtp_rounds, 6) if mtp_rounds else None
+    out["mtp_mean_committed_per_round"] = (
+        round((mtp_rounds + mtp_accepted) / mtp_rounds, 6) if mtp_rounds else None
+    )
+    return out
+
+
+def _completion_evidence(text: str) -> dict:
+    encoded = text.encode("utf-8")
+    return {
+        "completion_text": text,
+        "completion_chars": len(text),
+        "completion_sha256": hashlib.sha256(encoded).hexdigest(),
+    }
 
 
 def _metric_re_for(endpoint: str) -> re.Pattern[str]:
@@ -307,7 +339,8 @@ async def stream_one(
             if endpoint == "completions":
                 body = await resp.json()
                 wall = time.perf_counter() - t0
-                return {
+                choice = (body.get("choices") or [{}])[0]
+                result = {
                     "error": None,
                     "ttft_s": None,  # non-streaming: server metrics own TTFT
                     "last_event_s": round(wall, 4),
@@ -315,6 +348,9 @@ async def stream_one(
                     "usage_prompt": (body.get("usage") or {}).get("prompt_tokens"),
                     "usage_completion": (body.get("usage") or {}).get("completion_tokens"),
                 }
+                result.update(_completion_evidence(choice.get("text") or ""))
+                return result
+            completion_parts = []
             async for line in resp.content:
                 line = line.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data: "):
@@ -328,6 +364,7 @@ async def stream_one(
                 choice = (evt.get("choices") or [{}])[0]
                 delta = choice.get("delta") or {}
                 if delta.get("content") or delta.get("reasoning_content"):
+                    completion_parts.append(delta.get("content") or delta.get("reasoning_content"))
                     now = time.perf_counter()
                     if first_t is None:
                         first_t = now
@@ -335,12 +372,14 @@ async def stream_one(
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
         error = f"{type(exc).__name__}: {exc}"
     wall = time.perf_counter() - t0
-    return {
+    result = {
         "error": error,
         "ttft_s": round(first_t - t0, 4) if first_t is not None else None,
         "last_event_s": round(last_t - t0, 4) if last_t is not None else None,
         "wall_s": round(wall, 4),
     }
+    result.update(_completion_evidence("".join(completion_parts)))
+    return result
 
 
 def wave_summary(
@@ -373,6 +412,10 @@ def wave_summary(
         "requests_ok": len(ok),
         "requests_completed_delta": n,
         "errors": errors,
+        # Keep the exact completion evidence beside the counters that
+        # describe it.  Without this, a cold/warm acceptance change cannot
+        # be distinguished from the model taking a different greedy path.
+        "requests": reqs,
         "prompt_tokens_total": prompt_total,
         "generation_tokens_total": gen_total,
         "expected_prompt_tokens": None,  # filled by caller

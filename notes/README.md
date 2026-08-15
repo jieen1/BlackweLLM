@@ -1,6 +1,6 @@
 # notes/ 索引
 
-> 编制日期：2026-08-12 · 共 224 篇（`git ls-files notes | wc -l`，包含本次新增）
+> 编制日期：2026-08-15 · 共 225 篇（`git ls-files notes | wc -l`，包含本次新增）
 
 `notes/` 是**调查记录与证据档案**，不是文档。它的价值在于：当一个结论被
 质疑时，能翻出当初的实测数据、复现命令和被排除的假设。
@@ -51,6 +51,7 @@
 
 ## 2. 已定案的根因分析 🟢
 
+- [2026-08-15 Qwen3.8 dynamic MTP page-table 代际 bug](2026-08-15-qwen38-dynamic-mtp-page-table-regression.md) —— 🟢 **fresh-process 128K 接受率回退已修复**：dynamic arena remap 物理 bundle 后，MTP draft/sync CUDA Graph 仍按 slot id 缓存 capture 阶段旧 page table；改用 `(slot,page_table_version)` 后首条 128K 从 `[7,31,21,31]` / 2.844 committed-per-round / 74.95 tok/s 恢复到 `[0,0,0,64]` / 4.000 / 101.58 tok/s，prefix-on cold/warm 也均满接受，输出 SHA 不变。另修 128K chained hash O(n²)：5.352s→10.8ms，persistent-hit TTFT 13.97s→~52ms。
 - [2026-08-05 Qwen3.6-27B 质量套件重跑（MTP+CG 路径）](2026-08-05-qwen36-quality-rerun.md) —— 🟢 **质量无回退**：MMLU-Pro 414 精确复现 **84.54%**（与历史同 question_ids）；tool/agent/longctx 均 1.000；HumanEval 768 在 ±3.9pp SE 内。参数与历史一致（MTP K=3、block_size 16、FP8 KV、GPU util 0.92）；并行分片 + 断点续跑，`bash scripts/run_qwen36_quality.sh all` 可复现
 - [2026-08-05 Qwen3.6 服务端性能网格（严格上下文 × 并发，MTP+CG+prefix cache）](2026-08-05-server-perf-grid-mtp-cg-prefix.md) —— 🟢 **15/15 cell 全完成、WARM 全命中**：5 档严格上下文（4K–250K，block 对齐）× 3 并发，参数与历史一致；250K 冷→热 TTFT ~316 s → ~0.48 s（655.6×），MTP-on 解码（4K c=1/2/3 = 67.9/64.7/65.8 tok/s）不再有修复前 7.80 tok/s 的回退。**过程中修掉两个叠加的 persistent cache bug**（per-slot chunked prefill 缺 COW 写穿 scratch、live-slot 已提交别名无法逐出致 250K store 静默失败），回归测试已加；`benchmarks/server_perf_grid.py` 逐 cell 续跑，结果 JSON 与失败对照版一并入库
 - [2026-08-05 persistent prefix 完整命中路径修复 + Codex 接入](2026-08-05-persistent-prefix-full-hit-fix-and-codex-integration.md) —— 🟢 **完整命中必错的根因**：scratch restore 把 live GDN 列一起清零；次 bug 是 slot-local checkpoint 覆盖 one-to-one hash 索引导致隔次必 miss。修复 + 回归测试 + Codex CLI（Responses 协议）接入方式；流式生命周期事件缺顶层 `type` 导致 CLI 反复重连，已修并重跑通过

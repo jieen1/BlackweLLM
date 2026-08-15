@@ -183,17 +183,16 @@ def _prefix_hash(token_ids: list[int], length: int) -> str:
     return hashlib.blake2b(ids.tobytes(), digest_size=16).hexdigest()
 
 
-def _chained_block_keys(
-    token_ids: list[int], kv_len: int, block_size: int
-) -> list[BlockKey]:
+def _chained_block_keys(token_ids: list[int], kv_len: int, block_size: int) -> list[BlockKey]:
     """Chained 128-bit block hashes for the committed prefix.
 
     Phase 3: the arena's prefix cache is keyed per HASH BLOCK (the
     checkpoint/block boundary, ``block_size``=64 in practice) by a chained
-    hash over ``[0, (i+1)*block_size)`` (``runtime.block_pool.hash_block_tokens``
-    shape -- block i's hash depends on the whole prefix, so a divergence at
-    any earlier token changes every later block's hash and lookup can stop
-    at the first miss). One physical KV page (``page_size``=128) carries two
+    hash over the current block plus its parent hash
+    (``runtime.block_pool.hash_block_tokens`` shape -- block i's hash depends
+    on the whole prefix through the chain, so a divergence at any earlier
+    token changes every later block's hash and lookup can stop at the first
+    miss). One physical KV page (``page_size``=128) carries two
     hash blocks, both pointing at the same bundle -- vLLM's
     ``hash_block_size < block_size`` fine-grained lookup (plan §5.1C:
     finalized *blocks* enter the cache, including a page whose second half
@@ -205,7 +204,13 @@ def _chained_block_keys(
     keys: list[BlockKey] = []
     parent: int | None = None
     for end in range(block_size, kv_len + 1, block_size):
-        value = hash_block_tokens(parent, token_ids[:end], ())
+        # The parent already authenticates every preceding block. Feeding
+        # ``token_ids[:end]`` here redundantly re-hashed the whole prefix at
+        # every boundary: 128K / block_size=16 processed ~537M token values
+        # and added ~5 seconds to a persistent-prefix hit. Hash only the new
+        # block so key construction remains O(kv_len), as the chained design
+        # requires.
+        value = hash_block_tokens(parent, token_ids[end - block_size : end], ())
         keys.append(BlockKey(value=value, num_tokens=end))
         parent = value
     return keys
@@ -610,8 +615,7 @@ class Qwen36Backend:
             v_pool = getattr(self._mtp, "mtp_v_pool", None)
             if k_pool is not None and v_pool is not None:
                 mtp_bytes = (
-                    k_pool.numel() * k_pool.element_size()
-                    + v_pool.numel() * v_pool.element_size()
+                    k_pool.numel() * k_pool.element_size() + v_pool.numel() * v_pool.element_size()
                 )
         if mtp_bytes:
             # Dynamic MTP allocates the same number of physical bundles as
@@ -624,14 +628,10 @@ class Qwen36Backend:
             snapshot["qwen_kv_pool_bytes"] += mtp_bytes
             snapshot["qwen_kv_pool_bytes_measured"] += mtp_bytes
             mtp_bytes_per_page = mtp_bytes // self.pool.pool_bundles
-            snapshot["kv_bytes_per_slot"] += (
-                mtp_bytes_per_page * self.pool.pages_per_slot
-            )
+            snapshot["kv_bytes_per_slot"] += mtp_bytes_per_page * self.pool.pages_per_slot
         else:
             snapshot["qwen_kv_mtp_pool_bytes"] = 0
-        snapshot["qwen_kv_bundle_bytes"] = (
-            snapshot["qwen_kv_pool_bytes"] // self.pool.pool_bundles
-        )
+        snapshot["qwen_kv_bundle_bytes"] = snapshot["qwen_kv_pool_bytes"] // self.pool.pool_bundles
         return snapshot
 
     def reset_slot(self, slot: int) -> None:
@@ -1554,9 +1554,7 @@ class Qwen36Backend:
         self.drop_prefix_cache(slot)
         if self.pool.dynamic_arena:
             keys = _chained_block_keys(token_ids, entry.kv_len, self.block_size)
-            restored, _bundle_ids = self.pool.restore_prefix_from_arena(
-                slot, entry.kv_len, keys
-            )
+            restored, _bundle_ids = self.pool.restore_prefix_from_arena(slot, entry.kv_len, keys)
             if restored < entry.kv_len:
                 return 0
         else:
@@ -1564,9 +1562,7 @@ class Qwen36Backend:
                 self.pool.scratch_row * self.pool.pages_per_slot + page
                 for page in entry.scratch_page_offsets
             ]
-            self.pool.share_scratch_prefix(
-                slot, entry.kv_len, scratch_pages=scratch_physical_pages
-            )
+            self.pool.share_scratch_prefix(slot, entry.kv_len, scratch_pages=scratch_physical_pages)
         self.pool.restore_recurrent_state(slot, entry.checkpoint)
         self.pool.rewind_slot(slot, entry.kv_len)
         if self._mtp is not None and self.pool.dynamic_arena:

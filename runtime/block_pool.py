@@ -96,8 +96,8 @@ NONE_HASH: int = _derive_none_hash()
 def hash_block_tokens(parent_hash: int | None, token_ids: list[int], extra_keys: tuple) -> int:
     """Full-width 128-bit chained block hash (``notes/prefix-cache-design.md``
     sec 3.2; vLLM ``hash_block_tokens`` shape, adapted not copied). Block i's
-    hash depends on the WHOLE prefix ``0..(i+1)*block_size`` via the chained
-    ``parent_hash`` (or the ``NONE_HASH`` seed for block 0), so two prompts
+    hash depends on the whole prefix via the chained ``parent_hash`` plus the
+    current block's ``token_ids`` (or the ``NONE_HASH`` seed for block 0), so two prompts
     diverging at any earlier token get different hashes for every block from
     the divergence on -- which is exactly why prefix lookup can stop at the
     first miss.

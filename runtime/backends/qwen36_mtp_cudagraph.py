@@ -174,6 +174,13 @@ def decode_write_index(
     return global_page * page_size + kv_len % page_size
 
 
+def _page_table_slot_key(pool: object, slots: list[int]) -> tuple[object, ...]:
+    """Key a copied graph page table by slot and dynamic mapping epoch."""
+    if getattr(pool, "dynamic_arena", False):
+        return tuple((slot, pool.page_table_version(slot)) for slot in slots)
+    return tuple(slots)
+
+
 def build_pooled_mtp_caches(
     model,
     *,
@@ -225,8 +232,7 @@ def build_pooled_mtp_caches(
     if pool_bundles is not None:
         if page_table is None or page_table.shape[0] < num_rows:
             raise ValueError(
-                "dynamic MTP caches need a backbone page table with >= "
-                f"{num_rows} rows"
+                f"dynamic MTP caches need a backbone page table with >= {num_rows} rows"
             )
         caches = [
             Qwen36PagedAttentionCache.wrap(
@@ -446,7 +452,7 @@ class Qwen36MTPVerifyCudaGraph:
         # prefix-cache block table.  Avoid repeating the same D2D copies for
         # the common stable active-slot set while retaining arbitrary order
         # on the first replay after membership changes.
-        self._page_table_slots: dict[int, tuple[int, ...] | None] = {
+        self._page_table_slots: dict[int, tuple[object, ...] | None] = {
             batch: None for batch in self._batches
         }
         self._captured = False
@@ -593,7 +599,7 @@ class Qwen36MTPVerifyCudaGraph:
         positions.copy_(positions_host, non_blocking=True)
         cache_seqlens.copy_(cache_seqlens_host, non_blocking=True)
         write_index.copy_(write_index_host, non_blocking=True)
-        slot_key = tuple((slot, self.pool.page_table_version(slot)) for slot in slots)
+        slot_key = _page_table_slot_key(self.pool, slots)
         if self._page_table_slots[batch] != slot_key:
             for row, slot in enumerate(slots):
                 page_table[row].copy_(self.pool._global_page_table[slot])  # noqa: SLF001
@@ -694,7 +700,7 @@ class Qwen36MTPDraftCudaGraph:
         self._host_input_views: dict[int, tuple[object, object, object]] = {}
         self._drivers: dict[int, Qwen36DecodeGraphAttention] = {}
         self._attn_outputs: dict[int, torch.Tensor] = {}
-        self._page_table_slots: dict[int, tuple[int, ...] | None] = {}
+        self._page_table_slots: dict[int, tuple[object, ...] | None] = {}
         for batch in range(1, engine.backend.num_slots + 1):
             self._inputs[batch] = (
                 torch.zeros(batch, 1, dtype=torch.long, device=self.device),
@@ -781,7 +787,7 @@ class Qwen36MTPDraftCudaGraph:
         slot_buf.copy_(slots_host, non_blocking=True)
         start_pos.copy_(start_positions_host, non_blocking=True)
         driver = self._drivers[batch]
-        slot_key = tuple(slots)
+        slot_key = _page_table_slot_key(self.engine.backend.pool, slots)
         if self._page_table_slots[batch] != slot_key:
             for row, slot in enumerate(slots):
                 driver.page_table[row].copy_(self._page_table_by_slot[slot])
@@ -969,7 +975,7 @@ class Qwen36MTPBatchedSync:
         self._row_index: dict[int, torch.Tensor] = {}
         self._drivers: dict[int, Qwen36DecodeGraphAttention] = {}
         self._attn_outputs: dict[int, torch.Tensor] = {}
-        self._decode_page_table_slots: dict[int, tuple[int, ...] | None] = {}
+        self._decode_page_table_slots: dict[int, tuple[object, ...] | None] = {}
         self._graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self._verify_inputs: dict[
             tuple[int, int],
@@ -981,7 +987,7 @@ class Qwen36MTPBatchedSync:
         self._verify_host_input_views: dict[tuple[int, int], tuple[object, object, object]] = {}
         self._verify_drivers: dict[tuple[int, int], Qwen36VerifyGraphAttention] = {}
         self._verify_attn_outputs: dict[tuple[int, int], torch.Tensor] = {}
-        self._verify_page_table_slots: dict[tuple[int, int], tuple[int, ...] | None] = {}
+        self._verify_page_table_slots: dict[tuple[int, int], tuple[object, ...] | None] = {}
         self._verify_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self._step_tokens: dict[int, torch.Tensor] = {}
         self._step_hidden: dict[int, torch.Tensor] = {}
@@ -1128,7 +1134,7 @@ class Qwen36MTPBatchedSync:
         slot_buf.copy_(slots_host, non_blocking=True)
         start_pos.copy_(starts_host, non_blocking=True)
         driver = self._drivers[batch]
-        slot_key = tuple(slots)
+        slot_key = _page_table_slot_key(self.engine.backend.pool, slots)
         if self._decode_page_table_slots[batch] != slot_key:
             for row, slot in enumerate(slots):
                 driver.page_table[row].copy_(self._page_table_by_slot[slot])
@@ -1188,7 +1194,7 @@ class Qwen36MTPBatchedSync:
                 self._target_hidden[batch][row, lengths[row] : query_len].copy_(
                     row_hidden[0, -1:].expand(pad_len, -1)
                 )
-        slot_key = tuple(slots)
+        slot_key = _page_table_slot_key(self.engine.backend.pool, slots)
         if self._decode_page_table_slots[batch] != slot_key:
             for row, slot in enumerate(slots):
                 driver.page_table[row].copy_(self._page_table_by_slot[slot])
@@ -1231,7 +1237,7 @@ class Qwen36MTPBatchedSync:
         positions.copy_(positions_host, non_blocking=True)
         write_index.copy_(write_index_host, non_blocking=True)
         cache_seqlens.copy_(cache_seqlens_host, non_blocking=True)
-        slot_key = tuple(slots)
+        slot_key = _page_table_slot_key(self.engine.backend.pool, slots)
         if self._verify_page_table_slots[key] != slot_key:
             for row, slot in enumerate(slots):
                 page_table[row].copy_(self._page_table_by_slot[slot])

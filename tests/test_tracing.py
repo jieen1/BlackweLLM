@@ -48,6 +48,10 @@ class TestRequestTrace:
         assert "decode_ms" in d
         assert "avg_round_ms" in d
         assert "tokens_per_sec" in d
+        assert d["decode_rounds"] == [
+            {"round_idx": 0, "tokens_committed": 3, "round_ms": 15.0},
+            {"round_idx": 1, "tokens_committed": 3, "round_ms": 15.0},
+        ]
 
 
 class TestRequestTracer:

@@ -53,7 +53,7 @@ case ${1:-} in
         export QSR_SERVER_BLOCK_SIZE=16
         export QSR_SERVER_KV_CACHE_DTYPE=fp8_e4m3
         export QSR_SERVER_ENABLE_CUDAGRAPH=1
-        export QSR_SERVER_ENABLE_PREFIX_CACHE=1
+        export QSR_SERVER_ENABLE_PREFIX_CACHE=${QSR_BENCH_PREFIX_CACHE:-1}
         export QSR_SERVER_REQUEST_TIMEOUT_S=900
         export QSR_THINKING_CAPABLE=1
         export QSR_TRACE=1

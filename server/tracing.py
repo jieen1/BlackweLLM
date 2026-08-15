@@ -95,6 +95,18 @@ class RequestTrace:
             "avg_round_ms": round(self.avg_round_ms, 2),
             "tokens_per_sec": round(self.tokens_per_sec, 1),
             "finish_reason": self.finish_reason,
+            # Bounded by RequestTracer.max_rounds_per_trace (500). Keeping
+            # the already-recorded rows visible is essential for separating
+            # a one-round cold-start anomaly from sustained MTP rejection;
+            # aggregate avg_round_ms cannot make that distinction.
+            "decode_rounds": [
+                {
+                    "round_idx": round_idx,
+                    "tokens_committed": tokens_committed,
+                    "round_ms": round(round_ms, 3),
+                }
+                for round_idx, tokens_committed, round_ms in self.decode_rounds
+            ],
         }
 
 

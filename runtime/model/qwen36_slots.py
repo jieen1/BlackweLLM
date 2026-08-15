@@ -287,8 +287,11 @@ class Qwen36SlotPool:
                 # dynamic arena's pool size is not a multiple of
                 # ``pages_per_slot`` (strict 4x256K + reserve is).
                 kv_bytes_actual = getattr(self, "_kv_bytes_actual", 0)
-                kv_bytes_actual += 2 * total_pages * self.page_size * (
-                    attn.num_kv_heads * attn.head_dim * k.element_size()
+                kv_bytes_actual += (
+                    2
+                    * total_pages
+                    * self.page_size
+                    * (attn.num_kv_heads * attn.head_dim * k.element_size())
                 )
                 self._kv_bytes_actual = kv_bytes_actual
                 self.attn_outputs[i] = _mark_static(
@@ -386,9 +389,7 @@ class Qwen36SlotPool:
         # round; all future remapping goes through ``set_page_table_row`` so
         # the two representations change atomically.
         if self.dynamic_arena:
-            self._page_table_host = [
-                [0] * self.pages_per_slot for _ in range(self._num_rows)
-            ]
+            self._page_table_host = [[0] * self.pages_per_slot for _ in range(self._num_rows)]
         else:
             self._page_table_host = [
                 [slot * self.pages_per_slot + page for page in range(self.pages_per_slot)]
@@ -525,9 +526,7 @@ class Qwen36SlotPool:
             "kv_bytes_per_slot": self.geometry.kv_bytes_per_slot,
             "kv_bytes_total": self.geometry.kv_bytes_total,
             "kv_bytes_measured": self.kv_storage_bytes(),
-            "kv_bytes_scratch_row": (
-                0 if self.dynamic_arena else self.geometry.kv_bytes_per_slot
-            ),
+            "kv_bytes_scratch_row": (0 if self.dynamic_arena else self.geometry.kv_bytes_per_slot),
             "recurrent_bytes_per_slot": self.geometry.recurrent_bytes_per_slot,
             # Prometheus-facing aliases (Phase 0 gauges).
             "qwen_kv_pool_bytes": self.geometry.kv_bytes_total,
@@ -541,12 +540,8 @@ class Qwen36SlotPool:
             "qwen_kv_full_attention_layers": self.geometry.num_paged_kv_layers,
             "qwen_kv_gdn_layers": self.geometry.num_recurrent_layers,
             "qwen_kv_mode": 1 if self.dynamic_arena else 0,
-            "qwen_kv_free_bundles": (
-                arena_usage.free_bundles if arena_usage is not None else 0
-            ),
-            "qwen_kv_live_bundles": (
-                arena_usage.live_bundles if arena_usage is not None else 0
-            ),
+            "qwen_kv_free_bundles": (arena_usage.free_bundles if arena_usage is not None else 0),
+            "qwen_kv_live_bundles": (arena_usage.live_bundles if arena_usage is not None else 0),
             "qwen_kv_cached_bundles": (
                 arena_usage.cached_bundles if arena_usage is not None else 0
             ),
@@ -651,9 +646,7 @@ class Qwen36SlotPool:
             # incref'd it (which it does before remapping).
             non_null = [p for p in physical_pages if p != 0]
             if len(set(non_null)) != len(non_null):
-                raise ValueError(
-                    "a dynamic page-table row must not repeat non-null bundles"
-                )
+                raise ValueError("a dynamic page-table row must not repeat non-null bundles")
         if not self.dynamic_arena:
             old_pages = self._page_table_host[slot]
             for page in old_pages:
@@ -720,9 +713,7 @@ class Qwen36SlotPool:
                 elif self._arena.bundles[source_page].ref_cnt > 1:
                     # COW detach: the slot transfers its reference from the
                     # shared source to a fresh private clone.
-                    target_page = self._arena.ensure_writable(
-                        source_page, owner=f"slot-{slot}"
-                    )
+                    target_page = self._arena.ensure_writable(source_page, owner=f"slot-{slot}")
                     self._arena.decref([source_page], owner=f"slot-{slot}")
                     self._slot_bundles[slot].discard(source_page)
                     replacements.append((logical_page, source_page, target_page))
@@ -854,9 +845,7 @@ class Qwen36SlotPool:
             )
             # Complete shared pages will never need a private clone. A final
             # partial page keeps its reservation for the suffix-write COW.
-            self._arena.consume_reservation(
-                kv_len // self.page_size, owner=f"slot-{target_slot}"
-            )
+            self._arena.consume_reservation(kv_len // self.page_size, owner=f"slot-{target_slot}")
             self._slot_bundles[target_slot].update(
                 self._page_table_host[source_slot][:shared_pages]
             )
@@ -991,9 +980,7 @@ class Qwen36SlotPool:
                     continue
                 if self._arena.bundles[source_page].ref_cnt <= 1:
                     continue
-                target_page = self._arena.ensure_writable(
-                    source_page, owner=f"slot-{slot}"
-                )
+                target_page = self._arena.ensure_writable(source_page, owner=f"slot-{slot}")
                 self._arena.decref([source_page], owner=f"slot-{slot}")
                 self._slot_bundles[slot].discard(source_page)
                 replacements.append((logical_page, source_page, target_page))
@@ -1216,7 +1203,8 @@ class Qwen36SlotPool:
         if block_size <= 0 or self.page_size % block_size != 0:
             raise ValueError("block_size must divide the page size")
         row = self._page_table_host[slot]
-        published = 0
+        publish_keys: list[BlockKey] = []
+        bundle_ids: list[int] = []
         for key in keys:
             end = key.num_tokens
             if end > kv_len:
@@ -1230,9 +1218,10 @@ class Qwen36SlotPool:
                     f"slot {slot} has no bundle for block ending at {end}; "
                     "prefill must have written it first"
                 )
-            self._arena.publish_full_block(bundle_id, key)
-            published += 1
-        return published
+            publish_keys.append(key)
+            bundle_ids.append(bundle_id)
+        self._arena.cache_full_blocks(publish_keys, bundle_ids)
+        return len(publish_keys)
 
     def restore_prefix_from_arena(
         self, slot: int, kv_len: int, keys: Sequence[BlockKey]

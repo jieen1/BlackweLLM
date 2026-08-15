@@ -299,6 +299,41 @@ class TestPhase3PrefixCache:
             keys.append(BlockKey(value=parent, num_tokens=self._BLOCK * (i + 1)))
         return keys
 
+    def test_chained_keys_hash_each_token_once(self, monkeypatch) -> None:
+        from runtime import block_pool
+        from runtime.backends.qwen36 import _chained_block_keys
+
+        calls: list[tuple[int | None, list[int]]] = []
+
+        def _hash(parent, token_ids, extra_keys):
+            calls.append((parent, list(token_ids)))
+            return len(calls)
+
+        monkeypatch.setattr(block_pool, "hash_block_tokens", _hash)
+
+        keys = _chained_block_keys(list(range(12)), 12, 4)
+
+        assert calls == [
+            (None, [0, 1, 2, 3]),
+            (1, [4, 5, 6, 7]),
+            (2, [8, 9, 10, 11]),
+        ]
+        assert [key.num_tokens for key in keys] == [4, 8, 12]
+
+    def test_bulk_publish_checks_invariants_once(self, monkeypatch) -> None:
+        pool = _dynamic_pool(num_slots=2, max_seq_len=256, pool_bundles=16)
+        pool.prepare_kv_writes(0, 0, 128)
+        calls = 0
+
+        def _check_once():
+            nonlocal calls
+            calls += 1
+
+        monkeypatch.setattr(pool._arena, "_maybe_invariant_check", _check_once)
+        pool.publish_committed_blocks(0, 128, self._keys(2), self._BLOCK)
+
+        assert calls == 1
+
     def test_publish_then_reset_leaves_bundles_cached_ref0(self) -> None:
         pool = _dynamic_pool(num_slots=2, max_seq_len=256, pool_bundles=16)
         pool.prepare_kv_writes(0, 0, 128)
@@ -369,7 +404,9 @@ class TestPhase3PrefixCache:
         pool.publish_committed_blocks(0, 128, self._keys(2, base=7), self._BLOCK)
         pool.reset_slot(0)
         restored, bundle_ids = pool.restore_prefix_from_arena(
-            1, 128, self._keys(2, base=99)  # different content
+            1,
+            128,
+            self._keys(2, base=99),  # different content
         )
         assert restored == 0
         assert bundle_ids == []
