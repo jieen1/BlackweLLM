@@ -532,7 +532,10 @@ CC12.x strided broadcast 读越界条件和 PDL alpha/beta WAR。算法选择在
       decode arena）；
 - [x] MTP graph pool 按 target/draft/sync family 共享（2026-08-15，`8bc886d`：
       4→1 / 4→1 / 28→1，family 间不共池）；
-- [ ] persistent GDN checkpoint hard pool 与原子淘汰；
+- [x] persistent GDN checkpoint hard pool 与原子淘汰（2026-08-15，`544d79e`：
+      `evict_for_budget(include_pinned=...)` 让新 store 按 LRU 驱逐旧 pinned
+      persistent entry，dynamic arena 下不再无限堆积；rolling 方向保护不变；
+      96-clone ownership transfer 留作后续微优化）；
 - [x] strict 8201-bundle fresh-process 启动/逐槽增长验收（2026-08-15 实测通过：
       峰值 64.09 GiB，driver free 31.51 GiB，短请求 1 bundle，逐槽增长成比例）。
 
