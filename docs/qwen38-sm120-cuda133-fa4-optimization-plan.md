@@ -549,8 +549,14 @@ CC12.x strided broadcast 读越界条件和 PDL alpha/beta WAR。算法选择在
 
 ### Phase 1A：b12x/FA4 可迁移 P0（3–10 天）
 
-- [ ] exact conditional rescale；
-- [ ] packed `f32x2` score arithmetic；
+- [x] exact conditional rescale（2026-08-15，sparkinfer `8f74740`：row0 两变体
+      `m_new == m_prev` 时跳过 exp2+d/o rescale，bit-exact——20 轮 MTP + 60
+      plain decode tokens 与未改动逐 token 相同；128K B1 性能在跑间方差内中性，
+      rescale 占 kernel 比例小，收益主要是去除冗余工作 + threshold 变体的地基）；
+- [x] ~~packed `f32x2` score arithmetic~~ **已证伪**（2026-08-15，
+      [`../notes/2026-08-15-b12x-packed-f32x2-falsified.md`](../notes/2026-08-15-b12x-packed-f32x2-falsified.md)：
+      cutlass-dsl 4.7.0 把 fma_packed_f32x2 标量化，SASS 零 packed 指令、
+      净指令差 2 条、128K B1 性能在噪声内，按 §7.2 淘汰条款回退）；
 - [ ] tile/stage/producer/head-pair/residency 联合 A/B；
 - [ ] SplitKV forward+merge+scratch 联合 LUT；
 - [ ] page-id/descriptor load 审计。

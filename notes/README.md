@@ -1,6 +1,6 @@
 # notes/ 索引
 
-> 编制日期：2026-08-15 · 共 233 篇（`git ls-files notes | wc -l`，包含本次新增）
+> 编制日期：2026-08-15 · 共 234 篇（`git ls-files notes | wc -l`，包含本次新增）
 
 `notes/` 是**调查记录与证据档案**，不是文档。它的价值在于：当一个结论被
 质疑时，能翻出当初的实测数据、复现命令和被排除的假设。
@@ -123,6 +123,7 @@ Track F（性能，机会主义）的输入。
 
 | 文件 | 内容 |
 |---|---|
+| `2026-08-15-b12x-packed-f32x2-falsified.md` | 🔴 **P0-A2 packed f32x2 负面定案**：cutlass-dsl 4.7.0 把 `fma_packed_f32x2` 标量化——SASS 零 FFMA2/FMUL2/FADD2、净指令差仅 2 条、128K B1 warm 在 ±3-5% 噪声内（110.2 vs 108.8 tok/s），且 fused 舍入移动数值（plain 60 token 3 个平局翻转）。按规划 §7.2 淘汰条款回退；exact conditional rescale（bit-exact）保留，见 sparkinfer `8f74740` |
 | `2026-08-15-qwen38-phase0-round-attribution.md` | 🟢 **Phase 0 轮级 + kernel-family 归因实测**（规划 §6.1 门禁）：K=3 生产配置 128K，轮级 phase 解释 ≥90% round wall（B4 GPU 合计 93.2%、verify 79.5%、host 仅 ~7%）；nsys kernel-family：attention 41% 最大、W8A8 24%、W4A4 14.8%、GDN ~2.6%。判别树落判——P1-A（b12x attention）方向证实，ragged sync 分桶（sync 5.8%<8–10%）与 GDN 融合**排除**。接受率 100%（832/832）；c4 warm 66.3→66.4 tok/s/req 对 P0 显存提交**中性**。K=2/K=1 sweep 留作补测 |
 | `2026-08-15-strict-4x256k-startup-acceptance.md` | 🟢 **strict 4×256K fresh-process 启动验证实测通过**（规划 §4.9 门禁）：P0-M1/M2/M3/C 落地后，8201-bundle strict pool 完整启动序列峰值 **NVML 64.09 GiB / driver free 31.51 GiB**（优于规划 65–70 GiB 预估）；KV 合计 36.0 GiB 与代码精算 36.04 吻合；5-token 短请求只占 1 bundle；逐槽增长严格成比例（每 128 tokens 1 bundle）；decode graph 捕获阶段 Δallocated≈0，直接证明 P0-M2 step 2-3 释放抵消了 graph pool 增量 |
 | `2026-07-31-session-summary.md` | **当前最佳配置与性能基线**（4K 353–401 tok/s、64K 353–368、接受率 96.3–100%） |
