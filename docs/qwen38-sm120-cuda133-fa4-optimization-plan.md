@@ -508,9 +508,14 @@ CC12.x strided broadcast 读越界条件和 PDL alpha/beta WAR。算法选择在
 
 ### Phase 0：证据与正确性（0.5–2 天）
 
-- [ ] `QSR_PROFILE_ROUNDS=2` 解释 ≥90% round wall；
-- [ ] post-fix 128K exact-prefix repeat；
-- [ ] K=1/2/3 content-matched sweep；
+- [x] `QSR_PROFILE_ROUNDS=2` 解释 ≥90% round wall（2026-08-15，
+      [`../notes/2026-08-15-qwen38-phase0-round-attribution.md`](../notes/2026-08-15-qwen38-phase0-round-attribution.md)：
+      B4 GPU 合计 93.2%，verify 79.5%；nsys kernel-family：attention 41% 最大，
+      判别树落判——P1-A 方向证实，ragged sync 分桶与 GDN 融合排除）；
+- [x] post-fix 128K exact-prefix repeat（c4 实测 hits=4 restores=4，warm TTFT
+      ~0.19 s，GDN checkpoint restore 生效）；
+- [ ] K=1/2/3 content-matched sweep（K=3 已测：100% 接受率、profile 完整；
+      K=2/K=1 未跑——满接受下 K=3 优势可由 profile 数推算，留作补测）；
 - [x] 修 MTP partial-page COW，先钉 regression（2026-08-15，`c1f2f11`：MTP pooled KV
       注册为第 17 个原子 COW family，CPU 回归 + GPU dynamic-arena 注册探针）；
 - [x] 分阶段显存采样：weights → W4 prepare → attention warmup → GDN K3 expand → 每个
