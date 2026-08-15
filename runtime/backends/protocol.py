@@ -91,6 +91,7 @@ class BackendCapabilities:
     cuda_graph: bool
     chunked_prefill: bool
     warm_continue: bool
+    kv_reservation: bool = False
 
 
 @dataclass(frozen=True)
@@ -315,6 +316,12 @@ class ModelBackend(Protocol):
         prior_len: int,
     ) -> dict: ...
 
+    # -- capabilities.kv_reservation --------------------------------------
+
+    def reserve_kv_capacity(self, slot: int, total_tokens: int) -> bool: ...
+
+    def release_kv_reservation(self, slot: int) -> None: ...
+
 
 #: Which protocol members each capability flag governs. Members not listed
 #: here are unconditionally required.
@@ -345,6 +352,7 @@ CAPABILITY_MEMBERS: dict[str, tuple[str, ...]] = {
     ),
     "cuda_graph": ("capture_decode_cuda_graph",),
     "warm_continue": ("mtp_prefill_warm_continue",),
+    "kv_reservation": ("reserve_kv_capacity", "release_kv_reservation"),
 }
 
 REQUIRED_MEMBERS: tuple[str, ...] = (

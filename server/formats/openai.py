@@ -49,6 +49,12 @@ def parse_chat_messages(body: dict) -> list[dict]:
         else:
             entry["content"] = extract_text(msg.get("content"))
 
+        # Qwen3.6 and Qwen3.8 chat templates consume this field when
+        # preserve_thinking=True.  Dropping it here silently erased prior
+        # assistant reasoning before apply_chat_template saw the messages.
+        if role == "assistant" and isinstance(msg.get("reasoning_content"), str):
+            entry["reasoning_content"] = msg["reasoning_content"]
+
         messages.append(entry)
     return messages
 

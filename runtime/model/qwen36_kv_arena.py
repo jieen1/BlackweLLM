@@ -95,6 +95,7 @@ class QwenKVUsage:
     live_bundles: int
     cached_bundles: int
     reserved_bundles: int
+    request_reserved_bundles: int
     watermark_bundles: int
     cow_pending: int
     live_unique_bundles: int
@@ -213,6 +214,11 @@ class QwenPageBundlePool:
         #: is the plan's "pending copy" ledger.
         self._pending_cow: dict[int, int] = {}
         self._watermark_bundles = watermark_bundles
+        # owner -> logical pages still guaranteed to an admitted request but
+        # not yet satisfied by an allocation or an existing shared page.
+        # The engine thread is the only production mutator, so this needs no
+        # lock; keeping it here makes check+reserve one atomic Python call.
+        self._reservations: dict[str, int] = {}
 
     # -- free-queue primitives (vLLM FreeKVCacheBlockQueue shape) -----------
 
@@ -415,6 +421,22 @@ class QwenPageBundlePool:
                 f"(of {self.num_bundles - self.reserved} usable, excluding {self.reserved} "
                 "reserved); every other bundle is ref_cnt > 0 or cached"
             )
+        owner_reserved = self._reservations.get(owner, 0)
+        if owner_reserved:
+            if count > owner_reserved:
+                raise RuntimeError(
+                    f"owner {owner!r} requested {count} bundles with only "
+                    f"{owner_reserved} reserved"
+                )
+        else:
+            unreserved = self._unreserved_free_bundles()
+            if count > unreserved:
+                raise RuntimeError(
+                    f"bundle allocation would consume reserved capacity: owner={owner!r} "
+                    f"requested={count}, unreserved={unreserved}, "
+                    f"request_reserved={sum(self._reservations.values())}, "
+                    f"watermark={self._watermark_bundles}"
+                )
         ids: list[int] = []
         for _ in range(count):
             bundle = self._free_popleft()
@@ -433,6 +455,7 @@ class QwenPageBundlePool:
                     self._on_evict_cached(bundle.bundle_id)
             bundle.ref_cnt = 1
             ids.append(bundle.bundle_id)
+        self._consume_reservation(owner, count)
         self._maybe_invariant_check()
         return ids
 
@@ -448,6 +471,27 @@ class QwenPageBundlePool:
         """
         if not isinstance(owner, str) or not owner:
             raise ValueError("owner must be a non-empty string")
+        bundle_ids = list(bundle_ids)
+        for bundle_id in bundle_ids:
+            if bundle_id < self.reserved:
+                raise RuntimeError(f"INV7: cannot reference reserved bundle {bundle_id}")
+            if bundle_id >= self.num_bundles:
+                raise RuntimeError(
+                    f"bundle {bundle_id} is out of range (num_bundles={self.num_bundles})"
+                )
+        revivals = sum(
+            1 for bundle_id in bundle_ids if self.bundles[bundle_id].ref_cnt == 0
+        )
+        owner_reserved = self._reservations.get(owner, 0)
+        if (
+            revivals > owner_reserved
+            and revivals - owner_reserved > self._unreserved_free_bundles()
+        ):
+            raise RuntimeError(
+                f"cached hit would consume reserved capacity: owner={owner!r}, "
+                f"revivals={revivals}, owner_reserved={owner_reserved}, "
+                f"unreserved={self._unreserved_free_bundles()}"
+            )
         for bundle_id in bundle_ids:
             if bundle_id < self.reserved:
                 raise RuntimeError(
@@ -513,7 +557,7 @@ class QwenPageBundlePool:
                     self._free_prepend(bundle)  # unhashed: LIFO head
         self._maybe_invariant_check()
 
-    def ensure_writable(self, bundle_id: int) -> int:
+    def ensure_writable(self, bundle_id: int, *, owner: str = "cow") -> int:
         """Return a bundle the caller may write to, cloning if shared.
 
         A private bundle (``ref_cnt == 1``, not null) is writable as-is and
@@ -533,7 +577,7 @@ class QwenPageBundlePool:
                 f"ensure_writable on free bundle {bundle_id} (ref_cnt=0) -- allocate first"
             )
         # Shared: clone.
-        fresh = self.allocate(1, owner="cow")
+        fresh = self.allocate(1, owner=owner)
         target = fresh[0]
         self._pending_cow[target] = bundle_id
         return target
@@ -651,6 +695,7 @@ class QwenPageBundlePool:
             live_bundles=live,
             cached_bundles=cached,
             reserved_bundles=self.reserved,
+            request_reserved_bundles=sum(self._reservations.values()),
             watermark_bundles=self._watermark_bundles,
             cow_pending=len(self._pending_cow),
             live_unique_bundles=live,
@@ -673,7 +718,79 @@ class QwenPageBundlePool:
         write (plan §6.5 "capacity 不足进入 waiting queue 或明确返回容量原
         因;不得先运行后失败").
         """
-        available = self._free_len
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("owner must be a non-empty string")
+        # A retry for the same owner may reuse its existing guarantee. Other
+        # owners' promises are unavailable even though those pages have not
+        # necessarily been materialized yet.
+        available = self._free_len - sum(
+            count for reserved_owner, count in self._reservations.items()
+            if reserved_owner != owner
+        )
         if include_watermark:
             available -= self._watermark_bundles
         return num_required_bundles <= available
+
+    def reserve(self, count: int, *, owner: str) -> bool:
+        """Atomically guarantee ``count`` future logical pages to ``owner``.
+
+        Returns ``False`` without mutation when the global pool cannot honor
+        the guarantee. A duplicate owner is a lifecycle bug: callers must
+        release or reset the slot before attempting another admission.
+        """
+        if count < 0:
+            raise ValueError(f"cannot reserve a negative count ({count})")
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("owner must be a non-empty string")
+        if owner in self._reservations:
+            raise RuntimeError(f"owner {owner!r} already has a KV reservation")
+        if not self._check_admission_fits(count, owner=owner):
+            return False
+        if count:
+            self._reservations[owner] = count
+        return True
+
+    def reserved_for(self, owner: str) -> int:
+        """Return the unconsumed request reservation for diagnostics/tests."""
+        return self._reservations.get(owner, 0)
+
+    def release_reservation(self, *, owner: str) -> int:
+        """Release only ``owner``'s unmaterialized guarantee.
+
+        Live pages remain owned until the normal ``decref`` lifecycle runs.
+        The return value is the number of promised pages released.
+        """
+        return self._reservations.pop(owner, 0)
+
+    def consume_reservation(self, count: int, *, owner: str) -> None:
+        """Mark ``count`` promised pages satisfied without allocating them.
+
+        Prefix sharing calls this for complete read-only pages. A partial
+        shared tail deliberately remains reserved because its first suffix
+        write must COW-clone it before touching bytes.
+        """
+        if count < 0:
+            raise ValueError(f"cannot consume a negative count ({count})")
+        self._consume_reservation(owner, count)
+
+    def _consume_reservation(self, owner: str, count: int) -> None:
+        remaining = self._reservations.get(owner)
+        if remaining is None or count == 0:
+            return
+        if count > remaining:
+            raise RuntimeError(
+                f"owner {owner!r} consumed {count} pages with only {remaining} reserved"
+            )
+        remaining -= count
+        if remaining:
+            self._reservations[owner] = remaining
+        else:
+            self._reservations.pop(owner, None)
+
+    def _unreserved_free_bundles(self) -> int:
+        return max(
+            0,
+            self._free_len
+            - sum(self._reservations.values())
+            - self._watermark_bundles,
+        )

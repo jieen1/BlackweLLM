@@ -329,20 +329,12 @@ class Qwen36Backend:
             else enable_persistent_prefix_cache
         )
         self.batched_decode = batched_decode
-        # Phase 3 dynamic arena: the persistent scratch-arena cache still
-        # addresses a fixed physical scratch row (``_persistent_free_scratch_pages``
-        # + ``scratch_row * pages_per_slot`` offsets), which does not exist in
-        # dynamic mode -- KV pages are handed out per bundle. Dynamic mode's
-        # prefix cache is the Phase 3 arena-owned CACHED_REF0 path
-        # (publish_committed_blocks / restore_prefix_from_arena); the scratch
-        # arena is refused explicitly rather than silently addressing pages
-        # it does not own.
-        if dynamic_arena and self.enable_persistent_prefix_cache:
-            logger.warning(
-                "Qwen3.6 dynamic KV arena: persistent scratch-arena prefix cache disabled "
-                "(dynamic mode uses the arena's CACHED_REF0 prefix cache instead)"
-            )
-            self.enable_persistent_prefix_cache = False
+        # Dynamic mode keeps KV/MTP bytes in arena-owned CACHED_REF0 bundles,
+        # but still needs the co-keyed GDN checkpoint and full-prompt anchor
+        # hidden stored by the persistent cache family.  The store/restore
+        # methods below select CACHED_REF0 instead of the fixed scratch row;
+        # disabling the entire family here made every apparent 128K KV hit a
+        # state miss and forced a full prefill.
 
         self.pool = Qwen36SlotPool(
             model,
@@ -461,6 +453,7 @@ class Qwen36Backend:
             "prefix_persistent_restores": 0,
             "prefix_persistent_stores": 0,
             "prefix_persistent_evictions": 0,
+            "prefix_publish_failures": 0,
             "checkpoints_taken": 0,
             "checkpoints_evicted_by_budget": 0,
             "checkpoints_evicted_by_kv": 0,
@@ -512,7 +505,16 @@ class Qwen36Backend:
             cuda_graph=True,
             chunked_prefill=True,
             warm_continue=False,
+            kv_reservation=True,
         )
+
+    def reserve_kv_capacity(self, slot: int, total_tokens: int) -> bool:
+        """Atomically reserve a request's declared full-sequence KV pages."""
+        return self.pool.reserve_kv_capacity(slot, total_tokens)
+
+    def release_kv_reservation(self, slot: int) -> None:
+        """Release unmaterialized tail capacity while retaining live KV."""
+        self.pool.release_kv_reservation(slot)
 
     @property
     def has_speculative_decode(self) -> bool:
@@ -601,7 +603,36 @@ class Qwen36Backend:
         debug endpoint, and a GPU verification script cannot disagree about
         what was allocated. Keys match :meth:`Qwen36SlotPool.capacity_snapshot`.
         """
-        return self.pool.capacity_snapshot()
+        snapshot = self.pool.capacity_snapshot()
+        mtp_bytes = 0
+        if self._mtp is not None:
+            k_pool = getattr(self._mtp, "mtp_k_pool", None)
+            v_pool = getattr(self._mtp, "mtp_v_pool", None)
+            if k_pool is not None and v_pool is not None:
+                mtp_bytes = (
+                    k_pool.numel() * k_pool.element_size()
+                    + v_pool.numel() * v_pool.element_size()
+                )
+        if mtp_bytes:
+            # Dynamic MTP allocates the same number of physical bundles as
+            # the backbone. Include it in the operator-facing total; reporting
+            # backbone only is how a nominal 18 GiB budget appears to fit while
+            # the process actually allocates another ~2 GiB.
+            snapshot["qwen_kv_mtp_pool_bytes"] = mtp_bytes
+            snapshot["kv_bytes_total"] += mtp_bytes
+            snapshot["kv_bytes_measured"] += mtp_bytes
+            snapshot["qwen_kv_pool_bytes"] += mtp_bytes
+            snapshot["qwen_kv_pool_bytes_measured"] += mtp_bytes
+            mtp_bytes_per_page = mtp_bytes // self.pool.pool_bundles
+            snapshot["kv_bytes_per_slot"] += (
+                mtp_bytes_per_page * self.pool.pages_per_slot
+            )
+        else:
+            snapshot["qwen_kv_mtp_pool_bytes"] = 0
+        snapshot["qwen_kv_bundle_bytes"] = (
+            snapshot["qwen_kv_pool_bytes"] // self.pool.pool_bundles
+        )
+        return snapshot
 
     def reset_slot(self, slot: int) -> None:
         """Release ``slot``, saving its prefix cache; zero its GDN state.
@@ -639,11 +670,17 @@ class Qwen36Backend:
                     self.pool.publish_committed_blocks(
                         slot, self.pool.slot_kv_len[slot], keys, self.block_size
                     )
-                except RuntimeError:
+                except RuntimeError as exc:
                     # A partial page or an allocation gap: publish what is
                     # safely full; the rest stays private and is simply not
                     # cached (a compute miss on restore, never corruption).
-                    pass
+                    self.stats["prefix_publish_failures"] += 1
+                    logger.warning(
+                        "dynamic KV prefix publish failed for slot %d; "
+                        "continuing as a cache miss: %s",
+                        slot,
+                        exc,
+                    )
             else:
                 self._store_persistent_prefix(slot)
         self.pool.reset_slot(slot)
@@ -1434,20 +1471,30 @@ class Qwen36Backend:
                     and (tuple(tokens[: entry.kv_len]) == entry.token_ids)
                 ):
                     return
+        dynamic_arena = self.pool.dynamic_arena
         pages = (kv_len + self.pool.page_size - 1) // self.pool.page_size
-        if not self._evict_persistent_until(pages):
-            return
-        scratch_page_offsets = tuple(sorted(self._persistent_free_scratch_pages)[:pages])
-        scratch_physical_pages = [
-            self.pool.scratch_row * self.pool.pages_per_slot + page for page in scratch_page_offsets
-        ]
-        has_mtp_snapshot = self._mtp is None
-        if self._mtp is not None:
-            has_mtp_snapshot = self._mtp.snapshot_prefix_to_scratch(
-                slot, kv_len, scratch_pages=scratch_page_offsets
-            )
-            if not has_mtp_snapshot:
+        if dynamic_arena:
+            # Backbone and MTP use the same bundle mapping.  reset_slot later
+            # publishes/decrefs those live pages into CACHED_REF0, so no KV
+            # copy or separate MTP scratch snapshot is needed here.
+            scratch_page_offsets: tuple[int, ...] = ()
+            scratch_physical_pages: list[int] = []
+            has_mtp_snapshot = True
+        else:
+            if not self._evict_persistent_until(pages):
                 return
+            scratch_page_offsets = tuple(sorted(self._persistent_free_scratch_pages)[:pages])
+            scratch_physical_pages = [
+                self.pool.scratch_row * self.pool.pages_per_slot + page
+                for page in scratch_page_offsets
+            ]
+            has_mtp_snapshot = self._mtp is None
+            if self._mtp is not None:
+                has_mtp_snapshot = self._mtp.snapshot_prefix_to_scratch(
+                    slot, kv_len, scratch_pages=scratch_page_offsets
+                )
+                if not has_mtp_snapshot:
+                    return
 
         # RecurrentStatePool's hash index is one-to-one by design.  Transfer
         # the source checkpoint identity after all allocation checks pass;
@@ -1459,7 +1506,8 @@ class Qwen36Backend:
         # can be reused.
         self.checkpoint_pool.evict_for_budget(self._checkpoint_bytes)
         key = ("persistent", hash_value)
-        self.pool.copy_prefix_to_scratch(slot, kv_len, scratch_pages=scratch_physical_pages)
+        if not dynamic_arena:
+            self.pool.copy_prefix_to_scratch(slot, kv_len, scratch_pages=scratch_physical_pages)
         self.checkpoint_pool.register(
             key,
             hash_value=hash_value,
@@ -1488,7 +1536,8 @@ class Qwen36Backend:
             scratch_page_offsets=scratch_page_offsets,
             final_hidden=(prompt_hidden.detach().clone() if prompt_hidden is not None else None),
         )
-        self._persistent_free_scratch_pages.difference_update(scratch_page_offsets)
+        if not dynamic_arena:
+            self._persistent_free_scratch_pages.difference_update(scratch_page_offsets)
         self.stats["prefix_persistent_stores"] += 1
 
     def _restore_persistent_prefix(self, slot: int, token_ids: list[int]) -> int:
@@ -1503,16 +1552,32 @@ class Qwen36Backend:
         # checkpoint before changing page ownership, exactly as the existing
         # cross-slot path does, so it cannot later authenticate unrelated KV.
         self.drop_prefix_cache(slot)
-        scratch_physical_pages = [
-            self.pool.scratch_row * self.pool.pages_per_slot + page
-            for page in entry.scratch_page_offsets
-        ]
-        self.pool.share_scratch_prefix(slot, entry.kv_len, scratch_pages=scratch_physical_pages)
+        if self.pool.dynamic_arena:
+            keys = _chained_block_keys(token_ids, entry.kv_len, self.block_size)
+            restored, _bundle_ids = self.pool.restore_prefix_from_arena(
+                slot, entry.kv_len, keys
+            )
+            if restored < entry.kv_len:
+                return 0
+        else:
+            scratch_physical_pages = [
+                self.pool.scratch_row * self.pool.pages_per_slot + page
+                for page in entry.scratch_page_offsets
+            ]
+            self.pool.share_scratch_prefix(
+                slot, entry.kv_len, scratch_pages=scratch_physical_pages
+            )
         self.pool.restore_recurrent_state(slot, entry.checkpoint)
         self.pool.rewind_slot(slot, entry.kv_len)
-        if self._mtp is not None and not self._mtp.restore_prefix_from_scratch(
-            slot, entry.kv_len, scratch_pages=entry.scratch_page_offsets
-        ):
+        if self._mtp is not None and self.pool.dynamic_arena:
+            mtp_restored = self._mtp.restore_prefix_from_arena(slot, entry.kv_len)
+        elif self._mtp is not None:
+            mtp_restored = self._mtp.restore_prefix_from_scratch(
+                slot, entry.kv_len, scratch_pages=entry.scratch_page_offsets
+            )
+        else:
+            mtp_restored = True
+        if not mtp_restored:
             # The normal call site is fresh and this cannot fail after a
             # successful store.  Preserve the hard invariant anyway: undoing
             # a remap is more error-prone than a safe refusal before it.

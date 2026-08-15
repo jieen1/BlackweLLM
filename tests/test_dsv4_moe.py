@@ -360,7 +360,7 @@ def test_cuda_forward_decode_batch_preserves_token_major_hash_order(
 def test_cuda_prefill_keeps_batched_expert_ids_on_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import runtime.kernels.dsv4_iq2xs_gemm as iq2xs_kernels
+    import runtime.kernels.iq2_mma16_tc as iq2_kernels
 
     cfg = small_config()
     moe = Dsv4MoE(cfg, hashed=False, device="cuda")
@@ -373,39 +373,23 @@ def test_cuda_prefill_keeps_batched_expert_ids_on_device(
 
     seen: dict[str, torch.Tensor] = {}
 
-    def fake_dual(
-        xq: torch.Tensor,
-        _xs: torch.Tensor,
-        _packed_gate_all: torch.Tensor,
-        _packed_up_all: torch.Tensor,
-        expert_ids: torch.Tensor,
-        *,
-        rows: int,
-        **_kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        seen["dual_eids"] = expert_ids.clone()
-        seen["dual_x"] = xq.clone()
-        output = torch.zeros(expert_ids.numel(), rows, dtype=torch.float32, device=xq.device)
-        return output, output.clone()
-
-    def fake_down(
-        _hq: torch.Tensor,
-        _hs: torch.Tensor,
-        _packed_down: torch.Tensor,
-        expert_ids: torch.Tensor,
-        *,
-        rows: int,
+    def fake_grouped(
+        flat: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+        *_args,
         **_kwargs,
     ) -> torch.Tensor:
-        seen["down_eids"] = expert_ids.clone()
-        return torch.zeros(expert_ids.numel(), rows, dtype=torch.float32, device=_hq.device)
+        seen["weights"] = weights.clone()
+        seen["indices"] = indices.clone()
+        seen["flat"] = flat.clone()
+        return torch.zeros_like(flat, dtype=torch.float32)
 
     def fake_shared(_self, x: torch.Tensor) -> torch.Tensor:
         return torch.zeros_like(x)
 
     moe.gate = FixedGate()
-    monkeypatch.setattr(iq2xs_kernels, "iq2xs_dequant_gemm_indexed_dual_dp4a", fake_dual)
-    monkeypatch.setattr(iq2xs_kernels, "iq2xs_dequant_gemm_indexed_dp4a", fake_down)
+    monkeypatch.setattr(iq2_kernels, "grouped_moe_prefill_k32", fake_grouped)
     monkeypatch.setattr(Dsv4MoE, "_shared_forward", fake_shared)
 
     output = moe(
@@ -414,10 +398,11 @@ def test_cuda_prefill_keeps_batched_expert_ids_on_device(
     )
 
     assert torch.count_nonzero(output) == 0
-    expected_eids = torch.tensor([0, 1, 1, 2, 0, 2], dtype=torch.int64, device="cuda")
-    assert torch.equal(seen["dual_eids"], expected_eids)
-    assert torch.equal(seen["down_eids"], expected_eids)
-    assert seen["dual_x"].shape == (6, cfg.hidden_size)
+    expected_indices = torch.tensor([[0, 1], [1, 2], [0, 2]], dtype=torch.int64, device="cuda")
+    assert torch.equal(seen["indices"], expected_indices)
+    assert seen["indices"].device.type == "cuda"
+    assert seen["weights"].device.type == "cuda"
+    assert seen["flat"].shape == (3, cfg.hidden_size)
 
 
 def test_rms_norm_matches_reference_formula() -> None:

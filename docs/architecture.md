@@ -109,11 +109,23 @@ BlackweLLM 不是通用推理框架。它的每一个设计决策都建立在一
 - 启动时按 `capacity` 分配 N 个逻辑槽，每槽预留 `blocks_per_slot × block_size` 个 token 位。
 - 一个请求占一个槽，从 prefill 到生成结束不迁移。
 - 槽位不足则排队等待，不做抢占。
-- 额外的物理槽用于 CUDA Graph 预热（非 DFlash 路径 +1）。
+- CUDA Graph 预热槽按 backend 计算：Laguna 非 DFlash 路径需要 `+1`；Qwen
+  和 DSV4 都在接客前用真实槽完成捕获并重置，因此服务层 `+0`。Qwen pool
+  自己仍保留一行**逻辑** scratch 供 graph 安全路径使用：legacy 模式下它
+  对应完整物理行；dynamic arena 下页表行地址固定但初始全指向 null，页面只在
+  捕获/使用时按需借出，不再常驻一整行。动态持久前缀由 arena 的
+  `CACHED_REF0` bundle 持有，也不再依赖固定 scratch 物理行。
 
 **优点**：地址固定 → CUDA Graph 可以捕获整轮 decode；无块迁移 → 无碎片。
 **代价**：`capacity` / `num_slots` / `blocks_per_slot` 三者耦合，配错就是
 OOM 或者显存白扔——这正是 [`roadmap.md`](roadmap.md) Track D 要消灭的问题。
+
+Qwen 另有 opt-in 的全局 page-bundle arena（`QSR_QWEN_KV_MODE`）：
+`strict` 按所有可服务槽的最大上下文加 null/COW watermark 建池；`elastic`
+用 `QSR_QWEN_KV_POOL_BYTES` 指定物理预算。两者目前都执行保守的
+full-sequence reservation：slot 分配和 KV 预算必须同时成功才开始 prefill，
+不足时请求留在 waiting queue；完成、取消、超时、异常和 reset 都释放未兑现的
+tail reservation。`legacy` 仍是默认回滚路径，直到 4×256K GPU 矩阵完成。
 
 > ⚠️ **已知不一致**：`runtime/block_pool.py` 里 `RESERVED_PHYSICAL_SLOTS = 1`，
 > `runtime/backends/laguna.py` 里同名常量 `= 0`，两处各有一份 `_physical_slot()`。
@@ -540,4 +552,3 @@ Prometheus 指标在 `blackwellm:*` 命名空间下覆盖三个维度：
 | CI（push + PR） | ✅ 绿（2026-08-01 恢复）。一个已知 flaky：见 [`roadmap.md`](roadmap.md) §1.3 N6 |
 | 位精确回归门禁 | 有脚本，无自动化（GPU CI 缺失，待拍板 D3） |
 | 性能回归门禁 | bfdiag run record + `bf diff`，人工触发 |
-

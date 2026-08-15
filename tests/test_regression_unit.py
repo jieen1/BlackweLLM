@@ -391,6 +391,21 @@ class TestOpenAIParse:
         )
         assert isinstance(m[0]["tool_calls"][0]["function"]["arguments"], dict)
 
+    def test_assistant_reasoning_content_survives_for_qwen_template(self):
+        m = openai_format.parse_chat_messages(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "reasoning_content": "Prior reasoning",
+                        "content": "Prior answer",
+                    }
+                ]
+            }
+        )
+        assert m[0]["reasoning_content"] == "Prior reasoning"
+        assert m[0]["content"] == "Prior answer"
+
 
 class TestConvertTools:
     def test_openai_passthrough(self):

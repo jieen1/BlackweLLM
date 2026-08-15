@@ -512,6 +512,7 @@ class Qwen36SlotPool:
         The ``qwen_kv_*`` keys are the Prometheus-facing names used by
         ``server/metrics.py``; the plain names remain for the startup log.
         """
+        arena_usage = self._arena.usage() if self.dynamic_arena else None
         return {
             "num_slots": self.num_slots,
             "max_seq_len": self.max_seq_len,
@@ -524,18 +525,35 @@ class Qwen36SlotPool:
             "kv_bytes_per_slot": self.geometry.kv_bytes_per_slot,
             "kv_bytes_total": self.geometry.kv_bytes_total,
             "kv_bytes_measured": self.kv_storage_bytes(),
-            "kv_bytes_scratch_row": self.geometry.kv_bytes_per_slot,
+            "kv_bytes_scratch_row": (
+                0 if self.dynamic_arena else self.geometry.kv_bytes_per_slot
+            ),
             "recurrent_bytes_per_slot": self.geometry.recurrent_bytes_per_slot,
             # Prometheus-facing aliases (Phase 0 gauges).
             "qwen_kv_pool_bytes": self.geometry.kv_bytes_total,
             "qwen_kv_pool_bytes_measured": self.kv_storage_bytes(),
-            "qwen_kv_scratch_row_bytes": self.geometry.kv_bytes_per_slot,
+            "qwen_kv_scratch_row_bytes": (
+                0 if self.dynamic_arena else self.geometry.kv_bytes_per_slot
+            ),
             "qwen_kv_total_bundles": self.pool_bundles,
             "qwen_kv_pages_per_slot": self.pages_per_slot,
             "qwen_kv_slots": self.num_slots,
             "qwen_kv_full_attention_layers": self.geometry.num_paged_kv_layers,
             "qwen_kv_gdn_layers": self.geometry.num_recurrent_layers,
             "qwen_kv_mode": 1 if self.dynamic_arena else 0,
+            "qwen_kv_free_bundles": (
+                arena_usage.free_bundles if arena_usage is not None else 0
+            ),
+            "qwen_kv_live_bundles": (
+                arena_usage.live_bundles if arena_usage is not None else 0
+            ),
+            "qwen_kv_cached_bundles": (
+                arena_usage.cached_bundles if arena_usage is not None else 0
+            ),
+            "qwen_kv_request_reserved_bundles": (
+                arena_usage.request_reserved_bundles if arena_usage is not None else 0
+            ),
+            "qwen_kv_watermark_bundles": self.watermark_bundles,
         }
 
     def assert_kv_storage_consistent(self) -> None:
@@ -702,7 +720,9 @@ class Qwen36SlotPool:
                 elif self._arena.bundles[source_page].ref_cnt > 1:
                     # COW detach: the slot transfers its reference from the
                     # shared source to a fresh private clone.
-                    target_page = self._arena.ensure_writable(source_page)
+                    target_page = self._arena.ensure_writable(
+                        source_page, owner=f"slot-{slot}"
+                    )
                     self._arena.decref([source_page], owner=f"slot-{slot}")
                     self._slot_bundles[slot].discard(source_page)
                     replacements.append((logical_page, source_page, target_page))
@@ -831,6 +851,11 @@ class Qwen36SlotPool:
                 target_row[logical_page] = src
             self._arena.incref(
                 self._page_table_host[source_slot][:shared_pages], owner=f"slot-{target_slot}"
+            )
+            # Complete shared pages will never need a private clone. A final
+            # partial page keeps its reservation for the suffix-write COW.
+            self._arena.consume_reservation(
+                kv_len // self.page_size, owner=f"slot-{target_slot}"
             )
             self._slot_bundles[target_slot].update(
                 self._page_table_host[source_slot][:shared_pages]
@@ -966,7 +991,9 @@ class Qwen36SlotPool:
                     continue
                 if self._arena.bundles[source_page].ref_cnt <= 1:
                     continue
-                target_page = self._arena.ensure_writable(source_page)
+                target_page = self._arena.ensure_writable(
+                    source_page, owner=f"slot-{slot}"
+                )
                 self._arena.decref([source_page], owner=f"slot-{slot}")
                 self._slot_bundles[slot].discard(source_page)
                 replacements.append((logical_page, source_page, target_page))
@@ -1150,6 +1177,7 @@ class Qwen36SlotPool:
         self.slot_kv_len[slot] = 0
         self.slot_committed_tokens[slot] = []
         if self.dynamic_arena:
+            self._arena.release_reservation(owner=f"slot-{slot}")
             owned = self._slot_bundles[slot]
             if owned:
                 self._arena.decref(sorted(owned), owner=f"slot-{slot}")
@@ -1234,6 +1262,13 @@ class Qwen36SlotPool:
         # bundle IS the page, one reference).
         unique_bundles = list(dict.fromkeys(bundle_ids))
         self._arena.incref(unique_bundles, owner=f"slot-{slot}")
+        # Reservation accounting follows the physical ownership unit.  A
+        # block-aligned hit may end halfway through a page (for example a
+        # 64-token hash block in a 128-token bundle); floor-dividing tokens
+        # by page_size consumed zero even though one cached bundle became
+        # live.  Deduplicated bundle count is exact for both partial pages
+        # and the multiple-hash-blocks-per-page layout.
+        self._arena.consume_reservation(len(unique_bundles), owner=f"slot-{slot}")
         self._slot_bundles[slot].update(unique_bundles)
         row = list(self._page_table_host[slot])
         # Write each page's bundle once: the page covering hash-block ``i``
@@ -1243,6 +1278,35 @@ class Qwen36SlotPool:
             row[logical_page] = bundle_id
         self.set_page_table_row(slot, row)
         return hit.effective_tokens, unique_bundles
+
+    # -- Phase 4: request-scoped full-sequence reservations ----------------
+
+    def reserve_kv_capacity(self, slot: int, total_tokens: int) -> bool:
+        """Reserve every page a request may need before its first GPU write."""
+        if not 0 <= slot < self.num_slots:
+            raise ValueError(f"slot {slot} is not a live slot")
+        if total_tokens < 0 or total_tokens > self.max_seq_len:
+            raise ValueError(
+                f"request length {total_tokens} is outside pool capacity {self.max_seq_len}"
+            )
+        if not self.dynamic_arena:
+            return True
+        pages = (total_tokens + self.page_size - 1) // self.page_size
+        return self._arena.reserve(pages, owner=f"slot-{slot}")
+
+    def release_kv_reservation(self, slot: int) -> int:
+        if not 0 <= slot < self.num_slots:
+            raise ValueError(f"slot {slot} is not a live slot")
+        if not self.dynamic_arena:
+            return 0
+        return self._arena.release_reservation(owner=f"slot-{slot}")
+
+    def kv_reservation_remaining(self, slot: int) -> int:
+        if not 0 <= slot < self.num_slots:
+            raise ValueError(f"slot {slot} is not a live slot")
+        if not self.dynamic_arena:
+            return 0
+        return self._arena.reserved_for(f"slot-{slot}")
 
     def reset_all(self) -> None:
         for row in range(self._num_rows):

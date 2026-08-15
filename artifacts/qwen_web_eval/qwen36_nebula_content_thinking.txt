@@ -1,0 +1,2680 @@
+```html
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Nebula Mission Control — Deep space exploration fleet operations dashboard for Asteria-7 mission.">
+<title>Nebula Mission Control — Asteria-7</title>
+<style>
+/* ===== DESIGN TOKENS ===== */
+:root {
+  --color-bg-primary: #0a0e1a;
+  --color-bg-secondary: #111827;
+  --color-bg-tertiary: #1a2235;
+  --color-bg-elevated: #1e293b;
+  --color-bg-overlay: rgba(10,14,26,0.85);
+  --color-text-primary: #e8ecf4;
+  --color-text-secondary: #94a3b8;
+  --color-text-muted: #64748b;
+  --color-accent: #06b6d4;
+  --color-accent-hover: #22d3ee;
+  --color-accent-dim: rgba(6,182,212,0.15);
+  --color-warning: #f59e0b;
+  --color-warning-dim: rgba(245,158,11,0.15);
+  --color-danger: #ef4444;
+  --color-danger-dim: rgba(239,68,68,0.15);
+  --color-success: #10b981;
+  --color-success-dim: rgba(16,185,129,0.15);
+  --color-border: #1e293b;
+  --color-border-light: #334155;
+  --color-grid: rgba(148,163,184,0.04);
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.4);
+  --shadow-lg: 0 8px 30px rgba(0,0,0,0.5);
+  --shadow-glow: 0 0 20px rgba(6,182,212,0.1);
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", Consolas, monospace;
+  --font-size-xs: 11px;
+  --font-size-sm: 12px;
+  --font-size-base: 13px;
+  --font-size-md: 14px;
+  --font-size-lg: 16px;
+  --font-size-xl: 20px;
+  --font-size-2xl: 24px;
+  --font-size-3xl: 32px;
+  --spacing-xs: 4px;
+  --spacing-sm: 8px;
+  --spacing-md: 12px;
+  --spacing-base: 16px;
+  --spacing-lg: 20px;
+  --spacing-xl: 24px;
+  --spacing-2xl: 32px;
+  --spacing-3xl: 48px;
+  --transition-fast: 150ms ease;
+  --transition-base: 250ms ease;
+  --transition-slow: 400ms ease;
+  --sidebar-width: 240px;
+  --sidebar-collapsed: 56px;
+  --header-height: 56px;
+}
+
+[data-theme="light"] {
+  --color-bg-primary: #f1f5f9;
+  --color-bg-secondary: #ffffff;
+  --color-bg-tertiary: #e2e8f0;
+  --color-bg-elevated: #ffffff;
+  --color-bg-overlay: rgba(241,245,249,0.85);
+  --color-text-primary: #0f172a;
+  --color-text-secondary: #475569;
+  --color-text-muted: #94a3b8;
+  --color-accent: #0891b2;
+  --color-accent-hover: #06b6d4;
+  --color-accent-dim: rgba(8,145,178,0.1);
+  --color-border: #cbd5e1;
+  --color-border-light: #e2e8f0;
+  --color-grid: rgba(148,163,184,0.08);
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.08);
+  --shadow-lg: 0 8px 30px rgba(0,0,0,0.12);
+  --shadow-glow: 0 0 20px rgba(8,145,178,0.08);
+}
+
+/* ===== RESET & BASE ===== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 14px; -webkit-text-size-adjust: 100%; }
+body {
+  font-family: var(--font-sans);
+  font-size: var(--font-size-base);
+  color: var(--color-text-primary);
+  background: var(--color-bg-primary);
+  line-height: 1.5;
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
+}
+button { font: inherit; cursor: pointer; border: none; background: none; color: inherit; }
+input { font: inherit; color: inherit; background: none; border: none; outline: none; }
+a { color: var(--color-accent); text-decoration: none; }
+ul, ol { list-style: none; }
+:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; border-radius: var(--radius-sm); }
+
+/* ===== GRID TEXTURE ===== */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(var(--color-grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--color-grid) 1px, transparent 1px);
+  background-size: 40px 40px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ===== LAYOUT ===== */
+.app-layout {
+  display: grid;
+  grid-template-columns: var(--sidebar-width) 1fr;
+  grid-template-rows: var(--header-height) 1fr;
+  grid-template-areas:
+    "header header"
+    "sidebar main";
+  height: 100vh;
+  width: 100vw;
+  position: relative;
+  z-index: 1;
+}
+
+/* ===== HEADER ===== */
+.header {
+  grid-area: header;
+  display: flex;
+  align-items: center;
+  padding: 0 var(--spacing-base);
+  background: var(--color-bg-secondary);
+  border-bottom: 1px solid var(--color-border);
+  gap: var(--spacing-base);
+  z-index: 100;
+}
+.header-logo {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  font-weight: 700;
+  font-size: var(--font-size-md);
+  letter-spacing: 0.5px;
+  white-space: nowrap;
+}
+.header-logo svg { flex-shrink: 0; }
+.header-mission {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+.header-mission .mission-name {
+  color: var(--color-accent);
+  font-weight: 600;
+  font-family: var(--font-mono);
+}
+.header-mission .mission-duration {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  background: var(--color-bg-tertiary);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+}
+.header-spacer { flex: 1; }
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+.header-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  transition: all var(--transition-fast);
+  position: relative;
+  white-space: nowrap;
+}
+.header-btn:hover, .header-btn:focus-visible {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-primary);
+}
+.header-btn .badge {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-danger);
+}
+.header-btn .badge-count {
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  min-width: 16px;
+  height: 16px;
+  border-radius: 8px;
+  background: var(--color-danger);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+}
+.header-search {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  padding: 6px 12px;
+  border-radius: var(--radius-md);
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  min-width: 180px;
+  justify-content: space-between;
+}
+.header-search:hover { border-color: var(--color-accent); }
+.header-search kbd {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--color-bg-primary);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+}
+.header-utc {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  min-width: 70px;
+  text-align: right;
+}
+.header-link-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+}
+.header-link-status .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-success);
+}
+.header-link-status .dot.warn { background: var(--color-warning); }
+.header-link-status .dot.error { background: var(--color-danger); }
+
+/* ===== SIDEBAR ===== */
+.sidebar {
+  grid-area: sidebar;
+  background: var(--color-bg-secondary);
+  border-right: 1px solid var(--color-border);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  overflow-x: hidden;
+  transition: width var(--transition-base);
+  z-index: 90;
+}
+.sidebar.collapsed { width: var(--sidebar-collapsed); }
+.sidebar-nav { flex: 1; padding: var(--spacing-sm) 0; }
+.sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  padding: 10px var(--spacing-base);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  position: relative;
+  white-space: nowrap;
+  border-left: 3px solid transparent;
+}
+.sidebar-item:hover { background: var(--color-bg-tertiary); color: var(--color-text-primary); }
+.sidebar-item:focus-visible { background: var(--color-accent-dim); color: var(--color-accent); }
+.sidebar-item.active {
+  color: var(--color-accent);
+  background: var(--color-accent-dim);
+  border-left-color: var(--color-accent);
+  font-weight: 600;
+}
+.sidebar-item svg { flex-shrink: 0; width: 20px; height: 20px; }
+.sidebar-item .item-label { overflow: hidden; text-overflow: ellipsis; }
+.sidebar-item .item-badge {
+  margin-left: auto;
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 10px;
+  min-width: 20px;
+  text-align: center;
+}
+.sidebar-item.active .item-badge { background: var(--color-accent); color: #fff; }
+.sidebar-item .item-badge.warn { background: var(--color-warning); color: #000; }
+.sidebar-item .item-badge.danger { background: var(--color-danger); color: #fff; }
+.sidebar.collapsed .item-label,
+.sidebar.collapsed .item-badge { display: none; }
+.sidebar.collapsed .sidebar-item { justify-content: center; padding: 10px; }
+.sidebar-footer {
+  padding: var(--spacing-sm) var(--spacing-base);
+  border-top: 1px solid var(--color-border);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  text-align: center;
+}
+.sidebar-toggle {
+  display: none;
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 200;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-md);
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-secondary);
+  box-shadow: var(--shadow-md);
+}
+
+/* ===== MAIN CONTENT ===== */
+.main-content {
+  grid-area: main;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--spacing-xl);
+  position: relative;
+}
+.main-content::-webkit-scrollbar { width: 6px; }
+.main-content::-webkit-scrollbar-track { background: transparent; }
+.main-content::-webkit-scrollbar-thumb { background: var(--color-border-light); border-radius: 3px; }
+
+/* ===== SECTION HEADER ===== */
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--spacing-lg);
+  flex-wrap: wrap;
+  gap: var(--spacing-sm);
+}
+.section-title {
+  font-size: var(--font-size-xl);
+  font-weight: 700;
+  letter-spacing: -0.3px;
+}
+.section-subtitle {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+  margin-top: 2px;
+}
+.time-range-group {
+  display: flex;
+  gap: 2px;
+  background: var(--color-bg-tertiary);
+  border-radius: var(--radius-md);
+  padding: 2px;
+}
+.time-range-btn {
+  padding: 5px 14px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--color-text-muted);
+  transition: all var(--transition-fast);
+}
+.time-range-btn:hover { color: var(--color-text-primary); }
+.time-range-btn.active {
+  background: var(--color-accent);
+  color: #fff;
+}
+
+/* ===== KPI CARDS ===== */
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--spacing-base);
+  margin-bottom: var(--spacing-xl);
+}
+.kpi-card {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--spacing-lg);
+  position: relative;
+  overflow: hidden;
+  transition: all var(--transition-fast);
+}
+.kpi-card:hover { border-color: var(--color-border-light); box-shadow: var(--shadow-md); }
+.kpi-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+}
+.kpi-card.nominal::before { background: var(--color-success); }
+.kpi-card.warning::before { background: var(--color-warning); }
+.kpi-card.danger::before { background: var(--color-danger); }
+.kpi-card.info::before { background: var(--color-accent); }
+.kpi-label {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: var(--spacing-sm);
+}
+.kpi-value {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-2xl);
+  font-weight: 700;
+  line-height: 1.2;
+}
+.kpi-unit {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  font-weight: 400;
+}
+.kpi-change {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  margin-top: var(--spacing-xs);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+}
+.kpi-change.up { color: var(--color-success); background: var(--color-success-dim); }
+.kpi-change.down { color: var(--color-danger); background: var(--color-danger-dim); }
+.kpi-change.neutral { color: var(--color-text-muted); background: var(--color-bg-tertiary); }
+.kpi-sparkline {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 40px;
+  opacity: 0.3;
+}
+.kpi-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--font-size-xs);
+  margin-top: var(--spacing-sm);
+}
+.kpi-status .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.kpi-status .dot.green { background: var(--color-success); }
+.kpi-status .dot.yellow { background: var(--color-warning); }
+.kpi-status .dot.red { background: var(--color-danger); }
+
+/* ===== CHART PANELS ===== */
+.chart-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: var(--spacing-base);
+  margin-bottom: var(--spacing-xl);
+}
+.panel {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--spacing-lg);
+  position: relative;
+}
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--spacing-md);
+}
+.panel-title {
+  font-size: var(--font-size-md);
+  font-weight: 600;
+}
+.panel-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+}
+.panel-btn {
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  transition: all var(--transition-fast);
+}
+.panel-btn:hover { background: var(--color-bg-tertiary); color: var(--color-text-primary); }
+.panel-btn.active { background: var(--color-accent-dim); color: var(--color-accent); }
+
+/* ===== TELEMETRY CHART ===== */
+.telemetry-chart {
+  width: 100%;
+  height: 260px;
+  position: relative;
+}
+.telemetry-chart canvas {
+  width: 100%;
+  height: 100%;
+}
+.chart-tooltip {
+  position: absolute;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-sm) var(--spacing-md);
+  font-size: var(--font-size-xs);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+  box-shadow: var(--shadow-lg);
+  z-index: 10;
+  white-space: nowrap;
+}
+.chart-tooltip.visible { opacity: 1; }
+.chart-tooltip .tt-label { color: var(--color-text-muted); margin-bottom: 2px; }
+.chart-tooltip .tt-row { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+.chart-tooltip .tt-dot { width: 8px; height: 8px; border-radius: 50%; }
+.chart-legend {
+  display: flex;
+  gap: var(--spacing-lg);
+  margin-top: var(--spacing-sm);
+}
+.chart-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: var(--radius-sm);
+  transition: all var(--transition-fast);
+}
+.chart-legend-item:hover { background: var(--color-bg-tertiary); }
+.chart-legend-item.disabled { opacity: 0.3; }
+.chart-legend-item .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+
+/* ===== ORBITAL PANEL ===== */
+.orbital-panel {
+  display: flex;
+  flex-direction: column;
+}
+.orbital-canvas-wrap {
+  flex: 1;
+  position: relative;
+  min-height: 260px;
+}
+.orbital-canvas-wrap canvas {
+  width: 100%;
+  height: 100%;
+}
+.orbital-controls {
+  display: flex;
+  gap: var(--spacing-xs);
+  margin-top: var(--spacing-sm);
+  justify-content: center;
+}
+.orbital-controls button {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--font-size-md);
+  transition: all var(--transition-fast);
+}
+.orbital-controls button:hover { background: var(--color-bg-elevated); color: var(--color-text-primary); }
+
+/* ===== FLEET TABLE ===== */
+.table-panel {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  margin-bottom: var(--spacing-xl);
+  overflow: hidden;
+}
+.table-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-bottom: 1px solid var(--color-border);
+  flex-wrap: wrap;
+}
+.table-search {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 6px 10px;
+  min-width: 200px;
+}
+.table-search input {
+  flex: 1;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-primary);
+}
+.table-search input::placeholder { color: var(--color-text-muted); }
+.table-search svg { color: var(--color-text-muted); flex-shrink: 0; }
+.table-filter {
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+.table-filter option { background: var(--color-bg-secondary); }
+.table-wrap {
+  overflow-x: auto;
+}
+.fleet-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-sm);
+}
+.fleet-table th {
+  padding: 10px var(--spacing-md);
+  text-align: left;
+  font-weight: 600;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--color-border);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  position: relative;
+}
+.fleet-table th:hover { color: var(--color-text-primary); }
+.fleet-table th .sort-icon {
+  display: inline-block;
+  margin-left: 4px;
+  opacity: 0.3;
+  font-size: 10px;
+}
+.fleet-table th.sorted .sort-icon { opacity: 1; color: var(--color-accent); }
+.fleet-table td {
+  padding: 10px var(--spacing-md);
+  border-bottom: 1px solid var(--color-border);
+  white-space: nowrap;
+}
+.fleet-table tr {
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+.fleet-table tbody tr:hover { background: var(--color-bg-tertiary); }
+.fleet-table tbody tr:focus-visible { background: var(--color-accent-dim); }
+.fleet-table .mono { font-family: var(--font-mono); font-size: var(--font-size-xs); }
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 10px;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}
+.status-badge.nominal { background: var(--color-success-dim); color: var(--color-success); }
+.status-badge.degraded { background: var(--color-warning-dim); color: var(--color-warning); }
+.status-badge.critical { background: var(--color-danger-dim); color: var(--color-danger); }
+.status-badge.offline { background: var(--color-bg-tertiary); color: var(--color-text-muted); }
+.status-badge .status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.table-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-top: 1px solid var(--color-border);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+}
+.table-pagination {
+  display: flex;
+  gap: 4px;
+}
+.table-pagination button {
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border);
+  transition: all var(--transition-fast);
+}
+.table-pagination button:hover { background: var(--color-bg-tertiary); }
+.table-pagination button.active { background: var(--color-accent); color: #fff; border-color: var(--color-accent); }
+.table-pagination button:disabled { opacity: 0.3; cursor: not-allowed; }
+
+/* ===== EMPTY STATE ===== */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--spacing-3xl);
+  color: var(--color-text-muted);
+  text-align: center;
+}
+.empty-state svg { margin-bottom: var(--spacing-md); opacity: 0.4; }
+.empty-state p { margin-bottom: var(--spacing-md); }
+.empty-state button {
+  padding: 8px 16px;
+  border-radius: var(--radius-md);
+  background: var(--color-accent);
+  color: #fff;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  transition: all var(--transition-fast);
+}
+.empty-state button:hover { background: var(--color-accent-hover); }
+
+/* ===== DETAIL DRAWER ===== */
+.drawer-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--color-bg-overlay);
+  z-index: 300;
+  opacity: 0;
+  visibility: hidden;
+  transition: all var(--transition-base);
+}
+.drawer-overlay.open { opacity: 1; visibility: visible; }
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 420px;
+  max-width: 100vw;
+  background: var(--color-bg-secondary);
+  border-left: 1px solid var(--color-border);
+  z-index: 301;
+  transform: translateX(100%);
+  transition: transform var(--transition-base);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.drawer.open { transform: translateX(0); }
+.drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-lg);
+  border-bottom: 1px solid var(--color-border);
+}
+.drawer-title { font-size: var(--font-size-lg); font-weight: 700; }
+.drawer-close {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-md);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-muted);
+  transition: all var(--transition-fast);
+}
+.drawer-close:hover { background: var(--color-bg-tertiary); color: var(--color-text-primary); }
+.drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--spacing-lg);
+}
+.drawer-section {
+  margin-bottom: var(--spacing-xl);
+}
+.drawer-section-title {
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--color-text-muted);
+  margin-bottom: var(--spacing-sm);
+}
+.drawer-metric-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--spacing-sm);
+}
+.drawer-metric {
+  background: var(--color-bg-tertiary);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-sm) var(--spacing-md);
+}
+.drawer-metric-label {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+}
+.drawer-metric-value {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-md);
+  font-weight: 600;
+}
+.drawer-timeline {
+  position: relative;
+  padding-left: 20px;
+}
+.drawer-timeline::before {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--color-border);
+}
+.drawer-timeline-item {
+  position: relative;
+  padding-bottom: var(--spacing-md);
+  font-size: var(--font-size-sm);
+}
+.drawer-timeline-item::before {
+  content: '';
+  position: absolute;
+  left: -19px;
+  top: 5px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--color-accent);
+}
+.drawer-timeline-item.warn::before { background: var(--color-warning); }
+.drawer-timeline-item.error::before { background: var(--color-danger); }
+.drawer-timeline-time {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+}
+.drawer-timeline-text { color: var(--color-text-secondary); }
+.drawer-actions {
+  display: flex;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-lg);
+  border-top: 1px solid var(--color-border);
+}
+.drawer-actions button {
+  flex: 1;
+  padding: 10px;
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  transition: all var(--transition-fast);
+}
+.drawer-actions .btn-primary {
+  background: var(--color-accent);
+  color: #fff;
+}
+.drawer-actions .btn-primary:hover { background: var(--color-accent-hover); }
+.drawer-actions .btn-secondary {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border);
+}
+.drawer-actions .btn-secondary:hover { background: var(--color-bg-elevated); color: var(--color-text-primary); }
+.drawer-actions .btn-danger {
+  background: var(--color-danger-dim);
+  color: var(--color-danger);
+  border: 1px solid transparent;
+}
+.drawer-actions .btn-danger:hover { background: var(--color-danger); color: #fff; }
+
+/* ===== EVENT STREAM ===== */
+.event-stream {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  margin-bottom: var(--spacing-xl);
+  overflow: hidden;
+}
+.event-filters {
+  display: flex;
+  gap: 2px;
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-bottom: 1px solid var(--color-border);
+}
+.event-filter-btn {
+  padding: 5px 12px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--color-text-muted);
+  transition: all var(--transition-fast);
+}
+.event-filter-btn:hover { color: var(--color-text-primary); }
+.event-filter-btn.active { background: var(--color-accent-dim); color: var(--color-accent); }
+.event-list { max-height: 280px; overflow-y: auto; }
+.event-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--spacing-md);
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-bottom: 1px solid var(--color-border);
+  transition: background var(--transition-fast);
+  cursor: pointer;
+}
+.event-item:hover { background: var(--color-bg-tertiary); }
+.event-item.unread { background: var(--color-accent-dim); }
+.event-item.unread:hover { background: var(--color-accent-dim); }
+.event-severity {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-top: 4px;
+  flex-shrink: 0;
+}
+.event-severity.critical { background: var(--color-danger); }
+.event-severity.warning { background: var(--color-warning); }
+.event-severity.info { background: var(--color-accent); }
+.event-content { flex: 1; min-width: 0; }
+.event-title { font-size: var(--font-size-sm); font-weight: 600; }
+.event-desc { font-size: var(--font-size-xs); color: var(--color-text-muted); margin-top: 2px; }
+.event-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  margin-top: 4px;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  font-family: var(--font-mono);
+}
+.event-read-btn {
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  transition: all var(--transition-fast);
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.event-read-btn:hover { color: var(--color-accent); }
+
+/* ===== KANBAN ===== */
+.kanban-section {
+  margin-bottom: var(--spacing-xl);
+}
+.kanban-board {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--spacing-base);
+}
+.kanban-column {
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--spacing-md);
+  min-height: 200px;
+}
+.kanban-column-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--spacing-md);
+  padding-bottom: var(--spacing-sm);
+  border-bottom: 1px solid var(--color-border);
+}
+.kanban-column-title {
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.kanban-column-count {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  background: var(--color-bg-tertiary);
+  padding: 1px 6px;
+  border-radius: 10px;
+}
+.kanban-card {
+  background: var(--color-bg-tertiary);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-sm) var(--spacing-md);
+  margin-bottom: var(--spacing-sm);
+  cursor: grab;
+  transition: all var(--transition-fast);
+  font-size: var(--font-size-sm);
+}
+.kanban-card:hover { border-color: var(--color-border-light); box-shadow: var(--shadow-sm); }
+.kanban-card.dragging { opacity: 0.5; transform: scale(0.95); }
+.kanban-card-title { font-weight: 600; margin-bottom: 2px; }
+.kanban-card-desc { font-size: var(--font-size-xs); color: var(--color-text-muted); }
+.kanban-card-actions {
+  display: none;
+  margin-top: var(--spacing-xs);
+}
+.kanban-card .move-menu-btn {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+}
+.kanban-card .move-menu-btn:hover { background: var(--color-bg-elevated); color: var(--color-text-primary); }
+.kanban-drop-zone {
+  min-height: 40px;
+  border: 2px dashed transparent;
+  border-radius: var(--radius-md);
+  transition: all var(--transition-fast);
+}
+.kanban-drop-zone.drag-over {
+  border-color: var(--color-accent);
+  background: var(--color-accent-dim);
+}
+
+/* ===== COMMAND PALETTE ===== */
+.command-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--color-bg-overlay);
+  z-index: 500;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 15vh;
+  opacity: 0;
+  visibility: hidden;
+  transition: all var(--transition-fast);
+}
+.command-overlay.open { opacity: 1; visibility: visible; }
+.command-palette {
+  width: 560px;
+  max-width: 90vw;
+  max-height: 70vh;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.command-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-bottom: 1px solid var(--color-border);
+}
+.command-input-wrap svg { color: var(--color-text-muted); flex-shrink: 0; }
+.command-input {
+  flex: 1;
+  font-size: var(--font-size-md);
+  color: var(--color-text-primary);
+  background: none;
+}
+.command-input::placeholder { color: var(--color-text-muted); }
+.command-results {
+  overflow-y: auto;
+  max-height: 50vh;
+  padding: var(--spacing-xs) 0;
+}
+.command-group-label {
+  padding: var(--spacing-sm) var(--spacing-lg);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.command-item {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+  padding: 8px var(--spacing-lg);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+.command-item:hover, .command-item.selected { background: var(--color-accent-dim); color: var(--color-accent); }
+.command-item svg { color: var(--color-text-muted); flex-shrink: 0; }
+.command-item .cmd-label { flex: 1; }
+.command-item .cmd-shortcut {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-tertiary);
+}
+
+/* ===== NOTIFICATION POPOVER ===== */
+.notification-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 340px;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  z-index: 200;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-8px);
+  transition: all var(--transition-fast);
+}
+.notification-popover.open { opacity: 1; visibility: visible; transform: translateY(0); }
+.notification-popover-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-bottom: 1px solid var(--color-border);
+}
+.notification-popover-title { font-size: var(--font-size-sm); font-weight: 700; }
+.notification-popover-clear {
+  font-size: var(--font-size-xs);
+  color: var(--color-accent);
+  cursor: pointer;
+}
+.notification-popover-list {
+  max-height: 280px;
+  overflow-y: auto;
+}
+.notification-item {
+  display: flex;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-bottom: 1px solid var(--color-border);
+  font-size: var(--font-size-sm);
+  transition: background var(--transition-fast);
+}
+.notification-item:hover { background: var(--color-bg-tertiary); }
+.notification-item.unread { background: var(--color-accent-dim); }
+.notification-item .notif-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  margin-top: 5px;
+  flex-shrink: 0;
+}
+.notification-item .notif-dot.info { background: var(--color-accent); }
+.notification-item .notif-dot.warn { background: var(--color-warning); }
+.notification-item .notif-dot.error { background: var(--color-danger); }
+.notification-item .notif-text { flex: 1; }
+.notification-item .notif-time { font-size: var(--font-size-xs); color: var(--color-text-muted); font-family: var(--font-mono); }
+
+/* ===== USER MENU ===== */
+.user-menu-popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 200px;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  z-index: 200;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-8px);
+  transition: all var(--transition-fast);
+}
+.user-menu-popover.open { opacity: 1; visibility: visible; transform: translateY(0); }
+.user-menu-item {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  padding: 10px var(--spacing-lg);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+.user-menu-item:hover { background: var(--color-bg-tertiary); color: var(--color-text-primary); }
+.user-menu-item svg { flex-shrink: 0; }
+.user-menu-divider { height: 1px; background: var(--color-border); margin: 4px 0; }
+
+/* ===== MODAL ===== */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--color-bg-overlay);
+  z-index: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  visibility: hidden;
+  transition: all var(--transition-fast);
+}
+.modal-overlay.open { opacity: 1; visibility: visible; }
+.modal {
+  width: 400px;
+  max-width: 90vw;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+.modal-header {
+  padding: var(--spacing-lg);
+  border-bottom: 1px solid var(--color-border);
+}
+.modal-title { font-size: var(--font-size-lg); font-weight: 700; }
+.modal-body { padding: var(--spacing-lg); }
+.modal-body p { font-size: var(--font-size-sm); color: var(--color-text-secondary); line-height: 1.6; }
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-lg);
+  border-top: 1px solid var(--color-border);
+}
+.modal-footer button {
+  padding: 8px 20px;
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  transition: all var(--transition-fast);
+}
+.modal-footer .btn-cancel {
+  background: var(--color-bg-tertiary);
+  color: var(--color-text-secondary);
+  border: 1px solid var(--color-border);
+}
+.modal-footer .btn-cancel:hover { background: var(--color-bg-elevated); }
+.modal-footer .btn-confirm {
+  background: var(--color-accent);
+  color: #fff;
+}
+.modal-footer .btn-confirm:hover { background: var(--color-accent-hover); }
+.modal-footer .btn-confirm.danger { background: var(--color-danger); }
+.modal-footer .btn-confirm.danger:hover { background: #dc2626; }
+
+/* ===== TOAST ===== */
+.toast-container {
+  position: fixed;
+  bottom: var(--spacing-xl);
+  right: var(--spacing-xl);
+  z-index: 700;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  pointer-events: none;
+}
+.toast {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-md) var(--spacing-lg);
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  font-size: var(--font-size-sm);
+  pointer-events: auto;
+  animation: toastIn var(--transition-base) ease;
+  max-width: 360px;
+}
+.toast.removing { animation: toastOut var(--transition-base) ease forwards; }
+.toast.success { border-left: 3px solid var(--color-success); }
+.toast.warning { border-left: 3px solid var(--color-warning); }
+.toast.error { border-left: 3px solid var(--color-danger); }
+.toast.info { border-left: 3px solid var(--color-accent); }
+.toast-close {
+  margin-left: auto;
+  padding: 2px;
+  color: var(--color-text-muted);
+  cursor: pointer;
+}
+.toast-close:hover { color: var(--color-text-primary); }
+@keyframes toastIn { from { opacity: 0; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }
+@keyframes toastOut { from { opacity: 1; transform: translateX(0); } to { opacity: 0; transform: translateX(20px); } }
+
+/* ===== SKELETON ===== */
+.skeleton-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--color-bg-primary);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  padding: var(--spacing-xl);
+  transition: opacity var(--transition-slow);
+}
+.skeleton-overlay.hidden { opacity: 0; pointer-events: none; }
+.skeleton-header {
+  height: var(--header-height);
+  background: var(--color-bg-secondary);
+  border-radius: var(--radius-md);
+  margin-bottom: var(--spacing-lg);
+}
+.skeleton-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: var(--spacing-base);
+  margin-bottom: var(--spacing-lg);
+}
+.skeleton-card {
+  height: 100px;
+  background: var(--color-bg-secondary);
+  border-radius: var(--radius-lg);
+  animation: skeletonPulse 1.5s ease-in-out infinite;
+}
+.skeleton-row {
+  display: grid;
+  grid-template-columns: 2fr 1fr;
+  gap: var(--spacing-base);
+  margin-bottom: var(--spacing-lg);
+}
+.skeleton-panel {
+  height: 200px;
+  background: var(--color-bg-secondary);
+  border-radius: var(--radius-lg);
+  animation: skeletonPulse 1.5s ease-in-out infinite;
+}
+.skeleton-table {
+  height: 300px;
+  background: var(--color-bg-secondary);
+  border-radius: var(--radius-lg);
+  animation: skeletonPulse 1.5s ease-in-out infinite;
+}
+@keyframes skeletonPulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 0.6; }
+}
+
+/* ===== FOOTER ===== */
+.page-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-sm) 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  margin-top: var(--spacing-xl);
+}
+
+/* ===== SIMULATE BUTTON ===== */
+.simulate-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  padding: 6px 14px;
+  border-radius: var(--radius-md);
+  background: var(--color-accent-dim);
+  color: var(--color-accent);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  border: 1px solid var(--color-accent);
+  transition: all var(--transition-fast);
+}
+.simulate-btn:hover { background: var(--color-accent); color: #fff; }
+
+/* ===== RESPONSIVE ===== */
+@media (max-width: 1024px) {
+  .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+  .chart-grid { grid-template-columns: 1fr; }
+  .kanban-board { grid-template-columns: repeat(2, 1fr); }
+}
+
+@media (max-width: 768px) {
+  .app-layout {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "header"
+      "main";
+  }
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: var(--sidebar-width);
+    z-index: 150;
+    transform: translateX(-100%);
+    transition: transform var(--transition-base);
+  }
+  .sidebar.mobile-open { transform: translateX(0); }
+  .sidebar-toggle { display: flex; }
+  .sidebar-overlay {
+    position: fixed;
+    inset: 0;
+    background: var(--color-bg-overlay);
+    z-index: 140;
+    opacity: 0;
+    visibility: hidden;
+    transition: all var(--transition-base);
+  }
+  .sidebar-overlay.open { opacity: 1; visibility: visible; }
+  .main-content { padding: var(--spacing-base); }
+  .kpi-grid { grid-template-columns: 1fr 1fr; }
+  .kanban-board { grid-template-columns: 1fr; }
+  .header-search { min-width: 120px; }
+  .header-search kbd { display: none; }
+  .header-link-status { display: none; }
+  .fleet-table { font-size: var(--font-size-xs); }
+  .fleet-table th, .fleet-table td { padding: 8px var(--spacing-sm); }
+  .drawer { width: 100vw; }
+  .notification-popover { width: 280px; right: -40px; }
+}
+
+@media (max-width: 480px) {
+  .kpi-grid { grid-template-columns: 1fr; }
+  .header-mission .mission-duration { display: none; }
+  .header-utc { display: none; }
+  .table-toolbar { flex-direction: column; align-items: stretch; }
+  .table-search { min-width: auto; }
+}
+
+/* ===== REDUCED MOTION ===== */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .skeleton-overlay { opacity: 0; pointer-events: none; }
+}
+
+/* ===== MOBILE MOVE MENU ===== */
+.move-menu {
+  position: absolute;
+  background: var(--color-bg-secondary);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  z-index: 50;
+  min-width: 140px;
+  display: none;
+}
+.move-menu.open { display: block; }
+.move-menu-item {
+  padding: 8px 12px;
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+.move-menu-item:hover { background: var(--color-bg-tertiary); }
+</style>
+</head>
+<body>
+
+<!-- SKELETON LOADING -->
+<div class="skeleton-overlay" id="skeleton" aria-hidden="true">
+  <div class="skeleton-header"></div>
+  <div class="skeleton-grid">
+    <div class="skeleton-card"></div>
+    <div class="skeleton-card"></div>
+    <div class="skeleton-card"></div>
+    <div class="skeleton-card"></div>
+  </div>
+  <div class="skeleton-row">
+    <div class="skeleton-panel"></div>
+    <div class="skeleton-panel"></div>
+  </div>
+  <div class="skeleton-table"></div>
+</div>
+
+<!-- SIDEBAR MOBILE OVERLAY -->
+<div class="sidebar-overlay" id="sidebarOverlay" aria-hidden="true"></div>
+
+<!-- SIDEBAR TOGGLE (MOBILE) -->
+<button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle navigation menu">
+  <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+</button>
+
+<!-- APP LAYOUT -->
+<div class="app-layout">
+
+  <!-- HEADER -->
+  <header class="header" role="banner">
+    <div class="header-logo">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.5"/>
+        <circle cx="12" cy="12" r="3" fill="currentColor"/>
+        <ellipse cx="12" cy="12" rx="10" ry="4" stroke="currentColor" stroke-width="1" opacity="0.5"/>
+        <ellipse cx="12" cy="12" rx="10" ry="4" stroke="currentColor" stroke-width="1" opacity="0.5" transform="rotate(60 12 12)"/>
+        <ellipse cx="12" cy="12" rx="10" ry="4" stroke="currentColor" stroke-width="1" opacity="0.5" transform="rotate(120 12 12)"/>
+      </svg>
+      <span>Nebula</span>
+    </div>
+    <div class="header-mission">
+      <span class="mission-name">Asteria-7</span>
+      <span class="mission-duration" id="missionDuration">T+ 000:00:00</span>
+    </div>
+    <div class="header-spacer"></div>
+    <div class="header-link-status">
+      <span class="dot" id="linkDot"></span>
+      <span id="linkStatus">LINK OK</span>
+    </div>
+    <div class="header-utc" id="utcClock" aria-live="polite">--:--:--</div>
+    <div class="header-actions">
+      <button class="header-search" id="searchBtn" aria-label="Open command palette">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.5"/><path d="M9.5 9.5L12.5 12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <span>Search...</span>
+        <kbd>⌘K</kbd>
+      </button>
+      <button class="header-btn" id="themeToggle" aria-label="Toggle theme">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" id="themeIcon">
+          <circle cx="8" cy="8" r="3" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M8 1v2M8 13v2M1 8h2M13 8h2M2.93 2.93l1.41 1.41M11.66 11.66l1.41 1.41M2.93 13.07l1.41-1.41M11.66 4.34l1.41-1.41" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+      </button>
+      <div style="position:relative">
+        <button class="header-btn" id="notifBtn" aria-label="Notifications" aria-expanded="false">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 6a4 4 0 018 0c0 3 2 4 2 4H2s2-1 2-4zM6 13a1 1 0 002 0" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          <span class="badge-count" id="notifBadge" style="display:none">0</span>
+        </button>
+        <div class="notification-popover" id="notifPopover" role="dialog" aria-label="Notifications">
+          <div class="notification-popover-header">
+            <span class="notification-popover-title">Notifications</span>
+            <button class="notification-popover-clear" id="notifClear">Mark all read</button>
+          </div>
+          <div class="notification-popover-list" id="notifList"></div>
+        </div>
+      </div>
+      <div style="position:relative">
+        <button class="header-btn" id="userBtn" aria-label="User menu" aria-expanded="false">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="5" r="3" stroke="currentColor" stroke-width="1.5"/><path d="M2 14c0-3 2.5-5 6-5s6 2 6 5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        </button>
+        <div class="user-menu-popover" id="userMenu" role="menu">
+          <div class="user-menu-item" role="menuitem" tabindex="0">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="4.5" r="2.5" stroke="currentColor" stroke-width="1.2"/><path d="M1 12c0-2.5 2-4.5 6-4.5s6 2 6 4.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+            Profile
+          </div>
+          <div class="user-menu-item" role="menuitem" tabindex="0">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="2.5" stroke="currentColor" stroke-width="1.2"/><path d="M7 1v2M7 11v2M1 7h2M11 7h2M2.76 2.76l1.41 1.41M9.83 9.83l1.41 1.41M2.76 11.24l1.41-1.41M9.83 4.17l1.41-1.41" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>
+            Preferences
+          </div>
+          <div class="user-menu-divider"></div>
+          <div class="user-menu-item" role="menuitem" tabindex="0">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M5 3H3a1 1 0 00-1 1v6a1 1 0 001 1h2M12 7H5M10 4l3 3-3 3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            Sign out
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- SIDEBAR -->
+  <nav class="sidebar" id="sidebar" role="navigation" aria-label="Main navigation">
+    <ul class="sidebar-nav" id="sidebarNav">
+      <li class="sidebar-item active" data-page="overview" tabindex="0" role="link" aria-current="page">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><rect x="2" y="2" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.5"/><rect x="11" y="2" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.5"/><rect x="2" y="11" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.5"/><rect x="11" y="11" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.5"/></svg>
+        <span class="item-label">Overview</span>
+      </li>
+      <li class="sidebar-item" data-page="fleet" tabindex="0" role="link">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="3" stroke="currentColor" stroke-width="1.5"/><path d="M10 3v3M10 14v3M3 10h3M14 10h3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="10" cy="3" r="1.5" fill="currentColor"/><circle cx="10" cy="17" r="1.5" fill="currentColor"/><circle cx="3" cy="10" r="1.5" fill="currentColor"/><circle cx="17" cy="10" r="1.5" fill="currentColor"/></svg>
+        <span class="item-label">Fleet</span>
+        <span class="item-badge" id="fleetBadge">12</span>
+      </li>
+      <li class="sidebar-item" data-page="telemetry" tabindex="0" role="link">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M2 14l4-4 3 3 4-6 5 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="item-label">Telemetry</span>
+      </li>
+      <li class="sidebar-item" data-page="timeline" tabindex="0" role="link">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8" stroke="currentColor" stroke-width="1.5"/><path d="M10 5v5l3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="item-label">Mission Timeline</span>
+      </li>
+      <li class="sidebar-item" data-page="incidents" tabindex="0" role="link">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><path d="M10 2L2 18h16L10 2z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M10 8v4M10 14v.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <span class="item-label">Incidents</span>
+        <span class="item-badge danger" id="incidentBadge">3</span>
+      </li>
+      <li class="sidebar-item" data-page="payloads" tabindex="0" role="link">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><rect x="3" y="6" width="14" height="10" rx="2" stroke="currentColor" stroke-width="1.5"/><path d="M7 6V4a3 3 0 016 0v2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <span class="item-label">Payloads</span>
+      </li>
+      <li class="sidebar-item" data-page="settings" tabindex="0" role="link">
+        <svg width="20" height="20" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="3" stroke="currentColor" stroke-width="1.5"/><path d="M10 2v2M10 16v2M2 10h2M16 10h2M4.22 4.22l1.41 1.41M14.36 14.36l1.41 1.41M4.22 15.78l1.41-1.41M14.36 5.64l1.41-1.41" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <span class="item-label">Settings</span>
+      </li>
+    </ul>
+    <div class="sidebar-footer">
+      <span>v2.6.1</span>
+    </div>
+  </nav>
+
+  <!-- MAIN CONTENT -->
+  <main class="main-content" id="mainContent" role="main">
+
+    <!-- SECTION HEADER -->
+    <div class="section-header">
+      <div>
+        <h1 class="section-title">Mission Overview</h1>
+        <p class="section-subtitle">Last sync: <span id="lastSync">--</span> · <button class="simulate-btn" id="simulateBtn">
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none"><path d="M2 6h8M6 2v8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          Simulate Telemetry Update
+        </button></p>
+      </div>
+      <div class="time-range-group" role="tablist" aria-label="Time range">
+        <button class="time-range-btn" data-range="1h" role="tab">1H</button>
+        <button class="time-range-btn" data-range="6h" role="tab">6H</button>
+        <button class="time-range-btn active" data-range="24h" role="tab" aria-selected="true">24H</button>
+        <button class="time-range-btn" data-range="7d" role="tab">7D</button>
+      </div>
+    </div>
+
+    <!-- KPI CARDS -->
+    <div class="kpi-grid" id="kpiGrid">
+      <div class="kpi-card nominal">
+        <div class="kpi-label">Online Probes</div>
+        <div class="kpi-value" id="kpiOnline">9<span class="kpi-unit"> / 12</span></div>
+        <div class="kpi-change up" id="kpiOnlineChange">▲ +1 from last hour</div>
+        <div class="kpi-status"><span class="dot green"></span> Nominal</div>
+        <canvas class="kpi-sparkline" id="sparkOnline" height="40"></canvas>
+      </div>
+      <div class="kpi-card info">
+        <div class="kpi-label">Avg Signal Delay</div>
+        <div class="kpi-value" id="kpiDelay">142<span class="kpi-unit"> ms</span></div>
+        <div class="kpi-change down" id="kpiDelayChange">▼ -8ms from last hour</div>
+        <div class="kpi-status"><span class="dot green"></span> Within tolerance</div>
+        <canvas class="kpi-sparkline" id="sparkDelay" height="40"></canvas>
+      </div>
+      <div class="kpi-card nominal">
+        <div class="kpi-label">Downlink Today</div>
+        <div class="kpi-value" id="kpiDownlink">4.7<span class="kpi-unit"> TB</span></div>
+        <div class="kpi-change up" id="kpiDownlinkChange">▲ +12% from yesterday</div>
+        <div class="kpi-status"><span class="dot green"></span> On target</div>
+        <canvas class="kpi-sparkline" id="sparkDownlink" height="40"></canvas>
+      </div>
+      <div class="kpi-card danger">
+        <div class="kpi-label">Critical Events</div>
+        <div class="kpi-value" id="kpiCritical">3</div>
+        <div class="kpi-change neutral" id="kpiCriticalChange">— unchanged</div>
+        <div class="kpi-status"><span class="dot red"></span> Requires attention</div>
+        <canvas class="kpi-sparkline" id="sparkCritical" height="40"></canvas>
+      </div>
+    </div>
+
+    <!-- CHART GRID -->
+    <div class="chart-grid">
+      <!-- TELEMETRY CHART -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Telemetry Trends</span>
+          <div class="panel-actions">
+            <button class="panel-btn active" data-series="signal" aria-label="Toggle signal strength">Signal</button>
+            <button class="panel-btn active" data-series="thermal" aria-label="Toggle thermal load">Thermal</button>
+            <button class="panel-btn active" data-series="power" aria-label="Toggle power reserve">Power</button>
+          </div>
+        </div>
+        <div class="telemetry-chart" id="telemetryChart">
+          <canvas id="telemetryCanvas"></canvas>
+          <div class="chart-tooltip" id="chartTooltip"></div>
+        </div>
+        <div class="chart-legend" id="chartLegend">
+          <div class="chart-legend-item" data-series="signal"><span class="legend-dot" style="background:#06b6d4"></span> Signal Strength (dBm)</div>
+          <div class="chart-legend-item" data-series="thermal"><span class="legend-dot" style="background:#f59e0b"></span> Thermal Load (°C)</div>
+          <div class="chart-legend-item" data-series="power"><span class="legend-dot" style="background:#10b981"></span> Power Reserve (%)</div>
+        </div>
+      </div>
+
+      <!-- ORBITAL PANEL -->
+      <div class="panel orbital-panel">
+        <div class="panel-header">
+          <span class="panel-title">Orbital Map</span>
+        </div>
+        <div class="orbital-canvas-wrap">
+          <canvas id="orbitalCanvas"></canvas>
+        </div>
+        <div class="orbital-controls">
+          <button id="orbitZoomIn" aria-label="Zoom in">+</button>
+          <button id="orbitZoomOut" aria-label="Zoom out">−</button>
+          <button id="orbitReset" aria-label="Reset zoom">⟲</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- FLEET TABLE -->
+    <div class="table-panel">
+      <div class="panel-header" style="padding: var(--spacing-md) var(--spacing-lg); border-bottom: 1px solid var(--color-border);">
+        <span class="panel-title">Fleet Status</span>
+      </div>
+      <div class="table-toolbar">
+        <div class="table-search">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.5"/><path d="M9.5 9.5L12.5 12.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          <input type="text" id="tableSearch" placeholder="Search probes..." aria-label="Search probes">
+        </div>
+        <select class="table-filter" id="tableFilter" aria-label="Filter by status">
+          <option value="all">All Status</option>
+          <option value="nominal">Nominal</option>
+          <option value="degraded">Degraded</option>
+          <option value="critical">Critical</option>
+          <option value="offline">Offline</option>
+        </select>
+      </div>
+      <div class="table-wrap">
+        <table class="fleet-table" id="fleetTable" aria-label="Fleet status table">
+          <thead>
+            <tr>
+              <th data-sort="name" tabindex="0">Name <span class="sort-icon">↕</span></th>
+              <th data-sort="model" tabindex="0">Model <span class="sort-icon">↕</span></th>
+              <th data-sort="status" tabindex="0">Status <span class="sort-icon">↕</span></th>
+              <th data-sort="distance" tabindex="0">Distance <span class="sort-icon">↕</span></th>
+              <th data-sort="signal" tabindex="0">Signal <span class="sort-icon">↕</span></th>
+              <th data-sort="temp" tabindex="0">Temp <span class="sort-icon">↕</span></th>
+              <th data-sort="power" tabindex="0">Power <span class="sort-icon">↕</span></th>
+              <th data-sort="lastContact" tabindex="0">Last Contact <span class="sort-icon">↕</span></th>
+              <th data-sort="operator" tabindex="0">Operator <span class="sort-icon">↕</span></th>
+            </tr>
+          </thead>
+          <tbody id="fleetTableBody"></tbody>
+        </table>
+        <div class="empty-state" id="emptyState" style="display:none">
+          <svg width="48" height="48" viewBox="0 0 48 48" fill="none"><circle cx="24" cy="24" r="20" stroke="currentColor" stroke-width="1.5"/><path d="M16 24h16M24 16v16" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+          <p>No probes match your filters.</p>
+          <button id="clearFilters">Clear Filters</button>
+        </div>
+      </div>
+      <div class="table-footer">
+        <span id="tableInfo">Showing 1-8 of 12 probes</span>
+        <div class="table-pagination" id="tablePagination"></div>
+      </div>
+    </div>
+
+    <!-- EVENT STREAM -->
+    <div class="event-stream">
+      <div class="panel-header" style="padding: var(--spacing-md) var(--spacing-lg); border-bottom: 1px solid var(--color-border);">
+        <span class="panel-title">Recent Events</span>
+      </div>
+      <div class="event-filters" role="tablist" aria-label="Event filters">
+        <button class="event-filter-btn active" data-filter="all" role="tab" aria-selected="true">All</button>
+        <button class="event-filter-btn" data-filter="critical" role="tab">Critical</button>
+        <button class="event-filter-btn" data-filter="warning" role="tab">Warning</button>
+        <button class="event-filter-btn" data-filter="info" role="tab">Info</button>
+      </div>
+      <div class="event-list" id="eventList" role="list"></div>
+    </div>
+
+    <!-- KANBAN -->
+    <div class="kanban-section">
+      <div class="section-header">
+        <h2 class="section-title" style="font-size:var(--font-size-lg)">Mission Phases</h2>
+      </div>
+      <div class="kanban-board" id="kanbanBoard">
+        <div class="kanban-column" data-column="planning">
+          <div class="kanban-column-header">
+            <span class="kanban-column-title">Planning</span>
+            <span class="kanban-column-count" id="countPlanning">0</span>
+          </div>
+          <div class="kanban-drop-zone" id="zonePlanning"></div>
+        </div>
+        <div class="kanban-column" data-column="in-transit">
+          <div class="kanban-column-header">
+            <span class="kanban-column-title">In Transit</span>
+            <span class="kanban-column-count" id="countTransit">0</span>
+          </div>
+          <div class="kanban-drop-zone" id="zoneTransit"></div>
+        </div>
+        <div class="kanban-column" data-column="orbit">
+          <div class="kanban-column-header">
+            <span class="kanban-column-title">Orbit</span>
+            <span class="kanban-column-count" id="countOrbit">0</span>
+          </div>
+          <div class="kanban-drop-zone" id="zoneOrbit"></div>
+        </div>
+        <div class="kanban-column" data-column="complete">
+          <div class="kanban-column-header">
+            <span class="kanban-column-title">Complete</span>
+            <span class="kanban-column-count" id="countComplete">0</span>
+          </div>
+          <div class="kanban-drop-zone" id="zoneComplete"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- FOOTER -->
+    <div class="page-footer">
+      <span>Data updated: <span id="footerUpdate">--</span></span>
+      <span>Nebula Mission Control v2.6.1</span>
+    </div>
+  </main>
+</div>
+
+<!-- DETAIL DRAWER -->
+<div class="drawer-overlay" id="drawerOverlay" aria-hidden="true"></div>
+<div class="drawer" id="drawer" role="dialog" aria-label="Probe details" aria-hidden="true">
+  <div class="drawer-header">
+    <span class="drawer-title" id="drawerTitle">Probe Details</span>
+    <button class="drawer-close" id="drawerClose" aria-label="Close drawer">
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 4l10 10M14 4L4 14" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body" id="drawerBody"></div>
+  <div class="drawer-actions">
+    <button class="btn-secondary" id="drawerPing">Ping Probe</button>
+    <button class="btn-primary" id="drawerReboot">Reboot Systems</button>
+    <button class="btn-danger" id="drawerAbort">Abort Mission</button>
+  </div>
+</div>
+
+<!-- COMMAND PALETTE -->
+<div class="command-overlay" id="commandOverlay" aria-hidden="true">
+  <div class="command-palette" role="dialog" aria-label="Command palette">
+    <div class="command-input-wrap">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="7" cy="7" r="5" stroke="currentColor" stroke-width="1.5"/><path d="M11 11l4 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+      <input class="command-input" id="commandInput" type="text" placeholder="Search commands, probes, pages..." autocomplete="off" aria-label="Command search">
+    </div>
+    <div class="command-results" id="commandResults"></div>
+  </div>
+</div>
+
+<!-- CONFIRM MODAL -->
+<div class="modal-overlay" id="modalOverlay" aria-hidden="true">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-header">
+      <h2 class="modal-title" id="modalTitle">Confirm Action</h2>
+    </div>
+    <div class="modal-body">
+      <p id="modalMessage">Are you sure you want to proceed?</p>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-cancel" id="modalCancel">Cancel</button>
+      <button class="btn-confirm" id="modalConfirm">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- TOAST CONTAINER -->
+<div class="toast-container" id="toastContainer" aria-live="polite"></div>
+
+<!-- MOVE MENU (for mobile kanban) -->
+<div class="move-menu" id="moveMenu" role="menu"></div>
+
+<script>
+(function() {
+  'use strict';
+
+  // ===== DETERMINISTIC DATA =====
+  const PROBE_NAMES = [
+    'Hermes-1', 'Hermes-2', 'Hermes-3', 'Athena-1', 'Athena-2',
+    'Apollo-1', 'Apollo-2', 'Apollo-3', 'Artemis-1', 'Artemis-2',
+    'Perseus-1', 'Perseus-2'
+  ];
+  const MODELS = ['NX-4000', 'NX-4000', 'NX-4000', 'NX-5000', 'NX-5000', 'NX-3000', 'NX-3000', 'NX-3000', 'NX-5000', 'NX-5000', 'NX-4000', 'NX-4000'];
+  const OPERATORS = ['Dr. Chen', 'Cmdr. Vasquez', 'Dr. Okonkwo', 'Lt. Petrov', 'Dr. Tanaka', 'Cmdr. Vasquez', 'Dr. Chen', 'Lt. Petrov', 'Dr. Okonkwo', 'Dr. Tanaka', 'Cmdr. Vasquez', 'Dr. Chen'];
+  const STATUSES = ['nominal', 'nominal', 'nominal', 'degraded', 'nominal', 'nominal', 'critical', 'nominal', 'nominal', 'offline', 'nominal', 'degraded'];
+
+  // Deterministic fleet data
+  const fleetData = PROBE_NAMES.map((name, i) => ({
+    id: i,
+    name,
+    model: MODELS[i],
+    status: STATUSES[i],
+    distance: (1.2 + i * 0.3).toFixed(1) + ' AU',
+    distanceNum: 1.2 + i * 0.3,
+    signal: Math.round(72 - i * 3 + (i % 3) * 2),
+    temp: Math.round(22 + i * 2 - (i % 4) * 1.5),
+    power: Math.round(85 - i * 3 + (i % 5) * 2),
+    lastContact: `2025-01-15T${String(10 + i).padStart(2,'0')}:${String((i*7)%60).padStart(2,'0')}:00Z`,
+    operator: OPERATORS[i]
+  }));
+
+  // Events data
+  const eventsData = [
+    { id: 1, severity: 'critical', title: 'Apollo-3 thermal runaway detected', desc: 'Core temperature exceeded 85°C threshold. Auto-cooling engaged.', time: '2025-01-15T14:32:00Z', unread: true },
+    { id: 2, severity: 'warning', title: 'Perseus-2 signal degradation', desc: 'Signal strength dropped below -80 dBm. Antenna realignment scheduled.', time: '2025-01-15T13:15:00Z', unread: true },
+    { id: 3, severity: 'info', title: 'Hermes-1 orbit insertion confirmed', desc: 'Probe successfully entered Asteria-7 polar orbit at 400km altitude.', time: '2025-01-15T12:00:00Z', unread: false },
+    { id: 4, severity: 'critical', title: 'Artemis-2 power cell failure', desc: 'Secondary power cell offline. Switching to backup reserves.', time: '2025-01-15T11:45:00Z', unread: true },
+    { id: 5, severity: 'warning', title: 'Athena-1 navigation drift', desc: 'Positional accuracy degraded by 0.3%. Recalibration in progress.', time: '2025-01-15T10:20:00Z', unread: false },
+    { id: 6, severity: 'info', title: 'Fleet-wide telemetry sync complete', desc: 'All 12 probes synchronized. Data integrity verified at 99.7%.', time: '2025-01-15T09:00:00Z', unread: false },
+    { id: 7, severity: 'info', title: 'Hermes-2 payload deployment successful', desc: 'Spectrometer array deployed and calibrated.', time: '2025-01-15T08:30:00Z', unread: false },
+    { id: 8, severity: 'warning', title: 'Apollo-1 communication latency spike', desc: 'Latency increased to 210ms during solar conjunction window.', time: '2025-01-15T07:15:00Z', unread: false }
+  ];
+
+  // Kanban data
+  const kanbanData = {
+    planning: [
+      { id: 'k1', title: 'Surface Sample Collection', desc: 'Phase 3B — Artemis probes' },
+      { id: 'k2', title: 'Spectrometer Calibration', desc: 'Phase 4A — Athena probes' }
+    ],
+    'in-transit': [
+      { id: 'k3', title: 'Orbital Insertion Burn', desc: 'Phase 2C — Hermes fleet' },
+      { id: 'k4', title: 'Trajectory Correction', desc: 'Phase 2D — Apollo fleet' }
+    ],
+    orbit: [
+      { id: 'k5', title: 'Polar Mapping Survey', desc: 'Phase 1A — Perseus probes' },
+      { id: 'k6', title: 'Atmospheric Analysis', desc: 'Phase 1B — Athena-1' }
+    ],
+    complete: [
+      { id: 'k7', title: 'Launch Sequence', desc: 'Phase 0 — All probes' },
+      { id: 'k8', title: 'Deep Space Transit', desc: 'Phase 1 — All probes' }
+    ]
+  };
+
+  // Telemetry data (deterministic)
+  const telemetryPoints = 48;
+  const telemetryData = {
+    signal: [],
+    thermal: [],
+    power: []
+  };
+  for (let i = 0; i < telemetryPoints; i++) {
+    telemetryData.signal.push(-45 + Math.sin(i * 0.3) * 15 + Math.cos(i * 0.7) * 8);
+    telemetryData.thermal.push(28 + Math.sin(i * 0.2) * 12 + Math.cos(i * 0.5) * 5);
+    telemetryData.power.push(78 + Math.sin(i * 0.15) * 10 - i * 0.15);
+  }
+
+  // Sparkline data
+  const sparkData = {
+    online: [8, 8, 9, 9, 8, 9, 9, 10, 9, 9, 9, 9],
+    delay: [150, 148, 145, 143, 146, 142, 144, 141, 143, 142, 140, 142],
+    downlink: [3.2, 3.5, 3.8, 4.0, 4.1, 4.3, 4.4, 4.5, 4.6, 4.6, 4.7, 4.7],
+    critical: [2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+  };
+
+  // Notifications
+  const notifications = [
+    { id: 1, type: 'error', text: 'Apollo-3 thermal alert requires review', time: '14:32 UTC', unread: true },
+    { id: 2, type: 'warn', text: 'Perseus-2 signal below threshold', time: '13:15 UTC', unread: true },
+    { id: 3, type: 'info', text: 'Hermes-1 orbit insertion confirmed', time: '12:00 UTC', unread: false },
+    { id: 4, type: 'error', text: 'Artemis-2 power cell failure', time: '11:45 UTC', unread: true },
+    { id: 5, type: 'info', text: 'Fleet telemetry sync complete', time: '09:00 UTC', unread: false }
+  ];
+
+  // ===== STATE =====
+  let state = {
+    theme: localStorage.getItem('nebula-theme') || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'),
+    sidebarCollapsed: localStorage.getItem('nebula-sidebar') === 'collapsed',
+    sidebarMobileOpen: false,
+    tableSort: { key: 'name', dir: 'asc' },
+    tableFilter: 'all',
+    tableSearch: '',
+    tablePage: 1,
+    tablePageSize: 8,
+    eventFilter: 'all',
+    timeRange: '24h',
+    telemetryVisible: { signal: true, thermal: true, power: true },
+    orbitZoom: 1,
+    kanban: JSON.parse(localStorage.getItem('nebula-kanban')) || JSON.parse(JSON.stringify(kanbanData)),
+    notifications: JSON.parse(localStorage.getItem('nebula-notifications')) || JSON.parse(JSON.stringify(notifications)),
+    events: JSON.parse(localStorage.getItem('nebula-events')) || JSON.parse(JSON.stringify(eventsData)),
+    simStep: parseInt(localStorage.getItem('nebula-simstep') || '0'),
+    selectedProbe: null,
+    commandOpen: false,
+    notifOpen: false,
+    userMenuOpen: false,
+    drawerOpen: false,
+    modalOpen: false,
+    missionStart: new Date('2024-06-15T00:00:00Z').getTime()
+  };
+
+  // ===== DOM REFS =====
+  const $ = id => document.getElementById(id);
+  const $$ = sel => document.querySelectorAll(sel);
+
+  // ===== INIT =====
+  function init() {
+    applyTheme();
+    applySidebarState();
+    renderFleetTable();
+    renderEvents();
+    renderKanban();
+    renderNotifications();
+    renderSparklines();
+    renderTelemetryChart();
+    renderOrbitalMap();
+    updateClock();
+    updateMissionDuration();
+    updateFooterTime();
+    setupEventListeners();
+    setupKeyboardShortcuts();
+
+    // Remove skeleton
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    setTimeout(() => {
+      $('skeleton').classList.add('hidden');
+      if (reducedMotion) {
+        setTimeout(() => $('skeleton').remove(), 50);
+      }
+    }, reducedMotion ? 10 : 500);
+  }
+
+  // ===== THEME =====
+  function applyTheme() {
+    document.documentElement.setAttribute('data-theme', state.theme);
+    localStorage.setItem('nebula-theme', state.theme);
+    updateThemeIcon();
+  }
+  function toggleTheme() {
+    state.theme = state.theme === 'dark' ? 'light' : 'dark';
+    applyTheme();
+  }
+  function updateThemeIcon() {
+    const icon = $('themeIcon');
+    if (state.theme === 'dark') {
+      icon.innerHTML = '<circle cx="8" cy="8" r="3" stroke="currentColor" stroke-width="1.5"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2M2.93 2.93l1.41 1.41M11.66 11.66l1.41 1.41M2.93 13.07l1.41-1.41M11.66 4.34l1.41-1.41" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>';
+    } else {
+      icon.innerHTML = '<path d="M12 7a5 5 0 01-5 5 5 5 0 01-5-5 5 5 0 015-5c.8 0 1.5.2 2.2.5C8.5 3.5 7 5.5 7 8c0 2.5 1.5 4.5 3.5 5.5A5 5 0 0012 7z" stroke="currentColor" stroke-width="1.5" fill="none"/>';
+    }
+  }
+
+  // ===== SIDEBAR =====
+  function applySidebarState() {
+    const sb = $('sidebar');
+    if (state.sidebarCollapsed && window.innerWidth > 768) {
+      sb.classList.add('collapsed');
+    }
+  }
+  function toggleSidebar() {
+    if (window.innerWidth <= 768) {
+      state.sidebarMobileOpen = !state.sidebarMobileOpen;
+      $('sidebar').classList.toggle('mobile-open', state.sidebarMobileOpen);
+      $('sidebarOverlay').classList.toggle('open', state.sidebarMobileOpen);
+      $('sidebarOverlay').setAttribute('aria-hidden', !state.sidebarMobileOpen);
+    } else {
+      state.sidebarCollapsed = !state.sidebarCollapsed;
+      $('sidebar').classList.toggle('collapsed', state.sidebarCollapsed);
+      localStorage.setItem('nebula-sidebar', state.sidebarCollapsed ? 'collapsed' : 'expanded');
+    }
+  }
+  function closeSidebarMobile() {
+    state.sidebarMobileOpen = false;
+    $('sidebar').classList.remove('mobile-open');
+    $('sidebarOverlay').classList.remove('open');
+    $('sidebarOverlay').setAttribute('aria-hidden', 'true');
+  }
+
+  // ===== CLOCK =====
+  function updateClock() {
+    const now = new Date();
+    const h = String(now.getUTCHours()).padStart(2, '0');
+    const m = String(now.getUTCMinutes()).padStart(2, '0');
+    const s = String(now.getUTCSeconds()).padStart(2, '0');
+    $('utcClock').textContent = `${h}:${m}:${s} UTC`;
+  }
+  function updateMissionDuration() {
+    const elapsed = Date.now() - state.missionStart;
+    const days = Math.floor(elapsed / 86400000);
+    const hours = Math.floor((elapsed % 86400000) / 3600000);
+    const mins = Math.floor((elapsed % 3600000) / 60000);
+    const secs = Math.floor((elapsed % 60000) / 1000);
+    $('missionDuration').textContent = `T+ ${String(days).padStart(3,'0')}:${String(hours).padStart(2,'0')}:${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
+  }
+  function updateFooterTime() {
+    const now = new Date();
+    $('footerUpdate').textContent = now.toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+  }
+
+  // ===== SPARKLINES =====
+  function renderSparklines() {
+    drawSparkline('sparkOnline', sparkData.online, '#10b981');
+    drawSparkline('sparkDelay', sparkData.delay, '#06b6d4');
+    drawSparkline('sparkDownlink', sparkData.downlink, '#10b981');
+    drawSparkline('sparkCritical', sparkData.critical, '#ef4444');
+  }
+  function drawSparkline(canvasId, data, color) {
+    const canvas = $(canvasId);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.scale(dpr, dpr);
+    const w = rect.width;
+    const h = rect.height;
+    const min = Math.min(...data);
+    const max = Math.max(...data);
+    const range = max - min || 1;
+    const step = w / (data.length - 1);
+
+    ctx.clearRect(0, 0, w, h);
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.lineJoin = 'round';
+    data.forEach((v, i) => {
+      const x = i * step;
+      const y = h - ((v - min) / range) * (h - 4) - 2;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    // Fill
+    ctx.lineTo(w, h);
+    ctx.lineTo(0, h);
+    ctx.closePath();
+    ctx.fillStyle = color.replace(')', ',0.1)').replace('rgb', 'rgba');
+    ctx.fill();
+  }
+
+  // ===== TELEMETRY CHART =====
+  function renderTelemetryChart() {
+    const canvas = $('telemetryCanvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    canvas.style.width = rect.width + 'px';
+    canvas.style.height = rect.height + 'px';
+    ctx.scale(dpr, dpr);
+
+    const w = rect.width;
+    const h = rect.height;
+    const pad = { top: 20, right: 20, bottom: 35, left: 50 };
+    const cw = w - pad.left - pad.right;
+    const ch = h - pad.top - pad.bottom;
+
+    ctx.clearRect(0, 0, w, h);
+
+    // Grid
+    ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--color-border').trim();
+    ctx.lineWidth = 0.5;
+    for (let i = 0; i <= 5; i++) {
+      const y = pad.top + (ch / 5) * i;
+      ctx.beginPath();
+      ctx.moveTo(pad.left, y);
+      ctx.lineTo(w - pad.right, y);
+      ctx.stroke();
+    }
+
+    // Y-axis labels
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--color-text-muted').trim();
+    ctx.font = '10px ' + getComputedStyle(document.documentElement).getPropertyValue('--font-mono').trim();
+    ctx.textAlign = 'right';
+    for (let i = 0; i <= 5; i++) {
+      const y = pad.top + (ch / 5) * i;
+      const val = 100 - i * 20;
+      ctx.fillText(val, pad.left - 8, y + 4);
+    }
+
+    // X-axis labels
+    ctx.textAlign = 'center';
+    const timeLabels = ['00:00', '04:00', '08:00', '12:00', '16:00', '20:00', '24:00'];
+    timeLabels.forEach((label, i) => {
+      const x = pad.left + (cw / (timeLabels.length - 1)) * i;
+      ctx.fillText(label, x, h - pad.bottom + 18);
+    });
+
+    // Draw series
+    const seriesColors = { signal: '#06b6d4', thermal: '#f59e0b', power: '#10b981' };
+    const seriesKeys = Object.keys(state.telemetryVisible).filter(k => state.telemetryVisible[k]);
+
+    seriesKeys.forEach(key => {
+      const data = telemetryData[key];
+      const color = seriesColors[key];
+      const min = Math.min(...data);
+      const max = Math.max(...data);
+      const range = max - min || 1;
+      const step = cw / (data.length - 1);
+
+      ctx.beginPath();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.lineJoin = 'round';
+      data.forEach((v, i) => {
+        const x = pad.left + i * step;
+        const y = pad.top + ch - ((v - min) / range) * ch;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+
+      // Current point highlight
+      const lastX = pad.left + (data.length - 1) * step;
+      const lastY = pad.top + ch - ((data[data.length - 1] - min) / range) * ch;
+      ctx.beginPath();
+      ctx.arc(lastX, lastY, 4, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(lastX, lastY, 7, 0, Math.PI * 2);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1;
+      ctx.globalAlpha = 0.3;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    });
+
+    // Store chart info for tooltip
+    canvas._chartInfo = { pad, cw, ch, w, h };
+  }
+
+  // ===== ORBITAL MAP =====
+  function renderOrbitalMap() {
+    const canvas = $('orbitalCanvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    canvas.style.width = rect.width + 'px';
+    canvas.style.height = rect.height + 'px';
+    ctx.scale(dpr, dpr);
+
+    const w = rect.width;
+    const h = rect.height;
+    const cx = w / 2;
+    const cy = h / 2;
+    const zoom = state.orbitZoom;
+
+    ctx.clearRect(0, 0, w, h);
+
+    const bg = getComputedStyle(document.documentElement).getPropertyValue('--color-bg-secondary').trim();
+    const border = getComputedStyle(document.documentElement).getPropertyValue('--color-border').trim();
+    const muted = getComputedStyle(document.documentElement).getPropertyValue('--color-text-muted').trim();
+    const accent = getComputedStyle(document.documentElement).getPropertyValue('--color-accent').trim();
+
+    // Background
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, w, h);
+
+    // Grid circles
+    ctx.strokeStyle = border;
+    ctx.lineWidth = 0.5;
+    for (let r = 30; r <= 120; r += 30) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, r * zoom, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // Earth
+    ctx.beginPath();
+    ctx.arc(cx, cy, 12 * zoom, 0, Math.PI * 2);
+    ctx.fillStyle = '#3b82f6';
+    ctx.fill();
+    ctx.fillStyle = muted;
+    ctx.font = '10px ' + getComputedStyle(document.documentElement).getPropertyValue('--font-sans').trim();
+    ctx.textAlign = 'center';
+    ctx.fillText('Earth', cx, cy + 24 * zoom);
+
+    // Moon
+    const moonAngle = Date.now() * 0.0001;
+    const moonR = 40 * zoom;
+    const moonX = cx + Math.cos(moonAngle) * moonR;
+    const moonY = cy + Math.sin(moonAngle) * moonR;
+    ctx.beginPath();
+    ctx.arc(moonX, moonY, 4 * zoom, 0, Math.PI * 2);
+    ctx.fillStyle = '#94a3b8';
+    ctx.fill();
+    ctx.fillText('Moon', moonX, moonY + 12 * zoom);
+
+    // Asteria-7
+    const astR = 100 * zoom;
+    const astX = cx + Math.cos(1.2) * astR;
+    const astY = cy + Math.sin(1.2) * astR;
+    ctx.beginPath();
+    ctx.arc(astX, astY, 8 * zoom, 0, Math.PI * 2);
+    ctx.fillStyle = '#f59e0b';
+    ctx.fill();
+    ctx.fillText('Asteria-7', astX, astY + 18 * zoom);
+
+    // Orbits
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 1;
+    ctx.globalAlpha = 0.4;
+    // Orbit 1
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, 60 * zoom, 45 * zoom, 0.3, 0, Math.PI * 2);
+    ctx.stroke();
+    // Orbit 2
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, 80 * zoom, 55 * zoom, -0.2, 0, Math.PI * 2);
+    ctx.stroke();
+    // Orbit 3
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, 95 * zoom, 70 * zoom, 0.5, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    // Probe dots on orbits
+    const probeAngles = [0.5, 1.8, 3.2, 4.5, 5.8];
+    probeAngles.forEach((angle, i) => {
+      const orbitIdx = i % 3;
+      const radii = [[60, 45], [80, 55], [95, 70]];
+      const tilts = [0.3, -0.2, 0.5];
+      const rx = radii[orbitIdx][0] * zoom;
+      const ry = radii[orbitIdx][1] * zoom;
+      const tilt = tilts[orbitIdx];
+      const px = cx + Math.cos(angle) * rx * Math.cos(tilt) - Math.sin(angle) * ry * Math.sin(tilt);
+      const py = cy + Math.cos(angle) * rx * Math.sin(tilt) + Math.sin(angle) * ry * Math.cos(tilt);
+      ctx.beginPath();
+      ctx.arc(px, py, 3 * zoom, 0, Math.PI * 2);
+      ctx.fillStyle = accent;
+      ctx.fill();
+    });
+  }
+
+  // ===== FLEET TABLE =====
+  function getFilteredFleet() {
+    let data = [...fleetData];
+    if (state.tableFilter !== 'all') {
+      data = data.filter(p => p.status === state.tableFilter);
+    }
+    if (state.tableSearch) {
+      const q = state.tableSearch.toLowerCase();
+      data = data.filter(p => p.name.toLowerCase().includes(q) || p.model.toLowerCase().includes(q) || p.operator.toLowerCase().includes(q));
+    }
+    // Sort
+    const key = state.tableSort.key;
+    const dir = state.tableSort.dir === 'asc' ? 1 : -1;
+    data.sort((a, b) => {
+      let va = a[key], vb = b[key];
+      if (key === 'distance' || key === 'signal' || key === 'temp' || key === 'power') {
+        va = parseFloat(va);
+        vb = parseFloat(vb);
+      }
+      if (typeof va === 'string') {
+        return va.localeCompare(vb) * dir;
+      }
+      return (va - vb) * dir;
+    });
+    return data;
+  }
+
+  function renderFleetTable() {
+    const filtered = getFilteredFleet();
+    const tbody = $('fleetTableBody');
+    const emptyState = $('emptyState');
+    const totalPages = Math.ceil(filtered.length / state.tablePageSize);
+    const start = (state.tablePage - 1) * state.tablePageSize;
+    const pageData = filtered.slice(start, start + state.tablePageSize);
+
+    // Update sort indicators
+    $$('.fleet-table th').forEach(th => {
+      th.classList.toggle('sorted', th.dataset.sort === state.tableSort.key);
+      const icon = th.querySelector('.sort-icon');
+      if (icon) {
+        icon.textContent = th.dataset.sort === state.tableSort.key ? (state.tableSort.dir === 'asc' ? '↑' : '↓') : '↕';
+      }
+    });
+
+    if (filtered.length === 0) {
+      tbody.innerHTML = '';
+      emptyState.style.display = 'flex';
+      $('tableInfo').textContent = 'No matching probes';
+      $('tablePagination').innerHTML = '';
+      return;
+    }
+
+    emptyState.style.display = 'none';
+    tbody.innerHTML = pageData.map(p => `
+      <tr tabindex="0" data-id="${p.id}" role="row" aria-label="${p.name}">
+        <td><strong>${p.name}</strong></td>
+        <td class="mono">${p.model}</td>
+        <td><span class="status-badge ${p.status}"><span class="status-dot"></span>${capitalize(p.status)}</span></td>
+        <td class="mono">${p.distance}</td>
+        <td class="mono">${p.signal} dBm</td>
+        <td class="mono">${p.temp}°C</td>
+        <td class="mono">${p.power}%</td>
+        <td class="mono">${p.lastContact.slice(11,16)} UTC</td>
+        <td>${p.operator}</td>
+      </tr>
+    `).join('');
+
+    $('tableInfo').textContent = `Showing ${start + 1}-${Math.min(start + state.tablePageSize, filtered.length)} of ${filtered.length} probes`;
+
+    // Pagination
+    let pagHtml = '';
+    if (totalPages > 1) {
+      pagHtml += `<button ${state.tablePage === 1 ? 'disabled' : ''} data-page="${state.tablePage - 1}">‹</button>`;
+      for (let i = 1; i <= totalPages; i++) {
+        pagHtml += `<button class="${i === state.tablePage ? 'active' : ''}" data-page="${i}">${i}</button>`;
+      }
+      pagHtml += `<button ${state.tablePage === totalPages ? 'disabled' : ''} data-page="${state.tablePage + 1}">›</button>`;
+    }
+    $('tablePagination').innerHTML = pagHtml;
+  }
+
+  function capitalize(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+  // ===== EVENTS =====
+  function renderEvents() {
+    const list = $('eventList');
+    let data = state.events;
+    if (state.eventFilter !== 'all') {
+      data = data.filter(e => e.severity === state.eventFilter);
+    }
+    list.innerHTML = data.map(e => `
+      <div class="event-item ${e.unread ? 'unread' : ''}" data-id="${e.id}" role="listitem">
+        <span class="event-severity ${e.severity}"></span>
+        <div class="event-content">
+          <div class="event-title">${e.title}</div>
+          <div class="event-desc">${e.desc}</div>
+          <div class="event-meta">${e.time.slice(11, 16)} UTC · ${capitalize(e.severity)}</div>
+        </div>
+        ${e.unread ? `<button class="event-read-btn" data-id="${e.id}" aria-label="Mark as read">Mark read</button>` : ''}
+      </div>
+    `).join('');
+  }
+
+  // ===== KANBAN =====
+  function renderKanban() {
+    const columns = ['planning', 'in-transit', 'orbit', 'complete'];
+    const zoneIds = ['zonePlanning', 'zoneTransit', 'zoneOrbit', 'zoneComplete'];
+    const countIds = ['countPlanning', 'countTransit', 'countOrbit', 'countComplete'];
+
+    columns.forEach((col, i) => {
+      const zone = $(zoneIds[i]);
+      const items = state.kanban[col] || [];
+      $(countIds[i]).textContent = items.length;
+      zone.innerHTML = items.map(item => `
+        <div class="kanban-card" draggable="true" data-id="${item.id}" data-column="${col}">
+          <div class="kanban-card-title">${item.title}</div>
+          <div class="kanban-card-desc">${item.desc}</div>
+          <div class="kanban-card-actions">
+            <button class="move-menu-btn" data-id="${item.id}" data-column="${col}">Move to ▾</button>
+          </div>
+        </div>
+      `).join('');
+    });
+
+    setupKanbanDrag();
+    setupKanbanMobile();
+    localStorage.setItem('nebula-kanban', JSON.stringify(state.kanban));
+  }
+
+  function setupKanbanDrag() {
+    const cards = $$('.kanban-card');
+    const zones = $$('.kanban-drop-zone');
+
+    cards.forEach(card => {
+      card.addEventListener('dragstart', e => {
+        e.dataTransfer.setData('text/plain', JSON.stringify({ id: card.dataset.id, column: card.dataset.column }));
+        card.classList.add('dragging');
+      });
+      card.addEventListener('dragend', () => card.classList.remove('dragging'));
+    });
+
+    zones.forEach(zone => {
+      zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('drag-over'); });
+      zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+      zone.addEventListener('drop', e => {
+        e.preventDefault();
+        zone.classList.remove('drag-over');
+        const data = JSON.parse(e.dataTransfer.getData('text/plain'));
+        const targetCol = zone.id.replace('zone', '').toLowerCase();
+        const colMap = { planning: 'planning', transit: 'in-transit', orbit: 'orbit', complete: 'complete' };
+        const target = colMap[targetCol];
+        if (!target || target === data.column) return;
+
+        // Remove from source
+        const srcItems = state.kanban[data.column];
+        const idx = srcItems.findIndex(x => x.id === data.id);
+        if (idx > -1) {
+          const [item] = srcItems.splice(idx, 1);
+          state.kanban[target].push(item);
+          renderKanban();
+          showToast('info', `Moved "${item.title}" to ${capitalize(target.replace('-', ' '))}`);
+        }
+      });
+    });
+  }
+
+  function setupKanbanMobile() {
+    $$('.move-menu-btn').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
+        const menu = $('moveMenu');
+        const rect = btn.getBoundingClientRect();
+        menu.style.top = rect.bottom + 'px';
+        menu.style.left = rect.left + 'px';
+        menu.innerHTML = ['planning', 'in-transit', 'orbit', 'complete'].filter(c => c !== btn.dataset.column).map(c =>
+          `<div class="move-menu-item" data-target="${c}">${capitalize(c.replace('-', ' '))}</div>`
+        ).join('');
+        menu.classList.add('open');
+        menu.querySelectorAll('.move-menu-item').forEach(item => {
+          item.addEventListener('click', () => {
+            const target = item.dataset.target;
+            const srcCol = btn.dataset.column;
+            const srcItems = state.kanban[srcCol];
+            const idx = srcItems.findIndex(x => x.id === btn.dataset.id);
+            if (idx > -1) {
+              const [moved] = srcItems.splice(idx, 1);
+              state.kanban[target].push(moved);
+              renderKanban();
+              showToast('info', `Moved "${moved.title}" to ${capitalize(target.replace('-', ' '))}`);
+            }
+            menu.classList.remove('open');
+          });
+        });
+      });
+    });
+  }
+
+  // ===== NOTIFICATIONS =====
+  function renderNotifications() {
+    const list = $('notifList');
+    const unreadCount = state.notifications.filter(n => n.unread).length;
+    const badge = $('notifBadge');
+    badge.style.display = unreadCount > 0 ? 'flex' : 'none';
+    badge.textContent = unreadCount;
+
+    list.innerHTML = state.notifications.map(n => `
+      <div class="notification-item ${n.unread ? 'unread' : ''}">
+        <span class="notif-dot ${n.type}"></span>
+        <div class="notif-text">${n.text}</div>
+        <span class="notif-time">${n.time}</span>
+      </div>
+    `).join('');
+  }
+
+  function markAllNotificationsRead() {
+    state.notifications.forEach(n => n.unread = false);
+    localStorage.setItem('nebula-notifications', JSON.stringify(state.notifications));
+    renderNotifications();
+  }
+
+  // ===== DRAWER =====
+  function openDrawer(probeId) {
+    const probe = fleetData.find(p => p.id === probeId);
+    if (!probe) return;
+    state.selectedProbe = probe;
+    $('drawerTitle').textContent = probe.name;
+
+    const body = $('drawerBody');
+    body.innerHTML = `
+      <div class="drawer-section">
+        <div class="drawer-section-title">Key Metrics</div>
+        <div class="drawer-metric-grid">
+          <div class="drawer-metric"><div class="drawer-metric-label">Status</div><div class="drawer-metric-value"><span class="status-badge ${probe.status}"><span class="status-dot"></span>${capitalize(probe.status)}</span></div></div>
+          <div class="drawer-metric"><div class="drawer-metric-label">Model</div><div class="drawer-metric-value mono">${probe.model}</div></div>
+          <div class="drawer-metric"><div class="drawer-metric-label">Distance</div><div class="drawer-metric-value mono">${probe.distance}</div></div>
+          <div class="drawer-metric"><div class="drawer-metric-label">Signal</div><div class="drawer-metric-value mono">${probe.signal} dBm</div></div>
+          <div class="drawer-metric"><div class="drawer-metric-label">Temperature</div><div class="drawer-metric-value mono">${probe.temp}°C</div></div>
+          <div class="drawer-metric"><div class="drawer-metric-label">Power</div><div class="drawer-metric-value mono">${probe.power}%</div></div>
+          <div class="drawer-metric"><div class="drawer-metric-label">Last Contact</div><div class="drawer-metric-value mono">${probe.lastContact}</div></div>
+          <div class="drawer-metric"><div class="drawer-metric-label">Operator</div><div class="drawer-metric-value">${probe.operator}</div></div>
+        </div>
+      </div>
+      <div class="drawer-section">
+        <div class="drawer-section-title">Recent Events</div>
+        <div class="drawer-timeline">
+          <div class="drawer-timeline-item"><div class="drawer-timeline-time">14:32 UTC</div><div class="drawer-timeline-text">Telemetry packet received — nominal</div></div>
+          <div class="drawer-timeline-item warn"><div class="drawer-timeline-time">13:15 UTC</div><div class="drawer-timeline-text">Minor signal fluctuation detected</div></div>
+          <div class="drawer-timeline-item"><div class="drawer-timeline-time">12:00 UTC</div><div class="drawer-timeline-text">Scheduled health check passed</div></div>
+          <div class="drawer-timeline-item error"><div class="drawer-timeline-time">10:45 UTC</div><div class="drawer-timeline-text">Power cell voltage dip — auto-recovered</div></div>
+          <div class="drawer-timeline-item"><div class="drawer-timeline-time">09:00 UTC</div><div class="drawer-timeline-text">Fleet-wide sync completed</div></div>
+        </div>
+      </div>
+    `;
+
+    $('drawerOverlay').classList.add('open');
+    $('drawer').classList.add('open');
+    $('drawerOverlay').setAttribute('aria-hidden', 'false');
+    $('drawer').setAttribute('aria-hidden', 'false');
+    state.drawerOpen = true;
+    $('drawerClose').focus();
+  }
+
+  function closeDrawer() {
+    $('drawerOverlay').classList.remove('open');
+    $('drawer').classList.remove('open');
+    $('drawerOverlay').setAttribute('aria-hidden', 'true');
+    $('drawer').setAttribute('aria-hidden', 'true');
+    state.drawerOpen = false;
+    state.selectedProbe = null;
+  }
+
+  // ===== COMMAND PALETTE =====
+  function openCommandPalette() {
+    state.commandOpen = true;
+    $('commandOverlay').classList.add('open');
+    $('commandOverlay').setAttribute('aria-hidden', 'false');
+    $('commandInput').value = '';
+    $('commandInput').focus();
+    renderCommandResults('');
+  }
+
+  function closeCommandPalette() {
+    state.commandOpen = false;
+    $('commandOverlay').classList.remove('open');
+    $('commandOverlay').setAttribute('aria-hidden', 'true');
+  }
+
+  function renderCommandResults(query) {
+    const results = $('commandResults');
+    const q = query.toLowerCase().trim();
+
+    let items = [];
+
+    // Pages
+    const pages = [
+      { label: 'Overview', icon: 'grid', action: () => {} },
+      { label: 'Fleet', icon: 'fleet', action: () => {} },
+      { label: 'Telemetry', icon: 'chart', action: () => {} },
+      { label: 'Mission Timeline', icon: 'clock', action: () => {} },
+      { label: 'Incidents', icon: 'alert', action: () => {} },
+      { label: 'Payloads', icon: 'payload', action: () => {} },
+      { label: 'Settings', icon: 'settings', action: () => {} }
+    ];
+
+    // Probes
+    const probes = fleetData.map(p => ({
+      label: `${p.name} — ${capitalize(p.status)}`,
+      icon: 'probe',
+      action: () => { closeCommandPalette(); openDrawer(p.id); }
+    }));
+
+    // Actions
+    const actions = [
+      { label: 'Simulate Telemetry Update', icon: 'refresh', action: () => { closeCommandPalette(); simulateUpdate(); } },
+      { label: 'Toggle Theme', icon: 'theme', action: () => { closeCommandPalette(); toggleTheme(); } },
+      { label: 'Mark All Notifications Read', icon: 'bell', action: () => { closeCommandPalette(); markAllNotificationsRead(); } }
+    ];
+
+    const iconMap = {
+      grid: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="9" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="2" y="9" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.2"/><rect x="9" y="9" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.2"/></svg>',
+      fleet: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2.5" stroke="currentColor" stroke-width="1.2"/><path d="M8 2v2M8 12v2M2 8h2M12 8h2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>',
+      chart: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 12l4-4 3 3 5-6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+      clock: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.2"/><path d="M8 4v4l2.5 2.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>',
+      alert: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 2L2 14h12L8 2z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/><path d="M8 7v3M8 11v.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>',
+      payload: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><rect x="2" y="5" width="12" height="8" rx="1.5" stroke="currentColor" stroke-width="1.2"/><path d="M6 5V3.5a2 2 0 014 0V5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>',
+      settings: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="2.5" stroke="currentColor" stroke-width="1.2"/><path d="M8 1.5v2M8 12.5v2M1.5 8h2M12.5 8h2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>',
+      probe: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="3" stroke="currentColor" stroke-width="1.2"/><path d="M8 2v2M8 12v2M2 8h2M12 8h2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>',
+      refresh: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M2 8a6 6 0 0111.3-2.7M14 8a6 6 0 01-11.3 2.7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><path d="M12 2v3h-3M4 14v-3h3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+      theme: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><circle cx="8" cy="8" r="3" stroke="currentColor" stroke-width="1.2"/><path d="M8 1v2M8 13v2M1 8h2M13 8h2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>',
+      bell: '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4 6a4 4 0 018 0c0 3 2 4 2 4H2s2-1 2-4zM6 13a1 1 0 002 0" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>'
+    };
+
+    let html = '';
+    let selectedIndex = -1;
+
+    if (q) {
+      const filteredPages = pages.filter(p => p.label.toLowerCase().includes(q));
+      const filteredProbes = probes.filter(p => p.label.toLowerCase().includes(q));
+      const filteredActions = actions.filter(a => a.label.toLowerCase().includes(q));
+
+      if (filteredPages.length) {
+        html += '<div class="command-group-label">Pages</div>';
+        filteredPages.forEach(p => {
+          html += `<div class="command-item" data-action="${p.label}">${iconMap[p.icon]}<span class="cmd-label">${p.label}</span></div>`;
+        });
+      }
+      if (filteredProbes.length) {
+        html += '<div class="command-group-label">Probes</div>';
+        filteredProbes.forEach(p => {
+          html += `<div class="command-item" data-action="${p.label}">${iconMap[p.icon]}<span class="cmd-label">${p.label}</span></div>`;
+        });
+      }
+      if (filteredActions.length) {
+        html += '<div class="command-group-label">Actions</div>';
+        filteredActions.forEach(a => {
+          html += `<div class="command-item" data-action="${a.label}">${iconMap[a.icon]}<span class="cmd-label">${a.label}</span></div>`;
+        });
+      }
+    } else {

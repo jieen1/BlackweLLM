@@ -210,6 +210,7 @@ class TestContractShape:
         assert caps.speculative_decode is True
         assert backend.has_speculative_decode is False
         assert caps.warm_continue is False
+        assert caps.kv_reservation is True
 
     def test_page_size_must_be_a_multiple_of_block_size(self) -> None:
         # §1.7: the divisibility that holds today holds by coincidence of two
@@ -468,6 +469,34 @@ class TestPrefixCacheTwoFamilies:
         backend = _backend(
             num_slots=2,
             block_size=64,
+            enable_persistent_prefix_cache=True,
+        )
+        prompt = list(range(64))
+        first = _run(backend, 0, prompt, steps=2)
+        backend.reset_slot(0)
+
+        backend.model.forward_lengths.clear()
+        state = backend.prefill_chunked_begin([1], [prompt])
+
+        assert backend.model.forward_lengths == []
+        assert backend.stats["prefix_persistent_restores"] == 1
+        assert state.result[1]["anchor"] == first[0]
+        assert backend.pool.slot_kv_len[1] == len(prompt)
+
+    def test_dynamic_arena_restores_full_prompt_state_without_forward(self) -> None:
+        """Arena-owned KV must retain the co-keyed GDN checkpoint too.
+
+        Dynamic mode parks hashed attention/MTP bundles at CACHED_REF0 after
+        reset.  That is not a usable Qwen prefix by itself: the 48 recurrent
+        GDN layers need the checkpoint and exact-prompt anchor hidden from
+        the same boundary.  A repeat must therefore take the same zero-
+        forward full-prompt path as the fixed scratch arena.
+        """
+        backend = _backend(
+            num_slots=2,
+            block_size=64,
+            dynamic_arena=True,
+            pool_bundles=20,
             enable_persistent_prefix_cache=True,
         )
         prompt = list(range(64))

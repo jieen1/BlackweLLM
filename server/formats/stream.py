@@ -10,14 +10,14 @@ own separate parsing logic.
 
 Two ways a generation can carry a reasoning phase:
 
-1. ``thinking_capable=True`` (opt-in, no backend uses this today): the
-   chat template injects ``<think>`` into the PROMPT
+1. ``thinking_capable=True``: this request's chat template leaves an open
+   ``<think>`` in the PROMPT
    (``add_generation_prompt=True``), so the model's own generated tokens
    start directly with the reasoning body -- no literal ``<think>`` in the
    output. We synthesize the tag ourselves (``_get_raw()``) so the rest of
    the pipeline has one uniform representation to look at.
-2. ``thinking_capable=False`` (Laguna's mode, the default in production):
-   no template injection. A reasoning phase exists ONLY if the model's own
+2. ``thinking_capable=False``: the prompt does not leave a reasoning block
+   open. A reasoning phase exists ONLY if the model's own
    generated text literally starts with ``<think>`` (Laguna has been
    observed to do this voluntarily) -- see ``server/formats/thinking.py``
    for why this is anchored to position 0 rather than a blind scan: a
@@ -114,11 +114,11 @@ class StreamProcessor:
         template-injecting backend (``thinking_capable=True``) if it isn't
         already there.
 
-        For Laguna (``thinking_capable=False``) the decoded text is
-        returned as-is: a <think> synthesized here would make every
+        For a request whose prompt does not leave ``<think>`` open
+        (``thinking_capable=False``), decoded text is returned as-is: a
+        <think> synthesized here would make every
         downstream "still thinking" check see it as permanently open, even
-        though Laguna's template never injects one -- see the class
-        docstring.
+        though the prompt already closed or never opened the block.
         """
         n = len(self._all_ids)
         if n == self._last_decode_len:
@@ -256,8 +256,13 @@ class StreamProcessor:
         # Check for tool call XML start
         tc_start = find_tool_call_start(visible, open_tag=self._tool_parser.open_tag)
         if tc_start >= 0:
-            self._tool_call_started = True
             safe = visible[:tc_start]
+            # A trailing strict prefix (often just "<") is ambiguous while
+            # streaming.  Hold it back, but do not permanently enter tool-call
+            # mode until the complete opening tag has arrived: ordinary HTML
+            # such as ``</body>`` must be released on the next token.
+            if self._tool_parser.open_tag in visible:
+                self._tool_call_started = True
             if len(safe) > self._emitted_len:
                 delta = safe[self._emitted_len :]
                 self._emitted_len = len(safe)

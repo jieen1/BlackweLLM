@@ -157,6 +157,29 @@ class _FakeNoCacheRunner:
         raise NotImplementedError("has_speculative_decode=False; must not be called")
 
 
+class _FakeReservedRunner(_FakeNoCacheRunner):
+    def __init__(self, reservable_slots: set[int]):
+        super().__init__()
+        self.capabilities = BackendCapabilities(
+            speculative_decode=False,
+            prefix_cache=False,
+            cuda_graph=False,
+            chunked_prefill=True,
+            warm_continue=False,
+            kv_reservation=True,
+        )
+        self.reservable_slots = set(reservable_slots)
+        self.reserve_calls: list[tuple[int, int]] = []
+        self.release_calls: list[int] = []
+
+    def reserve_kv_capacity(self, slot: int, total_tokens: int) -> bool:
+        self.reserve_calls.append((slot, total_tokens))
+        return slot in self.reservable_slots
+
+    def release_kv_reservation(self, slot: int) -> None:
+        self.release_calls.append(slot)
+
+
 def _bare_admission_engine(runner, capacity: int = 2) -> ServerEngine:
     engine = ServerEngine(
         backend="laguna", capacity=capacity, num_slots=capacity, enable_cudagraph=False
@@ -214,6 +237,32 @@ class TestCapabilityGatedSlotAssignment:
         # hasattr(runner, "find_best_slot_for_prompt") == False did before.
         assert engine.active[0]["anchor"] == 700
         assert 1 in engine.free_slots
+
+
+class TestKVReservationAdmission:
+    def test_capacity_miss_stays_waiting_before_prefill(self) -> None:
+        runner = _FakeReservedRunner(reservable_slots={0})
+        engine = _bare_admission_engine(runner)
+        req_a = _req(engine, [1, 2, 3], "req-reserved")
+        req_b = _req(engine, [4, 5, 6], "req-wait")
+        engine.waiting = [req_a, req_b]
+
+        engine._step_sync()
+
+        assert runner.reserve_calls == [(0, 13), (1, 13)]
+        assert 0 in engine.active
+        assert engine.waiting == [req_b]
+        assert not req_b.future.done()
+        assert engine.free_slots == [1]
+
+    def test_finish_releases_unmaterialized_tail_before_slot_retention(self) -> None:
+        runner = _FakeReservedRunner(reservable_slots={0})
+        engine = _bare_admission_engine(runner, capacity=1)
+        req = _req(engine, [1, 2, 3], "req-finish")
+
+        engine._finish_request(0, req, [9], "length")
+
+        assert runner.release_calls == [0]
 
 
 class TestCoordinatorWiring:

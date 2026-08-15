@@ -73,6 +73,55 @@ class TestDynamicGeometry:
         pool.assert_kv_storage_consistent()
 
 
+class TestPhase4Reservations:
+    def test_slot_reservation_is_consumed_by_growth_and_released_on_reset(self) -> None:
+        pool = _dynamic_pool(
+            num_slots=2,
+            max_seq_len=256,
+            pool_bundles=8,
+            watermark_bundles=1,
+        )
+
+        assert pool.reserve_kv_capacity(0, 256)
+        assert pool.kv_reservation_remaining(0) == 2
+        pool.prepare_kv_writes(0, 0, 1)
+        assert pool.kv_reservation_remaining(0) == 1
+
+        pool.reset_slot(0)
+
+        assert pool.kv_reservation_remaining(0) == 0
+        assert pool._arena.usage().request_reserved_bundles == 0
+
+    def test_partial_shared_tail_keeps_cow_reserve(self) -> None:
+        pool = _dynamic_pool(
+            num_slots=2,
+            max_seq_len=256,
+            pool_bundles=8,
+            watermark_bundles=1,
+        )
+        pool.prepare_kv_writes(0, 0, 64)
+        assert pool.reserve_kv_capacity(1, 256)
+
+        pool.share_prefix_kv(0, 1, 64)
+        assert pool.kv_reservation_remaining(1) == 2
+        pool.prepare_kv_writes(1, 64, 1)
+        assert pool.kv_reservation_remaining(1) == 1
+
+    def test_full_shared_page_releases_that_part_of_reservation(self) -> None:
+        pool = _dynamic_pool(
+            num_slots=2,
+            max_seq_len=256,
+            pool_bundles=8,
+            watermark_bundles=1,
+        )
+        pool.prepare_kv_writes(0, 0, 128)
+        assert pool.reserve_kv_capacity(1, 256)
+
+        pool.share_prefix_kv(0, 1, 128)
+
+        assert pool.kv_reservation_remaining(1) == 1
+
+
 class TestOnDemandAllocation:
     def test_prepare_kv_writes_allocates_on_first_write(self) -> None:
         pool = _dynamic_pool()
@@ -294,9 +343,25 @@ class TestPhase3PrefixCache:
         assert restored == 192
         assert len(set(bundle_ids)) == 2  # two pages
         assert pool._page_table_host[1][0] == bundle_ids[0]
+        assert pool._page_table_host[1][1] == bundle_ids[1]
         # The bundle is the physical ownership unit: two hash blocks in one
         # page revive it once (ref_cnt=1), not once per block.
         assert pool._arena.bundles[b0].ref_cnt == 1
+
+    def test_partial_page_restore_consumes_one_reserved_bundle(self) -> None:
+        pool = _dynamic_pool(num_slots=2, max_seq_len=256, pool_bundles=16)
+        pool.prepare_kv_writes(0, 0, 64)
+        keys = self._keys(1)
+        pool.publish_committed_blocks(0, 64, keys, self._BLOCK)
+        pool.reset_slot(0)
+        assert pool.reserve_kv_capacity(1, 256)
+        before = pool.kv_reservation_remaining(1)
+
+        restored, bundle_ids = pool.restore_prefix_from_arena(1, 64, keys)
+
+        assert restored == 64
+        assert len(set(bundle_ids)) == 1
+        assert pool.kv_reservation_remaining(1) == before - 1
 
     def test_miss_returns_zero(self) -> None:
         pool = _dynamic_pool(num_slots=2, max_seq_len=256, pool_bundles=16)

@@ -1,0 +1,1109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nebula Mission Control | Asteria-7</title>
+    <meta name="description" content="Deep space exploration fleet management dashboard.">
+    <style>
+        /* --- CSS VARIABLES & THEME --- */
+        :root {
+            /* Colors - Dark (Default) */
+            --bg-body: #0b111e;
+            --bg-panel: #131b2e;
+            --bg-panel-hover: #1c2640;
+            --bg-surface: #1e2942;
+            --border-color: #2a3b55;
+            --text-primary: #e2e8f0;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            
+            /* Accents */
+            --accent-primary: #06b6d4; /* Cyan */
+            --accent-primary-dim: rgba(6, 182, 212, 0.15);
+            --accent-warning: #f59e0b; /* Orange */
+            --accent-danger: #ef4444; /* Red */
+            --accent-success: #10b981; /* Green */
+            
+            /* Spacing & Sizing */
+            --header-height: 60px;
+            --sidebar-width: 240px;
+            --sidebar-collapsed-width: 64px;
+            --radius-sm: 4px;
+            --radius-md: 8px;
+            --radius-lg: 12px;
+            
+            /* Typography */
+            --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            --font-mono: "SF Mono", "Roboto Mono", "Fira Code", Consolas, monospace;
+            
+            /* Transitions */
+            --ease-out: cubic-bezier(0.215, 0.61, 0.355, 1);
+            --duration-fast: 150ms;
+            --duration-normal: 300ms;
+        }
+
+        /* Light Theme Override */
+        [data-theme="light"] {
+            --bg-body: #f1f5f9;
+            --bg-panel: #ffffff;
+            --bg-panel-hover: #f8fafc;
+            --bg-surface: #e2e8f0;
+            --border-color: #cbd5e1;
+            --text-primary: #0f172a;
+            --text-secondary: #475569;
+            --text-muted: #94a3b8;
+            --accent-primary: #0891b2;
+            --accent-primary-dim: rgba(8, 145, 178, 0.1);
+        }
+
+        /* --- RESET & BASE --- */
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: var(--font-sans);
+            background-color: var(--bg-body);
+            color: var(--text-primary);
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            transition: background-color var(--duration-normal) var(--ease-out), color var(--duration-normal) var(--ease-out);
+        }
+        
+        /* Accessibility Focus */
+        :focus-visible { outline: 2px solid var(--accent-primary); outline-offset: 2px; }
+        
+        /* Scrollbars */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--border-color); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+        /* Utility Classes */
+        .flex { display: flex; }
+        .flex-col { flex-direction: column; }
+        .items-center { align-items: center; }
+        .justify-between { justify-content: space-between; }
+        .justify-center { justify-content: center; }
+        .gap-2 { gap: 0.5rem; }
+        .gap-4 { gap: 1rem; }
+        .text-mono { font-family: var(--font-mono); }
+        .text-sm { font-size: 0.875rem; }
+        .text-xs { font-size: 0.75rem; }
+        .text-muted { color: var(--text-muted); }
+        .text-warning { color: var(--accent-warning); }
+        .text-danger { color: var(--accent-danger); }
+        .text-success { color: var(--accent-success); }
+        .font-bold { font-weight: 700; }
+        .w-full { width: 100%; }
+        .h-full { height: 100%; }
+        .relative { position: relative; }
+        .absolute { position: absolute; }
+        .overflow-hidden { overflow: hidden; }
+        .overflow-auto { overflow: auto; }
+        .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+        /* --- LAYOUT --- */
+        #app {
+            display: flex;
+            flex: 1;
+            height: calc(100vh - var(--header-height));
+            position: relative;
+        }
+
+        /* Sidebar */
+        #sidebar {
+            width: var(--sidebar-width);
+            background-color: var(--bg-panel);
+            border-right: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            transition: width var(--duration-normal) var(--ease-out);
+            z-index: 20;
+        }
+        #sidebar.collapsed { width: var(--sidebar-collapsed-width); }
+        #sidebar.collapsed .nav-text, #sidebar.collapsed .badge { display: none; }
+        #sidebar.collapsed .nav-item { justify-content: center; padding: 0.75rem; }
+        
+        .nav-item {
+            display: flex;
+            align-items: center;
+            padding: 0.75rem 1rem;
+            color: var(--text-secondary);
+            text-decoration: none;
+            cursor: pointer;
+            transition: all var(--duration-fast);
+            border-left: 3px solid transparent;
+        }
+        .nav-item:hover, .nav-item.active {
+            background-color: var(--bg-panel-hover);
+            color: var(--text-primary);
+        }
+        .nav-item.active { border-left-color: var(--accent-primary); color: var(--accent-primary); }
+        .nav-item svg { width: 20px; height: 20px; min-width: 20px; }
+        .nav-text { margin-left: 0.75rem; font-size: 0.9rem; white-space: nowrap; }
+        .badge { margin-left: auto; background: var(--bg-surface); padding: 2px 6px; border-radius: 10px; font-size: 0.7rem; }
+
+        /* Main Content */
+        #main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            background-color: var(--bg-body);
+            position: relative;
+        }
+
+        /* Header */
+        header {
+            height: var(--header-height);
+            background-color: var(--bg-panel);
+            border-bottom: 1px solid var(--border-color);
+            display: flex;
+            align-items: center;
+            padding: 0 1.5rem;
+            justify-content: space-between;
+            z-index: 30;
+        }
+        .logo-area { display: flex; align-items: center; gap: 1rem; }
+        .logo-icon { width: 32px; height: 32px; fill: var(--accent-primary); }
+        .mission-info h1 { font-size: 1rem; font-weight: 600; letter-spacing: 0.5px; }
+        .mission-info span { font-size: 0.75rem; color: var(--text-muted); }
+        
+        .header-actions { display: flex; align-items: center; gap: 1rem; }
+        .icon-btn {
+            background: transparent; border: none; color: var(--text-secondary); cursor: pointer;
+            padding: 0.5rem; border-radius: var(--radius-sm); display: flex; align-items: center; justify-content: center;
+            position: relative;
+        }
+        .icon-btn:hover { background-color: var(--bg-panel-hover); color: var(--text-primary); }
+        .icon-btn svg { width: 20px; height: 20px; }
+        .notification-dot {
+            position: absolute; top: 6px; right: 6px; width: 8px; height: 8px;
+            background-color: var(--accent-danger); border-radius: 50%; border: 1px solid var(--bg-panel);
+        }
+
+        /* Dashboard Grid */
+        .dashboard-container {
+            padding: 1.5rem;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+            height: 100%;
+        }
+
+        /* KPI Cards */
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 1rem;
+        }
+        .card {
+            background-color: var(--bg-panel);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            position: relative;
+            overflow: hidden;
+        }
+        .kpi-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 0.5rem; }
+        .kpi-title { font-size: 0.85rem; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.5px; }
+        .kpi-value { font-size: 1.75rem; font-weight: 700; color: var(--text-primary); font-family: var(--font-mono); }
+        .kpi-trend { font-size: 0.8rem; display: flex; align-items: center; gap: 4px; margin-top: 0.5rem; }
+        .kpi-sparkline { height: 30px; width: 100%; margin-top: 0.5rem; }
+
+        /* Charts & Visuals */
+        .charts-row {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 1.5rem;
+            min-height: 300px;
+        }
+        .chart-panel {
+            background-color: var(--bg-panel);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            padding: 1rem;
+            display: flex;
+            flex-direction: column;
+        }
+        .panel-header { display: flex; justify-content: space-between; margin-bottom: 1rem; }
+        .panel-title { font-weight: 600; font-size: 0.95rem; }
+        
+        /* Telemetry Chart */
+        #telemetry-chart-container { flex: 1; position: relative; width: 100%; }
+        #telemetry-svg { width: 100%; height: 100%; overflow: visible; }
+        .chart-grid line { stroke: var(--border-color); stroke-opacity: 0.3; }
+        .chart-line { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; }
+        .chart-line.signal { stroke: var(--accent-primary); }
+        .chart-line.thermal { stroke: var(--accent-warning); }
+        .chart-line.power { stroke: var(--accent-success); }
+        .chart-tooltip {
+            position: absolute; background: var(--bg-surface); border: 1px solid var(--border-color);
+            padding: 0.5rem; border-radius: var(--radius-sm); pointer-events: none; opacity: 0;
+            transition: opacity 0.2s; font-size: 0.8rem; z-index: 10; box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+
+        /* Orbit Map */
+        #orbit-map-container { flex: 1; position: relative; background: radial-gradient(circle at center, #1e2942 0%, #0b111e 100%); border-radius: var(--radius-sm); overflow: hidden; }
+        #orbit-svg { width: 100%; height: 100%; }
+        .orbit-path { fill: none; stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 4 4; opacity: 0.5; }
+        .planet { fill: var(--text-primary); }
+        .probe-dot { fill: var(--accent-primary); r: 3; }
+        .orbit-controls { position: absolute; bottom: 10px; right: 10px; display: flex; gap: 4px; }
+        .orbit-btn { background: rgba(0,0,0,0.5); border: 1px solid var(--border-color); color: white; width: 24px; height: 24px; cursor: pointer; border-radius: 4px; }
+
+        /* Fleet Table */
+        .table-container {
+            background-color: var(--bg-panel);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        .table-toolbar { padding: 1rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-color); }
+        .search-input {
+            background: var(--bg-body); border: 1px solid var(--border-color); color: var(--text-primary);
+            padding: 0.5rem 0.75rem; border-radius: var(--radius-sm); width: 250px;
+        }
+        .data-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+        .data-table th { text-align: left; padding: 0.75rem 1rem; background: var(--bg-surface); color: var(--text-secondary); font-weight: 600; cursor: pointer; user-select: none; }
+        .data-table th:hover { color: var(--text-primary); }
+        .data-table td { padding: 0.75rem 1rem; border-bottom: 1px solid var(--border-color); }
+        .data-table tr:hover { background-color: var(--bg-panel-hover); cursor: pointer; }
+        .status-badge { padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }
+        .status-nominal { background: rgba(16, 185, 129, 0.2); color: var(--accent-success); }
+        .status-degraded { background: rgba(245, 158, 11, 0.2); color: var(--accent-warning); }
+        .status-critical { background: rgba(239, 68, 68, 0.2); color: var(--accent-danger); }
+        .status-offline { background: rgba(100, 116, 139, 0.2); color: var(--text-muted); }
+
+        /* Bottom Section: Events & Kanban */
+        .bottom-grid {
+            display: grid;
+            grid-template-columns: 1fr 1.5fr;
+            gap: 1.5rem;
+            min-height: 250px;
+        }
+        
+        /* Event Stream */
+        .event-list { display: flex; flex-direction: column; gap: 0.5rem; overflow-y: auto; max-height: 250px; }
+        .event-item {
+            display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem;
+            border-radius: var(--radius-sm); border-left: 3px solid transparent;
+            background: var(--bg-surface); font-size: 0.85rem;
+        }
+        .event-item.critical { border-left-color: var(--accent-danger); }
+        .event-item.warning { border-left-color: var(--accent-warning); }
+        .event-item.info { border-left-color: var(--accent-primary); }
+        
+        /* Kanban */
+        .kanban-board { display: flex; gap: 1rem; height: 100%; overflow-x: auto; padding-bottom: 0.5rem; }
+        .kanban-col {
+            flex: 1; min-width: 200px; background: var(--bg-surface); border-radius: var(--radius-md);
+            display: flex; flex-direction: column; padding: 0.5rem;
+        }
+        .kanban-header { font-size: 0.8rem; font-weight: 700; color: var(--text-secondary); margin-bottom: 0.5rem; padding: 0 0.25rem; text-transform: uppercase; }
+        .kanban-card {
+            background: var(--bg-panel); border: 1px solid var(--border-color); padding: 0.75rem;
+            border-radius: var(--radius-sm); margin-bottom: 0.5rem; cursor: grab; font-size: 0.85rem;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+        }
+        .kanban-card:active { cursor: grabbing; }
+        .kanban-card.dragging { opacity: 0.5; }
+
+        /* --- MODALS & DRAWERS --- */
+        .overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.6); z-index: 100; display: none;
+            backdrop-filter: blur(2px);
+        }
+        .overlay.active { display: block; }
+
+        /* Drawer */
+        .drawer {
+            position: fixed; top: 0; right: -400px; width: 400px; height: 100%;
+            background: var(--bg-panel); border-left: 1px solid var(--border-color);
+            z-index: 101; transition: right var(--duration-normal) var(--ease-out);
+            display: flex; flex-direction: column; box-shadow: -5px 0 15px rgba(0,0,0,0.3);
+        }
+        .drawer.open { right: 0; }
+        .drawer-header { padding: 1.5rem; border-bottom: 1px solid var(--border-color); display: flex; justify-content: space-between; align-items: center; }
+        .drawer-body { padding: 1.5rem; overflow-y: auto; flex: 1; }
+        .drawer-footer { padding: 1.5rem; border-top: 1px solid var(--border-color); display: flex; gap: 1rem; }
+
+        /* Command Palette */
+        .command-palette {
+            position: fixed; top: 20%; left: 50%; transform: translateX(-50%);
+            width: 600px; max-width: 90%; background: var(--bg-panel);
+            border: 1px solid var(--border-color); border-radius: var(--radius-md);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.5); z-index: 200; display: none;
+            flex-direction: column; overflow: hidden;
+        }
+        .command-palette.active { display: flex; }
+        .cmd-input { width: 100%; padding: 1rem; background: transparent; border: none; color: var(--text-primary); font-size: 1.1rem; outline: none; border-bottom: 1px solid var(--border-color); }
+        .cmd-list { max-height: 400px; overflow-y: auto; }
+        .cmd-item { padding: 0.75rem 1rem; cursor: pointer; display: flex; justify-content: space-between; }
+        .cmd-item:hover, .cmd-item.selected { background: var(--bg-panel-hover); color: var(--accent-primary); }
+        .cmd-shortcut { font-size: 0.8rem; color: var(--text-muted); }
+
+        /* Toast */
+        .toast-container { position: fixed; bottom: 2rem; right: 2rem; z-index: 300; display: flex; flex-direction: column; gap: 0.5rem; }
+        .toast {
+            background: var(--bg-panel); border: 1px solid var(--border-color);
+            padding: 1rem; border-radius: var(--radius-md); box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            display: flex; align-items: center; gap: 0.75rem; min-width: 300px;
+            animation: slideIn 0.3s ease-out;
+        }
+        @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+
+        /* Skeleton Loading */
+        .skeleton { background: var(--bg-surface); animation: pulse 1.5s infinite; border-radius: 4px; }
+        @keyframes pulse { 0% { opacity: 0.6; } 50% { opacity: 0.3; } 100% { opacity: 0.6; } }
+
+        /* Responsive */
+        @media (max-width: 1024px) {
+            .charts-row { grid-template-columns: 1fr; }
+            .bottom-grid { grid-template-columns: 1fr; }
+            #sidebar { position: absolute; height: 100%; transform: translateX(-100%); }
+            #sidebar.mobile-open { transform: translateX(0); }
+            .mobile-menu-btn { display: block !important; }
+        }
+        @media (min-width: 1025px) {
+            .mobile-menu-btn { display: none !important; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Header -->
+    <header>
+        <div class="logo-area">
+            <button class="icon-btn mobile-menu-btn" id="mobile-menu-btn" aria-label="Toggle Menu">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+            </button>
+            <svg class="logo-icon" viewBox="0 0 24 24">
+                <path d="M12 2L2 7l10 5 10-5-10-5zm0 9l2.5-1.25L12 8.5l-2.5 1.25L12 11zm0 2.5l-5-2.5-5 2.5L12 22l10-8.5-5-2.5-5 2.5z"/>
+            </svg>
+            <div class="mission-info">
+                <h1>NEBULA CONTROL</h1>
+                <span>MISSION: ASTERIA-7</span>
+            </div>
+        </div>
+        <div class="header-actions">
+            <div class="flex items-center gap-2 text-sm text-muted">
+                <span class="status-dot" style="width:8px;height:8px;background:var(--accent-success);border-radius:50%;"></span>
+                <span>LINK: STABLE</span>
+            </div>
+            <div class="text-mono text-sm" id="utc-clock">00:00:00 UTC</div>
+            <button class="icon-btn" id="theme-toggle" aria-label="Toggle Theme">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+            </button>
+            <button class="icon-btn" id="notif-btn" aria-label="Notifications">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+                <div class="notification-dot" id="notif-dot"></div>
+            </button>
+            <button class="icon-btn" id="user-menu-btn" aria-label="User Menu">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            </button>
+        </div>
+    </header>
+
+    <div id="app">
+        <!-- Sidebar -->
+        <nav id="sidebar">
+            <div class="nav-item active" data-target="overview">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+                <span class="nav-text">Overview</span>
+            </div>
+            <div class="nav-item" data-target="fleet">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+                <span class="nav-text">Fleet</span>
+                <span class="badge">8</span>
+            </div>
+            <div class="nav-item" data-target="telemetry">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                <span class="nav-text">Telemetry</span>
+            </div>
+            <div class="nav-item" data-target="timeline">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                <span class="nav-text">Timeline</span>
+            </div>
+            <div class="nav-item" data-target="incidents">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+                <span class="nav-text">Incidents</span>
+                <span class="badge text-danger">2</span>
+            </div>
+            <div class="nav-item" data-target="payloads">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+                <span class="nav-text">Payloads</span>
+            </div>
+            <div style="flex:1"></div>
+            <div class="nav-item" data-target="settings">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+                <span class="nav-text">Settings</span>
+            </div>
+        </nav>
+
+        <!-- Main Content -->
+        <main id="main-content">
+            <div class="dashboard-container">
+                
+                <!-- KPI Section -->
+                <div class="kpi-grid">
+                    <div class="card">
+                        <div class="kpi-header">
+                            <span class="kpi-title">Active Probes</span>
+                            <svg class="text-success" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/></svg>
+                        </div>
+                        <div class="kpi-value" id="kpi-active">8</div>
+                        <div class="kpi-trend text-success">+2 from yesterday</div>
+                        <div class="kpi-sparkline"><svg id="spark-1" width="100%" height="100%"></svg></div>
+                    </div>
+                    <div class="card">
+                        <div class="kpi-header">
+                            <span class="kpi-title">Avg Latency</span>
+                            <svg class="text-warning" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/></svg>
+                        </div>
+                        <div class="kpi-value"><span id="kpi-latency">142</span> <span class="text-sm text-muted">ms</span></div>
+                        <div class="kpi-trend text-warning">+12ms variance</div>
+                        <div class="kpi-sparkline"><svg id="spark-2" width="100%" height="100%"></svg></div>
+                    </div>
+                    <div class="card">
+                        <div class="kpi-header">
+                            <span class="kpi-title">Downlink Data</span>
+                            <svg class="text-primary" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/></svg>
+                        </div>
+                        <div class="kpi-value"><span id="kpi-data">4.2</span> <span class="text-sm text-muted">TB</span></div>
+                        <div class="kpi-trend text-success">+15% throughput</div>
+                        <div class="kpi-sparkline"><svg id="spark-3" width="100%" height="100%"></svg></div>
+                    </div>
+                    <div class="card">
+                        <div class="kpi-header">
+                            <span class="kpi-title">Critical Events</span>
+                            <svg class="text-danger" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/></svg>
+                        </div>
+                        <div class="kpi-value text-danger" id="kpi-critical">2</div>
+                        <div class="kpi-trend text-muted">Requires attention</div>
+                        <div class="kpi-sparkline"><svg id="spark-4" width="100%" height="100%"></svg></div>
+                    </div>
+                </div>
+
+                <!-- Charts Row -->
+                <div class="charts-row">
+                    <!-- Telemetry Chart -->
+                    <div class="chart-panel">
+                        <div class="panel-header">
+                            <span class="panel-title">Fleet Telemetry (Live)</span>
+                            <div class="flex gap-2">
+                                <button class="icon-btn text-xs" id="btn-simulate">Simulate Update</button>
+                            </div>
+                        </div>
+                        <div id="telemetry-chart-container">
+                            <svg id="telemetry-svg" viewBox="0 0 600 200" preserveAspectRatio="none">
+                                <!-- Grid -->
+                                <g class="chart-grid">
+                                    <line x1="0" y1="50" x2="600" y2="50" />
+                                    <line x1="0" y1="100" x2="600" y2="100" />
+                                    <line x1="0" y1="150" x2="600" y2="150" />
+                                </g>
+                                <!-- Lines -->
+                                <path id="line-signal" class="chart-line signal" d="" />
+                                <path id="line-thermal" class="chart-line thermal" d="" />
+                                <path id="line-power" class="chart-line power" d="" />
+                            </svg>
+                            <div id="chart-tooltip" class="chart-tooltip"></div>
+                        </div>
+                    </div>
+
+                    <!-- Orbit Map -->
+                    <div class="chart-panel">
+                        <div class="panel-header">
+                            <span class="panel-title">Orbital Mechanics</span>
+                        </div>
+                        <div id="orbit-map-container">
+                            <svg id="orbit-svg" viewBox="-500 -500 1000 1000">
+                                <g id="orbit-group">
+                                    <circle cx="0" cy="0" r="50" fill="#cbd5e1" /> <!-- Earth -->
+                                    <circle cx="0" cy="0" r="150" class="orbit-path" /> <!-- Moon Orbit -->
+                                    <circle cx="150" cy="0" r="10" fill="#94a3b8" /> <!-- Moon -->
+                                    <ellipse cx="0" cy="0" rx="350" ry="350" class="orbit-path" /> <!-- Asteria Orbit -->
+                                    <circle cx="350" cy="0" r="20" fill="#f59e0b" /> <!-- Asteria-7 -->
+                                    
+                                    <!-- Probes -->
+                                    <g id="probes-layer"></g>
+                                </g>
+                            </svg>
+                            <div class="orbit-controls">
+                                <button class="orbit-btn" id="zoom-in">+</button>
+                                <button class="orbit-btn" id="zoom-out">-</button>
+                                <button class="orbit-btn" id="zoom-reset">R</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Fleet Table -->
+                <div class="table-container">
+                    <div class="table-toolbar">
+                        <input type="text" id="fleet-search" class="search-input" placeholder="Search fleet ID, name, or status...">
+                        <div class="flex gap-2">
+                            <select id="status-filter" class="search-input" style="width: auto;">
+                                <option value="all">All Status</option>
+                                <option value="Nominal">Nominal</option>
+                                <option value="Degraded">Degraded</option>
+                                <option value="Critical">Critical</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div style="overflow-x: auto;">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th onclick="sortTable('id')">ID / Name</th>
+                                    <th onclick="sortTable('status')">Status</th>
+                                    <th onclick="sortTable('dist')">Distance (AU)</th>
+                                    <th onclick="sortTable('sig')">Signal (dBm)</th>
+                                    <th onclick="sortTable('temp')">Temp (K)</th>
+                                    <th onclick="sortTable('pwr')">Power (%)</th>
+                                    <th>Last Contact</th>
+                                </tr>
+                            </thead>
+                            <tbody id="fleet-tbody">
+                                <!-- Populated by JS -->
+                            </tbody>
+                        </table>
+                    </div>
+                    <div id="empty-state" class="flex flex-col items-center justify-center py-8" style="display:none;">
+                        <p class="text-muted">No probes match your criteria.</p>
+                        <button class="icon-btn text-sm" onclick="resetFilters()">Clear Filters</button>
+                    </div>
+                </div>
+
+                <!-- Bottom Grid -->
+                <div class="bottom-grid">
+                    <!-- Event Stream -->
+                    <div class="card">
+                        <div class="panel-header">
+                            <span class="panel-title">Mission Log</span>
+                            <select id="event-filter" class="search-input text-xs" style="width: 100px;">
+                                <option value="all">All</option>
+                                <option value="critical">Critical</option>
+                                <option value="warning">Warning</option>
+                            </select>
+                        </div>
+                        <div class="event-list" id="event-list">
+                            <!-- Populated by JS -->
+                        </div>
+                    </div>
+
+                    <!-- Kanban -->
+                    <div class="card" style="padding: 0.5rem;">
+                        <div class="panel-header" style="padding: 0.5rem 0.5rem 0;">
+                            <span class="panel-title">Task Board</span>
+                        </div>
+                        <div class="kanban-board" id="kanban-board">
+                            <div class="kanban-col" data-status="planning">
+                                <div class="kanban-header">Planning</div>
+                                <div class="kanban-card" draggable="true" id="task-1">Trajectory Correction</div>
+                                <div class="kanban-card" draggable="true" id="task-2">Payload Calibration</div>
+                            </div>
+                            <div class="kanban-col" data-status="transit">
+                                <div class="kanban-header">In Transit</div>
+                                <div class="kanban-card" draggable="true" id="task-3">Comms Relay Setup</div>
+                            </div>
+                            <div class="kanban-col" data-status="orbit">
+                                <div class="kanban-header">Orbit</div>
+                                <div class="kanban-card" draggable="true" id="task-4">Surface Scan</div>
+                            </div>
+                            <div class="kanban-col" data-status="complete">
+                                <div class="kanban-header">Complete</div>
+                                <div class="kanban-card" draggable="true" id="task-5">Launch Sequence</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </main>
+    </div>
+
+    <!-- Detail Drawer -->
+    <div class="overlay" id="drawer-overlay"></div>
+    <div class="drawer" id="detail-drawer">
+        <div class="drawer-header">
+            <h2 id="drawer-title">Probe Details</h2>
+            <button class="icon-btn" id="close-drawer">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            </button>
+        </div>
+        <div class="drawer-body">
+            <div class="flex gap-4 mb-4">
+                <div class="card flex-1">
+                    <div class="text-xs text-muted">STATUS</div>
+                    <div class="font-bold" id="drawer-status">NOMINAL</div>
+                </div>
+                <div class="card flex-1">
+                    <div class="text-xs text-muted">UPTIME</div>
+                    <div class="font-bold" id="drawer-uptime">142d 12h</div>
+                </div>
+            </div>
+            <h3 class="text-sm font-bold mb-2">Telemetry History</h3>
+            <div class="card" style="height: 150px; display:flex; align-items:center; justify-content:center; background: var(--bg-surface);">
+                <span class="text-muted text-xs">[Detailed Graph Placeholder]</span>
+            </div>
+            <h3 class="text-sm font-bold mt-4 mb-2">Recent Logs</h3>
+            <ul class="text-sm text-muted list-disc pl-4" id="drawer-logs">
+                <li>System check passed</li>
+                <li>Telemetry packet received</li>
+            </ul>
+        </div>
+        <div class="drawer-footer">
+            <button class="icon-btn" style="flex:1; border:1px solid var(--border-color);" onclick="showToast('Ping sent', 'info')">Ping Probe</button>
+            <button class="icon-btn" style="flex:1; border:1px solid var(--accent-danger); color:var(--accent-danger);" onclick="confirmAction('Reboot', 'Are you sure you want to reboot this probe?')">Reboot</button>
+        </div>
+    </div>
+
+    <!-- Command Palette -->
+    <div class="overlay" id="cmd-overlay"></div>
+    <div class="command-palette" id="cmd-palette">
+        <input type="text" class="cmd-input" placeholder="Type a command or search..." id="cmd-input">
+        <div class="cmd-list" id="cmd-list">
+            <!-- Populated by JS -->
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <script>
+        /* --- DATA & STATE --- */
+        const state = {
+            theme: localStorage.getItem('theme') || 'dark',
+            sidebarCollapsed: localStorage.getItem('sidebar') === 'collapsed',
+            fleet: [
+                { id: 'N-01', name: 'Vanguard Alpha', status: 'Nominal', dist: 0.45, sig: -42, temp: 280, pwr: 98, last: '10s ago' },
+                { id: 'N-02', name: 'Vanguard Beta', status: 'Nominal', dist: 0.45, sig: -45, temp: 275, pwr: 96, last: '12s ago' },
+                { id: 'N-03', name: 'Scout I', status: 'Degraded', dist: 1.2, sig: -85, temp: 310, pwr: 45, last: '2m ago' },
+                { id: 'N-04', name: 'Scout II', status: 'Nominal', dist: 1.2, sig: -82, temp: 290, pwr: 88, last: '15s ago' },
+                { id: 'N-05', name: 'Orbiter A', status: 'Critical', dist: 3.5, sig: -110, temp: 400, pwr: 12, last: '1h ago' },
+                { id: 'N-06', name: 'Orbiter B', status: 'Nominal', dist: 3.5, sig: -105, temp: 295, pwr: 92, last: '5s ago' },
+                { id: 'N-07', name: 'Lander 1', status: 'Offline', dist: 3.5, sig: 0, temp: 0, pwr: 0, last: '4d ago' },
+                { id: 'N-08', name: 'Relay Sat', status: 'Nominal', dist: 0.003, sig: -20, temp: 300, pwr: 100, last: '1s ago' }
+            ],
+            events: [
+                { id: 1, type: 'critical', msg: 'Orbiter A thermal runaway detected', time: '10:42:05' },
+                { id: 2, type: 'warning', msg: 'Scout I signal degradation', time: '10:30:12' },
+                { id: 3, type: 'info', msg: 'Vanguard Alpha orbit insertion complete', time: '09:15:00' },
+                { id: 4, type: 'info', msg: 'Daily telemetry dump received', time: '08:00:00' },
+                { id: 5, type: 'warning', msg: 'Relay Sat battery fluctuation', time: '07:45:22' },
+                { id: 6, type: 'critical', msg: 'Lander 1 comms lost', time: 'Yesterday' }
+            ],
+            telemetry: {
+                signal: [],
+                thermal: [],
+                power: []
+            },
+            orbitScale: 1
+        };
+
+        // Initialize Telemetry Data
+        for(let i=0; i<50; i++) {
+            state.telemetry.signal.push(80 + Math.random() * 10);
+            state.telemetry.thermal.push(280 + Math.random() * 20);
+            state.telemetry.power.push(90 + Math.random() * 5);
+        }
+
+        /* --- DOM ELEMENTS --- */
+        const els = {
+            body: document.body,
+            sidebar: document.getElementById('sidebar'),
+            themeToggle: document.getElementById('theme-toggle'),
+            utcClock: document.getElementById('utc-clock'),
+            fleetTbody: document.getElementById('fleet-tbody'),
+            fleetSearch: document.getElementById('fleet-search'),
+            statusFilter: document.getElementById('status-filter'),
+            emptyState: document.getElementById('empty-state'),
+            eventList: document.getElementById('event-list'),
+            eventFilter: document.getElementById('event-filter'),
+            drawer: document.getElementById('detail-drawer'),
+            drawerOverlay: document.getElementById('drawer-overlay'),
+            closeDrawer: document.getElementById('close-drawer'),
+            cmdPalette: document.getElementById('cmd-palette'),
+            cmdOverlay: document.getElementById('cmd-overlay'),
+            cmdInput: document.getElementById('cmd-input'),
+            cmdList: document.getElementById('cmd-list'),
+            toastContainer: document.getElementById('toast-container'),
+            svgSignal: document.getElementById('line-signal'),
+            svgThermal: document.getElementById('line-thermal'),
+            svgPower: document.getElementById('line-power'),
+            orbitGroup: document.getElementById('orbit-group'),
+            probesLayer: document.getElementById('probes-layer')
+        };
+
+        /* --- INITIALIZATION --- */
+        function init() {
+            applyTheme(state.theme);
+            if(state.sidebarCollapsed) els.sidebar.classList.add('collapsed');
+            
+            // Skeleton Loading Simulation
+            setTimeout(() => {
+                document.querySelectorAll('.skeleton').forEach(el => el.style.display = 'none');
+                renderFleet();
+                renderEvents();
+                renderTelemetry();
+                renderOrbit();
+                renderSparklines();
+            }, 600);
+
+            // Clock
+            setInterval(() => {
+                const now = new Date();
+                els.utcClock.textContent = now.toISOString().split('T')[1].split('.')[0] + ' UTC';
+            }, 1000);
+
+            // Event Listeners
+            setupEventListeners();
+        }
+
+        /* --- RENDERING FUNCTIONS --- */
+        function renderFleet() {
+            const term = els.fleetSearch.value.toLowerCase();
+            const status = els.statusFilter.value;
+            
+            const filtered = state.fleet.filter(p => {
+                const matchText = p.name.toLowerCase().includes(term) || p.id.toLowerCase().includes(term);
+                const matchStatus = status === 'all' || p.status === status;
+                return matchText && matchStatus;
+            });
+
+            els.fleetTbody.innerHTML = '';
+            if(filtered.length === 0) {
+                els.emptyState.style.display = 'flex';
+            } else {
+                els.emptyState.style.display = 'none';
+                filtered.forEach(p => {
+                    const tr = document.createElement('tr');
+                    tr.innerHTML = `
+                        <td><div class="font-bold">${p.id}</div><div class="text-xs text-muted">${p.name}</div></td>
+                        <td><span class="status-badge status-${p.status.toLowerCase()}">${p.status}</span></td>
+                        <td class="text-mono">${p.dist}</td>
+                        <td class="text-mono ${p.sig < -100 ? 'text-danger' : ''}">${p.sig}</td>
+                        <td class="text-mono ${p.temp > 350 ? 'text-warning' : ''}">${p.temp}</td>
+                        <td class="text-mono">${p.pwr}%</td>
+                        <td class="text-xs text-muted">${p.last}</td>
+                    `;
+                    tr.onclick = () => openDrawer(p);
+                    els.fleetTbody.appendChild(tr);
+                });
+            }
+        }
+
+        function renderEvents() {
+            const filter = els.eventFilter.value;
+            els.eventList.innerHTML = '';
+            state.events.forEach(e => {
+                if(filter !== 'all' && e.type !== filter) return;
+                const div = document.createElement('div');
+                div.className = `event-item ${e.type}`;
+                div.innerHTML = `
+                    <span class="text-xs font-bold text-muted">${e.time}</span>
+                    <span>${e.msg}</span>
+                `;
+                els.eventList.appendChild(div);
+            });
+        }
+
+        function renderTelemetry() {
+            const w = 600, h = 200;
+            const data = state.telemetry;
+            
+            // Helper to generate path
+            const getPath = (arr, min, max) => {
+                return arr.map((val, i) => {
+                    const x = (i / (arr.length - 1)) * w;
+                    const y = h - ((val - min) / (max - min)) * h;
+                    return `${i===0?'M':'L'} ${x} ${y}`;
+                }).join(' ');
+            };
+
+            els.svgSignal.setAttribute('d', getPath(data.signal, 70, 100));
+            els.svgThermal.setAttribute('d', getPath(data.thermal, 250, 450));
+            els.svgPower.setAttribute('d', getPath(data.power, 0, 100));
+        }
+
+        function renderOrbit() {
+            els.orbitGroup.setAttribute('transform', `scale(${state.orbitScale})`);
+            
+            // Render probes on orbit
+            els.probesLayer.innerHTML = '';
+            state.fleet.forEach((p, i) => {
+                if(p.status === 'Offline') return;
+                const angle = (Date.now() / 5000) + (i * 1.5); // Simple animation
+                const r = p.dist * 100; // Scale distance for visual
+                const x = Math.cos(angle) * r;
+                const y = Math.sin(angle) * r;
+                
+                const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+                circle.setAttribute("cx", x);
+                circle.setAttribute("cy", y);
+                circle.setAttribute("r", 3);
+                circle.setAttribute("fill", p.status === 'Critical' ? 'var(--accent-danger)' : 'var(--accent-primary)');
+                els.probesLayer.appendChild(circle);
+            });
+            
+            if(document.visibilityState === 'visible') requestAnimationFrame(renderOrbit);
+        }
+
+        function renderSparklines() {
+            // Simple sparkline generation for KPIs
+            const ids = ['spark-1', 'spark-2', 'spark-3', 'spark-4'];
+            ids.forEach(id => {
+                const svg = document.getElementById(id);
+                let d = 'M0 10';
+                for(let i=1; i<=10; i++) {
+                    d += ` L${i*10} ${Math.random()*20}`;
+                }
+                const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+                path.setAttribute("d", d);
+                path.setAttribute("fill", "none");
+                path.setAttribute("stroke", "currentColor");
+                path.setAttribute("stroke-width", "2");
+                path.setAttribute("opacity", "0.5");
+                svg.appendChild(path);
+            });
+        }
+
+        /* --- INTERACTION LOGIC --- */
+        function setupEventListeners() {
+            // Theme
+            els.themeToggle.onclick = () => {
+                state.theme = state.theme === 'dark' ? 'light' : 'dark';
+                localStorage.setItem('theme', state.theme);
+                applyTheme(state.theme);
+            };
+
+            // Sidebar Toggle (Mobile)
+            document.getElementById('mobile-menu-btn').onclick = () => {
+                els.sidebar.classList.toggle('mobile-open');
+            };
+
+            // Sidebar Collapse (Desktop)
+            // Add a small toggle button to sidebar bottom or hover logic? 
+            // For simplicity, let's use a double click on logo or just keep it simple.
+            // Let's add a click handler to the logo area for desktop collapse
+            document.querySelector('.logo-area').addEventListener('dblclick', (e) => {
+                if(window.innerWidth > 1024) {
+                    state.sidebarCollapsed = !state.sidebarCollapsed;
+                    localStorage.setItem('sidebar', state.sidebarCollapsed ? 'collapsed' : 'expanded');
+                    els.sidebar.classList.toggle('collapsed');
+                }
+            });
+
+            // Fleet Filters
+            els.fleetSearch.addEventListener('input', renderFleet);
+            els.statusFilter.addEventListener('change', renderFleet);
+            els.eventFilter.addEventListener('change', renderEvents);
+
+            // Drawer
+            els.closeDrawer.onclick = closeDrawer;
+            els.drawerOverlay.onclick = closeDrawer;
+
+            // Command Palette
+            document.addEventListener('keydown', (e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+                    e.preventDefault();
+                    openCommandPalette();
+                }
+                if (e.key === 'Escape') {
+                    closeCommandPalette();
+                    closeDrawer();
+                }
+            });
+            els.cmdInput.addEventListener('input', filterCommands);
+
+            // Orbit Controls
+            document.getElementById('zoom-in').onclick = () => { state.orbitScale += 0.2; };
+            document.getElementById('zoom-out').onclick = () => { state.orbitScale = Math.max(0.2, state.orbitScale - 0.2); };
+            document.getElementById('zoom-reset').onclick = () => { state.orbitScale = 1; };
+
+            // Simulate Update
+            document.getElementById('btn-simulate').onclick = simulateTelemetry;
+
+            // Kanban Drag & Drop
+            const board = document.getElementById('kanban-board');
+            const cards = document.querySelectorAll('.kanban-card');
+            
+            cards.forEach(card => {
+                card.addEventListener('dragstart', () => card.classList.add('dragging'));
+                card.addEventListener('dragend', () => card.classList.remove('dragging'));
+            });
+
+            board.addEventListener('dragover', e => {
+                e.preventDefault();
+                const afterElement = getDragAfterElement(board, e.clientY);
+                const draggable = document.querySelector('.dragging');
+                if (afterElement == null) {
+                    board.appendChild(draggable);
+                } else {
+                    board.insertBefore(draggable, afterElement);
+                }
+            });
+        }
+
+        function applyTheme(theme) {
+            document.documentElement.setAttribute('data-theme', theme);
+        }
+
+        function openDrawer(probe) {
+            document.getElementById('drawer-title').textContent = probe.name;
+            document.getElementById('drawer-status').textContent = probe.status.toUpperCase();
+            document.getElementById('drawer-status').className = `font-bold status-${probe.status.toLowerCase()}`;
+            els.drawer.classList.add('open');
+            els.drawerOverlay.classList.add('active');
+        }
+
+        function closeDrawer() {
+            els.drawer.classList.remove('open');
+            els.drawerOverlay.classList.remove('active');
+        }
+
+        function openCommandPalette() {
+            els.cmdPalette.classList.add('active');
+            els.cmdOverlay.classList.add('active');
+            els.cmdInput.value = '';
+            els.cmdInput.focus();
+            filterCommands();
+        }
+
+        function closeCommandPalette() {
+            els.cmdPalette.classList.remove('active');
+            els.cmdOverlay.classList.remove('active');
+        }
+
+        function filterCommands() {
+            const val = els.cmdInput.value.toLowerCase();
+            const items = [
+                { label: 'Overview', action: () => showToast('Navigating to Overview', 'info') },
+                { label: 'Fleet Status', action: () => showToast('Opening Fleet View', 'info') },
+                { label: 'Telemetry Logs', action: () => showToast('Downloading Logs...', 'info') },
+                { label: 'Toggle Theme', action: () => els.themeToggle.click() },
+                { label: 'Simulate Alert', action: () => showToast('CRITICAL: Oxygen Leak Detected', 'danger') }
+            ];
+            
+            const filtered = items.filter(i => i.label.toLowerCase().includes(val));
+            els.cmdList.innerHTML = filtered.map((item, idx) => `
+                <div class="cmd-item ${idx===0?'selected':''}" onclick="executeCommand('${item.label}')">
+                    <span>${item.label}</span>
+                    <span class="cmd-shortcut">↵</span>
+                </div>
+            `).join('');
+        }
+
+        // Global function for onclick handlers in HTML strings
+        window.executeCommand = (label) => {
+            if(label === 'Toggle Theme') els.themeToggle.click();
+            else if(label === 'Simulate Alert') showToast('CRITICAL: Oxygen Leak Detected', 'danger');
+            else showToast(`Action: ${label}`, 'info');
+            closeCommandPalette();
+        };
+
+        window.resetFilters = () => {
+            els.fleetSearch.value = '';
+            els.statusFilter.value = 'all';
+            renderFleet();
+        };
+
+        window.sortTable = (key) => {
+            // Simple sort toggle
+            state.fleet.sort((a, b) => {
+                if(key === 'id') return a.id.localeCompare(b.id);
+                if(key === 'dist') return a.dist - b.dist;
+                if(key === 'sig') return a.sig - b.sig;
+                if(key === 'temp') return a.temp - b.temp;
+                if(key === 'pwr') return a.pwr - b.pwr;
+                return 0;
+            });
+            renderFleet();
+        };
+
+        function simulateTelemetry() {
+            // Shift arrays
+            state.telemetry.signal.shift();
+            state.telemetry.signal.push(80 + Math.random() * 10);
+            state.telemetry.thermal.shift();
+            state.telemetry.thermal.push(280 + Math.random() * 20);
+            state.telemetry.power.shift();
+            state.telemetry.power.push(90 + Math.random() * 5);
+            
+            renderTelemetry();
+            showToast('Telemetry updated', 'success');
+            
+            // Update KPI numbers slightly
+            document.getElementById('kpi-latency').textContent = Math.floor(140 + Math.random() * 10);
+        }
+
+        function getDragAfterElement(container, y) {
+            const draggableElements = [...container.querySelectorAll('.kanban-card:not(.dragging)')];
+            return draggableElements.reduce((closest, child) => {
+                const box = child.getBoundingClientRect();
+                const offset = y - box.top - box.height / 2;
+                if (offset < 0 && offset > closest.offset) {
+                    return { offset: offset, element: child };
+                } else {
+                    return closest;
+                }
+            }, { offset: Number.NEGATIVE_INFINITY }).element;
+        }
+
+        /* --- TOAST & MODAL SYSTEM --- */
+        window.showToast = (msg, type = 'info') => {
+            const toast = document.createElement('div');
+            toast.className = 'toast';
+            const color = type === 'danger' ? 'var(--accent-danger)' : (type === 'success' ? 'var(--accent-success)' : 'var(--accent-primary)');
+            toast.innerHTML = `
+                <div style="width:8px;height:8px;border-radius:50%;background:${color}"></div>
+                <span>${msg}</span>
+            `;
+            els.toastContainer.appendChild(toast);
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        };
+
+        window.confirmAction = (title, msg) => {
+            // Simple custom modal implementation
+            const overlay = document.createElement('div');
+            overlay.className = 'overlay active';
+            overlay.style.zIndex = '2000';
+            const modal = document.createElement('div');
+            modal.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--bg-panel);border:1px solid var(--border-color);padding:2rem;border-radius:8px;width:300px;z-index:2001;box-shadow:0 10px 25px rgba(0,0,0,0.5);';
+            modal.innerHTML = `
+                <h3 style="margin-bottom:1rem">${title}</h3>
+                <p style="margin-bottom:1.5rem;color:var(--text-secondary)">${msg}</p>
+                <div style="display:flex;justify-content:flex-end;gap:0.5rem">
+                    <button id="modal-cancel" class="icon-btn" style="border:1px solid var(--border-color)">Cancel</button>
+                    <button id="modal-confirm" class="icon-btn" style="background:var(--accent-danger);color:white">Confirm</button>
+                </div>
+            `;
+            document.body.appendChild(overlay);
+            document.body.appendChild(modal);
+            
+            document.getElementById('modal-cancel').onclick = () => { overlay.remove(); modal.remove(); };
+            document.getElementById('modal-confirm').onclick = () => { 
+                showToast('Action confirmed', 'success'); 
+                overlay.remove(); modal.remove(); 
+            };
+        };
+
+        // Start
+        init();
+
+    </script>
+</body>
+</html>

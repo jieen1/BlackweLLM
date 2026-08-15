@@ -1,0 +1,2038 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="Nebula Mission Control — a deep-space operations command center for the Asteria-7 robotic probe fleet. Live telemetry, fleet status, mission timeline, incidents and payload management.">
+<title>Nebula Mission Control · Asteria-7</title>
+<style>
+/* ============================================================
+   DESIGN TOKENS
+   ============================================================ */
+:root{
+  --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:20px; --sp-6:28px;
+  --r-sm:4px; --r-md:7px; --r-lg:11px;
+  --fs-xs:11px; --fs-sm:12.5px; --fs-md:14px; --fs-lg:16px; --fs-xl:20px; --fs-2xl:28px;
+  --t-fast:120ms; --t-med:220ms; --t-slow:340ms;
+  --topbar-h:56px; --sidebar-w:236px; --sidebar-w-c:66px;
+
+  --shadow-1:0 1px 2px rgba(0,0,0,.35), 0 2px 8px rgba(0,0,0,.25);
+  --shadow-2:0 8px 30px rgba(0,0,0,.45);
+  --grid-line:rgba(120,160,255,.035);
+}
+html[data-theme="dark"]{
+  --bg:#070b14; --bg-2:#0a1020;
+  --surface:#0d1424; --surface-2:#111a2e; --surface-3:#16203a;
+  --border:#1d2a45; --border-strong:#2c3d61;
+  --text:#e8eef9; --text-dim:#9fb0cc; --text-faint:#5d6f8f;
+  --accent:#45c4f0; --accent-2:#6fd6ff; --accent-ink:#04121c;
+  --accent-soft:rgba(69,196,240,.12);
+  --warn:#f5a524; --warn-soft:rgba(245,165,36,.13);
+  --crit:#ff5d5d; --crit-soft:rgba(255,93,93,.13);
+  --offline:#8b98b3; --offline-soft:rgba(139,152,179,.14);
+  --ok:#37d39a;
+  --grid-line:rgba(120,160,255,.04);
+  --scrim:rgba(3,6,12,.62);
+  --focus:0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+}
+html[data-theme="light"]{
+  --bg:#eef2f8; --bg-2:#e6ecf5;
+  --surface:#ffffff; --surface-2:#f5f8fc; --surface-3:#eaf0f8;
+  --border:#d5deec; --border-strong:#b9c6dd;
+  --text:#16233a; --text-dim:#4a5b78; --text-faint:#8595b0;
+  --accent:#0a8fc4; --accent-2:#0a6f9c; --accent-ink:#ffffff;
+  --accent-soft:rgba(10,143,196,.10);
+  --warn:#c96a00; --warn-soft:rgba(201,106,0,.12);
+  --crit:#d92d2d; --crit-soft:rgba(217,45,45,.10);
+  --offline:#6b7893; --offline-soft:rgba(107,120,147,.14);
+  --ok:#0f9d6b;
+  --grid-line:rgba(30,60,120,.05);
+  --scrim:rgba(20,30,50,.4);
+  --shadow-1:0 1px 2px rgba(20,40,80,.10), 0 2px 8px rgba(20,40,80,.08);
+  --shadow-2:0 10px 34px rgba(20,40,80,.18);
+  --focus:0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+}
+
+/* ============================================================
+   BASE
+   ============================================================ */
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  font-family:var(--font-body); font-size:var(--fs-md); line-height:1.5;
+  color:var(--text); background:var(--bg);
+  background-image:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+  background-size:34px 34px;
+  -webkit-font-smoothing:antialiased;
+  min-height:100vh;
+}
+h1,h2,h3,h4{margin:0;font-weight:600}
+button{font-family:inherit;cursor:pointer}
+a{color:inherit}
+.mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+:focus-visible{outline:none;box-shadow:var(--focus);border-radius:var(--r-sm)}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.skip{position:absolute;left:-999px;top:8px;z-index:200;background:var(--accent);color:var(--accent-ink);padding:8px 14px;border-radius:var(--r-md);font-weight:600}
+.skip:focus{left:8px}
+
+/* ============================================================
+   TOP BAR
+   ============================================================ */
+.topbar{
+  position:sticky;top:0;z-index:60;height:var(--topbar-h);
+  display:flex;align-items:center;gap:var(--sp-3);
+  padding:0 var(--sp-4);
+  background:color-mix(in srgb, var(--surface) 88%, transparent);
+  backdrop-filter:blur(10px);
+  border-bottom:1px solid var(--border);
+}
+.brand{display:flex;align-items:center;gap:10px;min-width:0}
+.brand .logo{width:30px;height:30px;flex:none;color:var(--accent)}
+.brand .name{font-family:var(--font-mono);font-weight:700;letter-spacing:.14em;font-size:13px;line-height:1.1}
+.brand .name small{display:block;font-weight:500;letter-spacing:.28em;font-size:9px;color:var(--text-faint)}
+.mission-chip{
+  display:flex;align-items:center;gap:8px;
+  padding:5px 11px;border:1px solid var(--border);border-radius:999px;
+  background:var(--surface-2);font-family:var(--font-mono);font-size:var(--fs-xs);
+  color:var(--text-dim);white-space:nowrap;
+}
+.mission-chip b{color:var(--text);font-weight:600}
+.mission-chip .dot{width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent)}
+.topbar .spacer{flex:1}
+.topbar-actions{display:flex;align-items:center;gap:var(--sp-2)}
+.icon-btn{
+  position:relative;display:inline-flex;align-items:center;justify-content:center;
+  width:36px;height:36px;border-radius:var(--r-md);
+  border:1px solid var(--border);background:var(--surface-2);color:var(--text-dim);
+  transition:background var(--t-fast),color var(--t-fast),border-color var(--t-fast);
+}
+.icon-btn:hover{color:var(--text);border-color:var(--border-strong);background:var(--surface-3)}
+.icon-btn svg{width:18px;height:18px}
+.badge{
+  position:absolute;top:-6px;right:-6px;min-width:17px;height:17px;padding:0 4px;
+  border-radius:999px;background:var(--crit);color:#fff;font-family:var(--font-mono);
+  font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center;
+  border:2px solid var(--bg);
+}
+.badge.hidden{display:none}
+.utc{font-family:var(--font-mono);font-size:var(--fs-sm);color:var(--text-dim);letter-spacing:.04em;white-space:nowrap}
+.link-status{display:flex;align-items:center;gap:7px;font-family:var(--font-mono);font-size:var(--fs-xs);color:var(--text-dim);white-space:nowrap}
+.link-status .dot{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.link-status.warn .dot{background:var(--warn);box-shadow:0 0 8px var(--warn)}
+.user-btn{display:flex;align-items:center;gap:8px;padding:4px 8px 4px 4px;border-radius:999px;border:1px solid var(--border);background:var(--surface-2);color:var(--text-dim)}
+.user-btn:hover{color:var(--text);border-color:var(--border-strong)}
+.user-btn .avatar{width:28px;height:28px;border-radius:50%;background:linear-gradient(135deg,var(--accent),#2a6f9c);color:var(--accent-ink);display:flex;align-items:center;justify-content:center;font-family:var(--font-mono);font-weight:700;font-size:11px}
+.user-btn .uname{font-size:var(--fs-sm);font-weight:600}
+.user-btn svg{width:14px;height:14px}
+.only-mobile{display:none}
+
+/* ============================================================
+   SHELL / SIDEBAR
+   ============================================================ */
+.shell{display:flex;min-height:calc(100vh - var(--topbar-h))}
+.sidebar{
+  width:var(--sidebar-w);flex:none;position:sticky;top:var(--topbar-h);
+  height:calc(100vh - var(--topbar-h));
+  border-right:1px solid var(--border);
+  background:var(--surface);
+  display:flex;flex-direction:column;
+  transition:width var(--t-med) ease;
+  overflow:hidden;
+}
+.sidebar.collapsed{width:var(--sidebar-w-c)}
+.nav{list-style:none;margin:0;padding:var(--sp-3);flex:1;overflow-y:auto}
+.nav-item{
+  display:flex;align-items:center;gap:11px;
+  padding:9px 11px;margin-bottom:3px;border-radius:var(--r-md);
+  color:var(--text-dim);font-size:var(--fs-sm);font-weight:500;
+  border:1px solid transparent;white-space:nowrap;
+  transition:background var(--t-fast),color var(--t-fast);
+}
+.nav-item svg{width:19px;height:19px;flex:none}
+.nav-item:hover{background:var(--surface-2);color:var(--text)}
+.nav-item[aria-current="page"]{background:var(--accent-soft);color:var(--accent);border-color:color-mix(in srgb,var(--accent) 30%,transparent)}
+.nav-item .label{flex:1;overflow:hidden;text-overflow:ellipsis}
+.nav-item .count{font-family:var(--font-mono);font-size:10px;font-weight:700;padding:1px 6px;border-radius:999px;background:var(--surface-3);color:var(--text-dim)}
+.nav-item[aria-current="page"] .count{background:color-mix(in srgb,var(--accent) 22%,transparent);color:var(--accent)}
+.nav-item .count.crit{background:var(--crit-soft);color:var(--crit)}
+.sidebar-foot{padding:var(--sp-3);border-top:1px solid var(--border)}
+.collapse-btn{display:flex;align-items:center;gap:10px;width:100%;padding:8px 11px;border-radius:var(--r-md);border:1px solid var(--border);background:var(--surface-2);color:var(--text-dim);font-size:var(--fs-xs)}
+.collapse-btn:hover{color:var(--text);border-color:var(--border-strong)}
+.collapse-btn svg{width:16px;height:16px;transition:transform var(--t-med)}
+.sidebar.collapsed .collapse-btn svg{transform:rotate(180deg)}
+.sidebar.collapsed .label,
+.sidebar.collapsed .collapse-btn .lbl,
+.sidebar.collapsed .nav-item .count{display:none}
+.sidebar.collapsed .nav-item{justify-content:center}
+.scrim{position:fixed;inset:0;background:var(--scrim);z-index:70;opacity:0;pointer-events:none;transition:opacity var(--t-med)}
+.scrim.show{opacity:1;pointer-events:auto}
+
+/* ============================================================
+   MAIN / VIEWS
+   ============================================================ */
+main{flex:1;min-width:0;padding:var(--sp-5);max-width:1560px}
+.view{display:none;animation:fade var(--t-slow) ease}
+.view.active{display:block}
+@keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:var(--sp-4);flex-wrap:wrap;margin-bottom:var(--sp-5)}
+.page-head h1{font-family:var(--font-mono);font-size:var(--fs-xl);letter-spacing:.02em}
+.page-head .sub{color:var(--text-dim);font-size:var(--fs-sm);margin-top:4px}
+.page-head .sub .mono{color:var(--accent)}
+.page-actions{display:flex;align-items:center;gap:var(--sp-3);flex-wrap:wrap}
+
+/* segmented control */
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:var(--r-md);background:var(--surface-2);padding:3px;gap:2px}
+.seg button{border:0;background:transparent;color:var(--text-dim);font-family:var(--font-mono);font-size:var(--fs-xs);font-weight:600;padding:6px 12px;border-radius:5px;letter-spacing:.04em}
+.seg button:hover{color:var(--text)}
+.seg button[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink)}
+
+/* buttons */
+.btn{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);background:var(--surface-2);color:var(--text);font-size:var(--fs-sm);font-weight:600;padding:8px 14px;border-radius:var(--r-md);transition:background var(--t-fast),border-color var(--t-fast),transform var(--t-fast)}
+.btn:hover{border-color:var(--border-strong);background:var(--surface-3)}
+.btn:active{transform:translateY(1px)}
+.btn svg{width:16px;height:16px}
+.btn.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.btn.primary:hover{background:var(--accent-2)}
+.btn.danger{background:var(--crit-soft);color:var(--crit);border-color:color-mix(in srgb,var(--crit) 40%,transparent)}
+.btn.ghost{background:transparent}
+.btn.sm{padding:5px 10px;font-size:var(--fs-xs)}
+.kbd{font-family:var(--font-mono);font-size:10px;border:1px solid var(--border-strong);border-bottom-width:2px;border-radius:4px;padding:1px 5px;color:var(--text-dim);background:var(--surface-3)}
+
+/* ============================================================
+   PANELS
+   ============================================================ */
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);box-shadow:var(--shadow-1);overflow:hidden}
+.panel-head{display:flex;align-items:center;justify-content:space-between;gap:var(--sp-3);padding:var(--sp-4);border-bottom:1px solid var(--border);flex-wrap:wrap}
+.panel-head h2{font-family:var(--font-mono);font-size:var(--fs-sm);letter-spacing:.14em;text-transform:uppercase;color:var(--text-dim);font-weight:600}
+.panel-head .meta{font-size:var(--fs-xs);color:var(--text-faint);font-family:var(--font-mono)}
+.panel-body{padding:var(--sp-4)}
+.grid-2{display:grid;grid-template-columns:1.6fr 1fr;gap:var(--sp-4);margin-bottom:var(--sp-4)}
+.grid-2b{display:grid;grid-template-columns:1.7fr 1fr;gap:var(--sp-4);margin-bottom:var(--sp-4)}
+
+/* ============================================================
+   KPI
+   ============================================================ */
+.kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:var(--sp-4);margin-bottom:var(--sp-4)}
+.kpi{position:relative;background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:var(--sp-4);box-shadow:var(--shadow-1);overflow:hidden}
+.kpi::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent)}
+.kpi.warn::before{background:var(--warn)}
+.kpi.crit::before{background:var(--crit)}
+.kpi .k-label{font-family:var(--font-mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--text-faint)}
+.kpi .k-row{display:flex;align-items:baseline;gap:6px;margin-top:8px}
+.kpi .k-val{font-family:var(--font-mono);font-size:var(--fs-2xl);font-weight:700;letter-spacing:-.01em}
+.kpi .k-unit{font-family:var(--font-mono);font-size:var(--fs-sm);color:var(--text-dim)}
+.kpi .k-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px}
+.kpi .k-delta{font-family:var(--font-mono);font-size:var(--fs-xs);font-weight:600;display:inline-flex;align-items:center;gap:4px}
+.kpi .k-delta.up{color:var(--ok)}
+.kpi .k-delta.down{color:var(--crit)}
+.kpi .k-delta.flat{color:var(--text-faint)}
+.kpi .k-status{font-size:10px;font-family:var(--font-mono);letter-spacing:.08em;text-transform:uppercase;padding:2px 7px;border-radius:999px}
+.kpi .k-status.ok{background:var(--accent-soft);color:var(--accent)}
+.kpi .k-status.warn{background:var(--warn-soft);color:var(--warn)}
+.kpi .k-status.crit{background:var(--crit-soft);color:var(--crit)}
+.spark{width:78px;height:26px;flex:none}
+
+/* ============================================================
+   CHART
+   ============================================================ */
+.chart-wrap{position:relative}
+.chart-svg{display:block;width:100%;height:280px}
+.chart-svg text{font-family:var(--font-mono);font-size:10px;fill:var(--text-faint)}
+.chart-svg .grid{stroke:var(--border);stroke-width:1}
+.chart-svg .axis{stroke:var(--border-strong);stroke-width:1}
+.chart-svg .line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.chart-svg .cross{stroke:var(--text-faint);stroke-width:1;stroke-dasharray:3 3}
+.chart-svg .pt{stroke:var(--surface);stroke-width:1.5}
+.chart-svg .live-dot{animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.legend{display:flex;gap:6px;flex-wrap:wrap}
+.legend button{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--border);background:var(--surface-2);color:var(--text-dim);font-size:var(--fs-xs);font-weight:600;padding:5px 10px;border-radius:999px}
+.legend button .sw{width:10px;height:10px;border-radius:3px}
+.legend button[aria-pressed="false"]{opacity:.4}
+.legend button[aria-pressed="false"] .sw{background:var(--text-faint)!important}
+.chart-tip{position:absolute;pointer-events:none;background:var(--surface-3);border:1px solid var(--border-strong);border-radius:var(--r-md);padding:8px 10px;font-family:var(--font-mono);font-size:11px;box-shadow:var(--shadow-2);opacity:0;transition:opacity var(--t-fast);z-index:5;min-width:150px}
+.chart-tip .t-time{color:var(--text-faint);margin-bottom:5px;letter-spacing:.04em}
+.chart-tip .t-row{display:flex;align-items:center;gap:7px;margin-top:3px}
+.chart-tip .t-row .sw{width:9px;height:9px;border-radius:2px}
+.chart-tip .t-row b{margin-left:auto;font-weight:600}
+
+/* ============================================================
+   ORBIT
+   ============================================================ */
+.orbit-wrap{position:relative}
+.orbit-svg{display:block;width:100%;height:300px}
+.orbit-svg text{font-family:var(--font-mono);font-size:9px;fill:var(--text-faint);letter-spacing:.06em}
+.orbit-svg .orbit{fill:none;stroke:var(--border-strong);stroke-width:1}
+.orbit-svg .orbit.dash{stroke-dasharray:4 5;stroke:var(--text-faint)}
+.orbit-svg .body{fill:var(--accent)}
+.orbit-svg .moon{fill:var(--text-dim)}
+.orbit-svg .asteria{fill:var(--warn)}
+.orbit-svg .relay{fill:var(--text-faint)}
+.orbit-ctrl{display:flex;align-items:center;gap:6px}
+.orbit-ctrl .zval{font-family:var(--font-mono);font-size:var(--fs-xs);color:var(--text-dim);min-width:44px;text-align:center}
+
+/* ============================================================
+   TABLE
+   ============================================================ */
+.table-tools{display:flex;align-items:center;gap:var(--sp-3);flex-wrap:wrap}
+.search{position:relative}
+.search input{width:210px;padding:8px 10px 8px 32px;border:1px solid var(--border);border-radius:var(--r-md);background:var(--surface-2);color:var(--text);font-size:var(--fs-sm)}
+.search input::placeholder{color:var(--text-faint)}
+.search svg{position:absolute;left:9px;top:50%;transform:translateY(-50%);width:15px;height:15px;color:var(--text-faint)}
+.chips{display:flex;gap:5px;flex-wrap:wrap}
+.chips button{border:1px solid var(--border);background:var(--surface-2);color:var(--text-dim);font-size:var(--fs-xs);font-weight:600;padding:5px 11px;border-radius:999px}
+.chips button:hover{color:var(--text);border-color:var(--border-strong)}
+.chips button[aria-pressed="true"]{background:var(--accent-soft);color:var(--accent);border-color:color-mix(in srgb,var(--accent) 40%,transparent)}
+.table-scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:var(--fs-sm);min-width:760px}
+thead th{position:sticky;top:0;background:var(--surface-2);text-align:left;font-family:var(--font-mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-faint);font-weight:600;padding:10px 12px;border-bottom:1px solid var(--border);white-space:nowrap;user-select:none}
+thead th.sortable{cursor:pointer}
+thead th.sortable:hover{color:var(--text)}
+thead th .arrow{opacity:0;margin-left:4px}
+thead th[aria-sort="ascending"] .arrow,thead th[aria-sort="descending"] .arrow{opacity:1;color:var(--accent)}
+tbody td{padding:11px 12px;border-bottom:1px solid var(--border);vertical-align:middle;white-space:nowrap}
+tbody tr{cursor:pointer;transition:background var(--t-fast)}
+tbody tr:hover{background:var(--surface-2)}
+tbody tr:focus-visible{background:var(--accent-soft)}
+td.num{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+.p-name{font-weight:600}
+.p-name small{display:block;font-family:var(--font-mono);font-size:10px;color:var(--text-faint);font-weight:400}
+.status{display:inline-flex;align-items:center;gap:6px;font-size:var(--fs-xs);font-weight:600;padding:3px 9px;border-radius:999px;white-space:nowrap}
+.status .sd{width:7px;height:7px;border-radius:50%;flex:none}
+.status.nominal{background:var(--accent-soft);color:var(--accent)}
+.status.nominal .sd{background:var(--accent)}
+.status.degraded{background:var(--warn-soft);color:var(--warn)}
+.status.degraded .sd{background:var(--warn)}
+.status.critical{background:var(--crit-soft);color:var(--crit)}
+.status.critical .sd{background:var(--crit)}
+.status.offline{background:var(--offline-soft);color:var(--offline)}
+.status.offline .sd{background:var(--offline)}
+.batt{display:flex;align-items:center;gap:7px}
+.batt .bar{width:44px;height:5px;border-radius:3px;background:var(--surface-3);overflow:hidden}
+.batt .bar i{display:block;height:100%;background:var(--accent)}
+.batt .bar i.warn{background:var(--warn)}
+.batt .bar i.crit{background:var(--crit)}
+.batt span{font-family:var(--font-mono);font-size:var(--fs-xs);min-width:34px}
+.table-foot{display:flex;align-items:center;justify-content:space-between;gap:var(--sp-3);padding:var(--sp-3) var(--sp-4);border-top:1px solid var(--border);flex-wrap:wrap}
+.table-foot .info{font-family:var(--font-mono);font-size:var(--fs-xs);color:var(--text-faint)}
+.empty{padding:44px var(--sp-4);text-align:center;color:var(--text-dim)}
+.empty svg{width:34px;height:34px;color:var(--text-faint);margin-bottom:10px}
+.empty h3{font-size:var(--fs-md);margin-bottom:6px}
+.empty p{font-size:var(--fs-sm);margin:0 0 14px}
+/* mobile cards */
+.p-cards{display:none}
+.p-card{border:1px solid var(--border);border-radius:var(--r-md);padding:var(--sp-3);margin-bottom:var(--sp-3);cursor:pointer;background:var(--surface-2)}
+.p-card:last-child{margin-bottom:0}
+.p-card .top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:10px}
+.p-card .top .nm{font-weight:600}
+.p-card .top .nm small{display:block;font-family:var(--font-mono);font-size:10px;color:var(--text-faint);font-weight:400}
+.p-card .stats{display:grid;grid-template-columns:1fr 1fr;gap:8px 14px}
+.p-card .stats div{display:flex;justify-content:space-between;font-size:var(--fs-xs)}
+.p-card .stats dt{color:var(--text-faint)}
+.p-card .stats dd{margin:0;font-family:var(--font-mono)}
+
+/* ============================================================
+   EVENTS
+   ============================================================ */
+.event-list{list-style:none;margin:0;padding:0;max-height:420px;overflow-y:auto}
+.event{display:flex;gap:11px;padding:12px var(--sp-4);border-bottom:1px solid var(--border);position:relative}
+.event:last-child{border-bottom:0}
+.event .sev-ic{width:26px;height:26px;flex:none;border-radius:var(--r-sm);display:flex;align-items:center;justify-content:center}
+.event .sev-ic svg{width:15px;height:15px}
+.event.critical .sev-ic{background:var(--crit-soft);color:var(--crit)}
+.event.warning .sev-ic{background:var(--warn-soft);color:var(--warn)}
+.event.info .sev-ic{background:var(--accent-soft);color:var(--accent)}
+.event .body{flex:1;min-width:0}
+.event .body .t{font-size:var(--fs-sm);line-height:1.4}
+.event .body .t b{font-weight:600}
+.event .body .m{display:flex;align-items:center;gap:8px;margin-top:4px;font-family:var(--font-mono);font-size:10px;color:var(--text-faint);flex-wrap:wrap}
+.event .body .m .tag{background:var(--surface-3);color:var(--text-dim);padding:1px 6px;border-radius:4px}
+.event .read-btn{flex:none;align-self:flex-start;width:28px;height:28px;border-radius:var(--r-sm);border:1px solid var(--border);background:var(--surface-2);color:var(--text-faint);display:flex;align-items:center;justify-content:center}
+.event .read-btn:hover{color:var(--text);border-color:var(--border-strong)}
+.event .read-btn svg{width:15px;height:15px}
+.event.read{opacity:.55}
+.event.read .read-btn{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 40%,transparent)}
+.event:not(.read)::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent)}
+.event.critical:not(.read)::before{background:var(--crit)}
+.event.warning:not(.read)::before{background:var(--warn)}
+
+/* ============================================================
+   KANBAN
+   ============================================================ */
+.kanban{display:grid;grid-template-columns:repeat(4,1fr);gap:var(--sp-3)}
+.kb-col{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r-md);padding:var(--sp-3);min-height:180px;display:flex;flex-direction:column}
+.kb-col.drag-over{border-color:var(--accent);background:var(--accent-soft)}
+.kb-col h3{font-family:var(--font-mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim);display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.kb-col h3 .n{background:var(--surface-3);color:var(--text-faint);padding:1px 7px;border-radius:999px;font-size:10px}
+.kb-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-md);padding:10px 11px;margin-bottom:8px;cursor:grab;box-shadow:var(--shadow-1);position:relative}
+.kb-card:active{cursor:grabbing}
+.kb-card.dragging{opacity:.4}
+.kb-card .ct{font-size:var(--fs-sm);font-weight:600;line-height:1.35}
+.kb-card .cm{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:8px}
+.kb-card .cm .tag{font-family:var(--font-mono);font-size:10px;color:var(--text-faint);background:var(--surface-3);padding:1px 6px;border-radius:4px}
+.kb-card .move-btn{width:26px;height:26px;border-radius:var(--r-sm);border:1px solid var(--border);background:var(--surface-2);color:var(--text-dim);display:flex;align-items:center;justify-content:center;flex:none}
+.kb-card .move-btn:hover{color:var(--text);border-color:var(--border-strong)}
+.kb-card .move-btn svg{width:14px;height:14px}
+.kb-menu{position:absolute;right:8px;top:34px;z-index:20;background:var(--surface-3);border:1px solid var(--border-strong);border-radius:var(--r-md);box-shadow:var(--shadow-2);padding:4px;min-width:130px}
+.kb-menu button{display:block;width:100%;text-align:left;border:0;background:transparent;color:var(--text-dim);font-size:var(--fs-xs);font-weight:600;padding:7px 9px;border-radius:5px}
+.kb-menu button:hover{background:var(--surface-2);color:var(--text)}
+.kb-menu button[aria-current="true"]{color:var(--accent)}
+
+/* ============================================================
+   DRAWER
+   ============================================================ */
+.drawer{position:fixed;top:0;right:0;height:100vh;width:400px;max-width:92vw;background:var(--surface);border-left:1px solid var(--border-strong);box-shadow:var(--shadow-2);z-index:90;transform:translateX(100%);transition:transform var(--t-slow) ease;display:flex;flex-direction:column}
+.drawer.open{transform:none}
+.drawer-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:var(--sp-4);border-bottom:1px solid var(--border)}
+.drawer-head .t{font-family:var(--font-mono);font-size:var(--fs-lg);font-weight:700}
+.drawer-head .t small{display:block;font-size:10px;color:var(--text-faint);font-weight:400;letter-spacing:.06em;margin-top:3px}
+.drawer-body{flex:1;overflow-y:auto;padding:var(--sp-4)}
+.dv-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:var(--border);border:1px solid var(--border);border-radius:var(--r-md);overflow:hidden;margin-bottom:var(--sp-4)}
+.dv-grid .cell{background:var(--surface-2);padding:10px 12px}
+.dv-grid .cell .l{font-family:var(--font-mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-faint)}
+.dv-grid .cell .v{font-family:var(--font-mono);font-size:var(--fs-md);font-weight:600;margin-top:3px}
+.dv-sec{font-family:var(--font-mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-faint);margin:var(--sp-4) 0 10px}
+.dv-timeline{list-style:none;margin:0;padding:0;position:relative}
+.dv-timeline::before{content:"";position:absolute;left:6px;top:4px;bottom:4px;width:2px;background:var(--border)}
+.dv-timeline li{position:relative;padding:0 0 16px 24px}
+.dv-timeline li::before{content:"";position:absolute;left:2px;top:3px;width:9px;height:9px;border-radius:50%;background:var(--accent);border:2px solid var(--surface)}
+.dv-timeline li.crit::before{background:var(--crit)}
+.dv-timeline li.warn::before{background:var(--warn)}
+.dv-timeline .tt{font-size:var(--fs-sm);line-height:1.4}
+.dv-timeline .tm{font-family:var(--font-mono);font-size:10px;color:var(--text-faint);margin-top:2px}
+.drawer-foot{padding:var(--sp-4);border-top:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap}
+.drawer-foot .btn{flex:1;justify-content:center;min-width:110px}
+
+/* ============================================================
+   OVERLAYS: palette / modal / popover
+   ============================================================ */
+.overlay{position:fixed;inset:0;z-index:100;background:var(--scrim);display:none;align-items:flex-start;justify-content:center;padding-top:12vh}
+.overlay.open{display:flex}
+.palette{width:560px;max-width:92vw;background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-lg);box-shadow:var(--shadow-2);overflow:hidden}
+.palette .p-in{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--border)}
+.palette .p-in svg{width:18px;height:18px;color:var(--text-faint);flex:none}
+.palette .p-in input{flex:1;border:0;background:transparent;color:var(--text);font-size:var(--fs-lg);outline:none}
+.palette .p-in input::placeholder{color:var(--text-faint)}
+.palette .p-list{list-style:none;margin:0;padding:6px;max-height:340px;overflow-y:auto}
+.palette .p-list li{display:flex;align-items:center;gap:11px;padding:10px 12px;border-radius:var(--r-md);cursor:pointer;color:var(--text-dim)}
+.palette .p-list li svg{width:17px;height:17px;flex:none}
+.palette .p-list li .cat{margin-left:auto;font-family:var(--font-mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-faint)}
+.palette .p-list li.active{background:var(--accent-soft);color:var(--text)}
+.palette .p-list li.active .cat{color:var(--accent)}
+.palette .p-foot{display:flex;gap:14px;padding:9px 16px;border-top:1px solid var(--border);font-family:var(--font-mono);font-size:10px;color:var(--text-faint)}
+.modal-wrap{position:fixed;inset:0;z-index:110;background:var(--scrim);display:none;align-items:center;justify-content:center;padding:20px}
+.modal-wrap.open{display:flex}
+.modal{width:420px;max-width:100%;background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-lg);box-shadow:var(--shadow-2);overflow:hidden}
+.modal .m-head{padding:var(--sp-4);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px}
+.modal .m-head .ic{width:38px;height:38px;flex:none;border-radius:var(--r-md);display:flex;align-items:center;justify-content:center}
+.modal .m-head .ic svg{width:20px;height:20px}
+.modal.warn .m-head .ic{background:var(--warn-soft);color:var(--warn)}
+.modal.crit .m-head .ic{background:var(--crit-soft);color:var(--crit)}
+.modal .m-head h3{font-size:var(--fs-lg)}
+.modal .m-body{padding:var(--sp-4);color:var(--text-dim);font-size:var(--fs-sm);line-height:1.55}
+.modal .m-foot{padding:var(--sp-4);display:flex;justify-content:flex-end;gap:10px;border-top:1px solid var(--border)}
+.popover{position:fixed;z-index:95;background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-lg);box-shadow:var(--shadow-2);width:320px;max-width:92vw;display:none;overflow:hidden}
+.popover.open{display:block}
+.popover .pv-head{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid var(--border)}
+.popover .pv-head h3{font-family:var(--font-mono);font-size:var(--fs-xs);letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim)}
+.popover .pv-list{max-height:280px;overflow-y:auto}
+.popover .pv-item{display:flex;gap:10px;padding:11px 14px;border-bottom:1px solid var(--border)}
+.popover .pv-item:last-child{border-bottom:0}
+.popover .pv-item .sev-ic{width:24px;height:24px;flex:none;border-radius:var(--r-sm);display:flex;align-items:center;justify-content:center}
+.popover .pv-item .sev-ic svg{width:14px;height:14px}
+.popover .pv-item.critical .sev-ic{background:var(--crit-soft);color:var(--crit)}
+.popover .pv-item.warning .sev-ic{background:var(--warn-soft);color:var(--warn)}
+.popover .pv-item.info .sev-ic{background:var(--accent-soft);color:var(--accent)}
+.popover .pv-item .t{font-size:var(--fs-sm);line-height:1.4}
+.popover .pv-item .m{font-family:var(--font-mono);font-size:10px;color:var(--text-faint);margin-top:3px}
+.popover .pv-foot{padding:10px 14px;border-top:1px solid var(--border);display:flex;justify-content:space-between;gap:8px}
+.menu{position:fixed;z-index:95;background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-md);box-shadow:var(--shadow-2);min-width:180px;padding:5px;display:none}
+.menu.open{display:block}
+.menu button{display:flex;align-items:center;gap:10px;width:100%;text-align:left;border:0;background:transparent;color:var(--text-dim);font-size:var(--fs-sm);font-weight:500;padding:9px 11px;border-radius:var(--r-sm)}
+.menu button:hover{background:var(--surface-2);color:var(--text)}
+.menu button svg{width:16px;height:16px}
+.menu .sep{height:1px;background:var(--border);margin:5px 0}
+.menu button.danger{color:var(--crit)}
+
+/* ============================================================
+   TOASTS
+   ============================================================ */
+.toasts{position:fixed;right:16px;bottom:44px;z-index:120;display:flex;flex-direction:column;gap:10px;max-width:340px}
+.toast{display:flex;align-items:flex-start;gap:11px;background:var(--surface-3);border:1px solid var(--border-strong);border-left:3px solid var(--accent);border-radius:var(--r-md);box-shadow:var(--shadow-2);padding:12px 12px 12px 14px;position:relative;overflow:hidden;animation:toastIn var(--t-slow) ease}
+.toast.warn{border-left-color:var(--warn)}
+.toast.crit{border-left-color:var(--crit)}
+.toast .ic{width:20px;height:20px;flex:none;color:var(--accent);margin-top:1px}
+.toast.warn .ic{color:var(--warn)}
+.toast.crit .ic{color:var(--crit)}
+.toast .msg{flex:1;font-size:var(--fs-sm);line-height:1.4}
+.toast .x{flex:none;width:22px;height:22px;border:0;background:transparent;color:var(--text-faint);border-radius:var(--r-sm);display:flex;align-items:center;justify-content:center}
+.toast .x:hover{color:var(--text);background:var(--surface-2)}
+.toast .x svg{width:14px;height:14px}
+.toast .prog{position:absolute;left:0;bottom:0;height:2px;background:var(--accent);width:100%;transform-origin:left;animation:shrink linear forwards}
+.toast.warn .prog{background:var(--warn)}
+.toast.crit .prog{background:var(--crit)}
+@keyframes toastIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:none}}
+@keyframes shrink{from{transform:scaleX(1)}to{transform:scaleX(0)}}
+
+/* ============================================================
+   SKELETON
+   ============================================================ */
+.skel{background:linear-gradient(90deg,var(--surface-2) 25%,var(--surface-3) 37%,var(--surface-2) 63%);background-size:400% 100%;animation:shimmer 1.4s infinite;border-radius:var(--r-md)}
+@keyframes shimmer{0%{background-position:100% 0}100%{background-position:-100% 0}}
+.skel-block{height:120px;margin-bottom:var(--sp-4)}
+.skel-row{display:flex;gap:var(--sp-4);margin-bottom:var(--sp-4)}
+.skel-row .skel{flex:1;height:120px}
+
+/* ============================================================
+   VERSION CHIP
+   ============================================================ */
+.version-chip{position:fixed;right:14px;bottom:12px;z-index:50;font-family:var(--font-mono);font-size:10px;color:var(--text-faint);background:var(--surface);border:1px solid var(--border);border-radius:999px;padding:5px 11px;letter-spacing:.04em;box-shadow:var(--shadow-1)}
+.version-chip b{color:var(--accent);font-weight:600}
+
+/* ============================================================
+   TIMELINE / PAYLOADS / SETTINGS views
+   ============================================================ */
+.milestones{list-style:none;margin:0;padding:0;position:relative}
+.milestones::before{content:"";position:absolute;left:11px;top:6px;bottom:6px;width:2px;background:var(--border)}
+.milestones li{position:relative;padding:0 0 22px 40px}
+.milestones li::before{content:"";position:absolute;left:5px;top:2px;width:14px;height:14px;border-radius:50%;background:var(--surface);border:3px solid var(--accent)}
+.milestones li.done::before{background:var(--accent)}
+.milestones li.active::before{border-color:var(--warn);box-shadow:0 0 0 4px var(--warn-soft)}
+.milestones li .d{font-family:var(--font-mono);font-size:10px;color:var(--text-faint);letter-spacing:.06em}
+.milestones li .t{font-weight:600;font-size:var(--fs-md);margin-top:2px}
+.milestones li .s{font-size:var(--fs-sm);color:var(--text-dim);margin-top:2px}
+.payload-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--sp-4)}
+.payload{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r-md);padding:var(--sp-4)}
+.payload .ph{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px}
+.payload .ph .nm{font-weight:600;font-size:var(--fs-md)}
+.payload .ph .nm small{display:block;font-family:var(--font-mono);font-size:10px;color:var(--text-faint);font-weight:400}
+.payload .rows{display:grid;grid-template-columns:1fr 1fr;gap:9px 14px}
+.payload .rows div{display:flex;justify-content:space-between;font-size:var(--fs-xs)}
+.payload .rows dt{color:var(--text-faint)}
+.payload .rows dd{margin:0;font-family:var(--font-mono)}
+.settings-form{max-width:520px}
+.set-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 0;border-bottom:1px solid var(--border)}
+.set-row:last-child{border-bottom:0}
+.set-row .l{font-weight:600;font-size:var(--fs-sm)}
+.set-row .l small{display:block;color:var(--text-faint);font-weight:400;font-size:var(--fs-xs);margin-top:2px}
+.set-row select{border:1px solid var(--border);background:var(--surface-2);color:var(--text);border-radius:var(--r-md);padding:7px 10px;font-size:var(--fs-sm);font-family:inherit}
+.switch{position:relative;width:42px;height:24px;flex:none}
+.switch input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}
+.switch .track{position:absolute;inset:0;background:var(--surface-3);border:1px solid var(--border-strong);border-radius:999px;transition:background var(--t-fast)}
+.switch .track::after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:var(--text-dim);transition:transform var(--t-fast),background var(--t-fast)}
+.switch input:checked + .track{background:var(--accent-soft);border-color:var(--accent)}
+.switch input:checked + .track::after{transform:translateX(18px);background:var(--accent)}
+.switch input:focus-visible + .track{box-shadow:var(--focus)}
+
+/* ============================================================
+   RESPONSIVE
+   ============================================================ */
+@media (max-width:1180px){
+  .grid-2,.grid-2b{grid-template-columns:1fr}
+  .kpi-grid{grid-template-columns:repeat(2,1fr)}
+  .payload-grid{grid-template-columns:repeat(2,1fr)}
+}
+@media (max-width:900px){
+  .sidebar{position:fixed;top:var(--topbar-h);left:0;transform:translateX(-100%);transition:transform var(--t-med);z-index:80;box-shadow:var(--shadow-2)}
+  .sidebar.mobile-open{transform:none}
+  .sidebar.collapsed{width:var(--sidebar-w)}
+  .sidebar.collapsed .label,.sidebar.collapsed .nav-item .count{display:block}
+  .collapse-btn{display:none}
+  .only-mobile{display:inline-flex}
+  .mission-chip{display:none}
+  .user-btn .uname{display:none}
+  .kanban{grid-template-columns:repeat(2,1fr)}
+}
+@media (max-width:640px){
+  main{padding:var(--sp-3)}
+  .kpi-grid{grid-template-columns:1fr}
+  .payload-grid{grid-template-columns:1fr}
+  .kanban{grid-template-columns:1fr}
+  .table-scroll{display:none}
+  .p-cards{display:block}
+  .page-head{align-items:flex-start}
+  .search input{width:100%}
+  .search{flex:1}
+  .utc{display:none}
+  .link-status .txt{display:none}
+  .toasts{right:12px;left:12px;bottom:40px;max-width:none}
+  .version-chip{display:none}
+  .drawer{width:100%;max-width:100%}
+  .chart-svg{height:220px}
+  .orbit-svg{height:240px}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important;scroll-behavior:auto!important}
+}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<!-- ===================== TOP BAR ===================== -->
+<header class="topbar">
+  <button class="icon-btn only-mobile" id="btnMenu" aria-label="Open navigation menu" aria-expanded="false">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+  </button>
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <circle cx="16" cy="16" r="5" fill="currentColor"/>
+      <ellipse cx="16" cy="16" rx="13" ry="6" stroke="currentColor" stroke-width="1.4" transform="rotate(-24 16 16)"/>
+      <circle cx="27" cy="10" r="1.8" fill="currentColor"/>
+    </svg>
+    <div class="name">NEBULA<small>MISSION CONTROL</small></div>
+  </div>
+  <div class="mission-chip" title="Active mission">
+    <span class="dot" aria-hidden="true"></span>
+    <span>MISSION <b>ASTERIA-7</b></span>
+    <span aria-hidden="true">·</span>
+    <span>T+ <b id="missionClock">214d 06:42:11</b></span>
+  </div>
+  <div class="spacer"></div>
+  <div class="topbar-actions">
+    <button class="btn ghost" id="btnSearch" aria-label="Open command palette">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+      <span class="sr-only">Search</span>
+      <span class="kbd" id="searchKbd">Ctrl K</span>
+    </button>
+    <div class="link-status" id="linkStatus" role="status">
+      <span class="dot" aria-hidden="true"></span><span class="txt">LINK <b>NOMINAL</b></span>
+    </div>
+    <time class="utc" id="utcClock" datetime="">--:--:-- UTC</time>
+    <button class="icon-btn" id="btnTheme" aria-label="Toggle color theme">
+      <svg id="themeIcon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+    </button>
+    <button class="icon-btn" id="btnBell" aria-label="Notifications" aria-expanded="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+      <span class="badge" id="bellBadge">0</span>
+    </button>
+    <button class="user-btn" id="btnUser" aria-label="User menu" aria-expanded="false">
+      <span class="avatar" aria-hidden="true">MO</span>
+      <span class="uname">M. Okafor</span>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+    </button>
+  </div>
+</header>
+
+<div class="shell">
+  <!-- ===================== SIDEBAR ===================== -->
+  <nav class="sidebar" id="sidebar" aria-label="Primary navigation">
+    <ul class="nav" id="navList"></ul>
+    <div class="sidebar-foot">
+      <button class="collapse-btn" id="btnCollapse" aria-label="Collapse sidebar" aria-expanded="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+        <span class="lbl">Collapse</span>
+      </button>
+    </div>
+  </nav>
+  <div class="scrim" id="scrim"></div>
+
+  <!-- ===================== MAIN ===================== -->
+  <main id="main">
+    <!-- skeleton placeholder -->
+    <div id="skeleton" aria-hidden="true">
+      <div class="skel-row"><div class="skel"></div><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>
+      <div class="skel-block"></div>
+      <div class="skel-row"><div class="skel"></div><div class="skel"></div></div>
+    </div>
+
+    <!-- ============ OVERVIEW ============ -->
+    <section class="view" data-view="overview" aria-labelledby="ovTitle">
+      <div class="page-head">
+        <div>
+          <h1 id="ovTitle">Overview</h1>
+          <p class="sub">Fleet telemetry · last sync <span class="mono" id="lastSync">--:--:-- UTC</span></p>
+        </div>
+        <div class="page-actions">
+          <div class="seg" id="rangeSeg" role="group" aria-label="Time range">
+            <button data-range="1H" aria-pressed="false">1H</button>
+            <button data-range="6H" aria-pressed="true">6H</button>
+            <button data-range="24H" aria-pressed="false">24H</button>
+            <button data-range="7D" aria-pressed="false">7D</button>
+          </div>
+          <button class="btn primary" id="btnSimulate">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 4 20 12 6 20 6 4"/></svg>
+            Simulate update
+          </button>
+        </div>
+      </div>
+
+      <div class="kpi-grid" id="kpiGrid"></div>
+
+      <div class="grid-2">
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Telemetry Trend</h2>
+              <div class="meta" id="chartMeta">Fleet aggregate · normalized index</div>
+            </div>
+            <div class="legend" id="chartLegend" role="group" aria-label="Toggle series"></div>
+          </div>
+          <div class="panel-body">
+            <div class="chart-wrap" id="chartWrap">
+              <svg class="chart-svg" id="chartSvg" role="img" aria-label="Telemetry trend chart for signal strength, thermal load and power reserve"></svg>
+              <div class="chart-tip" id="chartTip" aria-hidden="true"></div>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Mission Orbit</h2>
+              <div class="meta">Earth · Moon · Asteria-7</div>
+            </div>
+            <div class="orbit-ctrl">
+              <button class="icon-btn" id="orbitOut" aria-label="Zoom out" style="width:30px;height:30px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
+              <span class="zval" id="orbitZoom">100%</span>
+              <button class="icon-btn" id="orbitIn" aria-label="Zoom in" style="width:30px;height:30px"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
+              <button class="btn sm ghost" id="orbitReset">Reset</button>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="orbit-wrap">
+              <svg class="orbit-svg" id="orbitSvg" viewBox="0 0 400 300" role="img" aria-label="Two-dimensional mission orbit diagram"></svg>
+            </div>
+          </div>
+        </article>
+      </div>
+
+      <div class="grid-2b">
+        <article class="panel">
+          <div class="panel-head">
+            <h2>Fleet Status</h2>
+            <div class="table-tools">
+              <div class="search">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+                <input type="search" id="fleetSearch" placeholder="Search probes…" aria-label="Search fleet probes">
+              </div>
+              <div class="chips" id="fleetStatusChips" role="group" aria-label="Filter by status"></div>
+            </div>
+          </div>
+          <div class="table-scroll">
+            <table id="fleetTable">
+              <caption class="sr-only">Fleet probe status table</caption>
+              <thead>
+                <tr id="fleetHead"></tr>
+              </thead>
+              <tbody id="fleetBody"></tbody>
+            </table>
+          </div>
+          <div class="p-cards" id="fleetCards"></div>
+          <div class="table-foot">
+            <span class="info" id="fleetInfo"></span>
+            <button class="btn sm" id="fleetMore">Show more</button>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <h2>Recent Events</h2>
+            <div class="chips" id="eventChips" role="group" aria-label="Filter events"></div>
+          </div>
+          <ul class="event-list" id="eventList"></ul>
+        </article>
+      </div>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Mission Phase Board</h2>
+          <div class="meta">Drag cards between phases · changes are saved</div>
+        </div>
+        <div class="panel-body">
+          <div class="kanban" id="kanban"></div>
+        </div>
+      </article>
+    </section>
+
+    <!-- ============ FLEET ============ -->
+    <section class="view" data-view="fleet" aria-labelledby="flTitle">
+      <div class="page-head">
+        <div><h1 id="flTitle">Fleet</h1><p class="sub">All probes assigned to mission Asteria-7</p></div>
+      </div>
+      <div class="kpi-grid" id="fleetKpis" style="grid-template-columns:repeat(4,1fr)"></div>
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Probe Roster</h2>
+          <div class="table-tools">
+            <div class="search">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+              <input type="search" id="fleetSearch2" placeholder="Search probes…" aria-label="Search fleet probes">
+            </div>
+            <div class="chips" id="fleetStatusChips2" role="group" aria-label="Filter by status"></div>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table id="fleetTable2">
+            <caption class="sr-only">Fleet probe roster table</caption>
+            <thead><tr id="fleetHead2"></tr></thead>
+            <tbody id="fleetBody2"></tbody>
+          </table>
+        </div>
+        <div class="p-cards" id="fleetCards2"></div>
+        <div class="table-foot">
+          <span class="info" id="fleetInfo2"></span>
+          <button class="btn sm" id="fleetMore2">Show more</button>
+        </div>
+      </article>
+    </section>
+
+    <!-- ============ TELEMETRY ============ -->
+    <section class="view" data-view="telemetry" aria-labelledby="tlTitle">
+      <div class="page-head">
+        <div><h1 id="tlTitle">Telemetry</h1><p class="sub">Live downlink streams · <span class="mono" id="lastSync2">--:--:-- UTC</span></p></div>
+        <div class="page-actions">
+          <div class="seg" id="rangeSeg2" role="group" aria-label="Time range">
+            <button data-range="1H" aria-pressed="false">1H</button>
+            <button data-range="6H" aria-pressed="true">6H</button>
+            <button data-range="24H" aria-pressed="false">24H</button>
+            <button data-range="7D" aria-pressed="false">7D</button>
+          </div>
+        </div>
+      </div>
+      <div class="grid-2">
+        <article class="panel">
+          <div class="panel-head">
+            <div><h2>Signal · Thermal · Power</h2><div class="meta">Fleet aggregate · normalized index</div></div>
+            <div class="legend" id="chartLegend2" role="group" aria-label="Toggle series"></div>
+          </div>
+          <div class="panel-body">
+            <div class="chart-wrap" id="chartWrap2">
+              <svg class="chart-svg" id="chartSvg2" role="img" aria-label="Telemetry trend chart"></svg>
+              <div class="chart-tip" id="chartTip2" aria-hidden="true"></div>
+            </div>
+          </div>
+        </article>
+        <article class="panel">
+          <div class="panel-head"><h2>Mission Orbit</h2></div>
+          <div class="panel-body"><div class="orbit-wrap"><svg class="orbit-svg" id="orbitSvg2" viewBox="0 0 400 300" role="img" aria-label="Mission orbit diagram"></svg></div></div>
+        </article>
+      </div>
+    </section>
+
+    <!-- ============ TIMELINE ============ -->
+    <section class="view" data-view="timeline" aria-labelledby="mtTitle">
+      <div class="page-head"><div><h1 id="mtTitle">Mission Timeline</h1><p class="sub">Asteria-7 · key milestones</p></div></div>
+      <article class="panel"><div class="panel-body"><ol class="milestones" id="milestones"></ol></div></article>
+    </section>
+
+    <!-- ============ INCIDENTS ============ -->
+    <section class="view" data-view="incidents" aria-labelledby="inTitle">
+      <div class="page-head">
+        <div><h1 id="inTitle">Incidents</h1><p class="sub">All severity levels · mark items as read</p></div>
+        <div class="chips" id="eventChips2" role="group" aria-label="Filter events"></div>
+      </div>
+      <article class="panel"><ul class="event-list" id="eventList2" style="max-height:none"></ul></article>
+    </section>
+
+    <!-- ============ PAYLOADS ============ -->
+    <section class="view" data-view="payloads" aria-labelledby="plTitle">
+      <div class="page-head"><div><h1 id="plTitle">Payloads</h1><p class="sub">Science instruments across the fleet</p></div></div>
+      <div class="payload-grid" id="payloadGrid"></div>
+    </section>
+
+    <!-- ============ SETTINGS ============ -->
+    <section class="view" data-view="settings" aria-labelledby="stTitle">
+      <div class="page-head"><div><h1 id="stTitle">Settings</h1><p class="sub">Local preferences · stored in this browser</p></div></div>
+      <article class="panel"><div class="panel-body">
+        <div class="settings-form">
+          <div class="set-row">
+            <div class="l">Color theme<small>Follows system unless overridden</small></div>
+            <select id="setTheme" aria-label="Color theme">
+              <option value="system">System</option>
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+            </select>
+          </div>
+          <div class="set-row">
+            <div class="l">Reduced motion<small>Detected from your OS setting</small></div>
+            <span class="mono" id="setMotion" style="font-size:var(--fs-sm);color:var(--text-dim)">—</span>
+          </div>
+          <div class="set-row">
+            <div class="l">Sidebar collapsed<small>Desktop icon-only mode</small></div>
+            <label class="switch"><input type="checkbox" id="setCollapse" aria-label="Collapse sidebar"><span class="track"></span></label>
+          </div>
+          <div class="set-row">
+            <div class="l">Reset demo data<small>Clears saved filters, board and read state</small></div>
+            <button class="btn danger sm" id="btnReset">Reset</button>
+          </div>
+        </div>
+      </div></article>
+    </section>
+  </main>
+</div>
+
+<!-- ===================== DRAWER ===================== -->
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawerTitle" aria-hidden="true">
+  <div class="drawer-head">
+    <div class="t" id="drawerTitle">—<small id="drawerSub"></small></div>
+    <button class="icon-btn" id="drawerClose" aria-label="Close details" style="width:32px;height:32px">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body" id="drawerBody"></div>
+  <div class="drawer-foot">
+    <button class="btn" id="actPing">Ping probe</button>
+    <button class="btn" id="actDownlink">Schedule downlink</button>
+    <button class="btn danger" id="actIsolate">Isolate subsystem</button>
+  </div>
+</aside>
+
+<!-- ===================== COMMAND PALETTE ===================== -->
+<div class="overlay" id="paletteOverlay" role="dialog" aria-modal="true" aria-label="Command palette">
+  <div class="palette">
+    <div class="p-in">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+      <input type="text" id="paletteInput" placeholder="Search commands, probes, actions…" aria-label="Command search" autocomplete="off">
+    </div>
+    <ul class="p-list" id="paletteList" role="listbox" aria-label="Commands"></ul>
+    <div class="p-foot"><span><span class="kbd">↑</span> <span class="kbd">↓</span> navigate</span><span><span class="kbd">↵</span> run</span><span><span class="kbd">esc</span> close</span></div>
+  </div>
+</div>
+
+<!-- ===================== CONFIRM MODAL ===================== -->
+<div class="modal-wrap" id="modalWrap" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+  <div class="modal" id="modalBox">
+    <div class="m-head">
+      <div class="ic" id="modalIcon"></div>
+      <h3 id="modalTitle">Confirm</h3>
+    </div>
+    <div class="m-body" id="modalBody"></div>
+    <div class="m-foot">
+      <button class="btn" id="modalCancel">Cancel</button>
+      <button class="btn primary" id="modalConfirm">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== POPOVERS / MENUS ===================== -->
+<div class="popover" id="notifPop" role="dialog" aria-label="Notifications">
+  <div class="pv-head"><h3>Notifications</h3><span class="mono" id="notifCount" style="font-size:10px;color:var(--text-faint)"></span></div>
+  <div class="pv-list" id="notifList"></div>
+  <div class="pv-foot">
+    <button class="btn sm" id="notifAll">Mark all read</button>
+    <button class="btn sm ghost" id="notifView">View all</button>
+  </div>
+</div>
+
+<div class="menu" id="userMenu" role="menu" aria-label="User menu">
+  <button role="menuitem" data-act="profile"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>Profile</button>
+  <button role="menuitem" data-act="prefs"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1.2l2-1.6-2-3.4-2.4 1a7 7 0 0 0-2-1.2L14 3h-4l-.5 2.6a7 7 0 0 0-2 1.2l-2.4-1-2 3.4 2 1.6A7 7 0 0 0 5 12a7 7 0 0 0 .1 1.2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 2 1.2L10 21h4l.5-2.6a7 7 0 0 0 2-1.2l2.4 1 2-3.4-2-1.6A7 7 0 0 0 19 12z"/></svg>Preferences</button>
+  <div class="sep"></div>
+  <button role="menuitem" class="danger" data-act="signout"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>Sign out</button>
+</div>
+
+<!-- ===================== TOASTS / VERSION ===================== -->
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+<div class="version-chip">SYNC <b id="verSync">--:--:--</b> · <b>v2.6.1</b></div>
+
+<script>
+"use strict";
+/* ============================================================
+   NEBULA MISSION CONTROL — application logic
+   Deterministic local simulation. No network. No external deps.
+   ============================================================ */
+(function(){
+
+/* ---------- tiny helpers ---------- */
+const $  = (s,r)=> (r||document).querySelector(s);
+const $$ = (s,r)=> Array.from((r||document).querySelectorAll(s));
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, kids){
+  const n = document.createElementNS(NS, tag);
+  if(attrs) for(const k in attrs) n.setAttribute(k, attrs[k]);
+  if(kids) (Array.isArray(kids)?kids:[kids]).forEach(c=> n.appendChild(typeof c==="string"?document.createTextNode(c):c));
+  return n;
+}
+function h(tag, attrs, kids){
+  const n = document.createElement(tag);
+  if(attrs) for(const k in attrs){
+    if(k==="class") n.className=attrs[k];
+    else if(k==="html") n.innerHTML=attrs[k];
+    else if(k.slice(0,2)==="on") n.addEventListener(k.slice(2), attrs[k]);
+    else n.setAttribute(k, attrs[k]);
+  }
+  if(kids) (Array.isArray(kids)?kids:[kids]).forEach(c=> n.appendChild(typeof c==="string"?document.createTextNode(c):c));
+  return n;
+}
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const pad=(n,l)=>String(n).padStart(l||2,"0");
+function fmtUTC(d){ return pad(d.getUTCHours())+":"+pad(d.getUTCMinutes())+":"+pad(d.getUTCSeconds()); }
+function fmtUTCShort(d){ return pad(d.getUTCHours())+":"+pad(d.getUTCMinutes()); }
+function relTime(mins){
+  if(mins<1) return "just now";
+  if(mins<60) return mins+"m ago";
+  const hr=Math.floor(mins/60);
+  if(hr<24) return hr+"h "+(mins%60)+"m ago";
+  return Math.floor(hr/24)+"d "+(hr%24)+"h ago";
+}
+const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
+
+/* ---------- inline icon set ---------- */
+const I = {
+  overview:'<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>',
+  fleet:'<path d="M12 2l3 5-3 2-3-2 3-5z"/><path d="M5 12l3-2 3 2-3 2-3-2z"/><path d="M13 12l3-2 3 2-3 2-3-2z"/><circle cx="12" cy="16" r="2"/>',
+  telemetry:'<polyline points="3 12 7 12 10 5 14 19 17 12 21 12"/>',
+  timeline:'<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 16 14"/>',
+  incidents:'<path d="M12 3l9 16H3L12 3z"/><line x1="12" y1="10" x2="12" y2="14"/><line x1="12" y1="17" x2="12" y2="17"/>',
+  payloads:'<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><line x1="12" y1="13" x2="12" y2="21"/>',
+  settings:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/>',
+  check:'<polyline points="20 6 9 17 4 12"/>',
+  x:'<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+  info:'<circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16"/><line x1="12" y1="8" x2="12" y2="8"/>',
+  warn:'<path d="M12 3l9 16H3L12 3z"/><line x1="12" y1="10" x2="12" y2="14"/><line x1="12" y1="17" x2="12" y2="17"/>',
+  crit:'<circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="13"/><line x1="12" y1="16" x2="12" y2="16"/>',
+  move:'<polyline points="5 9 2 12 5 15"/><polyline points="9 5 12 2 15 5"/><polyline points="15 19 12 22 9 19"/><polyline points="19 9 22 12 19 15"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/>',
+  chevron:'<polyline points="9 18 15 12 9 6"/>',
+  up:'<line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/>',
+  down:'<line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/>'
+};
+function svgIcon(name, size){
+  const s = size||18;
+  return '<svg viewBox="0 0 24 24" width="'+s+'" height="'+s+'" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'+I[name]+'</svg>';
+}
+
+/* ============================================================
+   DETERMINISTIC DATA
+   ============================================================ */
+const MISSION_START = Date.UTC(2024, 2, 14, 9, 30, 0); // fixed anchor
+const T0 = 1000; // base telemetry tick
+let tick = T0;
+
+// pure functions of tick -> deterministic, no drift
+function seriesVal(key, t){
+  switch(key){
+    case "signal": return -88 + 6*Math.sin(t*0.35) + 2*Math.sin(t*0.13) + 1.5*Math.sin(t*0.041);
+    case "thermal": return 55 + 15*Math.sin(t*0.21+1) + 4*Math.sin(t*0.07) + 3*Math.sin(t*0.02);
+    case "power":   return clamp(74 - t*0.006 + 3*Math.sin(t*0.1) + 2*Math.sin(t*0.033), 20, 100);
+  }
+}
+function kpiVal(key, t){
+  switch(key){
+    case "online":  return 8;
+    case "latency": return Math.round(412 + 22*Math.sin(t*0.1) + 8*Math.sin(t*0.045));
+    case "downlink":return (3.42 + t*0.0009 + 0.15*Math.sin(t*0.05)).toFixed(2);
+    case "critical":return 2;
+  }
+}
+
+const PROBES = [
+  {id:"AST-7/01", name:"Vega",       model:"NX-4 Meridian", status:"nominal",  dist:412.6, sig:-87.4, temp:21.3, batt:88, contact:2,  op:"M. Okafor"},
+  {id:"AST-7/02", name:"Cassiopeia", model:"NX-4 Meridian", status:"nominal",  dist:415.1, sig:-89.1, temp:19.8, batt:91, contact:4,  op:"L. Chen"},
+  {id:"AST-7/03", name:"Orion",      model:"KX-2 Sentinel", status:"degraded", dist:421.3, sig:-94.6, temp:27.5, batt:64, contact:9,  op:"R. Vasquez"},
+  {id:"AST-7/04", name:"Lyra",       model:"NX-4 Meridian", status:"nominal",  dist:409.8, sig:-86.2, temp:20.1, batt:83, contact:3,  op:"A. Novak"},
+  {id:"AST-7/05", name:"Draco",      model:"KX-2 Sentinel", status:"critical", dist:424.7, sig:-97.8, temp:41.9, batt:37, contact:12, op:"S. Ito"},
+  {id:"AST-7/06", name:"Aquila",     model:"PX-1 Scout",    status:"nominal",  dist:407.2, sig:-85.5, temp:18.6, batt:95, contact:1,  op:"D. Meyer"},
+  {id:"AST-7/07", name:"Cygnus",     model:"PX-1 Scout",    status:"offline",  dist:430.0, sig:-118.0,temp:14.2, batt:22, contact:372,op:"K. Adeyemi"},
+  {id:"AST-7/08", name:"Pegasus",    model:"NX-4 Meridian", status:"nominal",  dist:411.4, sig:-88.0, temp:22.0, batt:79, contact:6,  op:"T. Lindqvist"},
+  {id:"AST-7/09", name:"Andromeda",  model:"KX-2 Sentinel", status:"degraded", dist:418.9, sig:-93.2, temp:29.4, batt:41, contact:18, op:"M. Okafor"},
+  {id:"AST-7/10", name:"Hydra",      model:"PX-1 Scout",    status:"nominal",  dist:405.6, sig:-84.9, temp:19.2, batt:86, contact:5,  op:"L. Chen"}
+];
+// live per-probe values (deterministic w/ tick + index)
+function probeLive(p, i){
+  const s = p.status;
+  let sig = p.sig + 1.6*Math.sin(tick*0.2 + i*1.7);
+  let temp = p.temp + 1.2*Math.sin(tick*0.15 + i*2.1);
+  let batt = clamp(p.batt + 0.6*Math.sin(tick*0.08 + i), 0, 100);
+  if(s==="offline"){ sig = -118; temp = 14.2; }
+  return { sig:Math.round(sig*10)/10, temp:Math.round(temp*10)/10, batt:Math.round(batt) };
+}
+
+const EVENTS = [
+  {id:"e1", sev:"critical", probe:"Draco (AST-7/05)",   text:"Thermal load exceeded 85% — radiator array B offline", mins:12},
+  {id:"e2", sev:"warning",  probe:"Orion (AST-7/03)",   text:"Signal degradation 3.2 dB over the last 40 min", mins:34},
+  {id:"e3", sev:"info",     probe:"Vega (AST-7/01)",    text:"Completed science pass #214 over Asteria-7", mins:63},
+  {id:"e4", sev:"warning",  probe:"Andromeda (AST-7/09)",text:"Battery below 40% — scheduling solar alignment", mins:128},
+  {id:"e5", sev:"info",     probe:"Fleet",              text:"Downlink window opened — 4.2 TB queued for relay", mins:186},
+  {id:"e6", sev:"critical", probe:"Cygnus (AST-7/07)",  text:"Lost contact — last fix 6h 12m ago, search pattern active", mins:372},
+  {id:"e7", sev:"info",     probe:"Pegasus (AST-7/08)", text:"Attitude control nominal after correction burn", mins:540},
+  {id:"e8", sev:"warning",  probe:"Hydra (AST-7/10)",   text:"Dust impact detected on star tracker 2", mins:840}
+];
+
+const KANBAN_COLS = [
+  {id:"planning", label:"Planning"},
+  {id:"transit",  label:"In Transit"},
+  {id:"orbit",    label:"Orbit"},
+  {id:"complete", label:"Complete"}
+];
+const KANBAN_DEFAULT = {
+  planning:[{id:"k1",t:"Asteria-7 flyby sequence",tag:"NAV"},{id:"k2",t:"Spectroscopy calibration",tag:"SCI"},{id:"k3",t:"Deep-space relay handover",tag:"COM"}],
+  transit:[{id:"k4",t:"Cruise to L4 corridor",tag:"NAV"},{id:"k5",t:"Trajectory correction burn #4",tag:"PROP"}],
+  orbit:[{id:"k6",t:"Orbit insertion burn",tag:"PROP"},{id:"k7",t:"Science pass #215",tag:"SCI"},{id:"k8",t:"Radiator deployment",tag:"THERM"}],
+  complete:[{id:"k9",t:"Launch & separation",tag:"OPS"},{id:"k10",t:"Outgassing phase",tag:"OPS"},{id:"k11",t:"Comms check",tag:"COM"}]
+};
+
+const MILESTONES = [
+  {d:"2024-03-14", t:"Launch & separation", s:"Fleet of 10 probes separated from the Asteria-7 carrier.", st:"done"},
+  {d:"2024-03-19", t:"Outgassing phase", s:"Propellant venting complete across all probes.", st:"done"},
+  {d:"2024-03-22", t:"Comms check", s:"Two-way link established with the HALO relay.", st:"done"},
+  {d:"2024-04-02", t:"Cruise to L4 corridor", s:"Coast phase; trajectory correction burns #1–#3 executed.", st:"done"},
+  {d:"2024-04-18", t:"Trajectory correction burn #4", s:"Final mid-course correction for orbit insertion.", st:"active"},
+  {d:"2024-04-26", t:"Orbit insertion burn", s:"Planned capture into the Asteria-7 science orbit.", st:"upcoming"},
+  {d:"2024-04-28", t:"Radiator deployment", s:"Deploy thermal arrays for sustained science operations.", st:"upcoming"},
+  {d:"2024-05-01", t:"Science pass #215", s:"First full spectroscopy campaign over the target.", st:"upcoming"}
+];
+
+const PAYLOADS = [
+  {nm:"Spectrograph A", id:"SPX-A", mass:"14.2 kg", power:"38 W", status:"nominal", cal:"2024-04-11"},
+  {nm:"Star Tracker 1", id:"STR-1", mass:"3.1 kg",  power:"9 W",  status:"nominal", cal:"2024-04-09"},
+  {nm:"Star Tracker 2", id:"STR-2", mass:"3.1 kg",  power:"9 W",  status:"degraded",cal:"2024-03-30"},
+  {nm:"Radiator Array B",id:"RAD-B",mass:"22.6 kg", power:"0 W",  status:"critical",cal:"2024-04-01"},
+  {nm:"Magnetometer",   id:"MAG-1", mass:"6.8 kg",  power:"12 W", status:"nominal", cal:"2024-04-13"},
+  {nm:"Dust Sensor",    id:"DST-1", mass:"1.4 kg",  power:"4 W",  status:"nominal", cal:"2024-04-07"}
+];
+
+/* ============================================================
+   PERSISTENCE
+   ============================================================ */
+const LS = {
+  get(k,d){ try{ const v=localStorage.getItem("nmc."+k); return v===null?d:JSON.parse(v);}catch(e){return d;} },
+  set(k,v){ try{ localStorage.setItem("nmc."+k, JSON.stringify(v)); }catch(e){} },
+  clear(){ ["theme","sidebar","filters","kanban","eventsRead","range"].forEach(k=>{try{localStorage.removeItem("nmc."+k);}catch(e){}}); }
+};
+
+/* ============================================================
+   THEME
+   ============================================================ */
+const mq = window.matchMedia("(prefers-color-scheme: light)");
+function applyTheme(mode){
+  const resolved = mode==="system" ? (mq.matches?"light":"dark") : mode;
+  document.documentElement.setAttribute("data-theme", resolved);
+  const icon = $("#themeIcon");
+  icon.innerHTML = resolved==="dark"
+    ? '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>'
+    : '<circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4" y1="12" x2="2" y2="12"/><line x1="22" y1="12" x2="20" y2="12"/><line x1="5" y1="5" x2="6.5" y2="6.5"/><line x1="17.5" y1="17.5" x2="19" y2="19"/><line x1="19" y1="5" x2="17.5" y2="6.5"/><line x1="6.5" y1="17.5" x2="5" y2="19"/>';
+}
+let themeMode = LS.get("theme","system");
+applyTheme(themeMode);
+mq.addEventListener("change", ()=>{ if(themeMode==="system") applyTheme("system"); });
+function toggleTheme(){
+  const cur = document.documentElement.getAttribute("data-theme");
+  themeMode = cur==="dark" ? "light" : "dark";
+  LS.set("theme", themeMode);
+  applyTheme(themeMode);
+  syncSettings();
+}
+
+/* ============================================================
+   TOASTS
+   ============================================================ */
+function toast(msg, tone, dur){
+  tone = tone||"info"; dur = dur||4200;
+  const box = $("#toasts");
+  const icon = tone==="warn"?"warn":tone==="crit"?"crit":"info";
+  const t = h("div",{class:"toast "+tone, role:"status"});
+  t.innerHTML = '<span class="ic">'+svgIcon(icon,20)+'</span><span class="msg"></span>'+
+    '<button class="x" aria-label="Dismiss">'+svgIcon("x",14)+'</button><span class="prog"></span>';
+  t.querySelector(".msg").textContent = msg;
+  const prog = t.querySelector(".prog");
+  if(!reduced.matches) prog.style.animationDuration = dur+"ms";
+  const close = ()=>{ t.remove(); };
+  t.querySelector(".x").addEventListener("click", close);
+  box.appendChild(t);
+  while(box.children.length>4) box.firstChild.remove();
+  const timer = setTimeout(close, dur);
+  t.addEventListener("mouseenter", ()=>{ clearTimeout(timer); prog.style.animationPlayState="paused"; });
+  t.addEventListener("mouseleave", ()=>{ prog.style.animationPlayState="running"; setTimeout(close, 1200); });
+}
+
+/* ============================================================
+   CONFIRM MODAL
+   ============================================================ */
+let modalResolve=null, lastFocus=null;
+function openConfirm(opts){
+  return new Promise(res=>{
+    modalResolve = res;
+    lastFocus = document.activeElement;
+    const box = $("#modalBox");
+    box.className = "modal "+(opts.tone||"warn");
+    $("#modalIcon").innerHTML = svgIcon(opts.tone==="crit"?"crit":"warn",20);
+    $("#modalTitle").textContent = opts.title;
+    $("#modalBody").textContent = opts.body;
+    $("#modalConfirm").textContent = opts.confirm||"Confirm";
+    $("#modalWrap").classList.add("open");
+    $("#modalConfirm").focus();
+  });
+}
+function closeModal(val){
+  $("#modalWrap").classList.remove("open");
+  if(modalResolve){ modalResolve(val); modalResolve=null; }
+  if(lastFocus && lastFocus.focus) lastFocus.focus();
+}
+$("#modalCancel").addEventListener("click", ()=>closeModal(false));
+$("#modalConfirm").addEventListener("click", ()=>closeModal(true));
+$("#modalWrap").addEventListener("click", e=>{ if(e.target===$("#modalWrap")) closeModal(false); });
+$("#modalWrap").addEventListener("keydown", e=>{
+  if(e.key==="Tab"){ e.preventDefault(); const a=$("#modalCancel"),b=$("#modalConfirm"); (document.activeElement===a?b:a).focus(); }
+});
+
+/* ============================================================
+   NAV / VIEWS
+   ============================================================ */
+const NAV = [
+  {id:"overview",  label:"Overview",        icon:"overview"},
+  {id:"fleet",     label:"Fleet",           icon:"fleet",     badge:"fleet"},
+  {id:"telemetry", label:"Telemetry",       icon:"telemetry"},
+  {id:"timeline",  label:"Mission Timeline",icon:"timeline"},
+  {id:"incidents", label:"Incidents",       icon:"incidents", badge:"incidents"},
+  {id:"payloads",  label:"Payloads",        icon:"payloads"},
+  {id:"settings",  label:"Settings",        icon:"settings"}
+];
+let currentView = "overview";
+function buildNav(){
+  const ul = $("#navList"); ul.innerHTML="";
+  NAV.forEach(n=>{
+    const li = h("li");
+    const a = h("button",{class:"nav-item","data-view":n.id, role:"link","aria-current":"false"});
+    a.innerHTML = svgIcon(n.icon,19)+'<span class="label">'+n.label+'</span>';
+    if(n.badge){
+      const b = h("span",{class:"count"+(n.badge==="incidents"?" crit":""), "data-badge":n.badge});
+      a.appendChild(b);
+    }
+    a.addEventListener("click", ()=>{ setView(n.id); closeMobileNav(); });
+    li.appendChild(a); ul.appendChild(li);
+  });
+  updateBadges();
+}
+function updateBadges(){
+  const fleet = PROBES.length;
+  const inc = EVENTS.filter(e=>!readSet.has(e.id) && (e.sev==="critical"||e.sev==="warning")).length;
+  const fb = $('[data-badge="fleet"]'); if(fb) fb.textContent = fleet;
+  const ib = $('[data-badge="incidents"]'); if(ib) ib.textContent = inc;
+}
+function setView(id){
+  currentView = id;
+  $$(".view").forEach(v=> v.classList.toggle("active", v.dataset.view===id));
+  $$(".nav-item").forEach(n=>{
+    const on = n.dataset.view===id;
+    n.setAttribute("aria-current", on?"page":"false");
+  });
+  if(id==="fleet") renderFleetKpis();
+  if(id==="telemetry"){ renderChart(2); renderOrbit(2); }
+  if(id==="incidents") renderEvents(2);
+  if(id==="timeline") renderMilestones();
+  if(id==="payloads") renderPayloads();
+  if(id==="settings") syncSettings();
+  $("#main").scrollTop = 0;
+  window.scrollTo(0,0);
+}
+
+/* ============================================================
+   SIDEBAR (collapse + mobile drawer)
+   ============================================================ */
+let sidebarCollapsed = LS.get("sidebar", false);
+function applySidebar(){
+  const sb = $("#sidebar");
+  sb.classList.toggle("collapsed", sidebarCollapsed);
+  $("#btnCollapse").setAttribute("aria-expanded", String(!sidebarCollapsed));
+  $("#btnCollapse").setAttribute("aria-label", sidebarCollapsed?"Expand sidebar":"Collapse sidebar");
+  const sw = $("#setCollapse"); if(sw) sw.checked = sidebarCollapsed;
+}
+$("#btnCollapse").addEventListener("click", ()=>{
+  sidebarCollapsed = !sidebarCollapsed; LS.set("sidebar", sidebarCollapsed); applySidebar();
+});
+function openMobileNav(){ $("#sidebar").classList.add("mobile-open"); $("#scrim").classList.add("show"); $("#btnMenu").setAttribute("aria-expanded","true"); }
+function closeMobileNav(){ $("#sidebar").classList.remove("mobile-open"); $("#scrim").classList.remove("show"); $("#btnMenu").setAttribute("aria-expanded","false"); }
+$("#btnMenu").addEventListener("click", ()=>{ $("#sidebar").classList.contains("mobile-open")?closeMobileNav():openMobileNav(); });
+$("#scrim").addEventListener("click", closeMobileNav);
+
+/* ============================================================
+   KPIs
+   ============================================================ */
+function sparkline(vals, color){
+  const w=78, hh=26, min=Math.min.apply(null,vals), max=Math.max.apply(null,vals), rng=(max-min)||1;
+  const pts = vals.map((v,i)=> (i/(vals.length-1)*w).toFixed(1)+","+(hh-2-((v-min)/rng)*(hh-4)).toFixed(1)).join(" ");
+  return '<svg class="spark" viewBox="0 0 '+w+' '+hh+'" preserveAspectRatio="none" aria-hidden="true"><polyline points="'+pts+'" fill="none" stroke="'+color+'" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg>';
+}
+function renderKpis(){
+  const grid = $("#kpiGrid"); grid.innerHTML="";
+  const defs = [
+    {key:"online",  label:"Online Probes", unit:"/ 10", tone:"ok",   fmt:v=>v,        delta:1,  dUnit:"vs prev", status:"Nominal"},
+    {key:"latency", label:"Avg Signal Latency", unit:"ms", tone:"ok", fmt:v=>v,        delta:0,  dUnit:"vs prev", status:"Nominal"},
+    {key:"downlink",label:"Downlink Today", unit:"TB", tone:"ok",   fmt:v=>v,        delta:0,  dUnit:"vs prev", status:"Nominal"},
+    {key:"critical",label:"Critical Events", unit:"", tone:"crit", fmt:v=>v,        delta:0,  dUnit:"vs prev", status:"Action"}
+  ];
+  defs.forEach(d=>{
+    const cur = kpiVal(d.key, tick);
+    const prev = kpiVal(d.key, tick-24);
+    let delta = Math.round((cur-prev)*10)/10;
+    const dir = delta>0.05?"up":delta<-0.05?"down":"flat";
+    const arrow = dir==="up"?svgIcon("up",12):dir==="down"?svgIcon("down",12):"";
+    const spark = sparkline(Array.from({length:24},(_,i)=>kpiVal(d.key, tick-23+i)),
+      d.tone==="crit"?"var(--crit)":"var(--accent)");
+    const card = h("div",{class:"kpi "+(d.tone==="crit"?"crit":"")});
+    card.innerHTML =
+      '<div class="k-label">'+d.label+'</div>'+
+      '<div class="k-row"><span class="k-val">'+d.fmt(cur)+'</span><span class="k-unit">'+d.unit+'</span></div>'+
+      '<div class="k-foot"><span class="k-delta '+dir+'">'+arrow+' '+(dir==="flat"?"±0":(delta>0?"+":"")+delta)+' '+d.dUnit+'</span>'+
+      '<span class="k-status '+(d.tone==="crit"?"crit":"ok")+'">'+d.status+'</span></div>'+
+      spark;
+    grid.appendChild(card);
+  });
+}
+function renderFleetKpis(){
+  const g = $("#fleetKpis"); g.innerHTML="";
+  const counts = {nominal:0,degraded:0,critical:0,offline:0};
+  PROBES.forEach(p=>counts[p.status]++);
+  const items = [
+    {l:"Nominal", v:counts.nominal, c:"var(--accent)"},
+    {l:"Degraded", v:counts.degraded, c:"var(--warn)"},
+    {l:"Critical", v:counts.critical, c:"var(--crit)"},
+    {l:"Offline", v:counts.offline, c:"var(--offline)"}
+  ];
+  items.forEach(it=>{
+    const c = h("div",{class:"kpi"});
+    c.style.setProperty("--x","");
+    c.innerHTML = '<div class="k-label">'+it.l+'</div><div class="k-row"><span class="k-val" style="color:'+it.c+'">'+it.v+'</span></div>';
+    c.querySelector(".kpi")||c;
+    g.appendChild(c);
+  });
+}
+
+/* ============================================================
+   CHART (SVG) — two instances
+   ============================================================ */
+const SERIES = [
+  {key:"signal",  label:"Signal Strength", unit:"dBm", color:"var(--accent)", on:true},
+  {key:"thermal", label:"Thermal Load",    unit:"%",   color:"var(--warn)",   on:true},
+  {key:"power",   label:"Power Reserve",   unit:"%",   color:"var(--ok)",     on:true}
+];
+let range = LS.get("range","6H");
+const RANGE_POINTS = {"1H":48,"6H":72,"24H":96,"7D":120};
+const RANGE_SPAN   = {"1H":60,"6H":360,"24H":1440,"7D":10080}; // minutes
+const chartState = {1:{hover:-1}, 2:{hover:-1}};
+
+function buildLegend(inst){
+  const box = inst===1?$("#chartLegend"):$("#chartLegend2");
+  box.innerHTML="";
+  SERIES.forEach(s=>{
+    const b = h("button",{"aria-pressed":String(s.on)});
+    b.innerHTML = '<span class="sw" style="background:'+s.color+'"></span>'+s.label;
+    b.addEventListener("click", ()=>{ s.on=!s.on; b.setAttribute("aria-pressed",String(s.on)); renderChart(inst); });
+    box.appendChild(b);
+  });
+}
+function renderChart(inst){
+  const svg = inst===1?$("#chartSvg"):$("#chartSvg2");
+  const wrap = inst===1?$("#chartWrap"):$("#chartWrap2");
+  const tip = inst===1?$("#chartTip"):$("#chartTip2");
+  const W = Math.max(320, wrap.clientWidth||720);
+  const H = inst===1?280:280;
+  const m = {t:14,r:14,b:26,l:40};
+  const iw = W-m.l-m.r, ih = H-m.t-m.b;
+  svg.setAttribute("viewBox","0 0 "+W+" "+H);
+  svg.setAttribute("width",W); svg.setAttribute("height",H);
+  while(svg.firstChild) svg.removeChild(svg.firstChild);
+
+  const N = RANGE_POINTS[range];
+  const span = RANGE_SPAN[range];
+  const now = new Date();
+  const tEnd = now.getTime();
+  const tStart = tEnd - span*60000;
+
+  // grid + y ticks (0..100 index)
+  for(let i=0;i<=4;i++){
+    const y = m.t + ih - (i/4)*ih;
+    svg.appendChild(el("line",{class:"grid",x1:m.l,y1:y,x2:m.l+iw,y2:y}));
+    const tx = el("text",{x:m.l-8,y:y+3,"text-anchor":"end"}); tx.textContent=(i*25)+"%"; svg.appendChild(tx);
+  }
+  // x ticks
+  const xticks=5;
+  for(let i=0;i<=xticks;i++){
+    const x = m.l + (i/xticks)*iw;
+    const d = new Date(tStart + (i/xticks)*span*60000);
+    const lbl = range==="7D" ? (d.getUTCMonth()+1)+"/"+d.getUTCDate() : fmtUTCShort(d);
+    const tx = el("text",{x:x,y:H-8,"text-anchor":"middle"}); tx.textContent=lbl; svg.appendChild(tx);
+  }
+  svg.appendChild(el("line",{class:"axis",x1:m.l,y1:m.t+iw*0+ih,x2:m.l+iw,y2:m.t+ih}));
+
+  // series paths
+  const data = {};
+  SERIES.forEach(s=>{
+    if(!s.on) return;
+    const vals=[];
+    for(let i=0;i<N;i++){
+      const t = tick - (N-1-i);
+      vals.push(seriesVal(s.key, t));
+    }
+    data[s.key]=vals;
+    // normalize to 0..100 using a stable per-series domain
+    let lo,hi;
+    if(s.key==="signal"){ lo=-100; hi=-78; }
+    else { lo=20; hi=100; }
+    const pts = vals.map((v,i)=>{
+      const x = m.l + (i/(N-1))*iw;
+      const y = m.t + ih - clamp((v-lo)/(hi-lo),0,1)*ih;
+      return x.toFixed(1)+","+y.toFixed(1);
+    }).join(" ");
+    svg.appendChild(el("polyline",{class:"line",points:pts,stroke:s.color}));
+    // live point
+    const last = vals[vals.length-1];
+    const lx = m.l+iw, ly = m.t+ih-clamp((last-lo)/(hi-lo),0,1)*ih;
+    svg.appendChild(el("circle",{class:"pt live-dot",cx:lx,cy:ly,r:3.5,fill:s.color}));
+  });
+
+  // hover layer
+  const cross = el("line",{class:"cross",x1:0,y1:m.t,x2:0,y2:m.t+ih,visibility:"hidden"});
+  svg.appendChild(cross);
+  const dots = {};
+  SERIES.forEach(s=>{ const c=el("circle",{class:"pt",r:4,fill:s.color,visibility:"hidden"}); svg.appendChild(c); dots[s.key]=c; });
+
+  function showHover(clientX){
+    const rect = svg.getBoundingClientRect();
+    const px = (clientX-rect.left) * (W/rect.width);
+    const idx = clamp(Math.round((px-m.l)/iw*(N-1)),0,N-1);
+    const x = m.l + (idx/(N-1))*iw;
+    cross.setAttribute("x1",x); cross.setAttribute("x2",x); cross.setAttribute("visibility","visible");
+    let rows="";
+    SERIES.forEach(s=>{
+      if(!s.on){ dots[s.key].setAttribute("visibility","hidden"); return; }
+      const v = data[s.key][idx];
+      const lo = s.key==="signal"?-100:20, hi = s.key==="signal"?-78:100;
+      const y = m.t+ih-clamp((v-lo)/(hi-lo),0,1)*ih;
+      dots[s.key].setAttribute("cx",x); dots[s.key].setAttribute("cy",y); dots[s.key].setAttribute("visibility","visible");
+      rows += '<div class="t-row"><span class="sw" style="background:'+s.color+'"></span>'+s.label+'<b>'+ (s.key==="signal"?v.toFixed(1):Math.round(v)) +' '+s.unit+'</b></div>';
+    });
+    const d = new Date(tStart + (idx/(N-1))*span*60000);
+    tip.innerHTML = '<div class="t-time">'+fmtUTCShort(d)+' UTC</div>'+rows;
+    tip.style.opacity="1";
+    const tw = tip.offsetWidth;
+    let left = (x/W)*rect.width + 14;
+    if(left+tw > rect.width) left = (x/W)*rect.width - tw - 14;
+    tip.style.left = left+"px";
+    tip.style.top = (m.t+6)+"px";
+  }
+  function hideHover(){
+    cross.setAttribute("visibility","hidden");
+    SERIES.forEach(s=>dots[s.key].setAttribute("visibility","hidden"));
+    tip.style.opacity="0";
+  }
+  svg.onmousemove = e=>showHover(e.clientX);
+  svg.onmouseleave = hideHover;
+  svg.ontouchmove = e=>{ if(e.touches[0]) showHover(e.touches[0].clientX); };
+  svg.ontouchend = hideHover;
+}
+
+/* ============================================================
+   ORBIT (SVG) — two instances
+   ============================================================ */
+let orbitZoom = 1;
+function renderOrbit(inst){
+  const svg = inst===1?$("#orbitSvg"):$("#orbitSvg2");
+  while(svg.firstChild) svg.removeChild(svg.firstChild);
+  const cx=200, cy=150;
+  const scene = el("g",{id:"orbitScene"+inst});
+  // orbits
+  scene.appendChild(el("circle",{class:"orbit",cx:cx,cy:cy,r:52}));
+  scene.appendChild(el("ellipse",{class:"orbit",cx:cx,cy:cy,rx:150,ry:88,transform:"rotate(-18 "+cx+" "+cy+")"}));
+  scene.appendChild(el("circle",{class:"orbit dash",cx:cx,cy:cy,r:132}));
+  // earth
+  scene.appendChild(el("circle",{class:"body",cx:cx,cy:cy,r:9}));
+  const et=el("text",{x:cx+12,y:cy+3}); et.textContent="EARTH"; scene.appendChild(et);
+  // moon
+  const moon=el("circle",{class:"moon",r:4}); scene.appendChild(moon);
+  const mt=el("text",{x:0,y:0}); mt.textContent="MOON"; scene.appendChild(mt);
+  // relay
+  const relay=el("circle",{class:"relay",r:3}); scene.appendChild(relay);
+  // asteria
+  const ast=el("circle",{class:"asteria",r:5}); scene.appendChild(ast);
+  const at=el("text",{x:0,y:0}); at.textContent="ASTERIA-7"; scene.appendChild(at);
+  svg.appendChild(scene);
+  applyOrbitZoom(inst);
+  // animate
+  if(!reduced.matches){
+    const start = performance.now();
+    (function loop(now){
+      const e=(now-start)/1000;
+      const aM = e*0.5;
+      const aR = e*0.12 + 2;
+      const aA = e*0.06 + 0.6;
+      moon.setAttribute("cx",cx+52*Math.cos(aM)); moon.setAttribute("cy",cy+52*Math.sin(aM));
+      mt.setAttribute("x",cx+52*Math.cos(aM)+7); mt.setAttribute("y",cy+52*Math.sin(aM)-4);
+      relay.setAttribute("cx",cx+132*Math.cos(aR)); relay.setAttribute("cy",cy+132*Math.sin(aR));
+      const rx=150*Math.cos(aA), ry=88*Math.sin(aA), ph=-18*Math.PI/180;
+      const ax=cx+rx*Math.cos(ph)-ry*Math.sin(ph), ay=cy+rx*Math.sin(ph)+ry*Math.cos(ph);
+      ast.setAttribute("cx",ax); ast.setAttribute("cy",ay);
+      at.setAttribute("x",ax+9); at.setAttribute("y",ay-6);
+      requestAnimationFrame(loop);
+    })(start);
+  } else {
+    moon.setAttribute("cx",cx+52); moon.setAttribute("cy",cy);
+    mt.setAttribute("x",cx+59); mt.setAttribute("y",cy-4);
+    relay.setAttribute("cx",cx-132); relay.setAttribute("cy",cy);
+    const ph=-18*Math.PI/180, rx=150*Math.cos(0.6), ry=88*Math.sin(0.6);
+    const ax=cx+rx*Math.cos(ph)-ry*Math.sin(ph), ay=cy+rx*Math.sin(ph)+ry*Math.cos(ph);
+    ast.setAttribute("cx",ax); ast.setAttribute("cy",ay); at.setAttribute("x",ax+9); at.setAttribute("y",ay-6);
+  }
+}
+function applyOrbitZoom(inst){
+  const scene = $("#orbitScene"+inst);
+  if(!scene) return;
+  scene.setAttribute("transform","translate(200,150) scale("+orbitZoom+") translate(-200,-150)");
+  if(inst===1) $("#orbitZoom").textContent = Math.round(orbitZoom*100)+"%";
+}
+$("#orbitIn").addEventListener("click", ()=>{ orbitZoom=clamp(orbitZoom+0.25,0.5,2.5); applyOrbitZoom(1); applyOrbitZoom(2); });
+$("#orbitOut").addEventListener("click", ()=>{ orbitZoom=clamp(orbitZoom-0.25,0.5,2.5); applyOrbitZoom(1); applyOrbitZoom(2); });
+$("#orbitReset").addEventListener("click", ()=>{ orbitZoom=1; applyOrbitZoom(1); applyOrbitZoom(2); });
+
+/* ============================================================
+   FLEET TABLE (two instances, shared state)
+   ============================================================ */
+const COLS = [
+  {k:"name",  l:"Name",  sortable:true},
+  {k:"model", l:"Model", sortable:true},
+  {k:"status",l:"Status",sortable:true},
+  {k:"dist",  l:"Distance",sortable:true, num:true},
+  {k:"sig",   l:"Signal",sortable:true, num:true},
+  {k:"temp",  l:"Temp",  sortable:true, num:true},
+  {k:"batt",  l:"Battery",sortable:true, num:true},
+  {k:"contact",l:"Last Contact",sortable:true, num:true},
+  {k:"op",    l:"Operator",sortable:true}
+];
+let filters = LS.get("filters", {q:"", status:"all", sortKey:"name", sortDir:1});
+let limit = 6;
+const STATUS_OPTS = ["all","nominal","degraded","critical","offline"];
+
+function statusChip(s){
+  return '<span class="status '+s+'"><span class="sd"></span>'+s.charAt(0).toUpperCase()+s.slice(1)+'</span>';
+}
+function battCell(v){
+  const cls = v<20?"crit":v<50?"warn":"";
+  return '<div class="batt"><span class="bar"><i class="'+cls+'" style="width:'+v+'%"></i></span><span>'+v+'%</span></div>';
+}
+function filteredProbes(){
+  const q = filters.q.trim().toLowerCase();
+  let rows = PROBES.map((p,i)=>{
+    const lv = probeLive(p,i);
+    return Object.assign({}, p, {sig:lv.sig, temp:lv.temp, batt:lv.batt, _i:i});
+  });
+  if(filters.status!=="all") rows = rows.filter(r=>r.status===filters.status);
+  if(q) rows = rows.filter(r=> (r.name+" "+r.id+" "+r.model+" "+r.op).toLowerCase().includes(q));
+  const k=filters.sortKey, d=filters.sortDir;
+  rows.sort((a,b)=>{
+    let av=a[k], bv=b[k];
+    if(k==="contact"){ av=a.contact; bv=b.contact; }
+    if(typeof av==="string") return av.localeCompare(bv)*d;
+    return (av-bv)*d;
+  });
+  return rows;
+}
+function buildHead(inst){
+  const tr = inst===1?$("#fleetHead"):$("#fleetHead2");
+  tr.innerHTML="";
+  COLS.forEach(c=>{
+    const th = h("th",{scope:"col"});
+    if(c.sortable){
+      th.className="sortable";
+      th.setAttribute("aria-sort", filters.sortKey===c.k ? (filters.sortDir===1?"ascending":"descending") : "none");
+      th.innerHTML = c.l+'<span class="arrow">'+(filters.sortKey===c.k?(filters.sortDir===1?"↑":"↓"):"")+'</span>';
+      th.addEventListener("click", ()=>{
+        if(filters.sortKey===c.k) filters.sortDir*=-1; else { filters.sortKey=c.k; filters.sortDir=1; }
+        LS.set("filters",filters); renderFleet();
+      });
+    } else th.textContent=c.l;
+    tr.appendChild(th);
+  });
+}
+function renderFleet(){
+  const rows = filteredProbes();
+  const shown = rows.slice(0, limit);
+  // heads
+  buildHead(1); buildHead(2);
+  // bodies
+  [1,2].forEach(inst=>{
+    const body = inst===1?$("#fleetBody"):$("#fleetBody2");
+    const cards = inst===1?$("#fleetCards"):$("#fleetCards2");
+    body.innerHTML=""; cards.innerHTML="";
+    if(rows.length===0){
+      const empty = h("div",{class:"empty"});
+      empty.innerHTML = svgIcon("fleet",34)+'<h3>No probes match</h3><p>Try a different search or status filter.</p><button class="btn sm" data-clear>Clear filters</button>';
+      empty.querySelector("[data-clear]").addEventListener("click", clearFilters);
+      const tr = h("tr"); tr.appendChild(empty); body.appendChild(tr);
+      cards.appendChild(empty.cloneNode(true));
+      cards.querySelector("[data-clear]").addEventListener("click", clearFilters);
+    } else {
+      shown.forEach(r=>{
+        const tr = h("tr",{tabindex:"0","data-id":r.id});
+        tr.innerHTML =
+          '<td class="p-name">'+r.name+'<small>'+r.id+'</small></td>'+
+          '<td>'+r.model+'</td>'+
+          '<td>'+statusChip(r.status)+'</td>'+
+          '<td class="num">'+r.dist.toFixed(1)+' Mm</td>'+
+          '<td class="num">'+r.sig.toFixed(1)+' dBm</td>'+
+          '<td class="num">'+r.temp.toFixed(1)+' °C</td>'+
+          '<td>'+battCell(r.batt)+'</td>'+
+          '<td class="num">'+relTime(r.contact)+'</td>'+
+          '<td>'+r.op+'</td>';
+        tr.addEventListener("click", ()=>openDrawer(r.id));
+        tr.addEventListener("keydown", e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); openDrawer(r.id);} });
+        body.appendChild(tr);
+
+        const card = h("div",{class:"p-card","data-id":r.id,tabindex:"0"});
+        card.innerHTML =
+          '<div class="top"><span class="nm">'+r.name+'<small>'+r.id+'</small></span>'+statusChip(r.status)+'</div>'+
+          '<dl class="stats">'+
+            '<div><dt>Distance</dt><dd>'+r.dist.toFixed(1)+' Mm</dd></div>'+
+            '<div><dt>Signal</dt><dd>'+r.sig.toFixed(1)+' dBm</dd></div>'+
+            '<div><dt>Temp</dt><dd>'+r.temp.toFixed(1)+' °C</dd></div>'+
+            '<div><dt>Battery</dt><dd>'+r.batt+'%</dd></div>'+
+            '<div><dt>Operator</dt><dd>'+r.op+'</dd></div>'+
+            '<div><dt>Contact</dt><dd>'+relTime(r.contact)+'</dd></div>'+
+          '</dl>';
+        card.addEventListener("click", ()=>openDrawer(r.id));
+        card.addEventListener("keydown", e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); openDrawer(r.id);} });
+        cards.appendChild(card);
+      });
+    }
+    // info + more
+    const info = inst===1?$("#fleetInfo"):$("#fleetInfo2");
+    const more = inst===1?$("#fleetMore"):$("#fleetMore2");
+    info.textContent = "Showing "+shown.length+" of "+rows.length+" probes";
+    const remaining = rows.length - shown.length;
+    more.style.display = remaining>0 ? "inline-flex" : "none";
+    more.textContent = "Show more ("+remaining+")";
+  });
+}
+function clearFilters(){
+  filters = {q:"", status:"all", sortKey:"name", sortDir:1};
+  LS.set("filters",filters); limit=6;
+  $("#fleetSearch").value=""; $("#fleetSearch2").value="";
+  renderFleet(); syncChips();
+}
+function syncChips(){
+  [$("#fleetStatusChips"),$("#fleetStatusChips2")].forEach(box=>{
+    if(!box) return;
+    box.innerHTML="";
+    STATUS_OPTS.forEach(s=>{
+      const b=h("button",{"aria-pressed":String(filters.status===s)});
+      b.textContent = s==="all"?"All":s.charAt(0).toUpperCase()+s.slice(1);
+      b.addEventListener("click", ()=>{ filters.status=s; LS.set("filters",filters); renderFleet(); syncChips(); });
+      box.appendChild(b);
+    });
+  });
+}
+function bindFleetSearch(){
+  ["#fleetSearch","#fleetSearch2"].forEach(sel=>{
+    const inp=$(sel);
+    inp.value = filters.q;
+    inp.addEventListener("input", ()=>{ filters.q=inp.value; LS.set("filters",filters); renderFleet(); });
+  });
+}
+$("#fleetMore").addEventListener("click", ()=>{ limit+=4; renderFleet(); });
+$("#fleetMore2").addEventListener("click", ()=>{ limit+=4; renderFleet(); });
+
+/* ============================================================
+   EVENTS (two instances)
+   ============================================================ */
+let readSet = new Set(LS.get("eventsRead", []));
+let eventFilter = "all";
+function sevIcon(s){ return s==="critical"?"crit":s==="warning"?"warn":"info"; }
+function renderEvents(inst){
+  const list = inst===1?$("#eventList"):$("#eventList2");
+  const chips = inst===1?$("#eventChips"):$("#eventChips2");
+  if(chips){
+    chips.innerHTML="";
+    ["all","critical","warning","info"].forEach(s=>{
+      const b=h("button",{"aria-pressed":String(eventFilter===s)});
+      b.textContent = s==="all"?"All":s.charAt(0).toUpperCase()+s.slice(1);
+      b.addEventListener("click", ()=>{ eventFilter=s; renderEvents(1); renderEvents(2); });
+      chips.appendChild(b);
+    });
+  }
+  list.innerHTML="";
+  const rows = EVENTS.filter(e=> eventFilter==="all"||e.sev===eventFilter);
+  if(rows.length===0){
+    list.appendChild(h("li",{class:"empty"},[h("h3",null,"No events"),h("p",null,"Nothing at this severity.")]));
+  }
+  rows.forEach(e=>{
+    const read = readSet.has(e.id);
+    const li = h("li",{class:"event "+e.sev+(read?" read":"")});
+    li.innerHTML =
+      '<span class="sev-ic">'+svgIcon(sevIcon(e.sev),15)+'</span>'+
+      '<div class="body"><div class="t"><b>'+e.probe+'</b> — '+e.text+'</div>'+
+      '<div class="m"><span class="tag">'+e.sev.toUpperCase()+'</span><span>'+relTime(e.mins)+'</span></div></div>'+
+      '<button class="read-btn" aria-label="'+(read?"Mark unread":"Mark read")+'" aria-pressed="'+read+'">'+svgIcon(read?"x":"check",15)+'</button>';
+    li.querySelector(".read-btn").addEventListener("click", ()=>{
+      if(readSet.has(e.id)) readSet.delete(e.id); else readSet.add(e.id);
+      LS.set("eventsRead", Array.from(readSet));
+      renderEvents(1); renderEvents(2); updateBadges(); updateBell();
+    });
+    list.appendChild(li);
+  });
+}
+
+/* ============================================================
+   KANBAN
+   ============================================================ */
+let board = LS.get("kanban", null);
+if(!board){ board = JSON.parse(JSON.stringify(KANBAN_DEFAULT)); }
+let dragId=null;
+function renderKanban(){
+  const kb = $("#kanban"); kb.innerHTML="";
+  KANBAN_COLS.forEach(col=>{
+    const cards = board[col.id]||[];
+    const c = h("div",{class:"kb-col","data-col":col.id});
+    c.innerHTML = '<h3>'+col.label+'<span class="n">'+cards.length+'</span></h3>';
+    cards.forEach(card=>{
+      const elc = h("div",{class:"kb-card","data-id":card.id,draggable:"true"});
+      elc.innerHTML = '<div class="ct">'+card.t+'</div>'+
+        '<div class="cm"><span class="tag">'+card.tag+'</span>'+
+        '<button class="move-btn" aria-label="Move '+card.t+'">'+svgIcon("move",14)+'</button></div>';
+      elc.addEventListener("dragstart", e=>{ dragId=card.id; elc.classList.add("dragging"); e.dataTransfer.setData("text/plain",card.id); e.dataTransfer.effectAllowed="move"; });
+      elc.addEventListener("dragend", ()=>{ elc.classList.remove("dragging"); dragId=null; });
+      elc.querySelector(".move-btn").addEventListener("click", e=>{
+        e.stopPropagation(); openMoveMenu(elc, card.id);
+      });
+      c.appendChild(elc);
+    });
+    c.addEventListener("dragover", e=>{ e.preventDefault(); c.classList.add("drag-over"); });
+    c.addEventListener("dragleave", ()=>c.classList.remove("drag-over"));
+    c.addEventListener("drop", e=>{
+      e.preventDefault(); c.classList.remove("drag-over");
+      const id = e.dataTransfer.getData("text/plain")||dragId;
+      if(id) moveCard(id, col.id);
+    });
+    kb.appendChild(c);
+  });
+}
+function moveCard(id, toCol){
+  for(const k in board){ const i=board[k].findIndex(c=>c.id===id); if(i>-1){ const [c]=board[k].splice(i,1); if(k!==toCol) board[toCol].push(c); } }
+  LS.set("kanban", board);
+  renderKanban();
+  toast("Task moved to "+KANBAN_COLS.find(c=>c.id===toCol).label, "info");
+}
+function openMoveMenu(anchor, id){
+  $$(".kb-menu").forEach(m=>m.remove());
+  const menu = h("div",{class:"kb-menu",role:"menu"});
+  KANBAN_COLS.forEach(col=>{
+    const cur = (board[col.id]||[]).some(c=>c.id===id);
+    const b=h("button",{role:"menuitem","aria-current":String(cur)});
+    b.textContent = col.label;
+    b.addEventListener("click", ()=>{ moveCard(id,col.id); menu.remove(); });
+    menu.appendChild(b);
+  });
+  anchor.appendChild(menu);
+  setTimeout(()=>document.addEventListener("click", function h(e){ if(!menu.contains(e.target)) menu.remove(); document.removeEventListener("click",h); }),0);
+}
+
+/* ============================================================
+   DRAWER
+   ============================================================ */
+let drawerProbe=null, drawerLastFocus=null;
+function probeTimeline(id){
+  const base = {
+    "AST-7/05":[{t:"Radiator array B fault detected",m:"12m ago",s:"crit"},{t:"Thermal load rising above 80%",m:"48m ago",s:"warn"},{t:"Science pass #213 completed",m:"3h ago",s:"ok"}],
+    "AST-7/07":[{t:"Contact lost — search pattern active",m:"6h ago",s:"crit"},{t:"Signal below threshold",m:"6h 20m ago",s:"warn"},{t:"Nominal cruise telemetry",m:"12h ago",s:"ok"}],
+    "AST-7/03":[{t:"Signal degradation 3.2 dB",m:"34m ago",s:"warn"},{t:"Attitude trim executed",m:"2h ago",s:"ok"},{t:"Downlink burst received",m:"5h ago",s:"ok"}]
+  };
+  return base[id] || [{t:"Telemetry frame received",m:"recent",s:"ok"},{t:"Nominal operations",m:"1h ago",s:"ok"},{t:"Command uplink acknowledged",m:"4h ago",s:"ok"}];
+}
+function openDrawer(id){
+  const p = PROBES.find(x=>x.id===id); if(!p) return;
+  drawerProbe=p; drawerLastFocus=document.activeElement;
+  const i = PROBES.indexOf(p);
+  const lv = probeLive(p,i);
+  $("#drawerTitle").childNodes[0].nodeValue = p.name;
+  $("#drawerSub").textContent = p.id+" · "+p.model;
+  const tl = probeTimeline(id);
+  $("#drawerBody").innerHTML =
+    '<div style="margin-bottom:14px">'+statusChip(p.status)+'</div>'+
+    '<div class="dv-grid">'+
+      '<div class="cell"><div class="l">Distance</div><div class="v">'+p.dist.toFixed(1)+' Mm</div></div>'+
+      '<div class="cell"><div class="l">Signal</div><div class="v">'+lv.sig.toFixed(1)+' dBm</div></div>'+
+      '<div class="cell"><div class="l">Core Temp</div><div class="v">'+lv.temp.toFixed(1)+' °C</div></div>'+
+      '<div class="cell"><div class="l">Battery</div><div class="v">'+lv.batt+'%</div></div>'+
+      '<div class="cell"><div class="l">Last Contact</div><div class="v">'+relTime(p.contact)+'</div></div>'+
+      '<div class="cell"><div class="l">Operator</div><div class="v">'+p.op+'</div></div>'+
+    '</div>'+
+    '<div class="dv-sec">Recent Events</div>'+
+    '<ul class="dv-timeline">'+tl.map(x=>'<li class="'+(x.s==="crit"?"crit":x.s==="warn"?"warn":"")+'"><div class="tt">'+x.t+'</div><div class="tm">'+x.m+'</div></li>').join("")+'</ul>';
+  const d=$("#drawer");
+  d.classList.add("open"); d.setAttribute("aria-hidden","false");
+  $("#drawerClose").focus();
+}
+function closeDrawer(){
+  const d=$("#drawer");
+  d.classList.remove("open"); d.setAttribute("aria-hidden","true");
+  if(drawerLastFocus && drawerLastFocus.focus) drawerLastFocus.focus();
+}
+$("#drawerClose").addEventListener("click", closeDrawer);
+$("#actPing").addEventListener("click", ()=>{ toast("Ping sent to "+drawerProbe.name+" — awaiting ACK", "info"); });
+$("#actDownlink").addEventListener("click", async ()=>{
+  const ok = await openConfirm({title:"Schedule downlink", body:"Queue a 2.4 GB downlink window for "+drawerProbe.name+" via the HALO relay? This is a demo action and will not transmit data.", confirm:"Schedule", tone:"warn"});
+  if(ok) toast("Downlink scheduled for "+drawerProbe.name, "info");
+});
+$("#actIsolate").addEventListener("click", async ()=>{
+  const ok = await openConfirm({title:"Isolate subsystem", body:"Isolating a subsystem on "+drawerProbe.name+" will cut its science payload until restored. Confirm this action?", confirm:"Isolate", tone:"crit"});
+  if(ok) toast("Subsystem isolated on "+drawerProbe.name, "warn");
+});
+
+/* ============================================================
+   COMMAND PALETTE
+   ============================================================ */
+let palItems=[], palActive=0, palLastFocus=null;
+function buildPaletteItems(){
+  const items=[];
+  NAV.forEach(n=>items.push({label:"Go to "+n.label, cat:"Navigate", icon:n.icon, run:()=>setView(n.id)}));
+  PROBES.forEach(p=>items.push({label:"Open "+p.name+" ("+p.id+")", cat:"Probe", icon:"fleet", run:()=>{ setView("fleet"); openDrawer(p.id); }}));
+  items.push({label:"Simulate telemetry update", cat:"Action", icon:"telemetry", run:()=>simulate()});
+  items.push({label:"Toggle theme", cat:"Action", icon:"settings", run:toggleTheme});
+  items.push({label:"Mark all events read", cat:"Action", icon:"check", run:markAllRead});
+  items.push({label:"Collapse / expand sidebar", cat:"Action", icon:"settings", run:()=>{ sidebarCollapsed=!sidebarCollapsed; LS.set("sidebar",sidebarCollapsed); applySidebar(); }});
+  items.push({label:"Open settings", cat:"Navigate", icon:"settings", run:()=>setView("settings")});
+  return items;
+}
+function renderPalette(q){
+  q=(q||"").toLowerCase();
+  palItems = buildPaletteItems().filter(it=>it.label.toLowerCase().includes(q));
+  palActive=0;
+  const list=$("#paletteList"); list.innerHTML="";
+  if(palItems.length===0){ list.appendChild(h("li",null,"No results")); return; }
+  palItems.forEach((it,i)=>{
+    const li=h("li",{role:"option","aria-selected":String(i===0),"data-i":i});
+    li.innerHTML = svgIcon(it.icon,17)+'<span>'+it.label+'</span><span class="cat">'+it.cat+'</span>';
+    li.addEventListener("click", ()=>runPalette(i));
+    li.addEventListener("mousemove", ()=>{ if(palActive!==i){ palActive=i; highlightPalette(); }});
+    list.appendChild(li);
+  });
+}
+function highlightPalette(){
+  $$("#paletteList li").forEach((li,i)=>{ li.classList.toggle("active",i===palActive); li.setAttribute("aria-selected",String(i===palActive)); });
+  const a=$("#paletteList li.active"); if(a) a.scrollIntoView({block:"nearest"});
+}
+function runPalette(i){ const it=palItems[i]; if(it){ it.run(); closePalette(); } }
+function openPalette(){
+  palLastFocus=document.activeElement;
+  $("#paletteOverlay").classList.add("open");
+  $("#paletteInput").value=""; renderPalette("");
+  $("#paletteInput").focus();
+}
+function closePalette(){
+  $("#paletteOverlay").classList.remove("open");
+  if(palLastFocus && palLastFocus.focus) palLastFocus.focus();
+}
+$("#btnSearch").addEventListener("click", openPalette);
+$("#paletteInput").addEventListener("input", e=>renderPalette(e.target.value));
+$("#paletteInput").addEventListener("keydown", e=>{
+  if(e.key==="ArrowDown"){ e.preventDefault(); palActive=Math.min(palActive+1,palItems.length-1); highlightPalette(); }
+  else if(e.key==="ArrowUp"){ e.preventDefault(); palActive=Math.max(palActive-1,0); highlightPalette(); }
+  else if(e.key==="Enter"){ e.preventDefault(); runPalette(palActive); }
+  else if(e.key==="Tab"){ e.preventDefault(); }
+});
+$("#paletteOverlay").addEventListener("click", e=>{ if(e.target===$("#paletteOverlay")) closePalette(); });
+
+/* ============================================================
+   NOTIFICATIONS + USER MENU
+   ============================================================ */
+function updateBell(){
+  const unread = EVENTS.filter(e=>!readSet.has(e.id)).length;
+  const b=$("#bellBadge");
+  b.textContent=unread; b.classList.toggle("hidden",unread===0);
+}
+function renderNotif(){
+  const list=$("#notifList"); list.innerHTML="";
+  const unread = EVENTS.filter(e=>!readSet.has(e.id)).slice(0,5);
+  const rows = unread.length?unread:EVENTS.slice(0,4);
+  $("#notifCount").textContent = unread.length+" unread";
+  rows.forEach(e=>{
+    const li=h("div",{class:"pv-item "+e.sev});
+    li.innerHTML='<span class="sev-ic">'+svgIcon(sevIcon(e.sev),14)+'</span><div><div class="t">'+e.text+'</div><div class="m">'+e.probe+' · '+relTime(e.mins)+'</div></div>';
+    list.appendChild(li);
+  });
+}
+function toggleNotif(){
+  const pop=$("#notifPop"), btn=$("#btnBell");
+  const open=pop.classList.contains("open");
+  if(open){ pop.classList.remove("open"); btn.setAttribute("aria-expanded","false"); return; }
+  renderNotif();
+  const r=btn.getBoundingClientRect();
+  pop.style.top=(r.bottom+8)+"px";
+  pop.style.right=(window.innerWidth-r.right)+"px";
+  pop.classList.add("open"); btn.setAttribute("aria-expanded","true");
+}
+function markAllRead(){
+  EVENTS.forEach(e=>readSet.add(e.id));
+  LS.set("eventsRead", Array.from(readSet));
+  renderEvents(1); renderEvents(2); updateBadges(); updateBell(); renderNotif();
+  toast("All notifications marked as read","info");
+}
+$("#btnBell").addEventListener("click", e=>{ e.stopPropagation(); toggleNotif(); });
+$("#notifAll").addEventListener("click", markAllRead);
+$("#notifView").addEventListener("click", ()=>{ setView("incidents"); $("#notifPop").classList.remove("open"); $("#btnBell").setAttribute("aria-expanded","false"); });
+
+function toggleUser(){
+  const m=$("#userMenu"), btn=$("#btnUser");
+  const open=m.classList.contains("open");
+  if(open){ m.classList.remove("open"); btn.setAttribute("aria-expanded","false"); return; }
+  const r=btn.getBoundingClientRect();
+  m.style.top=(r.bottom+8)+"px";
+  m.style.right=(window.innerWidth-r.right)+"px";
+  m.classList.add("open"); btn.setAttribute("aria-expanded","true");
+  m.querySelector("button").focus();
+}
+$("#btnUser").addEventListener("click", e=>{ e.stopPropagation(); toggleUser(); });
+$$("#userMenu button").forEach(b=>b.addEventListener("click", ()=>{
+  const act=b.dataset.act;
+  $("#userMenu").classList.remove("open"); $("#btnUser").setAttribute("aria-expanded","false");
+  if(act==="profile") toast("Profile: M. Okafor · Flight Director","info");
+  else if(act==="prefs") setView("settings");
+  else if(act==="signout") toast("Signed out (demo session)","info");
+}));
+
+/* ============================================================
+   GLOBAL CLICK / KEY HANDLING
+   ============================================================ */
+document.addEventListener("click", e=>{
+  if(!e.target.closest("#notifPop") && !e.target.closest("#btnBell")) { $("#notifPop").classList.remove("open"); $("#btnBell").setAttribute("aria-expanded","false"); }
+  if(!e.target.closest("#userMenu") && !e.target.closest("#btnUser")) { $("#userMenu").classList.remove("open"); $("#btnUser").setAttribute("aria-expanded","false"); }
+});
+document.addEventListener("keydown", e=>{
+  // Ctrl/Cmd + K
+  if((e.ctrlKey||e.metaKey) && e.key.toLowerCase()==="k"){ e.preventDefault(); openPalette(); return; }
+  if(e.key==="Escape"){
+    if($("#paletteOverlay").classList.contains("open")){ closePalette(); return; }
+    if($("#modalWrap").classList.contains("open")){ closeModal(false); return; }
+    if($("#drawer").classList.contains("open")){ closeDrawer(); return; }
+    if($("#notifPop").classList.contains("open")){ $("#notifPop").classList.remove("open"); $("#btnBell").setAttribute("aria-expanded","false"); return; }
+    if($("#userMenu").classList.contains("open")){ $("#userMenu").classList.remove("open"); $("#btnUser").setAttribute("aria-expanded","false"); return; }
+    if($("#sidebar").classList.contains("mobile-open")){ closeMobileNav(); return; }
+  }
+});
+
+/* ============================================================
+   RANGE SEGMENTED (two instances)
+   ============================================================ */
+function bindRange(seg){
+  seg.addEventListener("click", e=>{
+    const b=e.target.closest("button"); if(!b) return;
+    range=b.dataset.range; LS.set("range",range);
+    $$("#rangeSeg button, #rangeSeg2 button").forEach(x=>x.setAttribute("aria-pressed",String(x.dataset.range===range)));
+    renderChart(1); renderChart(2);
+  });
+}
+function syncRange(){
+  $$("#rangeSeg button, #rangeSeg2 button").forEach(x=>x.setAttribute("aria-pressed",String(x.dataset.range===range)));
+}
+
+/* ============================================================
+   SIMULATE
+   ============================================================ */
+function simulate(){
+  tick += 4;
+  const now=new Date();
+  const s=fmtUTC(now);
+  $("#lastSync").textContent=s+" UTC";
+  $("#lastSync2").textContent=s+" UTC";
+  $("#verSync").textContent=s;
+  renderKpis(); renderFleet(); renderChart(1); renderChart(2);
+  if(currentView==="fleet") renderFleetKpis();
+  toast("Telemetry frame #"+tick+" received — KPIs, chart and fleet updated","info");
+}
+$("#btnSimulate").addEventListener("click", simulate);
+
+/* ============================================================
+   STATIC VIEWS
+   ============================================================ */
+function renderMilestones(){
+  const ol=$("#milestones"); ol.innerHTML="";
+  MILESTONES.forEach(m=>{
+    const li=h("li",{class:m.st});
+    li.innerHTML='<div class="d">'+m.d+'</div><div class="t">'+m.t+'</div><div class="s">'+m.s+'</div>';
+    ol.appendChild(li);
+  });
+}
+function renderPayloads(){
+  const g=$("#payloadGrid"); g.innerHTML="";
+  PAYLOADS.forEach(p=>{
+    const c=h("div",{class:"payload"});
+    c.innerHTML='<div class="ph"><span class="nm">'+p.nm+'<small>'+p.id+'</small></span>'+statusChip(p.status)+'</div>'+
+      '<dl class="rows"><div><dt>Mass</dt><dd>'+p.mass+'</dd></div><div><dt>Power</dt><dd>'+p.power+'</dd></div>'+
+      '<div><dt>Last cal</dt><dd>'+p.cal+'</dd></div><div><dt>Health</dt><dd>'+p.status.charAt(0).toUpperCase()+p.status.slice(1)+'</dd></div></dl>';
+    g.appendChild(c);
+  });
+}
+function syncSettings(){
+  const sel=$("#setTheme"); if(sel) sel.value=themeMode;
+  $("#setMotion").textContent = reduced.matches?"Reduced":"Full";
+  const sw=$("#setCollapse"); if(sw) sw.checked=sidebarCollapsed;
+}
+$("#setTheme").addEventListener("change", e=>{ themeMode=e.target.value; LS.set("theme",themeMode); applyTheme(themeMode); });
+$("#setCollapse").addEventListener("change", e=>{ sidebarCollapsed=e.target.checked; LS.set("sidebar",sidebarCollapsed); applySidebar(); });
+$("#btnReset").addEventListener("click", async ()=>{
+  const ok=await openConfirm({title:"Reset demo data", body:"This clears saved theme, filters, board layout and read state from this browser. Continue?", confirm:"Reset", tone:"warn"});
+  if(ok){ LS.clear(); location.reload(); }
+});
+
+/* ============================================================
+   CLOCKS
+   ============================================================ */
+function tickClocks(){
+  const now=new Date();
+  $("#utcClock").textContent=fmtUTC(now)+" UTC";
+  $("#utcClock").setAttribute("datetime", now.toISOString());
+  const ms = now.getTime()-MISSION_START;
+  const d=Math.floor(ms/86400000), hr=Math.floor(ms%86400000/3600000), mn=Math.floor(ms%3600000/60000), sc=Math.floor(ms%60000/1000);
+  $("#missionClock").textContent=d+"d "+pad(hr)+":"+pad(mn)+":"+pad(sc);
+}
+
+/* ============================================================
+   RESIZE
+   ============================================================ */
+let rzT=null;
+window.addEventListener("resize", ()=>{
+  clearTimeout(rzT);
+  rzT=setTimeout(()=>{ renderChart(1); renderChart(2); },150);
+});
+
+/* ============================================================
+   INIT
+   ============================================================ */
+function init(){
+  // kbd hint
+  const isMac = /Mac|iPhone|iPad/.test(navigator.platform||"");
+  $("#searchKbd").textContent = isMac?"⌘ K":"Ctrl K";
+
+  buildNav();
+  applySidebar();
+  syncRange();
+  bindRange($("#rangeSeg")); bindRange($("#rangeSeg2"));
+  buildLegend(1); buildLegend(2);
+  bindFleetSearch(); syncChips();
+  renderKpis();
+  renderFleet();
+  renderEvents(1); renderEvents(2);
+  renderKanban();
+  renderMilestones(); renderPayloads();
+  renderOrbit(1); renderOrbit(2);
+  renderChart(1); renderChart(2);
+  updateBadges(); updateBell();
+  syncSettings();
+
+  const now=new Date();
+  $("#lastSync").textContent=fmtUTC(now)+" UTC";
+  $("#lastSync2").textContent=fmtUTC(now)+" UTC";
+  $("#verSync").textContent=fmtUTC(now);
+  tickClocks();
+  setInterval(tickClocks,1000);
+
+  setView("overview");
+
+  // skeleton reveal
+  const sk=$("#skeleton");
+  const reveal=()=>{ if(sk) sk.remove(); };
+  if(reduced.matches){ reveal(); }
+  else { setTimeout(reveal, 500); }
+}
+
+if(document.readyState==="loading") document.addEventListener("DOMContentLoaded", init);
+else init();
+
+})();
+</script>
+</body>
+</html>

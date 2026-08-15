@@ -295,6 +295,64 @@ class TestEviction:
 
 
 class TestAdmission:
+    def test_reservations_are_atomic_across_owners(self) -> None:
+        pool = _pool(10, watermark_bundles=1)  # 8 request-usable bundles
+
+        assert pool.reserve(6, owner="slot-0")
+        assert not pool.reserve(3, owner="slot-1")
+        assert pool.reserve(2, owner="slot-1")
+        assert pool.reserved_for("slot-0") == 6
+        assert pool.reserved_for("slot-1") == 2
+
+    def test_allocation_consumes_only_its_owner_reservation(self) -> None:
+        pool = _pool(12, watermark_bundles=1)
+        assert pool.reserve(6, owner="slot-0")
+        assert pool.reserve(4, owner="slot-1")
+
+        pool.allocate(3, owner="slot-0")
+
+        assert pool.reserved_for("slot-0") == 3
+        assert pool.reserved_for("slot-1") == 4
+        # An unreserved allocation may not steal either request's remaining
+        # guarantee or the emergency watermark.
+        with pytest.raises(RuntimeError, match="reserved capacity"):
+            pool.allocate(1, owner="scratch")
+
+    def test_shared_or_cached_pages_consume_logical_reservation(self) -> None:
+        pool = _pool(12, watermark_bundles=1)
+        page = pool.allocate(1, owner="seed")
+        pool.publish_full_block(page[0], _key(1))
+        pool.decref(page, owner="seed")
+        assert pool.reserve(6, owner="slot-0")
+
+        pool.incref(page, owner="slot-0")
+        pool.consume_reservation(1, owner="slot-0")
+
+        # Reviving an existing page satisfies one logical page of the
+        # request; keeping all six reserved would double-count it.
+        assert pool.reserved_for("slot-0") == 5
+
+    def test_unreserved_cached_hit_cannot_steal_another_request_guarantee(self) -> None:
+        pool = _pool(10, watermark_bundles=1)
+        cached = pool.allocate(1, owner="seed")
+        pool.publish_full_block(cached[0], _key(1))
+        pool.decref(cached, owner="seed")
+        assert pool.reserve(8, owner="slot-0")
+
+        with pytest.raises(RuntimeError, match="reserved capacity"):
+            pool.incref(cached, owner="unadmitted")
+
+    def test_release_reservation_returns_capacity_without_freeing_live_pages(self) -> None:
+        pool = _pool(10, watermark_bundles=1)
+        assert pool.reserve(6, owner="slot-0")
+        live = pool.allocate(2, owner="slot-0")
+
+        pool.release_reservation(owner="slot-0")
+
+        assert pool.reserved_for("slot-0") == 0
+        assert all(pool.bundles[bundle_id].ref_cnt == 1 for bundle_id in live)
+        assert pool.reserve(4, owner="slot-1")
+
     def test_full_sequence_must_fit_check(self) -> None:
         pool = _pool(10)  # 9 usable (bundle 0 reserved as null)
         assert pool._check_admission_fits(8, owner="a")

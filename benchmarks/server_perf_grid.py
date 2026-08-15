@@ -526,6 +526,16 @@ async def main() -> None:
     p.add_argument("--base-url", default="http://127.0.0.1:8300")
     p.add_argument("--model", default="qwen3.6")
     p.add_argument(
+        "--tokenizer-path",
+        default=None,
+        help="local tokenizer/checkpoint path; defaults to the standard Qwen3.6 checkpoint",
+    )
+    p.add_argument(
+        "--server-label",
+        default="live server; launch parameters recorded separately",
+        help="exact server configuration written into the result artifact",
+    )
+    p.add_argument(
         "--endpoint",
         choices=["chat", "completions"],
         default="chat",
@@ -599,7 +609,8 @@ async def main() -> None:
             concurrencies[:1],
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(standard_checkpoint_path(), trust_remote_code=True)
+    tokenizer_path = args.tokenizer_path or standard_checkpoint_path()
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     results = {
         "config": {
             "base_url": args.base_url,
@@ -613,8 +624,8 @@ async def main() -> None:
             "warm_suffix_tokens": args.warm_suffix_tokens,
             "filler_prefix": args.filler_prefix,
             "filler_suffix": args.filler_suffix,
-            "tokenizer": standard_checkpoint_path(),
-            "server": "qwen36 best profile (MTP K=3 + CUDA Graph + prefix cache + 3x256K)",
+            "tokenizer": tokenizer_path,
+            "server": args.server_label,
         },
         "cells": {},
         "started_at": datetime.now(timezone.utc).isoformat(),

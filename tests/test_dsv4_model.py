@@ -112,8 +112,8 @@ def fill_transformer(model: Dsv4Transformer, seed: int) -> None:
     rng = random.Random(seed)
     for module in model.modules():
         if isinstance(module, PackedQ8_0Weight):  # includes PackedQ8_0Linear
-            data = valid_q8_0_blocks(rng, module.packed.numel() // 34)
-            module.packed.copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
+            data = valid_q8_0_blocks(rng, module.out_features * module.in_features // 32)
+            module.packed = torch.frombuffer(bytearray(data), dtype=torch.uint8)
         elif isinstance(module, PackedIQ2_XSExperts):
             data = valid_iq2_xs_blocks(rng, module.packed.numel() // 74)
             module.packed.copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
@@ -252,8 +252,8 @@ def test_block_hc_stream_matches_reference() -> None:
     }
 
     block = Dsv4Block(config, 0, max_seq_len=256, device="cuda")
-    block.hc_attn_fn.packed.copy_(w["blk.0.hc_attn_fn.weight"].data)
-    block.hc_ffn_fn.packed.copy_(w["blk.0.hc_ffn_fn.weight"].data)
+    block.hc_attn_fn.packed = w["blk.0.hc_attn_fn.weight"].data
+    block.hc_ffn_fn.packed = w["blk.0.hc_ffn_fn.weight"].data
     block.hc_attn_base.copy_(params["attn_base"])
     block.hc_ffn_base.copy_(params["ffn_base"])
     block.hc_attn_scale.copy_(params["attn_scale"])
@@ -325,7 +325,7 @@ def test_hc_head_matches_reference() -> None:
     scale = w["output_hc_scale.weight"].data.to(torch.float32)
 
     model = Dsv4Transformer(config, max_seq_len=256, device="cuda")
-    model.hc_head_fn.packed.copy_(w["output_hc_fn.weight"].data)
+    model.hc_head_fn.packed = w["output_hc_fn.weight"].data
     model.hc_head_base.copy_(base)
     model.hc_head_scale.copy_(scale)
 

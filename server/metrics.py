@@ -319,6 +319,16 @@ def _render_qwen_kv_capacity(lines: list[str], model_name: str) -> None:
         ("qwen_kv_slots", "Configured slot count"),
         ("qwen_kv_full_attention_layers", "Full-attention layers feeding the KV pool"),
         ("qwen_kv_gdn_layers", "GDN/recurrent layers"),
+        ("qwen_kv_bundle_bytes", "Bytes in one lock-step backbone/MTP KV bundle"),
+        ("qwen_kv_mtp_pool_bytes", "MTP KV tensor storage included in the pool total"),
+        ("qwen_kv_free_bundles", "Currently reclaimable Qwen KV bundles"),
+        ("qwen_kv_live_bundles", "Currently live Qwen KV bundles"),
+        ("qwen_kv_cached_bundles", "Cached refcount-zero Qwen KV bundles"),
+        (
+            "qwen_kv_request_reserved_bundles",
+            "Unmaterialized KV bundles promised to admitted requests",
+        ),
+        ("qwen_kv_watermark_bundles", "Emergency/COW bundles withheld from admission"),
     ]
     for key, help_text in keys:
         lines.append(f"# HELP blackwellm:{key} {help_text}")

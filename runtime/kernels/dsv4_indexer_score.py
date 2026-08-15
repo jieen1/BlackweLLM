@@ -5,15 +5,15 @@ This scorer covers decode and prefill under one narrow contract:
 - q: [1, R, 64, 128] bf16 on CUDA, where ``1 <= R <= 32``
 - kv: [N, 128] bf16 on the same CUDA device
 - weights: [1, R, 64] bf16 on the same CUDA device
-- out: [1, R, N] bf16 on the same CUDA device
+- out: [1, R, N] fp32 on the same CUDA device
 
 Semantics:
 
 ``score[r, n] = sum_h(relu(dot(q[r, h], kv[n])) * weights[r, h])``
 
-Production round points matter here: the eager expression returns bf16 from the
-einsum, keeps bf16 through ReLU and the weight multiply, then returns bf16 from
-the cross-head reduction. This is only the scorer: it does not perform top-k
+Production round points matter here: the eager expression promotes the score
+path to fp32 and keeps fp32 through ReLU, the weight multiply, and the
+cross-head reduction. This is only the scorer: it does not perform top-k
 selection.
 """
 
@@ -78,8 +78,8 @@ def _dsv4_indexer_score_kernel(
     )
     weights_base = pid_r * weights_row_stride
     weights = tl.load(weights_ptr + weights_base + offs_h).to(tl.float32)
-    # Match the reference einsum exactly: relu, weight multiply, and the
-    # head sum all stay in fp32; only the stored score rounds to bf16.
+    # Match the reference einsum exactly: relu, weight multiply, the head
+    # sum, and the stored score all stay in fp32.
     relu_dots = tl.maximum(dots, 0)
     weighted = relu_dots * weights[:, None]
     scores = tl.sum(weighted, axis=0)
@@ -130,11 +130,11 @@ def _dsv4_indexer_score_batch_kernel(
     )
     weights_base = pid_b * weights_batch_stride
     weights = tl.load(weights_ptr + weights_base + offs_h).to(tl.float32)
-    # Match the reference einsum exactly: relu, weight multiply, and the head
-    # sum stay in fp32; only the stored score rounds to bf16.
+    # Match the reference einsum exactly: relu, weight multiply, the head
+    # sum, and the stored score all stay in fp32.
     relu_dots = tl.maximum(dots, 0)
     weighted = relu_dots * weights[:, None]
-    scores = tl.sum(weighted, axis=0).to(tl.bfloat16)
+    scores = tl.sum(weighted, axis=0)
     out_base = pid_b * out_batch_stride
     tl.store(out_ptr + out_base + offs_n, scores, mask=n_mask)
 
@@ -399,7 +399,7 @@ def compile_dsv4_indexer_score_sm120(
         "q_ptr": "*bf16",
         "kv_ptr": "*bf16",
         "weights_ptr": "*bf16",
-        "out_ptr": "*bf16",
+        "out_ptr": "*fp32",
         "R": "i32",
         "q_row_stride": "i64",
         "weights_row_stride": "i64",
@@ -440,7 +440,7 @@ def compile_dsv4_indexer_score_batch_sm120(
         "kv_ptr": "*bf16",
         "weights_ptr": "*bf16",
         "slot_ids_ptr": "*i64",
-        "out_ptr": "*bf16",
+        "out_ptr": "*fp32",
         "N": "i32",
         "q_batch_stride": "i64",
         "kv_slot_stride": "i64",

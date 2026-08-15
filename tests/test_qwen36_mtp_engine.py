@@ -1212,6 +1212,42 @@ class TestPrefillSync:
         assert spec.activations == [(1, 0)]
         assert engine._spec_state_col == [0, 0]
 
+    def test_dynamic_arena_restore_never_clears_the_live_gdn_column(self) -> None:
+        """Dynamic retained pages must preserve the restored GDN checkpoint."""
+        engine = Qwen36MTPEngine.__new__(Qwen36MTPEngine)
+        engine.backend = SimpleNamespace(
+            pool=SimpleNamespace(
+                dynamic_arena=True,
+                _page_table_host=[[3, 2], [5, 4]],
+            )
+        )
+        engine.mtp_page_size = 128
+        engine._caches = [SimpleNamespace(seq_len=0), SimpleNamespace(seq_len=0)]
+        engine._sync_len = [0, 0]
+        engine._cached_prefix_sync_len = [0, 0]
+        engine._spec_state_col = [0, 0]
+
+        class _SpecRows:
+            def __init__(self) -> None:
+                self.resets = 0
+                self.activations: list[tuple[int, int]] = []
+
+            def reset_slot(self, slot: int) -> None:
+                self.resets += 1
+
+            def activate(self, slot: int, col: int) -> None:
+                self.activations.append((slot, col))
+
+        spec = _SpecRows()
+        engine._spec_rows = spec
+
+        assert engine.restore_prefix_from_arena(1, 129)
+        assert engine._caches[1].seq_len == 129
+        assert engine._sync_len[1] == 129
+        assert spec.resets == 0
+        assert spec.activations == [(1, 0)]
+        assert engine._spec_state_col == [0, 0]
+
     def test_scratch_watermark_survives_a_later_shorter_store(self) -> None:
         """A shorter later snapshot must not lower the scratch watermark.
 

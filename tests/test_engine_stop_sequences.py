@@ -31,6 +31,7 @@ import pytest
 
 pytest.importorskip("torch")
 
+from runtime.backends.protocol import BackendCapabilities
 from server.engine import GenerationRequest, ServerEngine, StreamChannel
 
 
@@ -215,6 +216,13 @@ class _FakeRunner:
     {slot: [tokens...]} per round, consumed in order."""
 
     def __init__(self, has_speculative_decode: bool, rounds: list[dict[int, list[int]]]):
+        self.capabilities = BackendCapabilities(
+            speculative_decode=has_speculative_decode,
+            prefix_cache=False,
+            cuda_graph=False,
+            chunked_prefill=False,
+            warm_continue=False,
+        )
         self.has_speculative_decode = has_speculative_decode
         self._rounds = list(rounds)
         self._kv_len: dict[int, int] = {}

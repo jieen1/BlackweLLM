@@ -91,10 +91,9 @@ DEFAULT_MAX_TOKENS = 16384
 SERVER_MODEL_PATH = os.environ.get("QSR_SERVER_MODEL_PATH", "poolside/Laguna-S-2.1-NVFP4")
 
 SERVER_CAPACITY = int(os.environ.get("QSR_SERVER_CAPACITY", "1"))
-# Laguna default bumped 1->2: ServerEngine requires num_slots >= capacity +
-# (capacity if enable_cudagraph else 0), and enable_cudagraph now defaults
-# on for Laguna (see SERVER_ENABLE_CUDAGRAPH below) -- capacity=1 needs the
-# extra slot for the CG capture's warmup writes.
+# Laguna default bumped 1->2: its non-DFlash decode graph owns one dedicated
+# capture slot. Qwen and DSV4 capture against stable pooled metadata/real rows
+# and need no extra server slot; ServerEngine computes this per backend.
 SERVER_NUM_SLOTS = int(os.environ.get("QSR_SERVER_NUM_SLOTS", "2"))
 SERVER_BLOCK_SIZE = int(os.environ.get("QSR_SERVER_BLOCK_SIZE", "64"))
 # Laguna's SparkInfer attention uses 64-token pages.  The default below is
@@ -164,6 +163,18 @@ SERVER_ENABLE_DFLASH = os.environ.get("QSR_SERVER_ENABLE_DFLASH", "0") != "0"
 # hidden) pairing fix this landing carries.
 SERVER_ENABLE_MTP = os.environ.get("QSR_SERVER_ENABLE_MTP", "0") != "0"
 SERVER_MTP_K = int(os.environ.get("QSR_SERVER_MTP_K", "4"))
+# Qwen dynamic KV Phase 4. ``legacy`` remains the rollback/default until the
+# full 4x256K GPU matrix (Phase 5) is green. ``strict`` guarantees every
+# configured slot's full context; ``elastic`` takes an explicit byte budget
+# but still uses conservative full-sequence admission (no unsafe overcommit).
+SERVER_QWEN_KV_MODE = os.environ.get("QSR_QWEN_KV_MODE", "legacy")
+SERVER_QWEN_KV_POOL_BYTES = int(os.environ.get("QSR_QWEN_KV_POOL_BYTES", "0"))
+SERVER_QWEN_KV_WATERMARK_BUNDLES = int(
+    os.environ.get("QSR_QWEN_KV_WATERMARK_BUNDLES", "8")
+)
+SERVER_QWEN_KV_FULL_SEQUENCE_MUST_FIT = (
+    os.environ.get("QSR_QWEN_KV_FULL_SEQUENCE_MUST_FIT", "1") != "0"
+)
 # Recurrent-checkpoint budget, in multiples of one checkpoint
 # (pool.recurrent_checkpoint_nbytes()). Default 0 keeps the backend
 # default (2x). At 128K with a block_size=16 boundary a checkpoint is
@@ -219,6 +230,21 @@ SERVER_THINKING_CAPABLE = os.environ.get("QSR_THINKING_CAPABLE", "1") != "0"
 SERVER_TOOL_CALL_PARSER = os.environ.get("QSR_TOOL_CALL_PARSER", "poolside_v1")
 
 engine: ServerEngine | None = None
+
+
+def _new_stream_processor(tokenizer, chat_template_kwargs: dict | None = None) -> StreamProcessor:
+    """Create a response parser that matches this request's rendered prompt.
+
+    ``QSR_THINKING_CAPABLE`` describes whether the loaded model's template can
+    leave generation inside an open ``<think>`` block.  Qwen3.6 and Qwen3.8
+    override that behavior per request: ``enable_thinking=False`` emits a
+    *closed* ``<think></think>`` block in the prompt, so generated tokens begin
+    with visible content and must not be parsed as an implicit reasoning body.
+    """
+    request_opens_thinking = SERVER_THINKING_CAPABLE and not (
+        chat_template_kwargs and chat_template_kwargs.get("enable_thinking") is False
+    )
+    return StreamProcessor(tokenizer, thinking_capable=request_opens_thinking)
 
 
 async def _tokenize_chat(engine_ref, messages, tools=None, chat_template_kwargs=None):
@@ -459,6 +485,10 @@ async def lifespan(app: FastAPI):
         mtp_num_speculative_tokens=SERVER_MTP_K,
         mtp_resync=SERVER_MTP_RESYNC,
         checkpoint_budget_multiple=(SERVER_CHECKPOINT_BUDGET_MULTIPLE or None),
+        qwen_kv_mode=SERVER_QWEN_KV_MODE,
+        qwen_kv_pool_bytes=SERVER_QWEN_KV_POOL_BYTES,
+        qwen_kv_watermark_bundles=SERVER_QWEN_KV_WATERMARK_BUNDLES,
+        qwen_kv_full_sequence_must_fit=SERVER_QWEN_KV_FULL_SEQUENCE_MUST_FIT,
         request_timeout_s=SERVER_REQUEST_TIMEOUT_S,
         gpu_memory_utilization=SERVER_GPU_MEM_UTIL,
         production=SERVER_PRODUCTION,
@@ -817,9 +847,7 @@ async def debug_stats():
         # distinguish "no capture attempted" from "field doesn't exist".
         engine.stats["_cuda_graph_dbg"] = dict(snapshot.dflash_cg_status)
         engine.stats["_backend_snapshot_stats_dbg"] = dict(snapshot.runtime_stats)
-        engine.stats["_cuda_graph_fallback_reasons_dbg"] = dict(
-            snapshot.cg_fallback_reasons
-        )
+        engine.stats["_cuda_graph_fallback_reasons_dbg"] = dict(snapshot.cg_fallback_reasons)
     # 2026-08-02 CG audit (docs/implementation-plan.md §7.3 C7-2, "activity
     # confirmation"): `_cuda_graph_dbg` above proves capture succeeded, not
     # that a real decode round actually replayed the captured graph instead
@@ -899,7 +927,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         created = int(time.time())
 
         async def _sse():
-            proc = StreamProcessor(engine.tok, thinking_capable=SERVER_THINKING_CAPABLE)
+            proc = _new_stream_processor(engine.tok, req.chat_template_kwargs)
             final_result = None
             first_token_t = None
             # First chunk: role announcement (matches vLLM format)
@@ -1061,7 +1089,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
     # Same state machine as the streaming path (server/formats/stream.py) --
     # not a second, independently-written parser for the non-streaming case.
-    proc = StreamProcessor(engine.tok, thinking_capable=SERVER_THINKING_CAPABLE)
+    proc = _new_stream_processor(engine.tok, req.chat_template_kwargs)
     proc.add_tokens(result["committed_token_ids"])
     text = proc.content_text()
     reasoning_content = proc.reasoning_content() if SERVER_REASONING_MODE == "expose" else None
@@ -1246,6 +1274,27 @@ def main() -> None:
     parser.add_argument("--capacity", type=int, default=SERVER_CAPACITY)
     parser.add_argument("--num-slots", type=int, default=SERVER_NUM_SLOTS)
     parser.add_argument("--blocks-per-slot", type=int, default=SERVER_BLOCKS_PER_SLOT)
+    parser.add_argument(
+        "--qwen-kv-mode",
+        choices=("legacy", "strict", "elastic"),
+        default=SERVER_QWEN_KV_MODE,
+        help=(
+            "Qwen KV allocation mode. legacy=fixed rows; strict=dynamic arena sized "
+            "for every slot ceiling; elastic=dynamic arena with --qwen-kv-pool-bytes."
+        ),
+    )
+    parser.add_argument(
+        "--qwen-kv-pool-bytes",
+        type=int,
+        default=SERVER_QWEN_KV_POOL_BYTES,
+        help="Physical Qwen KV byte budget for --qwen-kv-mode=elastic.",
+    )
+    parser.add_argument(
+        "--qwen-kv-watermark-bundles",
+        type=int,
+        default=SERVER_QWEN_KV_WATERMARK_BUNDLES,
+        help="Emergency/COW page bundles excluded from dynamic admission. Default 8.",
+    )
     parser.add_argument("--no-cudagraph", action="store_true")
     parser.add_argument(
         "--skip-preflight",
@@ -1347,6 +1396,11 @@ def main() -> None:
     os.environ["QSR_SERVER_CAPACITY"] = str(args.capacity)
     os.environ["QSR_SERVER_NUM_SLOTS"] = str(args.num_slots)
     os.environ["QSR_SERVER_BLOCKS_PER_SLOT"] = str(args.blocks_per_slot)
+    os.environ["QSR_QWEN_KV_MODE"] = args.qwen_kv_mode
+    os.environ["QSR_QWEN_KV_POOL_BYTES"] = str(args.qwen_kv_pool_bytes)
+    os.environ["QSR_QWEN_KV_WATERMARK_BUNDLES"] = str(
+        args.qwen_kv_watermark_bundles
+    )
     if args.no_cudagraph:
         os.environ["QSR_SERVER_ENABLE_CUDAGRAPH"] = "0"
     if args.no_prefix_cache:
@@ -1554,9 +1608,7 @@ async def metrics_endpoint():
         "decode_graph_replays",
         "decode_eager_fallbacks",
     ):
-        lines.append(
-            f"# HELP blackwellm:{stat_name}_total Backend {stat_name.replace('_', ' ')}."
-        )
+        lines.append(f"# HELP blackwellm:{stat_name}_total Backend {stat_name.replace('_', ' ')}.")
         lines.append(f"# TYPE blackwellm:{stat_name}_total counter")
         lines.append(
             f'blackwellm:{stat_name}_total{{model_name="{engine.MODEL}"}} '
@@ -1724,8 +1776,14 @@ async def anthropic_messages(request: Request):
 
     # Convert tools for the chat template
     tools = convert_tools_to_chat_template(body.get("tools"))
+    chat_template_kwargs = body.get("chat_template_kwargs")
 
-    prompt_ids = await _tokenize_chat(engine, chat_messages, tools=tools)
+    prompt_ids = await _tokenize_chat(
+        engine,
+        chat_messages,
+        tools=tools,
+        chat_template_kwargs=chat_template_kwargs,
+    )
     await _debug_log_input("ANTHROPIC /v1/messages", body, chat_messages, prompt_ids)
 
     effective_max = min(max_tokens, engine.capacity_tokens_per_slot - len(prompt_ids) - 1)
@@ -1736,7 +1794,7 @@ async def anthropic_messages(request: Request):
         import json as _json
 
         async def _anthropic_sse():
-            proc = StreamProcessor(engine.tok, thinking_capable=SERVER_THINKING_CAPABLE)
+            proc = _new_stream_processor(engine.tok, chat_template_kwargs)
             final_result = None
             first_token_t = None
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -1908,7 +1966,7 @@ async def anthropic_messages(request: Request):
     )
     _raw_anth = await _tokenize_decode(engine, result["committed_token_ids"])
     # Same state machine as the streaming path (server/formats/stream.py).
-    proc = StreamProcessor(engine.tok, thinking_capable=SERVER_THINKING_CAPABLE)
+    proc = _new_stream_processor(engine.tok, chat_template_kwargs)
     proc.add_tokens(result["committed_token_ids"])
     text = proc.content_text()
     reasoning_content = proc.reasoning_content() if SERVER_REASONING_MODE == "expose" else None
@@ -1965,7 +2023,13 @@ async def responses_api(request: Request):
     if not chat_messages:
         raise _invalid_request("no messages provided")
     tools = convert_tools_to_chat_template(body.get("tools"))
-    prompt_ids = await _tokenize_chat(engine, chat_messages, tools=tools)
+    chat_template_kwargs = body.get("chat_template_kwargs")
+    prompt_ids = await _tokenize_chat(
+        engine,
+        chat_messages,
+        tools=tools,
+        chat_template_kwargs=chat_template_kwargs,
+    )
     await _debug_log_input("OPENAI /v1/responses", body, chat_messages, prompt_ids)
     _validate_capacity(prompt_ids, max_tokens)
 
@@ -1973,7 +2037,7 @@ async def responses_api(request: Request):
         import json as _json
 
         async def _responses_sse():
-            proc = StreamProcessor(engine.tok, thinking_capable=SERVER_THINKING_CAPABLE)
+            proc = _new_stream_processor(engine.tok, chat_template_kwargs)
             final_result = None
             first_token_t = None
             resp_id = f"resp_{uuid.uuid4().hex[:24]}"
@@ -2216,7 +2280,7 @@ async def responses_api(request: Request):
         stop_sequences=None,
     )
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
-    proc = StreamProcessor(engine.tok, thinking_capable=SERVER_THINKING_CAPABLE)
+    proc = _new_stream_processor(engine.tok, chat_template_kwargs)
     proc.add_tokens(result["committed_token_ids"])
     text = proc.content_text()
     reasoning_content = proc.reasoning_content() if SERVER_REASONING_MODE == "expose" else None

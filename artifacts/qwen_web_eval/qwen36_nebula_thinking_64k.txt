@@ -1,0 +1,36 @@
+The user wants a complete, single-file HTML page for "Nebula Mission Control" - a complex SaaS operations dashboard for managing a deep space robot fleet. This is an extremely comprehensive request with many specific requirements. Let me plan the structure carefully:
+
+1. **HTML Structure**: Semantic layout with header, sidebar, main content area
+2. **CSS**: Custom properties for theming, responsive design, dark/light themes
+3. **JavaScript**: All interactions, data management, charts, etc.
+
+Key components to implement:
+- Top global bar with mission info, search, UTC time, theme toggle, notifications, user menu
+- Left sidebar navigation with icons, badges, collapsible
+- Main workspace with:
+  - KPI cards with mini sparklines
+  - Telemetry chart (SVG/Canvas) with 3 time series
+  - Orbital diagram with zoom
+  - Fleet table with sorting, filtering, pagination
+  - Detail drawer for fleet items
+  - Event stream with filtering
+  - Mission timeline kanban with drag & drop
+- Command palette (Ctrl+K)
+- Toast notifications
+- Modal confirmations
+- Skeleton loading
+- Theme persistence via localStorage
+- Responsive design for desktop, tablet, mobile
+
+Let me build this systematically. I'll use deterministic data (no random numbers that change on reload).
+
+This is going to be a very large file. Let me structure it carefully.
+
+I'll create:
+- CSS custom properties for all design tokens
+- SVG icons inline
+- Canvas-based charts
+- Deterministic mock data
+- Full interaction handlers
+
+Let me write this out completely.

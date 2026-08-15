@@ -499,6 +499,35 @@ class Qwen36MTPEngine:
         self._caches[slot].seq_len = kv_len
         self._sync_len[slot] = kv_len
 
+    def restore_prefix_from_arena(self, slot: int, kv_len: int) -> bool:
+        """Activate MTP rows retained in dynamic arena bundles.
+
+        Dynamic Qwen allocates backbone and MTP KV as one lock-step bundle
+        mapping.  ``Qwen36SlotPool.restore_prefix_from_arena`` has already
+        revived the physical bundles and installed the target page-table
+        row, so restoring MTP is metadata-only; copying would waste both
+        bandwidth and a second full-context allocation.
+        """
+        if not self.backend.pool.dynamic_arena:
+            return False
+        pages = (kv_len + self.mtp_page_size - 1) // self.mtp_page_size
+        row = self.backend.pool._page_table_host[slot]  # noqa: SLF001
+        if kv_len <= 0 or any(page == 0 for page in row[:pages]):
+            return False
+        cache = self._caches[slot]
+        cache.seq_len = kv_len
+        self._sync_len[slot] = kv_len
+        self._cached_prefix_sync_len[slot] = 0
+        if self._spec_rows is not None:
+            # The backend restored the recurrent checkpoint into the live
+            # GDN column before activating the retained MTP pages.  Clearing
+            # the speculative rows here would also erase that checkpoint.
+            # Candidate columns are overwritten by verify, so only restore
+            # the active-column pointer.
+            self._spec_rows.activate(slot, 0)
+        self._spec_state_col[slot] = 0
+        return True
+
     def mtp_write_index(self, slot: int, kv_len: int) -> int:
         """Physical flattened KV row for one logical MTP token position.
 

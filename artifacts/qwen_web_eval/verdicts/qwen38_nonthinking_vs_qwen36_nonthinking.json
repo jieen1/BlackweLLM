@@ -1,0 +1,17 @@
+{
+  "score": 93,
+  "verdict": "pass",
+  "category_match": true,
+  "differences": [
+    "Qwen3.8 uses a brighter, softer card system with stronger spacing and typography consistency than the Qwen3.6 dark dashboard.",
+    "Qwen3.8 avoids the Qwen3.6 desktop overlap between the orbital panel and fleet table.",
+    "Qwen3.8 has the cleaner mobile card stack, although its top bar and subtitle still clip at 390px.",
+    "The screenshot uses a one-line repaired copy because the raw Qwen3.8 JavaScript contains a fatal missing parenthesis."
+  ],
+  "suggestions": [
+    "Preserve the Qwen3.8 visual system but add a final JavaScript parse check before delivery.",
+    "Reduce or hide secondary top-bar controls below 480px and allow the mission subtitle to wrap cleanly.",
+    "Keep the unmodified raw output alongside any repaired preview so model correctness remains auditable."
+  ],
+  "reasoning": "The repaired Qwen3.8 non-thinking page is the strongest visual result and clearly matches a polished mission-control dashboard, but the raw model artifact is not functionally shippable because of one fatal JavaScript syntax error."
+}

@@ -24,6 +24,15 @@ def _torch_oracle(
     return (dots.relu() * weights.unsqueeze(-1)).sum(dim=2)
 
 
+def _torch_fp32_oracle(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    dots = torch.einsum("bshd,nd->bshn", q.float(), kv.float())
+    return (dots.relu() * weights.float().unsqueeze(-1)).sum(dim=2)
+
+
 def _torch_batch_slot_oracle(
     q: torch.Tensor,
     kv_slots: torch.Tensor,
@@ -175,14 +184,13 @@ def test_dsv4_indexer_score_matches_torch_oracle(rows: int) -> None:
         ],
         dim=1,
     )
-    expected = _torch_oracle(q, kv, weights)
-    assert actual.dtype == torch.bfloat16
+    expected = _torch_fp32_oracle(q, kv, weights)
+    assert actual.dtype == torch.float32
     assert actual.shape == (1, rows, 257)
     torch.testing.assert_close(actual, serial, atol=0.0, rtol=0.0)
-    # The existing production B1 scorer can differ from eager Torch by one BF16
-    # rounding step on a small number of rows; prefill must stay exact to the
-    # serial production path.
-    torch.testing.assert_close(actual, expected, atol=0.125, rtol=0.0)
+    # Triton and eager Torch use fp32 throughout; libdevice/tensor-core
+    # reduction order can still introduce a small absolute delta.
+    torch.testing.assert_close(actual, expected, atol=4e-5, rtol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU parity test is opt-in")
@@ -223,7 +231,7 @@ def test_dsv4_indexer_score_batch_matches_serial_b1_torch_oracle(
     actual = dsv4_indexer_score_batch(q, kv_slots, weights, slot_ids)
     expected = torch.cat(
         [
-            _torch_oracle(q[row : row + 1], kv_slots[slot], weights[row : row + 1])
+            _torch_fp32_oracle(q[row : row + 1], kv_slots[slot], weights[row : row + 1])
             for row, slot in enumerate(slot_ids_list)
         ],
         dim=0,
@@ -240,13 +248,12 @@ def test_dsv4_indexer_score_batch_matches_serial_b1_torch_oracle(
         dim=0,
     )
 
-    assert actual.dtype == torch.bfloat16
+    assert actual.dtype == torch.float32
     assert actual.shape == (batch_size, 1, 257)
     torch.testing.assert_close(actual, serial, atol=0.0, rtol=0.0)
-    # The exact production contract here is parity with the existing B1 scorer.
-    # Eager Torch remains a useful cross-check, but on GPU it can differ by one
-    # BF16 rounding step on some rows even when the serial kernel matches.
-    torch.testing.assert_close(actual, expected, atol=0.125, rtol=0.0)
+    # The exact production contract here is parity with the existing B1 scorer;
+    # eager Torch remains a small-tolerance cross-check for reduction ordering.
+    torch.testing.assert_close(actual, expected, atol=4e-5, rtol=1e-5)
 
 
 def test_compile_dsv4_indexer_score_sm120_offline() -> None:

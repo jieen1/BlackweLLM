@@ -200,6 +200,45 @@ _PREFIX_CACHE_HIT_SAMPLES_KEPT = 200
 _SESSION_WARM_CONTINUATION_SAMPLES_KEPT = 200
 
 
+def _cuda_graph_extra_slots(
+    *, backend: str, enable_cudagraph: bool, enable_dflash: bool
+) -> int:
+    """Return dedicated server slots required only for graph capture."""
+    if not enable_cudagraph or enable_dflash:
+        return 0
+    if backend in {"deepseek_v4", "qwen36"}:
+        return 0
+    return 1
+
+
+def _qwen_kv_bundle_bytes(model: Any, *, include_mtp: bool, page_size: int = 128) -> int:
+    """Return exact K+V bytes carried by one Qwen arena bundle.
+
+    This mirrors the actual tensor constructors in ``Qwen36SlotPool`` and
+    ``build_pooled_mtp_caches``. It intentionally inspects the loaded model's
+    dtypes/geometries instead of baking the current Qwen3.8 constants into a
+    deployment knob.
+    """
+    import torch
+
+    def attention_bytes(attn: Any) -> int:
+        element_size = torch.empty((), dtype=attn.kv_cache_dtype).element_size()
+        return 2 * page_size * attn.num_kv_heads * attn.head_dim * element_size
+
+    total = sum(
+        attention_bytes(layer.self_attn)
+        for layer in model.model.layers
+        if layer.layer_type != "linear_attention"
+    )
+    if include_mtp:
+        if model.mtp is None:
+            raise ValueError("MTP KV budgeting requested but the loaded model has no MTP head")
+        total += attention_bytes(model.mtp.layers[0].self_attn)
+    if total <= 0:
+        raise ValueError("loaded Qwen model has no paged-attention KV tensors to budget")
+    return total
+
+
 def _longest_common_prefix_len(a: list[int], b: list[int], cap: int | None = None) -> int:
     """Length of the common prefix of ``a`` and ``b``, optionally capped.
 
@@ -338,6 +377,10 @@ class ServerEngine:
         mtp_num_speculative_tokens: int = 4,
         mtp_resync: bool | None = None,
         checkpoint_budget_multiple: int | None = None,
+        qwen_kv_mode: str = "legacy",
+        qwen_kv_pool_bytes: int = 0,
+        qwen_kv_watermark_bundles: int = 8,
+        qwen_kv_full_sequence_must_fit: bool = True,
         gpu_memory_utilization: float = 0.85,
         idle_sleep_s: float = 0.005,
         production: bool = True,
@@ -370,6 +413,36 @@ class ServerEngine:
         self.mtp_num_speculative_tokens = mtp_num_speculative_tokens
         self.mtp_resync = mtp_resync
         self.checkpoint_budget_multiple = checkpoint_budget_multiple
+        if qwen_kv_mode not in {"legacy", "strict", "elastic"}:
+            raise ValueError(
+                f"qwen_kv_mode={qwen_kv_mode!r} must be 'legacy', 'strict', or 'elastic'"
+            )
+        if qwen_kv_mode != "legacy" and backend != "qwen36":
+            raise ValueError(f"qwen_kv_mode={qwen_kv_mode!r} requires backend='qwen36'")
+        if qwen_kv_pool_bytes < 0:
+            raise ValueError("qwen_kv_pool_bytes must be non-negative")
+        if qwen_kv_watermark_bundles < 0:
+            raise ValueError("qwen_kv_watermark_bundles must be non-negative")
+        if qwen_kv_mode == "elastic" and qwen_kv_pool_bytes <= 0:
+            raise ValueError("qwen_kv_mode='elastic' requires qwen_kv_pool_bytes > 0")
+        if qwen_kv_mode != "legacy" and not qwen_kv_full_sequence_must_fit:
+            raise ValueError(
+                "dynamic Qwen KV currently requires full-sequence reservation; "
+                "chunk-only overcommit has no safe preemption/recompute path"
+            )
+        mtp_graph_pool_enabled = (
+            enable_cudagraph
+            and os.environ.get("QSR_QWEN36_MTP_CUDA_GRAPH", "1") != "0"
+        )
+        if qwen_kv_mode != "legacy" and enable_mtp and not mtp_graph_pool_enabled:
+            raise ValueError(
+                "dynamic Qwen KV with MTP requires CUDA Graph pooled MTP caches; "
+                "the eager MTP path still allocates fixed per-slot cache rows"
+            )
+        self.qwen_kv_mode = qwen_kv_mode
+        self.qwen_kv_pool_bytes = qwen_kv_pool_bytes
+        self.qwen_kv_watermark_bundles = qwen_kv_watermark_bundles
+        self.qwen_kv_full_sequence_must_fit = qwen_kv_full_sequence_must_fit
         self.MODEL = model
         self.K = 0
 
@@ -399,19 +472,27 @@ class ServerEngine:
             self.K = mtp_num_speculative_tokens
 
         # CUDA Graph slot budget:
-        # - Decode CG (M=1) captures against ONE slot (the last), not capacity
-        #   slots.  After capture the slot is reset before real use.
+        # - Laguna decode CG (M=1) captures against ONE dedicated slot (the
+        #   last), not capacity slots.  After capture the slot is reset before
+        #   real use.
+        # - Qwen captures every decode batch against the real rows before the
+        #   server accepts work, then reset_all() clears them.  Its MTP anchor
+        #   graph uses Qwen36SlotPool.scratch_row.  Reserving another server
+        #   slot therefore duplicates a full KV/GDN row (9.3 GiB at 256K,
+        #   FP8 backbone KV + BF16 MTP KV, K=3) without protecting any graph.
         # - DFlash draft/verify CGs use shared scratch buffers and replay
         #   sequentially per slot; they do NOT need extra physical slots.
         # - DSV4 decode CG is a shared batched driver (B=1/2/4) whose slot ids
         #   and positions are persistent tensor inputs, so it is NOT bound to
         #   a concrete slot and needs no dedicated warmup slot (capacity plan
         #   Phase 2: cg_extra=0, exactly num_slots=capacity).
-        # So: +1 slot for decode CG warmup (non-DFlash non-DSV4 only),
-        # +0 for DFlash and DSV4.
-        cg_extra = 0
-        if enable_cudagraph and not enable_dflash and backend != "deepseek_v4":
-            cg_extra = 1  # single warmup slot for M=1 decode CG capture
+        # So: +1 only for Laguna's non-DFlash decode CG; +0 for Qwen, DFlash,
+        # and DSV4.
+        cg_extra = _cuda_graph_extra_slots(
+            backend=backend,
+            enable_cudagraph=enable_cudagraph,
+            enable_dflash=enable_dflash,
+        )
         if production:
             min_slots = capacity + cg_extra
         else:
@@ -529,6 +610,11 @@ class ServerEngine:
         # A5/B4: incremental chunked prefill state (None = no prefill in progress)
         self._pending_prefill = None  # ChunkedPrefillState | None
         self._pending_prefill_reqs: list[tuple[int, GenerationRequest]] = []
+        # A dynamic-arena capacity miss cannot improve while the same active
+        # requests keep their pages. Avoid re-hashing a long waiting prompt on
+        # every decode token; completion/cancel clears this immediately, and
+        # the bounded retry covers any less common capacity transition.
+        self._kv_admission_retry_round = 0
         self.retained: dict[str, dict[str, Any]] = {}
         self.ref_slot_for = {p: capacity + p for p in range(capacity)}
         self.diag_slot_for = {p: 2 * capacity + p for p in range(capacity)}
@@ -541,6 +627,7 @@ class ServerEngine:
             "rounds": 0,
             "admissions": 0,
             "admission_batch_sizes": [],
+            "kv_admission_waits": 0,
             "round_batch_sizes": [],
             "bootstrap_checks_ok": 0,
             "bootstrap_checks_failed": 0,
@@ -732,6 +819,28 @@ class ServerEngine:
             max_seq_len=max_model_len,
             enable_mtp=self.enable_mtp,
         )
+        dynamic_arena = self.qwen_kv_mode != "legacy"
+        pool_bundles = None
+        bundle_bytes = _qwen_kv_bundle_bytes(model, include_mtp=self.enable_mtp)
+        pages_per_slot = (max_model_len + 127) // 128
+        if self.qwen_kv_mode == "strict":
+            # Null bundle + every addressable server slot at its declared
+            # ceiling + an explicit emergency/COW watermark. The scratch row
+            # is logical-only in dynamic mode and borrows pages during load-
+            # time capture rather than pinning another 256K row forever.
+            pool_bundles = (
+                1 + self.num_slots * pages_per_slot + self.qwen_kv_watermark_bundles
+            )
+        elif self.qwen_kv_mode == "elastic":
+            pool_bundles = self.qwen_kv_pool_bytes // bundle_bytes
+            min_bundles = 1 + pages_per_slot + self.qwen_kv_watermark_bundles
+            if pool_bundles < min_bundles:
+                raise ValueError(
+                    "Qwen elastic KV pool cannot fit one maximum-length request plus "
+                    f"null/watermark: bytes={self.qwen_kv_pool_bytes}, "
+                    f"bundle_bytes={bundle_bytes}, bundles={pool_bundles}, "
+                    f"required_at_least={min_bundles}"
+                )
         # A5/B4: this is live again. Qwen36Backend.prefill_chunked_step now
         # advances one chunk per round and returns done=False until the prompt
         # is consumed, so the incremental branch below is reachable and a long
@@ -771,6 +880,9 @@ class ServerEngine:
             dtype=torch.bfloat16,
             enable_prefix_cache=self.enable_prefix_cache,
             checkpoint_budget_multiple=self.checkpoint_budget_multiple,
+            dynamic_arena=dynamic_arena,
+            pool_bundles=pool_bundles,
+            watermark_bundles=self.qwen_kv_watermark_bundles,
         )
         self._warmup_qwen36_full_forward()
         # MTP extends the shared GDN state allocation so its column zero is
@@ -1415,6 +1527,12 @@ class ServerEngine:
         logprobs_data: list[dict] | None = None,
         matched_stop_sequence: str | None = None,
     ) -> None:
+        if self.runner.capabilities.kv_reservation:
+            # A request may stop at EOS long before its declared max_tokens.
+            # Release the unmaterialized tail even when session affinity keeps
+            # the live prefix/slot resident and therefore skips reset_slot().
+            self.runner.release_kv_reservation(slot)
+            self._kv_admission_retry_round = 0
         tracer.request_finished(req.request_id, finish_reason)
         prefill_elapsed = max(
             0.0,
@@ -1533,6 +1651,7 @@ class ServerEngine:
                 except Exception:
                     logger.exception("cancel reset_slot(%d) failed", s)
                 self.free_slots.append(s)
+                self._kv_admission_retry_round = 0
             # Also remove from waiting queue
             if self._cancel_set:
                 self.waiting = [r for r in self.waiting if r.request_id not in self._cancel_set]
@@ -1618,7 +1737,12 @@ class ServerEngine:
                     self._pending_prefill_reqs = []
 
         # -- normal admission (starts incremental prefill, non-blocking) --
-        if self._pending_prefill is None and self.free_slots and self.waiting:
+        if (
+            self._pending_prefill is None
+            and self.free_slots
+            and self.waiting
+            and self.stats["rounds"] >= self._kv_admission_retry_round
+        ):
             n = min(len(self.free_slots), len(self.waiting))
             # Cache-aware slot assignment: match each prompt to the free
             # slot with the deepest warm KV prefix hit (same-slot reuse).
@@ -1648,8 +1772,6 @@ class ServerEngine:
                     best_slot = remaining_slots.pop(0)
                 admit_now.append((best_slot, req))
             self.free_slots = remaining_slots
-            new_slots = [s for s, _ in admit_now]
-            new_prompts = [r.prompt_ids for _, r in admit_now]
             for _slot, req in admit_now:
                 _adm_phase(req, "slot_match")
             try:
@@ -1658,37 +1780,61 @@ class ServerEngine:
                         self.runner.reset_slot(slot)
                 for _slot, req in admit_now:
                     _adm_phase(req, "reset")
-                # reconcile_prefix_hit returns a PrefixHit (runtime/backends/
-                # protocol.py); .effective is the length safe to skip prefill
-                # for (== state_hit, never kv_hit -- see PrefixHit's own
-                # docstring and docs/a3-cache-coordinator-design.md §3).
-                # A3 step 7-g: routed through the coordinator, not
-                # self.runner directly -- see self.slot_resources's docstring.
-                hit_depths = [
-                    self.slot_resources.reconcile_prefix_hit(p).effective for p in new_prompts
-                ]
-                for _slot, req in admit_now:
-                    _adm_phase(req, "reconcile")
-                # E2-b: only non-greedy requests carry an entry -- see the
-                # MTP-round call site's identical comment on why a missing
-                # entry preserves prior (greedy) behavior byte-for-byte.
-                # Harmless/ignored on a backend without DFlash enabled
-                # (LagunaBackend.prefill_chunked_begin's non-DFlash branch
-                # never looks at it -- those requests already go through
-                # decode_batch_sampled exclusively, per classify_decode_slots).
-                params_per_slot = {
-                    slot: req.sampling_params
-                    for slot, req in admit_now
-                    if not req.sampling_params.is_greedy
-                }
-                prefill_state = self.runner.prefill_chunked_begin(
-                    new_slots,
-                    new_prompts,
-                    chunk_size=self._prefill_chunk_size,
-                    params_per_slot=params_per_slot,
-                )
-                for _slot, req in admit_now:
-                    _adm_phase(req, "prefill_begin")
+                if self.runner.capabilities.kv_reservation:
+                    # Match vLLM's full_sequence_must_fit admission gate, but
+                    # retain an explicit per-request remainder because our
+                    # chunked prefill spans engine rounds. The first capacity
+                    # miss preserves FCFS: it and the unexamined tail go back
+                    # to waiting, and no GPU write has happened yet.
+                    first_wait = None
+                    for index, (slot, req) in enumerate(admit_now):
+                        total_tokens = len(req.prompt_ids) + req.max_tokens + self.K
+                        if not self.runner.reserve_kv_capacity(slot, total_tokens):
+                            first_wait = index
+                            break
+                    if first_wait is not None:
+                        deferred = admit_now[first_wait:]
+                        admit_now = admit_now[:first_wait]
+                        self.waiting = [req for _slot, req in deferred] + self.waiting
+                        self.free_slots.extend(slot for slot, _req in deferred)
+                        self.stats["kv_admission_waits"] += 1
+                        self._kv_admission_retry_round = self.stats["rounds"] + 16
+                        for _slot, req in deferred:
+                            _adm_phase(req, "kv_wait")
+
+                new_slots = [s for s, _ in admit_now]
+                new_prompts = [r.prompt_ids for _, r in admit_now]
+                prefill_state = None
+                hit_depths = []
+                if admit_now:
+                    # reconcile_prefix_hit returns a PrefixHit (runtime/backends/
+                    # protocol.py); .effective is the length safe to skip prefill
+                    # for (== state_hit, never kv_hit -- see PrefixHit's own
+                    # docstring and docs/a3-cache-coordinator-design.md §3).
+                    # A3 step 7-g: routed through the coordinator, not
+                    # self.runner directly -- see self.slot_resources's docstring.
+                    hit_depths = [
+                        self.slot_resources.reconcile_prefix_hit(p).effective
+                        for p in new_prompts
+                    ]
+                    for _slot, req in admit_now:
+                        _adm_phase(req, "reconcile")
+                    # E2-b: only non-greedy requests carry an entry -- see the
+                    # MTP-round call site's identical comment on why a missing
+                    # entry preserves prior (greedy) behavior byte-for-byte.
+                    params_per_slot = {
+                        slot: req.sampling_params
+                        for slot, req in admit_now
+                        if not req.sampling_params.is_greedy
+                    }
+                    prefill_state = self.runner.prefill_chunked_begin(
+                        new_slots,
+                        new_prompts,
+                        chunk_size=self._prefill_chunk_size,
+                        params_per_slot=params_per_slot,
+                    )
+                    for _slot, req in admit_now:
+                        _adm_phase(req, "prefill_begin")
             except Exception as exc:
                 logger.exception("admission failed for %d request(s)", len(admit_now))
                 for slot, req in admit_now:
@@ -1701,10 +1847,12 @@ class ServerEngine:
                         logger.exception("reset_slot(%d) failed in admission recovery", slot)
                     self.free_slots.append(slot)
             else:
-                self._log_prefix_overlap(admit_now)
-                self._record_prefix_cache_hits(admit_now, hit_depths)
-                if prefill_state.done:
+                if prefill_state is None:
+                    pass
+                elif prefill_state.done:
                     # Short prompt: prefill completed immediately
+                    self._log_prefix_overlap(admit_now)
+                    self._record_prefix_cache_hits(admit_now, hit_depths)
                     self.stats["admissions"] += 1
                     self.stats["admission_batch_sizes"].append(len(admit_now))
                     prefill_result = prefill_state.result
@@ -1714,6 +1862,8 @@ class ServerEngine:
                         self._activate_slot(slot, req, anchor, drafts)
                 else:
                     # Long prompt: prefill will be advanced incrementally
+                    self._log_prefix_overlap(admit_now)
+                    self._record_prefix_cache_hits(admit_now, hit_depths)
                     self._pending_prefill = prefill_state
                     self._pending_prefill_reqs = admit_now
 
@@ -1761,6 +1911,7 @@ class ServerEngine:
             # Have waiting requests but no active slots — retry admission
             # next round without blocking. Brief sleep to avoid hot-spin
             # if admission keeps failing (e.g. OOM).
+            self._kv_admission_retry_round = 0
             time.sleep(0.01)
             return
 
