@@ -270,3 +270,54 @@ class TestByteBudgetLRU:
         pool.register(1, hash_value=100, num_tokens=64, nbytes=50)
         pool.evict_for_budget(50)
         assert 1 in pool  # nothing needed to move
+
+
+class TestIncludePinnedBudgetEviction:
+    """Plan §4.7 P1-M: a family hard-bounds its own residency by letting a
+    new store evict older PINNED entries of that family, while the default
+    direction (rolling pressure, ``include_pinned=None``) keeps pinned
+    entries protected -- the 2026-08-05 semantics, unchanged."""
+
+    def test_include_pinned_evicts_matching_pinned_keys_lru_first(self):
+        pool = RecurrentStatePool(byte_budget=200)
+        pool.register(("persistent", "a"), hash_value="ha", num_tokens=64, nbytes=100)
+        pool.register(("persistent", "b"), hash_value="hb", num_tokens=64, nbytes=100)
+        pool.pin(("persistent", "a"))
+        pool.pin(("persistent", "b"))
+        pool.evict_for_budget(100, include_pinned=lambda k: k[0] == "persistent")
+        # Oldest pinned entry yields to make room; the newest survives.
+        assert ("persistent", "a") not in pool
+        assert ("persistent", "b") in pool
+        assert pool.is_pinned(("persistent", "b"))
+
+    def test_include_pinned_false_keeps_pinned_keys_protected(self):
+        pool = RecurrentStatePool(byte_budget=100)
+        pool.register((0, 64), hash_value="rolling", num_tokens=64, nbytes=100)
+        pool.register(("persistent", "a"), hash_value="ha", num_tokens=64, nbytes=100)
+        pool.pin(("persistent", "a"))
+        # A predicate that matches nothing behaves like the default
+        # direction: the unpinned rolling checkpoint yields, the pinned
+        # persistent entry stays.
+        pool.evict_for_budget(100, include_pinned=lambda k: False)
+        assert ("persistent", "a") in pool
+        assert (0, 64) not in pool
+
+    def test_include_pinned_fires_lockstep_drop_callbacks(self):
+        dropped: list = []
+        pool = RecurrentStatePool(
+            byte_budget=100,
+            should_drop_kv_hash=lambda key: True,
+            drop_kv_hash=lambda key: dropped.append(key),
+        )
+        pool.register(("persistent", "a"), hash_value="ha", num_tokens=64, nbytes=100)
+        pool.pin(("persistent", "a"))
+        pool.evict_for_budget(100, include_pinned=lambda k: k[0] == "persistent")
+        assert dropped == [("persistent", "a")]
+        assert ("persistent", "a") not in pool
+
+    def test_default_direction_still_protects_pinned(self):
+        pool = RecurrentStatePool(byte_budget=100)
+        pool.register(("persistent", "a"), hash_value="ha", num_tokens=64, nbytes=100)
+        pool.pin(("persistent", "a"))
+        pool.evict_for_budget(100)  # include_pinned=None
+        assert ("persistent", "a") in pool

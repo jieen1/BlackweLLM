@@ -163,7 +163,12 @@ class RecurrentStatePool:
     exhaustion ``RuntimeError``: going over budget because every evictable
     checkpoint is pinned is tolerated (the KV pool is the contested, hard-
     limited resource; checkpoints are the cheaper "safety valve" --
-    docs/a3-cache-coordinator-design.md §4).
+    docs/a3-cache-coordinator-design.md §4). A caller can close the valve
+    for its own family: :meth:`evict_for_budget` with ``include_pinned``
+    makes the matching pinned keys evictable too, which is how the
+    persistent prefix family keeps its own residency hard-bounded (plan
+    §4.7 P1-M) without weakening the protection rolling-checkpoint
+    pressure gets against it.
     """
 
     def __init__(
@@ -254,18 +259,36 @@ class RecurrentStatePool:
             if self._should_drop_kv_hash(key):
                 self._drop_kv_hash(key)
 
-    def evict_for_budget(self, incoming_bytes: int) -> None:
+    def evict_for_budget(
+        self,
+        incoming_bytes: int,
+        *,
+        include_pinned: Callable[[Any], bool] | None = None,
+    ) -> None:
         """Evict LRU-oldest-first, skipping pinned keys, until adding
         ``incoming_bytes`` fits within ``byte_budget`` -- or until no more
         evictable (unpinned) checkpoints remain, in which case the budget
         is exceeded and this returns anyway (soft cap; see class
-        docstring)."""
+        docstring).
+
+        ``include_pinned`` (plan §4.7 P1-M), when given, additionally makes
+        pinned keys for which it returns true evictable: they are unpinned
+        and evicted in LRU order exactly like unpinned keys. The caller
+        chooses the direction: rolling-checkpoint pressure passes ``None``
+        (persistent entries stay protected, the 2026-08-05 fix), while a
+        new persistent store passes a predicate matching the persistent
+        family so that family LRU-evicts within its own budget instead of
+        growing residency without bound. Eviction still runs through
+        :meth:`evict`, so the lockstep KV-hash callbacks fire for every
+        key dropped."""
         total = self.total_bytes
         for key in list(self._lru.keys()):  # oldest-first; snapshot, evict mutates
             if total + incoming_bytes <= self.byte_budget:
                 break
             if key in self._pinned:
-                continue
+                if include_pinned is None or not include_pinned(key):
+                    continue
+                self.unpin(key)
             nbytes = self._meta[key].nbytes
             self.evict(key)
             total -= nbytes

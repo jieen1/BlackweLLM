@@ -458,6 +458,7 @@ class Qwen36Backend:
             "prefix_persistent_restores": 0,
             "prefix_persistent_stores": 0,
             "prefix_persistent_evictions": 0,
+            "prefix_persistent_store_budget_skips": 0,
             "prefix_publish_failures": 0,
             "checkpoints_taken": 0,
             "checkpoints_evicted_by_budget": 0,
@@ -1504,7 +1505,31 @@ class Qwen36Backend:
         # persistent checkpoint rather than two copies of the same state.
         # Its callback clears any older KV identity before its scratch pages
         # can be reused.
-        self.checkpoint_pool.evict_for_budget(self._checkpoint_bytes)
+        #
+        # Hard family budget (plan §4.7 P1-M): entries stay pinned against
+        # rolling-checkpoint pressure (the 2026-08-05 fix, unchanged), but a
+        # NEW store LRU-evicts older persistent entries -- before this,
+        # dynamic-arena entries were pinned forever, so residency grew one
+        # ~75.75 MiB checkpoint clone per distinct stored prompt without
+        # bound.  Eviction stays atomic: RecurrentStatePool.evict's lockstep
+        # callback drops the evictee's KV identity, checkpoint, and scratch
+        # pages together; in dynamic arena its KV bundles stay in the arena
+        # as ordinary CACHED_REF0 blocks, so a later repeat degrades to a
+        # KV-only hit (safe recompute), never a corrupted restore.
+        self.checkpoint_pool.evict_for_budget(
+            self._checkpoint_bytes,
+            include_pinned=lambda key: isinstance(key, tuple) and key[0] == "persistent",
+        )
+        if (
+            self.checkpoint_pool.total_bytes + self._checkpoint_bytes
+            > self.checkpoint_pool.byte_budget
+        ):
+            # Defensive hard cap: still over budget after evicting every
+            # evictable persistent entry.  Refuse the store rather than
+            # exceed the budget -- the affected prefix simply pays a full
+            # prefill on its next repeat (the safe miss direction).
+            self.stats["prefix_persistent_store_budget_skips"] += 1
+            return
         key = ("persistent", hash_value)
         if not dynamic_arena:
             self.pool.copy_prefix_to_scratch(slot, kv_len, scratch_pages=scratch_physical_pages)

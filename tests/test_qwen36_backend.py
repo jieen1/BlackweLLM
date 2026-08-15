@@ -571,6 +571,58 @@ class TestPrefixCacheTwoFamilies:
         assert backend.pool.slot_kv_len[2] == 65
         assert backend.stats["prefix_persistent_restores"] == 2
 
+    def test_persistent_stores_hard_bound_the_checkpoint_budget(self) -> None:
+        # Plan §4.7 P1-M: entries stay pinned against rolling-checkpoint
+        # pressure, but a NEW store LRU-evicts the oldest persistent entry
+        # once the checkpoint budget is full -- before this, pinned entries
+        # were never evicted and residency grew one checkpoint clone per
+        # distinct stored prompt without bound.
+        backend = _backend(
+            num_slots=3,
+            block_size=64,
+            enable_persistent_prefix_cache=True,
+        )
+        prompts = [list(range(64)), list(range(100, 164)), list(range(200, 264))]
+        for slot, prompt in enumerate(prompts):
+            _run(backend, slot, prompt, steps=0)
+            backend.reset_slot(slot)
+        # Budget is 2 checkpoints: the third store evicted the oldest entry.
+        assert len(backend._persistent_prefixes) == 2  # noqa: SLF001
+        assert backend.stats["prefix_persistent_evictions"] == 1
+        assert backend.checkpoint_pool.total_bytes <= backend.checkpoint_pool.byte_budget
+        # The evicted prefix degrades to a safe miss...
+        assert backend.reconcile_prefix_hit(prompts[0] + [1]).state_hit == 0
+        # ...while the survivors still restore.
+        backend.prefill_chunked_begin([0], [prompts[1] + [777]])
+        assert backend.pool.slot_kv_len[0] == 65
+        assert backend.stats["prefix_persistent_restores"] == 1
+
+    def test_dynamic_arena_persistent_stores_are_budget_bounded_too(self) -> None:
+        # The unbounded-growth case lived in dynamic arena: no scratch-page
+        # bound exists there, so the checkpoint budget is the ONLY cap on
+        # pinned persistent entries. Three distinct prompts against the
+        # default two-checkpoint budget must leave exactly two entries.
+        backend = _backend(
+            num_slots=3,
+            block_size=64,
+            dynamic_arena=True,
+            pool_bundles=24,
+            enable_persistent_prefix_cache=True,
+        )
+        prompts = [list(range(64)), list(range(100, 164)), list(range(200, 264))]
+        for slot, prompt in enumerate(prompts):
+            _run(backend, slot, prompt, steps=0)
+            backend.reset_slot(slot)
+        assert len(backend._persistent_prefixes) == 2  # noqa: SLF001
+        assert backend.checkpoint_pool.total_bytes <= backend.checkpoint_pool.byte_budget
+        # The evicted prompt's KV bundles remain in the arena as ordinary
+        # cached blocks, but without the co-keyed checkpoint the repeat is a
+        # state miss (safe recompute), never a corrupted restore.
+        assert backend.reconcile_prefix_hit(prompts[0] + [1]).state_hit == 0
+        backend.prefill_chunked_begin([0], [prompts[2] + [777]])
+        assert backend.pool.slot_kv_len[0] == 65
+        assert backend.stats["prefix_persistent_restores"] == 1
+
     def test_per_slot_chunked_prefill_cow_detaches_aliased_page(self) -> None:
         """A single-slot prefill must not write through a shared scratch page.
 
