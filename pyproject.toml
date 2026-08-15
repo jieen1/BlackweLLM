@@ -40,13 +40,14 @@ cuda = [
   "numpy>=2,<3",                    # verified 2.3.5
   "safetensors>=0.7,<1",            # verified 0.7.0
   "torch==2.13.0",                   # declared target; reference env runs 2.13.0a0+gitcf30153 (see note above)
-  "triton>=3.6,<4",                  # verified 3.6.0 — runtime/kernels/*.py import triton directly
+  "triton>=3.6,<4",                  # verified 3.7.1 — DSV4 iq2xs kernels made bit-exact across
+                                      # triton 3.6/3.7 (see runtime/kernels/dsv4_iq2xs_gemm.py)
   "transformers>=5,<6",              # verified 5.8.0 — runtime/laguna_config.py imports this directly
                                       # (moved here from `serving`: it is a core runtime dependency,
                                       # needed even when running without the HTTP layer)
   "huggingface_hub>=1,<2",           # verified 1.13.0 — runtime/laguna_config.py imports this directly;
                                       # previously undeclared and only reached transitively via transformers
-  "nvidia-cutlass-dsl>=4.5,<5",       # verified 4.5.2 — transitive SparkInfer build dependency; pinned here
+  "nvidia-cutlass-dsl>=4.5,<5",       # verified 4.7.0 — transitive SparkInfer build dependency; pinned here
                                       # too because runtime/backends/laguna_sparkinfer_moe.py has a
                                       # sys.path workaround tied to this package's on-disk layout
 ]

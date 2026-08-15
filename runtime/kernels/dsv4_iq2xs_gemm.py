@@ -322,41 +322,47 @@ def _iq2xs_dequant_gemm_batch_indexed_kernel(
         tl.store(out_ptr + pid_e * ROWS + crows, acc)
         return
 
-    m = tl.arange(0, M_PAD)
-    acc = tl.zeros((M_PAD, BLOCK_COLS), dtype=tl.float32)
+    for mm in tl.static_range(M_PAD):
+        # Per-row 2D reduction, bit-identical to the M_PAD==1 branch: one
+        # [BLOCK_COLS, 32] tl.sum per token keeps the fp32 accumulation order
+        # stable across triton versions (a batched [M, BLOCK_COLS, 32] reduce
+        # rebalances its tree under triton 3.7 and breaks the M-batched vs
+        # M=1 bit-exact contract). Weight dequant is re-read per row inside
+        # the kb loop; M>1 prefill correctness is preserved at the cost of
+        # re-reading the packed weight block per token (the 3D path hoisted
+        # it). The numeric gate is the priority: same tree as M=1.
+        acc = tl.zeros((BLOCK_COLS,), dtype=tl.float32)
+        for kb in range(0, K, BLK_ELEMS):
+            kb_block = kb // BLK_ELEMS
+            col_byte = eid * ROWS * W_ROW_STRIDE + crows * W_ROW_STRIDE + kb_block * BLK_BYTES
+            base = w_ptr + col_byte
 
-    for kb in range(0, K, BLK_ELEMS):
-        kb_block = kb // BLK_ELEMS
-        col_byte = eid * ROWS * W_ROW_STRIDE + crows * W_ROW_STRIDE + kb_block * BLK_BYTES
-        base = w_ptr + col_byte
+            lo = tl.load(base[:, None] + 2 + c32[None, :] * 2).to(tl.uint32)
+            hi = tl.load(base[:, None] + 2 + c32[None, :] * 2 + 1).to(tl.uint32)
+            codes = (lo | (hi << 8)) & 0xFFFF
 
-        lo = tl.load(base[:, None] + 2 + c32[None, :] * 2).to(tl.uint32)
-        hi = tl.load(base[:, None] + 2 + c32[None, :] * 2 + 1).to(tl.uint32)
-        codes = (lo | (hi << 8)) & 0xFFFF
+            g = tl.load(grid_ptr + (codes & 511))
+            sb = tl.load(ksigns_ptr + (codes >> 9))
 
-        g = tl.load(grid_ptr + (codes & 511))
-        sb = tl.load(ksigns_ptr + (codes >> 9))
+            d_lo = tl.load(base).to(tl.uint32)
+            d_hi = tl.load(base + 1).to(tl.uint32)
+            d_u16 = d_lo.to(tl.uint16) | (d_hi.to(tl.uint16) << 8)
+            d_f = d_u16.to(tl.float16, bitcast=True).to(tl.float32)
+            sc = tl.load(base[:, None] + 66 + (c32[None, :] // 4))
+            nib = tl.where((c32[None, :] % 4) < 2, sc & 0xF, sc >> 4).to(tl.float32)
+            deltab = d_f[:, None] * (0.5 + nib) * 0.25
 
-        d_lo = tl.load(base).to(tl.uint32)
-        d_hi = tl.load(base + 1).to(tl.uint32)
-        d_u16 = d_lo.to(tl.uint16) | (d_hi.to(tl.uint16) << 8)
-        d_f = d_u16.to(tl.float16, bitcast=True).to(tl.float32)
-        sc = tl.load(base[:, None] + 66 + (c32[None, :] // 4))
-        nib = tl.where((c32[None, :] % 4) < 2, sc & 0xF, sc >> 4).to(tl.float32)
-        deltab = d_f[:, None] * (0.5 + nib) * 0.25
+            for j in tl.static_range(8):
+                magj = ((g >> (8 * j)) & 0xFF).to(tl.float32)
+                signj = tl.where((sb & (1 << j)) != 0, -1.0, 1.0)
+                valj = signj * magj * deltab
+                xaddr = pid_e * M_PAD * K + mm * K + kb + c32 * 8 + j
+                xv = (tl.load(x_u16 + xaddr).to(tl.uint32) << 16).to(
+                    tl.float32, bitcast=True
+                )
+                acc += tl.sum(valj * xv[None, :], axis=1)
 
-        for j in tl.static_range(8):
-            magj = ((g >> (8 * j)) & 0xFF).to(tl.float32)
-            signj = tl.where((sb & (1 << j)) != 0, -1.0, 1.0)
-            valj = signj * magj * deltab
-            xaddr = pid_e * M_PAD * K + m[:, None] * K + kb + c32[None, :] * 8 + j
-            xv = (tl.load(x_u16 + xaddr).to(tl.uint32) << 16).to(
-                tl.float32, bitcast=True
-            )
-            acc += tl.sum(valj[None, :, :] * xv[:, None, :], axis=2)
-
-    out_addr = pid_e * M_PAD * ROWS + m[:, None] * ROWS + crows[None, :]
-    tl.store(out_ptr + out_addr, acc)
+        tl.store(out_ptr + pid_e * M_PAD * ROWS + mm * ROWS + crows, acc)
 
 
 @triton.jit
@@ -780,16 +786,27 @@ def iq2xs_dequant_gemm_batch_indexed_dual_swiglu_b1(
         )
     )
 
-    out = torch.empty((E, 1, rows), dtype=torch.bfloat16, device=x.device)
+    gate_out = torch.empty((E, 1, rows), dtype=torch.float32, device=x.device)
+    up_out = torch.empty_like(gate_out)
     grid_t, ksigns_t, _ = grid_tables
-    _iq2xs_dequant_gemm_batch_indexed_dual_swiglu_b1_kernel[(E, rows // BLOCK_COLS)](
+    # Gate/up are stored as raw fp32 and SwiGLU runs outside the kernel.
+    # Fusing the SwiGLU tail changed the compiler's register allocation for
+    # the GEMM accumulation loop, which under triton 3.7 rebalanced the fp32
+    # tl.sum reduce tree and broke the bit-exact split contract at bf16
+    # rounding edges. Keeping this kernel structurally identical to the dual
+    # reference kernel makes it bit-identical to it on every triton version;
+    # swiglu_bf16 below matches the reference pipeline exactly.
+    _iq2xs_dequant_gemm_batch_indexed_dual_b1_kernel_rawfp32[
+        (E, rows // BLOCK_COLS)
+    ](
         x,
         packed_gate_all,
         packed_up_all,
         expert_ids,
         grid_t,
         ksigns_t,
-        out,
+        gate_out,
+        up_out,
         E,
         K=cols,
         ROWS=rows,
@@ -799,8 +816,106 @@ def iq2xs_dequant_gemm_batch_indexed_dual_swiglu_b1(
         BLK_ELEMS=_IQ2_XS_BLOCK_ELEMS,
         BLK_BYTES=_IQ2_XS_BLOCK_BYTES,
     )
-    return out
+    return swiglu_bf16(gate_out, up_out, limit)
 
+
+
+@triton.jit
+def _iq2xs_dequant_gemm_batch_indexed_dual_b1_kernel_rawfp32(
+    x_ptr,
+    gate_w_ptr,
+    up_w_ptr,
+    expert_ids_ptr,
+    grid_ptr,
+    ksigns_ptr,
+    gate_out_ptr,
+    up_out_ptr,
+    E,
+    K: tl.constexpr,
+    ROWS: tl.constexpr,
+    W_ROW_STRIDE: tl.constexpr,
+    LIMIT: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+    BLK_ELEMS: tl.constexpr,
+    BLK_BYTES: tl.constexpr,
+):
+    """B1 dual IQ2_XS storing raw fp32 gate/up; SwiGLU applied outside.
+
+    Deliberately NOT fused with the SwiGLU tail: fusing it changed the
+    compiler's register allocation for the GEMM accumulation loop, which
+    under triton 3.7 rebalanced the fp32 ``tl.sum`` reduce tree and broke the
+    bit-exact split contract at bf16 rounding edges (2/2048 elements, and a
+    DSV4 MoE decode batch). Structurally identical to
+    ``_iq2xs_dequant_gemm_batch_indexed_dual_kernel``'s M_PAD==1 path, so it
+    is bit-identical to it on every triton version; the caller applies
+    :func:`swiglu_bf16`, matching the reference pipeline exactly.
+    """
+    pid_e = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    col0 = pid_c * BLOCK_COLS
+
+    x_u16 = x_ptr.to(tl.pointer_type(tl.uint16))
+    x_base = pid_e * K
+    eid = tl.load(expert_ids_ptr + pid_e).to(tl.int32)
+
+    crows = col0 + tl.arange(0, BLOCK_COLS)
+    c32 = tl.arange(0, 32)
+    gate_acc = tl.zeros((BLOCK_COLS,), dtype=tl.float32)
+    up_acc = tl.zeros((BLOCK_COLS,), dtype=tl.float32)
+
+    for kb in range(0, K, BLK_ELEMS):
+        kb_block = kb // BLK_ELEMS
+        col_byte = eid * ROWS * W_ROW_STRIDE + crows * W_ROW_STRIDE + kb_block * BLK_BYTES
+        gate_base = gate_w_ptr + col_byte
+        up_base = up_w_ptr + col_byte
+
+        gate_lo = tl.load(gate_base[:, None] + 2 + c32[None, :] * 2).to(tl.uint32)
+        gate_hi = tl.load(gate_base[:, None] + 2 + c32[None, :] * 2 + 1).to(tl.uint32)
+        gate_codes = (gate_lo | (gate_hi << 8)) & 0xFFFF
+        gate_g = tl.load(grid_ptr + (gate_codes & 511))
+        gate_sb = tl.load(ksigns_ptr + (gate_codes >> 9))
+        gate_d_lo = tl.load(gate_base).to(tl.uint32)
+        gate_d_hi = tl.load(gate_base + 1).to(tl.uint32)
+        gate_d_u16 = gate_d_lo.to(tl.uint16) | (gate_d_hi.to(tl.uint16) << 8)
+        gate_d_f = gate_d_u16.to(tl.float16, bitcast=True).to(tl.float32)
+
+        up_lo = tl.load(up_base[:, None] + 2 + c32[None, :] * 2).to(tl.uint32)
+        up_hi = tl.load(up_base[:, None] + 2 + c32[None, :] * 2 + 1).to(tl.uint32)
+        up_codes = (up_lo | (up_hi << 8)) & 0xFFFF
+        up_g = tl.load(grid_ptr + (up_codes & 511))
+        up_sb = tl.load(ksigns_ptr + (up_codes >> 9))
+        up_d_lo = tl.load(up_base).to(tl.uint32)
+        up_d_hi = tl.load(up_base + 1).to(tl.uint32)
+        up_d_u16 = up_d_lo.to(tl.uint16) | (up_d_hi.to(tl.uint16) << 8)
+        up_d_f = up_d_u16.to(tl.float16, bitcast=True).to(tl.float32)
+
+        scale_idx = 66 + (c32[None, :] // 4)
+        gate_sc = tl.load(gate_base[:, None] + scale_idx)
+        up_sc = tl.load(up_base[:, None] + scale_idx)
+        is_lo = (c32[None, :] % 4) < 2
+
+        for j in tl.static_range(8):
+            xv = (tl.load(x_u16 + x_base + kb + c32 * 8 + j).to(tl.uint32) << 16).to(
+                tl.float32, bitcast=True
+            )
+
+            gate_magj = ((gate_g >> (8 * j)) & 0xFF).to(tl.float32)
+            gate_signj = tl.where((gate_sb & (1 << j)) != 0, -1.0, 1.0)
+            gate_nib = tl.where(is_lo, gate_sc & 0xF, gate_sc >> 4).to(tl.float32)
+            gate_deltaj = gate_d_f[:, None] * (0.5 + gate_nib) * 0.25
+            gate_valj = gate_signj * gate_magj * gate_deltaj
+            gate_acc += tl.sum(gate_valj * xv[None, :], axis=1)
+
+            up_magj = ((up_g >> (8 * j)) & 0xFF).to(tl.float32)
+            up_signj = tl.where((up_sb & (1 << j)) != 0, -1.0, 1.0)
+            up_nib = tl.where(is_lo, up_sc & 0xF, up_sc >> 4).to(tl.float32)
+            up_deltaj = up_d_f[:, None] * (0.5 + up_nib) * 0.25
+            up_valj = up_signj * up_magj * up_deltaj
+            up_acc += tl.sum(up_valj * xv[None, :], axis=1)
+
+    out_base = pid_e * ROWS + crows
+    tl.store(gate_out_ptr + out_base, gate_acc)
+    tl.store(up_out_ptr + out_base, up_acc)
 
 def compile_iq2xs_dequant_gemm_batch_indexed_dual_sm120(
     *,

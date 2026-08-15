@@ -94,7 +94,7 @@ FP8_W8A8_EXPORTS = runtime/kernels/fp8_w8a8_sm120.exports
 FP8_W8A8_GENERATED_DIR = runtime/kernels/_generated
 FP8_W8A8_LIBRARY = $(FP8_W8A8_GENERATED_DIR)/fp8_w8a8_sm120.so
 FP8_W8A8_MANIFEST = $(FP8_W8A8_GENERATED_DIR)/fp8_w8a8_sm120.manifest.json
-CUTLASS_ROOT ?= /home/bot/project/cutlass-4.6.1
+CUTLASS_ROOT ?= /home/bot/project/cutlass-4.7.0
 FP8_W8A8_FLAGS = -std=c++17 -O3 --shared -Xcompiler -fPIC -Xcompiler -fvisibility=hidden -diag-suppress=20012,20013,20015 -gencode arch=compute_120f,code=sm_120f -cudart static -Xlinker --version-script=$(FP8_W8A8_EXPORTS) -I$(CUTLASS_ROOT)/include -I$(CUTLASS_ROOT)/tools/util/include
 
 build-fp8-w8a8: ## Build the self-owned SM120 E4M3 W8A8 scaled-GEMM artifact
