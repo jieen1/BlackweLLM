@@ -190,3 +190,44 @@ def quantize_nvfp4_activation(
         num_warps=4,
     )
     return packed, sf
+
+
+def quantize_dequantize_nvfp4_roundtrip(
+    x: torch.Tensor, global_scale: torch.Tensor | None = None
+) -> torch.Tensor:
+    """NVFP4 block-16 quantize + dequantize round-trip (verification path).
+
+    Applies exactly the ``quantize_nvfp4_activation`` recipe (bit-identical
+    to the oracle) and then reconstructs ``x ~= code * (sf_deq / gs)`` with
+    the e2m1 magnitude LUT and a hardware-exact e4m3 scale decode.  This is
+    the numeric path a real nvfp4-KV cache would take end to end; it exists
+    so the KV precision question can be answered BEFORE any b12x kernel
+    work (see notes/2026-08-16-nvfp4-kv-plan.md S1).
+    """
+    if global_scale is None:
+        global_scale = torch.ones(1, dtype=torch.float32, device=x.device)
+    if global_scale.numel() != 1:
+        raise ValueError("roundtrip requires a scalar global scale")
+    orig_shape = x.shape
+    x2d = x.reshape(-1, x.shape[-1])
+    packed, sf = quantize_nvfp4_activation(x2d, global_scale)
+    codes = torch.stack([packed & 0x0F, packed >> 4], dim=-1).reshape(x2d.shape[0], -1)
+    mag = codes & 0x07
+    sign = (codes >> 3) & 0x01
+    # e2m1 magnitude table as a where-chain (no CPU tensor: this runs inside
+    # CUDA graph capture, where a device= tensor literal would attempt an
+    # illegal CPU->CUDA copy).
+    mag_f = mag.to(torch.float32)
+    val = torch.where(mag == 1, 0.5, torch.zeros_like(mag_f))
+    val = torch.where(mag == 2, 1.0, val)
+    val = torch.where(mag == 3, 1.5, val)
+    val = torch.where(mag == 4, 2.0, val)
+    val = torch.where(mag == 5, 3.0, val)
+    val = torch.where(mag == 6, 4.0, val)
+    val = torch.where(mag == 7, 6.0, val)
+    val = val * (1.0 - 2.0 * sign.to(torch.float32))
+    sf_deq = sf[: x2d.shape[0], : x2d.shape[1] // 16].view(torch.float8_e4m3fn).to(torch.float32)
+    sf_block = sf_deq.repeat_interleave(16, dim=-1)
+    gs = global_scale.reshape(()).to(torch.float32)
+    out = val * sf_block / gs
+    return out.reshape(orig_shape)

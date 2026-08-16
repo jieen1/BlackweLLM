@@ -2640,6 +2640,27 @@ class Qwen36Attention(nn.Module):
             device=device,
         )
 
+    def _kv_nvfp4_roundtrip(
+        self, key: torch.Tensor, value: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """NVFP4 block-16 KV round-trip for the verification path
+        (``QSR_QWEN36_NVFP4_KV=1``): quantize+dequantize K/V right before
+        the cache write, so the pool carries exactly the error a real
+        nvfp4-KV cache would.  The b12x read side is untouched; this only
+        answers the KV precision question (notes/2026-08-16-nvfp4-kv-plan.md
+        S1).  Returns None (no-op) unless the switch is on.
+        """
+        if os.environ.get("QSR_QWEN36_NVFP4_KV", "0") != "1":
+            return None
+        from runtime.kernels.nvfp4_quant import quantize_dequantize_nvfp4_roundtrip
+
+        return (
+            quantize_dequantize_nvfp4_roundtrip(key.reshape(-1, self.head_dim)).reshape(key.shape),
+            quantize_dequantize_nvfp4_roundtrip(value.reshape(-1, self.head_dim)).reshape(
+                value.shape
+            ),
+        )
+
     def _qkv_proj(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """q/gate, k, v projections -- one fused native W8A8 launch when possible.
 
@@ -2710,6 +2731,9 @@ class Qwen36Attention(nn.Module):
         query = query_flat.view(seq_len, self.num_heads, self.head_dim)
         key = key_flat.view(seq_len, self.num_kv_heads, self.head_dim)
 
+        _rt = self._kv_nvfp4_roundtrip(key, value)
+        if _rt is not None:
+            key, value = _rt
         k_to_store, v_to_store = _kv_to_cache_dtype(
             key, value, cache_dtype=cache.dtype, k_scale=self.k_scale, v_scale=self.v_scale
         )
@@ -2816,6 +2840,9 @@ class Qwen36Attention(nn.Module):
 
         k_flat = k_pool.view(-1, self.num_kv_heads, self.head_dim)
         v_flat = v_pool.view(-1, self.num_kv_heads, self.head_dim)
+        _rt = self._kv_nvfp4_roundtrip(key, value)
+        if _rt is not None:
+            key, value = _rt
         k_to_store, v_to_store = _kv_to_cache_dtype(
             key, value, cache_dtype=k_pool.dtype, k_scale=self.k_scale, v_scale=self.v_scale
         )
@@ -2890,6 +2917,9 @@ class Qwen36Attention(nn.Module):
         apply_rotary_embedding_inplace(positions, key_flat, self.head_dim, cos_sin_cache)
         query = query_flat.view(total_q, self.num_heads, self.head_dim)
         key = key_flat.view(total_q, self.num_kv_heads, self.head_dim)
+        _rt = self._kv_nvfp4_roundtrip(key, value)
+        if _rt is not None:
+            key, value = _rt
         k_to_store, v_to_store = _kv_to_cache_dtype(
             key, value, cache_dtype=k_pool.dtype, k_scale=self.k_scale, v_scale=self.v_scale
         )
@@ -2954,6 +2984,9 @@ class Qwen36Attention(nn.Module):
         query = query_flat.view(total_q, self.num_heads, self.head_dim)
         key = key_flat.view(total_q, self.num_kv_heads, self.head_dim)
 
+        _rt = self._kv_nvfp4_roundtrip(key, value)
+        if _rt is not None:
+            key, value = _rt
         k_to_store, v_to_store = _kv_to_cache_dtype(
             key, value, cache_dtype=k_pool.dtype, k_scale=self.k_scale, v_scale=self.v_scale
         )
