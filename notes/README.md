@@ -1,6 +1,6 @@
 # notes/ 索引
 
-> 编制日期：2026-08-16 · 共 235 篇（`git ls-files notes | wc -l`，包含本次新增）
+> 编制日期：2026-08-16 · 共 236 篇（`git ls-files notes | wc -l`，包含本次新增）
 
 `notes/` 是**调查记录与证据档案**，不是文档。它的价值在于：当一个结论被
 质疑时，能翻出当初的实测数据、复现命令和被排除的假设。
@@ -123,6 +123,7 @@ Track F（性能，机会主义）的输入。
 
 | 文件 | 内容 |
 |---|---|
+| `2026-08-16-qwen38-b1-decode-kernel-attribution.md` | 🟢 **生产 B1 128K decode kernel-family 归因（nsys node-trace）+ P0-A3 判定**：轮 GPU 32.2ms 中 W8A8 GEMM 33%、W4A4 MLP 20.8%、attention 仅 16.5% 且已达 DRAM 峰值 79-89%（生产 264µs/层=1023 GB/s；独立 bench B4 1160 GB/s）——attention tile/stage 联合搜索降级为条件项（上限 ≤3.3% 轮时）。eager 路径 1 CTA/SM/70 GB/s 的 stall 画像不代表生产（graph 路径健康）。下一优化面：小 M GEMM（54%）。方法学：graph-node 追踪必须，默认粒度下 graph 内 kernel 不进表 |
 | `2026-08-16-w4a4-vs-w4a16-small-m-ab.md` | 🟢 **Phase 1R-1 W4A4/W4A16 小 M 路由 A/B 定案：保留 all-W4A4**。W4A16 小 M 在 B1 慢 24%（82.5 vs ~109 tok/s）、B4 仅 +5%（70.0 vs 66.4/req）且需 +7.88 GiB——与 4×256K 显存目标冲突。Qwen3.6 旧结论不迁移。前置修复 `116ec2c`（expert_counts 未传给 run_w4a16_moe，致 verify graph 捕获失败、eager 退化 15.8 tok/s）让 W4A16 路径重新可服务 |
 | `2026-08-15-b12x-packed-f32x2-falsified.md` | 🔴 **P0-A2 packed f32x2 负面定案**：cutlass-dsl 4.7.0 把 `fma_packed_f32x2` 标量化——SASS 零 FFMA2/FMUL2/FADD2、净指令差仅 2 条、128K B1 warm 在 ±3-5% 噪声内（110.2 vs 108.8 tok/s），且 fused 舍入移动数值（plain 60 token 3 个平局翻转）。按规划 §7.2 淘汰条款回退；exact conditional rescale（bit-exact）保留，见 sparkinfer `8f74740` |
 | `2026-08-15-qwen38-phase0-round-attribution.md` | 🟢 **Phase 0 轮级 + kernel-family 归因实测**（规划 §6.1 门禁）：K=3 生产配置 128K，轮级 phase 解释 ≥90% round wall（B4 GPU 合计 93.2%、verify 79.5%、host 仅 ~7%）；nsys kernel-family：attention 41% 最大、W8A8 24%、W4A4 14.8%、GDN ~2.6%。判别树落判——P1-A（b12x attention）方向证实，ragged sync 分桶（sync 5.8%<8–10%）与 GDN 融合**排除**。接受率 100%（832/832）；c4 warm 66.3→66.4 tok/s/req 对 P0 显存提交**中性**。K=2/K=1 sweep 留作补测 |

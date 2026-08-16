@@ -561,7 +561,12 @@ CC12.x strided broadcast 读越界条件和 PDL alpha/beta WAR。算法选择在
       [`../notes/2026-08-15-b12x-packed-f32x2-falsified.md`](../notes/2026-08-15-b12x-packed-f32x2-falsified.md)：
       cutlass-dsl 4.7.0 把 fma_packed_f32x2 标量化，SASS 零 packed 指令、
       净指令差 2 条、128K B1 性能在噪声内，按 §7.2 淘汰条款回退）；
-- [ ] tile/stage/producer/head-pair/residency 联合 A/B；
+- [ ] tile/stage/producer/head-pair/residency 联合 A/B —— **2026-08-16 降级为
+      条件项**：生产 B1 decode kernel-family 归因实测（
+      [`../notes/2026-08-16-qwen38-b1-decode-kernel-attribution.md`](../notes/2026-08-16-qwen38-b1-decode-kernel-attribution.md)）
+      显示 attention 仅占轮 GPU 16.5%（B1）且已达 DRAM 峰值 79–89%，
+      调优理论上限 ≤3.3% 轮时；触发条件改为"NCU 证据表明 attention 离开
+      峰值带宽"。轮时大头是 W8A8 33% + W4A4 20.8% GEMM（小 M 权重带宽受限）；
 - [ ] SplitKV forward+merge+scratch 联合 LUT；
 - [ ] page-id/descriptor load 审计。
 
