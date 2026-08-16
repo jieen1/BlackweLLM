@@ -2427,6 +2427,7 @@ class Qwen36Attention(nn.Module):
         max_seq_len: int,
         weight_prefix: str | None = None,
         enable_fp8_kv: bool = False,
+        kv_scale_buffer: bool = False,
     ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
@@ -2462,8 +2463,20 @@ class Qwen36Attention(nn.Module):
         self.enable_fp8_kv = enable_fp8_kv
         self.kv_cache_dtype = _FP8_KV_DTYPE if enable_fp8_kv else torch.bfloat16
         if enable_fp8_kv:
-            self.k_scale = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
-            self.v_scale = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+            if kv_scale_buffer:
+                # Buffers instead of Parameters for callers whose checkpoint
+                # ships no k_scale/v_scale tensors (the MTP draft head --
+                # verified against its tensor list): buffers still move with
+                # .cuda()/.to() and are consumed identically by the write and
+                # descale paths, but they are invisible to
+                # assert_all_params_loaded's named_parameters() sweep, so a
+                # checkpoint that legitimately has no scales does not trip
+                # the loader gate.
+                self.register_buffer("k_scale", torch.ones(1, dtype=torch.float32))
+                self.register_buffer("v_scale", torch.ones(1, dtype=torch.float32))
+            else:
+                self.k_scale = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
+                self.v_scale = nn.Parameter(torch.ones(1, dtype=torch.float32), requires_grad=False)
         else:
             self.k_scale = None
             self.v_scale = None
@@ -3771,6 +3784,7 @@ class Qwen36MTPLayer(nn.Module):
         *,
         max_seq_len: int,
         weight_prefix: str,
+        enable_fp8_kv: bool = False,
     ) -> None:
         super().__init__()
         eps = config["rms_norm_eps"]
@@ -3781,6 +3795,8 @@ class Qwen36MTPLayer(nn.Module):
             quantized,
             max_seq_len=max_seq_len,
             weight_prefix=f"{weight_prefix}.self_attn",
+            enable_fp8_kv=enable_fp8_kv,
+            kv_scale_buffer=enable_fp8_kv,
         )
         self.mlp = Qwen36MLP(config, 0, quantized, weight_prefix=f"{weight_prefix}.mlp")
         self.input_layernorm = Qwen36RMSNorm(hidden_size, eps=eps)
@@ -3830,7 +3846,12 @@ class Qwen36MTPHead(nn.Module):
     """
 
     def __init__(
-        self, config: dict[str, Any], quantized: dict[str, str], *, max_seq_len: int
+        self,
+        config: dict[str, Any],
+        quantized: dict[str, str],
+        *,
+        max_seq_len: int,
+        enable_fp8_kv: bool = False,
     ) -> None:
         super().__init__()
         hidden_size = config["hidden_size"]
@@ -3849,11 +3870,27 @@ class Qwen36MTPHead(nn.Module):
         self.layers = nn.ModuleList(
             [
                 Qwen36MTPLayer(
-                    config, quantized, max_seq_len=max_seq_len, weight_prefix=f"mtp.layers.{i}"
+                    config,
+                    quantized,
+                    max_seq_len=max_seq_len,
+                    weight_prefix=f"mtp.layers.{i}",
+                    enable_fp8_kv=enable_fp8_kv,
                 )
                 for i in range(num_mtp_layers)
             ]
         )
+        if enable_fp8_kv:
+            # The checkpoint has no ``mtp.layers.*.self_attn.k_scale`` /
+            # ``v_scale`` tensors (verified against its tensor list), so the
+            # FP8 KV write/read scales fall back to the fixed 1/448
+            # convention FP8Linear uses for activations.  fp8 e4m3 relative
+            # precision is scale-independent; the fixed scale only needs to
+            # keep typical draft-head KV magnitudes inside the representable
+            # range, which O(1) post-norm values satisfy.
+            for layer in self.layers:
+                attn = layer.self_attn
+                attn.k_scale.data.fill_(1.0 / float(torch.finfo(torch.float8_e4m3fn).max))
+                attn.v_scale.data.fill_(1.0 / float(torch.finfo(torch.float8_e4m3fn).max))
         self.norm = Qwen36RMSNorm(hidden_size, eps=eps)
 
     def new_cache(self, *, device: torch.device, dtype: torch.dtype) -> Qwen36PagedAttentionCache:
@@ -4346,7 +4383,11 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         # floor.md); negligible relative to that, but still opt-in so every
         # existing B1/B2 caller's memory footprint is unchanged byte-for-byte.
         self.mtp: Qwen36MTPHead | None = (
-            Qwen36MTPHead(config, quantized, max_seq_len=max_seq_len) if enable_mtp else None
+            Qwen36MTPHead(
+                config, quantized, max_seq_len=max_seq_len, enable_fp8_kv=enable_fp8_kv
+            )
+            if enable_mtp
+            else None
         )
 
     def new_generation_state(
