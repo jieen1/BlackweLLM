@@ -313,9 +313,41 @@ buffer 到已提交前缀 → MTP draft capture 写未提交页非法访问（`c
 - reset 全空闲时 `release_physical` 物理回收（Phase D）
 - `qwen38-dynamic-context-vllm-plan.md` §2.2/§7 措辞更新
 
+## 12. 端到端验收补跑（2026-08-16，用户要求）
+
+### 12.1 strict 4×256K 生产形状（fresh process，`/tmp/opencode/accept_extensible_4x256k.py`，判据同 `notes/2026-08-15-strict-4x256k-startup-acceptance.md`）
+
+| 阶段 | 基线（全量提交，08-15） | **extensible** | 差异 |
+|---|---|---|---|
+| 0 CUDA baseline | 2.73 GiB | 3.50 GiB | — |
+| 1 model load（21.06 GiB 权重） | 25.37 | 25.90 | — |
+| **2 strict backend（8201 bundles）** | **57.42（+32.44）** | **25.92（+0.38）** | **−31.5 GiB：池 0 物理提交** |
+| 2b ensure_kv_blocks(21) | — | 26.05 | — |
+| 3 full-forward warmup | 57.74 | 26.63 | — |
+| 4 enable_mtp + MTP capture | 63.83 | 28.66 | −35.2 |
+| 5 decode capture | 63.90 | 28.69 | −35.2 |
+| 5b 实测提交（68.6 GiB free − 10 buffer） | — | **64.61（8201/8201 全量，36.07 GiB）** | strict 承诺保留 |
+| 6 短请求（5 tokens） | 63.90 | 64.59（live=1） | — |
+| 7 逐槽增长 512..2048 | 64.09 | 64.48（4/12/24/40 bundles 线性） | — |
+| 峰值 / driver free | 64.09 / 31.51 | **64.61 / 30.98** | ≥10 GiB 判据 ✓ |
+
+**结论**：生产形状下 extensible 把整个 warmup + MTP/decode 图捕获窗口从 64 GiB 压到 ~29 GiB（启动 OOM 窗口消失），捕获后实测内存足够时提交全量 8201 bundles，strict 4×256K 必达承诺不降级；短请求 1 bundle、逐槽增长严格线性。
+
+### 12.2 B1 128K decode tok/s A/B（Qwen3.8-27B-NVFP4，elastic 4160-bundle 池，MTP K=3，同 server 配置唯一差异为 `--qwen-kv-extensible`）
+
+| 指标 | 基线 | extensible | 差异 |
+|---|---|---|---|
+| mean_decode | **101.55 tok/s** | **100.88 tok/s** | −0.7%（0.67 tok/s） |
+| mean_ttft | 61.46 s | 61.26 s | −0.3% |
+| wall（128K prefill + 256 gen） | 64.03 s | 63.83 s | −0.3% |
+
+历史同配置记录 104.18 tok/s（08-15，跨运行噪声 ±2.5%），本 A/B 差异 0.7% 在运行间噪声内。**端到端确认 extensible 对 decode 性能零可测代价**（与 E2 微基准结论一致）。
+
 ## 10. 证据文件
 
 - `scripts/b4_vmm_extensible_experiments.py`（本机可复跑，E1/E2）
+- `scripts/b2_verify_extensible_kv.py`（GPU 门禁 11/11，可复跑）
+- `/tmp/opencode/accept_extensible_4x256k.py` + 输出（§12.1，一次性脚本未入库）
 - `/home/bot/vllm` 分支 `origin/extensible-kv-cache`（16 commits）
 - `notes/2026-08-15-strict-4x256k-startup-acceptance.md`（容量/启动基线）
 - `notes/2026-08-16-qwen38-b1-decode-kernel-attribution.md`（性能杠杆依据）
