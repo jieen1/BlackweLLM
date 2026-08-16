@@ -545,11 +545,22 @@ CC12.x strided broadcast 读越界条件和 PDL alpha/beta WAR。算法选择在
 
 ### Phase 1R：runtime 性能（2–7 天，按 profile 选前两项）
 
-- [ ] W4A4/W4A16 小 M 路由；
-- [ ] ragged sync bucket；
-- [ ] fused KV quant+scatter；
-- [ ] sampled MTP batching；
-- [ ] GDN/conv fusion 仅在新 profile 支持时进入。
+- [x] W4A4/W4A16 小 M 路由——**已实测定案（2026-08-16）：保留 all-W4A4**
+      （B1 慢 24%、B4 仅 +5% 且 +7.88 GiB，见
+      [`../notes/2026-08-16-w4a4-vs-w4a16-small-m-ab.md`](../notes/2026-08-16-w4a4-vs-w4a16-small-m-ab.md)）；
+- [x] ~~ragged sync bucket~~——**排除**（sync 仅 5.8% 轮时 < 8–10% 门槛）；
+- [ ] fused KV quant+scatter——降级为小 kernel 融合候选之一（见下方带宽地板
+      结论后的"仅剩可动面"）；
+- [ ] sampled MTP batching——仅 temperature>0 服务路径需要，条件项；
+- [x] ~~GDN/conv fusion~~——**排除**（GDN recurrent 仅 1.3% 轮时）。
+
+**2026-08-16 带宽地板结论（约束本 Phase 全部剩余项）**：W8A8/W4A4 GEMM
+真冷带宽实测已在 DRAM 峰值 57–71%（
+[`../notes/2026-08-16-w8a8-gemm-roofline-bandwidth-floor.md`](../notes/2026-08-16-w8a8-gemm-roofline-bandwidth-floor.md)），
+加上 attention 79–89%，decode 轮已逼近该模型+精度的 DRAM 带宽地板。
+kernel 微调整体空间 ≤ 数个百分比；剩余真实杠杆是减字节、提有效 M、
+以及 ~17% 小 kernel（quant 4% + gemvx/wmma 5.4% + norm 2.9% + copy/index
+~4.6%）的融合。本 Phase 剩余项只在这个前提下排序。
 
 ### Phase 1A：b12x/FA4 可迁移 P0（3–10 天）
 
