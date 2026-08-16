@@ -18,7 +18,7 @@ model_path=${QSR_BENCH_MODEL_PATH:-/home/bot/.cache/huggingface/hub/models--unsl
 tokenizer_path=${QSR_BENCH_TOKENIZER_PATH:-/home/bot/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/ccdaab7e68af2409599b8949a8f2685703c9bae5}
 run_tag=${QSR_BENCH_TAG:-$(date -u +%Y%m%d_%H%M%S)}
 result_dir=${QSR_BENCH_RESULT_DIR:-${repo_root}/benchmarks/fixtures}
-server_label="Qwen3.8-27B-NVFP4; qwen36 backend; MTP K=3; CUDA Graph; FP8 KV; dynamic 19629342720-byte/4160-bundle pool; capacity=4; num_slots=4; logical max=256K/slot"
+server_label="Qwen3.8-27B-NVFP4; qwen36 backend; MTP K=3; CUDA Graph; FP8 KV; fused QKV W8A8; block_size=32; dynamic 19629342720-byte/4160-bundle pool; capacity=4; num_slots=4; logical max=256K/slot"
 
 mkdir -p "${result_dir}"
 
@@ -50,7 +50,11 @@ case ${1:-} in
         export QSR_SERVER_MODEL_PATH="${model_path}"
         export QSR_SERVER_BACKEND=qwen36
         export QSR_SERVED_MODEL_NAME=qwen3.8
-        export QSR_SERVER_BLOCK_SIZE=16
+        # block_size 32 (2026-08-16): measured strictly better than 16 on the
+        # 131072-token workload (c1 107.99 vs 105.14 tok/s, TTFT 56.95 vs
+        # 60.17 s) and far better than 64 (c4 warm 51.8 at bs64 vs 70.0 at
+        # bs32 -- 64-token pages degrade the decode attention page walk).
+        export QSR_SERVER_BLOCK_SIZE=32
         export QSR_SERVER_KV_CACHE_DTYPE=fp8_e4m3
         export QSR_SERVER_ENABLE_CUDAGRAPH=1
         export QSR_SERVER_ENABLE_PREFIX_CACHE=${QSR_BENCH_PREFIX_CACHE:-1}
