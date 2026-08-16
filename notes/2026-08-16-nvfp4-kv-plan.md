@@ -27,20 +27,18 @@ e4m3 块 scale）。verify attention 占 B1 轮时 ~41%（融合前数据），K
   fp8 读 12.1 GB = 7.6 ms；nvfp4 读+解包 6.0 GB = 2.9 ms（解包被带宽-bound
   特性部分隐藏，等效吞吐 2.08 vs 1.59 TB/s）→ **每轮省 4.7 ms ≈ decode +12%**。
   S2 值得投入。
-- **S2（读侧 kernel）⬜ 插入点已定位**（`b12x/attention/paged/forward_paged.py`）：
-  1. `__init__` dtype 分支（`kv_is_fp8` 平级加 `kv_is_nvfp4`，line 3156/3430-3432）
-  2. KV TMA 源/布局（`_make_paged_kv_tile_source_tensor`、`kv_tma_plane_mem_dtype`、
-     `_get_paged_kv_tma_plane_layout`）
-  3. smem 载入（`_issue_paged_kv_tma_copy_*`）后插入**解包 copy**（打包行→fp8 smem）
-  4. QK/PV MMA 消费点（`tiled_mma_qk_tma`，line 5498+）不变——操作数改为解包后的 fp8 smem
-  - 解包实现参考：`b12x/attention/_shared/mla/decode_math.py` 的
-    `_ld_global_nvfp4_fp8_rope_bfloat2` / `_nvfp4_pair_bfloat2_mg`（e2m1 解包 +
-    e4m3 scale 解码，cute 实现可直接移植）
-  - 池布局：每 (page, token, kv_head) 行 144 B = 128 B e2m1 codes + 16 B e4m3 scales
-    （head_dim=256 = 16 个 block-16）
-- **S3（写入侧真 nvfp4 池）**：`fused_kv_scatter` nvfp4 变体（打包写入，不再解包回
-  fp8）——S2 完成后替换 S1 的往返
-- **S4（门禁）**：128K 真实文本 MTP 接受率 A/B + 质量 suite
+- **S2（读侧 kernel）✅ 2026-08-16**：triton split-KV flash decode
+  （`runtime/kernels/nvfp4_decode_attn.py`，代替 b12x paged kernel 改造）——
+  GQA + causal + 两遍 partial/merge；bf16 dot（SM120 tl.dot 无 fp8 LHS）；
+  BLOCK_K=64 半列解包（f32 中间 [BK,128] 压进 99 KiB smem）。128K×16
+  query microbench 8.5ms；端到端 c1 109.2 / c4 72.5 tok/s（nvfp4 on）。
+- **S3（写入侧真 nvfp4 池）✅ 2026-08-16**：`nvfp4_kv.py` 池打包 +
+  `pack_nvfp4_kv_into_pool` 写入；fp8 影子池维护（b12x prefill 读）。
+  MTP draft/sync 保持 BF16 原路径（其 KV 走打包池会使 128K sync
+  extend 慢 23 倍——已回滚，约束记录于 commit 08a92b5）。
+- **S4（门禁）🟡**：真实文本接受率 A/B 无退化（46.4% 与 FP8 一致，
+  FP8 两次独立测量）；输出质量正常。完整质量套件（MMLU/HumanEval）
+  未跑——commit 0f7e758 后待执行。
 
 ## 门禁（MTP FP8 KV 的教训，2026-08-16 实测）
 
