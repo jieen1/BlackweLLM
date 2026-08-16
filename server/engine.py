@@ -381,6 +381,8 @@ class ServerEngine:
         qwen_kv_pool_bytes: int = 0,
         qwen_kv_watermark_bundles: int = 8,
         qwen_kv_full_sequence_must_fit: bool = True,
+        qwen_kv_extensible: bool = False,
+        qwen_kv_commit_buffer_gb: float = 10.0,
         gpu_memory_utilization: float = 0.85,
         idle_sleep_s: float = 0.005,
         production: bool = True,
@@ -413,6 +415,8 @@ class ServerEngine:
         self.mtp_num_speculative_tokens = mtp_num_speculative_tokens
         self.mtp_resync = mtp_resync
         self.checkpoint_budget_multiple = checkpoint_budget_multiple
+        self.qwen_kv_extensible = qwen_kv_extensible
+        self.qwen_kv_commit_buffer_gb = qwen_kv_commit_buffer_gb
         if qwen_kv_mode not in {"legacy", "strict", "elastic"}:
             raise ValueError(
                 f"qwen_kv_mode={qwen_kv_mode!r} must be 'legacy', 'strict', or 'elastic'"
@@ -425,6 +429,13 @@ class ServerEngine:
             raise ValueError("qwen_kv_watermark_bundles must be non-negative")
         if qwen_kv_mode == "elastic" and qwen_kv_pool_bytes <= 0:
             raise ValueError("qwen_kv_mode='elastic' requires qwen_kv_pool_bytes > 0")
+        if qwen_kv_extensible and qwen_kv_mode == "legacy":
+            raise ValueError(
+                "qwen_kv_extensible=True requires qwen_kv_mode='strict' or 'elastic' "
+                "(the VMM physical pool only makes sense over the arena's bundle pool)"
+            )
+        if qwen_kv_commit_buffer_gb < 0:
+            raise ValueError("qwen_kv_commit_buffer_gb must be non-negative")
         if qwen_kv_mode != "legacy" and not qwen_kv_full_sequence_must_fit:
             raise ValueError(
                 "dynamic Qwen KV currently requires full-sequence reservation; "
@@ -883,7 +894,19 @@ class ServerEngine:
             dynamic_arena=dynamic_arena,
             pool_bundles=pool_bundles,
             watermark_bundles=self.qwen_kv_watermark_bundles,
+            extensible_kv=self.qwen_kv_extensible,
         )
+        if self.qwen_kv_extensible:
+            # Phase 5.5: the pool reserves full VA but commits physical
+            # pages incrementally. Everything that writes KV before the
+            # final commit must have its pages backed first: warmup (one
+            # 128-token page), MTP verify (K+1 pages per slot) and decode
+            # graph capture (one page per slot). One page per slot beyond
+            # that is already guaranteed by enable_mtp's ensure_kv_blocks(1)
+            # and the capture path; ensure the worst case up front.
+            self.runner.ensure_kv_blocks(
+                1 + self.num_slots * (self.mtp_num_speculative_tokens + 2)
+            )
         self._warmup_qwen36_full_forward()
         # MTP extends the shared GDN state allocation so its column zero is
         # the exact ordinary decode/prefill row.  This must precede decode
@@ -920,6 +943,52 @@ class ServerEngine:
             self.runner.pool.geometry.recurrent_bytes_per_slot / 2**20,
             self.runner.pool.geometry.kv_bytes_per_slot / 2**20,
         )
+        if self.qwen_kv_extensible:
+            self._commit_extensible_kv_pool(model)
+
+    def _commit_extensible_kv_pool(self, model) -> None:
+        """Commit the final extensible KV pool size from measured memory.
+
+        Runs after warmup + MTP + decode CUDA Graph capture, when every
+        non-KV allocation is settled. The pool's VA capacity was fixed at
+        construction (``pool_bundles``); this commits the physical prefix
+        to min(capacity, measured) bundles, leaving ``commit_buffer_gb``
+        of headroom. If measured memory cannot cover the configured
+        capacity, the arena's admission gate keeps refusing new requests
+        rather than OOMing -- logged loudly here, not silently.
+        """
+        import torch  # local: this module stays importable without torch
+
+        capacity = self.runner.pool.pool_bundles
+        bundle_bytes = _qwen_kv_bundle_bytes(model, include_mtp=self.enable_mtp)
+        torch.cuda.synchronize()
+        free_memory, _ = torch.cuda.mem_get_info()
+        measured = int(
+            (free_memory - int(self.qwen_kv_commit_buffer_gb * 2**30))
+            // bundle_bytes
+        )
+        final = min(capacity, measured)
+        committed = self.runner.commit_kv_cache(final)
+        logger.info(
+            "Extensible KV pool committed: capacity=%d bundles (VA), "
+            "committed=%d (%d MiB physical), measured-free %.1f GiB, "
+            "bundle_bytes=%d",
+            capacity,
+            committed,
+            self.runner.pool.physical_kv_bytes / 2**20,
+            free_memory / 2**30,
+            bundle_bytes,
+        )
+        if final < capacity:
+            logger.warning(
+                "Extensible KV pool committed %d/%d bundles: measured memory "
+                "(%.1f GiB free, %d GiB buffer) cannot cover the configured "
+                "capacity; long-context requests may be rejected by admission",
+                final,
+                capacity,
+                free_memory / 2**30,
+                self.qwen_kv_commit_buffer_gb,
+            )
 
     def _load_deepseek_model(self) -> None:
         """Load ``DeepseekV4Backend`` (Phase 4). MUST run on engine thread.

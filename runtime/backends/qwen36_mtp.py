@@ -324,6 +324,11 @@ class Qwen36MTPEngine:
                 dtype=self.dtype,
                 pool_bundles=backend.pool.pool_bundles if dynamic else None,
                 page_table=backend.pool._global_page_table if dynamic else None,  # noqa: SLF001
+                extensible_buffers=(
+                    backend.pool.extensible_buffers
+                    if getattr(backend.pool, "extensible", False)
+                    else None
+                ),
             )
             if dynamic:
                 # Register the pooled MTP KV as the 17th atomic COW family

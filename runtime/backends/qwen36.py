@@ -287,6 +287,7 @@ class Qwen36Backend:
         dynamic_arena: bool = False,
         pool_bundles: int | None = None,
         watermark_bundles: int = 0,
+        extensible_kv: bool = False,
     ) -> None:
         # Verify-attention numerics-mode policy (2026-08-07, five-way A/B in
         # notes/2026-08-06-128k-c4-parity-profiling.md S19): the DEFAULT is
@@ -350,6 +351,7 @@ class Qwen36Backend:
             dynamic_arena=dynamic_arena,
             pool_bundles=pool_bundles,
             watermark_bundles=watermark_bundles,
+            extensible_kv=extensible_kv,
         )
         # Phase 0 contract assertion: the formula-based KV capacity must
         # equal the actual tensor storage before anything downstream starts
@@ -551,14 +553,32 @@ class Qwen36Backend:
                 "state allocation so column zero aliases ordinary decode state; enabling it after "
                 "capture would leave decode graphs bound to stale addresses"
             )
+        if self.pool.extensible:
+            # The MTP pooled caches join the backbone's VMM lockstep pool;
+            # ensure they are committed before the first MTP forward.
+            self.pool.ensure_kv_blocks(1)
         from runtime.backends.qwen36_mtp import Qwen36MTPEngine
 
         self._mtp = Qwen36MTPEngine(
             self, num_speculative_tokens=num_speculative_tokens, enable_resync=enable_resync
         )
 
-    def slot_state(self, slot: int) -> Qwen36SlotStateView:
-        return Qwen36SlotStateView(
+    def ensure_kv_blocks(self, num_blocks: int) -> None:
+        """Commit at least ``num_blocks`` of the extensible KV pool's prefix
+        (warmup/capture-time hook; no-op unless the pool is extensible)."""
+        self.pool.ensure_kv_blocks(num_blocks)
+
+    def commit_kv_cache(self, num_blocks: int) -> int:
+        """Commit the final extensible KV pool size after warmup + CUDA
+        Graph capture. Returns the committed block count (0 when not
+        extensible). Base pointers never move, so captured graphs stay
+        valid -- the "measured final sizing" of the Phase 5.5 plan."""
+        if not self.pool.extensible:
+            return 0
+        self.pool.commit_kv_blocks(num_blocks)
+        return self.pool.extensible_buffers.num_blocks_committed
+
+    def slot_state(self, slot: int) -> Qwen36SlotStateView:        return Qwen36SlotStateView(
             kv_len=self.pool.slot_kv_len[slot],
             committed_tokens=tuple(self.pool.slot_committed_tokens[slot]),
         )

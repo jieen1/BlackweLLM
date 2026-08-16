@@ -172,6 +172,13 @@ SERVER_QWEN_KV_POOL_BYTES = int(os.environ.get("QSR_QWEN_KV_POOL_BYTES", "0"))
 SERVER_QWEN_KV_WATERMARK_BUNDLES = int(
     os.environ.get("QSR_QWEN_KV_WATERMARK_BUNDLES", "8")
 )
+# Phase 5.5: VMM-backed extensible physical KV (reserve full VA, commit the
+# final pool size from measured post-capture memory). Requires a dynamic
+# qwen_kv_mode; see notes/2026-08-16-vllm-extensible-kv-cache.md.
+SERVER_QWEN_KV_EXTENSIBLE = os.environ.get("QSR_QWEN_KV_EXTENSIBLE", "0") == "1"
+SERVER_QWEN_KV_COMMIT_BUFFER_GB = float(
+    os.environ.get("QSR_QWEN_KV_COMMIT_BUFFER_GB", "10")
+)
 SERVER_QWEN_KV_FULL_SEQUENCE_MUST_FIT = (
     os.environ.get("QSR_QWEN_KV_FULL_SEQUENCE_MUST_FIT", "1") != "0"
 )
@@ -489,6 +496,8 @@ async def lifespan(app: FastAPI):
         qwen_kv_pool_bytes=SERVER_QWEN_KV_POOL_BYTES,
         qwen_kv_watermark_bundles=SERVER_QWEN_KV_WATERMARK_BUNDLES,
         qwen_kv_full_sequence_must_fit=SERVER_QWEN_KV_FULL_SEQUENCE_MUST_FIT,
+        qwen_kv_extensible=SERVER_QWEN_KV_EXTENSIBLE,
+        qwen_kv_commit_buffer_gb=SERVER_QWEN_KV_COMMIT_BUFFER_GB,
         request_timeout_s=SERVER_REQUEST_TIMEOUT_S,
         gpu_memory_utilization=SERVER_GPU_MEM_UTIL,
         production=SERVER_PRODUCTION,
@@ -1295,6 +1304,23 @@ def main() -> None:
         default=SERVER_QWEN_KV_WATERMARK_BUNDLES,
         help="Emergency/COW page bundles excluded from dynamic admission. Default 8.",
     )
+    parser.add_argument(
+        "--qwen-kv-extensible",
+        action="store_true",
+        default=SERVER_QWEN_KV_EXTENSIBLE,
+        help=(
+            "Phase 5.5: VMM-backed extensible physical KV -- reserve the full "
+            "pool VA at load, commit the final size from measured post-capture "
+            "memory. Requires --qwen-kv-mode strict/elastic."
+        ),
+    )
+    parser.add_argument(
+        "--qwen-kv-commit-buffer-gb",
+        type=float,
+        default=SERVER_QWEN_KV_COMMIT_BUFFER_GB,
+        help="GiB of free GPU memory kept uncommitted after the extensible KV "
+        "final commit. Default 10.",
+    )
     parser.add_argument("--no-cudagraph", action="store_true")
     parser.add_argument(
         "--skip-preflight",
@@ -1401,6 +1427,8 @@ def main() -> None:
     os.environ["QSR_QWEN_KV_WATERMARK_BUNDLES"] = str(
         args.qwen_kv_watermark_bundles
     )
+    os.environ["QSR_QWEN_KV_EXTENSIBLE"] = "1" if args.qwen_kv_extensible else "0"
+    os.environ["QSR_QWEN_KV_COMMIT_BUFFER_GB"] = str(args.qwen_kv_commit_buffer_gb)
     if args.no_cudagraph:
         os.environ["QSR_SERVER_ENABLE_CUDAGRAPH"] = "0"
     if args.no_prefix_cache:

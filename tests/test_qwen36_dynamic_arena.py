@@ -439,3 +439,33 @@ class TestPhase3PrefixCache:
         # Back to CACHED_REF0 (refcnt=0, hash retained).
         assert pool._arena._ref_cached_ref0() == 1
         assert pool._arena._ref_live_unique() == 0
+
+
+class TestExtensibleKvValidation:
+    """Phase 5.5: extensible physical KV (VMM) constructor guards. The
+    pool-level behavior itself is GPU-only (VMM has no CPU path); these
+    lock the failure modes so a misconfiguration is loud at construction.
+    """
+
+    def test_extensible_requires_dynamic_arena(self) -> None:
+        with pytest.raises(ValueError, match="requires dynamic_arena"):
+            Qwen36SlotPool(
+                _stub_model(["full_attention"]),
+                num_slots=2,
+                max_seq_len=256,
+                device="cpu",
+                dtype=torch.float32,
+                extensible_kv=True,
+            )
+
+    def test_extensible_requires_cuda_device(self) -> None:
+        with pytest.raises(ValueError, match="requires a CUDA device"):
+            Qwen36SlotPool(
+                _stub_model(["full_attention"]),
+                num_slots=2,
+                max_seq_len=256,
+                device="cpu",
+                dtype=torch.float32,
+                dynamic_arena=True,
+                extensible_kv=True,
+            )

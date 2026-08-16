@@ -189,6 +189,7 @@ def build_pooled_mtp_caches(
     dtype: torch.dtype,
     pool_bundles: int | None = None,
     page_table: torch.Tensor | None = None,
+    extensible_buffers=None,
 ) -> tuple[list[Qwen36PagedAttentionCache], torch.Tensor, torch.Tensor, int, int]:
     """Build ``num_slots + 1`` (the ``+1`` scratch row, matching
     ``Qwen36SlotPool``'s own capture-safety reasoning) per-slot MTP
@@ -223,8 +224,35 @@ def build_pooled_mtp_caches(
     else:
         total_pages = pool_bundles
     kv_shape = (total_pages, page_size, mtp_attn.num_kv_heads, mtp_attn.head_dim)
-    k_pool = torch.zeros(kv_shape, dtype=mtp_attn.kv_cache_dtype, device=device)
-    v_pool = torch.zeros(kv_shape, dtype=mtp_attn.kv_cache_dtype, device=device)
+    if extensible_buffers is not None:
+        # Phase 5.5: MTP KV joins the backbone's lockstep VMM pool (same
+        # bundle count, same prefix-commit semantics). Imported lazily so
+        # this module stays importable without torch-free issues upstream
+        # of the GPU call sites.
+        from runtime.model.vmm_extensible import ExtensibleTensor
+
+        bytes_per_page = (
+            page_size
+            * mtp_attn.num_kv_heads
+            * mtp_attn.head_dim
+            * mtp_attn.kv_cache_dtype.itemsize
+        )
+        device_index = device.index if device.index is not None else 0
+        k_buf = ExtensibleTensor(
+            max_num_bytes=total_pages * bytes_per_page,
+            device_index=device_index,
+        )
+        v_buf = ExtensibleTensor(
+            max_num_bytes=total_pages * bytes_per_page,
+            device_index=device_index,
+        )
+        k_pool = k_buf.full_view().view(mtp_attn.kv_cache_dtype).view(kv_shape)
+        v_pool = v_buf.full_view().view(mtp_attn.kv_cache_dtype).view(kv_shape)
+        extensible_buffers.add(k_buf, bytes_per_page)
+        extensible_buffers.add(v_buf, bytes_per_page)
+    else:
+        k_pool = torch.zeros(kv_shape, dtype=mtp_attn.kv_cache_dtype, device=device)
+        v_pool = torch.zeros(kv_shape, dtype=mtp_attn.kv_cache_dtype, device=device)
     marker = getattr(torch._dynamo, "mark_static_address", None)
     if marker is not None:  # pragma: no branch - present in every supported torch
         marker(k_pool)

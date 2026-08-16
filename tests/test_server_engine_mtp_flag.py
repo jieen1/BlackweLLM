@@ -46,9 +46,7 @@ def test_qwen_bundle_budget_includes_backbone_and_mtp_storage_dtypes() -> None:
     )
 
     assert _qwen_kv_bundle_bytes(model, include_mtp=False) == 2 * 128 * 2 * 4
-    assert _qwen_kv_bundle_bytes(model, include_mtp=True) == (
-        2 * 128 * 2 * 4 + 2 * 128 * 1 * 4 * 2
-    )
+    assert _qwen_kv_bundle_bytes(model, include_mtp=True) == (2 * 128 * 2 * 4 + 2 * 128 * 1 * 4 * 2)
 
 
 class TestMtpRejectedForWrongBackend:
@@ -118,17 +116,13 @@ class TestMtpRejectedForWrongBackend:
 
     def test_qwen_cuda_graph_does_not_require_a_duplicate_live_slot(self) -> None:
         assert (
-            _cuda_graph_extra_slots(
-                backend="qwen36", enable_cudagraph=True, enable_dflash=False
-            )
+            _cuda_graph_extra_slots(backend="qwen36", enable_cudagraph=True, enable_dflash=False)
             == 0
         )
 
     def test_laguna_decode_graph_keeps_its_dedicated_capture_slot(self) -> None:
         assert (
-            _cuda_graph_extra_slots(
-                backend="laguna", enable_cudagraph=True, enable_dflash=False
-            )
+            _cuda_graph_extra_slots(backend="laguna", enable_cudagraph=True, enable_dflash=False)
             == 1
         )
 
@@ -158,3 +152,39 @@ class TestMtpRejectedForWrongBackend:
         )
         assert engine.mtp_num_speculative_tokens == 8
         assert engine.K == 0
+
+
+class TestExtensibleKvRejectedWhenMisconfigured:
+    def test_extensible_requires_dynamic_mode(self) -> None:
+        with pytest.raises(ValueError, match="requires qwen_kv_mode"):
+            ServerEngine(
+                backend="qwen36",
+                capacity=1,
+                num_slots=1,
+                enable_cudagraph=False,
+                qwen_kv_extensible=True,
+            )
+
+    def test_extensible_requires_positive_commit_buffer(self) -> None:
+        with pytest.raises(ValueError, match="qwen_kv_commit_buffer_gb"):
+            ServerEngine(
+                backend="qwen36",
+                capacity=1,
+                num_slots=1,
+                enable_cudagraph=False,
+                qwen_kv_mode="strict",
+                qwen_kv_extensible=True,
+                qwen_kv_commit_buffer_gb=-1,
+            )
+
+    def test_extensible_records_config(self) -> None:
+        engine = ServerEngine(
+            backend="qwen36",
+            capacity=1,
+            num_slots=1,
+            enable_cudagraph=False,
+            qwen_kv_mode="strict",
+            qwen_kv_extensible=True,
+        )
+        assert engine.qwen_kv_extensible is True
+        assert engine.qwen_kv_commit_buffer_gb == 10.0

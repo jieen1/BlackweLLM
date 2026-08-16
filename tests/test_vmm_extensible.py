@@ -231,10 +231,13 @@ class TestExtensibleKVCacheBuffersBookkeeping:
         b1 = _FakeExtensible(_fake_buffer(8 * 1024 * 1024, d))
         b2 = _FakeExtensible(_fake_buffer(8 * 1024 * 1024, d))
         bufs = ExtensibleKVCacheBuffers([(b1, 1024 * 1024)], 8)
-        bufs.add(b2, 1024 * 1024)
         bufs.commit(2)
+        bufs.add(b2, 1024 * 1024)  # added after commit: must catch up
         assert len(bufs.buffers) == 2
-        assert b1.physical_bytes == b2.physical_bytes == 2 * 1024 * 1024
+        assert b2.bytes_per_segment == 2 * 1024 * 1024
+        assert b2.physical_bytes == 2 * 1024 * 1024
+        bufs.commit(3)
+        assert b1.physical_bytes == b2.physical_bytes == 4 * 1024 * 1024
 
     def test_physical_bytes_sums_buffers(self) -> None:
         d = _FakeVmmDriver()
@@ -244,5 +247,3 @@ class TestExtensibleKVCacheBuffersBookkeeping:
         assert bufs.physical_bytes == 0
         bufs.commit(3)
         assert bufs.physical_bytes == b1.physical_bytes + b2.physical_bytes
-
-

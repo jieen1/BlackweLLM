@@ -71,6 +71,10 @@ from runtime.model.qwen36_model import (
     Qwen36PagedAttentionCache,
     Qwen36PrefillBatch,
 )
+from runtime.model.vmm_extensible import (
+    ExtensibleKVCacheBuffers,
+    ExtensibleTensor,
+)
 
 
 def _mark_static(tensor: torch.Tensor) -> torch.Tensor:
@@ -147,9 +151,17 @@ class Qwen36SlotPool:
         dynamic_arena: bool = False,
         pool_bundles: int | None = None,
         watermark_bundles: int = 0,
+        extensible_kv: bool = False,
     ) -> None:
         if num_slots < 1:
             raise ValueError(f"num_slots must be >= 1, got {num_slots}")
+        if extensible_kv and not dynamic_arena:
+            raise ValueError(
+                "extensible_kv=True requires dynamic_arena=True (the VMM "
+                "physical pool only makes sense over the arena's bundle pool)"
+            )
+        if extensible_kv and torch.device(device).type != "cuda":
+            raise ValueError("extensible_kv requires a CUDA device (VMM-backed VA)")
         self.model = model
         self.num_slots = num_slots
         self.device = torch.device(device)
@@ -188,11 +200,26 @@ class Qwen36SlotPool:
             #: Mirrors vLLM ``req_to_blocks``; ``reset_slot`` decrefs them all
             #: (plan §7 invariant 7: slot reset leaves no old-epoch ownership).
             self._slot_bundles: list[set[int]] = [set() for _ in range(self._num_rows)]
+            #: Phase 5.5 extensible physical KV (VMM): the K/V pools reserve
+            #: the full ``pool_bundles`` VA range but commit physical pages
+            #: incrementally; warmup/CUDA-graph capture runs against a tiny
+            #: committed prefix and :meth:`commit_kv_blocks` commits the
+            #: final size afterwards from measured memory. Base pointers are
+            #: stable, so every captured graph stays valid (verified by
+            #: tests/test_vmm_extensible_gpu.py and the research note's E1).
+            #: See ``notes/2026-08-16-vllm-extensible-kv-cache.md``.
+            if extensible_kv:
+                self.extensible_buffers = ExtensibleKVCacheBuffers([], pool_bundles)
+            else:
+                self.extensible_buffers = None
         else:
+            if extensible_kv:  # pragma: no cover - guarded at the top
+                raise ValueError("extensible_kv requires dynamic_arena")  # pragma: no cover
             self.pool_bundles = self._num_rows * self.pages_per_slot
             self.watermark_bundles = 0
             self._arena = None
             self._slot_bundles = [set() for _ in range(self._num_rows)]
+            self.extensible_buffers = None
 
         layers = model.model.layers
         self.num_layers = len(layers)
@@ -278,8 +305,32 @@ class Qwen36SlotPool:
                         f"{self._kv_dtype}"
                     )
                 shape = (total_pages, self.page_size, attn.num_kv_heads, attn.head_dim)
-                k = torch.zeros(shape, device=self.device, dtype=kv_dtype)
-                v = torch.zeros(shape, device=self.device, dtype=kv_dtype)
+                if self.extensible_buffers is not None:
+                    # Phase 5.5: reserve the full pool as VA, commit one
+                    # granule of physical pages; ExtensibleKVCacheBuffers
+                    # grows every layer's prefix in lockstep.
+                    bytes_per_page = (
+                        self.page_size
+                        * attn.num_kv_heads
+                        * attn.head_dim
+                        * kv_dtype.itemsize
+                    )
+                    device_index = self.device.index if self.device.index is not None else 0
+                    k_buf = ExtensibleTensor(
+                        max_num_bytes=total_pages * bytes_per_page,
+                        device_index=device_index,
+                    )
+                    v_buf = ExtensibleTensor(
+                        max_num_bytes=total_pages * bytes_per_page,
+                        device_index=device_index,
+                    )
+                    k = k_buf.full_view().view(kv_dtype).view(shape)
+                    v = v_buf.full_view().view(kv_dtype).view(shape)
+                    self.extensible_buffers.add(k_buf, bytes_per_page)
+                    self.extensible_buffers.add(v_buf, bytes_per_page)
+                else:
+                    k = torch.zeros(shape, device=self.device, dtype=kv_dtype)
+                    v = torch.zeros(shape, device=self.device, dtype=kv_dtype)
                 self.k_pools[i] = _mark_static(k)
                 self.v_pools[i] = _mark_static(v)
                 kv_bytes += (
@@ -678,6 +729,42 @@ class Qwen36SlotPool:
             raise ValueError(f"KV position {kv_len} is outside pool capacity {self.max_seq_len}")
         physical_page = self._page_table_host[slot][kv_len // self.page_size]
         return physical_page * self.page_size + kv_len % self.page_size
+
+    # -- Phase 5.5 extensible physical KV (VMM) ----------------------------
+
+    def ensure_kv_blocks(self, num_blocks: int) -> None:
+        """Commit at least ``num_blocks`` of the extensible pool's prefix.
+
+        Warmup/capture-time hook: real forwards write KV, and every page a
+        forward can touch must be physically backed before the launch.
+        No-op when the pool is not extensible or already committed further.
+        """
+        if self.extensible_buffers is None:
+            return
+        self.extensible_buffers.ensure_blocks(num_blocks)
+
+    def commit_kv_blocks(self, num_blocks: int) -> None:
+        """Commit the pool's physical prefix to ``num_blocks`` bundles.
+
+        Called once after warmup + CUDA Graph capture, when the final KV
+        size is known from measured memory (the plan's "measured final
+        sizing"). Base pointers never move, so all captured graphs stay
+        valid. No-op when the pool is not extensible.
+        """
+        if self.extensible_buffers is None:
+            return
+        self.extensible_buffers.commit(num_blocks)
+
+    @property
+    def extensible(self) -> bool:
+        return self.extensible_buffers is not None
+
+    @property
+    def physical_kv_bytes(self) -> int:
+        """Physically committed KV bytes (0 without the extensible pool)."""
+        if self.extensible_buffers is None:
+            return 0
+        return self.extensible_buffers.physical_bytes
 
     def register_mtp_kv(self, k_pool: torch.Tensor, v_pool: torch.Tensor) -> None:
         """Register the pooled MTP KV as an atomic COW family (plan §4.8).

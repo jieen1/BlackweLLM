@@ -1,8 +1,12 @@
 # vLLM extensible-KV-cache 分支调研与 SM120 动态物理 KV 实施规划（2026-08-16）
 
-状态：🟢 **调研完成 + 本机实验验证通过**。规划为 Phase 5.5 候选（挂接在
-`qwen38-dynamic-context-vllm-plan.md` 的 P0 动态逻辑 arena 之上），性能无代价
-已由本机实测证明，**是否立项由用户定夺**。
+状态：🟢 **调研完成 + 本机实验验证通过 + Phase A/B 已实施**。规划为
+Phase 5.5 候选（挂接在 `qwen38-dynamic-context-vllm-plan.md` 的 P0 动态逻辑
+arena 之上），性能无代价已由本机实测证明。**2026-08-16 实施落地**：
+Phase A（`runtime/model/vmm_extensible.py` + 双测试套件）+ Phase B
+（`Qwen36SlotPool.extensible_kv` 接入、MTP 锁步池、ServerEngine 实测提交、
+`QSR_QWEN_KV_EXTENSIBLE` 开关、GPU 门禁 11/11 + server smoke 通过），
+见 §11 实施记录。
 
 ## 1. 一句话结论
 
@@ -252,11 +256,62 @@ GPU：RTX PRO 6000 Blackwell Max-Q / CUDA 13.3 / torch 2.13.0a0 / 95.59 GiB。
 
 ## 9. 建议
 
-1. **立项（用户拍板）**：Phase A+B 为一个周末的工作量（移植已验证子集 +
-   接入 + A/B 门禁），直接消除 S7、启动 OOM 风险与 31.5 GiB 闲置。
+1. **已立项（2026-08-16 用户拍板）**：Phase A+B 已完成——移植已验证子集 +
+   接入 + A/B 门禁，直接消除 S7、启动 OOM 风险与闲置显存（见 §11）。
 2. 性能验收以 §7 验收 5 为准：B1 128K tok/s 差 ≤1% 即证明零代价。
 3. 若立项，`qwen38-dynamic-context-vllm-plan.md` §2.2 的"不做 VMM 稀疏
    提交"与 §7 Phase 8 条目 5 需随 PR 更新为"已落地（Phase 5.5）"。
+
+## 11. 实施记录（2026-08-16，Phase A + B 落地）
+
+### Phase A：`runtime/model/vmm_extensible.py`
+
+- `VmmDriver`（ctypes CUDA VMM，模块级零 torch import，CI torch-free 可收集）
+- `ExtensibleTensor`（grow-only 前缀提交、K/V-split `num_segments`、
+  DLPack `full_view`、`release_physical` 保留 VA）
+- `ExtensibleKVCacheBuffers`（多 buffer 锁步提交、`ensure_blocks` warmup
+  钩子、**`add` 会同步新 buffer 到当前已提交前缀**——这是 MTP 池注册
+  晚于 backbone 提交时的锁步不变量，vLLM 分支没有这个场景）
+- 测试：`tests/test_vmm_extensible.py`（18 项 torch-free 记账，fake driver）
+  + `tests/test_vmm_extensible_gpu.py`（8 项 GPU，self-skip）
+
+### Phase B：Qwen36Backend 接入
+
+- `Qwen36SlotPool(extensible_kv=True)`：backbone k/v pools 改 VMM 视图，
+  构造时 0 物理提交；`ensure_kv_blocks`/`commit_kv_blocks`/`physical_kv_bytes`
+- `build_pooled_mtp_caches`：MTP KV 加入同一锁步池（`register_mtp_kv`
+  COW family 语义不变）
+- `Qwen36Backend.ensure_kv_blocks/commit_kv_cache`；`ServerEngine`
+  `qwen_kv_extensible` + `qwen_kv_commit_buffer_gb`（env/CLI：
+  `QSR_QWEN_KV_EXTENSIBLE` / `--qwen-kv-extensible`）
+- `_commit_extensible_kv_pool`：warmup+MTP+decode capture 后实测
+  `mem_get_info` 定稿提交数，不足时警告（admission 拒绝而非 OOM）
+- 捕获期提交策略：warmup 前 `ensure(1 + slots*(K+2))` 覆盖全部写页点
+  （warmup 1 页、MTP verify K+1 页/slot、decode capture 1 页/slot）
+
+### 门禁结果（`scripts/b2_verify_extensible_kv.py`，11/11 PASS）
+
+| 检查 | 结果 |
+|---|---|
+| 构造 0 物理提交（4096 seq: 288 MiB VA → 0 MiB 物理） | ✅ |
+| pre-commit greedy == dynamic token 流（2 slots × 16 steps） | ✅ |
+| 部分提交下跑通 greedy（9/72 bundles committed） | ✅ |
+| commit 前后 KV base pointers 不变 | ✅ |
+| commit 全量后物理 == VA 容量 | ✅ |
+| post-commit greedy 仍 == dynamic | ✅ |
+| MTP K=3 在 extensible 池解码 + 池平衡 | ✅ |
+| 原 b2 dynamic A/B 9/9 无回归 | ✅ |
+| server smoke（strict+extensible+MTP K=4 完整启动+真实请求） | ✅ 25 bundles VA commit 144 MiB |
+
+修复过程中发现并解决的问题：`ExtensibleKVCacheBuffers.add` 未同步新
+buffer 到已提交前缀 → MTP draft capture 写未提交页非法访问（`c5a42db`
+之后补修）。
+
+### 遗留（后续 Phase C/D，不在本次范围）
+
+- 按需增长（请求路径 resize）与 elastic 实测定稿的自动默认
+- reset 全空闲时 `release_physical` 物理回收（Phase D）
+- `qwen38-dynamic-context-vllm-plan.md` §2.2/§7 措辞更新
 
 ## 10. 证据文件
 

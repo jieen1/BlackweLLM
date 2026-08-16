@@ -171,9 +171,7 @@ class VmmDriver:
         self._check(self._lib.cuCtxGetCurrent(ctypes.byref(pctx)))
         if pctx.value:
             return
-        self._check(
-            self._lib.cuDevicePrimaryCtxRetain(ctypes.byref(pctx), device_index)
-        )
+        self._check(self._lib.cuDevicePrimaryCtxRetain(ctypes.byref(pctx), device_index))
         self._check(self._lib.cuCtxSetCurrent(pctx))
 
     def _make_alloc_prop(self, device_index: int) -> _MemAllocationProp:
@@ -293,9 +291,7 @@ class _VirtualBuffer:
         if not 0 <= start <= end:
             raise ValueError(f"invalid range [{start}, {end})")
         if end > self.reserved_size:
-            raise ValueError(
-                f"range end {end} exceeds reserved capacity {self.reserved_size}"
-            )
+            raise ValueError(f"range end {end} exceeds reserved capacity {self.reserved_size}")
         if start == end:
             return
         first = start // self.granularity
@@ -306,9 +302,7 @@ class _VirtualBuffer:
             if unmapped and run_start is None:
                 run_start = g
             elif not unmapped and run_start is not None:
-                self._map_chunk_at(
-                    run_start * self.granularity, (g - run_start) * self.granularity
-                )
+                self._map_chunk_at(run_start * self.granularity, (g - run_start) * self.granularity)
                 self._mapped_granules.update(range(run_start, g))
                 run_start = None
 
@@ -511,9 +505,7 @@ class ExtensibleTensor:
 
     def full_view(self) -> object:
         """A uint8 torch view spanning the full reserved capacity."""
-        return uint8_tensor_from_ptr(
-            self._buffer.base_ptr, self._max_num_bytes, self._device_index
-        )
+        return uint8_tensor_from_ptr(self._buffer.base_ptr, self._max_num_bytes, self._device_index)
 
     def resize_per_segment_(self, bytes_per_segment: int, zero_new: bool = False) -> None:
         """Grow every segment's committed prefix to ``bytes_per_segment`` bytes.
@@ -586,7 +578,19 @@ class ExtensibleKVCacheBuffers:
         return sum(buffer.physical_bytes for buffer, _ in self.buffers)
 
     def add(self, buffer: ExtensibleTensor, bytes_per_block_per_segment: int) -> None:
-        """Register another lockstep buffer (e.g. the pooled MTP KV)."""
+        """Register another lockstep buffer (e.g. the pooled MTP KV).
+
+        Keeps the lockstep invariant: a buffer added after some blocks are
+        already committed is immediately grown to the current committed
+        prefix, so ``commit``/``ensure_blocks`` stay correct for every
+        buffer in the set (the MTP pools join the backbone's pool after
+        its construction-time commit).
+        """
+        if self.num_blocks_committed > 0:
+            buffer.resize_per_segment_(
+                self.num_blocks_committed * bytes_per_block_per_segment,
+                zero_new=True,
+            )
         self.buffers.append((buffer, bytes_per_block_per_segment))
 
     def commit(self, num_blocks: int) -> None:
@@ -597,15 +601,12 @@ class ExtensibleKVCacheBuffers:
         """
         if num_blocks > self.num_blocks_capacity:
             raise ValueError(
-                f"cannot commit {num_blocks} blocks; capacity is "
-                f"{self.num_blocks_capacity}"
+                f"cannot commit {num_blocks} blocks; capacity is {self.num_blocks_capacity}"
             )
         if num_blocks <= self.num_blocks_committed:
             return
         for buffer, bytes_per_block_per_segment in self.buffers:
-            buffer.resize_per_segment_(
-                num_blocks * bytes_per_block_per_segment, zero_new=True
-            )
+            buffer.resize_per_segment_(num_blocks * bytes_per_block_per_segment, zero_new=True)
         self.num_blocks_committed = num_blocks
 
     def ensure_blocks(self, num_blocks: int) -> None:
