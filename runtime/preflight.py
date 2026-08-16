@@ -54,19 +54,27 @@ Severity = Literal["fatal", "warning"]
 # release segment (major.minor.patch) only and deliberately ignores any
 # pre-release (`a0`, `rc1`, ...) or local (`+git...`) suffix, so a from-source
 # `2.13.0aN+...` build passes exactly like a stock PyPI `2.13.0` wheel would.
-REQUIRED_TORCH_VERSION: tuple[int, int, int] = (2, 13, 0)
+REQUIRED_TORCH_VERSION: tuple[int, int, int] = (2, 15, 0)
+# Both environments below are verified on this workstation and both must start:
+# the 2.13 reference env (torch 2.13.0a0+gitcf30153, /home/bot/.venvs/vllm) and the
+# 2.15 nightly env (torch 2.15.0.dev20260815+cu134, /home/bot/.venvs/torch-nightly).
+# `check_torch_version` passes when the release segment matches either.
+VERIFIED_TORCH_VERSIONS: tuple[tuple[int, int, int], ...] = ((2, 13, 0), (2, 15, 0))
 VERIFIED_TORCH_VERSION = (
-    "2.13.0a0+gitcf30153"  # reference environment, from-source build of /home/bot/pytorch-build
+    "2.15.0.dev20260815+cu134"  # nightly venv ~/.venvs/torch-nightly (Python 3.14);
+    # declared target in pyproject.toml is still 2.13.0 (the `cuda` extra's pin).
+    # The 2.13 reference env (from-source build of /home/bot/pytorch-build) remains
+    # supported via VERIFIED_TORCH_VERSIONS above.
 )
-VERIFIED_CUDA_RUNTIME_VERSION = "13.3"  # torch.version.cuda in the verified environment
+VERIFIED_CUDA_RUNTIME_VERSION = "13.4"  # torch.version.cuda in the verified environment
 MIN_CUDA_RUNTIME_VERSION: tuple[int, int] = (13, 0)
 MIN_DRIVER_VERSION: tuple[int, ...] = (
     550,
-)  # conservative Blackwell floor; verified driver is 610.47
-VERIFIED_DRIVER_VERSION = "610.47"
+)  # conservative Blackwell floor; verified driver is 610.88
+VERIFIED_DRIVER_VERSION = "610.88"
 REQUIRED_COMPUTE_CAPABILITY: tuple[int, int] = (12, 0)  # SM120 only — docs/architecture.md §1
 MIN_SPARKINFER_VERSION: tuple[int, int, int] = (1, 0, 0)
-VERIFIED_SPARKINFER_VERSION = "1.0.1"  # editable install of /home/bot/project/sparkinfer
+VERIFIED_SPARKINFER_VERSION = "1.2.3"  # editable install of /home/bot/project/sparkinfer
 # SparkInfer is installed from this project's own fork (`origin` =
 # github.com/jieen1/sparkinfer), not from upstream (`upstream` =
 # github.com/local-inference-lab/sparkinfer) directly. `origin/master` is
@@ -75,7 +83,7 @@ VERIFIED_SPARKINFER_VERSION = "1.0.1"  # editable install of /home/bot/project/s
 # docs/sparkinfer-fork-delta.md for what they are and why the version number
 # alone can't tell you whether they're present; check_sparkinfer_analytic_decode_gate
 # below is the check that actually answers that question.
-VERIFIED_SPARKINFER_COMMIT = "0844a4f"  # fork origin/master, based on upstream 3bd3a2e
+VERIFIED_SPARKINFER_COMMIT = "375cca44"  # fork origin/master, based on upstream 3bd3a2e
 
 # Real, unsharded (TP=1) full-attention shape SparkInfer's paged-attention
 # adapter runs in production — see runtime/backends/laguna_sparkinfer_attn.py
@@ -366,8 +374,8 @@ def check_torch_version(gpu: GpuProbe | None = None) -> CheckResult:
     sort it before the final release.
     """
     gpu = gpu if gpu is not None else probe_gpu()
-    required = ".".join(map(str, REQUIRED_TORCH_VERSION))
-    expected = f"{required} (release segment only; verified build: {VERIFIED_TORCH_VERSION})"
+    required = " or ".join(".".join(map(str, v)) for v in VERIFIED_TORCH_VERSIONS)
+    expected = f"{required} (release segment only; verified builds: 2.13.0a0+gitcf30153, {VERIFIED_TORCH_VERSION})"
     if not gpu.torch_importable or gpu.torch_version is None:
         return CheckResult(
             name="torch_version",
@@ -378,7 +386,7 @@ def check_torch_version(gpu: GpuProbe | None = None) -> CheckResult:
             remediation="Install torch per pyproject.toml's `cuda` extra: `pip install -e .[cuda]`",
         )
     parsed = _parse_version_prefix(gpu.torch_version)
-    ok = parsed == REQUIRED_TORCH_VERSION
+    ok = parsed in VERIFIED_TORCH_VERSIONS
     return CheckResult(
         name="torch_version",
         passed=ok,
@@ -389,10 +397,9 @@ def check_torch_version(gpu: GpuProbe | None = None) -> CheckResult:
             ""
             if ok
             else (
-                f"pyproject.toml pins torch=={required}. Rebuild/reinstall the "
-                "torch used by this venv to match that release segment (a "
-                "same-minor pre-release/local build, e.g. "
-                f"`{required}aN+git...`, also satisfies this check)."
+                f"pyproject.toml pins torch=={REQUIRED_TORCH_VERSION}. Rebuild/reinstall the "
+                "torch used by this venv to match a verified release segment "
+                f"({' or '.join('.'.join(map(str, v)) for v in VERIFIED_TORCH_VERSIONS)})."
             )
         ),
     )
