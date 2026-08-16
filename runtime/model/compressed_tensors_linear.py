@@ -800,3 +800,115 @@ class CompressedTensorsNVFP4Linear(nn.Module):
         for name in ("weight_packed", "weight_scale", "weight_global_scale", "input_global_scale"):
             param = getattr(self, name)
             param.data = param.data.new_empty(0)
+
+
+class FusedFP8ChannelQKV:
+    """Fused one-launch QKV W8A8 GEMM over three FP8-channel linears.
+
+    Production verify/decode runs q_proj / k_proj / v_proj as three
+    separate native W8A8 GEMMs that each re-quantize the same activation
+    and each pay launch + workspace overhead.  Fusing them into one launch
+    quantizes the shared input once and streams the three weight fragments
+    as one contiguous read, which is what the fused GEMM actually wins:
+    the bytes are the same (per-column dots are unchanged), so this is
+    bit-exact with the three-GEMM path -- every output column's dot
+    product and per-channel scale are identical, and the native per-token
+    activation quantizer is deterministic in its input.
+
+    Holds no Parameters (the fused buffers are plain tensors built lazily
+    on CUDA from the three linears' raw FP8 weights), so it never appears
+    in ``named_parameters()``/``state_dict`` and cannot perturb checkpoint
+    loading or the ``free_fp8_raw_weight`` ownership dance.  Build it after
+    loading and before the raw FP8 originals are freed (the model frees
+    them after warmup; the layer builds this on first forward, which
+    precedes warmup by construction).
+    """
+
+    def __init__(
+        self,
+        q_proj: CompressedTensorsFP8ChannelLinear,
+        k_proj: CompressedTensorsFP8ChannelLinear,
+        v_proj: CompressedTensorsFP8ChannelLinear,
+    ) -> None:
+        if q_proj.bias is not None or k_proj.bias is not None or v_proj.bias is not None:
+            raise ValueError("FusedFP8ChannelQKV requires bias-less projections")
+        self._q = q_proj
+        self._k = k_proj
+        self._v = v_proj
+        self._weight: torch.Tensor | None = None
+        self._weight_scale: torch.Tensor | None = None
+        self._out_split: tuple[int, int] | None = None
+        self._workspaces: dict[tuple[int, int, int, int, bool], torch.Tensor] = {}
+
+    @property
+    def ready(self) -> bool:
+        """True when the fused CUDA buffers have been built."""
+        return self._weight is not None
+
+    def _ensure(self) -> None:
+        if self._weight is not None:
+            return
+        wq, wk, wv = self._q.weight.data, self._k.weight.data, self._v.weight.data
+        if wq.numel() == 0 or wk.numel() == 0 or wv.numel() == 0:
+            raise RuntimeError(
+                "FusedFP8ChannelQKV needs raw FP8 weights; build it before "
+                "free_fp8_raw_weight() frees them"
+            )
+        self._weight = torch.cat([wq, wk, wv], dim=0).contiguous()
+        sq = self._q.weight_scale.data.float().reshape(-1)
+        sk = self._k.weight_scale.data.float().reshape(-1)
+        sv = self._v.weight_scale.data.float().reshape(-1)
+        self._weight_scale = torch.cat([sq, sk, sv]).contiguous()
+        self._out_split = (wq.shape[0], wk.shape[0])
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        library: object,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One quantize + one native W8A8 launch; returns ``(q_gate, k, v)``.
+
+        ``x`` may be any leading-shape ``[..., K]`` BF16 tensor; the output
+        splits keep its leading dimensions.  ``library`` is the loaded
+        ``NativeFP8W8A8Library`` (same ABI the single-projection path
+        uses).
+        """
+        self._ensure()
+        assert self._weight is not None
+        assert self._weight_scale is not None
+        assert self._out_split is not None
+        x_shape = x.shape
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        m, k = x_2d.shape
+        n_total = self._weight.shape[0]
+        x_fp8 = torch.empty_like(x_2d, dtype=torch.float8_e4m3fn)
+        activation_scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+        library.quantize_per_token(x_2d, x_fp8, activation_scale)
+        out = torch.empty((m, n_total), dtype=x_2d.dtype, device=x.device)
+        geometry = (m, n_total, k, False)
+        stream_id = torch.cuda.current_stream(x.device).cuda_stream
+        key = (stream_id, *geometry)
+        workspace = self._workspaces.get(key)
+        if workspace is None:
+            workspace = torch.empty(
+                library.workspace_bytes(m=m, n=n_total, k=k, batch_invariant=False),
+                dtype=torch.uint8,
+                device=x.device,
+            )
+            self._workspaces[key] = workspace
+        library.launch(
+            x_fp8,
+            self._weight.t(),
+            activation_scale,
+            self._weight_scale,
+            out,
+            workspace,
+            batch_invariant=False,
+        )
+        nq, nkv = self._out_split
+        lead = x_shape[:-1]
+        return (
+            out[:, :nq].view(*lead, nq),
+            out[:, nq : nq + nkv].view(*lead, nkv),
+            out[:, nq + nkv :].view(*lead, nkv),
+        )

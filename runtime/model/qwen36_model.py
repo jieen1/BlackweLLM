@@ -136,6 +136,9 @@ from runtime.model._weight_loading import default_weight_loader
 from runtime.model.compressed_tensors_linear import (
     CompressedTensorsFP8ChannelLinear,
     CompressedTensorsNVFP4Linear,
+    FusedFP8ChannelQKV,
+    _native_w8a8_fp8_channel_enabled,
+    _native_w8a8_library_for_cuda,
     fp8_channel_raw_execution_uses_all_layers,
 )
 from runtime.model.modelopt_linear import ModelOptFP8Linear, ModelOptNVFP4Linear
@@ -2495,6 +2498,12 @@ class Qwen36Attention(nn.Module):
         self.q_norm = Qwen36RMSNorm(self.head_dim, eps=self.eps)
         self.k_norm = Qwen36RMSNorm(self.head_dim, eps=self.eps)
 
+        # Fused one-launch QKV W8A8 GEMM (native route only), built lazily on
+        # first forward from the three projections' raw FP8 weights.  Kept as
+        # a plain attribute so named_parameters()/state_dict and the loader
+        # stay untouched.
+        self._fused_qkv: FusedFP8ChannelQKV | None = None
+
         # Built lazily on first forward() call, from the actual observed
         # cache/dtype -- safe because every Qwen36GenerationState this
         # layer instance will ever see comes from the SAME model instance
@@ -2608,6 +2617,42 @@ class Qwen36Attention(nn.Module):
             device=device,
         )
 
+    def _qkv_proj(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """q/gate, k, v projections -- one fused native W8A8 launch when possible.
+
+        Mirrors the three projections' own ``forward_native_w8a8`` routing
+        condition (CUDA + native W8A8 enabled + all-layers raw execution);
+        anything else (fallback env, missing raw FP8 weights, CPU) falls
+        back to the three separate modules so behavior is unchanged.  The
+        fused path is bit-exact with the three-GEMM path (same per-column
+        dots and scales, deterministic shared activation quantizer).
+        """
+        if (
+            hidden_states.device.type == "cuda"
+            and _native_w8a8_fp8_channel_enabled()
+            and fp8_channel_raw_execution_uses_all_layers()
+        ):
+            if self._fused_qkv is None:
+                try:
+                    if not all(
+                        isinstance(p, CompressedTensorsFP8ChannelLinear)
+                        for p in (self.q_proj, self.k_proj, self.v_proj)
+                    ):
+                        raise TypeError("fused QKV requires three FP8-channel projections")
+                    self._fused_qkv = FusedFP8ChannelQKV(self.q_proj, self.k_proj, self.v_proj)
+                    self._fused_qkv._ensure()
+                except (RuntimeError, ValueError, TypeError, AttributeError):
+                    self._fused_qkv = None
+            if self._fused_qkv is not None:
+                library = _native_w8a8_library_for_cuda()
+                if library is not None:
+                    return self._fused_qkv.forward_native(hidden_states, library)
+        return (
+            self.q_proj(hidden_states),
+            self.k_proj(hidden_states),
+            self.v_proj(hidden_states),
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2619,15 +2664,15 @@ class Qwen36Attention(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
         assert batch_size == 1
 
-        q_and_gate = self.q_proj(hidden_states)
+        q_and_gate, key_raw, value_raw = self._qkv_proj(hidden_states)
         q_and_gate = q_and_gate.view(batch_size, seq_len, self.num_heads, self.head_dim * 2)
         query, gate = torch.chunk(q_and_gate, 2, dim=-1)
         gate = gate.reshape(batch_size, seq_len, -1)
 
         kv_shape = (batch_size, seq_len, self.num_kv_heads, self.head_dim)
         query = self.q_norm(query)
-        key = self.k_norm(self.k_proj(hidden_states).view(*kv_shape))
-        value = self.v_proj(hidden_states).view(*kv_shape)
+        key = self.k_norm(key_raw.view(*kv_shape))
+        value = value_raw.view(*kv_shape)
 
         # Flatten batch=1 away for RoPE + sparkinfer, both of which are
         # token-major ([total_q, num_heads, head_dim]) by convention.
@@ -2729,15 +2774,15 @@ class Qwen36Attention(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
         assert seq_len == 1, "decode_batch is the single-token continuation path"
 
-        q_and_gate = self.q_proj(hidden_states)
+        q_and_gate, key_raw, value_raw = self._qkv_proj(hidden_states)
         q_and_gate = q_and_gate.view(batch_size, self.num_heads, self.head_dim * 2)
         query, gate = torch.chunk(q_and_gate, 2, dim=-1)
         gate = gate.reshape(batch_size, 1, -1)
 
         kv_shape = (batch_size, self.num_kv_heads, self.head_dim)
         query = self.q_norm(query)
-        key = self.k_norm(self.k_proj(hidden_states).view(*kv_shape))
-        value = self.v_proj(hidden_states).view(*kv_shape)
+        key = self.k_norm(key_raw.view(*kv_shape))
+        value = value_raw.view(*kv_shape)
 
         query_flat = query.reshape(batch_size, self.num_heads * self.head_dim).contiguous()
         key_flat = key.reshape(batch_size, self.num_kv_heads * self.head_dim).contiguous()
@@ -2802,20 +2847,19 @@ class Qwen36Attention(nn.Module):
                 f"got [{batch_size}, {seq_len}], expected [{attn.batch}, {attn.tokens_per_slot}]"
             )
         total_q = batch_size * seq_len
-        q_and_gate = self.q_proj(hidden_states).view(
+        q_and_gate, key_raw, value_raw = self._qkv_proj(hidden_states)
+        q_and_gate = q_and_gate.view(
             batch_size, seq_len, self.num_heads, self.head_dim * 2
         )
         query, gate = torch.chunk(q_and_gate, 2, dim=-1)
         gate = gate.reshape(batch_size, seq_len, -1)
         kv_shape = (batch_size, seq_len, self.num_kv_heads, self.head_dim)
         query = self.q_norm(query).reshape(total_q, self.num_heads, self.head_dim)
-        key = self.k_norm(self.k_proj(hidden_states).view(*kv_shape)).reshape(
+        key = self.k_norm(key_raw.view(*kv_shape)).reshape(
             total_q, self.num_kv_heads, self.head_dim
         )
         value = (
-            self.v_proj(hidden_states)
-            .view(*kv_shape)
-            .reshape(total_q, self.num_kv_heads, self.head_dim)
+            value_raw.view(*kv_shape).reshape(total_q, self.num_kv_heads, self.head_dim)
         )
         query_flat = query.reshape(total_q, self.num_heads * self.head_dim).contiguous()
         key_flat = key.reshape(total_q, self.num_kv_heads * self.head_dim).contiguous()
@@ -2862,15 +2906,16 @@ class Qwen36Attention(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
         assert batch_size == attn.batch and seq_len == attn.verify_tokens
 
-        q_and_gate = self.q_proj(hidden_states).view(
+        q_and_gate, key_raw, value_raw = self._qkv_proj(hidden_states)
+        q_and_gate = q_and_gate.view(
             batch_size, seq_len, self.num_heads, self.head_dim * 2
         )
         query, gate = torch.chunk(q_and_gate, 2, dim=-1)
         gate = gate.reshape(batch_size, seq_len, -1)
         kv_shape = (batch_size, seq_len, self.num_kv_heads, self.head_dim)
         query = self.q_norm(query)
-        key = self.k_norm(self.k_proj(hidden_states).view(*kv_shape))
-        value = self.v_proj(hidden_states).view(*kv_shape)
+        key = self.k_norm(key_raw.view(*kv_shape))
+        value = value_raw.view(*kv_shape)
         total_q = batch_size * seq_len
         query = query.reshape(total_q, self.num_heads, self.head_dim)
         key = key.reshape(total_q, self.num_kv_heads, self.head_dim)
