@@ -40,6 +40,48 @@ def _e4m3_byte_to_f32(byte):
 
 
 @triton.jit
+def _unpack_kv_half(
+    CODES,
+    SCALES,
+    phys,
+    pid_h,
+    H,
+    half_start,
+    row_mask,
+    D: tl.constexpr,
+    BK: tl.constexpr,
+):
+    """Unpack one half (D/2 columns) of a [BK, D] kv-head row into BF16.
+
+    Column-split keeps the f32 where-chain intermediates at [BK, D/2] so
+    BLOCK_K=64 fits SM120's 99 KiB smem (a full [64, 256] f32 tile is
+    64 KiB by itself)."""
+    # one half is D/2 elements = D/4 code bytes; nibble-unpack to D/2 elems
+    byte_cols = tl.arange(0, D // 4)
+    c_off = phys[:, None] * (H * (D // 2)) + pid_h * (D // 2) + (half_start // 2 + byte_cols)[None, :]
+    kc = tl.load(CODES + c_off, mask=row_mask[:, None], other=0)
+    lo = (kc & 0x0F).to(tl.int32)
+    hi = ((kc >> 4) & 0x0F).to(tl.int32)
+    nib = tl.reshape(tl.join(lo, hi), (BK, D // 2))
+    mag = nib & 0x07
+    sign = (nib >> 3) & 0x01
+    mag_f = mag.to(tl.float32)
+    val = tl.where(mag == 1, 0.5, tl.zeros_like(mag_f))
+    val = tl.where(mag == 2, 1.0, val)
+    val = tl.where(mag == 3, 1.5, val)
+    val = tl.where(mag == 4, 2.0, val)
+    val = tl.where(mag == 5, 3.0, val)
+    val = tl.where(mag == 6, 4.0, val)
+    val = tl.where(mag == 7, 6.0, val)
+    val = val * (1.0 - 2.0 * sign.to(tl.float32))
+    sf_idx = (half_start + tl.arange(0, D // 2)) // 16
+    sf_off = phys[:, None] * (H * (D // 16)) + pid_h * (D // 16) + sf_idx[None, :]
+    sf = tl.load(SCALES + sf_off, mask=row_mask[:, None], other=0)
+    sf_deq = _e4m3_byte_to_f32(sf)
+    return (val * sf_deq).to(tl.bfloat16)
+
+
+@triton.jit
 def nvfp4_decode_partial_kernel(
     Q,
     K_CODES,
@@ -92,47 +134,25 @@ def nvfp4_decode_partial_kernel(
         rows = tl.arange(0, BLOCK_K)
         row_mask = rows < n
         phys = page0 + k_start + rows
-        # ---- unpack K for this kv head: [BLOCK_K, D] fp8 ----
-        kc_off = phys[:, None] * (NUM_KV_HEADS * (HEAD_DIM // 2)) + pid_h * (HEAD_DIM // 2) + tl.arange(0, HEAD_DIM // 2)[None, :]
-        kc = tl.load(K_CODES + kc_off, mask=row_mask[:, None], other=0)
-        lo = (kc & 0x0F).to(tl.int32)
-        hi = ((kc >> 4) & 0x0F).to(tl.int32)
-        nib = tl.reshape(tl.join(lo, hi), (BLOCK_K, HEAD_DIM))
-        mag = nib & 0x07
-        sign = (nib >> 3) & 0x01
-        mag_f = mag.to(tl.float32)
-        val = tl.where(mag == 1, 0.5, tl.zeros_like(mag_f))
-        val = tl.where(mag == 2, 1.0, val)
-        val = tl.where(mag == 3, 1.5, val)
-        val = tl.where(mag == 4, 2.0, val)
-        val = tl.where(mag == 5, 3.0, val)
-        val = tl.where(mag == 6, 4.0, val)
-        val = tl.where(mag == 7, 6.0, val)
-        val = val * (1.0 - 2.0 * sign.to(tl.float32))
-        sf_idx = tl.arange(0, HEAD_DIM) // 16
-        sf_off = phys[:, None] * (NUM_KV_HEADS * (HEAD_DIM // 16)) + pid_h * (HEAD_DIM // 16) + sf_idx[None, :]
-        sf = tl.load(K_SCALES + sf_off, mask=row_mask[:, None], other=0)
-        sf_deq = _e4m3_byte_to_f32(sf)
-        k = (val * sf_deq).to(tl.bfloat16)  # [BLOCK_K, D]
+        # ---- unpack K for this kv head in column halves ----
+        k_lo = _unpack_kv_half(
+            K_CODES, K_SCALES, phys, pid_h, NUM_KV_HEADS, 0, row_mask, HEAD_DIM, BLOCK_K
+        )
+        k_hi = _unpack_kv_half(
+            K_CODES, K_SCALES, phys, pid_h, NUM_KV_HEADS, HEAD_DIM // 2, row_mask,
+            HEAD_DIM, BLOCK_K,
+        )
+        k = tl.reshape(tl.permute(tl.join(k_lo, k_hi), (0, 2, 1)), (BLOCK_K, HEAD_DIM))
         # ---- unpack V ----
-        vc = tl.load(V_CODES + kc_off, mask=row_mask[:, None], other=0)
-        lo = (vc & 0x0F).to(tl.int32)
-        hi = ((vc >> 4) & 0x0F).to(tl.int32)
-        nib = tl.reshape(tl.join(lo, hi), (BLOCK_K, HEAD_DIM))
-        mag = nib & 0x07
-        sign = (nib >> 3) & 0x01
-        mag_f = mag.to(tl.float32)
-        val = tl.where(mag == 1, 0.5, tl.zeros_like(mag_f))
-        val = tl.where(mag == 2, 1.0, val)
-        val = tl.where(mag == 3, 1.5, val)
-        val = tl.where(mag == 4, 2.0, val)
-        val = tl.where(mag == 5, 3.0, val)
-        val = tl.where(mag == 6, 4.0, val)
-        val = tl.where(mag == 7, 6.0, val)
-        val = val * (1.0 - 2.0 * sign.to(tl.float32))
-        vsf = tl.load(V_SCALES + sf_off, mask=row_mask[:, None], other=0)
-        vsf_deq = _e4m3_byte_to_f32(vsf)
-        v = (val * vsf_deq).to(tl.bfloat16)  # [BLOCK_K, D]
+        # ---- unpack V in column halves ----
+        v_lo = _unpack_kv_half(
+            V_CODES, V_SCALES, phys, pid_h, NUM_KV_HEADS, 0, row_mask, HEAD_DIM, BLOCK_K
+        )
+        v_hi = _unpack_kv_half(
+            V_CODES, V_SCALES, phys, pid_h, NUM_KV_HEADS, HEAD_DIM // 2, row_mask,
+            HEAD_DIM, BLOCK_K,
+        )
+        v = tl.reshape(tl.permute(tl.join(v_lo, v_hi), (0, 2, 1)), (BLOCK_K, HEAD_DIM))
 
         # ---- QK: [GQA, D] x [D, BLOCK_K] (bf16 dot: SM120 tl.dot has no
         # fp8 LHS) ----
@@ -207,7 +227,7 @@ def nvfp4_decode_attention(
     head_dim: int = 256,
     gqa: int = 6,
     n_split: int = 32,
-    block_k: int = 32,
+    block_k: int = 64,
     num_warps: int = 8,
 ) -> torch.Tensor:
     """NVFP4-KV flash decode attention (partial + merge).
