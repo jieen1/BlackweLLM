@@ -624,6 +624,11 @@ class Qwen36DecodeBatch:
     conv_pools: list[torch.Tensor | None]
     recurrent_pools: list[torch.Tensor | None]
     attn_outputs: list[torch.Tensor | None]
+    #: NVFP4 KV pools (None when QSR_QWEN36_NVFP4_KV is off).
+    nvfp4_k_codes: list[torch.Tensor | None] | None = None
+    nvfp4_k_scales: list[torch.Tensor | None] | None = None
+    nvfp4_v_codes: list[torch.Tensor | None] | None = None
+    nvfp4_v_scales: list[torch.Tensor | None] | None = None
 
     @property
     def page_table(self) -> torch.Tensor:
@@ -657,6 +662,11 @@ class Qwen36PrefillBatch:
     recurrent_pools: list[torch.Tensor | None]
     attn_outputs: list[torch.Tensor | None]
     has_previous_state: bool
+    #: NVFP4 KV pools (None when QSR_QWEN36_NVFP4_KV is off).
+    nvfp4_k_codes: list[torch.Tensor | None] | None = None
+    nvfp4_k_scales: list[torch.Tensor | None] | None = None
+    nvfp4_v_codes: list[torch.Tensor | None] | None = None
+    nvfp4_v_scales: list[torch.Tensor | None] | None = None
 
 
 @dataclass
@@ -688,6 +698,11 @@ class Qwen36VerifyBatch:
     #: Eager compatibility path.  CUDA graphs use ``gdn_destination_index``
     #: instead, so slot identity remains data rather than captured addresses.
     gdn_state_rows: dict[int, list[list[GdnLayerState]]] | None
+    #: NVFP4 KV pools (None when QSR_QWEN36_NVFP4_KV is off).
+    nvfp4_k_codes: list[torch.Tensor | None] | None = None
+    nvfp4_k_scales: list[torch.Tensor | None] | None = None
+    nvfp4_v_codes: list[torch.Tensor | None] | None = None
+    nvfp4_v_scales: list[torch.Tensor | None] | None = None
 
 
 @dataclass
@@ -1891,6 +1906,7 @@ class Qwen36BatchedDecodeAttention:
     ) -> None:
         self.batch = batch
         self.device = device
+        self.page_size = page_size
         # Fallback descale used when a caller's forward() doesn't pass its
         # own -- BF16 KV's harmless no-op (1.0). This driver is SHARED
         # across every full-attention layer for a given batch size (class
@@ -2206,6 +2222,7 @@ class Qwen36DecodeGraphAttention:
         # From here on these ARE the buffers the caller writes each step.
         self.page_table = self._workspace.page_table
         self.cache_seqlens = self._workspace.cache_seqlens
+        self.page_size = page_size
 
     def update_replay_metadata(self) -> None:
         """Re-derive the split-KV chunking from the LIVE cache lengths.
@@ -2641,25 +2658,62 @@ class Qwen36Attention(nn.Module):
         )
 
     def _kv_nvfp4_roundtrip(
-        self, key: torch.Tensor, value: torch.Tensor
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        nvfp4_k_codes: torch.Tensor | None,
+        nvfp4_k_scales: torch.Tensor | None,
+        nvfp4_v_codes: torch.Tensor | None,
+        nvfp4_v_scales: torch.Tensor | None,
+        write_index: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """NVFP4 block-16 KV round-trip for the verification path
-        (``QSR_QWEN36_NVFP4_KV=1``): quantize+dequantize K/V right before
-        the cache write, so the pool carries exactly the error a real
-        nvfp4-KV cache would.  The b12x read side is untouched; this only
-        answers the KV precision question (notes/2026-08-16-nvfp4-kv-plan.md
-        S1).  Returns None (no-op) unless the switch is on.
+        """NVFP4 KV write path (notes/2026-08-16-nvfp4-kv-plan.md S3):
+        pack ``key``/``value`` into the packed pools at ``write_index`` and
+        return the dequantized values so the caller can keep the fp8 shadow
+        pool (b12x prefill reads) coherent.  Returns None (no-op) unless
+        the pools were allocated (QSR_QWEN36_NVFP4_KV=1).
         """
-        if os.environ.get("QSR_QWEN36_NVFP4_KV", "0") != "1":
+        if nvfp4_k_codes is None or write_index is None:
             return None
-        from runtime.kernels.nvfp4_quant import quantize_dequantize_nvfp4_roundtrip
+        from runtime.kernels.nvfp4_kv import pack_nvfp4_kv_into_pool, unpack_nvfp4_kv
 
-        return (
-            quantize_dequantize_nvfp4_roundtrip(key.reshape(-1, self.head_dim)).reshape(key.shape),
-            quantize_dequantize_nvfp4_roundtrip(value.reshape(-1, self.head_dim)).reshape(
-                value.shape
-            ),
+        if os.environ.get("QSR_NVFP4_ATTN_DEBUG", "0") == "1":
+            import time as _t
+
+            _t0 = _t.perf_counter()
+        pack_nvfp4_kv_into_pool(
+            key,
+            value,
+            nvfp4_k_codes,
+            nvfp4_k_scales,
+            nvfp4_v_codes,
+            nvfp4_v_scales,
+            write_index,
+            head_dim=self.head_dim,
         )
+        rows = write_index.shape[0]
+        kv_heads = self.num_kv_heads
+        k_codes_rows = nvfp4_k_codes.view(-1, kv_heads, self.head_dim // 2)[
+            write_index
+        ].reshape(-1, self.head_dim // 2)
+        k_scales_rows = nvfp4_k_scales.view(-1, kv_heads, self.head_dim // 16)[
+            write_index
+        ].reshape(-1, self.head_dim // 16)
+        v_codes_rows = nvfp4_v_codes.view(-1, kv_heads, self.head_dim // 2)[
+            write_index
+        ].reshape(-1, self.head_dim // 2)
+        v_scales_rows = nvfp4_v_scales.view(-1, kv_heads, self.head_dim // 16)[
+            write_index
+        ].reshape(-1, self.head_dim // 16)
+        k_un = unpack_nvfp4_kv(k_codes_rows, k_scales_rows).to(torch.bfloat16).view(
+            rows, kv_heads, self.head_dim
+        )
+        v_un = unpack_nvfp4_kv(v_codes_rows, v_scales_rows).to(torch.bfloat16).view(
+            rows, kv_heads, self.head_dim
+        )
+        if os.environ.get("QSR_NVFP4_ATTN_DEBUG", "0") == "1":
+            print(f"[nvfp4-write] rows={rows} {( _t.perf_counter()-_t0)*1e3:.2f}ms", flush=True)
+        return k_un, v_un
 
     def _qkv_proj(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """q/gate, k, v projections -- one fused native W8A8 launch when possible.
@@ -2731,7 +2785,9 @@ class Qwen36Attention(nn.Module):
         query = query_flat.view(seq_len, self.num_heads, self.head_dim)
         key = key_flat.view(seq_len, self.num_kv_heads, self.head_dim)
 
-        _rt = self._kv_nvfp4_roundtrip(key, value)
+        _rt = self._kv_nvfp4_roundtrip(
+            key, value, None, None, None, None, write_index=None
+        )
         if _rt is not None:
             key, value = _rt
         k_to_store, v_to_store = _kv_to_cache_dtype(
@@ -2792,6 +2848,10 @@ class Qwen36Attention(nn.Module):
         write_index: torch.Tensor,
         attn: Qwen36BatchedDecodeAttention | Qwen36DecodeGraphAttention,
         output: torch.Tensor,
+        nvfp4_k_codes: torch.Tensor | None = None,
+        nvfp4_k_scales: torch.Tensor | None = None,
+        nvfp4_v_codes: torch.Tensor | None = None,
+        nvfp4_v_scales: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One decode step for ``B`` sequences sharing this layer's KV pool.
 
@@ -2840,7 +2900,9 @@ class Qwen36Attention(nn.Module):
 
         k_flat = k_pool.view(-1, self.num_kv_heads, self.head_dim)
         v_flat = v_pool.view(-1, self.num_kv_heads, self.head_dim)
-        _rt = self._kv_nvfp4_roundtrip(key, value)
+        _rt = self._kv_nvfp4_roundtrip(
+            key, value, nvfp4_k_codes, nvfp4_k_scales, nvfp4_v_codes, nvfp4_v_scales, write_index
+        )
         if _rt is not None:
             key, value = _rt
         k_to_store, v_to_store = _kv_to_cache_dtype(
@@ -2864,14 +2926,36 @@ class Qwen36Attention(nn.Module):
         # Query stays BF16 regardless of k_pool's dtype -- see forward()'s
         # matching comment for why casting it to the pool's dtype (the old
         # `needs_cast`/`q_for_kernel`) would be wrong for FP8 KV.
-        attn.forward(
-            q=query,
-            k_cache=k_pool,
-            v_cache=v_pool,
-            output=output,
-            k_descale=self.k_scale,
-            v_descale=self.v_scale,
-        )
+        if nvfp4_k_codes is not None:
+            from runtime.kernels.nvfp4_decode_attn import nvfp4_decode_attention
+
+            q2r = torch.arange(batch_size, device=query.device)
+            qpos = attn.cache_seqlens - 1
+            o = nvfp4_decode_attention(
+                query,
+                nvfp4_k_codes,
+                nvfp4_k_scales,
+                nvfp4_v_codes,
+                nvfp4_v_scales,
+                attn.page_table[:, 0] * attn.page_size,
+                attn.cache_seqlens,
+                q2r,
+                qpos,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                gqa=self.num_heads // self.num_kv_heads,
+            )
+            output.copy_(o)
+        else:
+            attn.forward(
+                q=query,
+                k_cache=k_pool,
+                v_cache=v_pool,
+                output=output,
+                k_descale=self.k_scale,
+                v_descale=self.v_scale,
+            )
 
         attn_out = output.reshape(batch_size, 1, -1)
         attn_out = attn_out * torch.sigmoid(gate)
@@ -2888,6 +2972,10 @@ class Qwen36Attention(nn.Module):
         write_index: torch.Tensor,
         attn: Qwen36BatchedExtendAttention,
         output: torch.Tensor,
+        nvfp4_k_codes: torch.Tensor | None = None,
+        nvfp4_k_scales: torch.Tensor | None = None,
+        nvfp4_v_codes: torch.Tensor | None = None,
+        nvfp4_v_scales: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Batched extend attention over globally addressed slot pages."""
         batch_size, seq_len, _ = hidden_states.shape
@@ -2917,7 +3005,9 @@ class Qwen36Attention(nn.Module):
         apply_rotary_embedding_inplace(positions, key_flat, self.head_dim, cos_sin_cache)
         query = query_flat.view(total_q, self.num_heads, self.head_dim)
         key = key_flat.view(total_q, self.num_kv_heads, self.head_dim)
-        _rt = self._kv_nvfp4_roundtrip(key, value)
+        _rt = self._kv_nvfp4_roundtrip(
+            key, value, nvfp4_k_codes, nvfp4_k_scales, nvfp4_v_codes, nvfp4_v_scales, write_index
+        )
         if _rt is not None:
             key, value = _rt
         k_to_store, v_to_store = _kv_to_cache_dtype(
@@ -2947,6 +3037,10 @@ class Qwen36Attention(nn.Module):
         write_index: torch.Tensor,
         attn: Qwen36VerifyGraphAttention,
         output: torch.Tensor,
+        nvfp4_k_codes: torch.Tensor | None = None,
+        nvfp4_k_scales: torch.Tensor | None = None,
+        nvfp4_v_codes: torch.Tensor | None = None,
+        nvfp4_v_scales: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """K-token graph-safe verify attention over a pooled KV cache.
 
@@ -2984,7 +3078,9 @@ class Qwen36Attention(nn.Module):
         query = query_flat.view(total_q, self.num_heads, self.head_dim)
         key = key_flat.view(total_q, self.num_kv_heads, self.head_dim)
 
-        _rt = self._kv_nvfp4_roundtrip(key, value)
+        _rt = self._kv_nvfp4_roundtrip(
+            key, value, nvfp4_k_codes, nvfp4_k_scales, nvfp4_v_codes, nvfp4_v_scales, write_index
+        )
         if _rt is not None:
             key, value = _rt
         k_to_store, v_to_store = _kv_to_cache_dtype(
@@ -2992,14 +3088,41 @@ class Qwen36Attention(nn.Module):
         )
         k_pool.view(-1, self.num_kv_heads, self.head_dim)[write_index] = k_to_store
         v_pool.view(-1, self.num_kv_heads, self.head_dim)[write_index] = v_to_store
-        attn.forward(
-            q=query,
-            k_cache=k_pool,
-            v_cache=v_pool,
-            output=output,
-            k_descale=self.k_scale,
-            v_descale=self.v_scale,
-        )
+        if nvfp4_k_codes is not None:
+            from runtime.kernels.nvfp4_decode_attn import nvfp4_decode_attention
+
+            qo_len = total_q // attn.batch
+            q2r = torch.repeat_interleave(
+                torch.arange(attn.batch, device=query.device), qo_len
+            )
+            qpos = torch.repeat_interleave(attn.cache_seqlens, qo_len) + torch.arange(
+                qo_len, device=query.device
+            ).repeat(attn.batch)
+            o = nvfp4_decode_attention(
+                query,
+                nvfp4_k_codes,
+                nvfp4_k_scales,
+                nvfp4_v_codes,
+                nvfp4_v_scales,
+                attn.page_table[:, 0] * attn.page_size,
+                attn.cache_seqlens,
+                q2r,
+                qpos,
+                num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=self.head_dim,
+                gqa=self.num_heads // self.num_kv_heads,
+            )
+            output.copy_(o)
+        else:
+            attn.forward(
+                q=query,
+                k_cache=k_pool,
+                v_cache=v_pool,
+                output=output,
+                k_descale=self.k_scale,
+                v_descale=self.v_scale,
+            )
 
         attn_out = output.reshape(batch_size, seq_len, -1)
         attn_out = attn_out * torch.sigmoid(gate)
@@ -3716,6 +3839,18 @@ class Qwen36DecoderLayer(nn.Module):
                 write_index=batch.write_index,
                 attn=batch.attn,
                 output=batch.attn_outputs[i],
+                nvfp4_k_codes=(
+                    None if batch.nvfp4_k_codes is None else batch.nvfp4_k_codes[i]
+                ),
+                nvfp4_k_scales=(
+                    None if batch.nvfp4_k_scales is None else batch.nvfp4_k_scales[i]
+                ),
+                nvfp4_v_codes=(
+                    None if batch.nvfp4_v_codes is None else batch.nvfp4_v_codes[i]
+                ),
+                nvfp4_v_scales=(
+                    None if batch.nvfp4_v_scales is None else batch.nvfp4_v_scales[i]
+                ),
             )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -3758,6 +3893,18 @@ class Qwen36DecoderLayer(nn.Module):
                 write_index=batch.write_index,
                 attn=batch.attn,
                 output=batch.attn_outputs[i],
+                nvfp4_k_codes=(
+                    None if batch.nvfp4_k_codes is None else batch.nvfp4_k_codes[i]
+                ),
+                nvfp4_k_scales=(
+                    None if batch.nvfp4_k_scales is None else batch.nvfp4_k_scales[i]
+                ),
+                nvfp4_v_codes=(
+                    None if batch.nvfp4_v_codes is None else batch.nvfp4_v_codes[i]
+                ),
+                nvfp4_v_scales=(
+                    None if batch.nvfp4_v_scales is None else batch.nvfp4_v_scales[i]
+                ),
             )
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
@@ -4273,6 +4420,18 @@ class Qwen36TextModelSelfBuilt(nn.Module):
                     write_index=batch.write_index,
                     attn=driver,
                     output=output,
+                    nvfp4_k_codes=(
+                        None if batch.nvfp4_k_codes is None else batch.nvfp4_k_codes[layer.layer_idx]
+                    ),
+                    nvfp4_k_scales=(
+                        None if batch.nvfp4_k_scales is None else batch.nvfp4_k_scales[layer.layer_idx]
+                    ),
+                    nvfp4_v_codes=(
+                        None if batch.nvfp4_v_codes is None else batch.nvfp4_v_codes[layer.layer_idx]
+                    ),
+                    nvfp4_v_scales=(
+                        None if batch.nvfp4_v_scales is None else batch.nvfp4_v_scales[layer.layer_idx]
+                    ),
                 )
             hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
             hidden_states = layer.mlp(hidden_states)

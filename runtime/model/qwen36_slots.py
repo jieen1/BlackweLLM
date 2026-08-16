@@ -55,9 +55,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+import os
 
 import torch
-
 from runtime.model.qwen36_kv_arena import BlockKey
 from runtime.model.qwen36_model import (
     _PAGED_ATTENTION_PAGE_SIZE,
@@ -225,6 +225,17 @@ class Qwen36SlotPool:
         self.num_layers = len(layers)
         self.k_pools: list[torch.Tensor | None] = [None] * self.num_layers
         self.v_pools: list[torch.Tensor | None] = [None] * self.num_layers
+        #: NVFP4 KV pools (S2/S3 of notes/2026-08-16-nvfp4-kv-plan.md), one
+        #: [total_pages*page_size, kv_heads, head_dim/2] codes pool and one
+        #: [.., head_dim/16] scales pool per layer, for K and V.  Allocated
+        #: only when QSR_QWEN36_NVFP4_KV=1; the fp8 pools above stay as the
+        #: b12x-read shadow (prefill extend) while decode/verify read the
+        #: packed pools through runtime/kernels/nvfp4_decode_attn.py.
+        self.nvfp4_k_codes: list[torch.Tensor | None] = [None] * self.num_layers
+        self.nvfp4_k_scales: list[torch.Tensor | None] = [None] * self.num_layers
+        self.nvfp4_v_codes: list[torch.Tensor | None] = [None] * self.num_layers
+        self.nvfp4_v_scales: list[torch.Tensor | None] = [None] * self.num_layers
+        self._nvfp4_kv = os.environ.get("QSR_QWEN36_NVFP4_KV", "0") == "1"
         self.conv_pools: list[torch.Tensor | None] = [None] * self.num_layers
         self.recurrent_pools: list[torch.Tensor | None] = [None] * self.num_layers
         self.attn_outputs: list[torch.Tensor | None] = [None] * self.num_layers
@@ -333,6 +344,35 @@ class Qwen36SlotPool:
                     v = torch.zeros(shape, device=self.device, dtype=kv_dtype)
                 self.k_pools[i] = _mark_static(k)
                 self.v_pools[i] = _mark_static(v)
+                if self._nvfp4_kv:
+                    if self.extensible_buffers is not None:
+                        raise ValueError(
+                            "QSR_QWEN36_NVFP4_KV=1 is not supported with extensible KV yet"
+                        )
+                    n_shape = (
+                        total_pages,
+                        self.page_size,
+                        attn.num_kv_heads,
+                        attn.head_dim // 2,
+                    )
+                    s_shape = (
+                        total_pages,
+                        self.page_size,
+                        attn.num_kv_heads,
+                        attn.head_dim // 16,
+                    )
+                    self.nvfp4_k_codes[i] = _mark_static(
+                        torch.zeros(n_shape, device=self.device, dtype=torch.uint8)
+                    )
+                    self.nvfp4_v_codes[i] = _mark_static(
+                        torch.zeros(n_shape, device=self.device, dtype=torch.uint8)
+                    )
+                    self.nvfp4_k_scales[i] = _mark_static(
+                        torch.zeros(s_shape, device=self.device, dtype=torch.uint8)
+                    )
+                    self.nvfp4_v_scales[i] = _mark_static(
+                        torch.zeros(s_shape, device=self.device, dtype=torch.uint8)
+                    )
                 kv_bytes += (
                     2
                     * self.pages_per_slot
@@ -1591,6 +1631,10 @@ class Qwen36SlotPool:
             conv_pools=self.conv_pools,
             recurrent_pools=self.recurrent_pools,
             attn_outputs=[None if out is None else out[:b] for out in self.attn_outputs],
+            nvfp4_k_codes=self.nvfp4_k_codes,
+            nvfp4_k_scales=self.nvfp4_k_scales,
+            nvfp4_v_codes=self.nvfp4_v_codes,
+            nvfp4_v_scales=self.nvfp4_v_scales,
         )
         return batch, b
 
@@ -1701,6 +1745,10 @@ class Qwen36SlotPool:
             recurrent_pools=self.recurrent_pools,
             attn_outputs=outputs,
             has_previous_state=has_previous_state,
+            nvfp4_k_codes=self.nvfp4_k_codes,
+            nvfp4_k_scales=self.nvfp4_k_scales,
+            nvfp4_v_codes=self.nvfp4_v_codes,
+            nvfp4_v_scales=self.nvfp4_v_scales,
         )
 
     def commit_prefill_batch(self, slots: list[int], token_ids_per_slot: list[list[int]]) -> None:
