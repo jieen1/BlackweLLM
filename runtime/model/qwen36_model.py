@@ -144,6 +144,16 @@ from runtime.model.compressed_tensors_linear import (
 from runtime.model.modelopt_linear import ModelOptFP8Linear, ModelOptNVFP4Linear
 from runtime.model.plain_linear import PlainLinear
 
+#: MTP-draft-head FP8 KV gate (2026-08-16): the backbone FP8 KV is gated by
+#: ``QSR_QWEN36_FP8_KV``; this separate switch lets an A/B keep the backbone
+#: FP8 and toggle only the draft head's cache dtype.  DEFAULT OFF: measured
+#: on real text (temperature 0, fixed prompt, 3x120 tokens) that FP8 MTP KV
+#: drops draft acceptance 46.4% -> 36.0%, which costs more tokens per round
+#: (2.38 -> 2.08) than the ~4% faster round it buys -- net negative.  The
+#: digit-filler bench (100% acceptance) does not expose this, so the switch
+#: stays available for any future scale strategy (e.g. per-token dynamic).
+QSR_QWEN36_MTP_FP8_KV_ENV = "QSR_QWEN36_MTP_FP8_KV"
+
 #: Checkpoint tensor suffixes this loader deliberately never consumes into
 #: a Parameter. Empty since the 2026-08-03 FP8 follow-up: ``ModelOptFP8Linear``
 #: now has a real ``input_scale`` Parameter (see its docstring), so that
@@ -4384,7 +4394,13 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         # existing B1/B2 caller's memory footprint is unchanged byte-for-byte.
         self.mtp: Qwen36MTPHead | None = (
             Qwen36MTPHead(
-                config, quantized, max_seq_len=max_seq_len, enable_fp8_kv=enable_fp8_kv
+                config,
+                quantized,
+                max_seq_len=max_seq_len,
+                enable_fp8_kv=(
+                    enable_fp8_kv
+                    and os.environ.get(QSR_QWEN36_MTP_FP8_KV_ENV, "0") != "0"
+                ),
             )
             if enable_mtp
             else None
