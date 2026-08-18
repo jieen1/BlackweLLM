@@ -33,7 +33,7 @@
         "served_context_tokens": 131072,
         "concurrency": 4,
         "cold": {
-          "wall_s": 41.0931,
+          "wall_s": 42.2508,
           "requests_sent": 4,
           "requests_ok": 4,
           "requests_completed_delta": 4,
@@ -42,8 +42,8 @@
             {
               "error": null,
               "ttft_s": null,
-              "last_event_s": 41.0929,
-              "wall_s": 41.0929,
+              "last_event_s": 42.1672,
+              "wall_s": 42.1672,
               "usage_prompt": 131072,
               "usage_completion": 256,
               "completion_text": "789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789",
@@ -53,8 +53,8 @@
             {
               "error": null,
               "ttft_s": null,
-              "last_event_s": 41.0475,
-              "wall_s": 41.0475,
+              "last_event_s": 42.2089,
+              "wall_s": 42.2089,
               "usage_prompt": 131072,
               "usage_completion": 256,
               "completion_text": "789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789",
@@ -64,8 +64,8 @@
             {
               "error": null,
               "ttft_s": null,
-              "last_event_s": 40.9628,
-              "wall_s": 40.9628,
+              "last_event_s": 42.1252,
+              "wall_s": 42.1252,
               "usage_prompt": 131072,
               "usage_completion": 256,
               "completion_text": "789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789",
@@ -75,8 +75,8 @@
             {
               "error": null,
               "ttft_s": null,
-              "last_event_s": 41.0084,
-              "wall_s": 41.0084,
+              "last_event_s": 42.2499,
+              "wall_s": 42.2499,
               "usage_prompt": 131072,
               "usage_completion": 256,
               "completion_text": "789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789",
@@ -89,12 +89,12 @@
           "expected_prompt_tokens": 524288,
           "ttft_s_per_request": [],
           "ttft_median_s": null,
-          "server_mean_ttft_s": 38.9153,
-          "server_mean_decode_tok_per_s": 123.17,
-          "server_e2e_tok_per_s": 6.25,
+          "server_mean_ttft_s": 40.04,
+          "server_mean_decode_tok_per_s": 121.2,
+          "server_e2e_tok_per_s": 6.07,
           "aggregate_decode_window_s": null,
           "aggregate_decode_tok_per_s": null,
-          "aggregate_e2e_tok_per_s": 24.92,
+          "aggregate_e2e_tok_per_s": 24.24,
           "stats_delta": {
             "requests_completed": 4,
             "prefix_cache_hits": 3,
@@ -156,17 +156,17 @@
           "metric_delta": {
             "prompt_tokens_total": 524288.0,
             "generation_tokens_total": 1024.0,
-            "e2e_request_latency_seconds_sum": 163.943,
+            "e2e_request_latency_seconds_sum": 168.576,
             "e2e_request_latency_seconds_count": 4.0,
-            "time_to_first_token_seconds_sum": 155.661,
+            "time_to_first_token_seconds_sum": 160.16,
             "time_to_first_token_seconds_count": 4.0,
-            "request_time_per_output_token_seconds_sum": 0.032476,
+            "request_time_per_output_token_seconds_sum": 0.033004,
             "request_time_per_output_token_seconds_count": 4.0
           }
         },
         "warm": [
           {
-            "wall_s": 2.3029,
+            "wall_s": 2.3188,
             "requests_sent": 4,
             "requests_ok": 4,
             "requests_completed_delta": 4,
@@ -175,8 +175,8 @@
               {
                 "error": null,
                 "ttft_s": null,
-                "last_event_s": 2.1628,
-                "wall_s": 2.1628,
+                "last_event_s": 2.1949,
+                "wall_s": 2.1949,
                 "usage_prompt": 131072,
                 "usage_completion": 256,
                 "completion_text": "789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789",
@@ -186,8 +186,8 @@
               {
                 "error": null,
                 "ttft_s": null,
-                "last_event_s": 2.2605,
-                "wall_s": 2.2605,
+                "last_event_s": 2.2801,
+                "wall_s": 2.2801,
                 "usage_prompt": 131072,
                 "usage_completion": 256,
                 "completion_text": "789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789",
@@ -197,8 +197,8 @@
               {
                 "error": null,
                 "ttft_s": null,
-                "last_event_s": 2.3022,
-                "wall_s": 2.3022,
+                "last_event_s": 2.241,
+                "wall_s": 2.241,
                 "usage_prompt": 131072,
                 "usage_completion": 256,
                 "completion_text": "789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789",
@@ -208,8 +208,8 @@
               {
                 "error": null,
                 "ttft_s": null,
-                "last_event_s": 2.2143,
-                "wall_s": 2.2143,
+                "last_event_s": 2.3181,
+                "wall_s": 2.3181,
                 "usage_prompt": 131072,
                 "usage_completion": 256,
                 "completion_text": "789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789",
@@ -222,12 +222,12 @@
             "expected_prompt_tokens": 524288,
             "ttft_s_per_request": [],
             "ttft_median_s": null,
-            "server_mean_ttft_s": 0.1623,
-            "server_mean_decode_tok_per_s": 125.54,
-            "server_e2e_tok_per_s": 116.71,
+            "server_mean_ttft_s": 0.16,
+            "server_mean_decode_tok_per_s": 123.87,
+            "server_e2e_tok_per_s": 115.39,
             "aggregate_decode_window_s": null,
             "aggregate_decode_tok_per_s": null,
-            "aggregate_e2e_tok_per_s": 444.66,
+            "aggregate_e2e_tok_per_s": 441.61,
             "stats_delta": {
               "requests_completed": 4,
               "prefix_cache_hits": 4,
@@ -289,16 +289,16 @@
             "metric_delta": {
               "prompt_tokens_total": 524288.0,
               "generation_tokens_total": 1024.0,
-              "e2e_request_latency_seconds_sum": 8.774,
+              "e2e_request_latency_seconds_sum": 8.874,
               "e2e_request_latency_seconds_count": 4.0,
-              "time_to_first_token_seconds_sum": 0.649,
+              "time_to_first_token_seconds_sum": 0.64,
               "time_to_first_token_seconds_count": 4.0,
-              "request_time_per_output_token_seconds_sum": 0.031863,
+              "request_time_per_output_token_seconds_sum": 0.032291,
               "request_time_per_output_token_seconds_count": 4.0
             }
           },
           {
-            "wall_s": 2.3405,
+            "wall_s": 2.3205,
             "requests_sent": 4,
             "requests_ok": 4,
             "requests_completed_delta": 4,
@@ -307,8 +307,8 @@
               {
                 "error": null,
                 "ttft_s": null,
-                "last_event_s": 2.2573,
-                "wall_s": 2.2573,
+                "last_event_s": 2.3204,
+                "wall_s": 2.3204,
                 "usage_prompt": 131072,
                 "usage_completion": 256,
                 "completion_text": "789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789",
@@ -318,8 +318,8 @@
               {
                 "error": null,
                 "ttft_s": null,
-                "last_event_s": 2.2202,
-                "wall_s": 2.2202,
+                "last_event_s": 2.2745,
+                "wall_s": 2.2745,
                 "usage_prompt": 131072,
                 "usage_completion": 256,
                 "completion_text": "789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789",
@@ -329,8 +329,8 @@
               {
                 "error": null,
                 "ttft_s": null,
-                "last_event_s": 2.34,
-                "wall_s": 2.34,
+                "last_event_s": 2.1945,
+                "wall_s": 2.1945,
                 "usage_prompt": 131072,
                 "usage_completion": 256,
                 "completion_text": "789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789",
@@ -340,8 +340,8 @@
               {
                 "error": null,
                 "ttft_s": null,
-                "last_event_s": 2.2994,
-                "wall_s": 2.2994,
+                "last_event_s": 2.2341,
+                "wall_s": 2.2341,
                 "usage_prompt": 131072,
                 "usage_completion": 256,
                 "completion_text": "789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789",
@@ -354,12 +354,12 @@
             "expected_prompt_tokens": 524288,
             "ttft_s_per_request": [],
             "ttft_median_s": null,
-            "server_mean_ttft_s": 0.1718,
-            "server_mean_decode_tok_per_s": 123.51,
-            "server_e2e_tok_per_s": 114.48,
+            "server_mean_ttft_s": 0.1635,
+            "server_mean_decode_tok_per_s": 124.34,
+            "server_e2e_tok_per_s": 115.6,
             "aggregate_decode_window_s": null,
             "aggregate_decode_tok_per_s": null,
-            "aggregate_e2e_tok_per_s": 437.51,
+            "aggregate_e2e_tok_per_s": 441.29,
             "stats_delta": {
               "requests_completed": 4,
               "prefix_cache_hits": 4,
@@ -421,11 +421,11 @@
             "metric_delta": {
               "prompt_tokens_total": 524288.0,
               "generation_tokens_total": 1024.0,
-              "e2e_request_latency_seconds_sum": 8.945,
+              "e2e_request_latency_seconds_sum": 8.858,
               "e2e_request_latency_seconds_count": 4.0,
-              "time_to_first_token_seconds_sum": 0.687,
+              "time_to_first_token_seconds_sum": 0.654,
               "time_to_first_token_seconds_count": 4.0,
-              "request_time_per_output_token_seconds_sum": 0.032386,
+              "request_time_per_output_token_seconds_sum": 0.03217,
               "request_time_per_output_token_seconds_count": 4.0
             }
           }
@@ -434,7 +434,7 @@
       }
     }
   },
-  "started_at": "2026-08-18T21:54:39.255948+00:00",
+  "started_at": "2026-08-18T22:09:34.682127+00:00",
   "server_stats_before": {
     "requests_completed": 0,
     "prefix_cache_hits": 0,
@@ -504,5 +504,5 @@
     "prefix_persistent_restores": 0,
     "checkpoints_taken": 0
   },
-  "finished_at": "2026-08-18T21:55:23.635548+00:00"
+  "finished_at": "2026-08-18T22:10:18.642828+00:00"
 }
