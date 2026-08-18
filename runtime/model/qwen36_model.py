@@ -123,6 +123,7 @@ from b12x.attention.paged.workspace import PagedAttentionWorkspace
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
 from torch import nn
 
+from runtime.kernels.fused_kv_scatter import fused_kv_scatter
 from runtime.kernels.rope import apply_rotary_embedding_inplace, compute_cos_sin_cache_default
 from runtime.loading.compressed_tensors import (
     QUANT_ALGO_MP_FP8_CHANNEL,
@@ -147,7 +148,10 @@ from runtime.model.compressed_tensors_linear import (
     fp8_channel_raw_execution_uses_all_layers,
 )
 from runtime.model.flashinfer_gdn import FlashInferGDNPrefill, load_chunk_gated_delta_rule
-from runtime.model.flashinfer_prefill import FlashInferPagedPrefill
+from runtime.model.flashinfer_prefill import (
+    FlashInferPagedPrefill,
+    FlashInferVerifyAttention,
+)
 from runtime.model.modelopt_linear import ModelOptFP8Linear, ModelOptNVFP4Linear
 from runtime.model.plain_linear import PlainLinear
 
@@ -174,6 +178,17 @@ QSR_QWEN36_GDN_PREFILL_VLLM_PREP_ENV = "QSR_QWEN36_GDN_PREFILL_VLLM_PREP"
 # switch used for bisects and environments without the reference package.
 QSR_QWEN36_PREFILL_ATTN_BACKEND_ENV = "QSR_QWEN36_PREFILL_ATTN_BACKEND"
 
+# SGLang's target-verify full-attention path is FlashInfer FA2 causal paged
+# prefill.  ``auto`` selects it when the optional package is available;
+# ``sparkinfer`` is the measured rollback path and ``flashinfer`` makes a
+# missing/incompatible reference kernel a hard capture error.
+QSR_QWEN36_VERIFY_ATTN_BACKEND_ENV = "QSR_QWEN36_VERIFY_ATTN_BACKEND"
+# The batched decode/verify paths have a flat physical row address already,
+# so FP8 KV writes can use the same fused scale/cast/scatter kernel as the
+# SGLang-compatible context injector.  Keep an explicit rollback switch for
+# correctness and performance bisects.
+QSR_QWEN36_FUSED_KV_SCATTER_ENV = "QSR_QWEN36_FUSED_KV_SCATTER"
+
 # SGLang/vLLM's Qwen GDN extend path uses the FlashInfer SM120 CuTeDSL chunk
 # kernel.  ``auto`` selects it when the optional package is available and
 # retains the tested FLA path otherwise; ``fla`` is the explicit bisect switch.
@@ -187,6 +202,16 @@ QSR_QWEN36_PREFILL_LAYER_PROFILE_ENV = "QSR_QWEN36_PREFILL_LAYER_PROFILE"
 # Keeping this separate from the layer timer lets us isolate attention/GDN
 # from the dense MLP without synchronizing the production path.
 QSR_QWEN36_PREFILL_OP_PROFILE_ENV = "QSR_QWEN36_PREFILL_OP_PROFILE"
+
+# SGLang quantizes NVFP4 activations with FlashInfer's CUDA implementation.
+# Keep the existing Triton recipe as the default until the explicit A/B path
+# clears the model-level correctness and acceptance gates.
+QSR_QWEN36_MLP_FP4_QUANT_ENV = "QSR_QWEN36_MLP_FP4_QUANT"
+
+# The indexed speculative GDN path already has a fused gate implementation
+# for the production CUDA/BF16 shape.  Keep the switch live at call time so
+# benchmark bisects can opt out without re-importing the model module.
+QSR_QWEN36_GDN_FUSED_GATES_ENV = "QSR_QWEN36_GDN_FUSED_GATES"
 
 # SGLang's CUDA Qwen3.5 path fuses Q/K Gemma RMSNorm, partial NeoX RoPE,
 # and q/gate deinterleaving, then applies the attention output gate in one
@@ -210,6 +235,32 @@ def _prefill_op_profile_enabled(layer_idx: int, device: torch.device) -> bool:
     except ValueError:
         logger.warning("ignoring invalid %s=%r", QSR_QWEN36_PREFILL_OP_PROFILE_ENV, value)
         return False
+
+
+def _mlp_flashinfer_fp4_quant_enabled() -> bool:
+    """Return whether W4A4 MLP activation quantization uses FlashInfer."""
+
+    value = os.environ.get(QSR_QWEN36_MLP_FP4_QUANT_ENV, "local").strip().lower()
+    if value not in {"local", "flashinfer"}:
+        logger.warning(
+            "ignoring invalid %s=%r; expected local or flashinfer",
+            QSR_QWEN36_MLP_FP4_QUANT_ENV,
+            value,
+        )
+        return False
+    return value == "flashinfer"
+
+
+def _qwen36_gdn_fused_gates_enabled() -> bool:
+    """Return whether indexed speculative GDN fuses gate math into recurrence.
+
+    The fused kernel is the fast path for the CUDA/BF16 indexed verify shape;
+    ``0`` remains an explicit rollback switch for numerical/performance A/B
+    tests.  The default is on because the same-shape benchmark shows the
+    unfused sigmoid/softplus/exp temporaries are measurable decode overhead.
+    """
+
+    return os.environ.get(QSR_QWEN36_GDN_FUSED_GATES_ENV, "1") == "1"
 
 
 def _gdn_prefill_l2norm(x: torch.Tensor) -> torch.Tensor:
@@ -783,9 +834,15 @@ class Qwen36VerifyBatch:
     #: while full attention consumes ``cu_seqlens_q`` directly.
     ragged: bool = False
     max_verify_tokens: int | None = None
+    verify_lens: torch.Tensor | None = None
     cu_seqlens_q: torch.Tensor | None = None
     gdn_padded_to_compact: torch.Tensor | None = None
     gdn_compact_to_padded: torch.Tensor | None = None
+    #: Optional DSpark verify epilogue inputs.  When present, the captured
+    #: graph projects the target auxiliary taps into the draft KV family
+    #: before returning to the scheduler, matching SGLang's fused injector.
+    context_positions: torch.Tensor | None = None
+    context_slot_mapping: torch.Tensor | None = None
 
 
 @dataclass
@@ -1472,7 +1529,7 @@ class Qwen36GatedDeltaNet(nn.Module):
         value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
         fuse_indexed_gates = (
-            os.environ.get("QSR_QWEN36_GDN_FUSED_GATES", "0") == "1"
+            _qwen36_gdn_fused_gates_enabled()
             and batch_large_projections
             and spec_destination_index is not None
             and query.is_cuda
@@ -2633,26 +2690,62 @@ class Qwen36VerifyGraphAttention:
         dtype: torch.dtype,
         kv_dtype: torch.dtype,
         device: torch.device,
+        shared_flashinfer: FlashInferVerifyAttention | None = None,
     ) -> None:
         self.verify_tokens = verify_tokens
         self.batch = batch
         self.device = device
         self.page_size = page_size
         self._default_descale = torch.ones(1, dtype=torch.float32, device=device)
-        self._workspace = PagedAttentionWorkspace.for_contract(
-            mode="verify",
-            device=device,
-            dtype=dtype,
-            kv_dtype=kv_dtype,
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim_qk=head_dim,
-            head_dim_vo=head_dim,
-            page_size=page_size,
-            max_total_q=batch * verify_tokens,
-            num_cache_pages=num_cache_pages,
-            use_cuda_graph=True,
-        )
+        requested_backend = os.environ.get(
+            QSR_QWEN36_VERIFY_ATTN_BACKEND_ENV, "auto"
+        ).strip().lower()
+        if requested_backend not in {"auto", "sparkinfer", "flashinfer"}:
+            raise ValueError(
+                f"{QSR_QWEN36_VERIFY_ATTN_BACKEND_ENV} must be one of "
+                f"auto, sparkinfer, flashinfer; got {requested_backend!r}"
+            )
+        self._flashinfer: FlashInferVerifyAttention | None = None
+        self._workspace: PagedAttentionWorkspace | None = None
+        if shared_flashinfer is not None:
+            self._flashinfer = shared_flashinfer
+        elif requested_backend in {"auto", "flashinfer"} and device.type == "cuda":
+            try:
+                self._flashinfer = FlashInferVerifyAttention(
+                    batch=batch,
+                    verify_tokens=verify_tokens,
+                    num_q_heads=num_q_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    page_size=page_size,
+                    pages_per_slot=pages_per_slot,
+                    num_cache_pages=num_cache_pages,
+                    max_seq_len=max_seq_len,
+                    dtype=dtype,
+                    kv_dtype=kv_dtype,
+                    device=device,
+                )
+            except Exception as exc:
+                if requested_backend == "flashinfer":
+                    raise
+                logger.warning(
+                    "Qwen verify FlashInfer unavailable; using SparkInfer: %s", exc
+                )
+        if self._flashinfer is None:
+            self._workspace = PagedAttentionWorkspace.for_contract(
+                mode="verify",
+                device=device,
+                dtype=dtype,
+                kv_dtype=kv_dtype,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim,
+                head_dim_vo=head_dim,
+                page_size=page_size,
+                max_total_q=batch * verify_tokens,
+                num_cache_pages=num_cache_pages,
+                use_cuda_graph=True,
+            )
         # arange(B+1) * qo_len -- every slot in one spec-decode verify submits
         # the SAME k+1 tokens, so the query offsets are uniform and this is not
         # a ragged batch. That is the historical contract verbatim
@@ -2662,16 +2755,55 @@ class Qwen36VerifyGraphAttention:
         self._cu_seqlens_q = (
             torch.arange(batch + 1, dtype=torch.int32, device=device) * verify_tokens
         )
-        self._workspace.prepare_prefill_graph_replay_state(
-            batch=batch,
-            total_q_capacity=batch * verify_tokens,
-            max_page_table_width=pages_per_slot,
-            max_cache_seqlen=max_seq_len,
-            cu_seqlens_q=self._cu_seqlens_q,
-            window_left=-1,
-        )
-        self.page_table = self._workspace.page_table
-        self.cache_seqlens = self._workspace.cache_seqlens
+        if self._workspace is not None:
+            self._workspace.prepare_prefill_graph_replay_state(
+                batch=batch,
+                total_q_capacity=batch * verify_tokens,
+                max_page_table_width=pages_per_slot,
+                max_cache_seqlen=max_seq_len,
+                cu_seqlens_q=self._cu_seqlens_q,
+                window_left=-1,
+            )
+            self.page_table = self._workspace.page_table
+            self.cache_seqlens = self._workspace.cache_seqlens
+        else:
+            # FlashInfer owns its compact CSR metadata.  These placeholders
+            # are replaced by the graph family's stable caller buffers in
+            # bind_runtime_metadata().
+            self.page_table = torch.empty(
+                batch, pages_per_slot, dtype=torch.int32, device=device
+            )
+            self.cache_seqlens = torch.empty(batch, dtype=torch.int32, device=device)
+        self._metadata_bound = False
+        self._last_bound_replay_page_key: object | None = None
+
+    def bind_runtime_metadata(
+        self,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+    ) -> None:
+        """Bind graph replay metadata to caller-owned stable-address tensors.
+
+        The ragged DSpark graph already owns one set of replay tensors per
+        batch bucket.  Copying those tensors into a private workspace for
+        every full-attention layer and every round is redundant: the captured
+        kernels only require stable addresses, while the caller updates the
+        values before replay.  The workspace API provides this binding
+        explicitly; once installed, ``update_metadata`` only refreshes the
+        split-KV worklist when the per-request page-count geometry changes.
+        """
+        if self._workspace is not None:
+            self._workspace.bind_cuda_graph_runtime_metadata(
+                page_table,
+                cache_seqlens,
+                cu_seqlens_q,
+            )
+        self.page_table = page_table
+        self.cache_seqlens = cache_seqlens
+        self._cu_seqlens_q = cu_seqlens_q
+        self._metadata_bound = True
+        self._last_bound_replay_page_key = None
 
     def update_metadata(
         self,
@@ -2679,7 +2811,24 @@ class Qwen36VerifyGraphAttention:
         cache_seqlens: torch.Tensor,
         cu_seqlens_q: torch.Tensor,
         host_cache_seqlens: object | None = None,
+        host_cu_seqlens_q: object | None = None,
+        metadata_key: object | None = None,
     ) -> None:
+        if self._flashinfer is not None:
+            if host_cache_seqlens is None:
+                raise ValueError(
+                    "FlashInfer verify requires host-known cache lengths for fast planning"
+                )
+            self._flashinfer.update_metadata(
+                page_table,
+                host_cache_seqlens=host_cache_seqlens,
+                host_cu_seqlens_q=host_cu_seqlens_q,
+                metadata_key=metadata_key,
+            )
+            self.page_table = page_table
+            self.cache_seqlens = cache_seqlens
+            self._cu_seqlens_q = cu_seqlens_q
+            return
         replay_page_key = None
         if host_cache_seqlens is not None:
             # Host-known lengths (the verify fill has already written them
@@ -2693,12 +2842,17 @@ class Qwen36VerifyGraphAttention:
                     for seq_len in host_cache_seqlens
                 ),
             )
+        if self._metadata_bound and replay_page_key == self._last_bound_replay_page_key:
+            return
+        assert self._workspace is not None
         self._workspace.update_prefill_graph_replay_metadata(
             page_table,
             cache_seqlens,
             cu_seqlens_q,
             replay_page_key=replay_page_key,
         )
+        if self._metadata_bound:
+            self._last_bound_replay_page_key = replay_page_key
 
     def forward(
         self,
@@ -2710,6 +2864,17 @@ class Qwen36VerifyGraphAttention:
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
     ) -> None:
+        if self._flashinfer is not None:
+            self._flashinfer.run(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                output=output,
+                k_scale=k_descale,
+                v_scale=v_descale,
+            )
+            return
+        assert self._workspace is not None
         binding = build_paged_attention_binding(
             scratch=self._workspace,
             q=q,
@@ -2772,6 +2937,64 @@ def _kv_to_cache_dtype(
         )
         return (key / k_scale).to(cache_dtype), (value / v_scale).to(cache_dtype)
     return key.to(cache_dtype), value.to(cache_dtype)
+
+
+def _store_batched_kv_rows(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    k_pool: torch.Tensor,
+    v_pool: torch.Tensor,
+    write_index: torch.Tensor,
+    k_scale: torch.Tensor | None,
+    v_scale: torch.Tensor | None,
+) -> None:
+    """Store batched K/V rows without materializing an intermediate FP8 pair.
+
+    The decode and verify graph paths already have a flat physical row address
+    for every new token.  For FP8 KV, use the same fused writer as the
+    SparkInfer/SGLang-compatible context-injection path: scale, cast, and
+    scatter happen in one CUDA kernel.  The BF16 path intentionally keeps the
+    old advanced-indexing store, and NVFP4 shadow pools continue to use the
+    caller's dequantized values.
+
+    ``fused_kv_scatter`` is graph-safe and accepts both native float8 pools and
+    uint8 views (the latter is how some slot-pool allocations preserve raw
+    byte storage).  Keeping this decision at one boundary prevents the fixed,
+    ragged, and ordinary batched paths from drifting in their scale
+    convention.
+    """
+    if (
+        k_pool.dtype in (torch.uint8, _FP8_KV_DTYPE)
+        and os.environ.get(QSR_QWEN36_FUSED_KV_SCATTER_ENV, "1") != "0"
+    ):
+        if v_pool.dtype != k_pool.dtype:
+            raise ValueError(
+                "Qwen36 K/V pools must have the same dtype for fused FP8 scatter: "
+                f"got k={k_pool.dtype}, v={v_pool.dtype}"
+            )
+        if k_scale is None or v_scale is None:
+            raise ValueError("Qwen36 FP8 KV scatter requires k_scale and v_scale")
+        fused_kv_scatter(
+            key,
+            value,
+            k_pool,
+            v_pool,
+            write_index,
+            k_scale,
+            v_scale,
+        )
+        return
+
+    k_to_store, v_to_store = _kv_to_cache_dtype(
+        key,
+        value,
+        cache_dtype=k_pool.dtype,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    k_pool.view(-1, key.shape[1], key.shape[2])[write_index] = k_to_store
+    v_pool.view(-1, value.shape[1], value.shape[2])[write_index] = v_to_store
 
 
 class Qwen36Attention(nn.Module):
@@ -3240,31 +3463,20 @@ class Qwen36Attention(nn.Module):
         query = query_flat.view(batch_size, self.num_heads, self.head_dim)
         key = key_flat.view(batch_size, self.num_kv_heads, self.head_dim)
 
-        k_flat = k_pool.view(-1, self.num_kv_heads, self.head_dim)
-        v_flat = v_pool.view(-1, self.num_kv_heads, self.head_dim)
         _rt = self._kv_nvfp4_roundtrip(
             key, value, nvfp4_k_codes, nvfp4_k_scales, nvfp4_v_codes, nvfp4_v_scales, write_index
         )
         if _rt is not None:
             key, value = _rt
-        k_to_store, v_to_store = _kv_to_cache_dtype(
-            key, value, cache_dtype=k_pool.dtype, k_scale=self.k_scale, v_scale=self.v_scale
+        _store_batched_kv_rows(
+            key,
+            value,
+            k_pool=k_pool,
+            v_pool=v_pool,
+            write_index=write_index,
+            k_scale=self.k_scale,
+            v_scale=self.v_scale,
         )
-        # Plain advanced-indexing assignment, NOT index_copy_: measured
-        # directly (2026-08-03, a real FP8 KV server load) that
-        # `index_copy_cuda` raises `NotImplementedError` for
-        # `Float8_e4m3fn` on this torch build, while `tensor[idx] = value`
-        # (dispatches to `aten::index_put_`) does not -- this is exactly
-        # the op :class:`Qwen36PagedAttentionCache`'s own `append` already
-        # uses successfully for FP8 (`self.k_cache[page_ids, offsets] =
-        # new_k.to(self.dtype)`, proven correct by the B1-R gap-error gate
-        # on GPU). Semantically identical here: `write_index` has one
-        # distinct row per batch entry, never a repeat, so index_copy_'s
-        # only behavioral edge over index_put_ (last-write-wins on
-        # duplicate indices) never applies.
-        k_flat[write_index] = k_to_store
-        v_flat[write_index] = v_to_store
-
         # Query stays BF16 regardless of k_pool's dtype -- see forward()'s
         # matching comment for why casting it to the pool's dtype (the old
         # `needs_cast`/`q_for_kernel`) would be wrong for FP8 KV.
@@ -3390,11 +3602,15 @@ class Qwen36Attention(nn.Module):
         )
         if _rt is not None:
             key, value = _rt
-        k_to_store, v_to_store = _kv_to_cache_dtype(
-            key, value, cache_dtype=k_pool.dtype, k_scale=self.k_scale, v_scale=self.v_scale
+        _store_batched_kv_rows(
+            key,
+            value,
+            k_pool=k_pool,
+            v_pool=v_pool,
+            write_index=write_index,
+            k_scale=self.k_scale,
+            v_scale=self.v_scale,
         )
-        k_pool.view(-1, self.num_kv_heads, self.head_dim)[write_index] = k_to_store
-        v_pool.view(-1, self.num_kv_heads, self.head_dim)[write_index] = v_to_store
         attn.forward(
             q=query,
             k_cache=k_pool,
@@ -3440,40 +3656,30 @@ class Qwen36Attention(nn.Module):
         assert batch_size == attn.batch and seq_len == attn.verify_tokens
 
         q_and_gate, key_raw, value_raw = self._qkv_proj(hidden_states)
-        q_and_gate = q_and_gate.view(
-            batch_size, seq_len, self.num_heads, self.head_dim * 2
-        )
-        query, gate = torch.chunk(q_and_gate, 2, dim=-1)
-        gate = gate.reshape(batch_size, seq_len, -1)
-        kv_shape = (batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        query = self.q_norm(query)
-        key = self.k_norm(key_raw.view(*kv_shape))
-        value = value_raw.view(*kv_shape)
         total_q = batch_size * seq_len
-        query = query.reshape(total_q, self.num_heads, self.head_dim)
-        key = key.reshape(total_q, self.num_kv_heads, self.head_dim)
-        value = value.reshape(total_q, self.num_kv_heads, self.head_dim)
-
-        # ``verify_batch`` is request-major ``[B, qo_len]``.  RoPE and the
-        # paged-attention binding are token-major, so flatten *all* requests
-        # rather than retaining the old B=1 ``seq_len`` shape here.
-        query_flat = query.reshape(total_q, self.num_heads * self.head_dim).contiguous()
-        key_flat = key.reshape(total_q, self.num_kv_heads * self.head_dim).contiguous()
-        apply_rotary_embedding_inplace(positions, query_flat, self.head_dim, cos_sin_cache)
-        apply_rotary_embedding_inplace(positions, key_flat, self.head_dim, cos_sin_cache)
-        query = query_flat.view(total_q, self.num_heads, self.head_dim)
-        key = key_flat.view(total_q, self.num_kv_heads, self.head_dim)
+        query, key, value, gate = self._prepare_verify_qkv(
+            q_and_gate=q_and_gate,
+            key_raw=key_raw,
+            value_raw=value_raw,
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            total_q=total_q,
+        )
 
         _rt = self._kv_nvfp4_roundtrip(
             key, value, nvfp4_k_codes, nvfp4_k_scales, nvfp4_v_codes, nvfp4_v_scales, write_index
         )
         if _rt is not None:
             key, value = _rt
-        k_to_store, v_to_store = _kv_to_cache_dtype(
-            key, value, cache_dtype=k_pool.dtype, k_scale=self.k_scale, v_scale=self.v_scale
+        _store_batched_kv_rows(
+            key,
+            value,
+            k_pool=k_pool,
+            v_pool=v_pool,
+            write_index=write_index,
+            k_scale=self.k_scale,
+            v_scale=self.v_scale,
         )
-        k_pool.view(-1, self.num_kv_heads, self.head_dim)[write_index] = k_to_store
-        v_pool.view(-1, self.num_kv_heads, self.head_dim)[write_index] = v_to_store
         if nvfp4_k_codes is not None:
             from runtime.kernels.nvfp4_decode_attn import nvfp4_decode_attention
 
@@ -3511,8 +3717,94 @@ class Qwen36Attention(nn.Module):
             )
 
         attn_out = output.reshape(batch_size, seq_len, -1)
-        attn_out = attn_out * torch.sigmoid(gate)
+        attn_out = attn_out * torch.sigmoid(gate.view(batch_size, seq_len, -1))
         return self.o_proj(attn_out)
+
+    def _prepare_verify_qkv(
+        self,
+        *,
+        q_and_gate: torch.Tensor,
+        key_raw: torch.Tensor,
+        value_raw: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        total_q: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare target-verify Q/K/V with the SGLang fused epilogue.
+
+        SGLang's CUDA Qwen3.5 path uses one Triton launch for Q/K
+        zero-centred RMSNorm, partial NeoX RoPE, and Q/Gate deinterleaving.
+        Verify used to bypass the local equivalent and run two RMSNorm calls
+        plus two standalone RoPE launches per full-attention layer.  Both the
+        fixed-width and ragged DSpark graphs have stable ``total_q`` rows, so
+        they can use the same graph-safe fused preparation as batched prefill.
+
+        The fallback is deliberately kept for CPU fixtures and unusual dtypes;
+        ``QSR_QWEN36_FUSED_ATTN_PREP=0`` remains the correctness/performance
+        bisect switch used by the prefill path.
+        """
+        use_fused_prepare = (
+            q_and_gate.is_cuda
+            and q_and_gate.dtype in (torch.bfloat16, torch.float16)
+            and os.environ.get(QSR_QWEN36_FUSED_ATTN_PREP_ENV, "1") != "0"
+        )
+        if use_fused_prepare:
+            try:
+                from runtime.kernels.qwen36_fused_attn import (
+                    fused_qk_rmsnorm_rope_gate,
+                )
+
+                q_gate = q_and_gate.reshape(
+                    total_q, self.num_heads, 2 * self.head_dim
+                )
+                key_3d = key_raw.reshape(
+                    total_q, self.num_kv_heads, self.head_dim
+                )
+                query_flat, key_flat, gate = fused_qk_rmsnorm_rope_gate(
+                    q_gate,
+                    key_3d,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    cos_sin_cache,
+                    positions,
+                    self.eps,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    cos_sin_cache.shape[-1],
+                )
+                return (
+                    query_flat.view(total_q, self.num_heads, self.head_dim),
+                    key_flat.view(total_q, self.num_kv_heads, self.head_dim),
+                    value_raw.reshape(total_q, self.num_kv_heads, self.head_dim),
+                    gate.reshape(total_q, -1),
+                )
+            except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+                logger.warning(
+                    "Qwen3.6 fused verify attention prepare unavailable at layer %s; "
+                    "using fallback: %s",
+                    self.layer_idx,
+                    exc,
+                )
+
+        q_and_gate = q_and_gate.reshape(
+            total_q, self.num_heads, self.head_dim * 2
+        )
+        query, gate = torch.chunk(q_and_gate, 2, dim=-1)
+        query = self.q_norm(query)
+        key = self.k_norm(
+            key_raw.reshape(total_q, self.num_kv_heads, self.head_dim)
+        )
+        query_flat = query.reshape(total_q, self.num_heads * self.head_dim).contiguous()
+        key_flat = key.reshape(total_q, self.num_kv_heads * self.head_dim).contiguous()
+        apply_rotary_embedding_inplace(positions, query_flat, self.head_dim, cos_sin_cache)
+        apply_rotary_embedding_inplace(positions, key_flat, self.head_dim, cos_sin_cache)
+        return (
+            query_flat.view(total_q, self.num_heads, self.head_dim),
+            key_flat.view(total_q, self.num_kv_heads, self.head_dim),
+            value_raw.reshape(total_q, self.num_kv_heads, self.head_dim),
+            gate.reshape(total_q, -1),
+        )
 
     def verify_ragged_batch(
         self,
@@ -3551,29 +3843,29 @@ class Qwen36Attention(nn.Module):
             raise ValueError("Qwen36 ragged attention output must match hidden capacity")
 
         q_and_gate, key_raw, value_raw = self._qkv_proj(hidden_states)
-        q_and_gate = q_and_gate.view(capacity, self.num_heads, self.head_dim * 2)
-        query, gate = torch.chunk(q_and_gate, 2, dim=-1)
-        query = self.q_norm(query)
-        key = self.k_norm(key_raw.view(capacity, self.num_kv_heads, self.head_dim))
-        value = value_raw.view(capacity, self.num_kv_heads, self.head_dim)
-
-        query_flat = query.reshape(capacity, self.num_heads * self.head_dim).contiguous()
-        key_flat = key.reshape(capacity, self.num_kv_heads * self.head_dim).contiguous()
-        apply_rotary_embedding_inplace(positions, query_flat, self.head_dim, cos_sin_cache)
-        apply_rotary_embedding_inplace(positions, key_flat, self.head_dim, cos_sin_cache)
-        query = query_flat.view(capacity, self.num_heads, self.head_dim)
-        key = key_flat.view(capacity, self.num_kv_heads, self.head_dim)
+        query, key, value, gate = self._prepare_verify_qkv(
+            q_and_gate=q_and_gate,
+            key_raw=key_raw,
+            value_raw=value_raw,
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            total_q=capacity,
+        )
 
         _rt = self._kv_nvfp4_roundtrip(
             key, value, nvfp4_k_codes, nvfp4_k_scales, nvfp4_v_codes, nvfp4_v_scales, write_index
         )
         if _rt is not None:
             key, value = _rt
-        k_to_store, v_to_store = _kv_to_cache_dtype(
-            key, value, cache_dtype=k_pool.dtype, k_scale=self.k_scale, v_scale=self.v_scale
+        _store_batched_kv_rows(
+            key,
+            value,
+            k_pool=k_pool,
+            v_pool=v_pool,
+            write_index=write_index,
+            k_scale=self.k_scale,
+            v_scale=self.v_scale,
         )
-        k_pool.view(-1, self.num_kv_heads, self.head_dim)[write_index] = k_to_store
-        v_pool.view(-1, self.num_kv_heads, self.head_dim)[write_index] = v_to_store
         if nvfp4_k_codes is not None:
             raise RuntimeError("NVFP4 KV attention is not wired for ragged DSpark verify")
         attn.forward(
@@ -3584,7 +3876,31 @@ class Qwen36Attention(nn.Module):
             k_descale=self.k_scale,
             v_descale=self.v_scale,
         )
-        return self.o_proj(output * torch.sigmoid(gate))
+        # ``o_proj`` consumes the flattened hidden dimension.  The fixed
+        # verify path gets this reshape from its ``[B, Q, H, D]`` view; the
+        # ragged path is token-major, so make the same contract explicit
+        # before the projection instead of handing it ``[capacity, H, D]``.
+        attn_out = output.reshape(capacity, -1)
+        if (
+            gate.is_cuda
+            and gate.dtype in (torch.bfloat16, torch.float16)
+            and attn_out.is_contiguous()
+        ):
+            # Match SGLang's CUDA Qwen path: the attention output gate is a
+            # single in-place launch, rather than a sigmoid temporary plus a
+            # separate elementwise multiply.  Ragged DSpark is the hot
+            # production verify path; the fixed-width helper above already
+            # used this kernel, but ragged verify had accidentally retained
+            # the eager expression.
+            from runtime.kernels.qwen36_fused_attn import fused_sigmoid_mul
+
+            fused_sigmoid_mul(
+                attn_out,
+                gate.view(capacity, self.num_heads, self.head_dim),
+            )
+        else:
+            attn_out = attn_out * torch.sigmoid(gate)
+        return self.o_proj(attn_out)
 
 
 # ---------------------------------------------------------------------------
@@ -4107,6 +4423,17 @@ class Qwen36MLP(nn.Module):
 
         from runtime.kernels.nvfp4_quant import quantize_nvfp4_activation
 
+        flashinfer_quant = None
+        flashinfer_silu_quant = None
+        if _mlp_flashinfer_fp4_quant_enabled():
+            from runtime.model.flashinfer_nvfp4 import (
+                quantize_nvfp4_activation as flashinfer_quant,
+            )
+            if self._w4a4_gate_up_fused:
+                from runtime.model.flashinfer_nvfp4 import (
+                    silu_and_mul_nvfp4_quantize as flashinfer_silu_quant,
+                )
+
         orig_shape = x.shape
         x2d = x.reshape(-1, self.hidden_size)
         if not x2d.is_contiguous():
@@ -4116,8 +4443,17 @@ class Qwen36MLP(nn.Module):
         assert prepared is not None, "_forward_w4a4_blockscaled before _ensure_w4a4_ready"
 
         def quant_operand(t2d: torch.Tensor, gs: torch.Tensor):
-            a_packed, sf_linear = quantize_nvfp4_activation(t2d, gs)
-            sw = swizzle_block_scale(sf_linear.view(torch.float8_e4m3fn).unsqueeze(0))
+            if flashinfer_quant is None:
+                a_packed, sf_linear = quantize_nvfp4_activation(t2d, gs)
+                sw = swizzle_block_scale(
+                    sf_linear.view(torch.float8_e4m3fn).unsqueeze(0)
+                )
+            else:
+                # FlashInfer already returns its 2-D swizzled scale storage;
+                # b12x only needs the leading batch dimension for its grouped
+                # view.  Do not swizzle this tensor a second time.
+                a_packed, sf_swizzled = flashinfer_quant(t2d, gs)
+                sw = sf_swizzled.unsqueeze(0)
             a_sf = as_grouped_scale_view(sw.view(torch.uint8), m, t2d.shape[1])
             # dense_gemm takes [M, K, L] group-major operands; num_groups=1
             return a_packed.unsqueeze(-1), a_sf
@@ -4147,8 +4483,29 @@ class Qwen36MLP(nn.Module):
             else:
                 a_up_p, a_up_sf = quant_operand(x2d, prepared["up"][3])
                 up = gemm("up", a_up_p, a_up_sf)
-        inter = F.silu(gate) * up
-        a_down_p, a_down_sf = quant_operand(inter.contiguous(), prepared["down"][3])
+        if flashinfer_silu_quant is not None:
+            # FlashInfer's CuTe-DSL op is the same fused SwiGLU+NVFP4
+            # quantization primitive used by SGLang on Blackwell.  It avoids
+            # materializing ``inter`` and removes the separate SiLU, multiply,
+            # and activation-quantizer launches.  The gate half is first,
+            # matching both ``F.silu(gate) * up`` and the merged FC1 layout.
+            gate_up_for_quant = (
+                gate_up if gate_up.is_contiguous() else gate_up.contiguous()
+            )
+            a_down_packed, sf_swizzled = flashinfer_silu_quant(
+                gate_up_for_quant, prepared["down"][3]
+            )
+            a_down_p = a_down_packed.unsqueeze(-1)
+            a_down_sf = as_grouped_scale_view(
+                sf_swizzled.unsqueeze(0).view(torch.uint8),
+                m,
+                gate_up.shape[1] // 2,
+            )
+        else:
+            inter = F.silu(gate) * up
+            a_down_p, a_down_sf = quant_operand(
+                inter.contiguous(), prepared["down"][3]
+            )
         out = gemm("down", a_down_p, a_down_sf)
         return out.reshape(*orig_shape[:-1], self.hidden_size)
 

@@ -1,0 +1,8 @@
+template_overhead={'128k': 0}; served (block-aligned) contexts: {'128k': 131072}
+
+=== cell 128k (served=131072) x c=4 (max_tokens=256) ===
+  COLD : wall=40.74s prompt=524288/524288 gen=1024 mean_ttft=38.5855s mean_decode=124.5 tok/s agg_e2e=25.14 tok/s hits=3 restores=3
+  WARM : wall=2.2718s prompt=524288/524288 gen=1024 mean_ttft=0.1618s mean_decode=127.14 tok/s agg_e2e=450.75 tok/s hits=4 restores=4
+  WARM : wall=2.2843s prompt=524288/524288 gen=1024 mean_ttft=0.16s mean_decode=126.13 tok/s agg_e2e=448.27 tok/s hits=4 restores=4
+
+results written to /home/bot/project/qwen-sm120-runtime/benchmarks/fixtures/server_perf_grid_qwen38_dynamic_128k_c4_qwen38_live_profile_c4_20260819.json

@@ -1,6 +1,6 @@
 """Aggregate one QSR_PROFILE_ROUNDS=1 server log into per-phase statistics.
 
-Each round emits one JSON line (label=mtp_round_bN) with wall-time phases
+Each round emits one JSON line (label=mtp_round_bN or dspark_ragged_round_bN) with wall-time phases
 plus CUDA-event GPU spans (verify_gpu_ms / sync_gpu_ms / draft_gpu_ms).
 This prints count, median, p90 and max for every phase/note so a run can be
 compared against an earlier one without hand-picking log lines.
@@ -41,7 +41,7 @@ def main(path: str) -> None:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if rec.get("label", "").startswith("mtp_round"):
+            if rec.get("label", "").startswith(("mtp_round", "dspark_ragged_round")):
                 rounds += 1
                 for name, ms in rec.get("phases", []):
                     phases[name].append(float(ms))

@@ -42,6 +42,7 @@ of keeping kernel-touching proofs out of the CPU suite.
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 import pytest
 
@@ -53,9 +54,13 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("fla")
 pytest.importorskip("b12x")
 
+from runtime.backends.qwen36_dspark_cudagraph import (  # noqa: E402
+    Qwen36DSparkDraftBatchCudaGraph,
+)
 from runtime.backends.qwen36_mtp_cudagraph import (  # noqa: E402
     Qwen36MTPBatchedSync,
     Qwen36MTPDraftCudaGraph,
+    Qwen36MTPRaggedVerifyCudaGraph,
     Qwen36MTPVerifyCudaGraph,
     _page_table_slot_key,
     attempt_mtp_cg_capture,
@@ -240,3 +245,63 @@ class TestReplayFillDiscipline:
             assert ".to(torch.int32)" not in source
             assert "cache_seqlens.copy_(start_pos)" in source
             assert "cache_seqlens.add_(1)" in source
+
+    def test_dspark_ragged_accept_builds_next_draft_inputs_on_device(self) -> None:
+        graph = Qwen36MTPRaggedVerifyCudaGraph.__new__(Qwen36MTPRaggedVerifyCudaGraph)
+        graph._capture_accept = True
+        graph.device = torch.device("cpu")
+        graph.max_verify_tokens = 4
+        graph._batches = {2: object()}
+        graph._accepted_long = {2: torch.empty(2, dtype=torch.long)}
+        graph._next_anchors = {2: torch.empty(2, dtype=torch.long)}
+        graph._next_kv_lens = {2: torch.empty(2, dtype=torch.long)}
+        graph._inputs = {
+            2: {
+                "cache_seqlens": torch.tensor([13, 24], dtype=torch.int32),
+                "verify_lens": torch.tensor([4, 3], dtype=torch.int32),
+            }
+        }
+
+        accepted = torch.tensor([1, 2], dtype=torch.int32)
+        committed = torch.tensor(
+            [[101, 202, 0, 0], [303, 404, 505, 0]], dtype=torch.long
+        )
+        anchors, kv_lens = graph.next_draft_inputs(2, accepted, committed)
+
+        assert anchors.tolist() == [202, 505]
+        assert kv_lens.tolist() == [11, 24]
+
+    def test_dspark_draft_graph_exposes_device_replay_without_flashinfer_d2h(self) -> None:
+        source = inspect.getsource(Qwen36DSparkDraftBatchCudaGraph)
+        assert "def replay_device(" in source
+        assert "self._anchors.copy_(anchors, non_blocking=True)" in source
+        assert "host_kv_lens" in source
+        assert "metadata_kv_lens = host_kv_lens" in source
+
+    def test_ragged_verify_exposes_device_next_draft_transition(self) -> None:
+        source = inspect.getsource(Qwen36MTPRaggedVerifyCudaGraph.next_draft_inputs)
+        assert "torch.gather" in source
+        assert "next_kv_lens.sub_(inputs[\"verify_lens\"])" in source
+        assert "next_kv_lens.add_(accepted)" in source
+
+    def test_fused_context_mapping_commits_only_the_accepted_prefix(self) -> None:
+        graph = Qwen36MTPRaggedVerifyCudaGraph.__new__(Qwen36MTPRaggedVerifyCudaGraph)
+        graph.context_kv_fused = True
+        graph._accepted = {2: torch.tensor([0, 2], dtype=torch.int32)}
+        indices = torch.arange(8, dtype=torch.long)
+        graph._context_indices = {2: indices}
+        graph._context_row_indices = {2: torch.empty(8, dtype=torch.long)}
+        graph._context_row_starts = {2: torch.empty(8, dtype=torch.int32)}
+        graph._context_columns = {2: torch.empty(8, dtype=torch.long)}
+        graph._context_row_accepts = {2: torch.empty(8, dtype=torch.int32)}
+        graph._context_keep = {2: torch.empty(8, dtype=torch.bool)}
+        graph._context_scratch_mapping = {2: indices + 100}
+        graph._context_gated_mapping = {2: torch.empty(8, dtype=torch.long)}
+        batch = SimpleNamespace(
+            cu_seqlens_q=torch.tensor([0, 3, 5], dtype=torch.int32),
+            context_slot_mapping=torch.arange(8, dtype=torch.long) + 10,
+        )
+
+        mapping = graph._accepted_context_mapping(2, batch)
+
+        assert mapping.tolist() == [10, 101, 102, 13, 14, 105, 106, 107]

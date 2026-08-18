@@ -1,0 +1,347 @@
+preflight [ok  ] gpu_present: NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition (cc 12.0)
+preflight [ok  ] compute_capability: 12.0
+preflight [ok  ] cuda_driver_version: 610.88
+preflight [ok  ] cuda_runtime_version: 13.4
+preflight [ok  ] torch_version: 2.15.0.dev20260815+cu134
+preflight [ok  ] sparkinfer_contract: 1.2.3 at /home/bot/project/sparkinfer/b12x/__init__.py
+preflight [ok  ] sparkinfer_analytic_decode_gate: accepts production shape
+preflight [ok  ] checkpoint_path: /home/bot/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/9c73e2daee1d0fd494ffbd1d8753f2174a953796
+preflight [ok  ] checkpoint_config: model_type='qwen3_5' arch=['Qwen3_5ForConditionalGeneration']
+INFO:     Started server process [2636224]
+INFO:     Waiting for application startup.
+2026-08-19 01:40:18,582 INFO qwen_sm120_server.app: tool_call_parser=qwen3_coder
+2026-08-19 01:40:18,582 INFO qwen_sm120_server.app: loading model=/home/bot/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/9c73e2daee1d0fd494ffbd1d8753f2174a953796 backend=qwen36 (registry-resolved; this can take a while: model load + KV cache alloc)...
+2026-08-19 01:40:34,430 INFO runtime.backends.qwen36: Qwen3.6 verify attention numerics mode: 08-05 quality mode (M16 kernel + frozen chunking)
+2026-08-19 01:40:34,568 INFO runtime.backends.qwen36: Qwen3.6 KV arena allocated: formula=19629342720 bytes (18.281 GiB), measured=19629342720 bytes (18.281 GiB), rows=5 (slots=4 + scratch=4), pages_per_slot=2048, kv_bytes_per_slot=8589934592 bytes (8.000 GiB), recurrent_bytes_per_slot=79429632 bytes (0.074 GiB)
+{"label": "prefill_segment", "segment": "restore", "ms": 0.023, "slot": 0, "hit": 0, "prompt_tokens": 5}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 7079.719, "slots": [0], "tokens": 5}
+{"label": "prefill_segment", "segment": "commit", "ms": 0.027, "slot": 0}
+2026-08-19 01:40:43,722 INFO qwen_sm120_runtime.bf_attention: Replaced 5 Laguna attention placeholders with BFAttention
+2026-08-19 01:40:43,944 INFO qwen_sm120_runtime.qwen36_dspark_cudagraph: Captured Qwen3.8 DSpark draft BxK CUDA Graph: batch=1 K=7
+2026-08-19 01:40:43,979 INFO qwen_sm120_runtime.qwen36_dspark_cudagraph: Captured Qwen3.8 DSpark draft BxK CUDA Graph: batch=2 K=7
+2026-08-19 01:40:44,017 INFO qwen_sm120_runtime.qwen36_dspark_cudagraph: Captured Qwen3.8 DSpark draft BxK CUDA Graph: batch=3 K=7
+2026-08-19 01:40:44,047 INFO qwen_sm120_runtime.qwen36_dspark_cudagraph: Captured Qwen3.8 DSpark draft BxK CUDA Graph: batch=4 K=7
+2026-08-19 01:40:45,480 INFO qwen_sm120_server.engine: Qwen3.8 DSpark speculative decode wired: draft=/home/bot/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-DSpark/snapshots/85ef153be924f17ce4bf62726954eeaa4a73e854 K=7 cg_status={'draft_b1': 'captured', 'draft_b2': 'captured', 'draft_b3': 'captured', 'draft_b4': 'captured', 'draft': 'captured', 'verify_ragged': 'captured', 'verify': 'captured'}
+2026-08-19 01:40:46,732 INFO runtime.backends.qwen36: Qwen3.6 decode graphs complete: released 4 eager drivers, 1 shared decode workspace(s) (mtp_healthy=True)
+2026-08-19 01:40:46,738 INFO qwen_sm120_server.engine: Qwen3.6 decode CUDA Graph captured at load (max batch_size=4)
+2026-08-19 01:40:46,738 INFO qwen_sm120_server.engine: Qwen3.6 model loaded on engine thread: num_slots=4 max_context=262144 tokens/slot, recurrent state 75.8 MiB/slot, KV 8192.0 MiB/slot
+2026-08-19 01:40:46,738 INFO qwen_sm120_server.engine: engine thread started
+2026-08-19 01:40:46,738 INFO qwen_sm120_server.app: engine ready: backend=qwen36 model=/home/bot/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/9c73e2daee1d0fd494ffbd1d8753f2174a953796 capacity=4 num_slots=4 capacity_tokens_per_slot=262144 cudagraph=True prefix_cache=True session_affinity=False ttl=30.0s dflash=False mtp=False(K=4,resync=None) dspark=True(K=7,draft=/home/bot/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-DSpark/snapshots/85ef153be924f17ce4bf62726954eeaa4a73e854)
+2026-08-19 01:40:47,077 INFO qwen_sm120_server.app: QSR_DISABLE_GC=1: cyclic garbage collection disabled for the serving loop
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8300 (Press CTRL+C to quit)
+INFO:     127.0.0.1:46950 - "GET /debug/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46950 - "GET /debug/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46950 - "GET /metrics HTTP/1.1" 200 OK
+{"label": "prefill_segment", "segment": "restore", "ms": 0.008, "slot": 0, "hit": 0, "prompt_tokens": 131072}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 1349.955, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 42.515, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 523.271, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 16.563, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 584.015, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 15.207, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 639.586, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 15.954, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 699.484, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 16.798, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 776.419, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 15.726, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 834.458, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 16.284, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 895.068, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 15.716, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 953.378, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 15.423, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 1006.888, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 15.314, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 1055.09, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 16.267, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 1110.138, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 15.827, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 1162.421, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 15.684, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 1218.794, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 16.289, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 1274.624, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 16.014, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "batched_forward", "ms": 1315.508, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "dspark_hidden_sync", "ms": 16.313, "slots": [0], "tokens": 8192}
+{"label": "prefill_segment", "segment": "commit", "ms": 36.888, "slot": 0}
+{"label": "prefill_segment", "segment": "restore", "ms": 5.754, "slot": 1, "hit": 131072, "prompt_tokens": 131072}
+{"label": "prefill_segment", "segment": "restore", "ms": 11.206, "slot": 2, "hit": 131072, "prompt_tokens": 131072}
+{"label": "prefill_segment", "segment": "restore", "ms": 10.374, "slot": 3, "hit": 131072, "prompt_tokens": 131072}
+{"label": "prefill_segment", "segment": "logits", "ms": 0.214, "slot": 1}
+{"label": "prefill_segment", "segment": "commit", "ms": 1.536, "slot": 1}
+{"label": "prefill_segment", "segment": "logits", "ms": 0.156, "slot": 2}
+{"label": "prefill_segment", "segment": "commit", "ms": 1.533, "slot": 2}
+{"label": "prefill_segment", "segment": "logits", "ms": 0.127, "slot": 3}
+{"label": "prefill_segment", "segment": "commit", "ms": 1.892, "slot": 3}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0037479912862181664], ["verify_fill", 8.364802983123809], ["verify_graph_launch", 2.2658439993392676], ["accept_decision", 38.97803800646216], ["commit", 0.8062480192165822], ["target_hidden_sync", 7.2023609827738255], ["draft_batch", 19.869918993208557], ["total", 77.5021529989317]], "notes": {"t_begin": 149880.57758, "t_end": 149880.655082}}
+{"label": "engine_step", "round_batch_ms": 77.65, "bookkeep_ms": 0.05}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.00418099807575345], ["verify_fill", 0.5507860041689128], ["verify_graph_launch", 0.07522499072365463], ["accept_decision", 49.11844900925644], ["commit", 0.07690797792747617], ["target_hidden_sync", 3.375970001798123], ["draft_batch", 0.43094801367260516], ["total", 53.63882699748501]], "notes": {"t_begin": 149880.65543, "t_end": 149880.709069}}
+{"label": "engine_step", "round_batch_ms": 53.77, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0038720027077943087], ["verify_fill", 0.6093470146879554], ["verify_graph_launch", 0.05041499389335513], ["accept_decision", 47.862261009868234], ["commit", 0.08370200521312654], ["target_hidden_sync", 3.14472898025997], ["draft_batch", 0.6495100096799433], ["total", 52.40984502597712]], "notes": {"t_begin": 149880.709357, "t_end": 149880.761767}}
+{"label": "engine_step", "round_batch_ms": 52.53, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0027460046112537384], ["verify_fill", 0.5914439971093088], ["verify_graph_launch", 0.04133998299948871], ["accept_decision", 48.57250500936061], ["commit", 0.07935499888844788], ["target_hidden_sync", 3.1543679942842573], ["draft_batch", 0.7241560088004917], ["total", 53.17210900830105]], "notes": {"t_begin": 149880.762044, "t_end": 149880.815216}}
+{"label": "engine_step", "round_batch_ms": 53.3, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002849003067240119], ["verify_fill", 0.5369819991756231], ["verify_graph_launch", 0.04037900362163782], ["accept_decision", 47.74654901120812], ["commit", 0.0737590016797185], ["target_hidden_sync", 2.9420429782476276], ["draft_batch", 0.387740001315251], ["total", 51.735112007008865]], "notes": {"t_begin": 149880.815527, "t_end": 149880.867263}}
+{"label": "engine_step", "round_batch_ms": 51.85, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0027460046112537384], ["verify_fill", 0.436503003584221], ["verify_graph_launch", 0.027722009690478444], ["accept_decision", 49.10583098535426], ["commit", 0.08825500844977796], ["target_hidden_sync", 3.118521999567747], ["draft_batch", 0.4270249919500202], ["total", 53.21162202744745]], "notes": {"t_begin": 149880.867531, "t_end": 149880.920743}}
+{"label": "engine_step", "round_batch_ms": 53.33, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002869986928999424], ["verify_fill", 0.3749790193978697], ["verify_graph_launch", 0.027885980671271682], ["accept_decision", 49.463889008620754], ["commit", 0.08051199256442487], ["target_hidden_sync", 3.09943500906229], ["draft_batch", 0.40939098107628524], ["total", 53.46428899792954]], "notes": {"t_begin": 149880.921021, "t_end": 149880.974486}}
+{"label": "engine_step", "round_batch_ms": 53.59, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004130008164793253], ["verify_fill", 0.3910949744749814], ["verify_graph_launch", 0.0300350075121969], ["accept_decision", 49.07752000144683], ["commit", 0.06771899643354118], ["target_hidden_sync", 2.972156013129279], ["draft_batch", 0.38500400842167437], ["total", 52.932428981876]], "notes": {"t_begin": 149880.974789, "t_end": 149881.027721}}
+{"label": "engine_step", "round_batch_ms": 53.05, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004150992026552558], ["verify_fill", 0.6024699832778424], ["verify_graph_launch", 0.04550101584754884], ["accept_decision", 49.127642007078975], ["commit", 0.07114699110388756], ["target_hidden_sync", 3.356559987878427], ["draft_batch", 0.378365017240867], ["total", 53.59075000160374]], "notes": {"t_begin": 149881.028035, "t_end": 149881.081625}}
+{"label": "engine_step", "round_batch_ms": 53.73, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002942979335784912], ["verify_fill", 0.36449902108870447], ["verify_graph_launch", 0.028082984499633312], ["accept_decision", 48.64104901207611], ["commit", 0.080520985648036], ["target_hidden_sync", 3.2181240094359964], ["draft_batch", 0.40940099279396236], ["total", 52.750009985174984]], "notes": {"t_begin": 149881.08189, "t_end": 149881.13464}}
+{"label": "engine_step", "round_batch_ms": 52.87, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003882014425471425], ["verify_fill", 0.4315270052757114], ["verify_graph_launch", 0.030033988878130913], ["accept_decision", 49.1832559928298], ["commit", 0.06533399573527277], ["target_hidden_sync", 3.003852005349472], ["draft_batch", 0.3905479970853776], ["total", 53.11318201711401]], "notes": {"t_begin": 149881.134937, "t_end": 149881.18805}}
+{"label": "engine_step", "round_batch_ms": 53.24, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0037279969546943903], ["verify_fill", 0.598402984905988], ["verify_graph_launch", 0.08669501403346658], ["accept_decision", 48.88801000197418], ["commit", 0.0781459966674447], ["target_hidden_sync", 2.984378981636837], ["draft_batch", 0.37300700205378234], ["total", 53.01723099546507]], "notes": {"t_begin": 149881.188346, "t_end": 149881.241363}}
+{"label": "engine_step", "round_batch_ms": 53.12, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002643006155267358], ["verify_fill", 0.363002996891737], ["verify_graph_launch", 0.02876401413232088], ["accept_decision", 49.657802999718115], ["commit", 0.08681998588144779], ["target_hidden_sync", 3.412304009543732], ["draft_batch", 0.41370600229129195], ["total", 53.969936998328194]], "notes": {"t_begin": 149881.241614, "t_end": 149881.295584}}
+{"label": "engine_step", "round_batch_ms": 54.09, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0041199964471161366], ["verify_fill", 0.5960900161881], ["verify_graph_launch", 0.043827982153743505], ["accept_decision", 49.46948401629925], ["commit", 0.0715389905963093], ["target_hidden_sync", 2.998957992531359], ["draft_batch", 0.38789500831626356], ["total", 53.57700400054455]], "notes": {"t_begin": 149881.295881, "t_end": 149881.349458}}
+{"label": "engine_step", "round_batch_ms": 53.69, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004760018782690167], ["verify_fill", 0.6295209750533104], ["verify_graph_launch", 0.05124101880937815], ["accept_decision", 48.51379999308847], ["commit", 0.07283999002538621], ["target_hidden_sync", 3.5306159988977015], ["draft_batch", 0.6271150195971131], ["total", 53.43580900807865]], "notes": {"t_begin": 149881.349743, "t_end": 149881.403179}}
+{"label": "engine_step", "round_batch_ms": 53.56, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0027049973141402006], ["verify_fill", 0.612938980339095], ["verify_graph_launch", 0.06450901855714619], ["accept_decision", 48.52901797858067], ["commit", 0.06728601874783635], ["target_hidden_sync", 2.955206000478938], ["draft_batch", 0.4989669832866639], ["total", 52.73620499065146]], "notes": {"t_begin": 149881.403455, "t_end": 149881.456191}}
+{"label": "engine_step", "round_batch_ms": 52.85, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003675988409668207], ["verify_fill", 0.3878840070683509], ["verify_graph_launch", 0.030282011721283197], ["accept_decision", 49.35623798519373], ["commit", 0.07819899474270642], ["target_hidden_sync", 3.4609160211402923], ["draft_batch", 0.4154929774813354], ["total", 53.738427988719195]], "notes": {"t_begin": 149881.456493, "t_end": 149881.510231}}
+{"label": "engine_step", "round_batch_ms": 53.86, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003129011020064354], ["verify_fill", 12.725990993203595], ["verify_graph_launch", 0.03882998134940863], ["accept_decision", 38.92771201208234], ["commit", 0.06563300848938525], ["target_hidden_sync", 3.0309440044220537], ["draft_batch", 0.40777999674901366], ["total", 55.20503700245172]], "notes": {"t_begin": 149881.510513, "t_end": 149881.565718}}
+{"label": "engine_step", "round_batch_ms": 55.33, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0033349788282066584], ["verify_fill", 0.38589202449657023], ["verify_graph_launch", 0.03271800233051181], ["accept_decision", 49.675500980811194], ["commit", 0.12074701953679323], ["target_hidden_sync", 3.23797098826617], ["draft_batch", 0.46362599823623896], ["total", 53.92593299620785]], "notes": {"t_begin": 149881.565997, "t_end": 149881.619923}}
+{"label": "engine_step", "round_batch_ms": 54.05, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.00417200499214232], ["verify_fill", 0.4132719768676907], ["verify_graph_launch", 0.031624018447473645], ["accept_decision", 49.100478005129844], ["commit", 0.08358797640539706], ["target_hidden_sync", 3.4131370193790644], ["draft_batch", 0.7929599960334599], ["total", 53.8448269944638]], "notes": {"t_begin": 149881.6202, "t_end": 149881.674045}}
+{"label": "engine_step", "round_batch_ms": 53.98, "bookkeep_ms": 0.04}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0026939960662275553], ["verify_fill", 0.5196580023039132], ["verify_graph_launch", 0.04912400618195534], ["accept_decision", 48.00940098357387], ["commit", 0.06726500578224659], ["target_hidden_sync", 3.1786620093043894], ["draft_batch", 0.6533599807880819], ["total", 52.48594598378986]], "notes": {"t_begin": 149881.674352, "t_end": 149881.726838}}
+{"label": "engine_step", "round_batch_ms": 52.6, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0027980131562799215], ["verify_fill", 0.5309109983500093], ["verify_graph_launch", 0.048918009269982576], ["accept_decision", 49.35566597850993], ["commit", 0.060120015405118465], ["target_hidden_sync", 3.611236985307187], ["draft_batch", 0.4024009977001697], ["total", 54.0175540081691]], "notes": {"t_begin": 149881.727106, "t_end": 149881.781123}}
+{"label": "engine_step", "round_batch_ms": 54.14, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003902008756995201], ["verify_fill", 0.4464049998205155], ["verify_graph_launch", 0.03017799463123083], ["accept_decision", 48.767957981908694], ["commit", 0.09049501386471093], ["target_hidden_sync", 3.2737739966250956], ["draft_batch", 0.4041980137117207], ["total", 53.022134001366794]], "notes": {"t_begin": 149881.781408, "t_end": 149881.83443}}
+{"label": "engine_step", "round_batch_ms": 53.14, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004036002792418003], ["verify_fill", 0.5970509955659509], ["verify_graph_launch", 0.05154000245966017], ["accept_decision", 49.34758800663985], ["commit", 0.06989800021983683], ["target_hidden_sync", 3.2305789936799556], ["draft_batch", 0.4926690016873181], ["total", 53.79928700858727]], "notes": {"t_begin": 149881.834721, "t_end": 149881.88852}}
+{"label": "engine_step", "round_batch_ms": 53.92, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004140019882470369], ["verify_fill", 0.6150669942144305], ["verify_graph_launch", 0.05131299258209765], ["accept_decision", 49.46849402040243], ["commit", 0.07082597585394979], ["target_hidden_sync", 3.2122950069606304], ["draft_batch", 0.39316099719144404], ["total", 53.82086001918651]], "notes": {"t_begin": 149881.888817, "t_end": 149881.942638}}
+{"label": "engine_step", "round_batch_ms": 53.95, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003788998583331704], ["verify_fill", 0.5669340025633574], ["verify_graph_launch", 0.0483290059491992], ["accept_decision", 48.254883993649855], ["commit", 0.07015600567683578], ["target_hidden_sync", 3.0279179918579757], ["draft_batch", 0.3655620093923062], ["total", 52.34227000619285]], "notes": {"t_begin": 149881.942932, "t_end": 149881.995274}}
+{"label": "engine_step", "round_batch_ms": 52.45, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0036650162655860186], ["verify_fill", 0.62750797951594], ["verify_graph_launch", 0.057074008509516716], ["accept_decision", 48.97975901258178], ["commit", 0.08277199231088161], ["target_hidden_sync", 3.248110006097704], ["draft_batch", 0.4011519777122885], ["total", 53.40542900376022]], "notes": {"t_begin": 149881.995542, "t_end": 149882.048948}}
+{"label": "engine_step", "round_batch_ms": 53.53, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0040990125853568316], ["verify_fill", 0.3926239733118564], ["verify_graph_launch", 0.029549002647399902], ["accept_decision", 48.86024602456018], ["commit", 0.079323974205181], ["target_hidden_sync", 3.541566024068743], ["draft_batch", 0.3991799894720316], ["total", 53.3115130092483]], "notes": {"t_begin": 149882.049239, "t_end": 149882.10255}}
+{"label": "engine_step", "round_batch_ms": 53.43, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003923021722584963], ["verify_fill", 0.5708569951821119], ["verify_graph_launch", 0.04092699964530766], ["accept_decision", 48.26866200892255], ["commit", 0.07736199768260121], ["target_hidden_sync", 3.292532986961305], ["draft_batch", 0.41395501466467977], ["total", 52.67384499893524]], "notes": {"t_begin": 149882.102837, "t_end": 149882.155511}}
+{"label": "engine_step", "round_batch_ms": 52.84, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0026740017347037792], ["verify_fill", 0.5012179899495095], ["verify_graph_launch", 0.02923901774920523], ["accept_decision", 49.879591999342665], ["commit", 0.08510600309818983], ["target_hidden_sync", 3.3778849756345153], ["draft_batch", 0.4134170012548566], ["total", 54.294489993480965]], "notes": {"t_begin": 149882.155841, "t_end": 149882.210135}}
+{"label": "engine_step", "round_batch_ms": 54.41, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004017027094960213], ["verify_fill", 0.7349869993049651], ["verify_graph_launch", 0.1276319962926209], ["accept_decision", 48.39213998639025], ["commit", 0.06509700324386358], ["target_hidden_sync", 3.1102870125323534], ["draft_batch", 0.38533497718162835], ["total", 52.824523008894175]], "notes": {"t_begin": 149882.210424, "t_end": 149882.263248}}
+{"label": "engine_step", "round_batch_ms": 52.93, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002643006155267358], ["verify_fill", 0.368650013115257], ["verify_graph_launch", 0.027968984795734286], ["accept_decision", 49.296651006443426], ["commit", 0.08202900062315166], ["target_hidden_sync", 3.2399490009993315], ["draft_batch", 0.4165660066064447], ["total", 53.439515992067754]], "notes": {"t_begin": 149882.263508, "t_end": 149882.316947}}
+{"label": "engine_step", "round_batch_ms": 53.56, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0042330066207796335], ["verify_fill", 0.41502798558212817], ["verify_graph_launch", 0.028269016183912754], ["accept_decision", 49.064584978623316], ["commit", 0.08270001853816211], ["target_hidden_sync", 3.2511769968550652], ["draft_batch", 0.4503479867707938], ["total", 53.301523003028706]], "notes": {"t_begin": 149882.317237, "t_end": 149882.370539}}
+{"label": "engine_step", "round_batch_ms": 53.42, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0038410071283578873], ["verify_fill", 12.793783011147752], ["verify_graph_launch", 0.03422598820179701], ["accept_decision", 39.585738006280735], ["commit", 0.08142998558469117], ["target_hidden_sync", 3.234258998418227], ["draft_batch", 0.6749190215487033], ["total", 56.413326994515955]], "notes": {"t_begin": 149882.370823, "t_end": 149882.427236}}
+2026-08-19 01:41:40,706 INFO qwen_sm120_server.app: SLOW POST /v1/completions -> 200 (40606ms)
+INFO:     127.0.0.1:46960 - "POST /v1/completions HTTP/1.1" 200 OK
+2026-08-19 01:41:40,748 INFO qwen_sm120_server.app: SLOW POST /v1/completions -> 200 (40650ms)
+INFO:     127.0.0.1:46950 - "POST /v1/completions HTTP/1.1" 200 OK
+2026-08-19 01:41:40,787 INFO qwen_sm120_server.app: SLOW POST /v1/completions -> 200 (40686ms)
+INFO:     127.0.0.1:46958 - "POST /v1/completions HTTP/1.1" 200 OK
+2026-08-19 01:41:40,828 INFO qwen_sm120_server.app: SLOW POST /v1/completions -> 200 (40729ms)
+INFO:     127.0.0.1:46952 - "POST /v1/completions HTTP/1.1" 200 OK
+{"label": "engine_step", "round_batch_ms": 56.54, "bookkeep_ms": 162.6}
+INFO:     127.0.0.1:46960 - "GET /debug/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46950 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46958 - "GET /debug/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46952 - "GET /metrics HTTP/1.1" 200 OK
+{"label": "prefill_segment", "segment": "restore", "ms": 14.66, "slot": 0, "hit": 131072, "prompt_tokens": 131072}
+{"label": "prefill_segment", "segment": "restore", "ms": 15.109, "slot": 1, "hit": 131072, "prompt_tokens": 131072}
+{"label": "prefill_segment", "segment": "restore", "ms": 12.684, "slot": 2, "hit": 131072, "prompt_tokens": 131072}
+{"label": "prefill_segment", "segment": "restore", "ms": 10.526, "slot": 3, "hit": 131072, "prompt_tokens": 131072}
+{"label": "prefill_segment", "segment": "logits", "ms": 0.228, "slot": 0}
+{"label": "prefill_segment", "segment": "commit", "ms": 1.522, "slot": 0}
+{"label": "prefill_segment", "segment": "logits", "ms": 0.212, "slot": 1}
+{"label": "prefill_segment", "segment": "commit", "ms": 1.464, "slot": 1}
+{"label": "prefill_segment", "segment": "logits", "ms": 0.139, "slot": 2}
+{"label": "prefill_segment", "segment": "commit", "ms": 1.501, "slot": 2}
+{"label": "prefill_segment", "segment": "logits", "ms": 0.122, "slot": 3}
+{"label": "prefill_segment", "segment": "commit", "ms": 1.502, "slot": 3}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.010076997568830848], ["verify_fill", 8.458522002911195], ["verify_graph_launch", 0.045666994992643595], ["accept_decision", 38.503118994412944], ["commit", 0.2400510129518807], ["target_hidden_sync", 2.958416996989399], ["draft_batch", 0.6677389901597053], ["total", 50.889667007140815]], "notes": {"t_begin": 149882.86533, "t_end": 149882.91622}}
+{"label": "engine_step", "round_batch_ms": 51.03, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0030279916245490313], ["verify_fill", 0.6022909947205335], ["verify_graph_launch", 0.05085099837742746], ["accept_decision", 47.943256999133155], ["commit", 0.06427700282074511], ["target_hidden_sync", 2.768319012830034], ["draft_batch", 0.5338679766282439], ["total", 51.9708669744432]], "notes": {"t_begin": 149882.916517, "t_end": 149882.968488}}
+{"label": "engine_step", "round_batch_ms": 52.08, "bookkeep_ms": 0.07}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003815017407760024], ["verify_fill", 0.6008399941492826], ["verify_graph_launch", 0.04837301094084978], ["accept_decision", 49.3322919937782], ["commit", 0.07551498129032552], ["target_hidden_sync", 3.3188930246979], ["draft_batch", 0.5946919845882803], ["total", 53.979666001396254]], "notes": {"t_begin": 149882.968842, "t_end": 149883.022822}}
+{"label": "engine_step", "round_batch_ms": 54.09, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002810003934428096], ["verify_fill", 0.5294510046951473], ["verify_graph_launch", 0.040265993447974324], ["accept_decision", 48.27170001226477], ["commit", 0.11105299927294254], ["target_hidden_sync", 3.8258789863903075], ["draft_batch", 0.47613299102522433], ["total", 53.2630980014801]], "notes": {"t_begin": 149883.023089, "t_end": 149883.076352}}
+{"label": "engine_step", "round_batch_ms": 53.39, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0038350117392838], ["verify_fill", 0.5747870018240064], ["verify_graph_launch", 0.04797999281436205], ["accept_decision", 48.22766999132], ["commit", 0.09041200974024832], ["target_hidden_sync", 3.560366982128471], ["draft_batch", 0.4357950238045305], ["total", 52.946951997000724]], "notes": {"t_begin": 149883.076656, "t_end": 149883.129603}}
+{"label": "engine_step", "round_batch_ms": 53.06, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.008324015652760863], ["verify_fill", 0.4625009896699339], ["verify_graph_launch", 0.04057699698023498], ["accept_decision", 49.14929502410814], ["commit", 0.0802529975771904], ["target_hidden_sync", 3.3764149993658066], ["draft_batch", 0.6722800026182085], ["total", 53.79640401224606]], "notes": {"t_begin": 149883.12992, "t_end": 149883.183716}}
+{"label": "engine_step", "round_batch_ms": 53.93, "bookkeep_ms": 0.04}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0037529971450567245], ["verify_fill", 0.5622419994324446], ["verify_graph_launch", 0.04853899008594453], ["accept_decision", 48.63234199001454], ["commit", 0.07126401760615408], ["target_hidden_sync", 3.24857298983261], ["draft_batch", 0.6693259929306805], ["total", 53.24167798971757]], "notes": {"t_begin": 149883.184034, "t_end": 149883.237275}}
+{"label": "engine_step", "round_batch_ms": 53.4, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002829998265951872], ["verify_fill", 0.5857970099896193], ["verify_graph_launch", 0.03462599124759436], ["accept_decision", 49.84393299673684], ["commit", 0.0763540156185627], ["target_hidden_sync", 3.084450989263132], ["draft_batch", 0.5039899842813611], ["total", 54.137413011631]], "notes": {"t_begin": 149883.237584, "t_end": 149883.291721}}
+{"label": "engine_step", "round_batch_ms": 54.26, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0030060182325541973], ["verify_fill", 0.40581199573352933], ["verify_graph_launch", 0.03417098196223378], ["accept_decision", 48.26803400646895], ["commit", 0.06419300916604698], ["target_hidden_sync", 3.0619699973613024], ["draft_batch", 0.5187010101508349], ["total", 52.36187900300138]], "notes": {"t_begin": 149883.292028, "t_end": 149883.34439}}
+{"label": "engine_step", "round_batch_ms": 52.48, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003939989255741239], ["verify_fill", 0.5712929996661842], ["verify_graph_launch", 0.04790700040757656], ["accept_decision", 49.151290993904695], ["commit", 0.07545301923528314], ["target_hidden_sync", 3.250071982620284], ["draft_batch", 0.40100200567394495], ["total", 53.50606900174171]], "notes": {"t_begin": 149883.344688, "t_end": 149883.398194}}
+{"label": "engine_step", "round_batch_ms": 53.63, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003908993676304817], ["verify_fill", 0.5086130113340914], ["verify_graph_launch", 0.04080499638803303], ["accept_decision", 49.76529299165122], ["commit", 0.07078700582496822], ["target_hidden_sync", 3.1550200073979795], ["draft_batch", 0.4674249794334173], ["total", 54.01730499579571]], "notes": {"t_begin": 149883.398483, "t_end": 149883.4525}}
+{"label": "engine_step", "round_batch_ms": 54.13, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0037530262488871813], ["verify_fill", 0.5470959877129644], ["verify_graph_launch", 0.04295099643059075], ["accept_decision", 48.840587987797335], ["commit", 0.07391802500933409], ["target_hidden_sync", 3.0421940027736127], ["draft_batch", 0.36434398498386145], ["total", 52.919883019058034]], "notes": {"t_begin": 149883.452785, "t_end": 149883.505705}}
+{"label": "engine_step", "round_batch_ms": 53.03, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002768007107079029], ["verify_fill", 0.36019698018208146], ["verify_graph_launch", 0.025854998966678977], ["accept_decision", 49.67457402381115], ["commit", 0.08440998499281704], ["target_hidden_sync", 3.521867998642847], ["draft_batch", 0.40463000186719], ["total", 54.08014901331626]], "notes": {"t_begin": 149883.505972, "t_end": 149883.560052}}
+{"label": "engine_step", "round_batch_ms": 54.23, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0031719973776489496], ["verify_fill", 0.37920998875051737], ["verify_graph_launch", 0.03024100442416966], ["accept_decision", 49.058339005568996], ["commit", 0.06939799641259015], ["target_hidden_sync", 3.0914790113456547], ["draft_batch", 0.4589129821397364], ["total", 53.096349991392344]], "notes": {"t_begin": 149883.56038, "t_end": 149883.613477}}
+{"label": "engine_step", "round_batch_ms": 53.21, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0036910059861838818], ["verify_fill", 0.40994901792146266], ["verify_graph_launch", 0.03261497477069497], ["accept_decision", 50.36439100513235], ["commit", 0.09601001511327922], ["target_hidden_sync", 3.2444410026073456], ["draft_batch", 0.6977619777899235], ["total", 54.8555460118223]], "notes": {"t_begin": 149883.613771, "t_end": 149883.668627}}
+{"label": "engine_step", "round_batch_ms": 54.99, "bookkeep_ms": 0.04}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004011992132291198], ["verify_fill", 0.40534601430408657], ["verify_graph_launch", 0.032127980375662446], ["accept_decision", 50.52853800589219], ["commit", 0.08479299140162766], ["target_hidden_sync", 3.3093350066337734], ["draft_batch", 0.413785019190982], ["total", 54.78346298332326]], "notes": {"t_begin": 149883.66895, "t_end": 149883.723734}}
+{"label": "engine_step", "round_batch_ms": 54.91, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0030070077627897263], ["verify_fill", 0.4132250032853335], ["verify_graph_launch", 0.03041699528694153], ["accept_decision", 49.15813801926561], ["commit", 0.07287098560482264], ["target_hidden_sync", 3.369810990989208], ["draft_batch", 0.6269139994401485], ["total", 53.68116300087422]], "notes": {"t_begin": 149883.724046, "t_end": 149883.777727}}
+{"label": "engine_step", "round_batch_ms": 53.81, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002964981831610203], ["verify_fill", 14.241349999792874], ["verify_graph_launch", 0.10803600889630616], ["accept_decision", 38.53605699259788], ["commit", 0.07122202077880502], ["target_hidden_sync", 3.156366990879178], ["draft_batch", 0.5794930038973689], ["total", 56.700891989748925]], "notes": {"t_begin": 149883.778016, "t_end": 149883.834716}}
+{"label": "engine_step", "round_batch_ms": 56.82, "bookkeep_ms": 0.04}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0027990026865154505], ["verify_fill", 0.5695410072803497], ["verify_graph_launch", 0.03423300222493708], ["accept_decision", 48.670432006474584], ["commit", 0.09718199726194143], ["target_hidden_sync", 3.627130005043], ["draft_batch", 0.5040109972469509], ["total", 53.5113200021442]], "notes": {"t_begin": 149883.834994, "t_end": 149883.888505}}
+{"label": "engine_step", "round_batch_ms": 53.64, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0041460152715444565], ["verify_fill", 0.6528729863930494], ["verify_graph_launch", 0.0512140104547143], ["accept_decision", 48.991341987857595], ["commit", 0.07860400364734232], ["target_hidden_sync", 3.1378979911096394], ["draft_batch", 0.40619602077640593], ["total", 53.327903005992994]], "notes": {"t_begin": 149883.888805, "t_end": 149883.942133}}
+{"label": "engine_step", "round_batch_ms": 53.46, "bookkeep_ms": 0.04}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004011992132291198], ["verify_fill", 0.5517200042959303], ["verify_graph_launch", 0.04404000355862081], ["accept_decision", 49.4377379945945], ["commit", 0.08168301428668201], ["target_hidden_sync", 3.1891230028122663], ["draft_batch", 0.4475190071389079], ["total", 53.76178599544801]], "notes": {"t_begin": 149883.94245, "t_end": 149883.996212}}
+{"label": "engine_step", "round_batch_ms": 53.89, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003855995601043105], ["verify_fill", 0.4257280088495463], ["verify_graph_launch", 0.02888299059122801], ["accept_decision", 49.27563000819646], ["commit", 0.09188399417325854], ["target_hidden_sync", 3.2396320020779967], ["draft_batch", 0.3923250187654048], ["total", 53.46359801478684]], "notes": {"t_begin": 149883.996506, "t_end": 149884.049969}}
+{"label": "engine_step", "round_batch_ms": 53.58, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0029860239010304213], ["verify_fill", 0.37160099600441754], ["verify_graph_launch", 0.028633978217840195], ["accept_decision", 50.179461017251015], ["commit", 0.072975002694875], ["target_hidden_sync", 3.4036290016956627], ["draft_batch", 0.6580969784408808], ["total", 54.7232509998139]], "notes": {"t_begin": 149884.050244, "t_end": 149884.104967}}
+{"label": "engine_step", "round_batch_ms": 54.85, "bookkeep_ms": 0.04}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0030479859560728073], ["verify_fill", 0.5323539953678846], ["verify_graph_launch", 0.042027997551485896], ["accept_decision", 48.898063017986715], ["commit", 0.06897299317643046], ["target_hidden_sync", 3.0725910037290305], ["draft_batch", 0.3949370002374053], ["total", 53.01738498383202]], "notes": {"t_begin": 149884.105254, "t_end": 149884.158272}}
+{"label": "engine_step", "round_batch_ms": 53.13, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003919005393981934], ["verify_fill", 0.6586259987670928], ["verify_graph_launch", 0.04247401375323534], ["accept_decision", 49.22290798276663], ["commit", 0.066661013988778], ["target_hidden_sync", 3.0106409976724535], ["draft_batch", 0.3896919952239841], ["total", 53.39990701759234]], "notes": {"t_begin": 149884.158558, "t_end": 149884.211958}}
+{"label": "engine_step", "round_batch_ms": 53.51, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003908004146069288], ["verify_fill", 0.4008050018455833], ["verify_graph_launch", 0.03220100188627839], ["accept_decision", 50.61262098024599], ["commit", 0.08428501314483583], ["target_hidden_sync", 3.233058989280835], ["draft_batch", 0.41830501868389547], ["total", 54.79026399552822]], "notes": {"t_begin": 149884.212213, "t_end": 149884.267004}}
+{"label": "engine_step", "round_batch_ms": 54.92, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004229979822412133], ["verify_fill", 0.6292140169534832], ["verify_graph_launch", 0.062441977206617594], ["accept_decision", 48.49751200526953], ["commit", 0.07690401980653405], ["target_hidden_sync", 3.2255319820251316], ["draft_batch", 0.46664700494147837], ["total", 52.968431991757825]], "notes": {"t_begin": 149884.267301, "t_end": 149884.320269}}
+{"label": "engine_step", "round_batch_ms": 53.09, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002829998265951872], ["verify_fill", 0.38332599797286093], ["verify_graph_launch", 0.029692018870264292], ["accept_decision", 49.81620400212705], ["commit", 0.06542698247358203], ["target_hidden_sync", 3.135136008495465], ["draft_batch", 0.37779999547638], ["total", 53.81571300677024]], "notes": {"t_begin": 149884.320552, "t_end": 149884.374368}}
+{"label": "engine_step", "round_batch_ms": 53.92, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003917986759915948], ["verify_fill", 0.5955839878879488], ["verify_graph_launch", 0.04780301242135465], ["accept_decision", 48.49308999837376], ["commit", 0.08168301428668201], ["target_hidden_sync", 3.292665001936257], ["draft_batch", 0.6841709837317467], ["total", 53.204895986709744]], "notes": {"t_begin": 149884.374642, "t_end": 149884.427847}}
+{"label": "engine_step", "round_batch_ms": 53.33, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.00432401429861784], ["verify_fill", 0.4099590005353093], ["verify_graph_launch", 0.0331960036419332], ["accept_decision", 49.677989998599514], ["commit", 0.0714399793650955], ["target_hidden_sync", 3.14503101981245], ["draft_batch", 0.40225699194706976], ["total", 53.74918301822618]], "notes": {"t_begin": 149884.428219, "t_end": 149884.481968}}
+{"label": "engine_step", "round_batch_ms": 53.87, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003741995897144079], ["verify_fill", 0.5917270027566701], ["verify_graph_launch", 0.04384299973025918], ["accept_decision", 49.86461400403641], ["commit", 0.06474301335401833], ["target_hidden_sync", 3.2205010065808892], ["draft_batch", 0.48738098121248186], ["total", 54.28224301431328]], "notes": {"t_begin": 149884.482262, "t_end": 149884.536544}}
+{"label": "engine_step", "round_batch_ms": 54.4, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003919005393981934], ["verify_fill", 0.6030990043655038], ["verify_graph_launch", 0.048196990974247456], ["accept_decision", 48.74738599755801], ["commit", 0.07304799510166049], ["target_hidden_sync", 3.3833420020528138], ["draft_batch", 0.44128901208750904], ["total", 53.307444002712145]], "notes": {"t_begin": 149884.536831, "t_end": 149884.590138}}
+{"label": "engine_step", "round_batch_ms": 53.44, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003515015123412013], ["verify_fill", 0.40937800076790154], ["verify_graph_launch", 0.03591200220398605], ["accept_decision", 49.51687398715876], ["commit", 0.08199401781894267], ["target_hidden_sync", 3.164857975207269], ["draft_batch", 0.414646026911214], ["total", 53.63265101914294]], "notes": {"t_begin": 149884.590438, "t_end": 149884.644071}}
+{"label": "engine_step", "round_batch_ms": 53.79, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003089022357016802], ["verify_fill", 12.959883984876797], ["verify_graph_launch", 0.03470899537205696], ["accept_decision", 39.66991399647668], ["commit", 0.06868300260975957], ["target_hidden_sync", 3.169378003804013], ["draft_batch", 0.6789980106987059], ["total", 56.59077101154253]], "notes": {"t_begin": 149884.644401, "t_end": 149884.700992}}
+2026-08-19 01:41:42,978 INFO qwen_sm120_server.app: SLOW POST /v1/completions -> 200 (2135ms)
+INFO:     127.0.0.1:46960 - "POST /v1/completions HTTP/1.1" 200 OK
+2026-08-19 01:41:43,027 INFO qwen_sm120_server.app: SLOW POST /v1/completions -> 200 (2183ms)
+INFO:     127.0.0.1:46952 - "POST /v1/completions HTTP/1.1" 200 OK
+2026-08-19 01:41:43,066 INFO qwen_sm120_server.app: SLOW POST /v1/completions -> 200 (2223ms)
+INFO:     127.0.0.1:46958 - "POST /v1/completions HTTP/1.1" 200 OK
+2026-08-19 01:41:43,107 INFO qwen_sm120_server.app: SLOW POST /v1/completions -> 200 (2263ms)
+INFO:     127.0.0.1:46950 - "POST /v1/completions HTTP/1.1" 200 OK
+{"label": "engine_step", "round_batch_ms": 56.7, "bookkeep_ms": 168.51}
+INFO:     127.0.0.1:46960 - "GET /debug/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46952 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46958 - "GET /debug/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46950 - "GET /metrics HTTP/1.1" 200 OK
+{"label": "prefill_segment", "segment": "restore", "ms": 14.598, "slot": 0, "hit": 131072, "prompt_tokens": 131072}
+{"label": "prefill_segment", "segment": "restore", "ms": 14.749, "slot": 1, "hit": 131072, "prompt_tokens": 131072}
+{"label": "prefill_segment", "segment": "restore", "ms": 13.058, "slot": 2, "hit": 131072, "prompt_tokens": 131072}
+{"label": "prefill_segment", "segment": "restore", "ms": 10.493, "slot": 3, "hit": 131072, "prompt_tokens": 131072}
+{"label": "prefill_segment", "segment": "logits", "ms": 0.222, "slot": 0}
+{"label": "prefill_segment", "segment": "commit", "ms": 1.517, "slot": 0}
+{"label": "prefill_segment", "segment": "logits", "ms": 0.229, "slot": 1}
+{"label": "prefill_segment", "segment": "commit", "ms": 1.585, "slot": 1}
+{"label": "prefill_segment", "segment": "logits", "ms": 0.158, "slot": 2}
+{"label": "prefill_segment", "segment": "commit", "ms": 1.625, "slot": 2}
+{"label": "prefill_segment", "segment": "logits", "ms": 0.115, "slot": 3}
+{"label": "prefill_segment", "segment": "commit", "ms": 1.603, "slot": 3}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.005846988642588258], ["verify_fill", 6.8547159899026155], ["verify_graph_launch", 0.03279102384112775], ["accept_decision", 39.68329797498882], ["commit", 0.22782900487072766], ["target_hidden_sync", 3.9255800074897707], ["draft_batch", 0.4121779929846525], ["total", 51.148158992873505]], "notes": {"t_begin": 149885.147112, "t_end": 149885.19826}}
+{"label": "engine_step", "round_batch_ms": 51.28, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004115980118513107], ["verify_fill", 0.40352100040763617], ["verify_graph_launch", 0.02907999441958964], ["accept_decision", 48.24914000346325], ["commit", 0.06483701872639358], ["target_hidden_sync", 3.43844699091278], ["draft_batch", 0.630011985776946], ["total", 52.82545697991736]], "notes": {"t_begin": 149885.198565, "t_end": 149885.251391}}
+{"label": "engine_step", "round_batch_ms": 52.94, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0027260102797299623], ["verify_fill", 0.5976370011921972], ["verify_graph_launch", 0.053027993999421597], ["accept_decision", 49.01683999923989], ["commit", 0.08652498945593834], ["target_hidden_sync", 3.106751013547182], ["draft_batch", 0.40713901398703456], ["total", 53.275529004167765]], "notes": {"t_begin": 149885.251655, "t_end": 149885.304931}}
+{"label": "engine_step", "round_batch_ms": 53.43, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0029030197765678167], ["verify_fill", 0.4344149783719331], ["verify_graph_launch", 0.028261012630537152], ["accept_decision", 48.36778700700961], ["commit", 0.07178299711085856], ["target_hidden_sync", 3.097745997365564], ["draft_batch", 0.3976740117650479], ["total", 52.405524998903275]], "notes": {"t_begin": 149885.305256, "t_end": 149885.357662}}
+{"label": "engine_step", "round_batch_ms": 52.53, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002954009687528014], ["verify_fill", 0.3777070087380707], ["verify_graph_launch", 0.027192989364266396], ["accept_decision", 49.83251800877042], ["commit", 0.0921649916563183], ["target_hidden_sync", 3.2306580105796456], ["draft_batch", 0.40074298158288], ["total", 53.96957800257951]], "notes": {"t_begin": 149885.357939, "t_end": 149885.411908}}
+{"label": "engine_step", "round_batch_ms": 54.09, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.00290299067273736], ["verify_fill", 0.37552000139839947], ["verify_graph_launch", 0.029785005608573556], ["accept_decision", 48.86006598826498], ["commit", 0.08576700929552317], ["target_hidden_sync", 3.1447889923583716], ["draft_batch", 0.4213940119370818], ["total", 52.92546999407932]], "notes": {"t_begin": 149885.412207, "t_end": 149885.465132}}
+{"label": "engine_step", "round_batch_ms": 53.05, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0027579953894019127], ["verify_fill", 0.38207200122997165], ["verify_graph_launch", 0.028187991119921207], ["accept_decision", 50.95090699614957], ["commit", 0.07725600153207779], ["target_hidden_sync", 3.310299012809992], ["draft_batch", 0.46299799578264356], ["total", 55.22018999909051]], "notes": {"t_begin": 149885.465415, "t_end": 149885.520636}}
+{"label": "engine_step", "round_batch_ms": 55.34, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003742985427379608], ["verify_fill", 0.4002870118711144], ["verify_graph_launch", 0.02787698758766055], ["accept_decision", 49.89446699619293], ["commit", 0.07196899969130754], ["target_hidden_sync", 3.130122000584379], ["draft_batch", 0.6425680185202509], ["total", 54.17739797849208]], "notes": {"t_begin": 149885.520929, "t_end": 149885.575106}}
+{"label": "engine_step", "round_batch_ms": 54.29, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002748012775555253], ["verify_fill", 0.45807298738509417], ["verify_graph_launch", 0.04841500776819885], ["accept_decision", 48.72934700688347], ["commit", 0.07057999027892947], ["target_hidden_sync", 3.274679009336978], ["draft_batch", 0.4967429849784821], ["total", 53.086773987160996]], "notes": {"t_begin": 149885.575373, "t_end": 149885.62846}}
+{"label": "engine_step", "round_batch_ms": 53.24, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0041669991333037615], ["verify_fill", 0.39837899385020137], ["verify_graph_launch", 0.03195198951289058], ["accept_decision", 49.88359700655565], ["commit", 0.08023198461160064], ["target_hidden_sync", 3.7512050184886903], ["draft_batch", 0.9345069993287325], ["total", 55.08974098484032]], "notes": {"t_begin": 149885.628787, "t_end": 149885.683877}}
+{"label": "engine_step", "round_batch_ms": 55.22, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004717003321275115], ["verify_fill", 0.6710049929097295], ["verify_graph_launch", 0.0427229970227927], ["accept_decision", 49.437868990935385], ["commit", 0.07196899969130754], ["target_hidden_sync", 3.3960480068344623], ["draft_batch", 0.4189890169072896], ["total", 54.04996499419212]], "notes": {"t_begin": 149885.684228, "t_end": 149885.738278}}
+{"label": "engine_step", "round_batch_ms": 54.17, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003389985067769885], ["verify_fill", 0.3952380211558193], ["verify_graph_launch", 0.030511000659316778], ["accept_decision", 48.88328799279407], ["commit", 0.08018000517040491], ["target_hidden_sync", 3.035973000805825], ["draft_batch", 0.3861769801005721], ["total", 52.81988900969736]], "notes": {"t_begin": 149885.738558, "t_end": 149885.791378}}
+{"label": "engine_step", "round_batch_ms": 52.93, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004043016815558076], ["verify_fill", 0.772903993492946], ["verify_graph_launch", 0.03806801396422088], ["accept_decision", 50.40623599779792], ["commit", 0.09220599895343184], ["target_hidden_sync", 4.239788977429271], ["draft_batch", 1.1106450110673904], ["total", 56.67003901908174]], "notes": {"t_begin": 149885.791662, "t_end": 149885.848332}}
+{"label": "engine_step", "round_batch_ms": 56.8, "bookkeep_ms": 0.04}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0032869866117835045], ["verify_fill", 0.7469650008715689], ["verify_graph_launch", 0.04446398816071451], ["accept_decision", 48.663538007531315], ["commit", 0.0657479977235198], ["target_hidden_sync", 3.773650008952245], ["draft_batch", 0.9697549976408482], ["total", 54.27353398408741]], "notes": {"t_begin": 149885.848787, "t_end": 149885.90306}}
+{"label": "engine_step", "round_batch_ms": 54.44, "bookkeep_ms": 0.09}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0028609938453882933], ["verify_fill", 0.6475749833043665], ["verify_graph_launch", 0.0434800167568028], ["accept_decision", 48.14605999854393], ["commit", 0.07049698615446687], ["target_hidden_sync", 3.6384810227900743], ["draft_batch", 0.48281997442245483], ["total", 53.03794299834408]], "notes": {"t_begin": 149885.903466, "t_end": 149885.956503}}
+{"label": "engine_step", "round_batch_ms": 53.16, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0029650109354406595], ["verify_fill", 0.38653999217785895], ["verify_graph_launch", 0.027161993784829974], ["accept_decision", 50.226190011017025], ["commit", 0.074466981459409], ["target_hidden_sync", 3.2375750015489757], ["draft_batch", 0.40654800250194967], ["total", 54.36694200034253]], "notes": {"t_begin": 149885.956786, "t_end": 149886.011153}}
+{"label": "engine_step", "round_batch_ms": 54.49, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004292000085115433], ["verify_fill", 0.6685780244879425], ["verify_graph_launch", 0.06575899897143245], ["accept_decision", 48.6866959836334], ["commit", 0.07222799467854202], ["target_hidden_sync", 2.8391530213411897], ["draft_batch", 0.41440699715167284], ["total", 52.757312019821256]], "notes": {"t_begin": 149886.011446, "t_end": 149886.064204}}
+{"label": "engine_step", "round_batch_ms": 52.88, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002715998562052846], ["verify_fill", 14.353234000736848], ["verify_graph_launch", 0.03420200664550066], ["accept_decision", 39.183970977319404], ["commit", 0.07094300235621631], ["target_hidden_sync", 3.9840929966885597], ["draft_batch", 0.9598240139894187], ["total", 58.59520297963172]], "notes": {"t_begin": 149886.064484, "t_end": 149886.123079}}
+{"label": "engine_step", "round_batch_ms": 58.72, "bookkeep_ms": 0.04}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002870976459234953], ["verify_fill", 0.8399110229220241], ["verify_graph_launch", 0.05484299617819488], ["accept_decision", 49.33567499392666], ["commit", 0.07874899893067777], ["target_hidden_sync", 3.019677009433508], ["draft_batch", 0.39828597800806165], ["total", 53.735267982119694]], "notes": {"t_begin": 149886.123368, "t_end": 149886.177103}}
+{"label": "engine_step", "round_batch_ms": 53.86, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004105007974430919], ["verify_fill", 0.618733000010252], ["verify_graph_launch", 0.04214298678562045], ["accept_decision", 48.0263700010255], ["commit", 0.07859300239942968], ["target_hidden_sync", 3.1890030077192932], ["draft_batch", 0.3616799949668348], ["total", 52.32538498239592]], "notes": {"t_begin": 149886.177395, "t_end": 149886.229721}}
+{"label": "engine_step", "round_batch_ms": 52.43, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0037740101106464863], ["verify_fill", 0.5805719993077219], ["verify_graph_launch", 0.04904699744656682], ["accept_decision", 49.7822480101604], ["commit", 0.06269998266361654], ["target_hidden_sync", 3.411720012081787], ["draft_batch", 0.45359498471952975], ["total", 54.34911901829764]], "notes": {"t_begin": 149886.229988, "t_end": 149886.284337}}
+{"label": "engine_step", "round_batch_ms": 54.46, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.00443699536845088], ["verify_fill", 0.6212320004124194], ["verify_graph_launch", 0.04431998240761459], ["accept_decision", 48.80080799921416], ["commit", 0.07717302651144564], ["target_hidden_sync", 4.255287989508361], ["draft_batch", 0.9178059990517795], ["total", 54.727449984056875]], "notes": {"t_begin": 149886.284609, "t_end": 149886.339337}}
+{"label": "engine_step", "round_batch_ms": 54.86, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002996006514877081], ["verify_fill", 0.7408380042761564], ["verify_graph_launch", 0.05331900320015848], ["accept_decision", 48.52190098608844], ["commit", 0.07154300692491233], ["target_hidden_sync", 3.9946470060385764], ["draft_batch", 0.8912339981179684], ["total", 54.28267800016329]], "notes": {"t_begin": 149886.339636, "t_end": 149886.393919}}
+{"label": "engine_step", "round_batch_ms": 54.41, "bookkeep_ms": 0.04}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0027580244932323694], ["verify_fill", 0.6248290010262281], ["verify_graph_launch", 0.04972098395228386], ["accept_decision", 49.73588601569645], ["commit", 0.06911699892953038], ["target_hidden_sync", 3.423186979489401], ["draft_batch", 0.4791810060851276], ["total", 54.391034005675465]], "notes": {"t_begin": 149886.394205, "t_end": 149886.448596}}
+{"label": "engine_step", "round_batch_ms": 54.51, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0027990026865154505], ["verify_fill", 0.3824559971690178], ["verify_graph_launch", 0.02884099376387894], ["accept_decision", 48.10329500469379], ["commit", 0.07832399569451809], ["target_hidden_sync", 3.444789006607607], ["draft_batch", 0.4192169872112572], ["total", 52.46559900115244]], "notes": {"t_begin": 149886.448877, "t_end": 149886.501343}}
+{"label": "engine_step", "round_batch_ms": 52.59, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003888009814545512], ["verify_fill", 0.39624300552532077], ["verify_graph_launch", 0.03057299181818962], ["accept_decision", 49.40905098919757], ["commit", 0.07614700007252395], ["target_hidden_sync", 3.6151050007902086], ["draft_batch", 0.9060290176421404], ["total", 54.442302003735676]], "notes": {"t_begin": 149886.501637, "t_end": 149886.55608}}
+{"label": "engine_step", "round_batch_ms": 54.58, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0027990026865154505], ["verify_fill", 0.6390330090653151], ["verify_graph_launch", 0.041830993723124266], ["accept_decision", 49.56562499864958], ["commit", 0.08702301420271397], ["target_hidden_sync", 3.739250998478383], ["draft_batch", 0.9091809915844351], ["total", 54.990775999613106]], "notes": {"t_begin": 149886.556369, "t_end": 149886.61136}}
+{"label": "engine_step", "round_batch_ms": 55.12, "bookkeep_ms": 0.04}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003151973942294717], ["verify_fill", 0.6563870119862258], ["verify_graph_launch", 0.042898987885564566], ["accept_decision", 48.6858670192305], ["commit", 0.07621999247930944], ["target_hidden_sync", 3.3750720031093806], ["draft_batch", 0.40968001121655107], ["total", 53.25483399792574]], "notes": {"t_begin": 149886.611649, "t_end": 149886.664904}}
+{"label": "engine_step", "round_batch_ms": 53.38, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.002964981831610203], ["verify_fill", 0.3844250168185681], ["verify_graph_launch", 0.027918984415009618], ["accept_decision", 50.3142710076645], ["commit", 0.07767099305056036], ["target_hidden_sync", 2.9981750121805817], ["draft_batch", 0.4098659846931696], ["total", 54.22057898249477]], "notes": {"t_begin": 149886.665184, "t_end": 149886.719404}}
+{"label": "engine_step", "round_batch_ms": 54.35, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004189001629129052], ["verify_fill", 0.7449949916917831], ["verify_graph_launch", 0.05151401273906231], ["accept_decision", 48.05165599100292], ["commit", 0.06896199192851782], ["target_hidden_sync", 4.096017015399411], ["draft_batch", 0.9046079940162599], ["total", 53.92758100060746]], "notes": {"t_begin": 149886.719703, "t_end": 149886.77363}}
+{"label": "engine_step", "round_batch_ms": 54.05, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.004240020643919706], ["verify_fill", 0.3961919865105301], ["verify_graph_launch", 0.030903989681974053], ["accept_decision", 48.36843500379473], ["commit", 0.06444202153943479], ["target_hidden_sync", 3.002993995323777], ["draft_batch", 0.3819169942289591], ["total", 52.25457702181302]], "notes": {"t_begin": 149886.773919, "t_end": 149886.826174}}
+{"label": "engine_step", "round_batch_ms": 52.37, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0030270020943135023], ["verify_fill", 0.3650799917522818], ["verify_graph_launch", 0.02956701791845262], ["accept_decision", 50.138755002990365], ["commit", 0.08411999442614615], ["target_hidden_sync", 3.2311670074705034], ["draft_batch", 0.45970099745318294], ["total", 54.31709799449891]], "notes": {"t_begin": 149886.826439, "t_end": 149886.880757}}
+{"label": "engine_step", "round_batch_ms": 54.44, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.0031719973776489496], ["verify_fill", 0.39609899977222085], ["verify_graph_launch", 0.033693009754642844], ["accept_decision", 49.57127501256764], ["commit", 0.08602699381299317], ["target_hidden_sync", 3.945371980080381], ["draft_batch", 0.9749600139912218], ["total", 55.01645599724725]], "notes": {"t_begin": 149886.88104, "t_end": 149886.936057}}
+{"label": "engine_step", "round_batch_ms": 55.15, "bookkeep_ms": 0.03}
+{"label": "dspark_ragged_round_b4", "phases": [["setup", 0.003980996552854776], ["verify_fill", 13.824664027197286], ["verify_graph_launch", 0.03959197783842683], ["accept_decision", 39.64707301929593], ["commit", 0.07961998926475644], ["target_hidden_sync", 3.766612004255876], ["draft_batch", 0.9951340034604073], ["total", 58.363487012684345]], "notes": {"t_begin": 149886.936368, "t_end": 149886.994731}}
+2026-08-19 01:41:45,273 INFO qwen_sm120_server.app: SLOW POST /v1/completions -> 200 (2152ms)
+INFO:     127.0.0.1:46952 - "POST /v1/completions HTTP/1.1" 200 OK
+2026-08-19 01:41:45,317 INFO qwen_sm120_server.app: SLOW POST /v1/completions -> 200 (2197ms)
+INFO:     127.0.0.1:46960 - "POST /v1/completions HTTP/1.1" 200 OK
+2026-08-19 01:41:45,357 INFO qwen_sm120_server.app: SLOW POST /v1/completions -> 200 (2236ms)
+INFO:     127.0.0.1:46958 - "POST /v1/completions HTTP/1.1" 200 OK
+2026-08-19 01:41:45,397 INFO qwen_sm120_server.app: SLOW POST /v1/completions -> 200 (2276ms)
+INFO:     127.0.0.1:46950 - "POST /v1/completions HTTP/1.1" 200 OK
+{"label": "engine_step", "round_batch_ms": 58.51, "bookkeep_ms": 163.39}
+INFO:     127.0.0.1:46952 - "GET /debug/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46960 - "GET /metrics HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58248 - "GET /debug/traces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58249 - "GET /debug/stats HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-08-19 01:42:05,235 INFO qwen_sm120_server.engine: engine thread stopped
+INFO:     Application shutdown complete.
+INFO:     Finished server process [2636224]

@@ -301,7 +301,17 @@ def greedy_accept_ragged(
         raise ValueError("DSpark ragged acceptance requires at least one request")
     if lens.dtype not in (torch.int32, torch.int64):
         raise ValueError("DSpark ragged verify_lens must be int32 or int64")
-    if bool(torch.any(lens < 1).item()) or bool(torch.any(lens > max_gamma + 1).item()):
+    # The graph driver validates the Python ``verify_lens`` list before
+    # copying it into these persistent device buffers.  Do not introduce a
+    # device-to-host scalar read here: ``.item()`` is illegal while a CUDA
+    # Graph is being captured.  The eager path keeps the defensive value
+    # check for callers that bypass the graph driver.
+    capturing = (
+        bool(target_logits.is_cuda) and torch.cuda.is_current_stream_capturing()
+    )
+    if not capturing and (
+        bool(torch.any(lens < 1).item()) or bool(torch.any(lens > max_gamma + 1).item())
+    ):
         raise ValueError(
             f"DSpark ragged verify_lens must be in [1,{max_gamma + 1}], got {lens.tolist()}"
         )
@@ -313,7 +323,7 @@ def greedy_accept_ragged(
         raise ValueError("DSpark ragged q_indptr must have shape [B+1]")
     if q_indptr.device != target_logits.device:
         raise ValueError("DSpark ragged q_indptr must share the logits device")
-    if int(q_indptr[-1].item()) > int(candidates.shape[0]):
+    if not capturing and int(q_indptr[-1].item()) > int(candidates.shape[0]):
         raise ValueError("DSpark ragged q_indptr exceeds compact candidate capacity")
 
     if predicted is None:

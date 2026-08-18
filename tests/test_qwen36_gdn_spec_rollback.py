@@ -29,6 +29,18 @@ from runtime.model.qwen36_model import (  # noqa: E402
 )
 
 
+class TestGdnFusedGateSwitch:
+    def test_fused_gate_is_the_default_with_explicit_opt_out(self, monkeypatch) -> None:
+        monkeypatch.delenv(qwen36_model_module.QSR_QWEN36_GDN_FUSED_GATES_ENV, raising=False)
+        assert qwen36_model_module._qwen36_gdn_fused_gates_enabled() is True
+
+        monkeypatch.setenv(qwen36_model_module.QSR_QWEN36_GDN_FUSED_GATES_ENV, "0")
+        assert qwen36_model_module._qwen36_gdn_fused_gates_enabled() is False
+
+        monkeypatch.setenv(qwen36_model_module.QSR_QWEN36_GDN_FUSED_GATES_ENV, "1")
+        assert qwen36_model_module._qwen36_gdn_fused_gates_enabled() is True
+
+
 def _state(seed: float) -> GdnLayerState:
     return GdnLayerState(
         conv_state=torch.full((1, 4, 4), seed),

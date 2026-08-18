@@ -68,6 +68,7 @@ from runtime.model.qwen36_model import (  # noqa: E402
     Qwen36Attention,
     Qwen36ForCausalLMSelfBuilt,
     _kv_to_cache_dtype,
+    _store_batched_kv_rows,
 )
 from runtime.model.qwen36_slots import Qwen36SlotPool  # noqa: E402
 
@@ -263,6 +264,60 @@ class TestQwen36AttentionConstructionGating:
         cache_bf16 = attn_bf16.new_cache(device=torch.device("cpu"), dtype=torch.bfloat16)
         assert cache_bf16.k_cache.dtype == torch.bfloat16
         assert cache_bf16.v_cache.dtype == torch.bfloat16
+
+
+def test_batched_kv_store_keeps_bf16_fallback_semantics() -> None:
+    key = torch.arange(12, dtype=torch.float32).view(2, 2, 3)
+    value = -key
+    k_pool = torch.zeros((2, 4, 2, 3), dtype=torch.bfloat16)
+    v_pool = torch.zeros_like(k_pool)
+    write_index = torch.tensor([1, 6], dtype=torch.long)
+
+    _store_batched_kv_rows(
+        key,
+        value,
+        k_pool=k_pool,
+        v_pool=v_pool,
+        write_index=write_index,
+        k_scale=None,
+        v_scale=None,
+    )
+
+    expected_k = key.to(torch.bfloat16)
+    expected_v = value.to(torch.bfloat16)
+    assert torch.equal(k_pool.view(-1, 2, 3)[write_index], expected_k)
+    assert torch.equal(v_pool.view(-1, 2, 3)[write_index], expected_v)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FP8 fused KV scatter requires CUDA")
+def test_batched_kv_store_fp8_matches_scale_cast_on_cuda() -> None:
+    key = torch.tensor(
+        [[[1.5, -2.0, 3.25], [4.0, -5.5, 6.0]], [[-7.0, 8.0, -9.5], [1.0, 2.0, 3.0]]],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    value = key * -0.5
+    k_pool = torch.zeros((2, 4, 2, 3), dtype=torch.float8_e4m3fn, device="cuda")
+    v_pool = torch.zeros_like(k_pool)
+    write_index = torch.tensor([1, 6], dtype=torch.long, device="cuda")
+    k_scale = torch.tensor([0.25], dtype=torch.float32, device="cuda")
+    v_scale = torch.tensor([0.5], dtype=torch.float32, device="cuda")
+
+    _store_batched_kv_rows(
+        key,
+        value,
+        k_pool=k_pool,
+        v_pool=v_pool,
+        write_index=write_index,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    torch.cuda.synchronize()
+
+    expected_k = (key / k_scale).to(torch.float8_e4m3fn)
+    expected_v = (value / v_scale).to(torch.float8_e4m3fn)
+    assert torch.equal(k_pool.view(-1, 2, 3)[write_index], expected_k)
+    assert torch.equal(v_pool.view(-1, 2, 3)[write_index], expected_v)
 
 
 class TestFullModelDefaultOff:

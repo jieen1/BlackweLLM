@@ -24,6 +24,7 @@ import collections
 import json
 import logging
 import os
+import select
 import threading
 import time
 import uuid
@@ -573,12 +574,6 @@ class ServerEngine:
         self.request_timeout_s = request_timeout_s
         self._kv_cache_dtype = kv_cache_dtype
         self._enable_cudagraph = enable_cudagraph
-        if enable_dspark and enable_prefix_cache:
-            logger.warning(
-                "DSpark currently has no prefix-cache snapshot for its draft KV; "
-                "disabling prefix caching for this engine"
-            )
-            enable_prefix_cache = False
         self.enable_prefix_cache = enable_prefix_cache
         self.enable_session_affinity = enable_session_affinity
         self.session_ttl_s = session_ttl_s
@@ -650,6 +645,29 @@ class ServerEngine:
         # A5/B4: incremental chunked prefill state (None = no prefill in progress)
         self._pending_prefill = None  # ChunkedPrefillState | None
         self._pending_prefill_reqs: list[tuple[int, GenerationRequest]] = []
+        # SGLang's radix scheduler avoids putting exact duplicate prompts in
+        # the same cold extend wave: the first request publishes the prefix,
+        # and the remaining requests restore it on the next wave.  Keep only
+        # keys whose first request is currently being admitted.  They are
+        # released as soon as that prefill commits, so all duplicates can
+        # restore together without serializing the cheap cache-hit path.
+        self._prefix_dedup_inflight: set[tuple[int, ...]] = set()
+        self._prefix_dedup_published: set[tuple[int, ...]] = set()
+        # SGLang-style wave admission: when the GPU is idle and the first
+        # request of a concurrent wave has arrived, briefly collect wakeups
+        # already in flight before starting a long prefill.  Keep the default
+        # off until a deployment opts in; the benchmarked Qwen3.8 DSpark
+        # service enables it explicitly because a 128K c4 wave otherwise
+        # entered as [1] + [3] and paid two separate prefill schedules.
+        configured_coalesce_ms = os.environ.get("QSR_ADMISSION_COALESCE_MS", "0")
+        try:
+            self._admission_coalesce_s = float(configured_coalesce_ms) / 1000.0
+        except ValueError as exc:
+            raise ValueError(
+                "QSR_ADMISSION_COALESCE_MS must be a non-negative number"
+            ) from exc
+        if self._admission_coalesce_s < 0:
+            raise ValueError("QSR_ADMISSION_COALESCE_MS must be non-negative")
         # A dynamic-arena capacity miss cannot improve while the same active
         # requests keep their pages. Avoid re-hashing a long waiting prompt on
         # every decode token; completion/cancel clears this immediately, and
@@ -667,6 +685,9 @@ class ServerEngine:
             "rounds": 0,
             "admissions": 0,
             "admission_batch_sizes": [],
+            "admission_coalesce_waits": 0,
+            "admission_coalesce_wait_ms": [],
+            "prefix_cache_dedup_deferrals": 0,
             "kv_admission_waits": 0,
             "round_batch_sizes": [],
             "bootstrap_checks_ok": 0,
@@ -948,7 +969,7 @@ class ServerEngine:
             device="cuda",
             dtype=torch.bfloat16,
             enable_prefix_cache=self.enable_prefix_cache,
-            enable_persistent_prefix_cache=(False if self.enable_dspark else None),
+            enable_persistent_prefix_cache=None,
             checkpoint_budget_multiple=self.checkpoint_budget_multiple,
             dynamic_arena=dynamic_arena,
             pool_bundles=pool_bundles,
@@ -1779,11 +1800,144 @@ class ServerEngine:
         while self._req_deque:
             self.waiting.append(self._req_deque.popleft())
 
+    def _coalesce_admission_wave(self) -> None:
+        """Collect a just-arriving idle wave before launching prefill.
+
+        The HTTP tasks are created together, but the asyncio loop can wake the
+        engine after the first append and before the remaining tasks have
+        appended.  Starting a 128K prefill at that point permanently splits
+        the wave: the other requests cannot join while ``_pending_prefill`` is
+        active.  A bounded ``select`` on the existing request pipe lets the
+        engine sleep without polling and preserves the zero-CPU idle path.
+
+        This is deliberately limited to an idle engine with spare slots.  It
+        never delays a decode round or an already-running incremental prefill,
+        and it exits early as soon as all currently free slots have a request.
+        """
+        # Catch the small race between the normal top-of-round drain and the
+        # pipe drain, but only for the opt-in feature.  With the feature off,
+        # keep the historical ordering intact; the idle branch's re-drain is
+        # the existing fix for that race.
+        if self._admission_coalesce_s <= 0.0:
+            return
+        self._drain_requests()
+        if (
+            self.active
+            or self._pending_prefill is not None
+            or not self.waiting
+            or len(self.waiting) >= len(self.free_slots)
+        ):
+            return
+
+        target = len(self.free_slots)
+        started = time.perf_counter()
+        deadline = started + self._admission_coalesce_s
+        while len(self.waiting) < target:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0.0:
+                break
+            try:
+                readable, _, _ = select.select([self._req_pipe_r], [], [], remaining)
+            except (OSError, ValueError):
+                # Shutdown can close the pipe while a request is being
+                # admitted.  The normal admission path remains correct.
+                break
+            if not readable:
+                break
+            _drain_pipe(self._req_pipe_r)
+            self._drain_requests()
+
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self.stats["admission_coalesce_waits"] += 1
+        samples = self.stats["admission_coalesce_wait_ms"]
+        samples.append(round(elapsed_ms, 3))
+        if len(samples) > 128:
+            del samples[:-128]
+
+    def _select_admission_requests(self, limit: int) -> list[GenerationRequest]:
+        """Select the next admission wave, applying in-batch prefix dedup.
+
+        SGLang's waiting-queue radix tree deliberately deprioritizes exact
+        duplicate prompts when they have no prior device-cache match.  The
+        first request gets to publish the full prefix; the duplicates then
+        enter a later extend wave as persistent-cache hits.  Doing the same
+        here is both cheaper and safer than trying to share live slot state
+        across requests: Qwen's target KV, GDN checkpoint, and DSpark KV are
+        restored through the existing persistent-prefix protocol.
+
+        Deduplication is restricted to block-aligned prompts.  Qwen only
+        publishes an exact full-prompt persistent checkpoint at that
+        boundary; holding an unaligned duplicate would otherwise turn a
+        useful batch into repeated cold prefills.  The environment switch is
+        an A/B escape hatch for profiling and incident response.
+        """
+        if limit <= 0 or not self.waiting:
+            return []
+        dedup_enabled = (
+            os.environ.get("QSR_PREFIX_CACHE_IN_BATCH_DEDUP", "1") != "0"
+            and self.runner.capabilities.prefix_cache_dedup
+        )
+        if not dedup_enabled:
+            selected = self.waiting[:limit]
+            del self.waiting[:limit]
+            return selected
+
+        selected: list[GenerationRequest] = []
+        deferred: list[GenerationRequest] = []
+        selected_keys: set[tuple[int, ...]] = set()
+        inflight_at_start = set(self._prefix_dedup_inflight)
+        for req in self.waiting:
+            key = tuple(req.prompt_ids)
+            aligned = (
+                len(req.prompt_ids) >= self.block_size
+                and len(req.prompt_ids) % self.block_size == 0
+            )
+            duplicate_inflight = aligned and key in inflight_at_start
+            duplicate_selected = (
+                aligned
+                and key in selected_keys
+                and key not in self._prefix_dedup_published
+            )
+            if len(selected) < limit and not duplicate_inflight and not duplicate_selected:
+                selected.append(req)
+                if aligned:
+                    selected_keys.add(key)
+                    self._prefix_dedup_inflight.add(key)
+            else:
+                deferred.append(req)
+                if duplicate_inflight or duplicate_selected:
+                    self.stats["prefix_cache_dedup_deferrals"] += 1
+        self.waiting = deferred
+        return selected
+
+    def _release_prefix_dedup_keys(
+        self,
+        requests: list[GenerationRequest] | list[tuple[int, GenerationRequest]],
+        *,
+        published: bool,
+    ) -> None:
+        """Release a key after success, deferral, or admission failure."""
+        for item in requests:
+            req = item[1] if isinstance(item, tuple) else item
+            aligned = (
+                len(req.prompt_ids) >= self.block_size
+                and len(req.prompt_ids) % self.block_size == 0
+            )
+            if aligned:
+                key = tuple(req.prompt_ids)
+                self._prefix_dedup_inflight.discard(key)
+                if published:
+                    self._prefix_dedup_published.add(key)
+
     def _step_sync(self) -> None:
         """One engine round. Runs entirely on the engine thread."""
         # -- drain request deque + pipe (non-blocking) --
         self._drain_requests()
         _drain_pipe(self._req_pipe_r)
+        # A request can be appended between the two operations above.  Drain
+        # once more before deciding whether this is the first request of an
+        # idle concurrent wave, then use the pipe as a bounded coalescing wait.
+        self._coalesce_admission_wave()
 
         # -- process cancellations (asyncio thread → engine thread) --
         if self._cancel_set and self.active:
@@ -1873,6 +2027,7 @@ class ServerEngine:
                 done = self.runner.prefill_chunked_step(self._pending_prefill)
             except Exception as exc:
                 logger.exception("incremental prefill step failed")
+                self._release_prefix_dedup_keys(self._pending_prefill_reqs, published=False)
                 for slot, req in self._pending_prefill_reqs:
                     self._fail_future(req.future, exc)
                     if req.stream_channel is not None:
@@ -1901,6 +2056,7 @@ class ServerEngine:
                 if done:
                     prefill_result = self._pending_prefill.result
                     admit_now = self._pending_prefill_reqs
+                    self._release_prefix_dedup_keys(admit_now, published=True)
                     self.stats["admissions"] += 1
                     self.stats["admission_batch_sizes"].append(len(admit_now))
                     for slot, req in admit_now:
@@ -1918,12 +2074,12 @@ class ServerEngine:
             and self.stats["rounds"] >= self._kv_admission_retry_round
         ):
             n = min(len(self.free_slots), len(self.waiting))
+            admission_reqs = self._select_admission_requests(n)
             # Cache-aware slot assignment: match each prompt to the free
             # slot with the deepest warm KV prefix hit (same-slot reuse).
             admit_now = []
             remaining_slots = list(self.free_slots)
-            for _ in range(n):
-                req = self.waiting.pop(0)
+            for req in admission_reqs:
                 _adm_start(req)
                 # A3 step 7-b (docs/a3-cache-coordinator-design.md §1.1):
                 # capability-bit query, not a hasattr probe -- the pattern
@@ -1970,6 +2126,7 @@ class ServerEngine:
                         deferred = admit_now[first_wait:]
                         admit_now = admit_now[:first_wait]
                         self.waiting = [req for _slot, req in deferred] + self.waiting
+                        self._release_prefix_dedup_keys(deferred, published=False)
                         self.free_slots.extend(slot for slot, _req in deferred)
                         self.stats["kv_admission_waits"] += 1
                         self._kv_admission_retry_round = self.stats["rounds"] + 16
@@ -2011,6 +2168,7 @@ class ServerEngine:
                         _adm_phase(req, "prefill_begin")
             except Exception as exc:
                 logger.exception("admission failed for %d request(s)", len(admit_now))
+                self._release_prefix_dedup_keys(admit_now, published=False)
                 for slot, req in admit_now:
                     self._fail_future(req.future, exc)
                     if req.stream_channel is not None:
@@ -2025,6 +2183,7 @@ class ServerEngine:
                     pass
                 elif prefill_state.done:
                     # Short prompt: prefill completed immediately
+                    self._release_prefix_dedup_keys(admit_now, published=True)
                     self._log_prefix_overlap(admit_now)
                     self._record_prefix_cache_hits(admit_now, hit_depths)
                     self.stats["admissions"] += 1

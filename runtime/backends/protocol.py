@@ -92,6 +92,11 @@ class BackendCapabilities:
     chunked_prefill: bool
     warm_continue: bool
     kv_reservation: bool = False
+    # The scheduler may hold exact duplicate prompts out of one admission
+    # wave until the first request has published its persistent prefix.  This
+    # is the SGLang-style in-batch prefix-cache path; a backend must only set
+    # it when its cache carries every state family needed by the model.
+    prefix_cache_dedup: bool = False
 
 
 @dataclass(frozen=True)

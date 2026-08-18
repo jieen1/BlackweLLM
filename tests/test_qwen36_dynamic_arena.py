@@ -383,6 +383,22 @@ class TestPhase3PrefixCache:
         # page revive it once (ref_cnt=1), not once per block.
         assert pool._arena.bundles[b0].ref_cnt == 1
 
+    def test_live_publish_fans_out_before_source_reset(self) -> None:
+        """A waiting duplicate may share a prefix with its live source."""
+        pool = _dynamic_pool(num_slots=2, max_seq_len=256, pool_bundles=16)
+        pool.prepare_kv_writes(0, 0, 128)
+        keys = self._keys(2)
+        pool.publish_committed_blocks(0, 128, keys, self._BLOCK)
+        source_bundle = pool._page_table_host[0][0]
+
+        assert pool.reserve_kv_capacity(1, 128)
+        restored, bundle_ids = pool.restore_prefix_from_arena(1, 128, keys)
+
+        assert restored == 128
+        assert bundle_ids == [source_bundle]
+        assert pool._arena.bundles[source_bundle].ref_cnt == 2
+        pool._arena._assert_invariants()
+
     def test_partial_page_restore_consumes_one_reserved_bundle(self) -> None:
         pool = _dynamic_pool(num_slots=2, max_seq_len=256, pool_bundles=16)
         pool.prepare_kv_writes(0, 0, 64)

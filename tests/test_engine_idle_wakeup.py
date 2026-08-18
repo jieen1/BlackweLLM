@@ -84,6 +84,40 @@ def _step_blocks(engine: ServerEngine, monkeypatch) -> bool:
 
 
 class TestIdleWakeup:
+    def test_coalesces_idle_wave_before_admission(self, monkeypatch):
+        """A second request arriving on the wakeup pipe joins the first.
+
+        The fake select result models the asyncio producer writing the pipe
+        while the engine is in its bounded coalescing window.  This keeps the
+        test CPU-only and proves the request is collected before the normal
+        admission branch can start a long prefill.
+        """
+        engine = _idle_engine()
+        try:
+            engine._admission_coalesce_s = 0.01
+            engine.waiting = [_queued_request(engine)]
+            calls = []
+
+            def _select(readable, _writable, _exceptional, _timeout):
+                calls.append(True)
+                if len(calls) == 1:
+                    req = _queued_request(engine)
+                    req.request_id = "coalesced-request"
+                    engine._req_deque.append(req)
+                return ([engine._req_pipe_r], [], [])
+
+            monkeypatch.setattr(engine_mod.select, "select", _select)
+            engine._coalesce_admission_wave()
+
+            assert calls
+            assert [req.request_id for req in engine.waiting] == [
+                "queued-while-winding-down",
+                "coalesced-request",
+            ]
+            assert engine.stats["admission_coalesce_waits"] == 1
+        finally:
+            engine._asyncio_loop.close()
+
     def test_does_not_block_when_request_arrives_mid_round(self, monkeypatch):
         """Reproduce the live race at its exact instant.
 

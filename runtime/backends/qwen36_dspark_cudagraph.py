@@ -499,28 +499,78 @@ class Qwen36DSparkDraftBatchCudaGraph:
         for name, impl in self._original_impls.items():
             self.engine._draft_attn_layers[name].impl = impl
 
-    def _fill_buffers(self, slots: list[int], anchors: list[int], kv_lens: list[int]) -> None:
+    def _fill_buffers(
+        self,
+        slots: list[int],
+        anchors: list[int] | torch.Tensor,
+        kv_lens: list[int] | torch.Tensor,
+        *,
+        host_kv_lens: list[int] | None = None,
+    ) -> None:
         if len(slots) != self.batch_size or len(anchors) != self.batch_size:
             raise ValueError(
                 f"DSpark draft B={self.batch_size} replay expects matching slots/anchors"
             )
         if len(kv_lens) != self.batch_size:
             raise ValueError(f"DSpark draft B={self.batch_size} replay expects kv_lens")
+        device_inputs = isinstance(anchors, torch.Tensor) or isinstance(kv_lens, torch.Tensor)
+        if device_inputs and not (
+            isinstance(anchors, torch.Tensor) and isinstance(kv_lens, torch.Tensor)
+        ):
+            raise ValueError(
+                "DSpark draft device replay requires both anchors and kv_lens as tensors"
+            )
         if any(slot < 0 or slot >= self.engine.backend.num_slots for slot in slots):
             raise ValueError(f"invalid DSpark draft graph slots: {slots}")
-        if any(kv_len < 0 or kv_len + self.num_tokens > self.max_seq_len for kv_len in kv_lens):
+        if device_inputs:
+            assert isinstance(anchors, torch.Tensor)
+            assert isinstance(kv_lens, torch.Tensor)
+            if (
+                anchors.ndim != 1
+                or kv_lens.ndim != 1
+                or anchors.dtype != torch.long
+                or kv_lens.dtype != torch.long
+                or anchors.device.type != self.device.type
+                or kv_lens.device.type != self.device.type
+                or (
+                    self.device.index is not None
+                    and (
+                        anchors.device.index != self.device.index
+                        or kv_lens.device.index != self.device.index
+                    )
+                )
+            ):
+                raise ValueError(
+                    "DSpark draft device replay expects long [B] tensors on "
+                    f"{self.device}, got anchors={tuple(anchors.shape)}/"
+                    f"{anchors.dtype}/{anchors.device}, kv_lens={tuple(kv_lens.shape)}/"
+                    f"{kv_lens.dtype}/{kv_lens.device}"
+                )
+            if host_kv_lens is not None and len(host_kv_lens) != self.batch_size:
+                raise ValueError("DSpark draft host_kv_lens must match the graph batch")
+        elif any(kv_len < 0 or kv_len + self.num_tokens > self.max_seq_len for kv_len in kv_lens):
             raise RuntimeError(
                 f"DSpark draft graph block does not fit: kv_lens={kv_lens}, "
                 f"gamma={self.num_tokens}, max_seq_len={self.max_seq_len}"
             )
 
         self._input_ids.fill_(self.engine.draft_model.config.mask_token_id)
-        for row, (slot, anchor, kv_len) in enumerate(zip(slots, anchors, kv_lens, strict=True)):
+        for row, slot in enumerate(slots):
             self._slot_host[row] = slot
-            self._anchor_host[row] = anchor
-            self._kv_len_host[row] = kv_len
-        self._anchors.copy_(self._anchor_host, non_blocking=True)
-        self._kv_lens.copy_(self._kv_len_host, non_blocking=True)
+        if device_inputs:
+            assert isinstance(anchors, torch.Tensor)
+            assert isinstance(kv_lens, torch.Tensor)
+            # The verify accept epilogue and this fill run on the same stream.
+            # Keep the next anchor/length on device so the common path does not
+            # add another D2H ``tolist()``/H2D upload between graph replays.
+            self._anchors.copy_(anchors, non_blocking=True)
+            self._kv_lens.copy_(kv_lens, non_blocking=True)
+        else:
+            for row, (anchor, kv_len) in enumerate(zip(anchors, kv_lens, strict=True)):
+                self._anchor_host[row] = anchor
+                self._kv_len_host[row] = kv_len
+            self._anchors.copy_(self._anchor_host, non_blocking=True)
+            self._kv_lens.copy_(self._kv_len_host, non_blocking=True)
         self._slot_ids.copy_(self._slot_host, non_blocking=True)
         self._input_ids[:, 0].copy_(self._anchors)
         torch.add(
@@ -548,7 +598,14 @@ class Qwen36DSparkDraftBatchCudaGraph:
         )
         if self.engine.use_flashinfer_draft:
             assert self._flashinfer_impl is not None
-            self._flashinfer_impl.update_graph_metadata(kv_lens, page_table=self._page_table)
+            # FlashInfer's split-KV planner still consumes host-known lengths.
+            # The target engine already has these exact committed lengths for
+            # scheduler bookkeeping, so pass that list explicitly instead of
+            # making the adapter synchronously copy device lengths to CPU.
+            metadata_kv_lens = host_kv_lens if host_kv_lens is not None else kv_lens
+            self._flashinfer_impl.update_graph_metadata(
+                metadata_kv_lens, page_table=self._page_table
+            )
             return
         assert self._workspace is not None
         self._workspace.update_prefill_graph_replay_metadata(
@@ -627,6 +684,34 @@ class Qwen36DSparkDraftBatchCudaGraph:
         if self._graph is None:
             raise RuntimeError("DSpark draft batch graph replay requested before capture")
         self._fill_buffers(slots, anchors, kv_lens)
+        self._graph.replay()
+        return self._tokens
+
+    def replay_device(
+        self,
+        slots: list[int],
+        anchors: torch.Tensor,
+        kv_lens: torch.Tensor,
+        *,
+        host_kv_lens: list[int] | None = None,
+    ) -> torch.Tensor:
+        """Replay using device-resident next-block metadata.
+
+        ``anchors`` and ``kv_lens`` are produced by the ragged verify graph.
+        Slots remain host metadata because they select the persistent page
+        table rows; ``host_kv_lens`` is only for FlashInfer's host-side
+        split-KV planner and is deliberately supplied by the scheduler rather
+        than read back from the device here.
+        """
+
+        if self._graph is None:
+            raise RuntimeError("DSpark draft batch graph replay requested before capture")
+        self._fill_buffers(
+            slots,
+            anchors,
+            kv_lens,
+            host_kv_lens=host_kv_lens,
+        )
         self._graph.replay()
         return self._tokens
 

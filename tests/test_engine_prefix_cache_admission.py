@@ -39,6 +39,7 @@ that gap.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -157,6 +158,14 @@ class _FakeNoCacheRunner:
         raise NotImplementedError("has_speculative_decode=False; must not be called")
 
 
+class _FakeInBatchCacheRunner(_FakeCacheAwareRunner):
+    """Cache-aware fake that opts into exact-prefix wave deduplication."""
+
+    def __init__(self):
+        super().__init__({})
+        self.capabilities = replace(self.capabilities, prefix_cache_dedup=True)
+
+
 class _FakeReservedRunner(_FakeNoCacheRunner):
     def __init__(self, reservable_slots: set[int]):
         super().__init__()
@@ -237,6 +246,37 @@ class TestCapabilityGatedSlotAssignment:
         # hasattr(runner, "find_best_slot_for_prompt") == False did before.
         assert engine.active[0]["anchor"] == 700
         assert 1 in engine.free_slots
+
+
+class TestInBatchPrefixDedup:
+    def test_exact_aligned_duplicates_wait_for_first_prefix_publish(self) -> None:
+        runner = _FakeInBatchCacheRunner()
+        engine = _bare_admission_engine(runner, capacity=2)
+        engine.block_size = 4
+        first = _req(engine, [1, 2, 3, 4], "req-a1")
+        duplicate = _req(engine, [1, 2, 3, 4], "req-a2")
+        distinct = _req(engine, [5, 6, 7, 8], "req-b")
+        engine.waiting = [first, duplicate, distinct]
+
+        selected = engine._select_admission_requests(2)
+
+        assert selected == [first, distinct]
+        assert engine.waiting == [duplicate]
+        assert engine.stats["prefix_cache_dedup_deferrals"] == 1
+
+        engine._release_prefix_dedup_keys(selected, published=True)
+        assert engine._select_admission_requests(2) == [duplicate]
+
+    def test_unaligned_duplicates_stay_batchable(self) -> None:
+        runner = _FakeInBatchCacheRunner()
+        engine = _bare_admission_engine(runner, capacity=2)
+        engine.block_size = 4
+        first = _req(engine, [1, 2, 3], "req-a1")
+        duplicate = _req(engine, [1, 2, 3], "req-a2")
+        engine.waiting = [first, duplicate]
+
+        assert engine._select_admission_requests(2) == [first, duplicate]
+        assert engine.stats["prefix_cache_dedup_deferrals"] == 0
 
 
 class TestKVReservationAdmission:

@@ -37,9 +37,11 @@ def test_dspark_allows_dynamic_target_kv_arena() -> None:
         num_slots=1,
         enable_cudagraph=False,
         enable_dspark=True,
+        enable_prefix_cache=True,
         qwen_kv_mode="strict",
     )
     assert engine.qwen_kv_mode == "strict"
+    assert engine.enable_prefix_cache is True
 
 
 def test_dspark_requires_positive_speculative_width() -> None:

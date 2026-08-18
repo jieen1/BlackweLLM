@@ -269,6 +269,13 @@ class Qwen36DSparkEngine:
         self.backend.stats["dspark_verify_width_histogram"] = [0] * (self.k + 1)
         self.capture_aux_hidden_states = True
         self.capture_device_accept = os.environ.get("QSR_QWEN36_DSPARK_FUSED_ACCEPT", "1") != "0"
+        # Ordinary SGLang DSpark pools inject accepted hidden rows after the
+        # ragged verify graph.  Keep the graph-folded variant opt-in: it is a
+        # specialized pool optimization, not the standard DSpark contract,
+        # and this runtime's generic cache writer is not that pool API.
+        self.fuse_context_kv = (
+            os.environ.get("QSR_QWEN36_DSPARK_FUSED_CONTEXT_KV", "0") != "0"
+        )
         self.verify_mode = os.environ.get("QSR_QWEN36_DSPARK_VERIFY_MODE", "static").strip().lower()
         if self.verify_mode not in {"static", "cap-accept", "compact"}:
             raise ValueError(
@@ -276,11 +283,6 @@ class Qwen36DSparkEngine:
                 "static, cap-accept, compact; "
                 f"got {self.verify_mode!r}"
             )
-        # SGLang does not instantiate/run the confidence head in static mode;
-        # avoid paying that extra projection when no dynamic planner consumes
-        # its output.
-        self.capture_confidence = self.verify_mode != "static"
-        self._load_confidence_sts()
         threshold_raw = os.environ.get("QSR_QWEN36_DSPARK_CONFIDENCE_THRESHOLD")
         self._confidence_threshold = None if threshold_raw is None else float(threshold_raw)
         if self._confidence_threshold is not None and not 0.0 <= self._confidence_threshold <= 1.0:
@@ -289,6 +291,17 @@ class Qwen36DSparkEngine:
                 f"got {self._confidence_threshold}"
             )
         self._sps_table_path = os.environ.get("QSR_QWEN36_DSPARK_SPS_TABLE")
+        # Compact mode is the SGLang-shaped ragged verify path.  A deployment
+        # without an explicit SPS table or confidence threshold still verifies
+        # the full K block (SGLang's static/no-profile fallback); it must not
+        # pay for a confidence-head projection and a per-request GPU->CPU
+        # transfer whose result is known in advance.  Dynamic planning is an
+        # explicit opt-in through one of those two knobs.
+        self._dynamic_planner = self.verify_mode != "static" and (
+            self._sps_table_path is not None or self._confidence_threshold is not None
+        )
+        self.capture_confidence = self._dynamic_planner
+        self._load_confidence_sts()
         if self._sps_table_path:
             self._sps_table = load_sps_table(self._sps_table_path)
         elif self.verify_mode in {"cap-accept", "compact"} and self._confidence_threshold is None:
@@ -359,7 +372,12 @@ class Qwen36DSparkEngine:
         if not self._draft_layer_names:
             raise ValueError("DSpark draft has no attention layers")
 
-        total_blocks = backend.num_slots * self.pages_per_slot
+        # The target persistent-prefix family has one scratch row. DSpark is
+        # a separate causal cache family, so it needs its own scratch row to
+        # make an exact prompt restore valid after the source slot continues
+        # decoding or is reused by another request.
+        self.scratch_row = backend.num_slots
+        total_blocks = (backend.num_slots + 1) * self.pages_per_slot
         self._draft_kv_caches: dict[str, torch.Tensor] = {}
         for name, attn in self._draft_attn_layers.items():
             shape = (
@@ -373,6 +391,15 @@ class Qwen36DSparkEngine:
         bind_laguna_kv_cache(self._draft_kv_caches, self._draft_attn_layers, [])
         self._patch_attention()
 
+        # The target prefix cache and the DSpark draft cache are independent
+        # cache families. Keeping only the target pages on reset would make a
+        # warm target hit feed the draft model from an empty/old context. The
+        # live length is reset with the slot; the cached length survives until
+        # the backend explicitly drops that prefix or overwrites it on reset.
+        self._draft_kv_len = [0] * backend.num_slots
+        self._cached_prefix_len = [0] * backend.num_slots
+        self._scratch_valid_pages: set[int] = set()
+
         self.stats: dict[str, int] = {
             "rounds": 0,
             "sampled_rounds": 0,
@@ -381,6 +408,12 @@ class Qwen36DSparkEngine:
             "verify_graph_replays": 0,
             "target_hidden_injections": 0,
         }
+
+        if self._use_cuda_graph and self.fuse_context_kv:
+            # Build the stacked projection views before graph capture.  The
+            # first-call lazy path creates/contiguates GPU tensors and is not
+            # part of the captured steady-state region.
+            self.draft_model.model._build_fused_kv_buffers()  # noqa: SLF001
 
         if self._use_cuda_graph:
             self.capture_cuda_graphs()
@@ -415,6 +448,136 @@ class Qwen36DSparkEngine:
     @property
     def kv_bytes(self) -> int:
         return sum(cache.numel() * cache.element_size() for cache in self._draft_kv_caches.values())
+
+    def _validate_slot(self, slot: int) -> None:
+        if slot < 0 or slot >= self.backend.num_slots:
+            raise ValueError(f"invalid DSpark slot {slot}")
+
+    def preserve_prefix(self, slot: int, kv_len: int) -> bool:
+        """Retain the draft KV prefix before the owning target slot resets."""
+
+        self._validate_slot(slot)
+        kv_len = int(kv_len)
+        if kv_len < 0 or kv_len > self.max_seq_len:
+            raise ValueError(f"invalid DSpark prefix length {kv_len}")
+        if self._draft_kv_len[slot] < kv_len:
+            # Do not advertise a target-only prefix. The caller will safely
+            # fall back to a full prefill when this family is incomplete.
+            self._cached_prefix_len[slot] = 0
+            return False
+        self._cached_prefix_len[slot] = kv_len
+        return True
+
+    def can_restore_prefix(self, slot: int, kv_len: int) -> bool:
+        self._validate_slot(slot)
+        kv_len = int(kv_len)
+        return 0 <= kv_len <= self._cached_prefix_len[slot]
+
+    def restore_prefix(self, slot: int, kv_len: int) -> None:
+        if not self.can_restore_prefix(slot, kv_len):
+            raise RuntimeError(
+                f"DSpark prefix is not restorable: slot={slot}, kv_len={kv_len}, "
+                f"cached={self._cached_prefix_len[slot]}"
+            )
+        self._draft_kv_len[slot] = int(kv_len)
+
+    def copy_prefix(self, source_slot: int, target_slot: int, kv_len: int) -> None:
+        """Copy retained draft pages for a cross-slot target prefix hit."""
+
+        self._validate_slot(source_slot)
+        self._validate_slot(target_slot)
+        kv_len = int(kv_len)
+        if not self.can_restore_prefix(source_slot, kv_len):
+            raise RuntimeError(
+                f"DSpark source prefix is not restorable: slot={source_slot}, kv_len={kv_len}"
+            )
+        if source_slot == target_slot:
+            self.restore_prefix(target_slot, kv_len)
+            return
+        pages = (kv_len + self.page_size - 1) // self.page_size
+        if pages > self.pages_per_slot:
+            raise RuntimeError(
+                f"DSpark prefix exceeds slot page capacity: pages={pages}, "
+                f"capacity={self.pages_per_slot}"
+            )
+        source_start = source_slot * self.pages_per_slot
+        target_start = target_slot * self.pages_per_slot
+        for cache in self._draft_kv_caches.values():
+            cache[:, target_start : target_start + pages].copy_(
+                cache[:, source_start : source_start + pages]
+            )
+        self._draft_kv_len[target_slot] = kv_len
+        self._cached_prefix_len[target_slot] = 0
+
+    def drop_prefix(self, slot: int) -> None:
+        self._validate_slot(slot)
+        self._cached_prefix_len[slot] = 0
+
+    def snapshot_prefix_to_scratch(
+        self,
+        source_slot: int,
+        kv_len: int,
+        *,
+        scratch_pages: tuple[int, ...],
+    ) -> bool:
+        """Copy a retained draft prefix into the persistent scratch row."""
+
+        self._validate_slot(source_slot)
+        kv_len = int(kv_len)
+        if self._draft_kv_len[source_slot] < kv_len:
+            return False
+        pages = (kv_len + self.page_size - 1) // self.page_size
+        if len(scratch_pages) != pages or len(set(scratch_pages)) != pages:
+            raise ValueError("DSpark scratch prefix needs one distinct page per logical page")
+        if any(page < 0 or page >= self.pages_per_slot for page in scratch_pages):
+            raise ValueError("DSpark scratch prefix page is outside the scratch row")
+        source_start = source_slot * self.pages_per_slot
+        scratch_start = self.scratch_row * self.pages_per_slot
+        source_pages = torch.arange(
+            source_start, source_start + pages, dtype=torch.long, device=self.device
+        )
+        scratch_page_tensor = torch.tensor(
+            [scratch_start + page for page in scratch_pages], dtype=torch.long, device=self.device
+        )
+        for cache in self._draft_kv_caches.values():
+            cache[:, scratch_page_tensor] = cache[:, source_pages]
+        self._scratch_valid_pages.update(scratch_pages)
+        return True
+
+    def restore_prefix_from_scratch(
+        self,
+        target_slot: int,
+        kv_len: int,
+        *,
+        scratch_pages: tuple[int, ...],
+    ) -> bool:
+        """Restore a persistent draft prefix into a live target slot."""
+
+        self._validate_slot(target_slot)
+        kv_len = int(kv_len)
+        pages = (kv_len + self.page_size - 1) // self.page_size
+        if len(scratch_pages) != pages or len(set(scratch_pages)) != pages:
+            raise ValueError("DSpark scratch prefix needs one distinct page per logical page")
+        if any(page < 0 or page >= self.pages_per_slot for page in scratch_pages):
+            raise ValueError("DSpark scratch prefix page is outside the scratch row")
+        if not set(scratch_pages).issubset(self._scratch_valid_pages):
+            return False
+        target_start = target_slot * self.pages_per_slot
+        scratch_start = self.scratch_row * self.pages_per_slot
+        target_pages = torch.arange(
+            target_start, target_start + pages, dtype=torch.long, device=self.device
+        )
+        scratch_page_tensor = torch.tensor(
+            [scratch_start + page for page in scratch_pages], dtype=torch.long, device=self.device
+        )
+        for cache in self._draft_kv_caches.values():
+            cache[:, target_pages] = cache[:, scratch_page_tensor]
+        self._draft_kv_len[target_slot] = kv_len
+        self._cached_prefix_len[target_slot] = 0
+        return True
+
+    def release_prefix_scratch(self, scratch_pages: tuple[int, ...]) -> None:
+        self._scratch_valid_pages.difference_update(scratch_pages)
 
     def capture_cuda_graphs(self) -> None:
         """Capture DSpark's target verify and greedy draft graphs.
@@ -610,6 +773,89 @@ class Qwen36DSparkEngine:
         base = slot * self.pages_per_slot * self.page_size
         return base + positions
 
+    def prepare_dspark_context_kv_metadata(
+        self,
+        *,
+        slots: list[int],
+        past_lens: list[int],
+        verify_lens: list[int],
+        host_positions: torch.Tensor,
+        host_slot_mapping: torch.Tensor,
+    ) -> None:
+        """Fill stable host metadata for the fused ragged context epilogue.
+
+        The target graph's auxiliary taps are compact request-major rows.  A
+        valid row maps to the corresponding live DSpark slot and absolute
+        position; graph-capacity tail rows map to the DSpark scratch row so
+        the fixed-shape projector can run without ever touching live KV.
+        """
+
+        if not self.fuse_context_kv:
+            raise RuntimeError("fused DSpark context KV metadata is disabled")
+        if not (len(slots) == len(past_lens) == len(verify_lens)):
+            raise ValueError("DSpark context metadata arguments must have equal lengths")
+        capacity = len(slots) * (self.k + 1)
+        if tuple(host_positions.shape) != (capacity,) or tuple(host_slot_mapping.shape) != (
+            capacity,
+        ):
+            raise ValueError(
+                "DSpark context metadata buffers must have shape "
+                f"[{capacity}], got {tuple(host_positions.shape)} and "
+                f"{tuple(host_slot_mapping.shape)}"
+            )
+        if any(int(length) < 1 or int(length) > self.k + 1 for length in verify_lens):
+            raise ValueError(f"invalid DSpark verify lengths: {verify_lens}")
+
+        host_positions.zero_()
+        host_slot_mapping.zero_()
+        compact_offset = 0
+        row_stride = self.pages_per_slot * self.page_size
+        for slot, past_len, verify_len in zip(
+            slots, past_lens, verify_lens, strict=True
+        ):
+            self._validate_slot(int(slot))
+            past_len = int(past_len)
+            verify_len = int(verify_len)
+            for column in range(verify_len):
+                position = past_len + column
+                if position < 0 or position >= self.max_seq_len:
+                    raise RuntimeError(
+                        "DSpark context position outside cache: "
+                        f"slot={slot}, position={position}, max_seq_len={self.max_seq_len}"
+                    )
+                index = compact_offset + column
+                host_positions[index] = position
+                host_slot_mapping[index] = int(slot) * row_stride + position
+            compact_offset += verify_len
+
+        scratch_base = self.scratch_row * row_stride
+        for index in range(compact_offset, capacity):
+            # Invalid target rows are never consumed by ragged attention, but
+            # they still pass through the fixed-shape MLP/projection body.
+            # Give each one a unique scratch address to avoid scatter races.
+            scratch_position = index - compact_offset
+            host_positions[index] = scratch_position
+            host_slot_mapping[index] = scratch_base + scratch_position
+
+    def inject_dspark_context_kv(
+        self,
+        target_taps: list[torch.Tensor],
+        context_positions: torch.Tensor,
+        context_slot_mapping: torch.Tensor,
+    ) -> None:
+        """Run the DSpark context projector inside a captured verify graph."""
+
+        if not self.fuse_context_kv:
+            raise RuntimeError("fused DSpark context KV injection is disabled")
+        if not target_taps:
+            raise RuntimeError("DSpark graph context epilogue returned no target taps")
+        combined = torch.cat(target_taps, dim=-1)
+        self.draft_model.precompute_and_store_context_kv(
+            combined,
+            context_positions,
+            context_slot_mapping,
+        )
+
     def _forward_draft(
         self,
         slot: int,
@@ -710,6 +956,7 @@ class Qwen36DSparkEngine:
         else:
             self._draft_confidence[slot] = confidence[0]
         self.stats["draft_forwards"] += 1
+        self._draft_kv_len[slot] = max(self._draft_kv_len[slot], kv_len + self.k)
         return [int(token) for token in draft_tokens[0].tolist()]
 
     def _replay_draft_graph(
@@ -727,6 +974,7 @@ class Qwen36DSparkEngine:
             tokens = graph.replay(anchor_token, kv_len)
         self.backend.stats.setdefault("dspark_draft_graph_replays", 0)
         self.backend.stats["dspark_draft_graph_replays"] += 1
+        self._draft_kv_len[slot] = max(self._draft_kv_len[slot], int(kv_len) + self.k)
         return tokens
 
     @staticmethod
@@ -807,6 +1055,7 @@ class Qwen36DSparkEngine:
             positions,
             slot_mapping,
         )
+        self._draft_kv_len[slot] = max(self._draft_kv_len[slot], position_offset + query_len)
         self.stats["target_hidden_injections"] += query_len
 
     def sync_prefill_context(
@@ -871,15 +1120,23 @@ class Qwen36DSparkEngine:
         )
 
     def reset_slot(self, slot: int) -> None:
+        self._validate_slot(slot)
         self._draft_probs.pop(slot, None)
         self._draft_confidence.pop(slot, None)
         self._spec_rows.reset_slot(slot)
         self._spec_state_col[slot] = 0
+        self._draft_kv_len[slot] = 0
 
     def _verify_widths(self, slots: list[int]) -> list[int]:
         """Choose SGLang-style compact verify widths for the active slots."""
 
         if self.verify_mode not in {"cap-accept", "compact"}:
+            return [self.k] * len(slots)
+        if not self._dynamic_planner:
+            # Full-width static verify is still request-major ragged: every
+            # request contributes K+1 rows to the one batch graph.  Avoid the
+            # confidence transfer/planner entirely when no dynamic policy was
+            # requested.
             return [self.k] * len(slots)
         rows: list[list[float]] = []
         for slot in slots:
@@ -1162,6 +1419,8 @@ class Qwen36DSparkEngine:
             positions,
             slot_mapping,
         )
+        for slot, offset, count in zip(slots, position_offsets, accepted_counts, strict=True):
+            self._draft_kv_len[slot] = max(self._draft_kv_len[slot], int(offset) + int(count))
         self.stats["target_hidden_injections"] += total_rows
 
     def _forward_draft_batch(
@@ -1171,6 +1430,8 @@ class Qwen36DSparkEngine:
         kv_lens: list[int],
         *,
         params_per_slot: Mapping[int, SamplingParams] | None = None,
+        device_anchors: torch.Tensor | None = None,
+        device_kv_lens: torch.Tensor | None = None,
     ) -> dict[int, torch.Tensor | list[int]]:
         """Produce one draft block per slot using the matching ``B*K`` graph.
 
@@ -1182,13 +1443,30 @@ class Qwen36DSparkEngine:
 
         if not slots:
             return {}
+        if (device_anchors is None) != (device_kv_lens is None):
+            raise ValueError("DSpark device draft metadata must include anchors and kv_lens")
+        if device_anchors is not None and (
+            tuple(device_anchors.shape) != (len(slots),)
+            or device_kv_lens is None
+            or tuple(device_kv_lens.shape) != (len(slots),)
+        ):
+            raise ValueError("DSpark device draft metadata must have shape [batch]")
         params_per_slot = params_per_slot or {}
         all_greedy = all(
             params_per_slot.get(slot) is None or params_per_slot[slot].is_greedy for slot in slots
         )
         graph = self._draft_cg.get(len(slots)) if all_greedy else None
         if graph is not None:
-            tokens = graph.replay(slots, anchors, kv_lens)
+            if device_anchors is None:
+                tokens = graph.replay(slots, anchors, kv_lens)
+            else:
+                assert device_kv_lens is not None
+                tokens = graph.replay_device(
+                    slots,
+                    device_anchors,
+                    device_kv_lens,
+                    host_kv_lens=kv_lens,
+                )
             confidence = graph.confidence
             if confidence is None:
                 for slot in slots:
@@ -1199,6 +1477,8 @@ class Qwen36DSparkEngine:
             self.stats["draft_graph_replays"] += 1
             self.backend.stats.setdefault("dspark_draft_graph_replays", 0)
             self.backend.stats["dspark_draft_graph_replays"] += 1
+            for slot, kv_len in zip(slots, kv_lens, strict=True):
+                self._draft_kv_len[slot] = max(self._draft_kv_len[slot], int(kv_len) + self.k)
             return {slot: tokens[row] for row, slot in enumerate(slots)}
 
         return {
@@ -1269,7 +1549,6 @@ class Qwen36DSparkEngine:
         self.backend.stats.setdefault("dspark_verify_graph_replays", 0)
         self.backend.stats["dspark_verify_graph_replays"] += 1
         decisions = self._decisions_from_device_accept(slots, accepted, committed, self.k)
-        round_profile.phase("verify_replay")
         round_profile.phase("accept_decision")
 
         accepted_counts: list[int] = []
@@ -1293,22 +1572,40 @@ class Qwen36DSparkEngine:
             committed_by_slot[slot] = committed_row
         round_profile.phase("commit")
 
-        self._sync_target_hidden_batch(
-            slots,
-            target_taps,
-            position_offsets=past_lens,
-            accepted_counts=accepted_counts,
-            verify_lens=verify_lens,
-        )
+        if graph.context_kv_fused:
+            # The verify CUDA graph already projected/scattered every
+            # request-local candidate row into the draft cache.  Only the
+            # accepted prefix is live for the next draft block; rejected
+            # candidate rows remain harmless scratch/stale cache data.
+            self.stats["target_hidden_injections"] += sum(accepted_counts)
+            for slot, past_len, accepted_count in zip(
+                slots, past_lens, accepted_counts, strict=True
+            ):
+                self._draft_kv_len[slot] = max(
+                    self._draft_kv_len[slot], int(past_len) + int(accepted_count)
+                )
+        else:
+            self._sync_target_hidden_batch(
+                slots,
+                target_taps,
+                position_offsets=past_lens,
+                accepted_counts=accepted_counts,
+                verify_lens=verify_lens,
+            )
         round_profile.phase("target_hidden_sync")
 
         next_anchors = [committed_by_slot[slot][-1] for slot in slots]
         next_lens = [self.backend.pool.slot_state(slot).num_tokens_seen for slot in slots]
+        device_next_anchors, device_next_lens = graph.next_draft_inputs(
+            len(slots), accepted, committed
+        )
         next_drafts_by_slot = self._forward_draft_batch(
             slots,
             next_anchors,
             next_lens,
             params_per_slot=params_per_slot,
+            device_anchors=device_next_anchors,
+            device_kv_lens=device_next_lens,
         )
         round_profile.phase("draft_batch")
         self.stats["rounds"] += len(slots)

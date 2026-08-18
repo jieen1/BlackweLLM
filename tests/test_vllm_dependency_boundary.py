@@ -21,11 +21,13 @@ _APPROVED_DIRECT_IMPORT_FILES: set[str] = set()
 
 _APPROVED_DIRECT_FLASHINFER_IMPORT_FILES: set[str] = {
     "runtime/backends/flashinfer_dspark_attn.py",
+    "runtime/model/flashinfer_nvfp4.py",
     "runtime/model/flashinfer_gdn.py",
     "runtime/model/flashinfer_prefill.py",
 }
-# These are the three intentional optional FlashInfer integration points for
-# Qwen3.8 DSpark and its batched prefill path.  Keeping them in this explicit
+# These are the four intentional optional FlashInfer integration points for
+# Qwen3.8 DSpark, its batched prefill path, and the opt-in NVFP4 activation
+# quantization helper. Keeping them in this explicit
 # ledger prevents an unrelated module from importing FlashInfer implicitly;
 # the runtime still falls back when the optional package is unavailable.
 

@@ -205,15 +205,8 @@ class Qwen36DSparkDraftModel(nn.Module):
     def _project_context_kv(
         self, context_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Project already-normalized context states into every draft layer.
+        """Project normalized context states into every draft layer."""
 
-        The external DSpark checkpoint follows vLLM's DFlash contract: the
-        target taps are concatenated, projected by ``fc``, normalized once by
-        the draft model's final ``hidden_norm``, and then sent through each
-        layer's K/V projection.  ``input_layernorm`` belongs to the masked
-        query forward and must not be applied to these precomputed context
-        states a second time.
-        """
         num_ctx = context_states.shape[0]
         context_states = context_states.unsqueeze(0).expand(self._num_attn_layers, -1, -1)
         all_kv_flat = torch.bmm(context_states, self._kv_weights.transpose(1, 2))
@@ -258,6 +251,7 @@ class Qwen36DSparkDraftModel(nn.Module):
             self._head_dim,
         )
         per_layer = isinstance(context_slot_mapping, (list, tuple))
+
         for layer_idx, attn in enumerate(self._attn_layers):
             mapping = context_slot_mapping[layer_idx] if per_layer else context_slot_mapping
             if mapping is None:

@@ -251,6 +251,9 @@ class _PersistentPrefixEntry:
     # otherwise leave no token to recompute and therefore no logits; the
     # stored row reproduces them without any forward.
     final_hidden: torch.Tensor | None = None
+    # External DSpark owns a separate causal KV family. Older entries and
+    # non-DSpark backends default to the already-valid target/MTP behavior.
+    has_dspark_snapshot: bool = True
 
 
 #: int32's positive range -- the width of the element count in the cutlass DSL
@@ -538,6 +541,9 @@ class Qwen36Backend:
             chunked_prefill=True,
             warm_continue=False,
             kv_reservation=True,
+            prefix_cache_dedup=(
+                self.enable_prefix_cache and self.enable_persistent_prefix_cache
+            ),
         )
 
     def reserve_kv_capacity(self, slot: int, total_tokens: int) -> bool:
@@ -591,20 +597,14 @@ class Qwen36Backend:
         """Attach the external Qwen3.8 DSpark draft before serving starts.
 
         DSpark has its own dense draft KV allocation and does not use the
-        target MTP head.  It also does not yet participate in the Qwen
-        persistent-prefix family, so callers must disable that feature before
-        construction rather than silently restoring only half a prefix.
+        target MTP head. Its draft KV participates in both ordinary per-slot
+        prefix restore/copy and the persistent scratch-prefix family.
         """
 
         if self._dspark is not None:
             return
         if self._mtp is not None:
             raise RuntimeError("DSpark and MTP are mutually exclusive")
-        if self.enable_prefix_cache or self.enable_persistent_prefix_cache:
-            raise RuntimeError(
-                "DSpark currently requires prefix caching to be disabled; "
-                "the draft KV family has no persistent-prefix snapshot yet"
-            )
         if self._decode_graphs:
             raise RuntimeError("enable DSpark before target decode CUDA Graph capture")
         if draft_model.gamma <= 0:
@@ -744,6 +744,8 @@ class Qwen36Backend:
             self._prefix_cache_kv_len[slot] = self.pool.slot_kv_len[slot]
             if self._mtp is not None:
                 self._mtp.preserve_prefix(slot, self.pool.slot_kv_len[slot])
+            if self._dspark is not None:
+                self._dspark.preserve_prefix(slot, self.pool.slot_kv_len[slot])
             if self.pool.dynamic_arena:
                 # Phase 3: publish the committed prefix's full pages into the
                 # arena BEFORE the reset releases the bundles. The hashes are
@@ -796,6 +798,8 @@ class Qwen36Backend:
         self._prefix_cache_kv_len[slot] = 0
         if self._mtp is not None:
             self._mtp.drop_prefix(slot)
+        if self._dspark is not None:
+            self._dspark.drop_prefix(slot)
         if slot in self._checkpoint_tensors:
             self.stats["checkpoints_evicted_by_kv"] += 1
         self._evict_checkpoint(slot)
@@ -1357,7 +1361,7 @@ class Qwen36Backend:
             elif self._dspark is not None:
                 if not is_last:
                     continue
-                if aux_hidden_states is None:
+                if aux_hidden_states is None and cached_hidden is None:
                     raise RuntimeError(
                         "DSpark prefill requires target hidden taps from the final chunk"
                     )
@@ -1583,6 +1587,8 @@ class Qwen36Backend:
                 continue
             if self._mtp is not None and not entry.has_mtp_snapshot:
                 continue
+            if self._dspark is not None and not entry.has_dspark_snapshot:
+                continue
             if best is None or entry.kv_len > best.kv_len:
                 best = entry
         return best
@@ -1708,13 +1714,47 @@ class Qwen36Backend:
                     return
         dynamic_arena = self.pool.dynamic_arena
         pages = (kv_len + self.pool.page_size - 1) // self.pool.page_size
+        has_dspark_snapshot = self._dspark is None
         if dynamic_arena:
-            # Backbone and MTP use the same bundle mapping.  reset_slot later
-            # publishes/decrefs those live pages into CACHED_REF0, so no KV
-            # copy or separate MTP scratch snapshot is needed here.
+            # Backbone and MTP use the same bundle mapping. reset_slot later
+            # publishes/decrefs those live pages into CACHED_REF0, so no target
+            # KV copy or separate MTP scratch snapshot is needed here. For an
+            # exact prompt-boundary store, publish the hashes while the source
+            # is still live as well: the next admission wave can then incref
+            # the same bundles immediately, just like a live radix-cache
+            # node. The source's later KV write COW-detaches the shared tail.
+            # DSpark is independent and still uses the otherwise-unused
+            # scratch-row page offsets for its own persistent copy.
             scratch_page_offsets: tuple[int, ...] = ()
             scratch_physical_pages: list[int] = []
             has_mtp_snapshot = True
+            if self._dspark is not None:
+                if not self._evict_persistent_until(pages):
+                    return
+                scratch_page_offsets = tuple(sorted(self._persistent_free_scratch_pages)[:pages])
+                has_dspark_snapshot = self._dspark.snapshot_prefix_to_scratch(
+                    slot, kv_len, scratch_pages=scratch_page_offsets
+                )
+                if not has_dspark_snapshot:
+                    return
+            if prompt_hidden is not None:
+                try:
+                    keys = _chained_block_keys(tokens, kv_len, self.block_size)
+                    self.pool.publish_committed_blocks(
+                        slot, kv_len, keys, self.block_size
+                    )
+                except RuntimeError as exc:
+                    # Do not register a persistent entry whose KV identity is
+                    # absent from the arena. A later repeat safely recomputes
+                    # this prefix, while the source remains fully usable.
+                    self.stats["prefix_publish_failures"] += 1
+                    logger.warning(
+                        "dynamic KV live-prefix publish failed for slot %d; "
+                        "continuing as a cache miss: %s",
+                        slot,
+                        exc,
+                    )
+                    return
         else:
             if not self._evict_persistent_until(pages):
                 return
@@ -1729,6 +1769,12 @@ class Qwen36Backend:
                     slot, kv_len, scratch_pages=scratch_page_offsets
                 )
                 if not has_mtp_snapshot:
+                    return
+            if self._dspark is not None:
+                has_dspark_snapshot = self._dspark.snapshot_prefix_to_scratch(
+                    slot, kv_len, scratch_pages=scratch_page_offsets
+                )
+                if not has_dspark_snapshot:
                     return
 
         # RecurrentStatePool's hash index is one-to-one by design.  Transfer
@@ -1794,8 +1840,9 @@ class Qwen36Backend:
             has_mtp_snapshot=has_mtp_snapshot,
             scratch_page_offsets=scratch_page_offsets,
             final_hidden=(prompt_hidden.detach().clone() if prompt_hidden is not None else None),
+            has_dspark_snapshot=has_dspark_snapshot,
         )
-        if not dynamic_arena:
+        if not dynamic_arena or self._dspark is not None:
             self._persistent_free_scratch_pages.difference_update(scratch_page_offsets)
         self.stats["prefix_persistent_stores"] += 1
 
@@ -1830,13 +1877,19 @@ class Qwen36Backend:
             mtp_restored = self._mtp.restore_prefix_from_scratch(
                 slot, entry.kv_len, scratch_pages=entry.scratch_page_offsets
             )
+        elif self._dspark is not None:
+            mtp_restored = self._dspark.restore_prefix_from_scratch(
+                slot, entry.kv_len, scratch_pages=entry.scratch_page_offsets
+            )
         else:
             mtp_restored = True
         if not mtp_restored:
             # The normal call site is fresh and this cannot fail after a
             # successful store.  Preserve the hard invariant anyway: undoing
             # a remap is more error-prone than a safe refusal before it.
-            raise RuntimeError("persistent MTP prefix disappeared after a validated cache hit")
+            raise RuntimeError(
+                "persistent speculative prefix disappeared after a validated cache hit"
+            )
         self.checkpoint_pool.touch(entry.checkpoint_key)
         self._persistent_prefixes.move_to_end(entry.hash_value)
         self.stats["prefix_persistent_restores"] += 1
@@ -1965,6 +2018,12 @@ class Qwen36Backend:
                     # causal context.  Continue searching: another source
                     # may carry an intact copy of the same prefix.
                     continue
+            if self._dspark is not None and hit.effective > 0:
+                if not self._dspark.can_restore_prefix(source_slot, hit.effective):
+                    # DSpark owns a second causal KV family. A target-only hit
+                    # is not a speculative hit, so continue searching for a
+                    # source whose draft pages survived the slot reset.
+                    continue
             key = (hit.effective, hit.kv_hit, source_slot == preferred_slot)
             best_key = (best.effective, best.kv_hit, best_slot == preferred_slot)
             if key > best_key:
@@ -2057,6 +2116,11 @@ class Qwen36Backend:
             # prefix hit into tail-only MTP context, so this is deliberately
             # a safe compute miss instead.
             return 0
+        if self._dspark is not None and not self._dspark.can_restore_prefix(source_slot, length):
+            # The external DSpark draft has its own causal KV pages. Reusing
+            # target/GDN state without them would silently verify against the
+            # wrong context, so degrade to a full recompute.
+            return 0
         if source_slot != slot:
             # The destination's previous retained prefix is about to be
             # overwritten.  Its checkpoint must disappear in lockstep;
@@ -2082,6 +2146,11 @@ class Qwen36Backend:
                 self._mtp.restore_prefix(slot, length)
             else:
                 self._mtp.copy_prefix(source_slot, slot, length)
+        if self._dspark is not None:
+            if source_slot == slot:
+                self._dspark.restore_prefix(slot, length)
+            else:
+                self._dspark.copy_prefix(source_slot, slot, length)
         self.checkpoint_pool.touch((source_slot, length))
         return length
 
@@ -2202,6 +2271,8 @@ class Qwen36Backend:
             entry = self._persistent_prefixes.pop(hash_value, None)
             if entry is not None and entry.checkpoint_key == key:
                 self._persistent_free_scratch_pages.update(entry.scratch_page_offsets)
+                if self._dspark is not None:
+                    self._dspark.release_prefix_scratch(entry.scratch_page_offsets)
                 self.stats["prefix_persistent_evictions"] += 1
             return
         slot = key[0] if isinstance(key, tuple) else key
@@ -2211,6 +2282,8 @@ class Qwen36Backend:
         self._prefix_cache_kv_len[slot] = 0
         if self._mtp is not None:
             self._mtp.drop_prefix(slot)
+        if self._dspark is not None:
+            self._dspark.drop_prefix(slot)
         self.stats["checkpoints_evicted_by_budget"] += 1
 
     # -- protocol: CUDA Graph ----------------------------------------------
