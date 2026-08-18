@@ -18,7 +18,31 @@ model_path=${QSR_BENCH_MODEL_PATH:-/home/bot/.cache/huggingface/hub/models--unsl
 tokenizer_path=${QSR_BENCH_TOKENIZER_PATH:-/home/bot/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/ccdaab7e68af2409599b8949a8f2685703c9bae5}
 run_tag=${QSR_BENCH_TAG:-$(date -u +%Y%m%d_%H%M%S)}
 result_dir=${QSR_BENCH_RESULT_DIR:-${repo_root}/benchmarks/fixtures}
-server_label="Qwen3.8-27B-NVFP4; qwen36 backend; MTP K=3; CUDA Graph; FP8 KV; fused QKV W8A8; block_size=32; dynamic 19629342720-byte/4160-bundle pool; capacity=4; num_slots=4; logical max=256K/slot"
+speculative=${QSR_BENCH_SPECULATIVE:-mtp}
+dspark_draft_model=${QSR_BENCH_DSPARK_MODEL_PATH:-/home/bot/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-DSpark/snapshots/85ef153be924f17ce4bf62726954eeaa4a73e854}
+
+case "${speculative}" in
+    mtp)
+        server_label="Qwen3.8-27B-NVFP4; qwen36 backend; MTP K=3; CUDA Graph; FP8 KV; fused QKV W8A8; block_size=32; dynamic 19629342720-byte/4160-bundle pool; capacity=4; num_slots=4; logical max=256K/slot"
+        server_spec_args=(--mtp --mtp-k 3)
+        ;;
+    dspark)
+        server_label="Qwen3.8-27B-NVFP4; qwen36 backend; DSpark K=7; CUDA Graph; FP8 KV; fused QKV W8A8; block_size=32; dynamic 19629342720-byte/4160-bundle pool; capacity=4; num_slots=4; logical max=256K/slot; prefix cache=off"
+        server_spec_args=(
+            --dspark
+            --dspark-k "${QSR_BENCH_DSPARK_K:-7}"
+            --dspark-draft-model "${dspark_draft_model}"
+        )
+        ;;
+    plain)
+        server_label="Qwen3.8-27B-NVFP4; qwen36 backend; plain decode; CUDA Graph; FP8 KV; fused QKV W8A8; block_size=32; dynamic 19629342720-byte/4160-bundle pool; capacity=4; num_slots=4; logical max=256K/slot; prefix cache=off"
+        server_spec_args=()
+        ;;
+    *)
+        echo "QSR_BENCH_SPECULATIVE must be mtp, dspark, or plain (got ${speculative@Q})" >&2
+        exit 2
+        ;;
+esac
 
 mkdir -p "${result_dir}"
 
@@ -58,23 +82,38 @@ case ${1:-} in
         export QSR_SERVER_KV_CACHE_DTYPE=fp8_e4m3
         export QSR_SERVER_ENABLE_CUDAGRAPH=1
         export QSR_SERVER_ENABLE_PREFIX_CACHE=${QSR_BENCH_PREFIX_CACHE:-1}
+        export QSR_SERVER_ENABLE_MTP=0
+        export QSR_SERVER_ENABLE_DSPARK=0
+        export QSR_QWEN36_DSPARK_CUDA_GRAPH=1
+        export QSR_QWEN36_DSPARK_REQUIRE_CG=0
         export QSR_SERVER_REQUEST_TIMEOUT_S=900
         export QSR_THINKING_CAPABLE=1
         export QSR_TRACE=1
         export QSR_DEBUG_REQUESTS=0
-        unset QSR_PROFILE_ROUNDS
+        if [[ -n "${QSR_BENCH_PROFILE_ROUNDS:-}" ]]; then
+            export QSR_PROFILE_ROUNDS="${QSR_BENCH_PROFILE_ROUNDS}"
+        else
+            unset QSR_PROFILE_ROUNDS
+        fi
+        if [[ "${speculative}" == "dspark" ]]; then
+            export QSR_QWEN36_DSPARK_REQUIRE_CG=1
+            # ServerEngine intentionally disables prefix caching for DSpark;
+            # setting this explicitly also makes the plain baseline match.
+            export QSR_SERVER_ENABLE_PREFIX_CACHE=0
+        elif [[ "${speculative}" == "plain" ]]; then
+            export QSR_SERVER_ENABLE_PREFIX_CACHE=0
+        fi
         cd "${repo_root}"
         exec "${python_bin}" -m server.app \
             --host 127.0.0.1 \
             --port 8300 \
             --capacity 4 \
             --num-slots 4 \
-            --blocks-per-slot 16384 \
+            --blocks-per-slot 8192 \
             --qwen-kv-mode elastic \
             --qwen-kv-pool-bytes 19629342720 \
             --qwen-kv-watermark-bundles 8 \
-            --mtp \
-            --mtp-k 3 \
+            "${server_spec_args[@]}" \
             --tool-call-parser qwen3_coder
         ;;
     c1)
@@ -84,7 +123,7 @@ case ${1:-} in
         run_cell 4 2
         ;;
     *)
-        echo "usage: $0 {server|c1|c4}" >&2
+        echo "usage: $0 {server|c1|c4} (QSR_BENCH_SPECULATIVE=mtp|dspark|plain)" >&2
         exit 2
         ;;
 esac

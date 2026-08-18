@@ -376,6 +376,9 @@ class ServerEngine:
         enable_mtp: bool = False,
         mtp_num_speculative_tokens: int = 4,
         mtp_resync: bool | None = None,
+        enable_dspark: bool = False,
+        dspark_draft_model: str = "RadixArk/Qwen3.8-27B-DSpark",
+        dspark_num_speculative_tokens: int = 7,
         checkpoint_budget_multiple: int | None = None,
         qwen_kv_mode: str = "legacy",
         qwen_kv_pool_bytes: int = 0,
@@ -414,6 +417,20 @@ class ServerEngine:
         self.enable_mtp = enable_mtp
         self.mtp_num_speculative_tokens = mtp_num_speculative_tokens
         self.mtp_resync = mtp_resync
+        if enable_dspark and backend != "qwen36":
+            raise ValueError(
+                f"enable_dspark requires backend='qwen36' (got {backend!r}); "
+                "DSpark is the Qwen3.8 external draft path"
+            )
+        if enable_dspark and (enable_dflash or enable_mtp):
+            raise ValueError("DSpark is mutually exclusive with DFlash and MTP")
+        if dspark_num_speculative_tokens <= 0:
+            raise ValueError("dspark_num_speculative_tokens must be positive")
+        if enable_dspark and enable_session_affinity:
+            raise ValueError("DSpark currently does not support session affinity")
+        self.enable_dspark = enable_dspark
+        self.dspark_draft_model = dspark_draft_model
+        self.dspark_num_speculative_tokens = dspark_num_speculative_tokens
         self.checkpoint_budget_multiple = checkpoint_budget_multiple
         self.qwen_kv_extensible = qwen_kv_extensible
         self.qwen_kv_commit_buffer_gb = qwen_kv_commit_buffer_gb
@@ -481,6 +498,12 @@ class ServerEngine:
             # capacity_ok() below must reserve room for up to K drafted-but-
             # not-yet-committed tokens per slot.
             self.K = mtp_num_speculative_tokens
+        elif enable_dspark:
+            # The official Qwen3.8 DSpark draft uses gamma=7. The loader checks
+            # the draft config again before allocation; this early value keeps
+            # admission from accepting a request whose speculative tail cannot
+            # fit before the draft checkpoint is loaded.
+            self.K = dspark_num_speculative_tokens
 
         # CUDA Graph slot budget:
         # - Laguna decode CG (M=1) captures against ONE dedicated slot (the
@@ -550,6 +573,12 @@ class ServerEngine:
         self.request_timeout_s = request_timeout_s
         self._kv_cache_dtype = kv_cache_dtype
         self._enable_cudagraph = enable_cudagraph
+        if enable_dspark and enable_prefix_cache:
+            logger.warning(
+                "DSpark currently has no prefix-cache snapshot for its draft KV; "
+                "disabling prefix caching for this engine"
+            )
+            enable_prefix_cache = False
         self.enable_prefix_cache = enable_prefix_cache
         self.enable_session_affinity = enable_session_affinity
         self.session_ttl_s = session_ttl_s
@@ -686,6 +715,16 @@ class ServerEngine:
             "mtp_sampled_total_accepted": 0,
             "mtp_sampled_total_draft": 0,
             "mtp_sampled_rounds": 0,
+            # DSpark uses the same scheduler branch as MTP, but its K and
+            # acceptance semantics belong to the external draft model. Keep
+            # a DSpark-native surface so benchmark artifacts state exactly
+            # which speculative engine produced them.
+            "dspark_acceptance_histogram": (
+                [0] * (dspark_num_speculative_tokens + 2) if enable_dspark else []
+            ),
+            "dspark_rounds": 0,
+            "dspark_accepted_tokens": 0,
+            "dspark_committed_tokens": 0,
         }
 
         self.runner = None
@@ -784,10 +823,13 @@ class ServerEngine:
         "B2: Qwen3.6 is servable"); this docstring used to say otherwise --
         that was already stale before this B3 change touched the file.
 
-        No DFlash for this backend (DFlash is Laguna's own draft model;
-        Qwen3.6's speculative story is MTP, wired below via
-        ``self.enable_mtp``); prefix caching is passed through rather than
-        forced, same as Laguna's.
+        No DFlash for this backend (DFlash is Laguna's own draft model).
+        Qwen3.6's native speculative story is MTP; Qwen3.8 additionally has
+        the separate DSpark draft wired below via ``self.enable_dspark``.
+        DSpark captures fixed-width target-verify and greedy-draft CUDA Graphs;
+        its separate draft KV remains a legacy physical allocation even when
+        the target uses the dynamic arena. Prefix caching stays disabled until
+        the draft-KV family has a snapshot/restore implementation.
 
         ``enable_cudagraph`` captures here, before ``start()``'s admission
         loop can hand out a slot, for the same reason Laguna does -- plus
@@ -806,7 +848,7 @@ class ServerEngine:
 
         from runtime.backends.qwen36 import Qwen36Backend
         from runtime.laguna_config import _resolve_laguna_model_dir
-        from runtime.model_loading import load_qwen36_model
+        from runtime.model_loading import load_qwen36_dspark_draft_model, load_qwen36_model
 
         if self.enable_dflash:
             # capabilities.speculative_decode is True for this backend (B3),
@@ -823,8 +865,9 @@ class ServerEngine:
             )
 
         max_model_len = self.blocks_per_slot * self.block_size
+        target_model_path = _resolve_laguna_model_dir(self.MODEL)
         model = load_qwen36_model(
-            _resolve_laguna_model_dir(self.MODEL),
+            target_model_path,
             device="cuda",
             dtype=torch.bfloat16,
             max_seq_len=max_model_len,
@@ -881,7 +924,22 @@ class ServerEngine:
         # which is true and is about chunking WITHOUT interleaving. It does
         # not mean chunk size is irrelevant once interleaving exists -- here
         # it is the parameter that decides whether interleaving pays at all.
-        self._prefill_chunk_size = 2048
+        configured_prefill_chunk = os.environ.get("QSR_PREFILL_CHUNK")
+        if configured_prefill_chunk is None:
+            self._prefill_chunk_size = 2048
+        else:
+            try:
+                self._prefill_chunk_size = int(configured_prefill_chunk)
+            except ValueError as exc:
+                raise ValueError(
+                    "QSR_PREFILL_CHUNK must be a positive integer, "
+                    f"got {configured_prefill_chunk!r}"
+                ) from exc
+            if self._prefill_chunk_size <= 0:
+                raise ValueError(
+                    "QSR_PREFILL_CHUNK must be a positive integer, "
+                    f"got {self._prefill_chunk_size}"
+                )
         self.runner = Qwen36Backend(
             model,
             num_slots=self.num_slots,
@@ -890,6 +948,7 @@ class ServerEngine:
             device="cuda",
             dtype=torch.bfloat16,
             enable_prefix_cache=self.enable_prefix_cache,
+            enable_persistent_prefix_cache=(False if self.enable_dspark else None),
             checkpoint_budget_multiple=self.checkpoint_budget_multiple,
             dynamic_arena=dynamic_arena,
             pool_bundles=pool_bundles,
@@ -904,9 +963,14 @@ class ServerEngine:
             # graph capture (one page per slot). One page per slot beyond
             # that is already guaranteed by enable_mtp's ensure_kv_blocks(1)
             # and the capture path; ensure the worst case up front.
-            self.runner.ensure_kv_blocks(
-                1 + self.num_slots * (self.mtp_num_speculative_tokens + 2)
+            speculative_k = (
+                self.mtp_num_speculative_tokens
+                if self.enable_mtp
+                else self.dspark_num_speculative_tokens
+                if self.enable_dspark
+                else 0
             )
+            self.runner.ensure_kv_blocks(1 + self.num_slots * (speculative_k + 2))
         self._warmup_qwen36_full_forward()
         # MTP extends the shared GDN state allocation so its column zero is
         # the exact ordinary decode/prefill row.  This must precede decode
@@ -922,6 +986,27 @@ class ServerEngine:
                 self.mtp_num_speculative_tokens,
                 self.runner._mtp.enable_resync,  # noqa: SLF001 -- log-only introspection
                 self.runner._mtp.cg_status,  # noqa: SLF001 -- log-only introspection
+            )
+        if self.enable_dspark:
+            draft_model_path = _resolve_laguna_model_dir(self.dspark_draft_model)
+            draft_model = load_qwen36_dspark_draft_model(
+                model,
+                target_model_path=str(target_model_path),
+                draft_model_path=str(draft_model_path),
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            if draft_model.gamma != self.dspark_num_speculative_tokens:
+                raise ValueError(
+                    "DSpark draft gamma does not match the server reservation: "
+                    f"draft={draft_model.gamma}, configured={self.dspark_num_speculative_tokens}"
+                )
+            self.runner.enable_dspark(draft_model)
+            logger.info(
+                "Qwen3.8 DSpark speculative decode wired: draft=%s K=%d cg_status=%s",
+                self.dspark_draft_model,
+                draft_model.gamma,
+                self.runner._dspark.cg_status,  # noqa: SLF001 -- load-time observability
             )
         if self._enable_cudagraph:
             graph_batch_size = self.runner.capture_decode_cuda_graph()
@@ -1022,6 +1107,11 @@ class ServerEngine:
                 "enable_mtp is not supported by the deepseek_v4 backend "
                 "(MTP is Qwen3.6's mechanism; DSV4's is DSpark, not served). "
                 "Start the server with QSR_SERVER_ENABLE_MTP=0."
+            )
+        if self.enable_dspark:
+            raise ValueError(
+                "enable_dspark is not supported by the deepseek_v4 backend; "
+                "DSpark is not wired for DSV4 in this runtime"
             )
 
         max_model_len = self.blocks_per_slot * self.block_size
@@ -1777,6 +1867,8 @@ class ServerEngine:
 
         # -- A5/B4: advance pending incremental prefill (one chunk per round) --
         if self._pending_prefill is not None:
+            if _ADMISSION_PROFILE:
+                _prefill_step_t0 = time.perf_counter()
             try:
                 done = self.runner.prefill_chunked_step(self._pending_prefill)
             except Exception as exc:
@@ -1793,6 +1885,19 @@ class ServerEngine:
                 self._pending_prefill = None
                 self._pending_prefill_reqs = []
             else:
+                if _ADMISSION_PROFILE:
+                    _adm_logger.info(
+                        json.dumps(
+                            {
+                                "label": "prefill_step",
+                                "ms": round(
+                                    (time.perf_counter() - _prefill_step_t0) * 1000.0,
+                                    3,
+                                ),
+                                "done": done,
+                            }
+                        )
+                    )
                 if done:
                     prefill_result = self._pending_prefill.result
                     admit_now = self._pending_prefill_reqs
@@ -2135,6 +2240,11 @@ class ServerEngine:
                 na = decision.get("num_accepted", 0)
                 if req.logprobs and "logprobs" in decision:
                     st.setdefault("logprobs_acc", []).extend(decision["logprobs"])
+                if self.enable_dspark:
+                    self.stats["dspark_rounds"] += 1
+                    self.stats["dspark_accepted_tokens"] += na
+                    dspark_hist = self.stats["dspark_acceptance_histogram"]
+                    dspark_hist[min(na, len(dspark_hist) - 1)] += 1
                 if st.get("sampled"):
                     # E2-b: recorded separately from mtp_acceptance_histogram
                     # (greedy-only) -- see the stats dict's own comment for why.
@@ -2176,6 +2286,8 @@ class ServerEngine:
                             break
                 if kept:
                     st["last_progress_round"] = self.stats["rounds"]
+                    if self.enable_dspark:
+                        self.stats["dspark_committed_tokens"] += len(kept)
                 if matched_stop is not None:
                     self._drop_stop_pending_from_committed(st)
                 elif not stop_sequences and kept and req.stream_channel is not None:

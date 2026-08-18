@@ -91,6 +91,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from runtime.kernels.dspark_accept import greedy_accept_device, greedy_accept_ragged
 from runtime.model.qwen36_model import (
     _PAGED_ATTENTION_PAGE_SIZE,
     Qwen36DecodeBatch,
@@ -232,10 +233,7 @@ def build_pooled_mtp_caches(
         from runtime.model.vmm_extensible import ExtensibleTensor
 
         bytes_per_page = (
-            page_size
-            * mtp_attn.num_kv_heads
-            * mtp_attn.head_dim
-            * mtp_attn.kv_cache_dtype.itemsize
+            page_size * mtp_attn.num_kv_heads * mtp_attn.head_dim * mtp_attn.kv_cache_dtype.itemsize
         )
         device_index = device.index if device.index is not None else 0
         k_buf = ExtensibleTensor(
@@ -429,7 +427,12 @@ class Qwen36MTPVerifyCudaGraph:
     during warmup.
     """
 
-    def __init__(self, engine: Qwen36MTPEngine) -> None:
+    def __init__(
+        self,
+        engine: Qwen36MTPEngine,
+        *,
+        verify_num_speculative_tokens: int | None = None,
+    ) -> None:
         if engine._spec_rows is None:  # pragma: no cover - guarded by caller
             raise RuntimeError("verify graph requires spec-row GDN state")
         self.engine = engine
@@ -438,13 +441,29 @@ class Qwen36MTPVerifyCudaGraph:
         self.model = engine.model
         self.device = engine.device
         self.dtype = engine.dtype
+        self.k = int(
+            engine.k if verify_num_speculative_tokens is None else verify_num_speculative_tokens
+        )
+        if not 0 <= self.k <= engine.k:
+            raise ValueError(
+                f"verify_num_speculative_tokens must be in [0,{engine.k}], got {self.k}"
+            )
         # qo_len, not k: this graph verifies the anchor token FOLLOWED by
         # the K drafts in one pass (the historical qo_len=k+1 shape,
         # oracle direct_model_runner.py::verify_batch_spec). Every
         # query-length quantity below is k+1, not k.
-        self.qo_len = engine.k + 1
+        self.qo_len = self.k + 1
         self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._hidden: dict[int, torch.Tensor] = {}
+        # DSpark reuses this graph family for target verification but needs
+        # the selected post-layer taps in addition to final hidden/logits.
+        # MTP leaves this disabled and keeps the original two-tensor replay
+        # contract byte-for-byte.
+        self._capture_aux = bool(getattr(engine, "capture_aux_hidden_states", False))
+        # DSpark can fold greedy acceptance into the verify graph.  MTP keeps
+        # the historical host epilogue unless its engine explicitly opts in.
+        self._capture_accept = bool(getattr(engine, "capture_device_accept", False))
+        self._aux_hidden: dict[int, list[torch.Tensor]] = {}
         #: One shared graph-private memory pool for every batch bucket in
         #: this family (plan §4.6 P0-M3): the B=1..num_slots verify graphs
         #: are mutually exclusive (exactly one replays per round, and its
@@ -462,6 +481,9 @@ class Qwen36MTPVerifyCudaGraph:
         #: path performs zero logits allocations (measured host-side
         #: replay fill ~10 ms/round under 94/96 GiB resident memory).
         self._logits: dict[int, torch.Tensor] = {}
+        self._accepted: dict[int, torch.Tensor] = {}
+        self._committed: dict[int, torch.Tensor] = {}
+        self._predicted: dict[int, torch.Tensor] = {}
         self._batches: dict[int, Qwen36VerifyBatch] = {}
         self._inputs: dict[
             int,
@@ -485,6 +507,14 @@ class Qwen36MTPVerifyCudaGraph:
         ] = {}
         for batch in range(1, self.pool.num_slots + 1):
             self._batches[batch] = self._new_batch(batch)
+            if self._capture_accept:
+                self._accepted[batch] = torch.empty(batch, dtype=torch.int32, device=self.device)
+                self._committed[batch] = torch.empty(
+                    batch, self.qo_len, dtype=torch.long, device=self.device
+                )
+                self._predicted[batch] = torch.empty(
+                    batch, self.qo_len, dtype=torch.long, device=self.device
+                )
         # The target pool's page table is a pure function of a physical slot
         # id.  It never grows or rebinds after construction, unlike a
         # prefix-cache block table.  Avoid repeating the same D2D copies for
@@ -494,6 +524,29 @@ class Qwen36MTPVerifyCudaGraph:
             batch: None for batch in self._batches
         }
         self._captured = False
+
+    def _forward_verify(
+        self, batch: Qwen36VerifyBatch
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        if self._capture_aux:
+            hidden, aux_hidden = self.model.verify_batch(batch, capture_aux_hidden_states=True)
+            return hidden, aux_hidden
+        return self.model.verify_batch(batch), None
+
+    def _capture_accept_epilogue(self, batch: Qwen36VerifyBatch, logits: torch.Tensor) -> None:
+        """Append the fixed-width greedy accept epilogue to a graph capture."""
+
+        if not self._capture_accept:
+            return
+        batch_size = int(batch.input_ids.shape[0])
+        greedy_accept_device(
+            batch.input_ids,
+            logits,
+            self.qo_len - 1,
+            predicted=self._predicted[batch_size],
+            accepted_out=self._accepted[batch_size],
+            committed_out=self._committed[batch_size],
+        )
 
     def _new_batch(self, batch: int) -> Qwen36VerifyBatch:
         input_ids = torch.zeros(batch, self.qo_len, dtype=torch.long, device=self.device)
@@ -664,19 +717,25 @@ class Qwen36MTPVerifyCudaGraph:
                 with torch.cuda.stream(side):
                     for _ in range(3):
                         self._fill(slots, [[0] * self.qo_len for _ in slots], [0] * batch_size)
-                        self.model.verify_batch(batch)
+                        hidden, _aux = self._forward_verify(batch)
+                        logits = self.model.compute_logits(hidden)
+                        self._capture_accept_epilogue(batch, logits)
                 torch.cuda.current_stream().wait_stream(side)
 
                 self._fill(slots, [[0] * self.qo_len for _ in slots], [0] * batch_size)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, pool=self._graph_pool):
-                    hidden = self.model.verify_batch(batch)
+                    hidden, aux_hidden = self._forward_verify(batch)
+                    assert aux_hidden is None or self._capture_aux
                     logits = self.model.compute_logits(hidden)
+                    self._capture_accept_epilogue(batch, logits)
                 if self._graph_pool is None:
                     self._graph_pool = graph.pool()
                 self._graphs[batch_size] = graph
                 self._hidden[batch_size] = hidden
                 self._logits[batch_size] = logits
+                if aux_hidden is not None:
+                    self._aux_hidden[batch_size] = aux_hidden
         finally:
             for slot in range(self.pool.num_slots + 1):
                 self.engine._spec_rows.reset_slot(slot)  # noqa: SLF001
@@ -684,13 +743,465 @@ class Qwen36MTPVerifyCudaGraph:
 
     def replay(
         self, slots: list[int], tokens: list[list[int]], past_lens: list[int]
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self._captured:
             raise RuntimeError("verify CUDA Graph replay requested before capture")
         batch = len(slots)
         self._fill(slots, tokens, past_lens)
         self._graphs[batch].replay()
         return self._hidden[batch], self._logits[batch]
+
+    def replay_with_aux(
+        self,
+        slots: list[int],
+        tokens: list[list[int]] | torch.Tensor,
+        past_lens: list[int],
+        *,
+        return_accept: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
+        | tuple[
+            torch.Tensor,
+            torch.Tensor,
+            list[torch.Tensor],
+            torch.Tensor,
+            torch.Tensor,
+        ]
+    ):
+        """Replay DSpark's verify graph and return its target hidden taps."""
+
+        if not self._captured:
+            raise RuntimeError("verify CUDA Graph replay requested before capture")
+        if not self._capture_aux:
+            raise RuntimeError("verify graph was captured without auxiliary hidden states")
+        batch = len(slots)
+        self._fill(slots, tokens, past_lens)
+        self._graphs[batch].replay()
+        result = (self._hidden[batch], self._logits[batch], self._aux_hidden[batch])
+        if return_accept:
+            if not self._capture_accept:
+                raise RuntimeError("verify graph has no captured DSpark accept epilogue")
+            return result + (self._accepted[batch], self._committed[batch])
+        return result
+
+
+class Qwen36MTPRaggedVerifyCudaGraph:
+    """One SGLang-shaped ragged target verify graph family for DSpark.
+
+    Each batch bucket has a fixed allocation of ``B * (K + 1)`` rows, but
+    replay metadata carries request-local query lengths and one compact
+    ``cu_seqlens_q``.  Full attention therefore launches over the sum of the
+    active request lengths, while the GDN recurrence uses a temporary padded
+    view and writes invalid columns only into the scratch candidate rows.
+    There is deliberately no width-specialized graph or request grouping in
+    this class.
+    """
+
+    def __init__(self, engine: Qwen36MTPEngine) -> None:
+        if getattr(engine, "_spec_rows", None) is None:
+            raise RuntimeError("ragged DSpark verify requires permanent GDN rows")
+        self.engine = engine
+        self.pool = engine.backend.pool
+        self.model = engine.model
+        self.device = engine.device
+        self.dtype = engine.dtype
+        self.max_gamma = int(engine.k)
+        self.max_verify_tokens = self.max_gamma + 1
+        self._capture_aux = bool(getattr(engine, "capture_aux_hidden_states", True))
+        self._capture_accept = bool(getattr(engine, "capture_device_accept", False))
+        self._graph_pool: object | None = None
+        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._hidden: dict[int, torch.Tensor] = {}
+        self._logits: dict[int, torch.Tensor] = {}
+        self._aux_hidden: dict[int, list[torch.Tensor]] = {}
+        self._accepted: dict[int, torch.Tensor] = {}
+        self._committed: dict[int, torch.Tensor] = {}
+        self._predicted: dict[int, torch.Tensor] = {}
+        self._batches: dict[int, Qwen36VerifyBatch] = {}
+        self._inputs: dict[int, dict[str, torch.Tensor]] = {}
+        self._host_inputs: dict[int, dict[str, torch.Tensor]] = {}
+        self._host_views: dict[int, dict[str, object]] = {}
+        self._page_table_slots: dict[int, tuple[object, ...] | None] = {}
+        for batch in range(1, self.pool.num_slots + 1):
+            self._new_batch(batch)
+        self._captured = False
+
+    def _new_batch(self, batch_size: int) -> None:
+        max_q = self.max_verify_tokens
+        capacity = batch_size * max_q
+        input_ids = torch.zeros(capacity, dtype=torch.long, device=self.device)
+        positions = torch.zeros(capacity, dtype=torch.long, device=self.device)
+        write_index = torch.zeros(capacity, dtype=torch.long, device=self.device)
+        page_table = torch.zeros(
+            batch_size, self.pool.pages_per_slot, dtype=torch.int32, device=self.device
+        )
+        cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=self.device)
+        source_index = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+        destination_index = torch.zeros(
+            batch_size, max_q, dtype=torch.long, device=self.device
+        )
+        cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int32, device=self.device)
+        verify_lens = torch.full(
+            (batch_size,), max_q, dtype=torch.int32, device=self.device
+        )
+        padded_to_compact = torch.zeros(capacity, dtype=torch.long, device=self.device)
+        compact_to_padded = torch.zeros(capacity, dtype=torch.long, device=self.device)
+
+        attn_drivers: list[Qwen36VerifyGraphAttention | None] = [None] * self.pool.num_layers
+        attn_outputs: list[torch.Tensor | None] = [None] * self.pool.num_layers
+        for layer in self.pool.model.model.layers:
+            if layer.layer_type != "full_attention":
+                continue
+            k_pool = self.pool.k_pools[layer.layer_idx]
+            assert k_pool is not None
+            attn = layer.self_attn
+            attn_drivers[layer.layer_idx] = Qwen36VerifyGraphAttention(
+                batch=batch_size,
+                num_q_heads=attn.num_heads,
+                num_kv_heads=attn.num_kv_heads,
+                head_dim=attn.head_dim,
+                page_size=self.pool.page_size,
+                pages_per_slot=self.pool.pages_per_slot,
+                num_cache_pages=k_pool.shape[0],
+                max_seq_len=self.pool.max_seq_len,
+                verify_tokens=max_q,
+                dtype=self.dtype,
+                kv_dtype=k_pool.dtype,
+                device=self.device,
+            )
+            attn_outputs[layer.layer_idx] = torch.zeros(
+                capacity,
+                attn.num_heads,
+                attn.head_dim,
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+        descriptor = Qwen36VerifyBatch(
+            input_ids=input_ids,
+            positions=positions,
+            write_index=write_index,
+            k_pools=self.pool.k_pools,
+            v_pools=self.pool.v_pools,
+            attn_drivers=attn_drivers,
+            attn_outputs=attn_outputs,
+            gdn_source_index=source_index,
+            gdn_destination_index=destination_index,
+            gdn_conv_pools=self.engine._spec_rows.conv_pools,  # noqa: SLF001
+            gdn_recurrent_pools=self.engine._spec_rows.recurrent_pools,  # noqa: SLF001
+            gdn_state_rows=None,
+            ragged=True,
+            max_verify_tokens=max_q,
+            cu_seqlens_q=cu_seqlens_q,
+            gdn_padded_to_compact=padded_to_compact,
+            gdn_compact_to_padded=compact_to_padded,
+        )
+        self._batches[batch_size] = descriptor
+        self._inputs[batch_size] = {
+            "input_ids": input_ids,
+            "positions": positions,
+            "write_index": write_index,
+            "page_table": page_table,
+            "cache_seqlens": cache_seqlens,
+            "source_index": source_index,
+            "destination_index": destination_index,
+            "cu_seqlens_q": cu_seqlens_q,
+            "verify_lens": verify_lens,
+            "padded_to_compact": padded_to_compact,
+            "compact_to_padded": compact_to_padded,
+        }
+        host = {
+            "tokens": torch.zeros(capacity, dtype=torch.long, device="cpu", pin_memory=True),
+            "positions": torch.zeros(capacity, dtype=torch.long, device="cpu", pin_memory=True),
+            "write_index": torch.zeros(capacity, dtype=torch.long, device="cpu", pin_memory=True),
+            "cache_seqlens": torch.zeros(
+                batch_size, dtype=torch.int32, device="cpu", pin_memory=True
+            ),
+            "source_index": torch.zeros(
+                batch_size, dtype=torch.long, device="cpu", pin_memory=True
+            ),
+            "destination_index": torch.zeros(
+                batch_size, max_q, dtype=torch.long, device="cpu", pin_memory=True
+            ),
+            "cu_seqlens_q": torch.zeros(
+                batch_size + 1, dtype=torch.int32, device="cpu", pin_memory=True
+            ),
+            "verify_lens": torch.full(
+                (batch_size,), max_q, dtype=torch.int32, device="cpu", pin_memory=True
+            ),
+            "padded_to_compact": torch.zeros(
+                capacity, dtype=torch.long, device="cpu", pin_memory=True
+            ),
+            "compact_to_padded": torch.zeros(
+                capacity, dtype=torch.long, device="cpu", pin_memory=True
+            ),
+        }
+        self._host_inputs[batch_size] = host
+        self._host_views[batch_size] = {name: tensor.numpy() for name, tensor in host.items()}
+        self._page_table_slots[batch_size] = None
+        if self._capture_accept:
+            self._accepted[batch_size] = torch.empty(
+                batch_size, dtype=torch.int32, device=self.device
+            )
+            self._committed[batch_size] = torch.empty(
+                batch_size, self.max_verify_tokens, dtype=torch.long, device=self.device
+            )
+            self._predicted[batch_size] = torch.empty(
+                capacity, dtype=torch.long, device=self.device
+            )
+
+    @staticmethod
+    def _draft_row(draft: list[int] | torch.Tensor, expected: int) -> torch.Tensor | list[int]:
+        if isinstance(draft, torch.Tensor):
+            if draft.ndim == 2 and tuple(draft.shape) == (1, expected):
+                draft = draft[0]
+            if draft.ndim != 1 or draft.numel() != expected:
+                raise ValueError(
+                    f"DSpark ragged device draft must have shape [{expected}], "
+                    f"got {tuple(draft.shape)}"
+                )
+            return draft
+        values = [int(token) for token in draft]
+        if len(values) != expected:
+            raise ValueError(
+                f"DSpark ragged draft has {len(values)} tokens; expected {expected}"
+            )
+        return values
+
+    def _fill(
+        self,
+        slots: list[int],
+        anchors: list[int],
+        drafts: list[list[int] | torch.Tensor],
+        past_lens: list[int],
+        verify_lens: list[int],
+    ) -> None:
+        batch_size = len(slots)
+        if batch_size not in self._batches:
+            raise ValueError(f"unsupported ragged verify batch size: {batch_size}")
+        if not (
+            len(anchors)
+            == len(drafts)
+            == len(past_lens)
+            == len(verify_lens)
+            == batch_size
+        ):
+            raise ValueError("ragged verify replay arguments must have equal lengths")
+        if any(not 1 <= int(length) <= self.max_verify_tokens for length in verify_lens):
+            raise ValueError(
+                f"ragged verify lengths must be in [1,{self.max_verify_tokens}], "
+                f"got {verify_lens}"
+            )
+
+        descriptor = self._batches[batch_size]
+        inputs = self._inputs[batch_size]
+        host = self._host_inputs[batch_size]
+        views = self._host_views[batch_size]
+        max_q = self.max_verify_tokens
+        scratch = self.pool.scratch_row
+        if scratch is None:
+            raise RuntimeError("ragged DSpark verify needs the pool scratch row")
+        capacity = batch_size * max_q
+        self.pool.prepare_kv_writes(scratch, 0, capacity)
+
+        views["tokens"][:] = 0
+        views["positions"][:] = 0
+        views["write_index"][:] = 0
+        views["padded_to_compact"][:] = 0
+        views["compact_to_padded"][:] = 0
+        views["source_index"][:] = 0
+        views["destination_index"][:] = 0
+        views["cache_seqlens"][:] = 0
+        views["verify_lens"][:] = verify_lens
+        views["cu_seqlens_q"][:] = 0
+
+        compact_offset = 0
+        compact_starts: list[int] = []
+        for row, (slot, anchor, draft, past_len, verify_len) in enumerate(
+            zip(slots, anchors, drafts, past_lens, verify_lens, strict=True)
+        ):
+            verify_len = int(verify_len)
+            past_len = int(past_len)
+            compact_start = compact_offset
+            compact_starts.append(compact_start)
+            self.pool.prepare_kv_writes(slot, past_len, verify_len)
+            views["source_index"][row] = self.engine._spec_rows.row_for_slot(  # noqa: SLF001
+                slot, self.engine._spec_state_col[slot]  # noqa: SLF001
+            )
+            for column in range(max_q):
+                padded_index = row * max_q + column
+                if column < verify_len:
+                    compact_index = compact_offset + column
+                    views["tokens"][compact_index] = (
+                        int(anchor) if column == 0 else 0
+                    )
+                    views["positions"][compact_index] = past_len + column
+                    views["write_index"][compact_index] = self.pool.write_index(
+                        slot, past_len + column
+                    )
+                    views["padded_to_compact"][padded_index] = compact_index
+                    views["compact_to_padded"][compact_index] = padded_index
+                    views["destination_index"][row, column] = self.engine._spec_rows.row_for_slot(  # noqa: SLF001
+                        slot, column
+                    )
+                else:
+                    views["write_index"][padded_index] = self.pool.write_index(scratch, column)
+                    views["destination_index"][row, column] = self.engine._spec_rows.row_for_slot(  # noqa: SLF001
+                        scratch, column
+                    )
+            draft_row = self._draft_row(draft, self.max_gamma)
+            if not isinstance(draft_row, torch.Tensor):
+                views["tokens"][compact_start + 1 : compact_start + verify_len] = draft_row[
+                    : verify_len - 1
+                ]
+            views["cache_seqlens"][row] = past_len + verify_len
+            compact_offset += verify_len
+
+        # The valid rows are compact at the front of every flat model input.
+        # Any graph-capacity tail is a harmless scratch query; keeping unique
+        # scratch write rows avoids a concurrent store collision in the
+        # attention KV write even though the ragged indptr excludes the tail.
+        for tail in range(compact_offset, capacity):
+            views["write_index"][tail] = self.pool.write_index(scratch, tail - compact_offset)
+
+        views["cu_seqlens_q"][:] = [
+            0,
+            *(
+                sum(int(length) for length in verify_lens[: row + 1])
+                for row in range(batch_size)
+            ),
+        ]
+        descriptor.input_ids.copy_(host["tokens"], non_blocking=True)
+        descriptor.positions.copy_(host["positions"], non_blocking=True)
+        descriptor.write_index.copy_(host["write_index"], non_blocking=True)
+        descriptor.gdn_source_index.copy_(host["source_index"], non_blocking=True)
+        descriptor.gdn_destination_index.copy_(host["destination_index"], non_blocking=True)
+        descriptor.cu_seqlens_q.copy_(host["cu_seqlens_q"], non_blocking=True)
+        descriptor.verify_lens.copy_(host["verify_lens"], non_blocking=True)
+        descriptor.gdn_padded_to_compact.copy_(host["padded_to_compact"], non_blocking=True)
+        descriptor.gdn_compact_to_padded.copy_(host["compact_to_padded"], non_blocking=True)
+        inputs["cache_seqlens"].copy_(host["cache_seqlens"], non_blocking=True)
+
+        for row, draft in enumerate(drafts):
+            if not isinstance(draft, torch.Tensor):
+                continue
+            draft_row = self._draft_row(draft, self.max_gamma)
+            assert isinstance(draft_row, torch.Tensor)
+            verify_len = int(verify_lens[row])
+            compact_start = compact_starts[row]
+            descriptor.input_ids[compact_start + 1 : compact_start + verify_len].copy_(
+                draft_row[: verify_len - 1].to(device=self.device, dtype=torch.long),
+                non_blocking=True,
+            )
+
+        slot_key = _page_table_slot_key(self.pool, slots)
+        if self._page_table_slots[batch_size] != slot_key:
+            for row, slot in enumerate(slots):
+                inputs["page_table"][row].copy_(self.pool._global_page_table[slot])  # noqa: SLF001
+            self._page_table_slots[batch_size] = slot_key
+        for driver in descriptor.attn_drivers:
+            if driver is not None:
+                driver.update_metadata(
+                    inputs["page_table"],
+                    inputs["cache_seqlens"],
+                    descriptor.cu_seqlens_q,
+                    host_cache_seqlens=views["cache_seqlens"],
+                )
+
+    def _forward_verify(
+        self, batch: Qwen36VerifyBatch
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        if self._capture_aux:
+            hidden, aux_hidden = self.model.verify_ragged_batch(
+                batch, capture_aux_hidden_states=True
+            )
+            return hidden, aux_hidden
+        return self.model.verify_ragged_batch(batch), None
+
+    def _capture_accept_epilogue(
+        self, batch_size: int, batch: Qwen36VerifyBatch, logits: torch.Tensor
+    ) -> None:
+        if not self._capture_accept:
+            return
+        greedy_accept_ragged(
+            batch.input_ids,
+            logits,
+            batch.verify_lens,
+            self.max_gamma,
+            q_indptr=batch.cu_seqlens_q,
+            predicted=self._predicted[batch_size],
+            accepted_out=self._accepted[batch_size],
+            committed_out=self._committed[batch_size],
+        )
+
+    def capture(self) -> None:
+        if self._captured:
+            return
+        try:
+            for batch_size, batch in self._batches.items():
+                slots = list(range(batch_size))
+                for slot in slots:
+                    self.engine._spec_rows.reset_slot(slot)  # noqa: SLF001
+                max_lens = [self.max_verify_tokens] * batch_size
+                drafts = [[0] * self.max_gamma for _ in slots]
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    for _ in range(3):
+                        self._fill(slots, [0] * batch_size, drafts, [0] * batch_size, max_lens)
+                        hidden, _aux = self._forward_verify(batch)
+                        logits = self.model.compute_logits(hidden)
+                        self._capture_accept_epilogue(batch_size, batch, logits)
+                torch.cuda.current_stream().wait_stream(side)
+
+                self._fill(slots, [0] * batch_size, drafts, [0] * batch_size, max_lens)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, pool=self._graph_pool):
+                    hidden, aux_hidden = self._forward_verify(batch)
+                    assert aux_hidden is None or self._capture_aux
+                    logits = self.model.compute_logits(hidden)
+                    self._capture_accept_epilogue(batch_size, batch, logits)
+                if self._graph_pool is None:
+                    self._graph_pool = graph.pool()
+                self._graphs[batch_size] = graph
+                self._hidden[batch_size] = hidden
+                self._logits[batch_size] = logits
+                if aux_hidden is not None:
+                    self._aux_hidden[batch_size] = aux_hidden
+        finally:
+            for slot in range(self.pool.num_slots + 1):
+                self.engine._spec_rows.reset_slot(slot)  # noqa: SLF001
+        self._captured = True
+
+    def replay_with_aux(
+        self,
+        slots: list[int],
+        anchors: list[int],
+        drafts: list[list[int] | torch.Tensor],
+        past_lens: list[int],
+        verify_lens: list[int],
+        *,
+        return_accept: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]] | tuple[
+        torch.Tensor, torch.Tensor, list[torch.Tensor], torch.Tensor, torch.Tensor
+    ]:
+        if not self._captured:
+            raise RuntimeError("ragged DSpark verify graph replay requested before capture")
+        if not self._capture_aux:
+            raise RuntimeError("ragged DSpark verify graph lacks auxiliary hidden states")
+        batch_size = len(slots)
+        self._fill(slots, anchors, drafts, past_lens, verify_lens)
+        self._graphs[batch_size].replay()
+        result = (
+            self._hidden[batch_size],
+            self._logits[batch_size],
+            self._aux_hidden[batch_size],
+        )
+        if return_accept:
+            if not self._capture_accept:
+                raise RuntimeError("ragged DSpark verify graph lacks accept epilogue")
+            return result + (self._accepted[batch_size], self._committed[batch_size])
+        return result
 
 
 class Qwen36MTPDraftCudaGraph:

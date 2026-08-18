@@ -123,7 +123,9 @@ from runtime.recurrent_state_pool import RecurrentStatePool
 from runtime.sampling import SamplingParams, make_generator, sample_from_logits
 
 if TYPE_CHECKING:
+    from runtime.backends.qwen36_dspark import Qwen36DSparkEngine
     from runtime.backends.qwen36_mtp import Qwen36MTPEngine
+    from runtime.model.qwen36_dspark import Qwen36DSparkDraftForCausalLM
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +262,12 @@ _W4A16_MEMREF_ELEMENT_LIMIT = 2**31 - 1
 #: ``_prefill_chunk_tokens`` default; capped by model geometry in
 #: :meth:`Qwen36Backend._prefill_chunk_tokens`.
 _PREFERRED_PREFILL_CHUNK_TOKENS = 8192
+
+# vLLM's comparable Qwen3.8 reference run uses
+# ``--max-num-batched-tokens=512``.  Exposing the local partition size keeps
+# same-configuration comparisons honest: GDN and full-attention prefill are
+# otherwise evaluated over different chunk boundaries.
+_QSR_PREFILL_CHUNK_ENV = "QSR_PREFILL_CHUNK"
 
 
 class Qwen36Backend:
@@ -410,6 +418,12 @@ class Qwen36Backend:
             # stub model instead of only against a 50 GiB checkpoint on a
             # contended GPU. See tests/test_qwen36_backend.py.
             self.pool.ensure_decode_workspaces(max_batch=num_slots)
+            # SGLang/FlashInfer compiles its FA2 module from the live query
+            # shape. Pay that compile before the first admission; otherwise
+            # TTFT includes a one-time 10--20s JIT stall.
+            self.pool.warmup_prefill_attention_driver(
+                batch=1, tokens_per_slot=self._prefill_chunk_tokens()
+            )
 
         # -- prefix cache bookkeeping (same shape as LagunaBackend's) ------
         self._prefix_cache_tokens: list[list[int] | None] = [None] * num_slots
@@ -481,6 +495,12 @@ class Qwen36Backend:
             "mtp_batched_draft_replays": 0,
             "mtp_batched_sync_replays": 0,
             "mtp_batched_sync_slots": 0,
+            # DSpark has a separate external draft cache and graph pair. Keep
+            # its live-traffic counters separate from the legacy MTP names so
+            # a performance run cannot be mistaken for an MTP run.
+            "dspark_verify_graph_replays": 0,
+            "dspark_draft_graph_replays": 0,
+            "dspark_verify_width_histogram": [],
         }
 
         self._decode_graphs: dict[int, torch.cuda.CUDAGraph] = {}
@@ -500,6 +520,10 @@ class Qwen36Backend:
         #: B3 (2026-08-03): the MTP round driver, wired via :meth:`enable_mtp`.
         #: ``None`` until then -- see :mod:`runtime.backends.qwen36_mtp`.
         self._mtp: Qwen36MTPEngine | None = None
+        #: External Qwen3.8 DSpark draft driver.  It is deliberately
+        #: mutually exclusive with MTP: both consume the same target verify
+        #: boundary but have different draft-cache contracts.
+        self._dspark: Qwen36DSparkEngine | None = None
 
         self.pool.reset_all()
 
@@ -526,14 +550,14 @@ class Qwen36Backend:
 
     @property
     def has_speculative_decode(self) -> bool:
-        """Whether MTP-verified rounds are active on THIS instance.
+        """Whether a verified speculative round is active on THIS instance.
 
         ``capabilities.speculative_decode`` above says this backend CAN do
-        MTP (:meth:`enable_mtp` may be called); this says whether it IS
-        active right now -- same split Laguna's own ``has_speculative_decode``
-        docstring documents for DFlash.
+        speculative decode; this says whether MTP or DSpark IS active right
+        now -- same split Laguna's own ``has_speculative_decode`` docstring
+        documents for DFlash.
         """
-        return self._mtp is not None
+        return self._mtp is not None or self._dspark is not None
 
     def enable_mtp(self, *, num_speculative_tokens: int, enable_resync: bool | None = None) -> None:
         """Attach the owned MTP round driver before any production slot is
@@ -562,6 +586,38 @@ class Qwen36Backend:
         self._mtp = Qwen36MTPEngine(
             self, num_speculative_tokens=num_speculative_tokens, enable_resync=enable_resync
         )
+
+    def enable_dspark(self, draft_model: Qwen36DSparkDraftForCausalLM) -> None:
+        """Attach the external Qwen3.8 DSpark draft before serving starts.
+
+        DSpark has its own dense draft KV allocation and does not use the
+        target MTP head.  It also does not yet participate in the Qwen
+        persistent-prefix family, so callers must disable that feature before
+        construction rather than silently restoring only half a prefix.
+        """
+
+        if self._dspark is not None:
+            return
+        if self._mtp is not None:
+            raise RuntimeError("DSpark and MTP are mutually exclusive")
+        if self.enable_prefix_cache or self.enable_persistent_prefix_cache:
+            raise RuntimeError(
+                "DSpark currently requires prefix caching to be disabled; "
+                "the draft KV family has no persistent-prefix snapshot yet"
+            )
+        if self._decode_graphs:
+            raise RuntimeError("enable DSpark before target decode CUDA Graph capture")
+        if draft_model.gamma <= 0:
+            raise ValueError(f"DSpark gamma must be positive, got {draft_model.gamma}")
+        # The external Qwen3.8 DSpark checkpoint stores target taps as
+        # zero-based block indices.  The target model's capture API follows
+        # vLLM and accepts one-based "after layer N" ids.
+        self.model.set_aux_hidden_state_layers(
+            tuple(layer_id + 1 for layer_id in draft_model.config.target_layer_ids)
+        )
+        from runtime.backends.qwen36_dspark import Qwen36DSparkEngine
+
+        self._dspark = Qwen36DSparkEngine(self, draft_model)
 
     def ensure_kv_blocks(self, num_blocks: int) -> None:
         """Commit at least ``num_blocks`` of the extensible KV pool's prefix
@@ -614,6 +670,14 @@ class Qwen36Backend:
                     if status != "unused"
                 }
             )
+        if self._dspark is not None:
+            cg_status.update(
+                {
+                    f"dspark_{name}": status
+                    for name, status in self._dspark.cg_status.items()
+                    if status != "unused"
+                }
+            )
         return BackendSnapshot(
             slots=slots,
             prefix=prefix,
@@ -652,6 +716,11 @@ class Qwen36Backend:
             snapshot["kv_bytes_per_slot"] += mtp_bytes_per_page * self.pool.pages_per_slot
         else:
             snapshot["qwen_kv_mtp_pool_bytes"] = 0
+        dspark_bytes = self._dspark.kv_bytes if self._dspark is not None else 0
+        snapshot["qwen_kv_dspark_draft_bytes"] = dspark_bytes
+        if dspark_bytes:
+            snapshot["kv_bytes_total"] += dspark_bytes
+            snapshot["kv_bytes_measured"] += dspark_bytes
         snapshot["qwen_kv_bundle_bytes"] = snapshot["qwen_kv_pool_bytes"] // self.pool.pool_bundles
         return snapshot
 
@@ -709,6 +778,8 @@ class Qwen36Backend:
         self._pending_cached_hidden.pop(slot, None)
         if self._mtp is not None:
             self._mtp.reset_slot(slot)
+        if self._dspark is not None:
+            self._dspark.reset_slot(slot)
 
     def drop_prefix_cache(self, slot: int) -> None:
         """Forget ``slot``'s saved KV prefix -- and, in lockstep, its
@@ -833,10 +904,24 @@ class Qwen36Backend:
         # returned, because only the last position's logits are sampled from.
         chunk = self._prefill_chunk_tokens()
         hidden = None
+        dspark = getattr(self, "_dspark", None)
         for start in range(0, len(suffix), chunk):
             piece = suffix[start : start + chunk]
             input_ids = torch.tensor([piece], dtype=torch.long, device=self.device)
-            hidden = self.model(input_ids, state)
+            if dspark is not None:
+                result = self.model(
+                    input_ids,
+                    state,
+                    capture_aux_hidden_states=True,
+                )
+                hidden, aux_hidden_states = result
+                dspark.sync_prefill_context(
+                    slot,
+                    aux_hidden_states,
+                    position_offset=prefix_hit + start,
+                )
+            else:
+                hidden = self.model(input_ids, state)
         assert hidden is not None  # `suffix` is non-empty, checked above
         logits = self.model.compute_logits(hidden[0])
         if return_hidden:
@@ -867,12 +952,27 @@ class Qwen36Backend:
         # tests to this bound. A stub that never prefills 61k tokens cannot
         # trip the limit the cap protects against. Any real model built from
         # a checkpoint always has the key.
+        configured = os.environ.get(_QSR_PREFILL_CHUNK_ENV)
+        if configured is not None:
+            try:
+                requested = int(configured)
+            except ValueError as exc:
+                raise ValueError(
+                    f"{_QSR_PREFILL_CHUNK_ENV} must be a positive integer, got {configured!r}"
+                ) from exc
+            if requested <= 0:
+                raise ValueError(
+                    f"{_QSR_PREFILL_CHUNK_ENV} must be a positive integer, got {requested}"
+                )
+        else:
+            requested = _PREFERRED_PREFILL_CHUNK_TOKENS
+
         config = getattr(self.model, "config", None)
         intermediate = (config or {}).get("intermediate_size") if isinstance(config, dict) else None
         if not intermediate:
-            return _PREFERRED_PREFILL_CHUNK_TOKENS
+            return requested
         hard_cap = _W4A16_MEMREF_ELEMENT_LIMIT // (2 * int(intermediate))
-        return max(1, min(_PREFERRED_PREFILL_CHUNK_TOKENS, hard_cap))
+        return max(1, min(requested, hard_cap))
 
     def _commit_prefill(self, slot: int, prompt_ids: list[int], first_token: int) -> None:
         self._prefix_hash_ctx.pop(slot, None)
@@ -1007,6 +1107,7 @@ class Qwen36Backend:
         # is semantically identical to the B1 loop.  Mixed/ragged/chunked
         # admissions remain on the proven per-slot path below.
         batched_hidden: dict[int, torch.Tensor] = {}
+        batched_aux_hidden: dict[int, list[torch.Tensor]] = {}
         # A prefill needs logits only at each request's final position.  The
         # historical batched runner explicitly gathered those rows before
         # the vocab projection: projecting every prompt position into the
@@ -1019,18 +1120,23 @@ class Qwen36Backend:
             for slot, suffix in zip(state.slots, state.suffix_per_slot)
             if start < len(suffix)
         ]
-        if pending and len(pending) > 1:
+        prompt_by_slot = dict(zip(state.slots, state.prompts_per_slot))
+        suffix_by_slot = dict(zip(state.slots, state.suffix_per_slot))
+        if pending and hasattr(self.model, "prefill_batch") and all(
+            len(prompt_by_slot.get(slot, ())) == len(suffix) for slot, suffix in pending
+        ):
             pending_lengths = {len(suffix) for _slot, suffix in pending}
             if len(pending_lengths) == 1:
-                # Every chunk step of a uniform multi-slot admission can
-                # share one BxQ extend forward, not only a suffix that fits
-                # a single chunk: prior KV lengths stay equal because
-                # commit_prefill_batch advances every slot by the same chunk,
-                # and the MTP sync below consumes exactly this chunk's hidden
-                # rows on either path.  The historical 128K+10240 suffix wave
-                # measured 2026-08-06 fell back to the per-slot loop on every
-                # chunk (47 s class vs 13 s class) because the old guard
-                # required start == 0 and len(suffix) <= chunk.
+                # Every chunk step of a uniform admission can share one BxQ
+                # extend forward, including B=1.  The B=1 case is important:
+                # it removes the per-layer single-sequence planner/metadata
+                # work from the dominant cold-prefill path while preserving
+                # the same recurrence and paged-KV state.  Prior KV lengths
+                # stay equal because commit_prefill_batch advances every
+                # slot by the same chunk, and the DSpark sync below consumes
+                # exactly this chunk's hidden rows on either path.  The old
+                # ``len(pending) > 1`` guard left all single-request 128K
+                # admissions on the slower serial path.
                 uniform_len = next(iter(pending_lengths))
                 end_uniform = min(start + chunk, uniform_len)
                 chunk_is_last = end_uniform >= uniform_len
@@ -1047,7 +1153,21 @@ class Qwen36Backend:
                 else:
                     if _PREFILL_PROFILE:
                         _t_batch = time.perf_counter()
-                    hidden_batch = self.model.prefill_batch(prefill_batch)
+                    capture_aux = self._dspark is not None
+                    if capture_aux:
+                        prefill_output = self.model.prefill_batch(
+                            prefill_batch,
+                            capture_aux_hidden_states=True,
+                        )
+                    else:
+                        # Keep the narrow batch protocol compatible with the
+                        # CPU/test doubles and older non-DSpark model wrappers.
+                        prefill_output = self.model.prefill_batch(prefill_batch)
+                    if capture_aux:
+                        hidden_batch, aux_hidden_batch = prefill_output
+                    else:
+                        hidden_batch = prefill_output
+                        aux_hidden_batch = []
                     self.pool.commit_prefill_batch(batch_slots, batch_tokens)
                     self.stats["prefill_batched_forwards"] += 1
                     if chunk_is_last:
@@ -1063,6 +1183,42 @@ class Qwen36Backend:
                         slot: hidden_batch[index : index + 1]
                         for index, slot in enumerate(batch_slots)
                     }
+                    if capture_aux:
+                        if not aux_hidden_batch:
+                            raise RuntimeError(
+                                "DSpark batched prefill returned no target hidden taps"
+                            )
+                        batched_aux_hidden = {
+                            slot: [tap[index : index + 1] for tap in aux_hidden_batch]
+                            for index, slot in enumerate(batch_slots)
+                        }
+                        if _PREFILL_PROFILE and self.device.type == "cuda":
+                            # The model forward and the hidden-to-draft KV
+                            # projection share the CUDA stream.  Synchronize
+                            # at this diagnostic boundary so async work is
+                            # attributed to the phase that launched it rather
+                            # than leaking into the next phase's wall time.
+                            torch.cuda.synchronize(self.device)
+                            _t_hidden_sync = time.perf_counter()
+                        self._dspark.sync_prefill_context_batch(
+                            batch_slots,
+                            aux_hidden_batch,
+                            position_offsets=[
+                                len(prompt_by_slot[slot])
+                                - len(suffix_by_slot[slot])
+                                + start
+                                for slot in batch_slots
+                            ],
+                            query_len=end_uniform - start,
+                        )
+                        if _PREFILL_PROFILE and self.device.type == "cuda":
+                            torch.cuda.synchronize(self.device)
+                            _prefill_profile(
+                                "dspark_hidden_sync",
+                                (time.perf_counter() - _t_hidden_sync) * 1000.0,
+                                slots=batch_slots,
+                                tokens=end_uniform - start,
+                            )
                     if chunk_is_last:
                         batched_anchor_logits = {
                             slot: anchor_logits[index : index + 1]
@@ -1083,6 +1239,7 @@ class Qwen36Backend:
                 is_last = True
             else:
                 hidden = batched_hidden.get(slot)
+            aux_hidden_states: list[torch.Tensor] | None = None
             if start < len(suffix):
                 end = min(start + chunk, len(suffix))
                 is_last = end >= len(suffix)
@@ -1112,7 +1269,20 @@ class Qwen36Backend:
                     input_ids = torch.tensor(
                         [suffix[start:end]], dtype=torch.long, device=self.device
                     )
-                    hidden = self.model(input_ids, self.pool.slot_state(slot))
+                    if self._dspark is not None:
+                        result = self.model(
+                            input_ids,
+                            self.pool.slot_state(slot),
+                            capture_aux_hidden_states=True,
+                        )
+                        hidden, aux_hidden_states = result
+                        self._dspark.sync_prefill_context(
+                            slot,
+                            aux_hidden_states,
+                            position_offset=hit + start,
+                        )
+                    else:
+                        hidden = self.model(input_ids, self.pool.slot_state(slot))
                     if _PREFILL_PROFILE:
                         _prefill_profile(
                             "forward",
@@ -1120,6 +1290,8 @@ class Qwen36Backend:
                             slot=slot,
                             tokens=end - start,
                         )
+                else:
+                    aux_hidden_states = batched_aux_hidden.get(slot)
             draft_tokens: list[int] = []
             if self._mtp is not None:
                 # MTP's own attention must see the SAME real prefix as the
@@ -1182,10 +1354,43 @@ class Qwen36Backend:
                             slot=slot,
                             cached_hidden=0,
                         )
+            elif self._dspark is not None:
+                if not is_last:
+                    continue
+                if aux_hidden_states is None:
+                    raise RuntimeError(
+                        "DSpark prefill requires target hidden taps from the final chunk"
+                    )
+                logits = batched_anchor_logits.get(slot)
+                if logits is None:
+                    if _PREFILL_PROFILE:
+                        _t_logits = time.perf_counter()
+                    logits = self.model.compute_logits(hidden[0, -1:])
+                    if _PREFILL_PROFILE:
+                        _prefill_profile(
+                            "logits",
+                            (time.perf_counter() - _t_logits) * 1000.0,
+                            slot=slot,
+                        )
+                params = params_per_slot.get(slot)
+                if params is None or params.is_greedy:
+                    token = int(logits[-1].argmax(dim=-1).item())
+                else:
+                    gen = make_generator(params.seed)
+                    token = int(
+                        sample_from_logits(
+                            logits[-1].unsqueeze(0), params, generator=gen
+                        ).item()
+                    )
+                draft_tokens = self._dspark.draft_after_prefill(
+                    slot,
+                    token,
+                    params=params,
+                )
             if not is_last:
                 continue
 
-            if self._mtp is None:
+            if self._mtp is None and self._dspark is None:
                 logits = batched_anchor_logits.get(slot)
                 if logits is None:
                     if _PREFILL_PROFILE:
@@ -1310,7 +1515,7 @@ class Qwen36Backend:
             self.pool.slot_committed_tokens[slot].append(int(token))
         return torch.stack(rows, dim=0)
 
-    # -- protocol: MTP speculative decode -----------------------------------
+    # -- protocol: speculative decode ---------------------------------------
 
     def mtp_verify_and_commit_batch(
         self,
@@ -1322,22 +1527,31 @@ class Qwen36Backend:
         return_logprobs: bool = False,
         top_logprobs: int = 0,
     ) -> dict[int, dict]:
-        """B3: Qwen3.6's sibling of ``LagunaBackend.mtp_verify_and_commit_batch``
-        -- called by the SAME ``ServerEngine._step_sync`` MTP branch
-        (``classify_decode_slots`` routes here once ``self.has_speculative_decode``
-        is true, i.e. once :meth:`enable_mtp` has been called).
+        """Run the active Qwen speculative driver.
 
-        The target verify is fused across the active slots whenever the MTP
-        verify CUDA Graph is healthy. Draft-head chaining remains per-slot;
-        sampled requests and the explicit eager fallback retain the proven
-        single-slot path.
+        MTP and DSpark share this server-facing hook.  DSpark keeps the
+        variable-length acceptance/commit epilogue on the host, while its
+        fixed-width target-verify and greedy-draft bodies may replay CUDA
+        Graphs; keeping the dispatch here preserves one server accounting
+        contract for both speculative strategies.
 
         ``params_per_slot``: optional per-slot ``SamplingParams``, forwarded
         to :meth:`Qwen36MTPEngine.round`. A missing entry (or ``None``
         altogether) takes the greedy path for that slot.
         """
+        if self._dspark is not None:
+            return self._dspark.round_batch(
+                slots,
+                anchors,
+                drafts,
+                params_per_slot=params_per_slot,
+                return_logprobs=return_logprobs,
+                top_logprobs=top_logprobs,
+            )
         if self._mtp is None:
-            raise RuntimeError("mtp_verify_and_commit_batch called without enable_mtp()")
+            raise RuntimeError(
+                "mtp_verify_and_commit_batch called without enable_mtp() or enable_dspark()"
+            )
         return self._mtp.round_batch(
             slots,
             anchors,

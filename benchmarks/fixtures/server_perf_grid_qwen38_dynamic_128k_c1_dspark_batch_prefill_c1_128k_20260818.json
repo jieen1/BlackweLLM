@@ -1,0 +1,209 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:8300",
+    "model": "qwen3.8",
+    "endpoint": "completions",
+    "context_labels": [
+      "128k"
+    ],
+    "context_targets": [
+      131072
+    ],
+    "concurrency": [
+      1
+    ],
+    "max_tokens": 256,
+    "warm_rounds": 0,
+    "warm_suffix_tokens": 0,
+    "filler_prefix": "0123456789 ",
+    "filler_suffix": "1357902468 ",
+    "tokenizer": "/home/bot/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/ccdaab7e68af2409599b8949a8f2685703c9bae5",
+    "server": "Qwen3.8-27B-NVFP4; qwen36 backend; DSpark K=7; CUDA Graph; FP8 KV; fused QKV W8A8; block_size=32; dynamic 19629342720-byte/4160-bundle pool; capacity=4; num_slots=4; logical max=256K/slot; prefix cache=off",
+    "template_overhead_tokens": {
+      "128k": 0
+    },
+    "served_context_tokens": {
+      "128k": 131072
+    }
+  },
+  "cells": {
+    "131072": {
+      "1": {
+        "context_tokens": 131072,
+        "served_context_tokens": 131072,
+        "concurrency": 1,
+        "cold": {
+          "wall_s": 58.2041,
+          "requests_sent": 1,
+          "requests_ok": 1,
+          "requests_completed_delta": 1,
+          "errors": [],
+          "requests": [
+            {
+              "error": null,
+              "ttft_s": null,
+              "last_event_s": 58.2039,
+              "wall_s": 58.2039,
+              "usage_prompt": 131072,
+              "usage_completion": 256,
+              "completion_text": "789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789",
+              "completion_chars": 256,
+              "completion_sha256": "75b43a8a0ae256dca5668dd5e73028d24f8700d46b7d5623526bc29711dff306"
+            }
+          ],
+          "prompt_tokens_total": 131072,
+          "generation_tokens_total": 256,
+          "expected_prompt_tokens": 131072,
+          "ttft_s_per_request": [],
+          "ttft_median_s": null,
+          "server_mean_ttft_s": 55.4599,
+          "server_mean_decode_tok_per_s": 94.71,
+          "server_e2e_tok_per_s": 4.4,
+          "aggregate_decode_window_s": null,
+          "aggregate_decode_tok_per_s": null,
+          "aggregate_e2e_tok_per_s": 4.4,
+          "stats_delta": {
+            "requests_completed": 1,
+            "prefix_cache_hits": 0,
+            "prefix_cache_misses": 1,
+            "prefix_cache_hit_tokens_saved": 0,
+            "decode_rounds": 0,
+            "decode_tokens": 0,
+            "decode_graph_replays": 0,
+            "mtp_verify_graph_replays": 0,
+            "mtp_draft_graph_replays": 0,
+            "mtp_batched_sync_replays": 0,
+            "dspark_verify_graph_replays": 34,
+            "dspark_draft_graph_replays": 35,
+            "prefix_persistent_stores": 0,
+            "prefix_persistent_evictions": 0,
+            "prefix_persistent_restores": 0,
+            "checkpoints_taken": 0,
+            "mtp_acceptance_histogram": [
+              1,
+              0,
+              0,
+              0,
+              0,
+              0,
+              5,
+              28,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "dspark_acceptance_histogram": [
+              1,
+              0,
+              0,
+              0,
+              0,
+              0,
+              5,
+              28,
+              0
+            ],
+            "dspark_rounds": 34,
+            "dspark_accepted_tokens": 226,
+            "dspark_committed_tokens": 255,
+            "mtp_rounds": 34,
+            "mtp_accepted_tokens": 226,
+            "mtp_committed_tokens": 260,
+            "mtp_mean_accepted_per_round": 6.647059,
+            "mtp_mean_committed_per_round": 7.647059,
+            "dspark_mean_accepted_per_round": 6.647059,
+            "dspark_mean_committed_per_round": 7.5
+          },
+          "metric_delta": {
+            "prompt_tokens_total": 131072.0,
+            "generation_tokens_total": 256.0,
+            "e2e_request_latency_seconds_sum": 58.1525,
+            "e2e_request_latency_seconds_count": 1.0,
+            "time_to_first_token_seconds_sum": 55.4599,
+            "time_to_first_token_seconds_count": 1.0,
+            "request_time_per_output_token_seconds_sum": 0.010559,
+            "request_time_per_output_token_seconds_count": 1.0
+          }
+        },
+        "warm": []
+      }
+    }
+  },
+  "started_at": "2026-08-17T16:12:08.842558+00:00",
+  "server_stats_before": {
+    "requests_completed": 4,
+    "prefix_cache_hits": 0,
+    "prefix_cache_misses": 4,
+    "prefix_cache_hit_tokens_saved": 0,
+    "decode_rounds": 0,
+    "decode_tokens": 0,
+    "decode_graph_replays": 0,
+    "mtp_verify_graph_replays": 0,
+    "mtp_draft_graph_replays": 0,
+    "mtp_batched_sync_replays": 0,
+    "dspark_verify_graph_replays": 35,
+    "dspark_draft_graph_replays": 39,
+    "prefix_persistent_stores": 0,
+    "prefix_persistent_evictions": 0,
+    "prefix_persistent_restores": 0,
+    "checkpoints_taken": 0,
+    "mtp_acceptance_histogram": [
+      1,
+      2,
+      0,
+      0,
+      0,
+      0,
+      13,
+      118,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "dspark_acceptance_histogram": [
+      1,
+      2,
+      0,
+      0,
+      0,
+      0,
+      13,
+      118,
+      0
+    ],
+    "dspark_rounds": 134,
+    "dspark_accepted_tokens": 906,
+    "dspark_committed_tokens": 1020
+  },
+  "server_stats_after": {
+    "requests_completed": 0,
+    "prefix_cache_hits": 0,
+    "prefix_cache_misses": 0,
+    "prefix_cache_hit_tokens_saved": 0,
+    "decode_rounds": 0,
+    "decode_tokens": 0,
+    "decode_graph_replays": 0,
+    "mtp_verify_graph_replays": 0,
+    "mtp_draft_graph_replays": 0,
+    "mtp_batched_sync_replays": 0,
+    "dspark_verify_graph_replays": 0,
+    "dspark_draft_graph_replays": 0,
+    "prefix_persistent_stores": 0,
+    "prefix_persistent_evictions": 0,
+    "prefix_persistent_restores": 0,
+    "checkpoints_taken": 0
+  },
+  "finished_at": "2026-08-17T16:13:07.203790+00:00"
+}

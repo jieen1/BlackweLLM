@@ -104,6 +104,10 @@ class SparkinferAttnMetadata:
         "cu_seqlens_q",
         "num_actual_tokens",
         "window_left",
+        "flashinfer_qo_indptr",
+        "flashinfer_kv_indptr",
+        "flashinfer_kv_indices",
+        "flashinfer_kv_last_page_len",
     )
 
     def __init__(
@@ -114,6 +118,10 @@ class SparkinferAttnMetadata:
         cu_seqlens_q: torch.Tensor,
         num_actual_tokens: int,
         window_left: int = -1,
+        flashinfer_qo_indptr: torch.Tensor | None = None,
+        flashinfer_kv_indptr: torch.Tensor | None = None,
+        flashinfer_kv_indices: torch.Tensor | None = None,
+        flashinfer_kv_last_page_len: torch.Tensor | None = None,
     ):
         self.mode = mode
         self.page_table = page_table
@@ -121,6 +129,10 @@ class SparkinferAttnMetadata:
         self.cu_seqlens_q = cu_seqlens_q
         self.num_actual_tokens = num_actual_tokens
         self.window_left = window_left
+        self.flashinfer_qo_indptr = flashinfer_qo_indptr
+        self.flashinfer_kv_indptr = flashinfer_kv_indptr
+        self.flashinfer_kv_indices = flashinfer_kv_indices
+        self.flashinfer_kv_last_page_len = flashinfer_kv_last_page_len
 
 
 class SparkinferPrefillWorkspace:
@@ -249,7 +261,14 @@ class SparkinferPrefillWorkspace:
     rather than a coefficient).
     """
 
-    def __init__(self, device: torch.device, *, max_total_q: int, max_page_table_width: int):
+    def __init__(
+        self,
+        device: torch.device,
+        *,
+        max_total_q: int,
+        max_page_table_width: int,
+        max_batch: int = 1,
+    ):
         # Lazy, like every other sparkinfer import in this module: importing
         # sparkinfer at module scope would make this file unimportable in the
         # sparkinfer-free environments some tests run in.
@@ -267,10 +286,14 @@ class SparkinferPrefillWorkspace:
         # rather than silently recompiling -- if the caller under-sized it).
         self._max_total_q = max_total_q
         self._max_page_table_width = max_page_table_width
-        # One request per extend/verify call everywhere in this runtime
-        # (prefill is always single-slot; DFlash verify is always
-        # single-slot -- see laguna.py and laguna_dflash.py call sites).
-        self._max_batch = 1
+        # Ordinary runtime prefill/verify calls use one request.  DSpark's
+        # non-causal masked block deliberately represents K query rows as K
+        # independent one-token requests, all sharing one slot's page table;
+        # its caller passes max_batch=K here so the eager planner reserves the
+        # corresponding batch-shaped schedule.
+        self._max_batch = int(max_batch)
+        if self._max_batch <= 0:
+            raise ValueError(f"max_batch must be positive, got {max_batch}")
         # Declares this capacity to the planner so plan policy that is part
         # of sparkinfer's compile key -- above all ``cta_tile_q`` -- is
         # derived from capacity rather than from the live request's query

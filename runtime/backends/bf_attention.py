@@ -202,6 +202,7 @@ def replace_laguna_attention(
     resolve_parent: Any = None,
     *,
     prefill_capacity_by_window_left: dict[int, tuple[int, int]],
+    max_batch: int = 1,
 ) -> int:
     """Replace Laguna attention placeholders in ``model`` with BFAttention.
 
@@ -238,7 +239,7 @@ def replace_laguna_attention(
     from runtime.backends.laguna_sparkinfer_attn import SparkinferPrefillWorkspace
 
     replaced = 0
-    prefill_workspaces: dict[tuple[int, int, int, int], SparkinferPrefillWorkspace] = {}
+    prefill_workspaces: dict[tuple[int, int, int, int, int], SparkinferPrefillWorkspace] = {}
 
     for layer_name, attn_layer in sfc.items():
         if not hasattr(attn_layer, "get_attn_backend"):
@@ -250,7 +251,7 @@ def replace_laguna_attention(
         num_kv_heads = attn_layer.num_kv_heads
         scale = attn_layer.impl.scale if hasattr(attn_layer.impl, "scale") else head_size**-0.5
         window_left = getattr(attn_layer.impl, "window_left", -1)
-        workspace_key = (window_left, num_heads, num_kv_heads, head_size)
+        workspace_key = (window_left, num_heads, num_kv_heads, head_size, max_batch)
         prefill_workspace = prefill_workspaces.get(workspace_key)
         if prefill_workspace is None:
             max_total_q, max_page_table_width = prefill_capacity_by_window_left[window_left]
@@ -258,6 +259,7 @@ def replace_laguna_attention(
                 torch.device("cuda"),
                 max_total_q=max_total_q,
                 max_page_table_width=max_page_table_width,
+                max_batch=max_batch,
             )
             prefill_workspaces[workspace_key] = prefill_workspace
 

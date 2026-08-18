@@ -1002,9 +1002,12 @@ class _SparkinferCGExtendImpl:
     backed by the graph-private fixed-address tensors used during replay.
     """
 
-    def __init__(self, workspace, num_tokens: int):
+    def __init__(self, workspace, num_tokens: int, *, batch_size: int = 1):
         self._ws = workspace
         self._num_tokens = num_tokens
+        self._batch_size = int(batch_size)
+        if self._batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
         self._binding = None
         self._binding_signature = None
         self._k_descale = None
@@ -1051,26 +1054,26 @@ class _SparkinferCGExtendImpl:
         if self._k_descale is None:
             self._k_descale = _paged_descale(
                 layer._k_scale,
-                batch_size=1,
+                batch_size=self._batch_size,
                 num_kv_heads=int(key_cache.shape[2]),
             ).clone()
             self._v_descale = _paged_descale(
                 layer._v_scale,
-                batch_size=1,
+                batch_size=self._batch_size,
                 num_kv_heads=int(value_cache.shape[2]),
             ).clone()
         else:
             self._k_descale.copy_(
                 _paged_descale(
                     layer._k_scale,
-                    batch_size=1,
+                    batch_size=self._batch_size,
                     num_kv_heads=int(key_cache.shape[2]),
                 )
             )
             self._v_descale.copy_(
                 _paged_descale(
                     layer._v_scale,
-                    batch_size=1,
+                    batch_size=self._batch_size,
                     num_kv_heads=int(value_cache.shape[2]),
                 )
             )

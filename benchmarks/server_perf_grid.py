@@ -105,6 +105,8 @@ COUNTER_KEYS = [
     "mtp_verify_graph_replays",
     "mtp_draft_graph_replays",
     "mtp_batched_sync_replays",
+    "dspark_verify_graph_replays",
+    "dspark_draft_graph_replays",
     "prefix_persistent_stores",
     "prefix_persistent_evictions",
     "prefix_persistent_restores",
@@ -219,6 +221,12 @@ def snapshot_stats(stats: dict) -> dict:
     out["prefix_cache_hits"] = stats.get("prefix_cache_hits", 0)
     out["prefix_cache_misses"] = stats.get("prefix_cache_misses", 0)
     out["mtp_acceptance_histogram"] = list(stats.get("mtp_acceptance_histogram", []))
+    out["dspark_acceptance_histogram"] = list(
+        stats.get("dspark_acceptance_histogram", [])
+    )
+    out["dspark_rounds"] = int(stats.get("dspark_rounds", 0))
+    out["dspark_accepted_tokens"] = int(stats.get("dspark_accepted_tokens", 0))
+    out["dspark_committed_tokens"] = int(stats.get("dspark_committed_tokens", 0))
     return out
 
 
@@ -243,6 +251,26 @@ def diff_stats(before: dict, after: dict) -> dict:
     out["mtp_mean_accepted_per_round"] = round(mtp_accepted / mtp_rounds, 6) if mtp_rounds else None
     out["mtp_mean_committed_per_round"] = (
         round((mtp_rounds + mtp_accepted) / mtp_rounds, 6) if mtp_rounds else None
+    )
+    dspark_hist = out.get("dspark_acceptance_histogram", [])
+    dspark_rounds = sum(dspark_hist)
+    dspark_accepted = sum(index * count for index, count in enumerate(dspark_hist))
+    # Prefer the explicit engine counters when present.  The histogram remains
+    # the fallback for old debug snapshots and still provides a useful
+    # cross-check against the acceptance bookkeeping.
+    out["dspark_rounds"] = int(out.get("dspark_rounds", 0) or dspark_rounds)
+    out["dspark_accepted_tokens"] = int(
+        out.get("dspark_accepted_tokens", 0) or dspark_accepted
+    )
+    out["dspark_mean_accepted_per_round"] = (
+        round(out["dspark_accepted_tokens"] / out["dspark_rounds"], 6)
+        if out["dspark_rounds"]
+        else None
+    )
+    out["dspark_mean_committed_per_round"] = (
+        round(out["dspark_committed_tokens"] / out["dspark_rounds"], 6)
+        if out["dspark_rounds"]
+        else None
     )
     return out
 
@@ -313,6 +341,11 @@ async def stream_one(
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0.0,
+            # Make greedy behavior explicit across OpenAI-compatible servers.
+            # Some servers merge omitted sampling fields from the model's
+            # generation_config even when temperature=0.0 is supplied.
+            "top_p": 1.0,
+            "top_k": 1,
         }
     else:
         payload = {
@@ -320,12 +353,15 @@ async def stream_one(
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": 0.0,
+            "top_p": 1.0,
+            "top_k": 1,
             "stream": True,
         }
     t0 = time.perf_counter()
     first_t = None
     last_t = None
     error = None
+    completion_parts = []
     try:
         url = (
             f"{base_url}/v1/completions"
@@ -350,7 +386,6 @@ async def stream_one(
                 }
                 result.update(_completion_evidence(choice.get("text") or ""))
                 return result
-            completion_parts = []
             async for line in resp.content:
                 line = line.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data: "):

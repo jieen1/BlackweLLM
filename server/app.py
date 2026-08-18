@@ -163,6 +163,14 @@ SERVER_ENABLE_DFLASH = os.environ.get("QSR_SERVER_ENABLE_DFLASH", "0") != "0"
 # hidden) pairing fix this landing carries.
 SERVER_ENABLE_MTP = os.environ.get("QSR_SERVER_ENABLE_MTP", "0") != "0"
 SERVER_MTP_K = int(os.environ.get("QSR_SERVER_MTP_K", "4"))
+# Qwen3.8 DSpark uses a separate RadixArk draft checkpoint.  It is opt-in
+# because loading it costs additional GPU memory and the first implementation
+# is eager-only; the target checkpoint itself remains usable with native MTP.
+SERVER_ENABLE_DSPARK = os.environ.get("QSR_SERVER_ENABLE_DSPARK", "0") != "0"
+SERVER_DSPARK_DRAFT_MODEL = os.environ.get(
+    "QSR_SERVER_DSPARK_DRAFT_MODEL", "RadixArk/Qwen3.8-27B-DSpark"
+)
+SERVER_DSPARK_K = int(os.environ.get("QSR_SERVER_DSPARK_K", "7"))
 # Qwen dynamic KV Phase 4. ``legacy`` remains the rollback/default until the
 # full 4x256K GPU matrix (Phase 5) is green. ``strict`` guarantees every
 # configured slot's full context; ``elastic`` takes an explicit byte budget
@@ -491,6 +499,9 @@ async def lifespan(app: FastAPI):
         enable_mtp=SERVER_ENABLE_MTP,
         mtp_num_speculative_tokens=SERVER_MTP_K,
         mtp_resync=SERVER_MTP_RESYNC,
+        enable_dspark=SERVER_ENABLE_DSPARK,
+        dspark_draft_model=SERVER_DSPARK_DRAFT_MODEL,
+        dspark_num_speculative_tokens=SERVER_DSPARK_K,
         checkpoint_budget_multiple=(SERVER_CHECKPOINT_BUDGET_MULTIPLE or None),
         qwen_kv_mode=SERVER_QWEN_KV_MODE,
         qwen_kv_pool_bytes=SERVER_QWEN_KV_POOL_BYTES,
@@ -506,20 +517,23 @@ async def lifespan(app: FastAPI):
     logger.info(
         "engine ready: backend=%s model=%s capacity=%d num_slots=%d capacity_tokens_per_slot=%d "
         "cudagraph=%s prefix_cache=%s session_affinity=%s ttl=%.1fs dflash=%s "
-        "mtp=%s(K=%d,resync=%s)",
+        "mtp=%s(K=%d,resync=%s) dspark=%s(K=%d,draft=%s)",
         engine.backend_name,
         engine.MODEL,
         engine.capacity,
         engine.num_slots,
         engine.capacity_tokens_per_slot,
         SERVER_ENABLE_CUDAGRAPH,
-        SERVER_ENABLE_PREFIX_CACHE,
+        engine.enable_prefix_cache,
         SERVER_ENABLE_SESSION_AFFINITY,
         SERVER_SESSION_TTL_S,
         SERVER_ENABLE_DFLASH,
         SERVER_ENABLE_MTP,
         SERVER_MTP_K,
         SERVER_MTP_RESYNC,
+        SERVER_ENABLE_DSPARK,
+        SERVER_DSPARK_K,
+        SERVER_DSPARK_DRAFT_MODEL,
     )
     # Cyclic-GC pauses land in the decode hot loop as 50-150 ms host stalls:
     # the 2026-08-06 128K/c4 node trace measured 667 GPU-idle gaps >0.5 ms
@@ -1382,6 +1396,29 @@ def main() -> None:
             "Default off, independently A/B-measurable from --mtp itself."
         ),
     )
+    parser.add_argument(
+        "--dspark",
+        action="store_true",
+        help=(
+            "Enable Qwen3.8 DSpark speculative decoding (qwen36 backend only). "
+            "Loads a separate five-layer draft checkpoint and uses gamma=7 by "
+            "default; prefix caching and MTP are disabled for this path."
+        ),
+    )
+    parser.add_argument(
+        "--dspark-draft-model",
+        default=SERVER_DSPARK_DRAFT_MODEL,
+        help=(
+            "Local path or cached Hugging Face id for the external DSpark draft. "
+            f"Default: {SERVER_DSPARK_DRAFT_MODEL}."
+        ),
+    )
+    parser.add_argument(
+        "--dspark-k",
+        type=int,
+        default=SERVER_DSPARK_K,
+        help="DSpark draft tokens per round; must match draft config block_size. Default 7.",
+    )
     from server.formats.tool_parsers import available_parsers
 
     parser.add_argument(
@@ -1418,6 +1455,10 @@ def main() -> None:
                 "the laguna backend does not support it yet "
                 "(see docs/architecture.md §3.5.6, N8)"
             )
+    if args.dspark and (args.mtp or args.dflash):
+        parser.error("--dspark is mutually exclusive with --mtp and --dflash")
+    if args.dspark and args.session_affinity:
+        parser.error("--dspark currently does not support --session-affinity")
 
     os.environ["QSR_SERVER_CAPACITY"] = str(args.capacity)
     os.environ["QSR_SERVER_NUM_SLOTS"] = str(args.num_slots)
@@ -1443,6 +1484,10 @@ def main() -> None:
     os.environ["QSR_SERVER_MTP_K"] = str(args.mtp_k)
     if args.mtp_resync:
         os.environ["QSR_SERVER_MTP_RESYNC"] = "1"
+    if args.dspark:
+        os.environ["QSR_SERVER_ENABLE_DSPARK"] = "1"
+    os.environ["QSR_SERVER_DSPARK_DRAFT_MODEL"] = args.dspark_draft_model
+    os.environ["QSR_SERVER_DSPARK_K"] = str(args.dspark_k)
     os.environ["QSR_TOOL_CALL_PARSER"] = args.tool_call_parser
 
     # Runs before uvicorn imports the app module, so the model is not loaded

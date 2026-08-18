@@ -58,6 +58,7 @@ from runtime.model._weight_loading import default_weight_loader
 QSR_EMULATE_FP8_ACTIVATION_ENV = "QSR_EMULATE_FP8_ACTIVATION"
 QSR_TORCH_SCALED_MM_FP8_CHANNEL_ENV = "QSR_TORCH_SCALED_MM_FP8_CHANNEL"
 QSR_NATIVE_W8A8_FP8_CHANNEL_ENV = "QSR_NATIVE_W8A8_FP8_CHANNEL"
+QSR_NATIVE_W8A8_FP8_GATE_UP_ENV = "QSR_NATIVE_W8A8_FP8_GATE_UP"
 QSR_NATIVE_W8A8_QUANT_ENV = "QSR_NATIVE_W8A8_QUANT"
 
 _native_w8a8_library: object | None = None
@@ -84,6 +85,11 @@ def _native_w8a8_fp8_channel_enabled() -> bool:
     if os.environ.get("QSR_NATIVE_W8A8_FP8_CHANNEL", "1") not in {"1", "all"}:
         return False
     return _native_w8a8_artifact_usable()
+
+
+def _native_w8a8_fp8_gate_up_enabled() -> bool:
+    """Return whether the vLLM-style FP8 MLP gate/up fusion is enabled."""
+    return os.environ.get(QSR_NATIVE_W8A8_FP8_GATE_UP_ENV, "1") != "0"
 
 
 def _native_w8a8_lm_head_enabled() -> bool:
@@ -912,3 +918,103 @@ class FusedFP8ChannelQKV:
             out[:, nq : nq + nkv].view(*lead, nkv),
             out[:, nq + nkv :].view(*lead, nkv),
         )
+
+
+class FusedFP8ChannelGateUp:
+    """Fused one-launch W8A8 GEMM for a dense SwiGLU gate/up pair.
+
+    vLLM models a SwiGLU ``gate_proj`` + ``up_proj`` pair as one
+    ``MergedColumnParallelLinear``.  Keep the same physical layout here for
+    the FP8-channel MLP layers: concatenate the two checkpoint-native FP8
+    matrices and their per-output-channel scales, quantize the activation
+    once, and split the result only after the GEMM.  The two projections have
+    the same input and output shapes in Qwen3.8, so this is bit-equivalent to
+    two independent launches while removing one quantizer/GEMM/workspace
+    launch pair.
+
+    The fused tensors are plain, lazily-created CUDA tensors rather than
+    Parameters.  This mirrors :class:`FusedFP8ChannelQKV`.  After the
+    concatenation, the two source ``weight`` Parameters become row views into
+    the combined matrix, so the fusion does not leave a second copy of the
+    large FP8 weights resident.
+    """
+
+    def __init__(
+        self,
+        gate_proj: CompressedTensorsFP8ChannelLinear,
+        up_proj: CompressedTensorsFP8ChannelLinear,
+    ) -> None:
+        if gate_proj.bias is not None or up_proj.bias is not None:
+            raise ValueError("FusedFP8ChannelGateUp requires bias-less projections")
+        if gate_proj.input_size != up_proj.input_size:
+            raise ValueError("FusedFP8ChannelGateUp requires matching input sizes")
+        if gate_proj.output_size != up_proj.output_size:
+            raise ValueError("FusedFP8ChannelGateUp requires matching output sizes")
+        self._gate = gate_proj
+        self._up = up_proj
+        self._weight: torch.Tensor | None = None
+        self._weight_scale: torch.Tensor | None = None
+        self._out_features = gate_proj.output_size
+        self._workspaces: dict[tuple[int, int, int, int, bool], torch.Tensor] = {}
+
+    @property
+    def ready(self) -> bool:
+        """True when the fused CUDA weight buffers have been built."""
+        return self._weight is not None
+
+    def _ensure(self) -> None:
+        if self._weight is not None:
+            return
+        wg, wu = self._gate.weight.data, self._up.weight.data
+        if wg.numel() == 0 or wu.numel() == 0:
+            raise RuntimeError(
+                "FusedFP8ChannelGateUp needs raw FP8 weights; build it before "
+                "free_fp8_raw_weight() frees them"
+            )
+        if wg.shape[1] != wu.shape[1] or wg.shape[0] != wu.shape[0]:
+            raise ValueError("FusedFP8ChannelGateUp weights have incompatible shapes")
+        self._weight = torch.cat([wg, wu], dim=0).contiguous()
+        # Keep the original module-shaped tensors usable for diagnostics and
+        # fallback routing without retaining a duplicate allocation.  The
+        # fused object owns the combined storage for as long as the MLP keeps
+        # this helper alive.
+        self._gate.weight.data = self._weight[: self._out_features]
+        self._up.weight.data = self._weight[self._out_features :]
+        sg = self._gate.weight_scale.data.float().reshape(-1)
+        su = self._up.weight_scale.data.float().reshape(-1)
+        self._weight_scale = torch.cat([sg, su]).contiguous()
+
+    def forward_native(self, x: torch.Tensor, library: object) -> torch.Tensor:
+        """Run one native W8A8 launch and return ``[..., 2 * intermediate]``."""
+        self._ensure()
+        assert self._weight is not None
+        assert self._weight_scale is not None
+        x_shape = x.shape
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        m, k = x_2d.shape
+        n_total = self._weight.shape[0]
+        x_fp8 = torch.empty_like(x_2d, dtype=torch.float8_e4m3fn)
+        activation_scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+        library.quantize_per_token(x_2d, x_fp8, activation_scale)
+        out = torch.empty((m, n_total), dtype=x_2d.dtype, device=x.device)
+        geometry = (m, n_total, k, False)
+        stream_id = torch.cuda.current_stream(x.device).cuda_stream
+        key = (stream_id, *geometry)
+        workspace = self._workspaces.get(key)
+        if workspace is None:
+            workspace = torch.empty(
+                library.workspace_bytes(m=m, n=n_total, k=k, batch_invariant=False),
+                dtype=torch.uint8,
+                device=x.device,
+            )
+            self._workspaces[key] = workspace
+        library.launch(
+            x_fp8,
+            self._weight.t(),
+            activation_scale,
+            self._weight_scale,
+            out,
+            workspace,
+            batch_invariant=False,
+        )
+        return out.view(*x_shape[:-1], n_total)

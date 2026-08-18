@@ -42,6 +42,58 @@ def test_stats_snapshot_keeps_engine_acceptance_histogram() -> None:
     assert snapshot["mtp_acceptance_histogram"] == [7, 31, 21, 31]
 
 
+def test_stats_snapshot_keeps_dspark_counters_separate_from_mtp() -> None:
+    snapshot = snapshot_stats(
+        {
+            "requests_completed": 1,
+            "dspark_acceptance_histogram": [2, 0, 1],
+            "dspark_rounds": 3,
+            "dspark_accepted_tokens": 2,
+            "dspark_committed_tokens": 5,
+            "_backend_stats_dbg": {
+                "dspark_draft_graph_replays": 3,
+                "dspark_verify_graph_replays": 3,
+            },
+        }
+    )
+
+    assert snapshot["dspark_acceptance_histogram"] == [2, 0, 1]
+    assert snapshot["dspark_rounds"] == 3
+    assert snapshot["dspark_accepted_tokens"] == 2
+    assert snapshot["dspark_committed_tokens"] == 5
+    assert snapshot["dspark_draft_graph_replays"] == 3
+    assert snapshot["dspark_verify_graph_replays"] == 3
+
+
+def test_dspark_acceptance_delta_uses_explicit_engine_counters() -> None:
+    delta = diff_stats(
+        snapshot_stats(
+            {
+                "dspark_acceptance_histogram": [1, 0, 0],
+                "dspark_rounds": 1,
+                "dspark_accepted_tokens": 0,
+                "dspark_committed_tokens": 1,
+                "_backend_stats_dbg": {},
+            }
+        ),
+        snapshot_stats(
+            {
+                "dspark_acceptance_histogram": [1, 0, 1],
+                "dspark_rounds": 2,
+                "dspark_accepted_tokens": 2,
+                "dspark_committed_tokens": 4,
+                "_backend_stats_dbg": {},
+            }
+        ),
+    )
+
+    assert delta["dspark_rounds"] == 1
+    assert delta["dspark_accepted_tokens"] == 2
+    assert delta["dspark_committed_tokens"] == 3
+    assert delta["dspark_mean_accepted_per_round"] == 2.0
+    assert delta["dspark_mean_committed_per_round"] == 3.0
+
+
 def test_completion_evidence_is_exact_and_reproducible() -> None:
     text = "Qwen3.8 output \u2713"
 

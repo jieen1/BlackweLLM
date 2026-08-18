@@ -99,7 +99,9 @@ B1's layer-by-layer cosine gate exists to catch:
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -108,6 +110,7 @@ import torch.nn.functional as F
 from b12x.attention.gated_delta_rule import (
     fused_recurrent_gated_delta_rule_multistep,
     fused_recurrent_gated_delta_rule_multistep_indexed,
+    fused_recurrent_gated_delta_rule_multistep_indexed_gated,
 )
 from b12x.attention.paged._forward import paged_attention_forward
 from b12x.attention.paged._scratch import build_paged_attention_binding
@@ -136,11 +139,15 @@ from runtime.model._weight_loading import default_weight_loader
 from runtime.model.compressed_tensors_linear import (
     CompressedTensorsFP8ChannelLinear,
     CompressedTensorsNVFP4Linear,
+    FusedFP8ChannelGateUp,
     FusedFP8ChannelQKV,
     _native_w8a8_fp8_channel_enabled,
+    _native_w8a8_fp8_gate_up_enabled,
     _native_w8a8_library_for_cuda,
     fp8_channel_raw_execution_uses_all_layers,
 )
+from runtime.model.flashinfer_gdn import FlashInferGDNPrefill, load_chunk_gated_delta_rule
+from runtime.model.flashinfer_prefill import FlashInferPagedPrefill
 from runtime.model.modelopt_linear import ModelOptFP8Linear, ModelOptNVFP4Linear
 from runtime.model.plain_linear import PlainLinear
 
@@ -153,6 +160,73 @@ from runtime.model.plain_linear import PlainLinear
 #: digit-filler bench (100% acceptance) does not expose this, so the switch
 #: stays available for any future scale strategy (e.g. per-token dynamic).
 QSR_QWEN36_MTP_FP8_KV_ENV = "QSR_QWEN36_MTP_FP8_KV"
+
+# vLLM/SGLang's optimized GDN extend path prepares q/k and the headwise gates
+# outside the chunk kernel: q/k are normalized in FP32 and beta is sigmoid'ed
+# in FP32 before being stored.  The diagnostic switch remains explicit so a
+# regression can be bisected, but the reference-aligned path is the default;
+# the decode/recurrent path is intentionally unaffected.
+QSR_QWEN36_GDN_PREFILL_VLLM_PREP_ENV = "QSR_QWEN36_GDN_PREFILL_VLLM_PREP"
+
+# SGLang's Qwen hybrid full-attention prefill uses FlashInfer FA2.  ``auto``
+# selects it on CUDA when the optional package is available and retains the
+# existing SparkInfer path otherwise; ``sparkinfer`` is the explicit rollback
+# switch used for bisects and environments without the reference package.
+QSR_QWEN36_PREFILL_ATTN_BACKEND_ENV = "QSR_QWEN36_PREFILL_ATTN_BACKEND"
+
+# SGLang/vLLM's Qwen GDN extend path uses the FlashInfer SM120 CuTeDSL chunk
+# kernel.  ``auto`` selects it when the optional package is available and
+# retains the tested FLA path otherwise; ``fla`` is the explicit bisect switch.
+QSR_QWEN36_GDN_PREFILL_BACKEND_ENV = "QSR_QWEN36_GDN_PREFILL_BACKEND"
+
+# Temporary, opt-in CUDA synchronization for identifying which decoder layer
+# dominates a long prefill.  It is off by default and must not affect serving.
+QSR_QWEN36_PREFILL_LAYER_PROFILE_ENV = "QSR_QWEN36_PREFILL_LAYER_PROFILE"
+# Temporary, opt-in sub-layer timing.  The value is either ``1`` (all
+# layers) or a comma-separated list of decoder layer ids, e.g. ``3,4``.
+# Keeping this separate from the layer timer lets us isolate attention/GDN
+# from the dense MLP without synchronizing the production path.
+QSR_QWEN36_PREFILL_OP_PROFILE_ENV = "QSR_QWEN36_PREFILL_OP_PROFILE"
+
+# SGLang's CUDA Qwen3.5 path fuses Q/K Gemma RMSNorm, partial NeoX RoPE,
+# and q/gate deinterleaving, then applies the attention output gate in one
+# Triton launch.  Keep an explicit A/B switch because the old sequence of
+# kernels remains the correctness fallback for unusual dtypes/layouts.
+QSR_QWEN36_FUSED_ATTN_PREP_ENV = "QSR_QWEN36_FUSED_ATTN_PREP"
+
+logger = logging.getLogger("qwen_sm120_runtime.qwen36_model")
+
+
+def _prefill_op_profile_enabled(layer_idx: int, device: torch.device) -> bool:
+    if device.type != "cuda":
+        return False
+    value = os.environ.get(QSR_QWEN36_PREFILL_OP_PROFILE_ENV, "").strip()
+    if not value:
+        return False
+    if value == "1":
+        return True
+    try:
+        return layer_idx in {int(item.strip()) for item in value.split(",") if item.strip()}
+    except ValueError:
+        logger.warning("ignoring invalid %s=%r", QSR_QWEN36_PREFILL_OP_PROFILE_ENV, value)
+        return False
+
+
+def _gdn_prefill_l2norm(x: torch.Tensor) -> torch.Tensor:
+    """Use the FLA Triton L2-normalizer with vLLM/SGLang's output contract.
+
+    The editable FLA checkout used by this runtime returns ``(normalized,
+    rstd)`` while SGLang's copy returns just ``normalized``.  Accept both
+    shapes so the call site documents the algorithmic contract rather than a
+    fork-specific helper return type.
+    """
+
+    from fla.modules.l2norm import l2norm_fwd
+
+    normalized = l2norm_fwd(x.contiguous())
+    if isinstance(normalized, tuple):
+        normalized = normalized[0]
+    return normalized
 
 #: Checkpoint tensor suffixes this loader deliberately never consumes into
 #: a Parameter. Empty since the 2026-08-03 FP8 follow-up: ``ModelOptFP8Linear``
@@ -703,6 +777,15 @@ class Qwen36VerifyBatch:
     nvfp4_k_scales: list[torch.Tensor | None] | None = None
     nvfp4_v_codes: list[torch.Tensor | None] | None = None
     nvfp4_v_scales: list[torch.Tensor | None] | None = None
+    #: Ragged DSpark verify metadata.  ``input_ids``/``positions``/writes are
+    #: compact request-major rows with capacity ``batch * max_verify_tokens``;
+    #: the GDN path temporarily views those rows through the padded maps below
+    #: while full attention consumes ``cu_seqlens_q`` directly.
+    ragged: bool = False
+    max_verify_tokens: int | None = None
+    cu_seqlens_q: torch.Tensor | None = None
+    gdn_padded_to_compact: torch.Tensor | None = None
+    gdn_compact_to_padded: torch.Tensor | None = None
 
 
 @dataclass
@@ -818,6 +901,104 @@ class Qwen36GatedDeltaNet(nn.Module):
             shard_sizes=[self.num_v_heads, self.num_v_heads],
             bias=False,
         )
+        self._flashinfer_gdn: FlashInferGDNPrefill | None = None
+        self._flashinfer_gdn_checked = False
+
+    def _flashinfer_gdn_prefill_enabled(self, hidden_states: torch.Tensor) -> bool:
+        backend = os.environ.get(QSR_QWEN36_GDN_PREFILL_BACKEND_ENV, "auto").lower()
+        if backend not in {"auto", "flashinfer", "fla"}:
+            raise ValueError(
+                f"{QSR_QWEN36_GDN_PREFILL_BACKEND_ENV} must be auto, flashinfer, or fla; "
+                f"got {backend!r}"
+            )
+        if backend == "fla" or not hidden_states.is_cuda:
+            return False
+        if not self._flashinfer_gdn_checked:
+            self._flashinfer_gdn_checked = True
+            if load_chunk_gated_delta_rule() is not None:
+                self._flashinfer_gdn = FlashInferGDNPrefill()
+            elif backend == "flashinfer":
+                raise RuntimeError("FlashInfer GDN prefill was requested but is unavailable")
+        if self._flashinfer_gdn is None and backend == "flashinfer":
+            raise RuntimeError("FlashInfer GDN prefill was requested but is unavailable")
+        return self._flashinfer_gdn is not None
+
+    def _run_prefill_core(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        z: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        *,
+        state: GdnLayerState,
+    ) -> torch.Tensor:
+        """Run the SGLang-compatible chunk path or the legacy FLA fallback."""
+        use_flashinfer = self._flashinfer_gdn_prefill_enabled(query)
+        use_vllm_prefill_prep = (
+            os.environ.get(QSR_QWEN36_GDN_PREFILL_VLLM_PREP_ENV, "1") == "1"
+            and query.is_cuda
+        )
+        if use_vllm_prefill_prep:
+            query = _gdn_prefill_l2norm(query)
+            key = _gdn_prefill_l2norm(key)
+            beta = b.float().sigmoid()
+        else:
+            beta = b.sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+
+        initial_state = state.recurrent_state if state.has_previous_state else None
+        if use_flashinfer:
+            assert self._flashinfer_gdn is not None
+            batch_size, seq_len = query.shape[:2]
+            if initial_state is None:
+                # The pool is already zeroed on admission, but passing an
+                # explicit zero state keeps the FlashInfer state bridge and
+                # all subsequent chunks on one fixed shape/ownership path.
+                initial_state = state.recurrent_state
+            cu_seqlens = torch.arange(
+                0,
+                (batch_size + 1) * seq_len,
+                seq_len,
+                device=query.device,
+                dtype=torch.int64,
+            )
+            core_attn_out = self._flashinfer_gdn.run(
+                query=query,
+                key=key,
+                value=value,
+                log_decay=g,
+                beta=beta,
+                recurrent_state=initial_state,
+                cu_seqlens=cu_seqlens,
+                num_value_heads=self.num_v_heads,
+                head_k_dim=self.head_k_dim,
+                head_v_dim=self.head_v_dim,
+            )
+            state.has_previous_state = True
+        else:
+            if self.repeat > 1:
+                query = query.repeat_interleave(self.repeat, dim=2)
+                key = key.repeat_interleave(self.repeat, dim=2)
+            core_attn_out, last_state = chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=not use_vllm_prefill_prep,
+            )
+            state.recurrent_state.copy_(last_state)
+            state.has_previous_state = True
+
+        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)
+        z_flat = z.reshape(-1, self.head_v_dim)
+        core_attn_out = self.norm(core_attn_out, z_flat)
+        core_attn_out = core_attn_out.reshape(query.shape[0], query.shape[1], -1)
+        return self.out_proj(core_attn_out)
 
     def new_state(self, *, batch: int, device: torch.device, dtype: torch.dtype) -> GdnLayerState:
         if batch < 1:
@@ -903,12 +1084,25 @@ class Qwen36GatedDeltaNet(nn.Module):
         key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
-        beta = b.sigmoid()
+        # vLLM's Qwen GDN prefill and SGLang's FlashInfer/CuTeDSL extend
+        # paths normalize q/k before the chunk kernel and keep beta in FP32.
+        # That is numerically distinct from the historical eager path here:
+        # ``b.sigmoid()`` rounds beta to BF16 before FLA sees it.  Keep the
+        # The reference-aligned form is the default for CUDA prefill/extend.
+        # Set the variable to 0 only when bisecting a numerical or acceptance
+        # regression; single-token recurrent decode remains on the old path.
+        use_vllm_prefill_prep = (
+            os.environ.get(QSR_QWEN36_GDN_PREFILL_VLLM_PREP_ENV, "1") == "1"
+            and query.is_cuda
+            and not (state.has_previous_state and seq_len == 1)
+        )
+        if use_vllm_prefill_prep:
+            query = _gdn_prefill_l2norm(query)
+            key = _gdn_prefill_l2norm(key)
+            beta = b.float().sigmoid()
+        else:
+            beta = b.sigmoid()
         g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
-
-        if self.repeat > 1:
-            query = query.repeat_interleave(self.repeat, dim=2)
-            key = key.repeat_interleave(self.repeat, dim=2)
 
         initial_state = state.recurrent_state if state.has_previous_state else None
         if state.has_previous_state and seq_len == 1:
@@ -923,6 +1117,9 @@ class Qwen36GatedDeltaNet(nn.Module):
                 use_qk_l2norm_in_kernel=True,
             )
         else:
+            if self.repeat > 1:
+                query = query.repeat_interleave(self.repeat, dim=2)
+                key = key.repeat_interleave(self.repeat, dim=2)
             core_attn_out, last_state = chunk_gated_delta_rule(
                 query,
                 key,
@@ -931,7 +1128,7 @@ class Qwen36GatedDeltaNet(nn.Module):
                 beta=beta,
                 initial_state=initial_state,
                 output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
+                use_qk_l2norm_in_kernel=not use_vllm_prefill_prep,
             )
 
         # Cross-step BF16 rounding (B0-4/B0-7): FLA computes this step in
@@ -1055,12 +1252,42 @@ class Qwen36GatedDeltaNet(nn.Module):
         wrapper keeps that admission invariant at the batch boundary instead
         of silently applying one row's recurrence mode to another.
         """
+        batch_size, seq_len, _ = hidden_states.shape
+        mixed_qkvz = self.in_proj_qkvz(hidden_states)
+        mixed_qkv = mixed_qkvz[..., : self.conv_dim].transpose(1, 2)
+        z = mixed_qkvz[..., self.conv_dim :].reshape(
+            batch_size, seq_len, -1, self.head_v_dim
+        )
+        b, a = self.in_proj_ba(hidden_states).split(self.num_v_heads, dim=-1)
+
+        if has_previous_state:
+            # ``conv_state`` and ``mixed_qkv`` are both [B, C, T].  Keep the
+            # continuation window in that layout so this path does not make
+            # two transient [B, T, C] views and a second transpose before the
+            # causal convolution.
+            mixed_qkv = torch.cat([conv_state, mixed_qkv], dim=-1)
+        new_conv_state = F.pad(
+            mixed_qkv,
+            (self.conv_kernel_size - mixed_qkv.shape[-1], 0),
+        )
+        conv_state.copy_(new_conv_state)
+        mixed_qkv = self._conv1d_causal(mixed_qkv)
+        if has_previous_state:
+            mixed_qkv = mixed_qkv[:, :, -seq_len:]
+        mixed_qkv = mixed_qkv.transpose(1, 2)
+        query, key, value = torch.split(
+            mixed_qkv, [self.key_dim, self.key_dim, self.value_dim], dim=-1
+        )
+        query = query.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+
         state = GdnLayerState(
             conv_state=conv_state,
             recurrent_state=recurrent_state,
             has_previous_state=has_previous_state,
         )
-        return self.forward(hidden_states, state)
+        return self._run_prefill_core(query, key, value, z, b, a, state=state)
 
     def spec_forward(
         self,
@@ -1244,8 +1471,16 @@ class Qwen36GatedDeltaNet(nn.Module):
         key = key.reshape(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
 
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        fuse_indexed_gates = (
+            os.environ.get("QSR_QWEN36_GDN_FUSED_GATES", "0") == "1"
+            and batch_large_projections
+            and spec_destination_index is not None
+            and query.is_cuda
+            and query.dtype == torch.bfloat16
+        )
+        if not fuse_indexed_gates:
+            beta = b.sigmoid()
+            g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
 
         if self.repeat > 1:
             query = query.repeat_interleave(self.repeat, dim=2)
@@ -1310,16 +1545,30 @@ class Qwen36GatedDeltaNet(nn.Module):
             # than the K+1 recurrent-state clones this path exists to delete.
             if use_indexed_multistep:
                 assert spec_recurrent_pool is not None and spec_source_index is not None
-                core_attn_out = fused_recurrent_gated_delta_rule_multistep_indexed(
-                    query.contiguous(),
-                    key.contiguous(),
-                    value.contiguous(),
-                    g=g.contiguous(),
-                    beta=beta.contiguous(),
-                    state_pool=spec_recurrent_pool,
-                    source_index=spec_source_index,
-                    destination_index=spec_destination_index,
-                )
+                if fuse_indexed_gates:
+                    core_attn_out = fused_recurrent_gated_delta_rule_multistep_indexed_gated(
+                        query.contiguous(),
+                        key.contiguous(),
+                        value.contiguous(),
+                        a=a.contiguous(),
+                        b=b.contiguous(),
+                        A_log=self.A_log.float(),
+                        dt_bias=self.dt_bias,
+                        state_pool=spec_recurrent_pool,
+                        source_index=spec_source_index,
+                        destination_index=spec_destination_index,
+                    )
+                else:
+                    core_attn_out = fused_recurrent_gated_delta_rule_multistep_indexed(
+                        query.contiguous(),
+                        key.contiguous(),
+                        value.contiguous(),
+                        g=g.contiguous(),
+                        beta=beta.contiguous(),
+                        state_pool=spec_recurrent_pool,
+                        source_index=spec_source_index,
+                        destination_index=spec_destination_index,
+                    )
                 recurrent_states = None
             else:
                 core_attn_out, recurrent_states = fused_recurrent_gated_delta_rule_multistep(
@@ -2066,31 +2315,102 @@ class Qwen36BatchedExtendAttention:
         # one per layer would retain 16 copies of a BxQxH tensor and turn a
         # throughput optimisation into a long-context OOM.
         self.output = torch.empty(total_q, num_q_heads, head_dim, dtype=dtype, device=device)
-        max_work_items = PagedAttentionWorkspace.eager_extend_work_items_capacity(
-            max_total_q=total_q, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
-        )
-        self._workspace = PagedAttentionWorkspace.for_fixed_capacity(
-            mode="extend",
-            device=device,
-            dtype=dtype,
-            kv_dtype=kv_dtype,
-            num_q_heads=num_q_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim_qk=head_dim,
-            head_dim_vo=head_dim,
-            page_size=page_size,
-            max_total_q=total_q,
-            max_batch=batch,
-            max_page_table_width=pages_per_slot,
-            max_work_items=max_work_items,
-            max_partial_rows=0,
-            num_cache_pages=num_cache_pages,
-            use_cuda_graph=False,
-        )
-        self._plan_budget = PagedPlanBudget(
-            max_total_q=total_q,
-            max_batch=batch,
-            max_page_table_width=pages_per_slot,
+        self._flashinfer: FlashInferPagedPrefill | None = None
+        self._prefill_kv_lengths: tuple[int, ...] | None = None
+        self._prefill_metadata_generation = 0
+        requested_backend = os.environ.get(QSR_QWEN36_PREFILL_ATTN_BACKEND_ENV, "auto").lower()
+        if requested_backend not in {"auto", "flashinfer", "fa2", "sparkinfer", "b12x"}:
+            raise ValueError(
+                f"{QSR_QWEN36_PREFILL_ATTN_BACKEND_ENV} must be one of "
+                f"auto/flashinfer/fa2/sparkinfer/b12x, got {requested_backend!r}"
+            )
+        if device.type == "cuda" and requested_backend in {"auto", "flashinfer", "fa2"}:
+            try:
+                self._flashinfer = FlashInferPagedPrefill(
+                    batch=batch,
+                    tokens_per_slot=tokens_per_slot,
+                    num_q_heads=num_q_heads,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    page_size=page_size,
+                    pages_per_slot=pages_per_slot,
+                    num_cache_pages=num_cache_pages,
+                    dtype=dtype,
+                    kv_dtype=kv_dtype,
+                    device=device,
+                )
+            except (RuntimeError, ValueError, ImportError) as exc:
+                if requested_backend in {"flashinfer", "fa2"}:
+                    raise
+                logger.warning(
+                    "Qwen3.6 FlashInfer FA2 prefill unavailable; using SparkInfer: %s", exc
+                )
+        self.prefill_backend = "flashinfer" if self._flashinfer is not None else "sparkinfer"
+        self._workspace: PagedAttentionWorkspace | None = None
+        self._plan_budget: PagedPlanBudget | None = None
+        if self._flashinfer is None:
+            max_work_items = PagedAttentionWorkspace.eager_extend_work_items_capacity(
+                max_total_q=total_q, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads
+            )
+            self._workspace = PagedAttentionWorkspace.for_fixed_capacity(
+                mode="extend",
+                device=device,
+                dtype=dtype,
+                kv_dtype=kv_dtype,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim,
+                head_dim_vo=head_dim,
+                page_size=page_size,
+                max_total_q=total_q,
+                max_batch=batch,
+                max_page_table_width=pages_per_slot,
+                max_work_items=max_work_items,
+                max_partial_rows=0,
+                num_cache_pages=num_cache_pages,
+                use_cuda_graph=False,
+            )
+            self._plan_budget = PagedPlanBudget(
+                max_total_q=total_q,
+                max_batch=batch,
+                max_page_table_width=pages_per_slot,
+            )
+
+    def set_kv_lengths(self, lengths: list[int] | tuple[int, ...]) -> None:
+        """Record host-known KV lengths for FlashInfer's compact page list."""
+        normalized = tuple(int(length) for length in lengths)
+        if len(normalized) != self.batch:
+            raise ValueError(
+                f"batched extend expected {self.batch} KV lengths, got {len(normalized)}"
+            )
+        self._prefill_kv_lengths = normalized
+        self._prefill_metadata_generation += 1
+
+    def warmup_flashinfer(
+        self,
+        *,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        kv_length: int,
+    ) -> None:
+        """Compile and run the configured FA2 shape before serving traffic."""
+        if self._flashinfer is None:
+            return
+        self.page_table.copy_(page_table[: self.batch])
+        self.cache_seqlens.fill_(kv_length)
+        self.set_kv_lengths([kv_length] * self.batch)
+        self._flashinfer.run(
+            q=torch.zeros_like(self.output),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            output=self.output,
+            page_table=self.page_table,
+            kv_lengths=self._prefill_kv_lengths,
+            qo_indptr=self.cu_seqlens_q,
+            generation=self._prefill_metadata_generation,
+            k_scale=None,
+            v_scale=None,
         )
 
     def forward(
@@ -2106,6 +2426,25 @@ class Qwen36BatchedExtendAttention:
         total_q = self.batch * self.tokens_per_slot
         if q.shape[0] != total_q:
             raise ValueError(f"batched extend expected {total_q} query rows, got {q.shape[0]}")
+        if self._flashinfer is not None:
+            if self._prefill_kv_lengths is None:
+                raise RuntimeError(
+                    "FlashInfer prefill metadata was not initialized; "
+                    "call set_kv_lengths before the first forward"
+                )
+            self._flashinfer.run(
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                output=output,
+                page_table=self.page_table,
+                kv_lengths=self._prefill_kv_lengths,
+                qo_indptr=self.cu_seqlens_q,
+                generation=self._prefill_metadata_generation,
+                k_scale=k_descale,
+                v_scale=v_descale,
+            )
+            return
         plan = create_paged_plan(
             q,
             k_cache,
@@ -2119,6 +2458,7 @@ class Qwen36BatchedExtendAttention:
             plan_budget=self._plan_budget,
         )
         ws = self._workspace
+        assert ws is not None
         ws._ensure_capacity(plan)
         ws._copy_runtime_metadata(self.page_table, self.cache_seqlens, self.cu_seqlens_q)
         ws._copy_plan_metadata(plan)
@@ -2715,7 +3055,9 @@ class Qwen36Attention(nn.Module):
             print(f"[nvfp4-write] rows={rows} {( _t.perf_counter()-_t0)*1e3:.2f}ms", flush=True)
         return k_un, v_un
 
-    def _qkv_proj(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _qkv_proj(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """q/gate, k, v projections -- one fused native W8A8 launch when possible.
 
         Mirrors the three projections' own ``forward_native_w8a8`` routing
@@ -2986,25 +3328,63 @@ class Qwen36Attention(nn.Module):
             )
         total_q = batch_size * seq_len
         q_and_gate, key_raw, value_raw = self._qkv_proj(hidden_states)
-        q_and_gate = q_and_gate.view(
-            batch_size, seq_len, self.num_heads, self.head_dim * 2
+        use_fused_prepare = (
+            hidden_states.is_cuda
+            and hidden_states.dtype in (torch.bfloat16, torch.float16)
+            and os.environ.get(QSR_QWEN36_FUSED_ATTN_PREP_ENV, "1") != "0"
         )
-        query, gate = torch.chunk(q_and_gate, 2, dim=-1)
-        gate = gate.reshape(batch_size, seq_len, -1)
-        kv_shape = (batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        query = self.q_norm(query).reshape(total_q, self.num_heads, self.head_dim)
-        key = self.k_norm(key_raw.view(*kv_shape)).reshape(
-            total_q, self.num_kv_heads, self.head_dim
-        )
-        value = (
-            value_raw.view(*kv_shape).reshape(total_q, self.num_kv_heads, self.head_dim)
-        )
-        query_flat = query.reshape(total_q, self.num_heads * self.head_dim).contiguous()
-        key_flat = key.reshape(total_q, self.num_kv_heads * self.head_dim).contiguous()
-        apply_rotary_embedding_inplace(positions, query_flat, self.head_dim, cos_sin_cache)
-        apply_rotary_embedding_inplace(positions, key_flat, self.head_dim, cos_sin_cache)
-        query = query_flat.view(total_q, self.num_heads, self.head_dim)
-        key = key_flat.view(total_q, self.num_kv_heads, self.head_dim)
+        if use_fused_prepare:
+            try:
+                from runtime.kernels.qwen36_fused_attn import (
+                    fused_qk_rmsnorm_rope_gate,
+                )
+
+                q_gate = q_and_gate.reshape(total_q, self.num_heads, 2 * self.head_dim)
+                key_raw_3d = key_raw.reshape(total_q, self.num_kv_heads, self.head_dim)
+                query_flat, key_flat, gate_flat = fused_qk_rmsnorm_rope_gate(
+                    q_gate,
+                    key_raw_3d,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    cos_sin_cache,
+                    positions,
+                    self.eps,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    cos_sin_cache.shape[-1],
+                )
+                query = query_flat.view(total_q, self.num_heads, self.head_dim)
+                key = key_flat.view(total_q, self.num_kv_heads, self.head_dim)
+                value = value_raw.reshape(total_q, self.num_kv_heads, self.head_dim)
+            except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
+                logger.warning(
+                    "Qwen3.6 fused attention prefill prepare unavailable at layer %s; "
+                    "using fallback: %s",
+                    self.layer_idx,
+                    exc,
+                )
+                use_fused_prepare = False
+        if not use_fused_prepare:
+            q_and_gate = q_and_gate.view(
+                batch_size, seq_len, self.num_heads, self.head_dim * 2
+            )
+            query, gate = torch.chunk(q_and_gate, 2, dim=-1)
+            gate = gate.reshape(batch_size, seq_len, -1)
+            kv_shape = (batch_size, seq_len, self.num_kv_heads, self.head_dim)
+            query = self.q_norm(query).reshape(total_q, self.num_heads, self.head_dim)
+            key = self.k_norm(key_raw.view(*kv_shape)).reshape(
+                total_q, self.num_kv_heads, self.head_dim
+            )
+            value = value_raw.view(*kv_shape).reshape(
+                total_q, self.num_kv_heads, self.head_dim
+            )
+            query_flat = query.reshape(total_q, self.num_heads * self.head_dim).contiguous()
+            key_flat = key.reshape(total_q, self.num_kv_heads * self.head_dim).contiguous()
+            apply_rotary_embedding_inplace(positions, query_flat, self.head_dim, cos_sin_cache)
+            apply_rotary_embedding_inplace(positions, key_flat, self.head_dim, cos_sin_cache)
+            query = query_flat.view(total_q, self.num_heads, self.head_dim)
+            key = key_flat.view(total_q, self.num_kv_heads, self.head_dim)
         _rt = self._kv_nvfp4_roundtrip(
             key, value, nvfp4_k_codes, nvfp4_k_scales, nvfp4_v_codes, nvfp4_v_scales, write_index
         )
@@ -3023,7 +3403,13 @@ class Qwen36Attention(nn.Module):
             k_descale=self.k_scale,
             v_descale=self.v_scale,
         )
-        attn_out = output.reshape(batch_size, seq_len, -1) * torch.sigmoid(gate)
+        if use_fused_prepare:
+            from runtime.kernels.qwen36_fused_attn import fused_sigmoid_mul
+
+            fused_sigmoid_mul(output.reshape(total_q, -1), gate_flat)
+            attn_out = output.reshape(batch_size, seq_len, -1)
+        else:
+            attn_out = output.reshape(batch_size, seq_len, -1) * torch.sigmoid(gate)
         return self.o_proj(attn_out)
 
     def verify_batch(
@@ -3127,6 +3513,78 @@ class Qwen36Attention(nn.Module):
         attn_out = output.reshape(batch_size, seq_len, -1)
         attn_out = attn_out * torch.sigmoid(gate)
         return self.o_proj(attn_out)
+
+    def verify_ragged_batch(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor,
+        *,
+        k_pool: torch.Tensor,
+        v_pool: torch.Tensor,
+        write_index: torch.Tensor,
+        attn: Qwen36VerifyGraphAttention,
+        output: torch.Tensor,
+        nvfp4_k_codes: torch.Tensor | None = None,
+        nvfp4_k_scales: torch.Tensor | None = None,
+        nvfp4_v_codes: torch.Tensor | None = None,
+        nvfp4_v_scales: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run one compact request-major ragged verify attention.
+
+        The leading dimension is the graph capacity, not ``B * Q`` with a
+        request-local padded width.  ``Qwen36VerifyGraphAttention`` owns the
+        dynamic query indptr, so its paged kernel consumes only the valid
+        prefix of each request while the graph keeps a stable allocation for
+        the largest possible batch.  Rows after the indptr end are harmless
+        scratch rows used only to keep the captured tensor shapes static.
+        """
+        if hidden_states.ndim != 2:
+            raise ValueError(
+                "Qwen36 ragged verify hidden states must be [capacity, H], "
+                f"got {tuple(hidden_states.shape)}"
+            )
+        capacity = int(hidden_states.shape[0])
+        if positions.shape != (capacity,) or write_index.shape != (capacity,):
+            raise ValueError("Qwen36 ragged verify positions/write_index must match capacity")
+        if output.shape[0] != capacity:
+            raise ValueError("Qwen36 ragged attention output must match hidden capacity")
+
+        q_and_gate, key_raw, value_raw = self._qkv_proj(hidden_states)
+        q_and_gate = q_and_gate.view(capacity, self.num_heads, self.head_dim * 2)
+        query, gate = torch.chunk(q_and_gate, 2, dim=-1)
+        query = self.q_norm(query)
+        key = self.k_norm(key_raw.view(capacity, self.num_kv_heads, self.head_dim))
+        value = value_raw.view(capacity, self.num_kv_heads, self.head_dim)
+
+        query_flat = query.reshape(capacity, self.num_heads * self.head_dim).contiguous()
+        key_flat = key.reshape(capacity, self.num_kv_heads * self.head_dim).contiguous()
+        apply_rotary_embedding_inplace(positions, query_flat, self.head_dim, cos_sin_cache)
+        apply_rotary_embedding_inplace(positions, key_flat, self.head_dim, cos_sin_cache)
+        query = query_flat.view(capacity, self.num_heads, self.head_dim)
+        key = key_flat.view(capacity, self.num_kv_heads, self.head_dim)
+
+        _rt = self._kv_nvfp4_roundtrip(
+            key, value, nvfp4_k_codes, nvfp4_k_scales, nvfp4_v_codes, nvfp4_v_scales, write_index
+        )
+        if _rt is not None:
+            key, value = _rt
+        k_to_store, v_to_store = _kv_to_cache_dtype(
+            key, value, cache_dtype=k_pool.dtype, k_scale=self.k_scale, v_scale=self.v_scale
+        )
+        k_pool.view(-1, self.num_kv_heads, self.head_dim)[write_index] = k_to_store
+        v_pool.view(-1, self.num_kv_heads, self.head_dim)[write_index] = v_to_store
+        if nvfp4_k_codes is not None:
+            raise RuntimeError("NVFP4 KV attention is not wired for ragged DSpark verify")
+        attn.forward(
+            q=query,
+            k_cache=k_pool,
+            v_cache=v_pool,
+            output=output,
+            k_descale=self.k_scale,
+            v_descale=self.v_scale,
+        )
+        return self.o_proj(output * torch.sigmoid(gate))
 
 
 # ---------------------------------------------------------------------------
@@ -3299,6 +3757,7 @@ class Qwen36MLP(nn.Module):
         weight_prefix: str | None = None,
     ) -> None:
         super().__init__()
+        self.layer_idx = layer_idx
         hidden_size = config["hidden_size"]
         intermediate_size = config["intermediate_size"]
         self.hidden_size = hidden_size
@@ -3343,10 +3802,19 @@ class Qwen36MLP(nn.Module):
             and isinstance(self.up_proj, (ModelOptNVFP4Linear, CompressedTensorsNVFP4Linear))
             and isinstance(self.down_proj, (ModelOptNVFP4Linear, CompressedTensorsNVFP4Linear))
         )
+        # vLLM's Qwen3NextMLP uses one merged gate/up projection.  The
+        # corresponding runtime fusion is built lazily only for the native
+        # FP8-channel route; NVFP4 MLPs use their existing W4A4/W4A16 paths.
+        self._fused_fp8_gate_up: FusedFP8ChannelGateUp | None = None
         self._w4a16_prepared = None  # built lazily, once, on first fused forward
         self._w4a4_prepared = None  # W4A4 blockscaled operands (opt-in, prefill)
         self._w4a4_unavailable = False  # checkpoint lacks activation global scales
         self._w4a4_share_gate_up_quant = False
+        # SGLang's Qwen3.5/Qwen3.8 MLP uses one merged gate+up projection
+        # (MergedColumnParallelLinear).  Keep the W4A4 equivalent explicit so
+        # a checkpoint with mismatched calibration scales can still use the
+        # old two-GEMM fallback without silently changing its numerics.
+        self._w4a4_gate_up_fused = False
         # ``run_w4a16_moe`` takes caller-owned route, output, and GEMM scratch.
         # Decode/verify used to recreate all of them for every NVFP4 layer on
         # every replay. Cache only CUDA-graph-sized M values so each captured
@@ -3537,6 +4005,7 @@ class Qwen36MLP(nn.Module):
         )
 
         prepared: dict[str, tuple] = {}
+        raw_components: dict[str, tuple[torch.Tensor, ...]] = {}
         for name in ("gate", "up", "down"):
             lin = getattr(self, f"{name}_proj")
             comps = getattr(lin, "nvfp4_w4a4_components_for_fuse", None)
@@ -3547,6 +4016,7 @@ class Qwen36MLP(nn.Module):
             if igs.numel() == 0 or not torch.isfinite(igs.float()).all():
                 self._w4a4_unavailable = True
                 return
+            raw_components[name] = (w_packed, w_scale, w_gs, igs)
             out_dim, in_dim = w_packed.shape[0], w_packed.shape[1] * 2
             # NO weight copy: the historical implementation kept exactly one
             # NVFP4 weight residency. ``unsqueeze(-1)`` on a contiguous
@@ -3564,10 +4034,62 @@ class Qwen36MLP(nn.Module):
             )
             alpha = (1.0 / (igs.to(torch.float32) * w_gs.to(torch.float32))).reshape(1)
             prepared[name] = (b_p, b_sf, alpha, igs.to(torch.float32).reshape(1))
-        self._w4a4_share_gate_up_quant = bool(
-            prepared["gate"][3].item() == prepared["up"][3].item()
+
+        # Match SGLang's merged FC1.  The blockscaled kernel accepts one
+        # weight operand with [gate rows; up rows], so one launch replaces the
+        # two otherwise identical input-quantized GEMMs.  Both halves must
+        # share input and weight calibration; if they do not, keep the exact
+        # per-projection path below rather than approximating one scale.
+        gate_w, gate_scale, gate_gs, gate_igs = raw_components["gate"]
+        up_w, up_scale, up_gs, up_igs = raw_components["up"]
+        can_fuse_gate_up = (
+            gate_w.shape == up_w.shape
+            and gate_scale.shape == up_scale.shape
+            and torch.equal(gate_gs.reshape(()), up_gs.reshape(()))
+            and torch.equal(gate_igs.reshape(()), up_igs.reshape(()))
+            and torch.equal(prepared["gate"][2], prepared["up"][2])
+        )
+        if can_fuse_gate_up:
+            gate_up_w = torch.cat((gate_w, up_w), dim=0).contiguous().unsqueeze(-1)
+            gate_up_scale = as_grouped_scale_view(
+                swizzle_block_scale(
+                    torch.cat((gate_scale, up_scale), dim=0)
+                    .unsqueeze(0)
+                    .contiguous()
+                ).view(torch.uint8),
+                gate_w.shape[0] * 2,
+                gate_w.shape[1] * 2,
+            )
+            prepared["gate_up"] = (
+                gate_up_w,
+                gate_up_scale,
+                prepared["gate"][2],
+                prepared["gate"][3],
+            )
+            # Drop the views into the two raw tensors before optionally
+            # releasing their Parameter storage.  The merged packed weights
+            # and merged block scales above are independent allocations.
+            del prepared["gate"], prepared["up"]
+            self._w4a4_gate_up_fused = True
+            if not self._keep_raw_nvfp4_weights:
+                self.gate_proj.free_nvfp4_raw_params()
+                self.up_proj.free_nvfp4_raw_params()
+                if gate_w.device.type == "cuda":
+                    torch.cuda.empty_cache()
+        del raw_components
+        self._w4a4_share_gate_up_quant = (
+            False
+            if self._w4a4_gate_up_fused
+            else prepared["gate"][3].item() == prepared["up"][3].item()
         )
         self._w4a4_prepared = prepared
+        if os.environ.get("QSR_QWEN36_MLP_PROFILE", "0") == "1":
+            logger.info(
+                "qwen36_mlp_w4a4 layer=%s gate_up_fused=%s shared_input_scale=%s",
+                self.layer_idx,
+                self._w4a4_gate_up_fused,
+                self._w4a4_share_gate_up_quant,
+            )
 
     def _forward_w4a4_blockscaled(self, x: torch.Tensor) -> torch.Tensor:
         """True W4A4 NVFP4 MLP (both operands quantized, FP4 tensor-core
@@ -3613,13 +4135,18 @@ class Qwen36MLP(nn.Module):
                 expected_m=m,
             )[:, :, 0]
 
-        a_gate_p, a_gate_sf = quant_operand(x2d, prepared["gate"][3])
-        gate = gemm("gate", a_gate_p, a_gate_sf)
-        if self._w4a4_share_gate_up_quant:
-            up = gemm("up", a_gate_p, a_gate_sf)
+        if self._w4a4_gate_up_fused:
+            a_gate_up_p, a_gate_up_sf = quant_operand(x2d, prepared["gate_up"][3])
+            gate_up = gemm("gate_up", a_gate_up_p, a_gate_up_sf)
+            gate, up = gate_up.chunk(2, dim=-1)
         else:
-            a_up_p, a_up_sf = quant_operand(x2d, prepared["up"][3])
-            up = gemm("up", a_up_p, a_up_sf)
+            a_gate_p, a_gate_sf = quant_operand(x2d, prepared["gate"][3])
+            gate = gemm("gate", a_gate_p, a_gate_sf)
+            if self._w4a4_share_gate_up_quant:
+                up = gemm("up", a_gate_p, a_gate_sf)
+            else:
+                a_up_p, a_up_sf = quant_operand(x2d, prepared["up"][3])
+                up = gemm("up", a_up_p, a_up_sf)
         inter = F.silu(gate) * up
         a_down_p, a_down_sf = quant_operand(inter.contiguous(), prepared["down"][3])
         out = gemm("down", a_down_p, a_down_sf)
@@ -3710,6 +4237,38 @@ class Qwen36MLP(nn.Module):
         )
         return out.reshape(*orig_shape[:-1], self.hidden_size)
 
+    def _forward_native_fp8_gate_up(self, x: torch.Tensor) -> torch.Tensor | None:
+        """Run vLLM-style merged gate/up W8A8 when the raw route is active."""
+        if (
+            x.device.type != "cuda"
+            or self._nvfp4_fused
+            or not _native_w8a8_fp8_channel_enabled()
+            or not _native_w8a8_fp8_gate_up_enabled()
+            or (
+                self.gate_proj.output_size != 17408
+                and not fp8_channel_raw_execution_uses_all_layers()
+            )
+            or not isinstance(self.gate_proj, CompressedTensorsFP8ChannelLinear)
+            or not isinstance(self.up_proj, CompressedTensorsFP8ChannelLinear)
+        ):
+            return None
+        if self._fused_fp8_gate_up is None:
+            try:
+                fused = FusedFP8ChannelGateUp(self.gate_proj, self.up_proj)
+                fused._ensure()
+            except (RuntimeError, ValueError, TypeError, AttributeError):
+                self._fused_fp8_gate_up = None
+            else:
+                self._fused_fp8_gate_up = fused
+        if self._fused_fp8_gate_up is None:
+            return None
+        library = _native_w8a8_library_for_cuda()
+        if library is None:
+            return None
+        gate_up = self._fused_fp8_gate_up.forward_native(x, library)
+        gate, up = torch.chunk(gate_up, 2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._nvfp4_fused:
             if _w4a4_all_rows_enabled() and _mlp_w4a4_prefill_enabled():
@@ -3732,6 +4291,9 @@ class Qwen36MLP(nn.Module):
                 if rows >= _W4A4_PREFILL_MIN_ROWS:
                     return self._forward_w4a4_blockscaled(x)
             return self._forward_w4a16_fused(x)
+        fused_gate_up = self._forward_native_fp8_gate_up(x)
+        if fused_gate_up is not None:
+            return fused_gate_up
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -3866,11 +4428,26 @@ class Qwen36DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One homogeneous multi-slot extend layer over pooled state."""
         i = self.layer_idx
+        profile_ops = _prefill_op_profile_enabled(i, hidden_states.device)
+        op_times: dict[str, float] = {}
+
+        def mark(name: str, started: float) -> None:
+            if profile_ops:
+                torch.cuda.synchronize(hidden_states.device)
+                op_times[name] = (time.perf_counter() - started) * 1000.0
+
+        if profile_ops:
+            torch.cuda.synchronize(hidden_states.device)
+            op_started = time.perf_counter()
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        mark("input_norm", op_started if profile_ops else 0.0)
+
+        if profile_ops:
+            op_started = time.perf_counter()
         if self.layer_type == "linear_attention":
             slot_index = batch.slot_index
             conv = batch.conv_pools[i].index_select(0, slot_index)
@@ -3906,8 +4483,29 @@ class Qwen36DecoderLayer(nn.Module):
                     None if batch.nvfp4_v_scales is None else batch.nvfp4_v_scales[i]
                 ),
             )
+        mark("attention", op_started if profile_ops else 0.0)
+
+        if profile_ops:
+            op_started = time.perf_counter()
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        mark("post_norm", op_started if profile_ops else 0.0)
+
+        if profile_ops:
+            op_started = time.perf_counter()
         hidden_states = self.mlp(hidden_states)
+        mark("mlp", op_started if profile_ops else 0.0)
+        if profile_ops:
+            logger.info(
+                "qwen36_prefill_ops layer=%d kind=%s tokens=%d input_norm_ms=%.3f "
+                "attention_ms=%.3f post_norm_ms=%.3f mlp_ms=%.3f",
+                i,
+                self.layer_type,
+                hidden_states.shape[1],
+                op_times["input_norm"],
+                op_times["attention"],
+                op_times["post_norm"],
+                op_times["mlp"],
+            )
         return hidden_states, residual
 
 
@@ -4150,6 +4748,18 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         )
         self.norm = Qwen36RMSNorm(self.hidden_size, eps=config["rms_norm_eps"])
 
+        # DSpark uses post-layer residual states at the target layer ids from
+        # the external draft config (the same 1-based convention as the
+        # existing Laguna DFlash aux-state path).  Keep this opt-in: ordinary
+        # Qwen/MTP forwards must not retain five extra [tokens, hidden]
+        # tensors.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
+        # Bounded, opt-in cross-engine diagnostics.  This is intentionally
+        # separate from ``aux_hidden_state_layers``: DSpark needs exactly five
+        # taps for its projector, while a numerical comparison may need every
+        # post-layer residual state without changing the model contract.
+        self._debug_last_all_layer_hidden: list[torch.Tensor] | None = None
+
         rope_params = config["rope_parameters"]
         assert rope_params.get("rope_type", "default") == "default", (
             "B0-6: mrope only degenerates to standard 1D RoPE for rope_type "
@@ -4174,6 +4784,27 @@ class Qwen36TextModelSelfBuilt(nn.Module):
     def head_dim_for_rope(self) -> int:
         return self.config["head_dim"]
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Select 1-based post-layer outputs for an external draft model."""
+
+        if any(layer_id <= 0 or layer_id > self.num_hidden_layers for layer_id in layers):
+            raise ValueError(
+                f"aux hidden layer ids must be in 1..{self.num_hidden_layers}, got {layers}"
+            )
+        self.aux_hidden_state_layers = tuple(layers)
+
+    def _maybe_add_aux_hidden_state(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> None:
+        if layer_id in self.aux_hidden_state_layers:
+            aux_hidden_states.append(
+                hidden_states + residual if residual is not None else hidden_states
+            )
+
     def new_generation_state(
         self, *, device: torch.device, dtype: torch.dtype
     ) -> Qwen36GenerationState:
@@ -4194,6 +4825,7 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         state: Qwen36GenerationState,
         *,
         capture_hidden_states: bool = False,
+        capture_aux_hidden_states: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         assert input_ids.dim() == 2 and input_ids.shape[0] == 1, "B1 only supports batch=1"
         seq_len = input_ids.shape[1]
@@ -4206,6 +4838,14 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         cos_sin_cache = self.cos_sin_cache.to(hidden_states.device)
 
         per_layer_hidden: list[torch.Tensor] = []
+        aux_hidden_states: list[torch.Tensor] = []
+        debug_all_layers = (
+            capture_aux_hidden_states
+            and os.environ.get("QSR_DSPARK_DUMP_ALL_LAYERS")
+            not in (None, "", "0")
+        )
+        debug_row_cap = max(1, int(os.environ.get("QSR_DSPARK_DUMP_ALL_LAYERS_ROWS", "8")))
+        debug_all: list[torch.Tensor] = []
         residual: torch.Tensor | None = None
         for layer in self.layers:
             hidden_states, residual = layer(
@@ -4218,16 +4858,36 @@ class Qwen36TextModelSelfBuilt(nn.Module):
             )
             if capture_hidden_states:
                 per_layer_hidden.append(hidden_states)
+            if capture_aux_hidden_states:
+                self._maybe_add_aux_hidden_state(
+                    aux_hidden_states,
+                    layer.layer_idx + 1,
+                    hidden_states,
+                    residual,
+                )
+            if debug_all_layers:
+                assert residual is not None
+                debug_all.append(
+                    (hidden_states + residual)[..., :debug_row_cap, :].detach().clone()
+                )
 
         assert residual is not None
+        self._debug_last_all_layer_hidden = debug_all if debug_all_layers else None
         hidden_states, _ = self.norm(hidden_states, residual)
         state.num_tokens_seen = past_len + seq_len
 
+        if capture_aux_hidden_states:
+            return hidden_states, aux_hidden_states
         if capture_hidden_states:
             return hidden_states, per_layer_hidden
         return hidden_states
 
-    def prefill_batch(self, batch: Qwen36PrefillBatch) -> torch.Tensor:
+    def prefill_batch(
+        self,
+        batch: Qwen36PrefillBatch,
+        *,
+        capture_aux_hidden_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """Run the pool-backed uniform batched prefill body.
 
         State-length bookkeeping remains in :class:`Qwen36SlotPool`: this
@@ -4237,12 +4897,38 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         hidden_states = self.embed_tokens(batch.input_ids)
         cos_sin_cache = self.cos_sin_cache
         residual: torch.Tensor | None = None
+        aux_hidden_states: list[torch.Tensor] = []
         for layer in self.layers:
+            profile_layer = (
+                os.environ.get(QSR_QWEN36_PREFILL_LAYER_PROFILE_ENV, "0") == "1"
+                and hidden_states.is_cuda
+            )
+            if profile_layer:
+                torch.cuda.synchronize(hidden_states.device)
+                layer_t0 = time.perf_counter()
             hidden_states, residual = layer.prefill_batch(
                 hidden_states, residual, cos_sin_cache, batch
             )
+            if profile_layer:
+                torch.cuda.synchronize(hidden_states.device)
+                logger.info(
+                    "qwen36_prefill_layer layer=%d kind=%s tokens=%d ms=%.3f",
+                    layer.layer_idx,
+                    layer.layer_type,
+                    hidden_states.shape[1],
+                    (time.perf_counter() - layer_t0) * 1000.0,
+                )
+            if capture_aux_hidden_states:
+                self._maybe_add_aux_hidden_state(
+                    aux_hidden_states,
+                    layer.layer_idx + 1,
+                    hidden_states,
+                    residual,
+                )
         assert residual is not None
         hidden_states, _ = self.norm(hidden_states, residual)
+        if capture_aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def verify_forward(
@@ -4251,7 +4937,11 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         state: Qwen36GenerationState,
         *,
         spec_state_rows: dict[int, list[GdnLayerState] | list[list[GdnLayerState]]] | None = None,
-    ) -> tuple[torch.Tensor, dict[int, list[GdnLayerState]] | None]:
+        capture_aux_hidden_states: bool = False,
+    ) -> (
+        tuple[torch.Tensor, dict[int, list[GdnLayerState]] | None]
+        | tuple[torch.Tensor, dict[int, list[GdnLayerState]] | None, list[torch.Tensor]]
+    ):
         """B3: run ``K`` draft tokens through every layer in ONE pass,
         WITHOUT committing ``state`` -- the target-model half of MTP verify.
 
@@ -4305,6 +4995,7 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         gdn_snapshots: dict[int, list[GdnLayerState]] | None = (
             {} if spec_state_rows is None else None
         )
+        aux_hidden_states: list[torch.Tensor] = []
         residual: torch.Tensor | None = None
         for layer in self.layers:
             if residual is None:
@@ -4338,9 +5029,18 @@ class Qwen36TextModelSelfBuilt(nn.Module):
 
             hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
             hidden_states = layer.mlp(hidden_states)
+            if capture_aux_hidden_states:
+                self._maybe_add_aux_hidden_state(
+                    aux_hidden_states,
+                    layer.layer_idx + 1,
+                    hidden_states,
+                    residual,
+                )
 
         assert residual is not None
         hidden_states, _ = self.norm(hidden_states, residual)
+        if capture_aux_hidden_states:
+            return hidden_states, gdn_snapshots, aux_hidden_states
         return hidden_states, gdn_snapshots
 
     def verify_batch(
@@ -4348,7 +5048,12 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         batch: Qwen36VerifyBatch,
         *,
         capture_hidden_states: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        capture_aux_hidden_states: bool = False,
+    ) -> (
+        torch.Tensor
+        | tuple[torch.Tensor, list[torch.Tensor]]
+        | tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]
+    ):
         """Run the graph-safe K-token target verify forward.
 
         GDN rows and full-attention metadata are supplied by the persistent
@@ -4359,12 +5064,13 @@ class Qwen36TextModelSelfBuilt(nn.Module):
         hidden_states = self.embed_tokens(batch.input_ids)
         cos_sin_cache = self.cos_sin_cache.to(hidden_states.device)
         residual: torch.Tensor | None = None
-        # This is deliberately an eager-only diagnostic seam.  CUDA-graph
-        # capture always takes the default, tensor-only return path; the
-        # optional list lets the historical/current comparison capture the
-        # exact pooled K+1 verify body without substituting ``verify_forward``
-        # (whose cache/GDN addressing is a different execution form).
+        # Both optional capture seams are kept on the graph-safe body.  MTP
+        # uses the per-layer list for diagnostics; DSpark uses the selected
+        # post-layer taps inside its captured verify graph.  Neither path
+        # substitutes ``verify_forward``: that method has different
+        # cache/GDN addressing and is the eager fallback only.
         per_layer_hidden: list[torch.Tensor] = []
+        aux_hidden_states: list[torch.Tensor] = []
         for layer in self.layers:
             if residual is None:
                 residual = hidden_states
@@ -4421,24 +5127,180 @@ class Qwen36TextModelSelfBuilt(nn.Module):
                     attn=driver,
                     output=output,
                     nvfp4_k_codes=(
-                        None if batch.nvfp4_k_codes is None else batch.nvfp4_k_codes[layer.layer_idx]
+                        None
+                        if batch.nvfp4_k_codes is None
+                        else batch.nvfp4_k_codes[layer.layer_idx]
                     ),
                     nvfp4_k_scales=(
-                        None if batch.nvfp4_k_scales is None else batch.nvfp4_k_scales[layer.layer_idx]
+                        None
+                        if batch.nvfp4_k_scales is None
+                        else batch.nvfp4_k_scales[layer.layer_idx]
                     ),
                     nvfp4_v_codes=(
-                        None if batch.nvfp4_v_codes is None else batch.nvfp4_v_codes[layer.layer_idx]
+                        None
+                        if batch.nvfp4_v_codes is None
+                        else batch.nvfp4_v_codes[layer.layer_idx]
                     ),
                     nvfp4_v_scales=(
-                        None if batch.nvfp4_v_scales is None else batch.nvfp4_v_scales[layer.layer_idx]
+                        None
+                        if batch.nvfp4_v_scales is None
+                        else batch.nvfp4_v_scales[layer.layer_idx]
                     ),
                 )
             hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
             hidden_states = layer.mlp(hidden_states)
             if capture_hidden_states:
                 per_layer_hidden.append(hidden_states)
+            if capture_aux_hidden_states:
+                self._maybe_add_aux_hidden_state(
+                    aux_hidden_states,
+                    layer.layer_idx + 1,
+                    hidden_states,
+                    residual,
+                )
         assert residual is not None
         hidden_states, _ = self.norm(hidden_states, residual)
+        if capture_hidden_states and capture_aux_hidden_states:
+            return hidden_states, per_layer_hidden, aux_hidden_states
+        if capture_aux_hidden_states:
+            return hidden_states, aux_hidden_states
+        if capture_hidden_states:
+            return hidden_states, per_layer_hidden
+        return hidden_states
+
+    def verify_ragged_batch(
+        self,
+        batch: Qwen36VerifyBatch,
+        *,
+        capture_hidden_states: bool = False,
+        capture_aux_hidden_states: bool = False,
+    ) -> (
+        torch.Tensor
+        | tuple[torch.Tensor, list[torch.Tensor]]
+        | tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]
+    ):
+        """Run one compact request-major DSpark verify body.
+
+        Full-attention rows use ``batch.cu_seqlens_q`` through the graph
+        driver, so only the request-local ``verify_lens`` prefix participates
+        in attention.  GDN is still evaluated through its existing batched
+        ``spec_forward`` contract: the compact rows are viewed through a
+        padded ``[B, max_verify_tokens, H]`` map, and invalid padding writes
+        only to the scratch candidate rows.  This keeps the recurrent state
+        update graph-safe without putting a second target verify graph in the
+        scheduler.
+        """
+        if not batch.ragged:
+            raise ValueError("verify_ragged_batch requires a ragged batch descriptor")
+        if batch.max_verify_tokens is None:
+            raise ValueError("ragged verify descriptor is missing max_verify_tokens")
+        if batch.gdn_padded_to_compact is None or batch.gdn_compact_to_padded is None:
+            raise ValueError("ragged verify descriptor is missing GDN compact maps")
+        if batch.cu_seqlens_q is None:
+            raise ValueError("ragged verify descriptor is missing cu_seqlens_q")
+
+        capacity = int(batch.input_ids.shape[0])
+        batch_size = int(batch.gdn_source_index.shape[0])
+        max_verify_tokens = int(batch.max_verify_tokens)
+        if capacity != batch_size * max_verify_tokens:
+            raise ValueError(
+                "ragged verify capacity must equal B*max_verify_tokens: "
+                f"capacity={capacity}, B={batch_size}, max={max_verify_tokens}"
+            )
+
+        hidden_states = self.embed_tokens(batch.input_ids)
+        cos_sin_cache = self.cos_sin_cache.to(hidden_states.device)
+        residual: torch.Tensor | None = None
+        per_layer_hidden: list[torch.Tensor] = []
+        aux_hidden_states: list[torch.Tensor] = []
+        for layer in self.layers:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = layer.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = layer.input_layernorm(hidden_states, residual)
+
+            if layer.layer_type == "linear_attention":
+                conv_pool = batch.gdn_conv_pools[layer.layer_idx]
+                recurrent_pool = batch.gdn_recurrent_pools[layer.layer_idx]
+                assert conv_pool is not None and recurrent_pool is not None
+                padded_hidden = hidden_states.index_select(
+                    0, batch.gdn_padded_to_compact
+                ).view(batch_size, max_verify_tokens, -1)
+                source = GdnLayerState(
+                    conv_state=conv_pool.index_select(0, batch.gdn_source_index),
+                    recurrent_state=recurrent_pool[:batch_size],
+                    has_previous_state=True,
+                )
+                padded_out, snapshots = layer.linear_attn.spec_forward(
+                    padded_hidden,
+                    source,
+                    spec_source_index=batch.gdn_source_index,
+                    spec_destination_index=batch.gdn_destination_index,
+                    spec_conv_pool=conv_pool,
+                    spec_recurrent_pool=recurrent_pool,
+                    batch_large_projections=fp8_channel_raw_execution_uses_all_layers(),
+                )
+                assert snapshots is None
+                hidden_states = padded_out.reshape(capacity, -1).index_select(
+                    0, batch.gdn_compact_to_padded
+                )
+            else:
+                attn_cache = batch.k_pools[layer.layer_idx]
+                v_cache = batch.v_pools[layer.layer_idx]
+                driver = batch.attn_drivers[layer.layer_idx]
+                output = batch.attn_outputs[layer.layer_idx]
+                assert attn_cache is not None
+                assert v_cache is not None and driver is not None and output is not None
+                hidden_states = layer.self_attn.verify_ragged_batch(
+                    hidden_states,
+                    batch.positions,
+                    cos_sin_cache,
+                    k_pool=attn_cache,
+                    v_pool=v_cache,
+                    write_index=batch.write_index,
+                    attn=driver,
+                    output=output,
+                    nvfp4_k_codes=(
+                        None
+                        if batch.nvfp4_k_codes is None
+                        else batch.nvfp4_k_codes[layer.layer_idx]
+                    ),
+                    nvfp4_k_scales=(
+                        None
+                        if batch.nvfp4_k_scales is None
+                        else batch.nvfp4_k_scales[layer.layer_idx]
+                    ),
+                    nvfp4_v_codes=(
+                        None
+                        if batch.nvfp4_v_codes is None
+                        else batch.nvfp4_v_codes[layer.layer_idx]
+                    ),
+                    nvfp4_v_scales=(
+                        None
+                        if batch.nvfp4_v_scales is None
+                        else batch.nvfp4_v_scales[layer.layer_idx]
+                    ),
+                )
+
+            hidden_states, residual = layer.post_attention_layernorm(hidden_states, residual)
+            hidden_states = layer.mlp(hidden_states)
+            if capture_hidden_states:
+                per_layer_hidden.append(hidden_states)
+            if capture_aux_hidden_states:
+                self._maybe_add_aux_hidden_state(
+                    aux_hidden_states,
+                    layer.layer_idx + 1,
+                    hidden_states,
+                    residual,
+                )
+
+        assert residual is not None
+        hidden_states, _ = self.norm(hidden_states, residual)
+        if capture_hidden_states and capture_aux_hidden_states:
+            return hidden_states, per_layer_hidden, aux_hidden_states
+        if capture_aux_hidden_states:
+            return hidden_states, aux_hidden_states
         if capture_hidden_states:
             return hidden_states, per_layer_hidden
         return hidden_states
@@ -4739,8 +5601,19 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         state: Qwen36GenerationState,
         *,
         capture_hidden_states: bool = False,
+        capture_aux_hidden_states: bool = False,
     ):
-        return self.model(input_ids, state, capture_hidden_states=capture_hidden_states)
+        return self.model(
+            input_ids,
+            state,
+            capture_hidden_states=capture_hidden_states,
+            capture_aux_hidden_states=capture_aux_hidden_states,
+        )
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Enable the selected 1-based target taps used by external DSpark."""
+
+        self.model.set_aux_hidden_state_layers(layers)
 
     def decode_batch(self, batch: Qwen36DecodeBatch) -> torch.Tensor:
         """Batched decode -> ``[B, vocab_size]`` logits (B2).
@@ -4752,9 +5625,22 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         hidden_states = self.model.decode_batch(batch)
         return self.lm_head(hidden_states.reshape(hidden_states.shape[0], -1))
 
-    def prefill_batch(self, batch: Qwen36PrefillBatch) -> torch.Tensor:
-        """Pool-backed homogeneous prefill -> post-norm ``[B, Q, H]``."""
-        return self.model.prefill_batch(batch)
+    def prefill_batch(
+        self,
+        batch: Qwen36PrefillBatch,
+        *,
+        capture_aux_hidden_states: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        """Pool-backed homogeneous prefill -> post-norm ``[B, Q, H]``.
+
+        DSpark asks for the same target-layer taps that the B1 path already
+        captures.  Returning them from this batch body keeps target prefill
+        and draft-KV injection on the same BxQ execution boundary instead of
+        silently falling back to one target forward per slot.
+        """
+        return self.model.prefill_batch(
+            batch, capture_aux_hidden_states=capture_aux_hidden_states
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden_states)
@@ -4767,13 +5653,51 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         state: Qwen36GenerationState,
         *,
         spec_state_rows: dict[int, list[GdnLayerState] | list[list[GdnLayerState]]] | None = None,
-    ) -> tuple[torch.Tensor, dict[int, list[GdnLayerState]] | None]:
+        capture_aux_hidden_states: bool = False,
+    ):
         """See :meth:`Qwen36TextModelSelfBuilt.verify_forward`."""
-        return self.model.verify_forward(draft_token_ids, state, spec_state_rows=spec_state_rows)
+        return self.model.verify_forward(
+            draft_token_ids,
+            state,
+            spec_state_rows=spec_state_rows,
+            capture_aux_hidden_states=capture_aux_hidden_states,
+        )
 
-    def verify_batch(self, batch: Qwen36VerifyBatch) -> torch.Tensor:
+    def verify_batch(
+        self,
+        batch: Qwen36VerifyBatch,
+        *,
+        capture_hidden_states: bool = False,
+        capture_aux_hidden_states: bool = False,
+    ) -> (
+        torch.Tensor
+        | tuple[torch.Tensor, list[torch.Tensor]]
+        | tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]
+    ):
         """Graph-safe target verify body; see the text-model method."""
-        return self.model.verify_batch(batch)
+        return self.model.verify_batch(
+            batch,
+            capture_hidden_states=capture_hidden_states,
+            capture_aux_hidden_states=capture_aux_hidden_states,
+        )
+
+    def verify_ragged_batch(
+        self,
+        batch: Qwen36VerifyBatch,
+        *,
+        capture_hidden_states: bool = False,
+        capture_aux_hidden_states: bool = False,
+    ) -> (
+        torch.Tensor
+        | tuple[torch.Tensor, list[torch.Tensor]]
+        | tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]
+    ):
+        """Graph-safe compact DSpark target verify body."""
+        return self.model.verify_ragged_batch(
+            batch,
+            capture_hidden_states=capture_hidden_states,
+            capture_aux_hidden_states=capture_aux_hidden_states,
+        )
 
     def commit_verify(
         self,

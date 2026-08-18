@@ -70,6 +70,7 @@ from typing import Any
 
 import torch
 
+from runtime.dspark_config import load_and_validate_dspark_pair
 from runtime.loading.common import (
     apply_kv_cache_scale_post_load,
     assert_all_params_loaded,
@@ -84,6 +85,7 @@ from runtime.loading.language_model_only import (
 )
 from runtime.model.laguna_dflash_model import LagunaDraftForCausalLMSelfBuilt
 from runtime.model.laguna_model import LagunaForCausalLMSelfBuilt
+from runtime.model.qwen36_dspark import Qwen36DSparkDraftForCausalLM
 from runtime.model.qwen36_model import Qwen36ForCausalLMSelfBuilt
 
 
@@ -386,3 +388,41 @@ def load_qwen36_model(
             if freed:
                 print(f"freed raw FP8 weights on {freed} Linear(s) (BF16 cache retained)")
     return model
+
+
+def load_qwen36_dspark_draft_model(
+    target_model: Qwen36ForCausalLMSelfBuilt,
+    *,
+    target_model_path: str,
+    draft_model_path: str,
+    device: torch.device | str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+) -> Qwen36DSparkDraftForCausalLM:
+    """Load the separate Qwen3.8 DSpark draft and share target modules.
+
+    The target config is validated against the draft config before the first
+    draft parameter is allocated.  The draft checkpoint intentionally has no
+    embedding or LM-head tensors; those two modules are attached by object
+    reference after loading, exactly like the existing Laguna DFlash path.
+    """
+
+    draft_config = load_and_validate_dspark_pair(target_model_path, draft_model_path)
+    target_layer_count = len(target_model.model.layers)
+    target_device = torch.device(device)
+    with default_torch_dtype(dtype), target_device:
+        model = Qwen36DSparkDraftForCausalLM(
+            draft_config,
+            target_layer_count=target_layer_count,
+        )
+        loaded_param_names = model.load_weights(iterate_safetensors_checkpoint(draft_model_path))
+        assert_all_params_loaded(
+            model,
+            loaded_param_names,
+            context="load_qwen36_dspark_draft_model",
+            expected_unloaded=frozenset({"embed_tokens.weight", "lm_head.weight"}),
+        )
+    model.attach_shared_modules(
+        embed_tokens=target_model.model.embed_tokens,
+        lm_head=target_model.lm_head,
+    )
+    return model.eval()

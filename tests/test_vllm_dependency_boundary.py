@@ -19,10 +19,15 @@ _PRODUCTION_SOURCE_DIRECTORIES = ("runtime", "server", "bfdiag")
 # excluded from production distributions. Runtime and server now have none.
 _APPROVED_DIRECT_IMPORT_FILES: set[str] = set()
 
-_APPROVED_DIRECT_FLASHINFER_IMPORT_FILES: set[str] = set()
-# Empty since 2026-07-28 (任务#41): laguna_dflash_cudagraph.py's only
-# FlashInfer import was inside the same dead DFlashVerifyCudaGraph class
-# removed above -- see _APPROVED_DIRECT_IMPORT_FILES's comment on that file.
+_APPROVED_DIRECT_FLASHINFER_IMPORT_FILES: set[str] = {
+    "runtime/backends/flashinfer_dspark_attn.py",
+    "runtime/model/flashinfer_gdn.py",
+    "runtime/model/flashinfer_prefill.py",
+}
+# These are the three intentional optional FlashInfer integration points for
+# Qwen3.8 DSpark and its batched prefill path.  Keeping them in this explicit
+# ledger prevents an unrelated module from importing FlashInfer implicitly;
+# the runtime still falls back when the optional package is unavailable.
 
 
 def _is_type_checking_guard(node: ast.AST) -> bool:

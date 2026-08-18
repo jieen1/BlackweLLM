@@ -53,11 +53,12 @@ assignment supports, and it is what the prefix-cache path below implements.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
-import os
 
 import torch
+
 from runtime.model.qwen36_kv_arena import BlockKey
 from runtime.model.qwen36_model import (
     _PAGED_ATTENTION_PAGE_SIZE,
@@ -1725,6 +1726,12 @@ class Qwen36SlotPool:
         )
         attn.cache_seqlens.fill_(past + q)
         torch.index_select(self._global_page_table, 0, slot_index, out=attn.page_table)
+        # FlashInfer FA2 needs the host-known compact page counts.  Keep this
+        # metadata alongside the existing device lengths so no full-attention
+        # layer has to read ``cache_seqlens`` back to the CPU.
+        set_kv_lengths = getattr(attn, "set_kv_lengths", None)
+        if set_kv_lengths is not None:
+            set_kv_lengths([past + q] * b)
         # All full-attention layers run serially and share this one scratch
         # buffer.  See Qwen36BatchedExtendAttention.output for the memory
         # accounting; allocating one output per layer would retain 16 large
@@ -1776,6 +1783,33 @@ class Qwen36SlotPool:
                 batch=batch, tokens_per_slot=tokens_per_slot, **self._driver_kwargs()
             )
         return self._prefill_attn
+
+    def warmup_prefill_attention_driver(self, *, batch: int, tokens_per_slot: int) -> None:
+        """Compile the selected batched-prefill backend at its live shape."""
+        if batch < 1 or batch > self.num_slots:
+            raise ValueError(f"prefill warmup batch must be in 1..{self.num_slots}, got {batch}")
+        if tokens_per_slot < 1 or tokens_per_slot > self.max_seq_len:
+            raise ValueError(
+                "prefill warmup token count must fit the pool: "
+                f"{tokens_per_slot} not in 1..{self.max_seq_len}"
+            )
+        driver = self.prefill_attention_driver(batch, tokens_per_slot)
+        warmup = getattr(driver, "warmup_flashinfer", None)
+        if warmup is None:
+            return
+        full_attention_index = next(
+            (index for index, pool in enumerate(self.k_pools) if pool is not None), None
+        )
+        if full_attention_index is None:
+            raise RuntimeError("Qwen36 pool has no full-attention KV layer to warm up")
+        warmup(
+            k_cache=self.k_pools[full_attention_index],
+            v_cache=self.v_pools[full_attention_index],
+            page_table=self._global_page_table[:batch],
+            kv_length=tokens_per_slot,
+        )
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
 
     def attention_driver(self, batch: int):
         """The shared attention driver for a decode step of size ``batch``.
