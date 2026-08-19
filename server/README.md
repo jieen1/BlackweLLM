@@ -66,6 +66,7 @@ kept as historical/rollback settings.
 | `QSR_SERVER_GPU_MEM_UTIL` | — | 0.85 | 0.92 | `gpu_memory_utilization` |
 | `QSR_SERVER_PRODUCTION` | — | 1 | 1 | production slot layout (vs. diagnostic layout) |
 | `QSR_SERVED_MODEL_NAME` | — | `qwen3.8` for Qwen | `qwen3.8` | name(s) reported by `/v1/models` (space-separated list) |
+| `QSR_DEFAULT_REASONING_EFFORT` | — | `medium` for native Qwen | `medium` | in-memory Qwen template default; omitted requests keep request kwargs empty and explicit effort wins |
 | `QSR_THINKING_TOKEN_BUDGET` | — | 8192 for Qwen | 8192 | implicit `<think>` ceiling, bounded to half of `max_tokens`; explicit request budget wins |
 | `QSR_SERVER_REQUEST_TIMEOUT_S` | — | 600 | 0 | server-side request cap; 0 disables (long generations) |
 | `QSR_DEBUG_REQUESTS` | — | 1 | 1 | log raw request/response (see **Raw I/O logging**); legacy alias `QSR_DEBUG_ANTHROPIC` |

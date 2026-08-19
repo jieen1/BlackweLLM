@@ -40,13 +40,14 @@
 
 ### 1.1a Qwen3.8 request-level effort（2026-08-19）
 
-Qwen3.8 的官方模板把 `reasoning_effort` 作为 Jinja 变量，且默认值是
-`xhigh`；这不是一个硬 token budget。OpenAI Chat Completions 的顶层
+Qwen3.8 的官方模板把 `reasoning_effort` 作为 Jinja 变量，模板文件默认值是
+`xhigh`；runtime 在加载 native Qwen tokenizer 时将这个模板默认改为
+`medium`（可用 `QSR_DEFAULT_REASONING_EFFORT` 覆盖），这不是一个硬 token budget。OpenAI Chat Completions 的顶层
 `reasoning_effort`、Responses API 的 `reasoning.effort` 现在由
 `server/app.py::_resolve_chat_template_kwargs` 映射到模板：`low`、`medium`、
 `high`、`xhigh` 保持思考并传递 effort，`none` 映射为
-`enable_thinking=false`。显式 `chat_template_kwargs` 优先级最高，未传任何字段
-则保持模板默认行为。
+`enable_thinking=false`。显式 `chat_template_kwargs` 优先级最高；未传任何字段时
+请求 kwargs 保持为空，直接使用 runtime 的模板默认 `medium`。
 
 不要把 `max_tokens` 当作 thinking budget：它限制整个 completion，达到上限时
 可能只有未闭合 reasoning 而没有正文。当前 runtime 的

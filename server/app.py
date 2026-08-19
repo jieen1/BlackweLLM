@@ -391,9 +391,11 @@ def _resolve_chat_template_kwargs(
     ``chat_template_kwargs`` is the escape hatch used by vLLM and remains the
     most explicit request-level control.  Therefore an explicit
     ``enable_thinking`` or ``reasoning_effort`` in that mapping wins over the
-    OpenAI-compatible root field.  ``none`` is represented by the Qwen hard
-    switch because Qwen3.8's template accepts ``low|medium|xhigh`` (with
-    ``high`` aliased to ``xhigh``), not ``none``.
+    OpenAI-compatible root field.  If the request does not select an effort,
+    the tokenizer's configured model default is left untouched.
+    ``none`` is represented by the Qwen hard switch because Qwen3.8's template
+    accepts ``low|medium|xhigh`` (with ``high`` aliased to ``xhigh``), not
+    ``none``.
     """
     resolved = dict(chat_template_kwargs or {})
     if "enable_thinking" in resolved or "reasoning_effort" in resolved:

@@ -354,6 +354,7 @@ plus the Laguna run in
 | `QSR_SERVER_ENABLE_DFLASH` | `0` | Enable DFlash speculative engine (Laguna) |
 | `QSR_SERVER_REQUEST_TIMEOUT_S` | `600` | Server-side request cap; `0` disables (quality/longctx profiles) |
 | `QSR_SERVED_MODEL_NAME` | model ID | Advertised model name(s) |
+| `QSR_DEFAULT_REASONING_EFFORT` | `medium` for native Qwen | In-memory Qwen template default; omitted requests are not rewritten, explicit request effort wins |
 | `QSR_THINKING_TOKEN_BUDGET` | `8192` for Qwen | Default per-request reasoning-token cap; request-level budget/effort overrides it |
 | `QSR_DEBUG_REQUESTS` | `0` | Log raw request/response |
 | `QSR_TRACE` | `0` | bfdiag flight recorder |

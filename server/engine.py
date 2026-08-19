@@ -42,6 +42,7 @@ from runtime.thinking_budget import ThinkingBudgetConfig, ThinkingBudgetState
 from server import metrics
 from server.formats.stop import find_earliest_stop_match, trim_ambiguous_stop_tail
 from server.formats.stream import StreamProcessor
+from server.formats.thinking import apply_qwen_default_reasoning_effort
 from server.tracing import tracer
 
 # N2: stop-sequence matching must exclude the reasoning phase (OpenAI's
@@ -619,6 +620,14 @@ class ServerEngine:
             # onto a generic path that chokes on Laguna's yarn
             # rope_parameters (KeyError: 'original_max_position_embeddings').
             self.tok = AutoTokenizer.from_pretrained(self.MODEL, trust_remote_code=True)
+            if backend == "qwen36":
+                configured_effort = apply_qwen_default_reasoning_effort(self.tok)
+                if configured_effort is not None:
+                    logger.info(
+                        "Qwen reasoning template default configured to effort=%s; "
+                        "request-level effort remains explicit-only",
+                        configured_effort,
+                    )
             self.eos_token_id = self.tok.eos_token_id
             try:
                 from transformers import GenerationConfig

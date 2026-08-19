@@ -39,10 +39,46 @@ artifacts`` unchanged from its pre-existing behavior.
 
 from __future__ import annotations
 
+import os
 import re
 
 THINK_OPEN = "<think>"
 THINK_CLOSE = "</think>"
+
+
+def apply_qwen_default_reasoning_effort(tokenizer, default: str | None = None) -> str | None:
+    """Set Qwen's template default without rewriting individual requests.
+
+    The official Qwen3.8 template uses ``reasoning_effort|default('xhigh')``.
+    Replacing only that Jinja default keeps the request contract simple:
+    requests that omit effort use the service default, while an explicit
+    ``reasoning_effort`` still wins through the template variable.  Non-Qwen
+    or already-customized templates are left unchanged.
+    """
+    template = getattr(tokenizer, "chat_template", None)
+    if not isinstance(template, str) or "reasoning_effort" not in template:
+        return None
+
+    configured = default
+    if configured is None:
+        configured = os.environ.get("QSR_DEFAULT_REASONING_EFFORT", "medium")
+    configured = configured.strip().lower()
+    if configured == "high":
+        configured = "xhigh"
+    if configured not in {"low", "medium", "xhigh"}:
+        raise ValueError(
+            "QSR_DEFAULT_REASONING_EFFORT must be one of low, medium, xhigh"
+        )
+
+    for marker in ("reasoning_effort|default('xhigh')", 'reasoning_effort|default("xhigh")'):
+        if marker in template:
+            tokenizer.chat_template = template.replace(
+                marker,
+                f"reasoning_effort|default('{configured}')",
+                1,
+            )
+            return configured
+    return None
 
 # <usage>...</usage>: paired and unclosed (hit max_tokens mid-block) forms.
 _USAGE_BLOCK_RE = re.compile(r"<usage>.*?</usage>\s*", re.DOTALL)

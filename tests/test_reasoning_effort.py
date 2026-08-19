@@ -10,6 +10,7 @@ from server.app import (
     _resolve_chat_template_kwargs,
     _resolve_thinking_token_budget,
 )
+from server.formats.thinking import apply_qwen_default_reasoning_effort
 
 
 def test_openai_request_preserves_reasoning_effort() -> None:
@@ -34,6 +35,26 @@ def test_none_maps_to_qwen_hard_thinking_switch() -> None:
 def test_high_aliases_to_qwen_xhigh_template_value() -> None:
     assert _resolve_chat_template_kwargs(None, reasoning_effort="high") == {
         "reasoning_effort": "xhigh",
+        "enable_thinking": True,
+    }
+
+
+def test_unspecified_effort_leaves_request_kwargs_unchanged() -> None:
+    assert _resolve_chat_template_kwargs(None) is None
+
+
+def test_service_default_changes_template_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    tokenizer = type("Tokenizer", (), {})()
+    tokenizer.chat_template = "{{ reasoning_effort|default('xhigh') }}"
+    monkeypatch.setenv("QSR_DEFAULT_REASONING_EFFORT", "medium")
+
+    assert apply_qwen_default_reasoning_effort(tokenizer) == "medium"
+    assert "reasoning_effort|default('medium')" in tokenizer.chat_template
+
+
+def test_explicit_effort_remains_request_override() -> None:
+    assert _resolve_chat_template_kwargs(None, reasoning_effort="low") == {
+        "reasoning_effort": "low",
         "enable_thinking": True,
     }
 
