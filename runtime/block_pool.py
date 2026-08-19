@@ -174,6 +174,10 @@ class ChunkedPrefillState:
     step0_logits: object = None
     step0_hidden: object = None
     anchors: dict = None
+    # Optional per-slot token forcing used by reasoning-budget requests.  The
+    # value is carried across incremental prefill steps so the first sampled
+    # anchor can be constrained before speculative drafts are built from it.
+    force_token_ids: dict[int, int] | None = None
 
     def __post_init__(self):
         if self.slots is None:

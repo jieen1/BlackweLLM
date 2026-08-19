@@ -852,10 +852,13 @@ class DeepseekV4Backend:
         chunk_size: int = 512,
         *,
         params_per_slot: dict[int, SamplingParams] | None = None,
+        force_token_ids: dict[int, int] | None = None,
     ) -> ChunkedPrefillState:
         """One-shot prefill: every prompt fully prefilled, done immediately."""
         if len(slots) != len(prompts_per_slot):
             raise ValueError("slots and prompts_per_slot must have equal length")
+        if force_token_ids:
+            raise ValueError("thinking-token forcing is only supported by the Qwen backend")
         result: dict[int, dict] = {}
         for slot, prompt in zip(slots, prompts_per_slot):
             params = params_per_slot.get(slot) if params_per_slot else None
@@ -1398,6 +1401,7 @@ class DeepseekV4Backend:
         *,
         return_logprobs: bool = False,
         top_logprobs: int = 0,
+        force_token_ids: list[int | None] | None = None,
     ) -> list[int] | tuple[list[int], list[dict]]:
         """Decode one token per distinct slot through native B=1/2/4 buckets."""
         if not (len(slot_ids) == len(token_ids) == len(kv_lengths) == len(params_list)):
@@ -1406,6 +1410,8 @@ class DeepseekV4Backend:
             return ([], []) if return_logprobs else []
         if len(set(slot_ids)) != len(slot_ids):
             raise ValueError("one decode batch cannot contain the same slot more than once")
+        if force_token_ids is not None and len(force_token_ids) != len(slot_ids):
+            raise ValueError("force_token_ids must match the decode batch length")
 
         # Validate the complete host request before any graph/eager state is
         # mutated. This is the graph-safety boundary: device-side slot tensors
@@ -1442,7 +1448,14 @@ class DeepseekV4Backend:
             graph_key = chunk_slots[0] if serial_decode else batch_size
             graph = self._decode_graphs.get(graph_key)
             try:
-                if graph is not None:
+                force_in_chunk = (
+                    force_token_ids[offset:end_offset]
+                    if force_token_ids is not None
+                    else []
+                )
+                if graph is not None and not any(
+                    token_id is not None for token_id in force_in_chunk
+                ):
                     if serial_decode:
                         logits = graph.replay(chunk_slots[0], chunk_tokens[0], chunk_positions[0])
                     else:
@@ -1499,8 +1512,22 @@ class DeepseekV4Backend:
                 self._invalidate_slots_after_decode_failure(chunk_slots)
                 raise
 
+            for row, forced_token in enumerate(force_in_chunk):
+                if forced_token is None:
+                    continue
+                if not 0 <= forced_token < logits.shape[-1]:
+                    raise ValueError(
+                        f"forced token {forced_token} is outside vocabulary size {logits.shape[-1]}"
+                    )
+                logits[row, 0].fill_(float("-inf"))
+                logits[row, 0, forced_token] = 0.0
+
             if all(params.temperature == 0.0 for params in chunk_params):
-                if graph is not None and getattr(graph, "greedy", False):
+                if (
+                    graph is not None
+                    and not any(token_id is not None for token_id in force_in_chunk)
+                    and getattr(graph, "greedy", False)
+                ):
                     # The graph baked argmax into the input buffer; replay
                     # already returned the next-token ids for the batch.
                     chunk_outs = [int(t) for t in logits.tolist()]
@@ -1520,6 +1547,11 @@ class DeepseekV4Backend:
                             ).item()
                         )
                     chunk_outs.append(out)
+
+            if force_token_ids is not None:
+                for row, forced_token in enumerate(force_in_chunk):
+                    if forced_token is not None:
+                        chunk_outs[row] = int(forced_token)
 
             for row, (slot, token, kv_len, out) in enumerate(
                 zip(chunk_slots, chunk_tokens, chunk_positions, chunk_outs)

@@ -1,6 +1,6 @@
 # notes/ 索引
 
-> 编制日期：2026-08-16 · 共 237 篇（`git ls-files notes | wc -l`，包含本次新增）
+> 编制日期：2026-08-19 · 共 238 篇（`git ls-files notes | wc -l`，包含本次新增）
 
 `notes/` 是**调查记录与证据档案**，不是文档。它的价值在于：当一个结论被
 质疑时，能翻出当初的实测数据、复现命令和被排除的假设。
@@ -51,6 +51,7 @@
 
 ## 2. 已定案的根因分析 🟢
 
+- [2026-08-19 Qwen3.8 thinking overrun reproduction](2026-08-19-qwen38-thinking-overrun-reproduction.md) —— 🟢 **社区问题与本地真实模型复现一致，且低层预算已收口**：Qwen3.8 模板默认 xhigh；顶层 `reasoning_effort` 在修复前被 Pydantic 静默忽略；修复后 low 与 `chat_template_kwargs` 完全同口径，none 可关闭 thinking；sampler-level `thinking_token_budget` 已覆盖 plain/MTP、流式与三套 API，并完成真实 GPU E2E。
 - [2026-08-19 Qwen3.8 DSpark live prefix parity](2026-08-19-qwen38-dspark-live-prefix-parity.md) —— 🟢 **同 prompt / 同参数 / 同配置的 4×128K 对比已超过 SGLang**：local cold 40.7986s vs SGLang 50.2784s；steady warm `1024/2.609 = 392.49` 对比 local 450.88 tok/s（+14.88%）；四路 completion SHA 完全一致。根因是 duplicate admission 后 live dynamic-arena block hash 未提前发布，导致三路重复 prefill；prompt commit 时发布并由 COW 保护，cold prefill batched forwards 33→17。
 - [2026-08-15 Qwen3.8 dynamic MTP page-table 代际 bug](2026-08-15-qwen38-dynamic-mtp-page-table-regression.md) —— 🟢 **fresh-process 128K 接受率回退已修复**：dynamic arena remap 物理 bundle 后，MTP draft/sync CUDA Graph 仍按 slot id 缓存 capture 阶段旧 page table；改用 `(slot,page_table_version)` 后首条 128K 从 `[7,31,21,31]` / 2.844 committed-per-round / 74.95 tok/s 恢复到 `[0,0,0,64]` / 4.000 / 101.58 tok/s，prefix-on cold/warm 也均满接受，输出 SHA 不变。另修 128K chained hash O(n²)：5.352s→10.8ms，persistent-hit TTFT 13.97s→~52ms。
 - [2026-08-05 Qwen3.6-27B 质量套件重跑（MTP+CG 路径）](2026-08-05-qwen36-quality-rerun.md) —— 🟢 **质量无回退**：MMLU-Pro 414 精确复现 **84.54%**（与历史同 question_ids）；tool/agent/longctx 均 1.000；HumanEval 768 在 ±3.9pp SE 内。参数与历史一致（MTP K=3、block_size 16、FP8 KV、GPU util 0.92）；并行分片 + 断点续跑，`bash scripts/run_qwen36_quality.sh all` 可复现

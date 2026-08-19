@@ -1031,6 +1031,8 @@ class Qwen36MTPEngine:
         params: SamplingParams | None = None,
         return_logprobs: bool = False,
         top_logprobs: int = 0,
+        thinking_force_position: int | None = None,
+        thinking_force_token_id: int | None = None,
     ) -> dict[str, Any]:
         """One draft-verify-accept/reject-redraft round for ``slot``.
 
@@ -1099,6 +1101,23 @@ class Qwen36MTPEngine:
                 all_hiddens, gdn_snapshots = self.model.verify_forward(verify_input, state)
         if self._verify_cg is None:
             all_logits = self.model.compute_logits(all_hiddens)[0]  # [k+1, vocab]
+
+        if thinking_force_position is not None:
+            if thinking_force_token_id is None:
+                raise ValueError("thinking force position requires a token id")
+            if not 0 <= thinking_force_position < all_logits.shape[0]:
+                raise ValueError(
+                    "thinking force position is outside the MTP verify block: "
+                    f"position={thinking_force_position}, rows={all_logits.shape[0]}"
+                )
+            if not 0 <= thinking_force_token_id < all_logits.shape[-1]:
+                raise ValueError(
+                    "thinking force token is outside the model vocabulary: "
+                    f"token={thinking_force_token_id}, vocab={all_logits.shape[-1]}"
+                )
+            forced_row = all_logits[thinking_force_position]
+            forced_row.fill_(float("-inf"))
+            forced_row[thinking_force_token_id] = 0.0
 
         sampled = params is not None and not params.is_greedy
         if sampled:
@@ -1186,6 +1205,8 @@ class Qwen36MTPEngine:
         params_per_slot: dict[int, SamplingParams] | None = None,
         return_logprobs: bool = False,
         top_logprobs: int = 0,
+        thinking_force_positions: dict[int, int] | None = None,
+        thinking_force_token_ids: dict[int, int] | None = None,
     ) -> dict[int, dict[str, Any]]:
         """Run one uniform ``anchor + K`` verify for every active slot.
 
@@ -1197,7 +1218,14 @@ class Qwen36MTPEngine:
         """
         if not slots:
             return {}
-        if self._verify_cg is None or any(
+        position_keys = set(thinking_force_positions or ())
+        token_keys = set(thinking_force_token_ids or ())
+        if position_keys != token_keys:
+            raise ValueError(
+                "thinking force positions and token ids must cover the same slots"
+            )
+        forced_slots = position_keys
+        if self._verify_cg is None or forced_slots.intersection(slots) or any(
             params_per_slot is not None
             and params_per_slot.get(slot) is not None
             and not params_per_slot[slot].is_greedy
@@ -1218,6 +1246,16 @@ class Qwen36MTPEngine:
                     params=(params_per_slot.get(slot) if params_per_slot else None),
                     return_logprobs=return_logprobs,
                     top_logprobs=top_logprobs,
+                    thinking_force_position=(
+                        thinking_force_positions.get(slot)
+                        if thinking_force_positions is not None
+                        else None
+                    ),
+                    thinking_force_token_id=(
+                        thinking_force_token_ids.get(slot)
+                        if thinking_force_token_ids is not None
+                        else None
+                    ),
                 )
                 for slot in slots
             }

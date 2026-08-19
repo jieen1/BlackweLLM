@@ -1218,6 +1218,8 @@ class Qwen36DSparkEngine:
         return_logprobs: bool = False,
         top_logprobs: int = 0,
         _accept_cap: int | None = None,
+        thinking_force_position: int | None = None,
+        thinking_force_token_id: int | None = None,
     ) -> dict[str, Any]:
         """Verify one DSpark block, commit its accepted prefix, and redraft."""
 
@@ -1282,6 +1284,23 @@ class Qwen36DSparkEngine:
             all_logits = self.model.compute_logits(all_hiddens)[0]
         round_profile.phase("verify_replay")
 
+        if thinking_force_position is not None:
+            if thinking_force_token_id is None:
+                raise ValueError("thinking force position requires a token id")
+            if not 0 <= thinking_force_position < all_logits.shape[0]:
+                raise ValueError(
+                    "thinking force position is outside the DSpark verify block: "
+                    f"position={thinking_force_position}, rows={all_logits.shape[0]}"
+                )
+            if not 0 <= thinking_force_token_id < all_logits.shape[-1]:
+                raise ValueError(
+                    "thinking force token is outside the model vocabulary: "
+                    f"token={thinking_force_token_id}, vocab={all_logits.shape[-1]}"
+                )
+            forced_row = all_logits[thinking_force_position]
+            forced_row.fill_(float("-inf"))
+            forced_row[thinking_force_token_id] = 0.0
+
         sampled = params is not None and not params.is_greedy
         if sampled:
             if draft_values is None:
@@ -1304,7 +1323,11 @@ class Qwen36DSparkEngine:
             # Greedy acceptance is vectorized on device and drains only the
             # tiny combined decision tensor.  In particular, the K draft
             # tokens and target verify input never cross back to Python.
-            if self.capture_device_accept and self._verify_cg is not None:
+            if (
+                thinking_force_position is None
+                and self.capture_device_accept
+                and self._verify_cg is not None
+            ):
                 decision = self._decisions_from_device_accept(
                     [slot], graph_result[3], graph_result[4], self.k
                 )[slot]
@@ -1646,6 +1669,8 @@ class Qwen36DSparkEngine:
         return_logprobs: bool = False,
         top_logprobs: int = 0,
         _verify_gamma: int | None = None,
+        thinking_force_positions: Mapping[int, int] | None = None,
+        thinking_force_token_ids: Mapping[int, int] | None = None,
     ) -> dict[int, dict[str, Any]]:
         """Verify and redraft one DSpark round for the active request batch.
 
@@ -1663,6 +1688,35 @@ class Qwen36DSparkEngine:
             raise ValueError("DSpark batch is missing an anchor or draft row")
 
         params_per_slot = params_per_slot or {}
+        position_keys = set(thinking_force_positions or ())
+        token_keys = set(thinking_force_token_ids or ())
+        if position_keys != token_keys:
+            raise ValueError(
+                "thinking force positions and token ids must cover the same slots"
+            )
+        forced_slots = position_keys
+        if forced_slots.intersection(slots):
+            normalized_drafts = {
+                slot: (value.tolist() if isinstance(value, torch.Tensor) else value)
+                for slot, value in drafts_by_slot.items()
+            }
+            return {
+                slot: self.round(
+                    slot,
+                    anchors[slot],
+                    normalized_drafts[slot],
+                    params=params_per_slot.get(slot),
+                    return_logprobs=return_logprobs,
+                    top_logprobs=top_logprobs,
+                    thinking_force_position=thinking_force_positions.get(slot),
+                    thinking_force_token_id=(
+                        thinking_force_token_ids.get(slot)
+                        if thinking_force_token_ids is not None
+                        else None
+                    ),
+                )
+                for slot in slots
+            }
         if _verify_gamma is None and self.verify_mode == "compact":
             return self._round_batch_ragged(
                 slots,

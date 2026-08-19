@@ -38,6 +38,7 @@ from runtime.model_registry import IMPLEMENTED_BACKENDS
 from runtime.round_profile import round_profile
 from runtime.sampling import SamplingParams
 from runtime.slot_resource_manager import SlotResourceManager
+from runtime.thinking_budget import ThinkingBudgetConfig, ThinkingBudgetState
 from server import metrics
 from server.formats.stop import find_earliest_stop_match, trim_ambiguous_stop_tail
 from server.formats.stream import StreamProcessor
@@ -282,6 +283,7 @@ class GenerationRequest:
     stop_sequences: list[str] | None = None
     logprobs: bool = False
     top_logprobs: int = 0
+    thinking_budget: ThinkingBudgetConfig | None = None
 
 
 class StreamChannel:
@@ -1346,6 +1348,7 @@ class ServerEngine:
         stop_sequences: list[str] | None = None,
         logprobs: bool = False,
         top_logprobs: int = 0,
+        thinking_budget: ThinkingBudgetConfig | None = None,
     ) -> dict:
         """Submit a generation request. Resolves when generation completes."""
         loop = asyncio.get_running_loop()
@@ -1360,6 +1363,7 @@ class ServerEngine:
             stop_sequences=stop_sequences,
             logprobs=logprobs,
             top_logprobs=top_logprobs,
+            thinking_budget=thinking_budget,
         )
         req._admitted_at = time.perf_counter()
         self._req_deque.append(req)
@@ -1379,6 +1383,7 @@ class ServerEngine:
         stop_sequences: list[str] | None = None,
         logprobs: bool = False,
         top_logprobs: int = 0,
+        thinking_budget: ThinkingBudgetConfig | None = None,
     ):
         """Submit a streaming generation request. Yields token-id lists as
         each MTP round commits them. Final yield is the result dict."""
@@ -1400,6 +1405,7 @@ class ServerEngine:
             stop_sequences=stop_sequences,
             logprobs=logprobs,
             top_logprobs=top_logprobs,
+            thinking_budget=thinking_budget,
         )
         req._admitted_at = time.perf_counter()
         self._req_deque.append(req)
@@ -1413,6 +1419,12 @@ class ServerEngine:
                 break
             if item:
                 yield item
+        # The stream carries token batches through the channel, while the
+        # completion metadata is resolved on the request future.  Returning
+        # that result here keeps the streaming contract identical to
+        # ``submit`` and gives protocol adapters the authoritative finish
+        # reason, token usage, and merged logprobs.
+        yield await fut
 
     def cancel(self, request_id: str) -> None:
         """Request cancellation from any thread (asyncio-safe).
@@ -1544,13 +1556,93 @@ class ServerEngine:
             except Exception:
                 logger.exception("reset_slot(%d) failed releasing session %s", ret["slot"], sid)
 
+    def _thinking_decode_kwargs(self, slots: list[int]) -> dict[str, object]:
+        """Build the optional one-token logits constraint for plain decode."""
+        forced: dict[int, int] = {}
+        for slot in slots:
+            state = self.active[slot].get("thinking_state")
+            if state is None:
+                continue
+            decision = state.force_for(1)
+            if decision is not None:
+                position, token_id = decision
+                if position != 0:  # force_for(1) can only return position zero
+                    raise RuntimeError(f"invalid one-token thinking force position: {position}")
+                forced[slot] = token_id
+        if not forced:
+            return {}
+        return {"force_token_ids": [forced.get(slot) for slot in slots]}
+
+    def _thinking_mtp_kwargs(self, slots: list[int]) -> dict[str, object]:
+        """Build per-slot force maps for an MTP target verify block."""
+        positions: dict[int, int] = {}
+        token_ids: dict[int, int] = {}
+        for slot in slots:
+            state = self.active[slot].get("thinking_state")
+            if state is None:
+                continue
+            decision = state.force_for(self.K + 1)
+            if decision is not None:
+                positions[slot], token_ids[slot] = decision
+        if not positions:
+            return {}
+        return {
+            "thinking_force_positions": positions,
+            "thinking_force_token_ids": token_ids,
+        }
+
+    @staticmethod
+    def _thinking_prefill_kwargs(
+        admissions: list[tuple[int, GenerationRequest]],
+    ) -> dict[str, object]:
+        """Force an already-exhausted budget at the initial anchor sample."""
+        forced: dict[int, int] = {}
+        for slot, req in admissions:
+            if req.thinking_budget is None:
+                continue
+            state = ThinkingBudgetState(req.prompt_ids, req.thinking_budget)
+            decision = state.force_for(1)
+            if decision is not None:
+                position, token_id = decision
+                if position != 0:
+                    raise RuntimeError(f"invalid prefill thinking force position: {position}")
+                forced[slot] = token_id
+        if not forced:
+            return {}
+        return {"force_token_ids": forced}
+
     # -- slot lifecycle (engine thread) --------------------------------------
     def _activate_slot(
         self, slot: int, req: GenerationRequest, anchor: int, drafts: list[int]
     ) -> None:
         req._prefill_done_at = time.perf_counter()
         _adm_end(req)
-        if not self.production and req.sampling_params.is_greedy:
+        thinking_state = (
+            ThinkingBudgetState(req.prompt_ids, req.thinking_budget)
+            if req.thinking_budget is not None
+            else None
+        )
+        forced_anchor: int | None = None
+        if thinking_state is not None:
+            forced = thinking_state.force_for(1)
+            if forced is not None:
+                if forced[0] != 0:
+                    raise RuntimeError(f"invalid prefill thinking force position: {forced[0]}")
+                forced_anchor = forced[1]
+                if anchor != forced_anchor:
+                    raise RuntimeError(
+                        "prefill did not honor the thinking-token constraint: "
+                        f"expected anchor {forced_anchor}, got {anchor}"
+                    )
+        # A forced anchor is intentionally not the ordinary greedy reference
+        # token, so do not compare it against the unconstrained bootstrap
+        # check. Qwen prefill already verified the token at the logits boundary
+        # before creating speculative drafts.
+        if (
+            not self.production
+            and req.sampling_params.is_greedy
+            and forced_anchor is None
+        ):
             self._admission_bootstrap_check(slot, req, anchor)
 
         if anchor in self.eos_token_ids:
@@ -1570,6 +1662,7 @@ class ServerEngine:
             "last_progress_round": self.stats["rounds"],
             "start_time": time.perf_counter(),
             "stop_sequences": stop_sequences,
+            "thinking_state": thinking_state,
         }
         st = self.active[slot]
         if stop_sequences:
@@ -1593,6 +1686,8 @@ class ServerEngine:
         # the tracker even when it doesn't match, or all later matching
         # would be silently missing this token's contribution.
         st["committed_tokens"].append(anchor)
+        if thinking_state is not None:
+            thinking_state.add_output([anchor])
         matched = self._stop_check_token(st, anchor) if stop_sequences else None
         if matched is not None:
             self._drop_stop_pending_from_committed(st)
@@ -2158,11 +2253,13 @@ class ServerEngine:
                         for slot, req in admit_now
                         if not req.sampling_params.is_greedy
                     }
+                    prefill_kwargs = self._thinking_prefill_kwargs(admit_now)
                     prefill_state = self.runner.prefill_chunked_begin(
                         new_slots,
                         new_prompts,
                         chunk_size=self._prefill_chunk_size,
                         params_per_slot=params_per_slot,
+                        **prefill_kwargs,
                     )
                     for _slot, req in admit_now:
                         _adm_phase(req, "prefill_begin")
@@ -2293,6 +2390,7 @@ class ServerEngine:
                 params_list,
                 return_logprobs=any_lp,
                 top_logprobs=top_lp,
+                **self._thinking_decode_kwargs(slot_ids),
             )
             if any_lp:
                 next_tokens, lp_batch = decode_result
@@ -2325,6 +2423,8 @@ class ServerEngine:
                     newly_finished.append(s)
                     continue
                 st["committed_tokens"].append(tok)
+                if st.get("thinking_state") is not None:
+                    st["thinking_state"].add_output([tok])
                 st["last_token"] = tok
                 st["last_progress_round"] = self.stats["rounds"]
                 if lp_batch is not None and st["req"].logprobs:
@@ -2387,6 +2487,7 @@ class ServerEngine:
                 params_per_slot=params_per_slot,
                 return_logprobs=any_lp_g,
                 top_logprobs=top_lp_g,
+                **self._thinking_mtp_kwargs(mtp_slots),
             )
             _round_ms = (time.perf_counter() - _round_t0) * 1000
             _bookkeep_t0 = time.perf_counter()
@@ -2438,6 +2539,8 @@ class ServerEngine:
                         break
                     st["committed_tokens"].append(t)
                     kept.append(t)
+                    if st.get("thinking_state") is not None:
+                        st["thinking_state"].add_output([t])
                     if stop_sequences:
                         matched_stop = self._stop_check_token(st, t)
                         if matched_stop is not None:

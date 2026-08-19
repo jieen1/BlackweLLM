@@ -994,6 +994,7 @@ class Qwen36Backend:
         chunk_size: int = 512,
         *,
         params_per_slot: dict[int, SamplingParams] | None = None,
+        force_token_ids: dict[int, int] | None = None,
     ) -> ChunkedPrefillState:
         """Prefill every admitted slot, honouring pending prefix hits.
 
@@ -1061,6 +1062,7 @@ class Qwen36Backend:
             chunk_start=0,
             total_len=max((len(s) for s in suffixes), default=0),
             anchors=dict(params_per_slot),
+            force_token_ids=dict(force_token_ids or {}),
         )
         # Advance once here, so a prompt that fits in one chunk still finishes
         # within this round. ``ServerEngine`` activates slots immediately on
@@ -1314,8 +1316,11 @@ class Qwen36Backend:
                                 (time.perf_counter() - _t_logits) * 1000.0,
                                 slot=slot,
                             )
+                    forced_token = (state.force_token_ids or {}).get(slot)
                     params = params_per_slot.get(slot)
-                    if params is None or params.is_greedy:
+                    if forced_token is not None:
+                        token = int(forced_token)
+                    elif params is None or params.is_greedy:
                         token = int(logits[-1].argmax(dim=-1).item())
                     else:
                         gen = make_generator(params.seed)
@@ -1376,8 +1381,11 @@ class Qwen36Backend:
                             (time.perf_counter() - _t_logits) * 1000.0,
                             slot=slot,
                         )
+                forced_token = (state.force_token_ids or {}).get(slot)
                 params = params_per_slot.get(slot)
-                if params is None or params.is_greedy:
+                if forced_token is not None:
+                    token = int(forced_token)
+                elif params is None or params.is_greedy:
                     token = int(logits[-1].argmax(dim=-1).item())
                 else:
                     gen = make_generator(params.seed)
@@ -1406,8 +1414,11 @@ class Qwen36Backend:
                             (time.perf_counter() - _t_logits) * 1000.0,
                             slot=slot,
                         )
+                forced_token = (state.force_token_ids or {}).get(slot)
                 params = params_per_slot.get(slot)
-                if params is None or params.is_greedy:
+                if forced_token is not None:
+                    token = int(forced_token)
+                elif params is None or params.is_greedy:
                     token = int(logits[-1].argmax(dim=-1).item())
                 else:
                     gen = make_generator(params.seed)
@@ -1444,6 +1455,7 @@ class Qwen36Backend:
         *,
         return_logprobs: bool = False,
         top_logprobs: int = 0,
+        force_token_ids: list[int | None] | None = None,
     ) -> list[int] | tuple[list[int], list[dict]]:
         """One decode round for every active slot -- continuous batching.
 
@@ -1467,9 +1479,25 @@ class Qwen36Backend:
         else:
             logits = self._decode_forward_serial(slot_ids, token_ids)
 
+        if force_token_ids is not None:
+            if len(force_token_ids) != len(slot_ids):
+                raise ValueError("force_token_ids must match the decode batch length")
+            for row, forced_token in enumerate(force_token_ids):
+                if forced_token is None:
+                    continue
+                if not 0 <= forced_token < logits.shape[-1]:
+                    raise ValueError(
+                        f"forced token {forced_token} is outside vocabulary size {logits.shape[-1]}"
+                    )
+                logits[row].fill_(float("-inf"))
+                logits[row, forced_token] = 0.0
+
         next_tokens: list[int] = []
         for i, params in enumerate(params_list):
-            if params.is_greedy:
+            forced_token = force_token_ids[i] if force_token_ids is not None else None
+            if forced_token is not None:
+                next_tokens.append(int(forced_token))
+            elif params.is_greedy:
                 next_tokens.append(int(logits[i].argmax(dim=-1).item()))
             else:
                 gen = make_generator(params.seed)
@@ -1530,6 +1558,8 @@ class Qwen36Backend:
         params_per_slot: dict[int, SamplingParams] | None = None,
         return_logprobs: bool = False,
         top_logprobs: int = 0,
+        thinking_force_positions: dict[int, int] | None = None,
+        thinking_force_token_ids: dict[int, int] | None = None,
     ) -> dict[int, dict]:
         """Run the active Qwen speculative driver.
 
@@ -1551,6 +1581,8 @@ class Qwen36Backend:
                 params_per_slot=params_per_slot,
                 return_logprobs=return_logprobs,
                 top_logprobs=top_logprobs,
+                thinking_force_positions=thinking_force_positions,
+                thinking_force_token_ids=thinking_force_token_ids,
             )
         if self._mtp is None:
             raise RuntimeError(
@@ -1563,6 +1595,8 @@ class Qwen36Backend:
             params_per_slot=params_per_slot,
             return_logprobs=return_logprobs,
             top_logprobs=top_logprobs,
+            thinking_force_positions=thinking_force_positions,
+            thinking_force_token_ids=thinking_force_token_ids,
         )
 
     # -- protocol: prefix cache --------------------------------------------

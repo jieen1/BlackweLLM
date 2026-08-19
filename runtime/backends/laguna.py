@@ -2161,6 +2161,7 @@ class LagunaBackend:
         *,
         return_logprobs: bool = False,
         top_logprobs: int = 0,
+        force_token_ids: list[int | None] | None = None,
     ) -> list[int] | tuple[list[int], list[dict]]:
         """Decode one token per slot with per-request sampling params.
 
@@ -2174,7 +2175,10 @@ class LagunaBackend:
         forward -- this is the path ``ServerEngine._step_sync`` actually
         calls, so it is what makes CUDA Graph decode reach real requests.
         """
-        _bf_cg_ok = self._decode_cg_batch_eligible(slot_ids, params_list, return_logprobs)
+        _bf_cg_ok = (
+            not any(token_id is not None for token_id in (force_token_ids or ()))
+            and self._decode_cg_batch_eligible(slot_ids, params_list, return_logprobs)
+        )
         if bfdiag_trace.TRACE_ENABLED:
             bfdiag_trace.record_decode_batch_path(
                 slot_ids, kv_lengths, self._decode_cg, _bf_cg_ok, return_logprobs, params_list
@@ -2187,9 +2191,24 @@ class LagunaBackend:
             return next_tokens
 
         logits = self._forward(slot_ids, token_ids, kv_lengths, qo_len=1, is_decode=True)
+        if force_token_ids is not None:
+            if len(force_token_ids) != len(slot_ids):
+                raise ValueError("force_token_ids must match the decode batch length")
+            for row, forced_token in enumerate(force_token_ids):
+                if forced_token is None:
+                    continue
+                if not 0 <= forced_token < logits.shape[-1]:
+                    raise ValueError(
+                        f"forced token {forced_token} is outside vocabulary size {logits.shape[-1]}"
+                    )
+                logits[row].fill_(float("-inf"))
+                logits[row, forced_token] = 0.0
         next_tokens: list[int] = []
         for i, (slot, params) in enumerate(zip(slot_ids, params_list)):
-            if params.is_greedy:
+            forced_token = force_token_ids[i] if force_token_ids is not None else None
+            if forced_token is not None:
+                tok = int(forced_token)
+            elif params.is_greedy:
                 tok = int(logits[i].argmax(dim=-1).item())
             else:
                 row = logits[i].unsqueeze(0)
@@ -2339,6 +2358,7 @@ class LagunaBackend:
         chunk_size: int = 512,
         *,
         params_per_slot: dict[int, SamplingParams] | None = None,
+        force_token_ids: dict[int, int] | None = None,
     ) -> ChunkedPrefillState:
         """Prefill with prefix cache: skip cached prefix, prefill only suffix.
 
@@ -2366,6 +2386,8 @@ class LagunaBackend:
             raise ValueError("slots and prompts_per_slot must have equal length")
         if not slots:
             return ChunkedPrefillState(done=True, result={})
+        if force_token_ids:
+            raise ValueError("thinking-token forcing is only supported by the Qwen backend")
         result: dict[int, dict] = {}
         for slot, prompt in zip(slots, prompts_per_slot):
             slot_params = params_per_slot.get(slot) if params_per_slot else None
@@ -2423,6 +2445,8 @@ class LagunaBackend:
         params_per_slot: dict[int, SamplingParams] | None = None,
         return_logprobs: bool = False,
         top_logprobs: int = 0,
+        thinking_force_positions: dict[int, int] | None = None,
+        thinking_force_token_ids: dict[int, int] | None = None,
     ) -> dict[int, dict]:
         """E1: DFlash's sibling of ``DirectModelRunner.mtp_verify_and_commit_batch``,
         called by the SAME ``ServerEngine._step_sync`` MTP branch
@@ -2449,6 +2473,8 @@ class LagunaBackend:
         """
         if self._dflash is None:
             raise RuntimeError("mtp_verify_and_commit_batch called without a DFlashEngine wired up")
+        if thinking_force_positions:
+            raise ValueError("thinking-token forcing is only supported by the Qwen backend")
         return {
             slot: self._dflash.dflash_round(
                 slot,

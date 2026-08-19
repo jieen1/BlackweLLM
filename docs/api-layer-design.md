@@ -38,6 +38,24 @@
 
 ## 1. thinking / reasoning 契约：问题与修复
 
+### 1.1a Qwen3.8 request-level effort（2026-08-19）
+
+Qwen3.8 的官方模板把 `reasoning_effort` 作为 Jinja 变量，且默认值是
+`xhigh`；这不是一个硬 token budget。OpenAI Chat Completions 的顶层
+`reasoning_effort`、Responses API 的 `reasoning.effort` 现在由
+`server/app.py::_resolve_chat_template_kwargs` 映射到模板：`low`、`medium`、
+`high`、`xhigh` 保持思考并传递 effort，`none` 映射为
+`enable_thinking=false`。显式 `chat_template_kwargs` 优先级最高，未传任何字段
+则保持模板默认行为。
+
+不要把 `max_tokens` 当作 thinking budget：它限制整个 completion，达到上限时
+可能只有未闭合 reasoning 而没有正文。当前 runtime 的
+`thinking_token_budget` 采用更底层的单次连续生成路径：调度器跟踪
+`<think>`/`</think>` token span，并在 plain decode 或 MTP verify 的 logits 边界
+强制输出 close marker；不会通过二次 HTTP 请求或响应层字符串拼接续生成。官方
+两阶段 early-stop 方案仍是可选的上层策略，当前实现细节和真实 GPU E2E 证据见
+`notes/2026-08-19-qwen38-thinking-overrun-reproduction.md`。
+
 ### 1.1 坏在哪（修复前，`fix/t0-api-thinking` 分支基线 `40e9cdd`）
 
 `docs/roadmap.md` R3/R4 已经点出问题，这里补完整证据链：

@@ -263,6 +263,27 @@ class TestSlotLifecycle:
     def test_empty_decode_round_is_a_no_op(self) -> None:
         assert _backend().decode_batch_sampled([], [], [], []) == []
 
+    def test_prefill_and_decode_honor_sampler_level_forced_tokens(self) -> None:
+        backend = _backend(num_slots=1)
+        params = SamplingParams()
+
+        prefill = backend.prefill_chunked_begin(
+            [0],
+            [[1, 2, 3]],
+            params_per_slot={},
+            force_token_ids={0: 17},
+        )
+        assert prefill.result[0]["anchor"] == 17
+
+        next_token = backend.decode_batch_sampled(
+            [0],
+            [17],
+            [backend.slot_state(0).kv_len],
+            [params],
+            force_token_ids=[23],
+        )
+        assert next_token == [23]
+
     def test_prefill_into_a_dirty_slot_is_refused(self) -> None:
         # Without this guard the GDN layers would continue from the previous
         # sequence's recurrent state: no exception, no NaN, just a wrong

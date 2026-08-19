@@ -37,6 +37,7 @@ from pydantic import BaseModel
 
 from runtime.sampling import PersistentSeed, SamplingParams
 from runtime.structured_output import ResponseFormat
+from runtime.thinking_budget import ThinkingBudgetConfig
 from server import metrics
 from server.engine import ServerEngine
 from server.formats import anthropic as anthropic_format
@@ -236,6 +237,55 @@ if SERVER_REASONING_MODE not in ("expose", "strip"):
 # thinking-strip-bug.md) turned on: prepending unconditionally, on the endpoint
 # that has no template, ate whole responses.
 SERVER_THINKING_CAPABLE = os.environ.get("QSR_THINKING_CAPABLE", "1") != "0"
+
+# Qwen3.8's template uses ``reasoning_effort`` as a Jinja variable.  OpenAI
+# clients, however, commonly put it at the request root (and the Responses
+# API puts it under ``reasoning.effort``).  Keep the root-level compatibility
+# mapping here instead of making every endpoint know the template details.
+_REASONING_EFFORT_VALUES = ("low", "medium", "high", "xhigh", "none")
+
+
+def _resolve_chat_template_kwargs(
+    chat_template_kwargs: dict | None,
+    *,
+    reasoning_effort: str | None = None,
+) -> dict | None:
+    """Merge an API-level reasoning effort into chat-template kwargs.
+
+    ``chat_template_kwargs`` is the escape hatch used by vLLM and remains the
+    most explicit request-level control.  Therefore an explicit
+    ``enable_thinking`` or ``reasoning_effort`` in that mapping wins over the
+    OpenAI-compatible root field.  ``none`` is represented by the Qwen hard
+    switch because Qwen3.8's template accepts ``low|medium|xhigh`` (with
+    ``high`` aliased to ``xhigh``), not ``none``.
+    """
+    resolved = dict(chat_template_kwargs or {})
+    if "enable_thinking" in resolved or "reasoning_effort" in resolved:
+        return resolved or None
+    if reasoning_effort is None:
+        return resolved or None
+    if not isinstance(reasoning_effort, str):
+        raise _invalid_request(
+            "reasoning_effort must be one of "
+            f"{', '.join(_REASONING_EFFORT_VALUES)}, got {reasoning_effort!r}"
+        )
+    effort = reasoning_effort.lower()
+    if effort not in _REASONING_EFFORT_VALUES:
+        raise _invalid_request(
+            "reasoning_effort must be one of "
+            f"{', '.join(_REASONING_EFFORT_VALUES)}, got {reasoning_effort!r}"
+        )
+    if effort == "high":
+        effort = "xhigh"
+    if effort == "none":
+        resolved["enable_thinking"] = False
+    else:
+        resolved["reasoning_effort"] = effort
+        # This mirrors vLLM's automatic activation for a request-level
+        # effort.  Qwen3.8 already defaults to thinking, while other Qwen
+        # templates may require the explicit switch.
+        resolved["enable_thinking"] = True
+    return resolved
 
 # Selects which server/formats/tool_parsers/ shape to decode tool calls
 # with -- mirrors vLLM's --tool-call-parser NAME. Default matches this
@@ -605,6 +655,15 @@ class ChatCompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     logprobs: bool | None = False
     top_logprobs: int | None = None
+    # OpenAI-compatible request-level reasoning control.  It must be mapped
+    # to the model's chat-template kwargs before tokenization; leaving this
+    # field out makes pydantic silently ignore the client's setting and lets
+    # Qwen3.8 fall back to its default xhigh instruction.
+    reasoning_effort: str | None = None
+    # Qwen's model-specific sampler-level thinking budget. This is deliberately
+    # separate from ``max_tokens``: the scheduler forces ``</think>`` at the
+    # token boundary while preserving one continuous generation request.
+    thinking_token_budget: int | None = None
     # Forwarded to the chat template (e.g. {"enable_thinking": False} for
     # non-thinking mode). Mirrors vLLM's chat_template_kwargs request field.
     chat_template_kwargs: dict | None = None
@@ -692,6 +751,164 @@ def _validate_and_resolve_max_tokens(max_tokens: int | None) -> int:
     return resolved
 
 
+def _validate_thinking_token_budget(value: object | None) -> int | None:
+    """Validate the request-level low-level thinking budget."""
+    if value is None:
+        return None
+    # bool is an int subclass, but accepting true as a one-token budget is a
+    # particularly surprising API failure mode.
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise _invalid_request(
+            f"thinking_token_budget must be a positive integer, got {value!r}"
+        )
+    return value
+
+
+def _resolve_thinking_token_budget(
+    value: object | None,
+    chat_template_kwargs: dict | None,
+) -> int | None:
+    """Resolve and validate a budget after template switches are merged."""
+    budget = _validate_thinking_token_budget(value)
+    if budget is not None and chat_template_kwargs:
+        if chat_template_kwargs.get("enable_thinking") is False:
+            raise _invalid_request(
+                "thinking_token_budget requires thinking mode; remove "
+                "enable_thinking=false or the budget"
+            )
+    return budget
+
+
+async def _tokenize_thinking_budget_config(
+    engine_ref, thinking_token_budget: int | None
+) -> ThinkingBudgetConfig | None:
+    """Resolve Qwen's marker ids for the scheduler-owned token state."""
+    if thinking_token_budget is None:
+        return None
+    backend_name = getattr(engine_ref, "backend_name", None)
+    if backend_name not in (None, "qwen36"):
+        raise _invalid_request(
+            "thinking_token_budget is supported only by the Qwen reasoning backend"
+        )
+    loop = asyncio.get_running_loop()
+    start_fn = functools.partial(engine_ref.tok.encode, "<think>", add_special_tokens=False)
+    end_fn = functools.partial(engine_ref.tok.encode, "</think>", add_special_tokens=False)
+    start_ids, end_ids = await asyncio.gather(
+        loop.run_in_executor(None, start_fn),
+        loop.run_in_executor(None, end_fn),
+    )
+    start_ids = tuple(int(token_id) for token_id in start_ids)
+    end_ids = tuple(int(token_id) for token_id in end_ids)
+    if not start_ids or not end_ids:
+        raise _invalid_request(
+            "thinking_token_budget requires tokenizer ids for both <think> and </think>"
+        )
+    return ThinkingBudgetConfig(
+        budget=thinking_token_budget,
+        start_token_ids=start_ids,
+        end_token_ids=end_ids,
+    )
+
+
+def _merge_generation_result(
+    result: dict,
+    generated_ids: list[int],
+    prompt_tokens: int,
+    logprobs: list[dict] | None,
+) -> dict:
+    """Normalize scheduler output while preserving authoritative token usage."""
+    merged = dict(result)
+    merged["committed_token_ids"] = list(generated_ids)
+    merged["completion_tokens"] = len(generated_ids)
+    merged["prompt_tokens"] = prompt_tokens
+    if logprobs is not None:
+        merged["logprobs"] = logprobs
+    return merged
+
+
+async def _submit_with_thinking_budget(
+    engine_ref,
+    prompt_ids: list[int],
+    max_tokens: int,
+    *,
+    thinking_budget: ThinkingBudgetConfig | None,
+    processor: StreamProcessor,
+    session_id: str | None = None,
+    sampling_params: SamplingParams | None = None,
+    stop_sequences: list[str] | None = None,
+    logprobs: bool = False,
+    top_logprobs: int = 0,
+) -> dict:
+    """Submit one request with a sampler-level thinking constraint."""
+    result = await engine_ref.submit(
+        prompt_ids,
+        max_tokens,
+        session_id=session_id,
+        sampling_params=sampling_params,
+        stop_sequences=stop_sequences,
+        logprobs=logprobs,
+        top_logprobs=top_logprobs,
+        thinking_budget=thinking_budget,
+    )
+    generated_ids = list(result.get("committed_token_ids", []))
+    processor.add_tokens(generated_ids)
+    generation_logprobs = list(result.get("logprobs") or []) if logprobs else None
+    return _merge_generation_result(
+        result, generated_ids, len(prompt_ids), generation_logprobs
+    )
+
+
+async def _submit_stream_with_thinking_budget(
+    engine_ref,
+    prompt_ids: list[int],
+    max_tokens: int,
+    *,
+    thinking_budget: ThinkingBudgetConfig | None,
+    processor: StreamProcessor,
+    session_id: str | None = None,
+    sampling_params: SamplingParams | None = None,
+    cancel_ref: list | None = None,
+    stop_sequences: list[str] | None = None,
+    logprobs: bool = False,
+    top_logprobs: int = 0,
+):
+    """Streaming counterpart of :func:`_submit_with_thinking_budget`."""
+    generated_ids: list[int] = []
+    stream_ids: list[int] = []
+    result: dict | None = None
+    async for item in engine_ref.submit_stream(
+        prompt_ids,
+        max_tokens,
+        session_id=session_id,
+        sampling_params=sampling_params,
+        cancel_ref=cancel_ref,
+        stop_sequences=stop_sequences,
+        logprobs=logprobs,
+        top_logprobs=top_logprobs,
+        thinking_budget=thinking_budget,
+    ):
+        if isinstance(item, dict):
+            result = item
+            break
+        processor.add_tokens(item)
+        stream_ids.extend(item)
+        yield item
+
+    if result is None:
+        return
+    generated_ids = list(result.get("committed_token_ids", stream_ids))
+    # Test doubles may yield only the terminal result.  The real engine emits
+    # token batches first, so do not double-feed the normal stream.
+    if not stream_ids:
+        processor.add_tokens(generated_ids)
+    yield _merge_generation_result(
+        result,
+        generated_ids,
+        len(prompt_ids),
+        (list(result.get("logprobs") or []) if logprobs else None),
+    )
+
+
 def _reject_unsupported_response_format(response_format: dict | None) -> None:
     """N1: structured output (``json_object`` / ``json_schema``) has no
     working enforcement path in this runtime -- see
@@ -752,15 +969,26 @@ def _normalize_stop(
     return seqs
 
 
-def _validate_capacity(prompt_ids: list[int], max_tokens: int) -> None:
+def _validate_capacity(
+    prompt_ids: list[int], max_tokens: int, *, extra_tokens: int = 0
+) -> None:
     # metrics.record_error is NOT called here: _http_exception_handler
     # records it once, uniformly, for every raised HTTPException -- an
     # explicit call here would double-count.
     assert engine is not None
-    if not engine.capacity_ok(len(prompt_ids), max_tokens):
+    reserved_tokens = max_tokens + extra_tokens
+    capacity_ok = getattr(engine, "capacity_ok", None)
+    if capacity_ok is None:
+        # Small API test doubles from before the dynamic-capacity helper only
+        # expose the public ceiling.  Keep the validation useful for them
+        # while production ServerEngine continues to own the exact policy.
+        fits = len(prompt_ids) + reserved_tokens <= engine.capacity_tokens_per_slot
+    else:
+        fits = capacity_ok(len(prompt_ids), reserved_tokens)
+    if not fits:
         raise _invalid_request(
-            f"prompt_tokens({len(prompt_ids)}) + max_tokens({max_tokens}) = "
-            f"{len(prompt_ids) + max_tokens} exceeds this runtime's per-slot capacity of "
+            f"prompt too long: prompt_tokens({len(prompt_ids)}) + max_tokens({reserved_tokens}) = "
+            f"{len(prompt_ids) + reserved_tokens} exceeds this runtime's per-slot capacity of "
             f"{engine.capacity_tokens_per_slot} tokens (blocks_per_slot * block_size). "
             "Reduce the prompt length or max_tokens and retry."
         )
@@ -929,17 +1157,29 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     # Convert tools for the chat template
     tools = convert_tools_to_chat_template(req.tools)
+    chat_template_kwargs = _resolve_chat_template_kwargs(
+        req.chat_template_kwargs,
+        reasoning_effort=req.reasoning_effort,
+    )
+    thinking_token_budget = _resolve_thinking_token_budget(
+        req.thinking_token_budget,
+        chat_template_kwargs,
+    )
 
     prompt_ids = await _tokenize_chat(
         engine,
         chat_messages,
         tools=tools,
-        chat_template_kwargs=req.chat_template_kwargs,
+        chat_template_kwargs=chat_template_kwargs,
     )
     await _debug_log_input(
         "OPENAI /v1/chat/completions", req.model_dump(), chat_messages, prompt_ids
     )
-    _validate_capacity(prompt_ids, max_tokens)
+    thinking_budget = await _tokenize_thinking_budget_config(engine, thinking_token_budget)
+    _validate_capacity(
+        prompt_ids,
+        max_tokens,
+    )
 
     model_name = req.model or engine.MODEL
 
@@ -950,7 +1190,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         created = int(time.time())
 
         async def _sse():
-            proc = _new_stream_processor(engine.tok, req.chat_template_kwargs)
+            proc = _new_stream_processor(engine.tok, chat_template_kwargs)
             final_result = None
             first_token_t = None
             # First chunk: role announcement (matches vLLM format)
@@ -969,9 +1209,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             }
             yield f"data: {_json.dumps(first_chunk)}\n\n"
             _cancel_ref: list[str | None] = [None]
-            async for item in engine.submit_stream(
+            async for item in _submit_stream_with_thinking_budget(
+                engine,
                 prompt_ids,
                 max_tokens,
+                thinking_budget=thinking_budget,
+                processor=proc,
                 session_id=req.session_id,
                 sampling_params=sampling_params,
                 cancel_ref=_cancel_ref,
@@ -986,7 +1229,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 if isinstance(item, dict):
                     final_result = item
                     break
-                proc.add_tokens(item)
                 if first_token_t is None and item:
                     first_token_t = time.perf_counter()
                 if SERVER_REASONING_MODE == "expose":
@@ -1087,7 +1329,11 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             metrics.record_request(
                 "chat",
                 len(prompt_ids),
-                len(proc.all_ids),
+                (
+                    final_result.get("completion_tokens", len(proc.all_ids))
+                    if final_result
+                    else len(proc.all_ids)
+                ),
                 finish,
                 time.perf_counter() - t0,
                 (first_token_t - t0) if first_token_t is not None else None,
@@ -1100,9 +1346,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         return StreamingResponse(_sse(), media_type="text/event-stream")
 
     # Non-streaming path
-    result = await engine.submit(
+    proc = _new_stream_processor(engine.tok, chat_template_kwargs)
+    result = await _submit_with_thinking_budget(
+        engine,
         prompt_ids,
         max_tokens,
+        thinking_budget=thinking_budget,
+        processor=proc,
         session_id=req.session_id,
         sampling_params=sampling_params,
         stop_sequences=stop_sequences,
@@ -1112,8 +1362,6 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
     # Same state machine as the streaming path (server/formats/stream.py) --
     # not a second, independently-written parser for the non-streaming case.
-    proc = _new_stream_processor(engine.tok, req.chat_template_kwargs)
-    proc.add_tokens(result["committed_token_ids"])
     text = proc.content_text()
     reasoning_content = proc.reasoning_content() if SERVER_REASONING_MODE == "expose" else None
     metrics.record_request(
@@ -1787,7 +2035,16 @@ async def anthropic_count_tokens(request: Request):
 
     chat_messages = parse_messages(body)
     tools = convert_tools_to_chat_template(body.get("tools"))
-    prompt_ids = await _tokenize_chat(engine, chat_messages, tools=tools)
+    chat_template_kwargs = _resolve_chat_template_kwargs(
+        body.get("chat_template_kwargs"),
+        reasoning_effort=body.get("reasoning_effort"),
+    )
+    prompt_ids = await _tokenize_chat(
+        engine,
+        chat_messages,
+        tools=tools,
+        chat_template_kwargs=chat_template_kwargs,
+    )
     if DEBUG_REQUESTS:
         logger.info(
             "ANTHROPIC count_tokens: msgs=%d system_chars=%d tools=%d -> input_tokens=%d",
@@ -1826,7 +2083,7 @@ async def anthropic_messages(request: Request):
         str(request.url.query) if request.url.query else "-",
     )
 
-    max_tokens = body.get("max_tokens", DEFAULT_MAX_TOKENS)
+    max_tokens = _validate_and_resolve_max_tokens(body.get("max_tokens"))
     model_name = body.get("model") or engine.MODEL
     stream = body.get("stream", False)
     sampling_params = _build_sampling_params(
@@ -1849,7 +2106,21 @@ async def anthropic_messages(request: Request):
 
     # Convert tools for the chat template
     tools = convert_tools_to_chat_template(body.get("tools"))
-    chat_template_kwargs = body.get("chat_template_kwargs")
+    chat_template_kwargs = _resolve_chat_template_kwargs(
+        body.get("chat_template_kwargs"),
+        reasoning_effort=body.get("reasoning_effort"),
+    )
+    anthropic_thinking = body.get("thinking")
+    thinking_token_budget = _resolve_thinking_token_budget(
+        body.get("thinking_token_budget")
+        if body.get("thinking_token_budget") is not None
+        else (
+            anthropic_thinking.get("budget_tokens")
+            if isinstance(anthropic_thinking, dict)
+            else None
+        ),
+        chat_template_kwargs,
+    )
 
     prompt_ids = await _tokenize_chat(
         engine,
@@ -1859,9 +2130,9 @@ async def anthropic_messages(request: Request):
     )
     await _debug_log_input("ANTHROPIC /v1/messages", body, chat_messages, prompt_ids)
 
-    effective_max = min(max_tokens, engine.capacity_tokens_per_slot - len(prompt_ids) - 1)
-    if effective_max < 1:
-        raise _invalid_request("prompt too long for requested max_tokens")
+    thinking_budget = await _tokenize_thinking_budget_config(engine, thinking_token_budget)
+    _validate_capacity(prompt_ids, max_tokens)
+    effective_max = max_tokens
 
     if stream:
         import json as _json
@@ -1898,9 +2169,12 @@ async def anthropic_messages(request: Request):
             text_open = False
 
             _cancel_ref: list[str | None] = [None]
-            async for item in engine.submit_stream(
+            async for item in _submit_stream_with_thinking_budget(
+                engine,
                 prompt_ids,
                 effective_max,
+                thinking_budget=thinking_budget,
+                processor=proc,
                 sampling_params=sampling_params,
                 cancel_ref=_cancel_ref,
                 stop_sequences=stop_sequences,
@@ -1912,7 +2186,6 @@ async def anthropic_messages(request: Request):
                 if isinstance(item, dict):
                     final_result = item
                     break
-                proc.add_tokens(item)
                 if first_token_t is None and item:
                     first_token_t = time.perf_counter()
 
@@ -1963,7 +2236,11 @@ async def anthropic_messages(request: Request):
             else:
                 stop_reason = "end_turn" if finish == "stop" else "max_tokens"
             visible_text, tool_calls = proc.finalize()
-            out_tokens = len(proc.all_ids)
+            out_tokens = (
+                final_result.get("completion_tokens", len(proc.all_ids))
+                if final_result
+                else len(proc.all_ids)
+            )
             if tool_calls:
                 stop_reason = "tool_use"
                 from server.formats.tools import format_tool_calls_anthropic
@@ -2018,7 +2295,7 @@ async def anthropic_messages(request: Request):
             metrics.record_request(
                 "messages",
                 len(prompt_ids),
-                len(proc.all_ids),
+                out_tokens,
                 finish,
                 time.perf_counter() - t0,
                 (first_token_t - t0) if first_token_t is not None else None,
@@ -2031,16 +2308,18 @@ async def anthropic_messages(request: Request):
         return StreamingResponse(_anthropic_sse(), media_type="text/event-stream")
 
     # Non-streaming path
-    result = await engine.submit(
+    proc = _new_stream_processor(engine.tok, chat_template_kwargs)
+    result = await _submit_with_thinking_budget(
+        engine,
         prompt_ids,
         effective_max,
+        thinking_budget=thinking_budget,
+        processor=proc,
         sampling_params=sampling_params,
         stop_sequences=stop_sequences,
     )
     _raw_anth = await _tokenize_decode(engine, result["committed_token_ids"])
     # Same state machine as the streaming path (server/formats/stream.py).
-    proc = _new_stream_processor(engine.tok, chat_template_kwargs)
-    proc.add_tokens(result["committed_token_ids"])
     text = proc.content_text()
     reasoning_content = proc.reasoning_content() if SERVER_REASONING_MODE == "expose" else None
     metrics.record_request(
@@ -2096,7 +2375,23 @@ async def responses_api(request: Request):
     if not chat_messages:
         raise _invalid_request("no messages provided")
     tools = convert_tools_to_chat_template(body.get("tools"))
-    chat_template_kwargs = body.get("chat_template_kwargs")
+    response_reasoning = body.get("reasoning")
+    response_effort = (
+        response_reasoning.get("effort") if isinstance(response_reasoning, dict) else None
+    )
+    chat_template_kwargs = _resolve_chat_template_kwargs(
+        body.get("chat_template_kwargs"),
+        reasoning_effort=body.get("reasoning_effort", response_effort),
+    )
+    responses_thinking_budget = body.get("thinking_token_budget")
+    if responses_thinking_budget is None and isinstance(response_reasoning, dict):
+        responses_thinking_budget = response_reasoning.get("thinking_token_budget")
+        if responses_thinking_budget is None:
+            responses_thinking_budget = response_reasoning.get("budget_tokens")
+    thinking_token_budget = _resolve_thinking_token_budget(
+        responses_thinking_budget,
+        chat_template_kwargs,
+    )
     prompt_ids = await _tokenize_chat(
         engine,
         chat_messages,
@@ -2104,7 +2399,11 @@ async def responses_api(request: Request):
         chat_template_kwargs=chat_template_kwargs,
     )
     await _debug_log_input("OPENAI /v1/responses", body, chat_messages, prompt_ids)
-    _validate_capacity(prompt_ids, max_tokens)
+    thinking_budget = await _tokenize_thinking_budget_config(engine, thinking_token_budget)
+    _validate_capacity(
+        prompt_ids,
+        max_tokens,
+    )
 
     if stream:
         import json as _json
@@ -2168,9 +2467,12 @@ async def responses_api(request: Request):
             text_started = False
             last_send = time.monotonic()
             _cancel_ref: list[str | None] = [None]
-            async for item in engine.submit_stream(
+            async for item in _submit_stream_with_thinking_budget(
+                engine,
                 prompt_ids,
                 max_tokens,
+                thinking_budget=thinking_budget,
+                processor=proc,
                 sampling_params=sampling_params,
                 cancel_ref=_cancel_ref,
                 stop_sequences=None,
@@ -2182,7 +2484,6 @@ async def responses_api(request: Request):
                 if isinstance(item, dict):
                     final_result = item
                     break
-                proc.add_tokens(item)
                 if first_token_t is None and item:
                     first_token_t = time.perf_counter()
                 for delta in proc.drain_content():
@@ -2316,7 +2617,11 @@ async def responses_api(request: Request):
 
             usage = responses_format.build_usage(
                 len(prompt_ids),
-                len(proc.all_ids),
+                (
+                    final_result.get("completion_tokens", len(proc.all_ids))
+                    if final_result
+                    else len(proc.all_ids)
+                ),
                 final_result.get("prefix_cache_hit_tokens", 0) if final_result else 0,
             )
             completed = responses_format.snapshot(
@@ -2325,7 +2630,11 @@ async def responses_api(request: Request):
             metrics.record_request(
                 "responses",
                 len(prompt_ids),
-                len(proc.all_ids),
+                (
+                    final_result.get("completion_tokens", len(proc.all_ids))
+                    if final_result
+                    else len(proc.all_ids)
+                ),
                 finish,
                 time.perf_counter() - t0,
                 (first_token_t - t0) if first_token_t is not None else None,
@@ -2346,15 +2655,17 @@ async def responses_api(request: Request):
 
         return StreamingResponse(_responses_sse(), media_type="text/event-stream")
 
-    result = await engine.submit(
+    proc = _new_stream_processor(engine.tok, chat_template_kwargs)
+    result = await _submit_with_thinking_budget(
+        engine,
         prompt_ids,
         max_tokens,
+        thinking_budget=thinking_budget,
+        processor=proc,
         sampling_params=sampling_params,
         stop_sequences=None,
     )
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
-    proc = _new_stream_processor(engine.tok, chat_template_kwargs)
-    proc.add_tokens(result["committed_token_ids"])
     text = proc.content_text()
     reasoning_content = proc.reasoning_content() if SERVER_REASONING_MODE == "expose" else None
     metrics.record_request(

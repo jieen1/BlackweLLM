@@ -99,11 +99,29 @@ class StreamProcessor:
         self._thinking_emitted_len = 0
         self._last_decode_len = 0
         self._cached_raw = ""
+        # Legacy compatibility for callers that inject control tokens into
+        # the parser.  The active thinking_token_budget path enforces the
+        # boundary in the sampler and never appends a second-generation
+        # prompt here.
+        self._internal_token_ranges: list[tuple[int, int]] = []
         self._tool_names_emitted: set[int] = set()
         self._tool_args_emitted: set[int] = set()
 
     def add_tokens(self, token_ids: list[int]) -> None:
         self._all_ids.extend(token_ids)
+
+    def add_internal_tokens(self, token_ids: list[int]) -> None:
+        """Append legacy server-injected control tokens without exposing them.
+
+        This remains for compatibility with older parser callers.  New
+        thinking budgets force the end marker in the decoder state and feed
+        the resulting token through :meth:`add_tokens` like any other model
+        output.
+        """
+        start = len(self._all_ids)
+        self._all_ids.extend(token_ids)
+        if token_ids:
+            self._internal_token_ranges.append((start, len(self._all_ids)))
 
     @property
     def all_ids(self) -> list[int]:
@@ -137,6 +155,11 @@ class StreamProcessor:
     @property
     def thinking_done(self) -> bool:
         return self._thinking_done
+
+    def has_unclosed_thinking(self) -> bool:
+        """Whether the completed input still ends inside a think span."""
+        span = self._reasoning_span(self._get_raw(), final=True)
+        return span not in (None, "pending") and not span[2]
 
     def _reasoning_span(self, raw: str, *, final: bool):
         """Locate the reasoning span in ``raw``, or report ambiguity.
@@ -209,13 +232,28 @@ class StreamProcessor:
         carries no reasoning span. Safe to call any time (including after
         ``finalize()``); does not mutate drain state. The non-streaming
         counterpart to incrementally draining via ``drain_thinking()``."""
-        raw = self._get_raw()
+        # Exclude server-injected budget continuation text from the public
+        # reasoning field while retaining it in ``_get_raw`` for boundary
+        # detection and visible-content parsing.
+        if self._internal_token_ranges:
+            first_internal_start = self._internal_token_ranges[0][0]
+            visible_ids = self._all_ids[:first_internal_start]
+            raw = self._decode_ids(visible_ids)
+        else:
+            raw = self._get_raw()
         span = self._reasoning_span(raw, final=True)
         if span in (None, "pending"):
             return None
         start, end, _closed = span
         text = raw[start:end].strip()
         return text or None
+
+    def _decode_ids(self, token_ids: list[int]) -> str:
+        decoded = self._tok.decode(token_ids, skip_special_tokens=True)
+        decoded = decoded.replace("\ufffd", "")
+        if self._thinking_capable and not decoded.startswith(_THINK_OPEN):
+            return _THINK_OPEN + "\n" + decoded
+        return decoded
 
     def content_text(self) -> str:
         """Full visible content: reasoning removed, <usage> artifacts

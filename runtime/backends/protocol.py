@@ -267,6 +267,7 @@ class ModelBackend(Protocol):
         *,
         return_logprobs: bool = False,
         top_logprobs: int = 0,
+        force_token_ids: list[int | None] | None = None,
     ) -> list[int] | tuple[list[int], list[dict]]: ...
 
     # -- capabilities.chunked_prefill --------------------------------------
@@ -278,6 +279,7 @@ class ModelBackend(Protocol):
         chunk_size: int = 512,
         *,
         params_per_slot: dict[int, SamplingParams] | None = None,
+        force_token_ids: dict[int, int] | None = None,
     ) -> ChunkedPrefillState: ...
 
     def prefill_chunked_step(self, state: ChunkedPrefillState) -> bool: ...
@@ -306,6 +308,8 @@ class ModelBackend(Protocol):
         params_per_slot: dict[int, SamplingParams] | None = None,
         return_logprobs: bool = False,
         top_logprobs: int = 0,
+        thinking_force_positions: dict[int, int] | None = None,
+        thinking_force_token_ids: dict[int, int] | None = None,
     ) -> dict[int, dict]: ...
 
     # -- capabilities.cuda_graph -------------------------------------------
