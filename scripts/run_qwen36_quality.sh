@@ -71,7 +71,7 @@ cd "$REPO_ROOT"
 
 # NOTE: the venv is named after the pre-removal era; it hosts the repo's
 # editable install + eval deps. `server.app` and the qwen36 backend import no vllm.
-PY=/home/bot/.venvs/vllm/bin/python
+PY=/home/bot/.venvs/torch-nightly/bin/python
 LOCK_TOOL=/tmp/gpu_lock.sh
 LOCK_NAME=qwen36-quality-rerun
 

@@ -383,10 +383,11 @@ P2  Track H 发布 0.2.0                  ←── M5→M6
     `False`，不存在跨 CTA 归并，逐 query 行的 softmax 顺序不随分块变化。kernel 级 A/B（S=2…257，
     16 与 64 两种分块）**逐 bit 相同**，且都对 fp32 稠密参照 cos≥0.999998；全模型 10 个 prompt 的
     贪心 token 与末步 logits 修前/修后**逐 bit 相同**（`scripts/b1_verify_prefill_jit_and_greedy.py --compare`）。
-  - **附带**：`Qwen36ForCausalLMSelfBuilt.warmup_attention_shapes()` + `load_qwen36_model(warmup_attention=True)`
-    把这唯一一次编译移到加载期（首个 prefill 37.8s → 5.5s）。**剩下的 5.5s 不是 sparkinfer**，是 FLA/Triton
-    在 GDN chunk 路径上的首调用编译（单独实测冷进程 12.0s，且**不随长度重编译**：S=3…1023 之后每次 ~1ms）——
-    是一次性冷启动项，不是每形状项，不在本条范围内。
+  - **附带**：`Qwen36ForCausalLMSelfBuilt.warmup_attention_shapes()` +
+    `warmup_gdn_prefill_shapes()` + `load_qwen36_model(warmup_attention=True)` 把注意力和 GDN
+    chunk 的唯一一次编译都移到加载期。后者同时覆盖单请求 `forward` 与批量 `prefill_batch`；因此
+    首个 prefill/缓存前缀扩展不再把 FLA/Triton JIT 暴露给用户请求。`QSR_QWEN36_GDN_PREFILL_WARMUP=0`
+    仅用于冷启动 JIT 对照。
 
   CUDA-Graph 专属加速内核（`_is_laguna_fp8_gqa6_analytic_decode_graph`
   等）全部硬编码 `head_dim_qk==128`，摸不到，head_dim=256 decode 只能走通用

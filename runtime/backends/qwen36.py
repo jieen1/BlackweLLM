@@ -185,7 +185,13 @@ def _prefix_hash(token_ids: list[int], length: int) -> str:
     return hashlib.blake2b(ids.tobytes(), digest_size=16).hexdigest()
 
 
-def _chained_block_keys(token_ids: list[int], kv_len: int, block_size: int) -> list[BlockKey]:
+def _chained_block_keys(
+    token_ids: list[int],
+    kv_len: int,
+    block_size: int,
+    *,
+    include_partial: bool = False,
+) -> list[BlockKey]:
     """Chained 128-bit block hashes for the committed prefix.
 
     Phase 3: the arena's prefix cache is keyed per HASH BLOCK (the
@@ -205,7 +211,8 @@ def _chained_block_keys(token_ids: list[int], kv_len: int, block_size: int) -> l
 
     keys: list[BlockKey] = []
     parent: int | None = None
-    for end in range(block_size, kv_len + 1, block_size):
+    full_end = (kv_len // block_size) * block_size
+    for end in range(block_size, full_end + 1, block_size):
         # The parent already authenticates every preceding block. Feeding
         # ``token_ids[:end]`` here redundantly re-hashed the whole prefix at
         # every boundary: 128K / block_size=16 processed ~537M token values
@@ -215,6 +222,9 @@ def _chained_block_keys(token_ids: list[int], kv_len: int, block_size: int) -> l
         value = hash_block_tokens(parent, token_ids[end - block_size : end], ())
         keys.append(BlockKey(value=value, num_tokens=end))
         parent = value
+    if include_partial and full_end < kv_len:
+        value = hash_block_tokens(parent, token_ids[full_end:kv_len], ())
+        keys.append(BlockKey(value=value, num_tokens=kv_len))
     return keys
 
 
@@ -247,6 +257,11 @@ class _PersistentPrefixEntry:
     checkpoint_key: tuple[str, str]
     has_mtp_snapshot: bool
     scratch_page_offsets: tuple[int, ...]
+    # Dynamic-arena entries need the exact physical page row as well as the
+    # chained full-block hashes.  A prompt may end in the middle of a page;
+    # a longer conversation can still reuse that page row even though the
+    # next prompt's fixed block chain cannot contain the old partial key.
+    arena_bundle_ids: tuple[int, ...] = ()
     # Anchor-row hidden of a full-prompt entry.  An exact-length hit would
     # otherwise leave no token to recompute and therefore no logits; the
     # stored row reproduces them without any forward.
@@ -529,6 +544,13 @@ class Qwen36Backend:
         #: mutually exclusive with MTP: both consume the same target verify
         #: boundary but have different draft-cache contracts.
         self._dspark: Qwen36DSparkEngine | None = None
+
+        if self.pool.dynamic_arena:
+            # The arena must invalidate a persistent recurrent checkpoint when
+            # any one of its backing KV bundles is evicted. Without this hook
+            # a later exact-token match could restore a checkpoint alongside
+            # recycled physical pages.
+            self.pool._arena._on_evict_cached = self._on_dynamic_bundle_evicted  # noqa: SLF001
 
         self.pool.reset_all()
 
@@ -985,7 +1007,17 @@ class Qwen36Backend:
         self._prefix_hash_len.pop(slot, None)
         self.pool.slot_kv_len[slot] = len(prompt_ids)
         self.pool.slot_committed_tokens[slot] = list(prompt_ids) + [first_token]
-        self._maybe_checkpoint(slot)
+        # Persistent prefixes must authenticate the exact prompt boundary,
+        # not only a block boundary. DSH/agent prompts routinely end at an
+        # arbitrary token (for example 122484), so force this checkpoint.
+        # The production Qwen profile uses the dynamic arena.  Keep the
+        # legacy fixed-scratch policy's historical block-only stores (and its
+        # two-entry budget) unchanged; dynamic arena entries carry the exact
+        # physical page row needed for arbitrary prompt boundaries.
+        self._maybe_checkpoint(
+            slot,
+            force=self.enable_persistent_prefix_cache and self.pool.dynamic_arena,
+        )
 
     # -- protocol: chunked prefill -----------------------------------------
 
@@ -1641,20 +1673,28 @@ class Qwen36Backend:
     def _evict_persistent_until(self, pages: int) -> bool:
         """Make ``pages`` scratch pages available without touching live aliases."""
         while len(self._persistent_free_scratch_pages) < pages:
-            evictable = next(
-                (
-                    entry
-                    for entry in self._persistent_prefixes.values()
-                    if all(
-                        self.pool._page_refcounts[  # noqa: SLF001 - allocator invariant
-                            self.pool.scratch_row * self.pool.pages_per_slot + page
-                        ]
-                        == 1
-                        for page in entry.scratch_page_offsets
-                    )
-                ),
-                None,
-            )
+            if self.pool.dynamic_arena:
+                # Dynamic Qwen KV no longer has the legacy fixed-page
+                # ``_page_refcounts`` table.  In this mode the only scratch
+                # family left here is DSpark's copied draft KV; it has no
+                # page-table aliases, so the oldest persistent entry is
+                # always safe to evict when more scratch pages are needed.
+                evictable = next(iter(self._persistent_prefixes.values()), None)
+            else:
+                evictable = next(
+                    (
+                        entry
+                        for entry in self._persistent_prefixes.values()
+                        if all(
+                            self.pool._page_refcounts[  # noqa: SLF001 - allocator invariant
+                                self.pool.scratch_row * self.pool.pages_per_slot + page
+                            ]
+                            == 1
+                            for page in entry.scratch_page_offsets
+                        )
+                    ),
+                    None,
+                )
             if evictable is None:
                 # A finished warm request keeps its page-table alias on the
                 # entry's scratch pages (``reset_slot`` leaves it so
@@ -1725,8 +1765,8 @@ class Qwen36Backend:
         tokens = self.pool.slot_committed_tokens[slot]
         if prompt_hidden is not None:
             # The prefill-commit boundary must still be the slot's own
-            # checkpoint; a prompt length off a block boundary has no stored
-            # state and stays on the old reset-time behaviour.
+            # checkpoint; it is exact even when the prompt is off the normal
+            # rolling block boundary.
             if self.pool.slot_kv_len[slot] != kv_len or kv_len > len(tokens) - 1:
                 return
         if kv_len <= 0 or tensors is None or len(tokens) < kv_len:
@@ -1753,6 +1793,7 @@ class Qwen36Backend:
         dynamic_arena = self.pool.dynamic_arena
         pages = (kv_len + self.pool.page_size - 1) // self.pool.page_size
         has_dspark_snapshot = self._dspark is None
+        arena_bundle_ids: tuple[int, ...] = ()
         if dynamic_arena:
             # Backbone and MTP use the same bundle mapping. reset_slot later
             # publishes/decrefs those live pages into CACHED_REF0, so no target
@@ -1777,10 +1818,17 @@ class Qwen36Backend:
                     return
             if prompt_hidden is not None:
                 try:
-                    keys = _chained_block_keys(tokens, kv_len, self.block_size)
-                    self.pool.publish_committed_blocks(
-                        slot, kv_len, keys, self.block_size
+                    keys = _chained_block_keys(
+                        tokens, kv_len, self.block_size, include_partial=True
                     )
+                    self.pool.publish_committed_blocks(
+                        slot,
+                        kv_len,
+                        keys,
+                        self.block_size,
+                        include_partial=True,
+                    )
+                    arena_bundle_ids = tuple(self.pool._page_table_host[slot][:pages])
                 except RuntimeError as exc:
                     # Do not register a persistent entry whose KV identity is
                     # absent from the arena. A later repeat safely recomputes
@@ -1877,6 +1925,7 @@ class Qwen36Backend:
             checkpoint_key=key,
             has_mtp_snapshot=has_mtp_snapshot,
             scratch_page_offsets=scratch_page_offsets,
+            arena_bundle_ids=arena_bundle_ids,
             final_hidden=(prompt_hidden.detach().clone() if prompt_hidden is not None else None),
             has_dspark_snapshot=has_dspark_snapshot,
         )
@@ -1897,8 +1946,17 @@ class Qwen36Backend:
         # cross-slot path does, so it cannot later authenticate unrelated KV.
         self.drop_prefix_cache(slot)
         if self.pool.dynamic_arena:
-            keys = _chained_block_keys(token_ids, entry.kv_len, self.block_size)
-            restored, _bundle_ids = self.pool.restore_prefix_from_arena(slot, entry.kv_len, keys)
+            if entry.arena_bundle_ids:
+                restored, _bundle_ids = self.pool.restore_prefix_from_cached_bundles(
+                    slot, entry.kv_len, entry.arena_bundle_ids
+                )
+            else:
+                keys = _chained_block_keys(
+                    token_ids, entry.kv_len, self.block_size, include_partial=True
+                )
+                restored, _bundle_ids = self.pool.restore_prefix_from_arena(
+                    slot, entry.kv_len, keys
+                )
             if restored < entry.kv_len:
                 return 0
         else:
@@ -2194,8 +2252,8 @@ class Qwen36Backend:
 
     # -- second cache family: checkpoints ----------------------------------
 
-    def _maybe_checkpoint(self, slot: int) -> None:
-        """Refresh ``slot``'s rolling checkpoint if it is on a boundary.
+    def _maybe_checkpoint(self, slot: int, *, force: bool = False) -> None:
+        """Refresh ``slot``'s checkpoint at a rolling or exact boundary.
 
         Called after every commit (prefill and each decode token). The
         boundary test is on ``kv_len``, i.e. on positions actually written
@@ -2205,7 +2263,7 @@ class Qwen36Backend:
         if not self.enable_prefix_cache:
             return
         kv_len = self.pool.slot_kv_len[slot]
-        if kv_len <= 0 or kv_len % self.block_size != 0:
+        if kv_len <= 0 or (not force and kv_len % self.block_size != 0):
             return
         if self._checkpoint_len.get(slot) == kv_len:
             return
@@ -2302,6 +2360,20 @@ class Qwen36Backend:
             return True
         slot = key[0] if isinstance(key, tuple) else key
         return self.pool.slot_kv_len[slot] == 0
+
+    def _on_dynamic_bundle_evicted(self, bundle_id: int) -> None:
+        """Drop persistent entries whose dynamic KV backing was evicted."""
+        stale = [
+            entry
+            for entry in self._persistent_prefixes.values()
+            if bundle_id in entry.arena_bundle_ids
+        ]
+        for entry in stale:
+            key = entry.checkpoint_key
+            if key not in self.checkpoint_pool:
+                continue
+            self.checkpoint_pool.unpin(key)
+            self.checkpoint_pool.evict(key)
 
     def _drop_kv_for_checkpoint(self, key: object) -> None:
         if isinstance(key, tuple) and len(key) == 2 and key[0] == "persistent":

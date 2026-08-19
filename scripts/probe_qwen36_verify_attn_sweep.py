@@ -11,7 +11,7 @@ geometry so the two can be compared head-to-head without a full server run.
 Synthetic only -- no model load, no weight files.  Needs ~1.5 GB GPU.
 
 Usage:
-    /home/bot/.venvs/vllm/bin/python scripts/probe_qwen36_verify_attn_sweep.py
+    /home/bot/.venvs/torch-nightly/bin/python scripts/probe_qwen36_verify_attn_sweep.py
 
 Env knobs:
     QSR_PROBE_CAPACITY_PAGES=2048   worst-case workspace capacity

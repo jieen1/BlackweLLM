@@ -193,6 +193,12 @@ QSR_QWEN36_FUSED_KV_SCATTER_ENV = "QSR_QWEN36_FUSED_KV_SCATTER"
 # kernel.  ``auto`` selects it when the optional package is available and
 # retains the tested FLA path otherwise; ``fla`` is the explicit bisect switch.
 QSR_QWEN36_GDN_PREFILL_BACKEND_ENV = "QSR_QWEN36_GDN_PREFILL_BACKEND"
+# The single-request scheduler uses ``Qwen36GatedDeltaNet.forward`` rather
+# than the batched ``prefill_batch`` entry.  Both eventually execute a chunk
+# kernel, but the first call to the direct entry used to JIT FLA/Triton in the
+# request that extended a cached prompt.  Keep a load-time escape hatch for
+# cold-start bisects; production defaults to paying this once before serving.
+QSR_QWEN36_GDN_PREFILL_WARMUP_ENV = "QSR_QWEN36_GDN_PREFILL_WARMUP"
 
 # Temporary, opt-in CUDA synchronization for identifying which decoder layer
 # dominates a long prefill.  It is off by default and must not affect serving.
@@ -5929,6 +5935,79 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
                 )
         if device.type == "cuda":
             torch.cuda.synchronize(device)
+
+    def warmup_gdn_prefill_shapes(self, *, device: torch.device | str, dtype: torch.dtype) -> None:
+        """Compile both GDN extend entry points before accepting requests.
+
+        The attention warmup above covers SparkInfer/FlashInfer's paged
+        attention driver, but a single-request admission still enters GDN via
+        :meth:`Qwen36GatedDeltaNet.forward`.  Its first continuation used to
+        compile FLA/Triton's chunk kernels inside the request, which made an
+        otherwise cached ``+13``-token extension look like a 13-second
+        prefill.  Batch admission uses :meth:`Qwen36GatedDeltaNet.prefill_batch`
+        and may select FlashInfer instead, so warm both call sites.
+
+        Only one real GDN layer is needed: all Qwen3.6 GDN layers share the
+        same head geometry and kernel shapes.  The buffers and states are
+        throwaway; no production recurrent state or KV page is touched.  The
+        two lengths deliberately cover a cold prefill and the small
+        continuation that exposed the bug.  Triton's chunk kernels use the
+        same geometry for the intermediate ``+100``/``+300`` extensions,
+        which is verified by the end-to-end growth matrix.
+        """
+        device = torch.device(device)
+        if device.type != "cuda" or os.environ.get(QSR_QWEN36_GDN_PREFILL_WARMUP_ENV, "1") == "0":
+            return
+
+        gdn = next(
+            (
+                layer.linear_attn
+                for layer in self.model.layers
+                if layer.layer_type == "linear_attention" and layer.linear_attn is not None
+            ),
+            None,
+        )
+        if gdn is None:
+            return
+
+        # ``forward`` and ``prefill_batch`` have independent Python entry
+        # points.  Use a length larger than the exposed append cases for the
+        # initial call, then the exact small continuation which previously
+        # paid the JIT.  Each state is private to this warmup.
+        initial_hidden = torch.zeros(
+            1, 300, self.config["hidden_size"], device=device, dtype=dtype
+        )
+        continuation_hidden = torch.zeros(
+            1, 13, self.config["hidden_size"], device=device, dtype=dtype
+        )
+        # ``FlashInferGDNPrefill`` retains a small state-layout workspace on
+        # the layer.  ``inference_mode`` would make that retained tensor an
+        # inference tensor, which normal serving cannot update after this
+        # method returns.  ``no_grad`` gives the same allocation-free
+        # semantics here without changing the storage contract of the
+        # persistent adapter workspace.
+        with torch.no_grad():
+            direct_state = gdn.new_state(batch=1, device=device, dtype=dtype)
+            gdn(initial_hidden, direct_state)
+            gdn(continuation_hidden, direct_state)
+
+            batched_state = gdn.new_state(batch=1, device=device, dtype=dtype)
+            gdn.prefill_batch(
+                initial_hidden,
+                batched_state.conv_state,
+                batched_state.recurrent_state,
+                has_previous_state=False,
+            )
+            gdn.prefill_batch(
+                continuation_hidden,
+                batched_state.conv_state,
+                batched_state.recurrent_state,
+                has_previous_state=True,
+            )
+        torch.cuda.synchronize(device)
+        logger.info(
+            "Qwen GDN prefill warmup complete (direct + batched, initial=300, continuation=13)"
+        )
 
     def release_decode_workspaces(self) -> int:
         """Release the shared decode-mode attention arenas (plan §4.5

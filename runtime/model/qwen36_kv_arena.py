@@ -553,9 +553,10 @@ class QwenPageBundlePool:
     def ensure_writable(self, bundle_id: int, *, owner: str = "cow") -> int:
         """Return a bundle the caller may write to, cloning if shared.
 
-        A private bundle (``ref_cnt == 1``, not null) is writable as-is and
-        returned unchanged. A shared bundle (``ref_cnt > 1``) or a
-        freed-but-cached one is COW-detached: a fresh bundle is allocated and
+        A private, unhashed bundle (``ref_cnt == 1``, not null) is writable
+        as-is and returned unchanged. A shared bundle (``ref_cnt > 1``), a
+        live cached bundle (``block_hash is not None``), or a freed-but-cached
+        one is COW-detached: a fresh bundle is allocated and
         recorded in ``_pending_cow[bundle_id] -> source`` so Phase 2 can copy
         the source bytes before the first write (plan §6.4 "shared tail 在任
         何写入前 COW"; §7 invariant 3 -- a writable tail's refcount must be 1).
@@ -563,7 +564,7 @@ class QwenPageBundlePool:
         if bundle_id < self.reserved:
             raise RuntimeError(f"INV7: cannot write to reserved bundle {bundle_id}")
         bundle = self.bundles[bundle_id]
-        if bundle.ref_cnt == 1 and not bundle.is_null:
+        if bundle.ref_cnt == 1 and not bundle.is_null and bundle.block_hash is None:
             return bundle_id
         if bundle.ref_cnt == 0:
             raise RuntimeError(

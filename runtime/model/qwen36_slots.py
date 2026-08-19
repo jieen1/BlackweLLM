@@ -1335,7 +1335,13 @@ class Qwen36SlotPool:
     # -- Phase 3: prefix cache as arena-owned cached blocks ----------------
 
     def publish_committed_blocks(
-        self, slot: int, kv_len: int, keys: Sequence[BlockKey], block_size: int
+        self,
+        slot: int,
+        kv_len: int,
+        keys: Sequence[BlockKey],
+        block_size: int,
+        *,
+        include_partial: bool = False,
     ) -> int:
         """Publish hashes for ``slot``'s committed blocks to the arena.
 
@@ -1352,7 +1358,9 @@ class Qwen36SlotPool:
         ``page_size // block_size`` of them, all pointing at the same
         bundle (vLLM fine-grained lookup). Only blocks fully covered by
         committed tokens are published -- a final partial block stays
-        private (plan §5.1C). Returns the number of blocks published.
+        private (plan §5.1C). ``include_partial`` is reserved for an exact
+        persistent prompt boundary whose recurrent checkpoint authenticates
+        the partial page. Returns the number of blocks published.
         """
         if not self.dynamic_arena:
             return 0
@@ -1369,7 +1377,7 @@ class Qwen36SlotPool:
             end = key.num_tokens
             if end > kv_len:
                 break  # not committed yet
-            if end % block_size != 0:
+            if end % block_size != 0 and not (include_partial and end == kv_len):
                 continue  # not a block boundary
             logical_page = (end - 1) // self.page_size
             bundle_id = row[logical_page]
@@ -1403,30 +1411,107 @@ class Qwen36SlotPool:
         if not hit.hit or not hit.bundle_ids:
             return 0, []
         bundle_ids = list(hit.bundle_ids)
-        # Multiple hash blocks (block_size boundaries) share one physical
-        # page, so the hit's bundle list is denser than the page row. The
-        # bundle is the physical ownership unit: dedup before incref, or a
-        # two-block page would be referenced twice and never reach ref_cnt 0
-        # on release (vLLM touches one KVCacheBlock per block; here one
-        # bundle IS the page, one reference).
-        unique_bundles = list(dict.fromkeys(bundle_ids))
-        self._arena.incref(unique_bundles, owner=f"slot-{slot}")
-        # Reservation accounting follows the physical ownership unit.  A
-        # block-aligned hit may end halfway through a page (for example a
-        # 64-token hash block in a 128-token bundle); floor-dividing tokens
-        # by page_size consumed zero even though one cached bundle became
-        # live.  Deduplicated bundle count is exact for both partial pages
-        # and the multiple-hash-blocks-per-page layout.
-        self._arena.consume_reservation(len(unique_bundles), owner=f"slot-{slot}")
-        self._slot_bundles[slot].update(unique_bundles)
+        pages = (kv_len + self.page_size - 1) // self.page_size
+        page_sources = [0] * pages
+        # Multiple hash blocks can share one physical page, so the arena's
+        # dense block list must be normalized to the logical page row before
+        # applying the partial-page copy-on-write rule.
+        for key, bundle_id in zip(keys, bundle_ids, strict=False):
+            if key.num_tokens > kv_len:
+                break
+            logical_page = (key.num_tokens - 1) // self.page_size
+            if 0 <= logical_page < pages:
+                page_sources[logical_page] = bundle_id
+        if any(bundle_id == 0 for bundle_id in page_sources):
+            return 0, []
+        return self._restore_cached_page_prefix(slot, kv_len, page_sources)
+
+    def restore_prefix_from_cached_bundles(
+        self, slot: int, kv_len: int, bundle_ids: Sequence[int]
+    ) -> tuple[int, list[int]]:
+        """Restore an authenticated persistent page row without rehashing it.
+
+        A prompt may end in the middle of a hash block.  A longer prompt
+        repartitions that tail, so its fixed chained hashes cannot contain
+        the old partial key even though the exact token prefix is reusable.
+        Persistent-prefix token/checkpoint authentication happens in the
+        backend; this method owns only arena references and page mapping.
+        """
+        pages = (kv_len + self.page_size - 1) // self.page_size
+        page_sources = list(bundle_ids)
+        if len(page_sources) != pages:
+            return 0, []
+        if any(bundle_id == 0 for bundle_id in page_sources):
+            return 0, []
+        return self._restore_cached_page_prefix(slot, kv_len, page_sources)
+
+    def _restore_cached_page_prefix(
+        self, slot: int, kv_len: int, page_sources: Sequence[int]
+    ) -> tuple[int, list[int]]:
+        """Install cached pages and privatize a writable partial tail."""
+        if not self.dynamic_arena:
+            return 0, []
+        pages = (kv_len + self.page_size - 1) // self.page_size
+        if not 0 < kv_len <= self.max_seq_len or len(page_sources) != pages:
+            return 0, []
+        source_pages = list(page_sources)
+        unique_sources = list(dict.fromkeys(source_pages))
+        for bundle_id in unique_sources:
+            if not self._arena.reserved <= bundle_id < self._arena.num_bundles:
+                return 0, []
+            bundle = self._arena.bundles[bundle_id]
+            if bundle.ref_cnt == 0 and bundle.block_hash is None:
+                # An evicted persistent entry must degrade to a safe miss,
+                # never alias a recycled physical bundle.
+                return 0, []
+
+        owner = f"slot-{slot}"
+        reserved = self._arena.reserved_for(owner)
+        if reserved and reserved < pages:
+            return 0, []
+        partial = kv_len % self.page_size != 0
+        full_sources = source_pages[:-1] if partial else source_pages
+        fresh_tail: int | None = None
+        revived = False
+        try:
+            # Revive all source pages before allocating the private partial
+            # tail so arena pressure cannot evict the page being copied.
+            self._arena.incref(unique_sources, owner=owner)
+            revived = True
+            if partial:
+                fresh_tail = self._arena.allocate(1, owner=owner)[0]
+            self._arena.consume_reservation(len(full_sources), owner=owner)
+        except RuntimeError:
+            # ``incref`` validates the complete source list before mutation.
+            # If a later capacity check fails, undo both the temporary source
+            # revival and a just-allocated private tail before taking the
+            # cold-safe path.  The tail is not in the slot bundle set yet, so
+            # release it directly through the arena.
+            if fresh_tail is not None:
+                try:
+                    self._arena.decref([fresh_tail], owner=owner)
+                except RuntimeError:
+                    pass
+            if revived:
+                try:
+                    self._arena.decref(unique_sources, owner=owner)
+                except RuntimeError:
+                    pass
+            return 0, []
+
         row = list(self._page_table_host[slot])
-        # Write each page's bundle once: the page covering hash-block ``i``
-        # is ``(keys[i].num_tokens - 1) // page_size``.
-        for i, bundle_id in enumerate(bundle_ids):
-            logical_page = (keys[i].num_tokens - 1) // self.page_size
-            row[logical_page] = bundle_id
+        row[: len(full_sources)] = full_sources
+        self._slot_bundles[slot].update(full_sources)
+        restored_pages = list(full_sources)
+        if partial:
+            assert fresh_tail is not None
+            self._slot_bundles[slot].add(fresh_tail)
+            self._clone_cow_pages([(pages - 1, source_pages[-1], fresh_tail)])
+            self._arena.decref([source_pages[-1]], owner=owner)
+            row[pages - 1] = fresh_tail
+            restored_pages.append(fresh_tail)
         self.set_page_table_row(slot, row)
-        return hit.effective_tokens, unique_bundles
+        return kv_len, restored_pages
 
     # -- Phase 4: request-scoped full-sequence reservations ----------------
 

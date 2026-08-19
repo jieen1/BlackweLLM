@@ -108,3 +108,61 @@ graph、ragged verify graph 和 target graph 全部 captured。关闭 thinking �
 性能 JSON、server trace/stats 与本记录均使用同一轮真实进程，后续做默认
 参数 A/B 时应继续沿用该 workload，并先确认 `mtp_verify_graph_replays=0`
 和 completion SHA。
+
+## 追加验证：不同前缀增长与 GDN JIT 根因（2026-08-19）
+
+针对“相同前缀后追加少量 token 仍然很慢”的问题，使用全新服务进程、三组
+首 token 不同的 120000-token prompt，分别执行原 prompt、累计追加 13/100/300
+token。三组 cold base 分别为 `33.751/33.481/33.719 s`；对应追加耗时为：
+
+| workload | case 1 | case 2 | case 3 |
+|---|---:|---:|---:|
+| base cold | 33.751 s | 33.481 s | 33.719 s |
+| `+13` | 0.452 s | 0.421 s | 0.434 s |
+| `+100` | 0.489 s | 0.469 s | 0.482 s |
+| `+300` | 0.538 s | 0.541 s | 0.534 s |
+
+9/9 次增长请求命中 persistent prefix，HTTP 全部 200，错误、超时和 watchdog
+均为 0。另一个新 prompt 的 exact repeat 为 `0.098 s`，证明 exact prompt-boundary
+的 KV/GDN 状态恢复有效；`hit_L` 的 block 对齐显示不代表只恢复了整块 KV，动态
+arena 的 partial state 也同时恢复。
+
+追加 13 token 的历史长尾不是 prefix cache miss，而是首次进入单请求
+`Qwen36GatedDeltaNet.forward` 时，FLA/Triton chunk kernel 在用户请求线程内
+JIT 编译。现在加载期由 `warmup_gdn_prefill_shapes()` 同时 warm direct
+`forward` 和 batched `prefill_batch`，并用 `torch.no_grad()` 保持 FlashInfer
+适配器的可写 persistent workspace；`inference_mode()` 会把该 workspace 变成
+不可更新的 inference tensor，已排除。
+
+## 工具链对比与 GIL 状态
+
+同脚本、同模型快照、同 128K/c1-c4 workload 的工具链 A/B（2026-08-16）如下：
+
+| 指标 | 旧 venv | Python3.14 nightly | 变化 |
+|---|---:|---:|---:|
+| c1 cold decode | 97.30 tok/s | 97.45 tok/s | +0.15% |
+| c4 warm 1 | 64.58 tok/s | 64.50 tok/s | -0.12% |
+| c4 warm 2 | 63.81 tok/s | 64.93 tok/s | +1.76% |
+| c4 warm mean | 64.20 tok/s | 64.72 tok/s | +0.81% |
+
+旧环境是 Python 3.12 + torch 2.13/cu133 + Triton 3.7.1 + b12x 1.1.0；当前
+环境是 Python 3.14.4 + torch 2.15.0.dev/cu134 + Triton 3.8.0 + b12x 1.2.3。
+同机连续测量的约 3% run-to-run 漂移大于上述差异，因此结论是工具链没有可归因
+的性能回退。当前 DSpark K=7 生产路径的后续 c4 warm 复测均值为约 479.6
+tok/s，历史同口径约 480.1 tok/s，也在误差范围内。
+
+当前 `/home/bot/.venvs/torch-nightly/bin/python` 不是 free-threaded 构建：
+`sys._is_gil_enabled()` 为 `True`，`Py_GIL_DISABLED=0`，SOABI 是普通的
+`cpython-314-x86_64-linux-gnu`；`-X gil=0`/`PYTHON_GIL=0` 会被解释器拒绝。
+因此本轮优化没有依赖 nogil。即便换成 free-threaded Python，主要算子在 CUDA/C
+扩展中执行并会释放 GIL，当前主要瓶颈是 prefill、DSpark verify 和 GPU GEMM，
+预计不会解决 13-token JIT 长尾；还必须先验证 PyTorch、Triton、FlashInfer 和
+b12x 的 free-threaded ABI 兼容性，不能直接切换生产环境。
+
+## 根因修复后的最终回归
+
+- Python3.14 全套：`2544 passed, 8 skipped, 55 warnings`。
+- 目标 Ruff、`compileall`、shell 语法检查通过；全仓 Ruff 仍仅被工作区既有
+  的 12 个无关错误阻断。
+- 修复后的 4×131K c4：cold `40.377 s`，稳定 warm 均值约 `479.6 tok/s`；
+  既有基线约 `40.495 s` / `480.1 tok/s`，completion SHA 保持一致。

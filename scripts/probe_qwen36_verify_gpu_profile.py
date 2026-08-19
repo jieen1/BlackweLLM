@@ -12,7 +12,7 @@ differs, which is exactly what the graph is for.
 Usage (mirror the serving env, single process):
     source /tmp/qwen36_server_env.sh
     export QSR_SERVER_CAPACITY=4 QSR_SERVER_NUM_SLOTS=5
-    /home/bot/.venvs/vllm/bin/python scripts/probe_qwen36_verify_gpu_profile.py
+    /home/bot/.venvs/torch-nightly/bin/python scripts/probe_qwen36_verify_gpu_profile.py
 """
 
 from __future__ import annotations

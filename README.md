@@ -293,7 +293,7 @@ QSR_SERVER_MODEL_PATH=/path/to/Qwen3.8-27B-NVFP4 \
   python -m server.app --host 0.0.0.0 --port 8300
 ```
 
-Same self-built server (no vLLM), model id `qwen3.6`, callable through
+Same self-built server (no vLLM), model id `qwen3.8`, callable through
 `/v1/chat/completions`, `/v1/messages`, or `/v1/responses`.
 
 ### Call
@@ -318,7 +318,7 @@ Both Codex CLI and Claude Code can drive this runtime directly, no proxy:
   (`base_url = http://127.0.0.1:8300/v1`, `wire_api = "responses"`, 256K
   context). Run `CODEX_HOME="$PWD/.codex" codex exec -p blackwellm "<task>"`.
 - **Claude Code** — project `.claude/settings.json` sets
-  `ANTHROPIC_BASE_URL = http://127.0.0.1:8300`, `ANTHROPIC_MODEL = qwen3.6`.
+  `ANTHROPIC_BASE_URL = http://127.0.0.1:8300`, `ANTHROPIC_MODEL = qwen3.8`.
   Run `claude -p "<task>"` from the repo root.
 - **Laguna backend** — `.codex/laguna.config.toml` defines profile `laguna`
   (`base_url = http://127.0.0.1:8100/v1`), and
@@ -354,6 +354,7 @@ plus the Laguna run in
 | `QSR_SERVER_ENABLE_DFLASH` | `0` | Enable DFlash speculative engine (Laguna) |
 | `QSR_SERVER_REQUEST_TIMEOUT_S` | `600` | Server-side request cap; `0` disables (quality/longctx profiles) |
 | `QSR_SERVED_MODEL_NAME` | model ID | Advertised model name(s) |
+| `QSR_THINKING_TOKEN_BUDGET` | `8192` for Qwen | Default per-request reasoning-token cap; request-level budget/effort overrides it |
 | `QSR_DEBUG_REQUESTS` | `0` | Log raw request/response |
 | `QSR_TRACE` | `0` | bfdiag flight recorder |
 | `QSR_ASSERT_LEVEL` | `0` | Runtime invariant assertions |
@@ -406,13 +407,16 @@ been repaired; what remains open:
   signature we cannot produce, and a fake one makes Claude Desktop silently drop
   every subsequent content block including `tool_use`
   (see [`docs/roadmap.md`](docs/roadmap.md) §1.4).
-- **Prefix-cache full hits require block-aligned prompts.** Persistent entries
-  are published at `block_size` (16) boundaries; a prompt whose length is not
-  aligned recomputes its tail. Growing agent conversations hit partially when
-  aligned. This is by design, not a correctness issue.
+- **Prefix cache is page-aware for growing prompts.** Dynamic Qwen entries keep
+  the exact prompt-boundary GDN checkpoint and publish the final partial page
+  as an authenticated cache entry. A longer conversation reuses the complete
+  128-token pages plus the saved recurrent state, then prefills only its new
+  suffix; the writable partial tail is copy-on-write detached.
 - **Short `max_tokens` can be consumed by thinking.** Qwen3.6 reasons first;
-  with a very small budget (e.g. 32) the visible answer can be empty. Real
-  workloads (Claude Code / Codex send 32K) are unaffected.
+  `max_tokens` is the total completion allowance, including reasoning. The
+  Qwen default cap is 8192 so the default 16K allowance leaves answer
+  headroom; explicit budgets still require a sufficiently large
+  `max_tokens`.
 - **One known flaky test** surfaces only in a full-suite run under machine load
   (`test_bfdiag_record.py::test_cli_ls_labels_an_unfinished_record_running`).
 - **SparkInfer must be this project's fork.** A stock upstream install starts and

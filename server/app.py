@@ -305,18 +305,86 @@ if SERVER_REASONING_MODE not in ("expose", "strip"):
 # thinking-strip-bug.md) turned on: prepending unconditionally, on the endpoint
 # that has no template, ate whole responses.
 SERVER_THINKING_CAPABLE = os.environ.get("QSR_THINKING_CAPABLE", "1") != "0"
+_DEFAULT_SERVER_THINKING_TOKEN_BUDGET = 8192
+_thinking_budget_env = os.environ.get("QSR_THINKING_TOKEN_BUDGET")
+if _thinking_budget_env is None:
+    # Keep enough output headroom for the runtime's default max_tokens=16K.
+    # Qwen Cloud's 128K default is appropriate when the client also grants a
+    # 128K output window; it would otherwise let a local 16K completion spend
+    # its entire allowance inside <think> and return no answer.
+    SERVER_THINKING_TOKEN_BUDGET: int | None = _DEFAULT_SERVER_THINKING_TOKEN_BUDGET
+else:
+    try:
+        SERVER_THINKING_TOKEN_BUDGET = int(_thinking_budget_env)
+    except ValueError as exc:
+        raise RuntimeError("QSR_THINKING_TOKEN_BUDGET must be a positive integer") from exc
+    if SERVER_THINKING_TOKEN_BUDGET <= 0:
+        raise RuntimeError("QSR_THINKING_TOKEN_BUDGET must be a positive integer")
 
 # Qwen3.8's template uses ``reasoning_effort`` as a Jinja variable.  OpenAI
 # clients, however, commonly put it at the request root (and the Responses
 # API puts it under ``reasoning.effort``).  Keep the root-level compatibility
 # mapping here instead of making every endpoint know the template details.
 _REASONING_EFFORT_VALUES = ("low", "medium", "high", "xhigh", "none")
+_DEFAULT_REASONING_EFFORT_BUDGETS = {
+    # Qwen's published API mapping: low=4K, medium=16K, xhigh=full
+    # 256K-class budget.  ``high`` is normalized to xhigh by the template
+    # compatibility layer.
+    "low": 4096,
+    "medium": 16384,
+    "high": 262144,
+    "xhigh": 262144,
+}
+
+
+def _supports_native_reasoning_effort(engine_ref) -> bool:
+    """Whether the loaded chat template consumes ``reasoning_effort``.
+
+    Qwen3.8 exposes the variable in its template.  Some Qwen-compatible
+    checkpoints expose only the thinking switch; for those, an effort request
+    still needs a real runtime effect, so the caller maps it to a bounded
+    thinking span instead of silently forwarding an ignored Jinja kwarg.
+    """
+    template = getattr(getattr(engine_ref, "tok", None), "chat_template", "")
+    return isinstance(template, str) and "reasoning_effort" in template
+
+
+def _default_served_model_name(engine_ref) -> str:
+    """Return the stable public model id, independent of snapshot paths."""
+    configured = os.environ.get("QSR_SERVED_MODEL_NAME")
+    if configured:
+        return configured.split()[0]
+    if getattr(engine_ref, "backend_name", None) == "qwen36":
+        return "qwen3.8"
+    return engine_ref.MODEL
+
+
+def _reasoning_effort_budget(effort: str) -> int:
+    """Return the fallback token budget for templates without effort levels."""
+    normalized = effort.lower()
+    if normalized == "high":
+        normalized = "xhigh"
+    default = _DEFAULT_REASONING_EFFORT_BUDGETS[normalized]
+    env_name = f"QSR_THINKING_BUDGET_{normalized.upper()}"
+    configured = os.environ.get(env_name)
+    if configured is None:
+        return default
+    try:
+        budget = int(configured)
+    except ValueError as exc:
+        raise _invalid_request(f"{env_name} must be a positive integer") from exc
+    if budget <= 0:
+        raise _invalid_request(f"{env_name} must be a positive integer")
+    return budget
 
 
 def _resolve_chat_template_kwargs(
     chat_template_kwargs: dict | None,
     *,
     reasoning_effort: str | None = None,
+    enable_thinking: bool | None = None,
+    reasoning: dict | None = None,
+    thinking: dict | None = None,
 ) -> dict | None:
     """Merge an API-level reasoning effort into chat-template kwargs.
 
@@ -330,6 +398,30 @@ def _resolve_chat_template_kwargs(
     resolved = dict(chat_template_kwargs or {})
     if "enable_thinking" in resolved or "reasoning_effort" in resolved:
         return resolved or None
+    for controls in (reasoning, thinking):
+        if not isinstance(controls, dict):
+            continue
+        if reasoning_effort is None:
+            for key in ("effort", "reasoning_effort", "level"):
+                candidate = controls.get(key)
+                if candidate is not None:
+                    reasoning_effort = candidate
+                    break
+        if enable_thinking is None:
+            if "enable_thinking" in controls:
+                enable_thinking = controls["enable_thinking"]
+            elif controls.get("type") in ("disabled", "off", "none"):
+                enable_thinking = False
+            elif controls.get("type") in ("enabled", "on"):
+                enable_thinking = True
+    if enable_thinking is not None:
+        if not isinstance(enable_thinking, bool):
+            raise _invalid_request(
+                f"enable_thinking must be a boolean, got {enable_thinking!r}"
+            )
+        resolved["enable_thinking"] = enable_thinking
+        if enable_thinking is False:
+            return resolved
     if reasoning_effort is None:
         return resolved or None
     if not isinstance(reasoning_effort, str):
@@ -638,10 +730,12 @@ async def lifespan(app: FastAPI):
     )
     engine.start()
     logger.info(
-        "engine ready: backend=%s model=%s capacity=%d num_slots=%d capacity_tokens_per_slot=%d "
+        "engine ready: backend=%s served_model=%s checkpoint=%s capacity=%d "
+        "num_slots=%d capacity_tokens_per_slot=%d "
         "cudagraph=%s prefix_cache=%s session_affinity=%s ttl=%.1fs dflash=%s "
         "mtp=%s(K=%d,resync=%s) dspark=%s(K=%d,draft=%s,verify=%s,require_cg=%s)",
         engine.backend_name,
+        _default_served_model_name(engine),
         engine.MODEL,
         engine.capacity,
         engine.num_slots,
@@ -739,6 +833,13 @@ class ChatCompletionRequest(BaseModel):
     # separate from ``max_tokens``: the scheduler forces ``</think>`` at the
     # token boundary while preserving one continuous generation request.
     thinking_token_budget: int | None = None
+    # OpenAI-compatible clients also send nested reasoning controls.  Keep
+    # these explicit so pydantic cannot silently discard the user's choice.
+    reasoning: dict | None = None
+    enable_thinking: bool | None = None
+    # Anthropic/agent clients sometimes use the same request body on this
+    # endpoint; accepting the shape is harmless and keeps all adapters aligned.
+    thinking: dict | None = None
     # Forwarded to the chat template (e.g. {"enable_thinking": False} for
     # non-thinking mode). Mirrors vLLM's chat_template_kwargs request field.
     chat_template_kwargs: dict | None = None
@@ -842,9 +943,47 @@ def _validate_thinking_token_budget(value: object | None) -> int | None:
 def _resolve_thinking_token_budget(
     value: object | None,
     chat_template_kwargs: dict | None,
+    *,
+    reasoning_effort: str | None = None,
+    reasoning: dict | None = None,
+    thinking: dict | None = None,
+    native_reasoning_effort: bool = True,
+    enable_effort_budget: bool = False,
+    default_budget: int | None = None,
 ) -> int | None:
     """Resolve and validate a budget after template switches are merged."""
     budget = _validate_thinking_token_budget(value)
+    if budget is None:
+        for controls in (reasoning, thinking):
+            if not isinstance(controls, dict):
+                continue
+            for key in ("thinking_token_budget", "budget_tokens"):
+                candidate = controls.get(key)
+                if candidate is not None:
+                    budget = _validate_thinking_token_budget(candidate)
+                    break
+            if budget is not None:
+                break
+    if budget is None:
+        effort = reasoning_effort
+        if effort is None and chat_template_kwargs:
+            effort = chat_template_kwargs.get("reasoning_effort")
+        if isinstance(effort, str):
+            normalized = effort.lower()
+            if normalized == "high":
+                normalized = "xhigh"
+            if (
+                normalized in _DEFAULT_REASONING_EFFORT_BUDGETS
+                and not native_reasoning_effort
+                and enable_effort_budget
+            ):
+                budget = _reasoning_effort_budget(normalized)
+    if (
+        budget is None
+        and default_budget is not None
+        and not (chat_template_kwargs and chat_template_kwargs.get("enable_thinking") is False)
+    ):
+        budget = _validate_thinking_token_budget(default_budget)
     if budget is not None and chat_template_kwargs:
         if chat_template_kwargs.get("enable_thinking") is False:
             raise _invalid_request(
@@ -1235,10 +1374,23 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     chat_template_kwargs = _resolve_chat_template_kwargs(
         req.chat_template_kwargs,
         reasoning_effort=req.reasoning_effort,
+        enable_thinking=req.enable_thinking,
+        reasoning=req.reasoning,
+        thinking=req.thinking,
     )
     thinking_token_budget = _resolve_thinking_token_budget(
         req.thinking_token_budget,
         chat_template_kwargs,
+        reasoning_effort=req.reasoning_effort,
+        reasoning=req.reasoning,
+        thinking=req.thinking,
+        native_reasoning_effort=_supports_native_reasoning_effort(engine),
+        enable_effort_budget=getattr(engine, "backend_name", None) == "qwen36",
+        default_budget=(
+            SERVER_THINKING_TOKEN_BUDGET
+            if getattr(engine, "backend_name", None) == "qwen36"
+            else None
+        ),
     )
 
     prompt_ids = await _tokenize_chat(
@@ -1256,7 +1408,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         max_tokens,
     )
 
-    model_name = req.model or engine.MODEL
+    model_name = req.model or _default_served_model_name(engine)
 
     if req.stream:
         import json as _json
@@ -1530,7 +1682,7 @@ async def completions(req: CompletionRequest, request: Request):
         "id": f"cmpl-{uuid.uuid4().hex[:24]}",
         "object": "text_completion",
         "created": int(time.time()),
-        "model": req.model or engine.MODEL,
+        "model": req.model or _default_served_model_name(engine),
         "choices": [
             {
                 "index": 0,
@@ -1830,7 +1982,8 @@ if __name__ == "__main__":
 
 @app.get("/v1/models")
 async def list_models():
-    served = os.environ.get("QSR_SERVED_MODEL_NAME", engine.MODEL)
+    configured = os.environ.get("QSR_SERVED_MODEL_NAME")
+    served = configured or _default_served_model_name(engine)
     names = served.split()
     return {
         "object": "list",
@@ -1840,7 +1993,7 @@ async def list_models():
                 "object": "model",
                 "created": int(time.time()),
                 "owned_by": "qwen-sm120-runtime",
-                "root": engine.MODEL,
+                "root": _default_served_model_name(engine),
                 "parent": None,
                 "max_model_len": engine.capacity_tokens_per_slot if engine else 0,
                 "permission": [
@@ -1894,6 +2047,7 @@ def _backend_snapshot(runner):
 async def metrics_endpoint():
     """Prometheus-compatible metrics in the BlackweLLM namespace."""
     assert engine is not None
+    served_model = _default_served_model_name(engine)
     runner = engine.runner
     # LagunaBackend uses static block allocation (num_slots × blocks_per_slot),
     # not a dynamic BlockPool. Compute KV usage from active slot count.
@@ -1933,42 +2087,42 @@ async def metrics_endpoint():
     lines = [
         "# HELP blackwellm:num_requests_running Number of requests currently running.",
         "# TYPE blackwellm:num_requests_running gauge",
-        f'blackwellm:num_requests_running{{model_name="{engine.MODEL}"}} {num_running}',
+        f'blackwellm:num_requests_running{{model_name="{served_model}"}} {num_running}',
         "# HELP blackwellm:num_requests_waiting Number of requests waiting to be processed.",
         "# TYPE blackwellm:num_requests_waiting gauge",
-        f'blackwellm:num_requests_waiting{{model_name="{engine.MODEL}"}} {num_waiting}',
+        f'blackwellm:num_requests_waiting{{model_name="{served_model}"}} {num_waiting}',
         "# HELP blackwellm:kv_cache_usage_perc KV cache usage percentage.",
         "# TYPE blackwellm:kv_cache_usage_perc gauge",
-        f'blackwellm:kv_cache_usage_perc{{model_name="{engine.MODEL}"}} {kv_usage:.4f}',
+        f'blackwellm:kv_cache_usage_perc{{model_name="{served_model}"}} {kv_usage:.4f}',
         "# HELP blackwellm:num_free_slots Number of free production slots.",
         "# TYPE blackwellm:num_free_slots gauge",
-        f'blackwellm:num_free_slots{{model_name="{engine.MODEL}"}} {num_free_slots}',
+        f'blackwellm:num_free_slots{{model_name="{served_model}"}} {num_free_slots}',
         "# HELP blackwellm:capacity_tokens_per_slot Max tokens per slot.",
         "# TYPE blackwellm:capacity_tokens_per_slot gauge",
-        f'blackwellm:capacity_tokens_per_slot{{model_name="{engine.MODEL}"}} '
+        f'blackwellm:capacity_tokens_per_slot{{model_name="{served_model}"}} '
         f"{engine.capacity_tokens_per_slot}",
         "# HELP blackwellm:requests_completed_total Total completed requests.",
         "# TYPE blackwellm:requests_completed_total counter",
-        f'blackwellm:requests_completed_total{{model_name="{engine.MODEL}"}} '
+        f'blackwellm:requests_completed_total{{model_name="{served_model}"}} '
         f"{engine.stats.get('requests_completed', 0)}",
         "# HELP blackwellm:prefix_cache_hit_rate Prefix cache hit rate.",
         "# TYPE blackwellm:prefix_cache_hit_rate gauge",
-        f'blackwellm:prefix_cache_hit_rate{{model_name="{engine.MODEL}"}} '
+        f'blackwellm:prefix_cache_hit_rate{{model_name="{served_model}"}} '
         f"{engine.stats.get('prefix_cache_hit_rate', 0.0):.4f}",
         "# HELP blackwellm:prefix_cache_hits_total Prefix cache hits.",
         "# TYPE blackwellm:prefix_cache_hits_total counter",
-        f'blackwellm:prefix_cache_hits_total{{model_name="{engine.MODEL}"}} '
+        f'blackwellm:prefix_cache_hits_total{{model_name="{served_model}"}} '
         f"{engine.stats.get('prefix_cache_hits', 0)}",
         "# HELP blackwellm:prefix_cache_misses_total Prefix cache misses.",
         "# TYPE blackwellm:prefix_cache_misses_total counter",
-        f'blackwellm:prefix_cache_misses_total{{model_name="{engine.MODEL}"}} '
+        f'blackwellm:prefix_cache_misses_total{{model_name="{served_model}"}} '
         f"{engine.stats.get('prefix_cache_misses', 0)}",
         "# HELP blackwellm:kv_cache_total_blocks Total KV cache blocks.",
         "# TYPE blackwellm:kv_cache_total_blocks gauge",
-        f'blackwellm:kv_cache_total_blocks{{model_name="{engine.MODEL}"}} {total_blocks}',
+        f'blackwellm:kv_cache_total_blocks{{model_name="{served_model}"}} {total_blocks}',
         "# HELP blackwellm:kv_cache_used_blocks Used KV cache blocks.",
         "# TYPE blackwellm:kv_cache_used_blocks gauge",
-        f'blackwellm:kv_cache_used_blocks{{model_name="{engine.MODEL}"}} {used_blocks}',
+        f'blackwellm:kv_cache_used_blocks{{model_name="{served_model}"}} {used_blocks}',
     ]
 
     # DFlash CUDA Graph capture health, one gauge per graph DFlash has
@@ -1995,7 +2149,7 @@ async def metrics_endpoint():
     for graph_name, status in cg_status:
         captured = 1 if status == "captured" else 0
         lines.append(
-            f'blackwellm:dflash_cg_captured{{model_name="{engine.MODEL}",graph="{graph_name}"}} '
+            f'blackwellm:dflash_cg_captured{{model_name="{served_model}",graph="{graph_name}"}} '
             f"{captured}"
         )
 
@@ -2010,7 +2164,7 @@ async def metrics_endpoint():
         lines.append(f"# HELP blackwellm:{stat_name}_total Backend {stat_name.replace('_', ' ')}.")
         lines.append(f"# TYPE blackwellm:{stat_name}_total counter")
         lines.append(
-            f'blackwellm:{stat_name}_total{{model_name="{engine.MODEL}"}} '
+            f'blackwellm:{stat_name}_total{{model_name="{served_model}"}} '
             f"{snapshot_stats.get(stat_name, 0)}"
         )
     lines.append(
@@ -2021,7 +2175,7 @@ async def metrics_endpoint():
     fallback_reasons = snapshot.cg_fallback_reasons if snapshot is not None else ()
     for reason, count in fallback_reasons:
         lines.append(
-            f'blackwellm:decode_eager_fallback_reason_total{{model_name="{engine.MODEL}",'
+            f'blackwellm:decode_eager_fallback_reason_total{{model_name="{served_model}",'
             f'reason="{reason}"}} {count}'
         )
 
@@ -2035,7 +2189,7 @@ async def metrics_endpoint():
     )
     lines.append("# TYPE blackwellm:bootstrap_checks_ok_total counter")
     lines.append(
-        f'blackwellm:bootstrap_checks_ok_total{{model_name="{engine.MODEL}"}} '
+        f'blackwellm:bootstrap_checks_ok_total{{model_name="{served_model}"}} '
         f"{engine.stats.get('bootstrap_checks_ok', 0)}"
     )
     lines.append(
@@ -2044,16 +2198,16 @@ async def metrics_endpoint():
     )
     lines.append("# TYPE blackwellm:bootstrap_checks_failed_total counter")
     lines.append(
-        f'blackwellm:bootstrap_checks_failed_total{{model_name="{engine.MODEL}"}} '
+        f'blackwellm:bootstrap_checks_failed_total{{model_name="{served_model}"}} '
         f"{engine.stats.get('bootstrap_checks_failed', 0)}"
     )
 
     # App-layer request metrics: latency, TTFT, TPOT, token throughput, and
     # success/error counters (recorded per request in the handlers above).
-    lines.extend(metrics.render(engine.MODEL))
+    lines.extend(metrics.render(served_model))
 
     # D2: runtime-internal metrics (MTP acceptance, prefix cache depth, per-slot KV)
-    lines.append(metrics.render_d2_metrics(engine.MODEL))
+    lines.append(metrics.render_d2_metrics(served_model))
 
     # Phase 0 Qwen KV capacity gauges: load-time pool geometry, measured only
     # when the backend opted in (kv_capacity_snapshot). Absent for Laguna, so
@@ -2065,10 +2219,10 @@ async def metrics_endpoint():
         except Exception:  # pragma: no cover - observability must not die
             logger.exception("KV capacity snapshot failed; omitting Qwen gauges")
         _render_kv = getattr(metrics, "_render_qwen_kv_capacity")
-        _render_kv(lines, engine.MODEL)
+        _render_kv(lines, served_model)
 
     # D3: request-level tracing stats
-    lines.append(tracer.render_prometheus(engine.MODEL))
+    lines.append(tracer.render_prometheus(served_model))
 
     from fastapi.responses import PlainTextResponse
 
@@ -2099,7 +2253,7 @@ async def v1_root():
     return {
         "object": "api_info",
         "endpoints": ["/v1/models", "/v1/chat/completions", "/v1/completions", "/metrics"],
-        "model": engine.MODEL,
+        "model": _default_served_model_name(engine),
     }
 
 
@@ -2116,6 +2270,9 @@ async def anthropic_count_tokens(request: Request):
     chat_template_kwargs = _resolve_chat_template_kwargs(
         body.get("chat_template_kwargs"),
         reasoning_effort=body.get("reasoning_effort"),
+        enable_thinking=body.get("enable_thinking"),
+        reasoning=body.get("reasoning"),
+        thinking=body.get("thinking"),
     )
     prompt_ids = await _tokenize_chat(
         engine,
@@ -2162,7 +2319,7 @@ async def anthropic_messages(request: Request):
     )
 
     max_tokens = _validate_and_resolve_max_tokens(body.get("max_tokens"))
-    model_name = body.get("model") or engine.MODEL
+    model_name = body.get("model") or _default_served_model_name(engine)
     stream = body.get("stream", False)
     sampling_params = _build_sampling_params(
         temperature=body.get("temperature"),
@@ -2187,6 +2344,9 @@ async def anthropic_messages(request: Request):
     chat_template_kwargs = _resolve_chat_template_kwargs(
         body.get("chat_template_kwargs"),
         reasoning_effort=body.get("reasoning_effort"),
+        enable_thinking=body.get("enable_thinking"),
+        reasoning=body.get("reasoning"),
+        thinking=body.get("thinking"),
     )
     anthropic_thinking = body.get("thinking")
     thinking_token_budget = _resolve_thinking_token_budget(
@@ -2198,6 +2358,16 @@ async def anthropic_messages(request: Request):
             else None
         ),
         chat_template_kwargs,
+        reasoning_effort=body.get("reasoning_effort"),
+        reasoning=body.get("reasoning"),
+        thinking=anthropic_thinking,
+        native_reasoning_effort=_supports_native_reasoning_effort(engine),
+        enable_effort_budget=getattr(engine, "backend_name", None) == "qwen36",
+        default_budget=(
+            SERVER_THINKING_TOKEN_BUDGET
+            if getattr(engine, "backend_name", None) == "qwen36"
+            else None
+        ),
     )
 
     prompt_ids = await _tokenize_chat(
@@ -2441,7 +2611,7 @@ async def responses_api(request: Request):
     t0 = time.perf_counter()
 
     max_tokens = _validate_and_resolve_max_tokens(body.get("max_output_tokens"))
-    model_name = body.get("model") or engine.MODEL
+    model_name = body.get("model") or _default_served_model_name(engine)
     stream = body.get("stream", False)
     sampling_params = _build_sampling_params(
         temperature=body.get("temperature"),
@@ -2460,6 +2630,9 @@ async def responses_api(request: Request):
     chat_template_kwargs = _resolve_chat_template_kwargs(
         body.get("chat_template_kwargs"),
         reasoning_effort=body.get("reasoning_effort", response_effort),
+        enable_thinking=body.get("enable_thinking"),
+        reasoning=response_reasoning,
+        thinking=body.get("thinking"),
     )
     responses_thinking_budget = body.get("thinking_token_budget")
     if responses_thinking_budget is None and isinstance(response_reasoning, dict):
@@ -2469,6 +2642,16 @@ async def responses_api(request: Request):
     thinking_token_budget = _resolve_thinking_token_budget(
         responses_thinking_budget,
         chat_template_kwargs,
+        reasoning_effort=body.get("reasoning_effort", response_effort),
+        reasoning=response_reasoning,
+        thinking=body.get("thinking"),
+        native_reasoning_effort=_supports_native_reasoning_effort(engine),
+        enable_effort_budget=getattr(engine, "backend_name", None) == "qwen36",
+        default_budget=(
+            SERVER_THINKING_TOKEN_BUDGET
+            if getattr(engine, "backend_name", None) == "qwen36"
+            else None
+        ),
     )
     prompt_ids = await _tokenize_chat(
         engine,

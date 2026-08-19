@@ -263,14 +263,14 @@ def load_qwen36_model(
     batch=1/no-CUDA-graph scope.
 
     ``warmup_attention`` (default True, CUDA only) runs
-    :meth:`Qwen36ForCausalLMSelfBuilt.warmup_attention_shapes` before
-    returning, so sparkinfer's one-time CuTe compile for this geometry is
-    paid here rather than inside whichever request arrives first. It adds
-    nothing to steady-state cost and, once ``~/.cache/sparkinfer`` is warm,
-    little to load time either; pass False only when a caller genuinely
-    wants to measure that first compile itself (as
-    ``scripts/b1_probe_extend_jit_buckets.py`` and
-    ``scripts/b1_verify_prefill_jit_and_greedy.py`` do).
+    :meth:`Qwen36ForCausalLMSelfBuilt.warmup_attention_shapes` and
+    :meth:`Qwen36ForCausalLMSelfBuilt.warmup_gdn_prefill_shapes` before
+    returning, so SparkInfer/FlashInfer attention and FLA/Triton GDN chunk
+    compilation are both paid here rather than inside whichever request
+    arrives first. It adds nothing to steady-state cost and, once the kernel
+    caches are warm, little to load time; pass False only when a caller
+    genuinely wants to measure cold first-request compilation (as the
+    prefill JIT probe scripts do).
 
     ``enable_mtp`` (default False, B3): construct and load
     :attr:`Qwen36ForCausalLMSelfBuilt.mtp`, the MTP draft head, from this
@@ -379,6 +379,7 @@ def load_qwen36_model(
     model.eval()
     if warmup_attention and target_device.type == "cuda":
         model.warmup_attention_shapes(device=target_device, dtype=dtype)
+        model.warmup_gdn_prefill_shapes(device=target_device, dtype=dtype)
         # Only on CUDA, and only alongside warmup: this materializes every FP8
         # Linear's BF16 cache to free the originals, which is a real cost to
         # pay eagerly and pointless on a CPU-side construction (a test fixture,

@@ -63,7 +63,8 @@ kept as historical/rollback settings.
 | `QSR_QWEN_KV_POOL_BYTES` | `--qwen-kv-pool-bytes` | 19629342720 (Qwen) | 19629342720 | Qwen DSpark physical KV budget |
 | `QSR_SERVER_GPU_MEM_UTIL` | — | 0.85 | 0.92 | `gpu_memory_utilization` |
 | `QSR_SERVER_PRODUCTION` | — | 1 | 1 | production slot layout (vs. diagnostic layout) |
-| `QSR_SERVED_MODEL_NAME` | — | engine MODEL | `qwen3.6` | name(s) reported by `/v1/models` (space-separated list) |
+| `QSR_SERVED_MODEL_NAME` | — | `qwen3.8` for Qwen | `qwen3.8` | name(s) reported by `/v1/models` (space-separated list) |
+| `QSR_THINKING_TOKEN_BUDGET` | — | 8192 for Qwen | 8192 | default low-level `<think>` token cap; explicit request budget/effort wins |
 | `QSR_SERVER_REQUEST_TIMEOUT_S` | — | 600 | 0 | server-side request cap; 0 disables (long generations) |
 | `QSR_DEBUG_REQUESTS` | — | 1 | 1 | log raw request/response (see **Raw I/O logging**); legacy alias `QSR_DEBUG_ANTHROPIC` |
 
@@ -102,6 +103,11 @@ counters are exported as `blackwellm:prefix_cache_hits_total` /
 the pre-P4a server **byte-for-byte**. `_finish_request` still does an
 unconditional `reset_slot` in P4a — the content-hash cache survives reset by
 design (R10).
+
+For Qwen's dynamic arena, the exact prompt boundary is checkpointed even when
+the prompt is not 128-token aligned. A growing conversation restores the
+longest common page prefix and its GDN/DSpark state, then computes only the
+new suffix; the final partial page is copied on write before extension.
 
 ### Session affinity (P4b)
 

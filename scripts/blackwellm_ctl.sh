@@ -22,7 +22,10 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV_BIN=/home/bot/.venvs/vllm/bin
+# Python 3.14/nightly is the validated serving environment.  The older
+# ``vllm`` venv remains useful for historical oracle probes, not production
+# startup.
+VENV_BIN=/home/bot/.venvs/torch-nightly/bin
 LOG_DIR="$REPO_ROOT/logs"
 PID_FILE="$LOG_DIR/server.pid"
 
@@ -59,7 +62,7 @@ mkdir -p "$LOG_DIR"
 : "${QSR_SERVER_ENABLE_DFLASH:=1}"
 : "${QSR_SERVER_ENABLE_SESSION_AFFINITY:=0}"
 : "${QSR_SERVER_GPU_MEM_UTIL:=0.95}"    # 3x256K is memory-heavy; see `config` output
-: "${QSR_SERVED_MODEL_NAME:=laguna-s-2.1 qwen3.6}"
+: "${QSR_SERVED_MODEL_NAME:=laguna-s-2.1 qwen3.8}"
 : "${QSR_DEBUG_REQUESTS:=1}"
 export QSR_SERVER_PRODUCTION QSR_SERVER_CAPACITY QSR_SERVER_NUM_SLOTS \
     QSR_SERVER_BLOCK_SIZE QSR_SERVER_BLOCKS_PER_SLOT QSR_SERVER_ENABLE_CUDAGRAPH \

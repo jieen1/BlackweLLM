@@ -42,15 +42,15 @@ Historically comparable anchors (documented in
   reuse, so a documented fraction of that ceiling is expected.
 
 Usage:
-    /home/bot/.venvs/vllm/bin/python benchmarks/server_perf_grid.py \
-        --base-url http://127.0.0.1:8300 --model qwen3.6 \
+    /home/bot/.venvs/torch-nightly/bin/python benchmarks/server_perf_grid.py \
+        --base-url http://127.0.0.1:8300 --model qwen3.8 \
         --contexts 4k,32k,64k,128k,250k --concurrency 1,2,3 \
         --max-tokens 256 --warm-rounds 1
 
     # Historical Pattern-B protocol (cached prefix + 10240 fresh suffix,
     # raw tokenization, no chat template -- matches native_warm_compare):
-    /home/bot/.venvs/vllm/bin/python benchmarks/server_perf_grid.py \
-        --base-url http://127.0.0.1:8300 --model qwen3.6 \
+    /home/bot/.venvs/torch-nightly/bin/python benchmarks/server_perf_grid.py \
+        --base-url http://127.0.0.1:8300 --model qwen3.8 \
         --endpoint completions --contexts 64k,128k,200k \
         --concurrency 1 --max-tokens 256 --warm-rounds 1 \
         --warm-suffix-tokens 10240 --filler-prefix '9876543210 '
@@ -602,7 +602,7 @@ def _print_wave(kind: str, w: dict, expected_prompt: int) -> None:
 async def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--base-url", default="http://127.0.0.1:8300")
-    p.add_argument("--model", default="qwen3.6")
+    p.add_argument("--model", default="qwen3.8")
     p.add_argument(
         "--tokenizer-path",
         default=None,

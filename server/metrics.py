@@ -336,7 +336,7 @@ def _render_qwen_kv_capacity(lines: list[str], model_name: str) -> None:
         lines.append(f'blackwellm:{key}{{model_name="{model_name}"}} {snap.get(key, -1)}')
 
 
-def render_d2_metrics(model_name: str = "qwen3.6-27b") -> str:
+def render_d2_metrics(model_name: str = "qwen3.8") -> str:
     """Render D2 metrics in Prometheus exposition format."""
     lines: list[str] = []
     # MTP acceptance

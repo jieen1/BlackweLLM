@@ -10,7 +10,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-python_bin=${QSR_BENCH_PYTHON:-/home/bot/.venvs/vllm/bin/python}
+python_bin=${QSR_BENCH_PYTHON:-/home/bot/.venvs/torch-nightly/bin/python}
 base_url=${QSR_BENCH_BASE_URL:-http://127.0.0.1:8300}
 model_path=${QSR_BENCH_MODEL_PATH:-/home/bot/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/9c73e2daee1d0fd494ffbd1d8753f2174a953796}
 # The recorded 2026-08-15 run generated its digit filler with this tokenizer.

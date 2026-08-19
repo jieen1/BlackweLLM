@@ -532,6 +532,43 @@ class TestPrefixCacheTwoFamilies:
         assert state.result[1]["anchor"] == first[0]
         assert backend.pool.slot_kv_len[1] == len(prompt)
 
+    def test_dynamic_arena_restores_unaligned_prefix_and_keeps_tail_private(self) -> None:
+        """An arbitrary prompt boundary must survive an extending request.
+
+        DSH prompts are not guaranteed to end on the 64/128-token hash/page
+        boundary.  The old path recorded KV bytes but no exact GDN state, so
+        the next request paid a full prefill.  The restored partial page must
+        also be copied before the suffix write, otherwise that write mutates
+        the cached prompt in place.
+        """
+        backend = _backend(
+            num_slots=2,
+            block_size=64,
+            dynamic_arena=True,
+            pool_bundles=20,
+            enable_persistent_prefix_cache=True,
+        )
+        prompt = list(range(100))
+        _run(backend, 0, prompt, steps=0)
+        backend.reset_slot(0)
+        assert backend.stats["prefix_persistent_stores"] == 1
+
+        backend.model.forward_lengths.clear()
+        extended = prompt + [777]
+        state = backend.prefill_chunked_begin([1], [extended])
+        assert backend.model.forward_lengths == [1]
+        assert backend.stats["prefix_persistent_restores"] == 1
+        assert backend.pool.slot_kv_len[1] == len(extended)
+
+        # The original exact entry remains reusable after the extending
+        # request wrote its private partial tail.
+        backend.reset_slot(1)
+        backend.model.forward_lengths.clear()
+        state = backend.prefill_chunked_begin([0], [prompt])
+        assert backend.model.forward_lengths == []
+        assert backend.stats["prefix_persistent_restores"] == 2
+        assert state.result[0]["anchor"] == (prompt[-1] + 1) % _VOCAB
+
     def test_repeated_full_prompt_hits_stay_persistent_across_generations(self) -> None:
         """A full-prompt repeat must not orphan the persistent hash index.
 

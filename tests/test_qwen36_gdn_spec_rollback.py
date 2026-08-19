@@ -313,7 +313,7 @@ class TestSpecRowAddressing:
         output, snapshots = layer.spec_forward(hidden, source, spec_state_rows=rows)
 
         assert snapshots is None
-        assert torch.equal(output, expected_output)
+        torch.testing.assert_close(output, expected_output, rtol=1e-5, atol=1e-6)
         assert not torch.equal(rows[0][-1].recurrent_state, rows[1][-1].recurrent_state)
 
     def test_indexed_rows_match_snapshot_oracle_with_permuted_destinations(

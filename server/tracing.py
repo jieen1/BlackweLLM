@@ -257,7 +257,7 @@ class RequestTracer:
             ),
         }
 
-    def render_prometheus(self, model_name: str = "qwen3.6-27b") -> str:
+    def render_prometheus(self, model_name: str = "qwen3.8") -> str:
         """Render tracing stats as Prometheus gauges."""
         stats = self.get_stats()
         lines = [

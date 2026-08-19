@@ -355,6 +355,24 @@ class TestPhase3PrefixCache:
         assert n == 1  # only the 64-token block is committed (plan §5.1C)
         assert pool._arena._ref_cached_ref0() == 0  # bundle still live
 
+    def test_exact_partial_prompt_can_be_published_when_requested(self) -> None:
+        pool = _dynamic_pool(num_slots=2, max_seq_len=256, pool_bundles=16)
+        pool.prepare_kv_writes(0, 0, 100)
+        from runtime.backends.qwen36 import _chained_block_keys
+
+        keys = _chained_block_keys(
+            list(range(100)), 100, self._BLOCK, include_partial=True
+        )
+        n = pool.publish_committed_blocks(
+            0, 100, keys, self._BLOCK, include_partial=True
+        )
+        assert n == 2
+        pool.reset_slot(0)
+        restored, bundle_ids = pool.restore_prefix_from_arena(1, 100, keys)
+        assert restored == 100
+        assert len(bundle_ids) == 1
+        assert pool._arena.bundles[bundle_ids[0]].ref_cnt == 1
+
     def test_partial_page_second_block_published_when_committed(self) -> None:
         pool = _dynamic_pool(num_slots=2, max_seq_len=256, pool_bundles=16)
         pool.prepare_kv_writes(0, 0, 192)  # 192 = page0 full + 64 of page1
