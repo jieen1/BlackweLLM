@@ -141,6 +141,7 @@ def snapshot(
     *,
     max_output_tokens: int | None = None,
     incomplete_details: dict | None = None,
+    error: dict | None = None,
 ) -> dict:
     """Build the full Responses object carried by lifecycle events.
 
@@ -154,7 +155,7 @@ def snapshot(
         "object": "response",
         "created_at": created_at,
         "status": status,
-        "error": None,
+        "error": error,
         "incomplete_details": incomplete_details,
         "instructions": None,
         "max_output_tokens": max_output_tokens,
@@ -185,6 +186,8 @@ def terminal_status(finish_reason: str) -> tuple[str, dict | None]:
     """
     if finish_reason == "length":
         return "incomplete", {"reason": "max_output_tokens"}
+    if finish_reason == "error":
+        return "failed", None
     return "completed", None
 
 

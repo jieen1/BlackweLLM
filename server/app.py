@@ -2671,6 +2671,7 @@ async def responses_api(request: Request):
         async def _responses_sse():
             proc = _new_stream_processor(engine.tok, chat_template_kwargs)
             final_result = None
+            stream_error: BaseException | None = None
             first_token_t = None
             resp_id = f"resp_{uuid.uuid4().hex[:24]}"
             created_at = int(time.time())
@@ -2723,47 +2724,75 @@ async def responses_api(request: Request):
             )
             last_send = time.monotonic()
             _cancel_ref: list[str | None] = [None]
-            async for item in _submit_stream_with_thinking_budget(
-                engine,
-                prompt_ids,
-                max_tokens,
-                thinking_budget=thinking_budget,
-                processor=proc,
-                sampling_params=sampling_params,
-                cancel_ref=_cancel_ref,
-                stop_sequences=None,
-            ):
-                if await request.is_disconnected():
-                    if _cancel_ref[0]:
-                        engine.cancel(_cancel_ref[0])
-                    return
-                if isinstance(item, dict):
-                    final_result = item
-                    break
-                if first_token_t is None and item:
-                    first_token_t = time.perf_counter()
-                for delta in proc.drain_content():
-                    yield emit(
-                        "response.output_text.delta",
-                        {
-                            "item_id": text_item_id,
-                            "output_index": output_index,
-                            "content_index": 0,
-                            "delta": delta,
-                            "logprobs": [],
-                        },
-                    )
-                    last_send = time.monotonic()
-                # Long reasoning-only stretches emit no delta events; an SSE
-                # comment keeps the connection alive for clients with an idle
-                # read timeout (comments are ignored by spec-compliant SSE
-                # parsers, including Codex's).
-                if time.monotonic() - last_send >= 15:
-                    yield ": keepalive\n\n"
-                    last_send = time.monotonic()
+            try:
+                async for item in _submit_stream_with_thinking_budget(
+                    engine,
+                    prompt_ids,
+                    max_tokens,
+                    thinking_budget=thinking_budget,
+                    processor=proc,
+                    sampling_params=sampling_params,
+                    cancel_ref=_cancel_ref,
+                    stop_sequences=None,
+                ):
+                    if await request.is_disconnected():
+                        if _cancel_ref[0]:
+                            engine.cancel(_cancel_ref[0])
+                        return
+                    if isinstance(item, dict):
+                        final_result = item
+                        break
+                    if first_token_t is None and item:
+                        first_token_t = time.perf_counter()
+                    for delta in proc.drain_content():
+                        yield emit(
+                            "response.output_text.delta",
+                            {
+                                "item_id": text_item_id,
+                                "output_index": output_index,
+                                "content_index": 0,
+                                "delta": delta,
+                                "logprobs": [],
+                            },
+                        )
+                        last_send = time.monotonic()
+                    # Long reasoning-only stretches emit no delta events; an SSE
+                    # comment keeps the connection alive for clients with an idle
+                    # read timeout (comments are ignored by spec-compliant SSE
+                    # parsers, including Codex's).
+                    if time.monotonic() - last_send >= 15:
+                        yield ": keepalive\n\n"
+                        last_send = time.monotonic()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Once StreamingResponse has sent HTTP 200, the global
+                # exception handler cannot turn an engine failure into JSON.
+                # Without an in-band terminal event the client sees a valid
+                # prefix followed by EOF and commonly reports "one sentence
+                # then stopped".  Preserve the partial text but terminate the
+                # Responses state machine explicitly as response.failed.
+                stream_error = exc
+                logger.exception("Responses generation stream failed")
 
-            finish = final_result["finish_reason"] if final_result else "stop"
-            visible_text, tool_calls = proc.finalize()
+            if final_result is None and stream_error is None:
+                # A stream that closes without its authoritative result is an
+                # engine protocol violation, not a successful EOS.  Do not
+                # silently convert it into response.completed.
+                stream_error = RuntimeError(
+                    "generation stream ended before completion metadata"
+                )
+                logger.error("Responses generation stream ended without a result")
+
+            try:
+                visible_text, tool_calls = proc.finalize()
+            except Exception as exc:
+                if stream_error is None:
+                    stream_error = exc
+                logger.exception("Responses output finalization failed")
+                visible_text, tool_calls = "", []
+
+            finish = "error" if stream_error is not None else final_result["finish_reason"]
             output_items = []
             text = visible_text or ""
             output_items.append(responses_format.message_item(text_item_id, text))
@@ -2853,6 +2882,14 @@ async def responses_api(request: Request):
                 final_result.get("prefix_cache_hit_tokens", 0) if final_result else 0,
             )
             status, incomplete_details = responses_format.terminal_status(finish)
+            response_error = (
+                {
+                    "code": "server_error",
+                    "message": "The model failed to generate a response.",
+                }
+                if stream_error is not None
+                else None
+            )
             completed = responses_format.snapshot(
                 resp_id,
                 created_at,
@@ -2862,28 +2899,45 @@ async def responses_api(request: Request):
                 usage,
                 max_output_tokens=max_tokens,
                 incomplete_details=incomplete_details,
+                error=response_error,
             )
-            metrics.record_request(
-                "responses",
-                len(prompt_ids),
-                (
-                    final_result.get("completion_tokens", len(proc.all_ids))
-                    if final_result
-                    else len(proc.all_ids)
-                ),
-                finish,
-                time.perf_counter() - t0,
-                (first_token_t - t0) if first_token_t is not None else None,
+            completion_tokens = (
+                final_result.get("completion_tokens", len(proc.all_ids))
+                if final_result
+                else len(proc.all_ids)
             )
+            if stream_error is None:
+                metrics.record_request(
+                    "responses",
+                    len(prompt_ids),
+                    completion_tokens,
+                    finish,
+                    time.perf_counter() - t0,
+                    (first_token_t - t0) if first_token_t is not None else None,
+                )
+            else:
+                metrics.record_error("responses", 500)
             await _debug_log_stream_output(
                 "OPENAI /v1/responses", proc, visible_text, tool_calls, finish
             )
             terminal_event = (
-                "response.incomplete" if status == "incomplete" else "response.completed"
+                "response.failed"
+                if status == "failed"
+                else "response.incomplete"
+                if status == "incomplete"
+                else "response.completed"
             )
             yield emit(terminal_event, {"response": completed})
 
-        return StreamingResponse(_responses_sse(), media_type="text/event-stream")
+        return StreamingResponse(
+            _responses_sse(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     proc = _new_stream_processor(engine.tok, chat_template_kwargs)
     result = await _submit_with_thinking_budget(

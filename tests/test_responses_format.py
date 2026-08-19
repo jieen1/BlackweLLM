@@ -169,6 +169,11 @@ def test_snapshot_has_required_fields():
     assert snap["usage"] is None
     assert snap["max_output_tokens"] == 128
     assert snap["incomplete_details"] is None
+    assert snap["error"] is None
+
+
+def test_terminal_status_marks_stream_errors_failed():
+    assert responses_format.terminal_status("error") == ("failed", None)
 
 
 def test_parse_input_empty_is_falsey():

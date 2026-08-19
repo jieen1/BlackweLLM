@@ -542,6 +542,64 @@ def test_responses_stream_emits_ordered_terminal_lifecycle(monkeypatch):
     assert text == raw
 
 
+def test_responses_stream_reports_engine_failure_in_band(monkeypatch):
+    """A post-200 engine error must not look like a successful EOF."""
+    from server import app as server_app
+
+    class _FakeTok:
+        def decode(self, _ids, skip_special_tokens=True):
+            return "partial answer"
+
+    class _FakeEngine:
+        MODEL = "qwen-test"
+        capacity_tokens_per_slot = 4096
+        tok = _FakeTok()
+
+        def capacity_ok(self, _prompt_tokens, _max_tokens):
+            return True
+
+        async def submit_stream(self, *_args, **_kwargs):
+            yield [1]
+            raise RuntimeError("synthetic engine failure")
+
+    class _FakeRequest:
+        async def is_disconnected(self):
+            return False
+
+        async def json(self):
+            return {
+                "model": "qwen-test",
+                "input": "say it",
+                "stream": True,
+                "max_output_tokens": 32,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+
+    async def _tokenize_chat(*_args, **_kwargs):
+        return [0]
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server_app, "engine", _FakeEngine())
+    monkeypatch.setattr(server_app, "_tokenize_chat", _tokenize_chat)
+    monkeypatch.setattr(server_app, "_debug_log_input", _noop)
+    monkeypatch.setattr(server_app, "_debug_log_stream_output", _noop)
+
+    async def _run():
+        response = await server_app.responses_api(_FakeRequest())
+        return response, [chunk async for chunk in response.body_iterator]
+
+    response, chunks = asyncio.run(_run())
+    events = _parse_sse(chunks)
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert events[-1]["event"] == "response.failed"
+    assert events[-1]["data"]["response"]["status"] == "failed"
+    assert events[-1]["data"]["response"]["error"]["code"] == "server_error"
+    assert "response.completed" not in [event["event"] for event in events]
+
+
 @pytest.mark.parametrize("endpoint", ["anthropic", "responses"])
 def test_qwen_non_thinking_compat_endpoints_keep_html_in_content(monkeypatch, endpoint):
     """Every chat-template endpoint must use the request-scoped thinking mode."""
