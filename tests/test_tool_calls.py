@@ -10,6 +10,7 @@ from server.formats.tools import (
     find_tool_call_start,
     format_tool_calls_anthropic,
     format_tool_calls_openai,
+    new_tool_call_id,
     parse_tool_calls,
 )
 
@@ -190,14 +191,24 @@ class TestFormatToolCallsOpenAI:
         result = format_tool_calls_openai(calls, start_id=5)
         assert result[0]["id"] == "call_0005"
 
-    def test_multiple_calls_sequential_ids(self):
+    def test_multiple_calls_get_unique_default_ids(self):
         calls = [
             {"name": "a", "arguments": {}},
             {"name": "b", "arguments": {}},
         ]
         result = format_tool_calls_openai(calls)
-        assert result[0]["id"] == "call_0000"
-        assert result[1]["id"] == "call_0001"
+        assert result[0]["id"].startswith("call_")
+        assert result[1]["id"].startswith("call_")
+        assert result[0]["id"] != result[1]["id"]
+
+    def test_default_ids_are_unique_across_turns(self):
+        calls = [{"name": "read", "arguments": {}}]
+        first = format_tool_calls_openai(calls)
+        second = format_tool_calls_openai(calls)
+        assert first[0]["id"] != second[0]["id"]
+
+    def test_new_tool_call_id_is_opaque_and_unique(self):
+        assert new_tool_call_id() != new_tool_call_id()
 
 
 class TestFormatToolCallsAnthropic:
@@ -309,6 +320,25 @@ class TestStreamToolDeltas:
         assert len(name_deltas) == 1
         assert name_deltas[0]["name"] == "get_weather"
         assert name_deltas[0]["index"] == 0
+
+    def test_tool_name_ids_are_unique_across_streams(self):
+        close_think = chr(60) + "/think" + chr(62)
+        tc_open = chr(60) + "tool_call" + chr(62)
+        func_open = chr(60) + "function=read" + chr(62)
+        output = _ids("thinking" + close_think + tc_open + func_open)
+
+        first = StreamProcessor(_FakeTok(), tool_parser=QWEN_PARSER)
+        second = StreamProcessor(_FakeTok(), tool_parser=QWEN_PARSER)
+        first.add_tokens(output)
+        second.add_tokens(output)
+        first.drain_content()
+        second.drain_content()
+
+        first_id = first.drain_tool_deltas()[0]["id"]
+        second_id = second.drain_tool_deltas()[0]["id"]
+        assert first_id.startswith("call_")
+        assert second_id.startswith("call_")
+        assert first_id != second_id
 
     def test_arguments_delta_withheld_until_block_closes(self):
         """No arguments_delta while </parameter></function> hasn't arrived

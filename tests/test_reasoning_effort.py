@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from server.app import (
     ChatCompletionRequest,
     _resolve_chat_template_kwargs,
+    _resolve_engine_chat_template_kwargs,
     _resolve_thinking_token_budget,
 )
 from server.formats.thinking import apply_qwen_default_reasoning_effort
@@ -32,11 +33,29 @@ def test_none_maps_to_qwen_hard_thinking_switch() -> None:
     }
 
 
-def test_high_aliases_to_qwen_xhigh_template_value() -> None:
-    assert _resolve_chat_template_kwargs(None, reasoning_effort="high") == {
-        "reasoning_effort": "xhigh",
-        "enable_thinking": True,
-    }
+def test_high_is_not_a_runtime_effort_level() -> None:
+    with pytest.raises(HTTPException, match="reasoning_effort must be one of"):
+        _resolve_chat_template_kwargs(None, reasoning_effort="high")
+
+
+@pytest.mark.parametrize("value", ["high", "xhigh", "max"])
+def test_qwen_downgrades_unsupported_high_effort_to_medium(value: str) -> None:
+    engine = type("Engine", (), {"backend_name": "qwen36"})()
+
+    assert _resolve_engine_chat_template_kwargs(
+        engine,
+        None,
+        reasoning_effort=value,
+    ) == {"reasoning_effort": "medium", "enable_thinking": True}
+
+
+def test_qwen_downgrades_explicit_template_high_effort_to_medium() -> None:
+    engine = type("Engine", (), {"backend_name": "qwen36"})()
+
+    assert _resolve_engine_chat_template_kwargs(
+        engine,
+        {"reasoning_effort": "xhigh"},
+    ) == {"reasoning_effort": "medium"}
 
 
 def test_unspecified_effort_leaves_request_kwargs_unchanged() -> None:
@@ -129,7 +148,7 @@ def test_explicit_budget_is_not_rewritten_by_completion_window() -> None:
     ) == 8192
 
 
-@pytest.mark.parametrize("value", ["minimal", "max", "bogus", 2])
+@pytest.mark.parametrize("value", ["minimal", "high", "max", "bogus", 2])
 def test_invalid_reasoning_effort_is_rejected(value: object) -> None:
     with pytest.raises(HTTPException, match="reasoning_effort must be one of"):
         _resolve_chat_template_kwargs(None, reasoning_effort=value)  # type: ignore[arg-type]

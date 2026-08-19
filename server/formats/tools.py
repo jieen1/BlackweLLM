@@ -17,6 +17,7 @@ a tool call parses identically whether the request was streamed or not.
 from __future__ import annotations
 
 import json
+import uuid
 
 from server.formats.tool_parsers import ToolCallParser, get_active_parser
 
@@ -24,6 +25,7 @@ __all__ = [
     "parse_tool_calls",
     "format_tool_calls_openai",
     "format_tool_calls_anthropic",
+    "new_tool_call_id",
     "convert_tools_to_chat_template",
     "find_tool_call_start",
 ]
@@ -72,13 +74,31 @@ def parse_tool_calls(text: str, parser: ToolCallParser | None = None) -> tuple[s
     return visible, tool_calls
 
 
-def format_tool_calls_openai(tool_calls: list[dict], start_id: int = 0) -> list[dict]:
-    """Format parsed tool calls for OpenAI chat completion response."""
+def new_tool_call_id() -> str:
+    """Return an opaque tool-call ID unique across response turns."""
+    return f"call_{uuid.uuid4().hex[:24]}"
+
+
+def format_tool_calls_openai(
+    tool_calls: list[dict], start_id: int | None = None
+) -> list[dict]:
+    """Format parsed tool calls for an OpenAI chat completion response.
+
+    The old default (``call_0000`` on every response) reused the same ID on
+    every tool-call turn.  Anthropic-to-OpenAI relays use that ID to match
+    tool results; reusing it makes a client treat later turns as the same
+    call and can drive an agent into repeating the previous tool forever.
+    ``start_id`` remains as an explicit deterministic test/compatibility
+    escape hatch, while normal responses receive opaque unique IDs.
+    """
     result = []
     for i, tc in enumerate(tool_calls):
+        call_id = (
+            f"call_{start_id + i:04d}" if start_id is not None else new_tool_call_id()
+        )
         result.append(
             {
-                "id": f"call_{start_id + i:04d}",
+                "id": call_id,
                 "type": "function",
                 "function": {
                     "name": tc["name"],

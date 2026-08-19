@@ -40,7 +40,7 @@ from server.formats.thinking import THINK_CLOSE as _THINK_CLOSE
 from server.formats.thinking import THINK_OPEN as _THINK_OPEN
 from server.formats.thinking import find_reasoning_span, strip_usage_artifacts
 from server.formats.tool_parsers import ToolCallParser, get_active_parser
-from server.formats.tools import find_tool_call_start, parse_tool_calls
+from server.formats.tools import find_tool_call_start, new_tool_call_id, parse_tool_calls
 
 _USAGE_OPEN = chr(60) + "usage" + chr(62)
 
@@ -106,6 +106,11 @@ class StreamProcessor:
         self._internal_token_ranges: list[tuple[int, int]] = []
         self._tool_names_emitted: set[int] = set()
         self._tool_args_emitted: set[int] = set()
+        # IDs must remain stable between the streamed name and arguments
+        # deltas, but must be fresh for every response turn.  Deriving the ID
+        # from function name + index reused ``call_Read_0`` across turns and
+        # broke relay-side tool_result matching.
+        self._tool_call_ids: dict[int, str] = {}
 
     def add_tokens(self, token_ids: list[int]) -> None:
         self._all_ids.extend(token_ids)
@@ -390,12 +395,13 @@ class StreamProcessor:
 
             if tc_idx not in self._tool_names_emitted:
                 self._tool_names_emitted.add(tc_idx)
+                call_id = self._tool_call_ids.setdefault(tc_idx, new_tool_call_id())
                 deltas.append(
                     {
                         "type": "name",
                         "index": tc_idx,
                         "name": call_name,
-                        "id": f"call_{call_name}_{tc_idx}",
+                        "id": call_id,
                     }
                 )
 

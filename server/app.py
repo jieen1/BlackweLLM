@@ -325,14 +325,19 @@ else:
 # clients, however, commonly put it at the request root (and the Responses
 # API puts it under ``reasoning.effort``).  Keep the root-level compatibility
 # mapping here instead of making every endpoint know the template details.
-_REASONING_EFFORT_VALUES = ("low", "medium", "high", "xhigh", "none")
+#
+# ``high`` is deliberately not a runtime effort level.  The Anthropic relay
+# currently translates its ``max`` setting to OpenAI ``high``; the Qwen
+# adapter downgrades that compatibility value to ``medium`` before this
+# resolver runs.  This prevents the old high -> xhigh alias from silently
+# activating Qwen3.8's effectively unbounded thinking path.
+_REASONING_EFFORT_VALUES = ("low", "medium", "xhigh", "none")
+_QWEN_UNSUPPORTED_REASONING_EFFORTS = frozenset({"high", "xhigh", "max"})
 _DEFAULT_REASONING_EFFORT_BUDGETS = {
     # Qwen's published API mapping: low=4K, medium=16K, xhigh=full
-    # 256K-class budget.  ``high`` is normalized to xhigh by the template
-    # compatibility layer.
+    # 256K-class budget.  ``high`` is not a runtime level.
     "low": 4096,
     "medium": 16384,
-    "high": 262144,
     "xhigh": 262144,
 }
 
@@ -362,8 +367,6 @@ def _default_served_model_name(engine_ref) -> str:
 def _reasoning_effort_budget(effort: str) -> int:
     """Return the fallback token budget for templates without effort levels."""
     normalized = effort.lower()
-    if normalized == "high":
-        normalized = "xhigh"
     default = _DEFAULT_REASONING_EFFORT_BUDGETS[normalized]
     env_name = f"QSR_THINKING_BUDGET_{normalized.upper()}"
     configured = os.environ.get(env_name)
@@ -376,6 +379,77 @@ def _reasoning_effort_budget(effort: str) -> int:
     if budget <= 0:
         raise _invalid_request(f"{env_name} must be a positive integer")
     return budget
+
+
+def _qwen_compat_effort(value: object) -> object:
+    """Map unsupported high-effort compatibility values to medium.
+
+    Claude/Anthropic clients use ``max`` while the local OpenAI-compatible
+    relay currently forwards that as ``reasoning_effort=high``.  Qwen3.8 does
+    not have a usable high path, so accepting that value and then translating
+    it to xhigh is a dangerous silent behavior.  Keep the client-facing
+    request working, but make the runtime contract unambiguous: Qwen only
+    executes low, medium, xhigh, or disabled thinking, and the relay's high
+    compatibility value executes as medium.
+    """
+    if isinstance(value, str) and value.lower() in _QWEN_UNSUPPORTED_REASONING_EFFORTS:
+        return "medium"
+    return value
+
+
+def _resolve_engine_chat_template_kwargs(
+    engine_ref,
+    chat_template_kwargs: dict | None,
+    *,
+    reasoning_effort: str | None = None,
+    enable_thinking: bool | None = None,
+    reasoning: dict | None = None,
+    thinking: dict | None = None,
+) -> dict | None:
+    """Resolve request controls after applying the loaded model's contract."""
+    requested_effort = reasoning_effort
+    if getattr(engine_ref, "backend_name", None) == "qwen36":
+        if chat_template_kwargs:
+            chat_template_kwargs = dict(chat_template_kwargs)
+            for key in ("effort", "reasoning_effort", "level"):
+                if key in chat_template_kwargs:
+                    chat_template_kwargs[key] = _qwen_compat_effort(
+                        chat_template_kwargs[key]
+                    )
+        reasoning_effort = _qwen_compat_effort(reasoning_effort)
+        if isinstance(reasoning, dict):
+            reasoning = {
+                **reasoning,
+                **{
+                    key: _qwen_compat_effort(reasoning[key])
+                    for key in ("effort", "reasoning_effort", "level")
+                    if key in reasoning
+                },
+            }
+        if isinstance(thinking, dict):
+            thinking = {
+                **thinking,
+                **{
+                    key: _qwen_compat_effort(thinking[key])
+                    for key in ("effort", "reasoning_effort", "level")
+                    if key in thinking
+                },
+            }
+    resolved = _resolve_chat_template_kwargs(
+        chat_template_kwargs,
+        reasoning_effort=reasoning_effort,
+        enable_thinking=enable_thinking,
+        reasoning=reasoning,
+        thinking=thinking,
+    )
+    if DEBUG_REQUESTS and getattr(engine_ref, "backend_name", None) == "qwen36":
+        logger.info(
+            "Qwen reasoning effort resolved: requested=%r effective=%r thinking=%r",
+            requested_effort,
+            resolved.get("reasoning_effort") if resolved else None,
+            resolved.get("enable_thinking") if resolved else None,
+        )
+    return resolved
 
 
 def _resolve_chat_template_kwargs(
@@ -394,8 +468,9 @@ def _resolve_chat_template_kwargs(
     OpenAI-compatible root field.  If the request does not select an effort,
     the tokenizer's configured model default is left untouched.
     ``none`` is represented by the Qwen hard switch because Qwen3.8's template
-    accepts ``low|medium|xhigh`` (with ``high`` aliased to ``xhigh``), not
-    ``none``.
+    accepts ``low|medium|xhigh``, not ``none``.  The engine-aware wrapper
+    removes the unusable high-effort compatibility path before this function
+    sees it.
     """
     resolved = dict(chat_template_kwargs or {})
     if "enable_thinking" in resolved or "reasoning_effort" in resolved:
@@ -437,8 +512,6 @@ def _resolve_chat_template_kwargs(
             "reasoning_effort must be one of "
             f"{', '.join(_REASONING_EFFORT_VALUES)}, got {reasoning_effort!r}"
         )
-    if effort == "high":
-        effort = "xhigh"
     if effort == "none":
         resolved["enable_thinking"] = False
     else:
@@ -1389,7 +1462,8 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     # Convert tools for the chat template
     tools = convert_tools_to_chat_template(req.tools)
-    chat_template_kwargs = _resolve_chat_template_kwargs(
+    chat_template_kwargs = _resolve_engine_chat_template_kwargs(
+        engine,
         req.chat_template_kwargs,
         reasoning_effort=req.reasoning_effort,
         enable_thinking=req.enable_thinking,
@@ -2293,7 +2367,8 @@ async def anthropic_count_tokens(request: Request):
 
     chat_messages = parse_messages(body)
     tools = convert_tools_to_chat_template(body.get("tools"))
-    chat_template_kwargs = _resolve_chat_template_kwargs(
+    chat_template_kwargs = _resolve_engine_chat_template_kwargs(
+        engine,
         body.get("chat_template_kwargs"),
         reasoning_effort=body.get("reasoning_effort"),
         enable_thinking=body.get("enable_thinking"),
@@ -2367,7 +2442,8 @@ async def anthropic_messages(request: Request):
 
     # Convert tools for the chat template
     tools = convert_tools_to_chat_template(body.get("tools"))
-    chat_template_kwargs = _resolve_chat_template_kwargs(
+    chat_template_kwargs = _resolve_engine_chat_template_kwargs(
+        engine,
         body.get("chat_template_kwargs"),
         reasoning_effort=body.get("reasoning_effort"),
         enable_thinking=body.get("enable_thinking"),
@@ -2656,7 +2732,8 @@ async def responses_api(request: Request):
     response_effort = (
         response_reasoning.get("effort") if isinstance(response_reasoning, dict) else None
     )
-    chat_template_kwargs = _resolve_chat_template_kwargs(
+    chat_template_kwargs = _resolve_engine_chat_template_kwargs(
+        engine,
         body.get("chat_template_kwargs"),
         reasoning_effort=body.get("reasoning_effort", response_effort),
         enable_thinking=body.get("enable_thinking"),

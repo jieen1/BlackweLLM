@@ -28,6 +28,7 @@ from server.formats.tools import (
     find_tool_call_start,
     format_tool_calls_anthropic,
     format_tool_calls_openai,
+    new_tool_call_id,
     parse_tool_calls,
 )
 
@@ -38,6 +39,7 @@ __all__ = [
     "parse_tool_calls",
     "format_tool_calls_openai",
     "format_tool_calls_anthropic",
+    "new_tool_call_id",
     "convert_tools_to_chat_template",
     "find_tool_call_start",
     "StreamProcessor",
