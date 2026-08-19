@@ -2667,7 +2667,6 @@ async def responses_api(request: Request):
     )
 
     if stream:
-        import json as _json
 
         async def _responses_sse():
             proc = _new_stream_processor(engine.tok, chat_template_kwargs)
@@ -2677,55 +2676,51 @@ async def responses_api(request: Request):
             created_at = int(time.time())
             output_index = 0
             text_item_id = f"msg_{uuid.uuid4().hex[:24]}"
+            sequence_number = 0
+
+            def emit(event_type: str, payload: dict) -> str:
+                nonlocal sequence_number
+                event = responses_format.sse_event(event_type, sequence_number, payload)
+                sequence_number += 1
+                return event
 
             in_progress = responses_format.snapshot(
-                resp_id, created_at, model_name, "in_progress", [], None
+                resp_id,
+                created_at,
+                model_name,
+                "in_progress",
+                [],
+                None,
+                max_output_tokens=max_tokens,
             )
             # Responses lifecycle events carry the full snapshot under a
             # ``response`` key with a top-level ``type`` (the OpenAI SSE
             # contract).  Sending the bare snapshot made Codex's client treat
             # the terminal events as unknown and reconnect ("stream closed
             # before response.completed").
-            yield (
-                "event: response.created\ndata: "
-                + _json.dumps({"type": "response.created", "response": in_progress})
-                + "\n\n"
+            yield emit("response.created", {"response": in_progress})
+            yield emit("response.in_progress", {"response": in_progress})
+            yield emit(
+                "response.output_item.added",
+                {
+                    "output_index": output_index,
+                    "item": {
+                        "id": text_item_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                    },
+                },
             )
-            yield (
-                "event: response.in_progress\ndata: "
-                + _json.dumps({"type": "response.in_progress", "response": in_progress})
-                + "\n\n"
+            yield emit(
+                "response.content_part.added",
+                {
+                    "item_id": text_item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []},
+                },
             )
-            yield (
-                "event: response.output_item.added\ndata: "
-                + _json.dumps(
-                    {
-                        "type": "response.output_item.added",
-                        "output_index": output_index,
-                        "item": {
-                            "id": text_item_id,
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [],
-                        },
-                    }
-                )
-                + "\n\n"
-            )
-            yield (
-                "event: response.content_part.added\ndata: "
-                + _json.dumps(
-                    {
-                        "type": "response.content_part.added",
-                        "item_id": text_item_id,
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "part": {"type": "output_text", "text": "", "annotations": []},
-                    }
-                )
-                + "\n\n"
-            )
-            text_started = False
             last_send = time.monotonic()
             _cancel_ref: list[str | None] = [None]
             async for item in _submit_stream_with_thinking_budget(
@@ -2748,15 +2743,16 @@ async def responses_api(request: Request):
                 if first_token_t is None and item:
                     first_token_t = time.perf_counter()
                 for delta in proc.drain_content():
-                    text_started = True
-                    ev = {
-                        "type": "response.output_text.delta",
-                        "item_id": text_item_id,
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "delta": delta,
-                    }
-                    yield f"event: response.output_text.delta\ndata: {_json.dumps(ev)}\n\n"
+                    yield emit(
+                        "response.output_text.delta",
+                        {
+                            "item_id": text_item_id,
+                            "output_index": output_index,
+                            "content_index": 0,
+                            "delta": delta,
+                            "logprobs": [],
+                        },
+                    )
                     last_send = time.monotonic()
                 # Long reasoning-only stretches emit no delta events; an SSE
                 # comment keeps the connection alive for clients with an idle
@@ -2771,47 +2767,36 @@ async def responses_api(request: Request):
             output_items = []
             text = visible_text or ""
             output_items.append(responses_format.message_item(text_item_id, text))
-            if text_started:
-                yield (
-                    "event: response.output_text.done\ndata: "
-                    + _json.dumps(
-                        {
-                            "type": "response.output_text.done",
-                            "item_id": text_item_id,
-                            "output_index": output_index,
-                            "content_index": 0,
-                            "text": text,
-                        }
-                    )
-                    + "\n\n"
-                )
-            yield (
-                "event: response.content_part.done\ndata: "
-                + _json.dumps(
-                    {
-                        "type": "response.content_part.done",
-                        "item_id": text_item_id,
-                        "output_index": output_index,
-                        "content_index": 0,
-                        "part": {
-                            "type": "output_text",
-                            "text": text,
-                            "annotations": [],
-                        },
-                    }
-                )
-                + "\n\n"
+            # Finalization events are required even when the model spent its
+            # entire allowance thinking and therefore produced no visible
+            # delta.  Omitting output_text.done leaves Responses clients
+            # waiting for a content item that the terminal event then closes.
+            yield emit(
+                "response.output_text.done",
+                {
+                    "item_id": text_item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "text": text,
+                    "logprobs": [],
+                },
             )
-            yield (
-                "event: response.output_item.done\ndata: "
-                + _json.dumps(
-                    {
-                        "type": "response.output_item.done",
-                        "output_index": output_index,
-                        "item": output_items[-1],
-                    }
-                )
-                + "\n\n"
+            yield emit(
+                "response.content_part.done",
+                {
+                    "item_id": text_item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "part": {
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": [],
+                    },
+                },
+            )
+            yield emit(
+                "response.output_item.done",
+                {"output_index": output_index, "item": output_items[-1]},
             )
             output_index += 1
             for tc in tool_calls:
@@ -2819,60 +2804,42 @@ async def responses_api(request: Request):
                 fc_item = responses_format.function_call_item(
                     fc_id,
                     tc["name"],
-                    _json.dumps(tc["arguments"], ensure_ascii=False),
+                    json.dumps(tc["arguments"], ensure_ascii=False),
                 )
                 output_items.append(fc_item)
-                yield (
-                    "event: response.output_item.added\ndata: "
-                    + _json.dumps(
-                        {
-                            "type": "response.output_item.added",
-                            "output_index": output_index,
-                            "item": {
-                                "id": fc_id,
-                                "type": "function_call",
-                                "call_id": fc_item["call_id"],
-                                "name": tc["name"],
-                                "arguments": "",
-                            },
-                        }
-                    )
-                    + "\n\n"
+                yield emit(
+                    "response.output_item.added",
+                    {
+                        "output_index": output_index,
+                        "item": {
+                            "id": fc_id,
+                            "type": "function_call",
+                            "call_id": fc_item["call_id"],
+                            "name": tc["name"],
+                            "arguments": "",
+                        },
+                    },
                 )
-                yield (
-                    "event: response.function_call_arguments.delta\ndata: "
-                    + _json.dumps(
-                        {
-                            "type": "response.function_call_arguments.delta",
-                            "item_id": fc_id,
-                            "output_index": output_index,
-                            "delta": fc_item["arguments"],
-                        }
-                    )
-                    + "\n\n"
+                yield emit(
+                    "response.function_call_arguments.delta",
+                    {
+                        "item_id": fc_id,
+                        "output_index": output_index,
+                        "delta": fc_item["arguments"],
+                    },
                 )
-                yield (
-                    "event: response.function_call_arguments.done\ndata: "
-                    + _json.dumps(
-                        {
-                            "type": "response.function_call_arguments.done",
-                            "item_id": fc_id,
-                            "output_index": output_index,
-                            "arguments": fc_item["arguments"],
-                        }
-                    )
-                    + "\n\n"
+                yield emit(
+                    "response.function_call_arguments.done",
+                    {
+                        "item_id": fc_id,
+                        "output_index": output_index,
+                        "name": fc_item["name"],
+                        "arguments": fc_item["arguments"],
+                    },
                 )
-                yield (
-                    "event: response.output_item.done\ndata: "
-                    + _json.dumps(
-                        {
-                            "type": "response.output_item.done",
-                            "output_index": output_index,
-                            "item": fc_item,
-                        }
-                    )
-                    + "\n\n"
+                yield emit(
+                    "response.output_item.done",
+                    {"output_index": output_index, "item": fc_item},
                 )
                 output_index += 1
 
@@ -2885,8 +2852,16 @@ async def responses_api(request: Request):
                 ),
                 final_result.get("prefix_cache_hit_tokens", 0) if final_result else 0,
             )
+            status, incomplete_details = responses_format.terminal_status(finish)
             completed = responses_format.snapshot(
-                resp_id, created_at, model_name, "completed", output_items, usage
+                resp_id,
+                created_at,
+                model_name,
+                status,
+                output_items,
+                usage,
+                max_output_tokens=max_tokens,
+                incomplete_details=incomplete_details,
             )
             metrics.record_request(
                 "responses",
@@ -2903,16 +2878,10 @@ async def responses_api(request: Request):
             await _debug_log_stream_output(
                 "OPENAI /v1/responses", proc, visible_text, tool_calls, finish
             )
-            yield (
-                "event: response.completed\ndata: "
-                + _json.dumps({"type": "response.completed", "response": completed})
-                + "\n\n"
+            terminal_event = (
+                "response.incomplete" if status == "incomplete" else "response.completed"
             )
-            yield (
-                "event: response.done\ndata: "
-                + _json.dumps({"type": "response.done", "response": completed})
-                + "\n\n"
-            )
+            yield emit(terminal_event, {"response": completed})
 
         return StreamingResponse(_responses_sse(), media_type="text/event-stream")
 
@@ -2952,4 +2921,5 @@ async def responses_api(request: Request):
         committed_token_ids=result["committed_token_ids"],
         reasoning_content=reasoning_content,
         prefix_cache_hit_tokens=result.get("prefix_cache_hit_tokens", 0),
+        max_output_tokens=max_tokens,
     )

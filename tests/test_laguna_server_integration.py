@@ -476,6 +476,72 @@ def test_qwen_non_thinking_stream_keeps_html_in_content_delta(monkeypatch):
     assert reasoning == ""
 
 
+def test_responses_stream_emits_ordered_terminal_lifecycle(monkeypatch):
+    """Responses clients need sequence numbers and one HTTP terminal event."""
+    from server import app as server_app
+
+    raw = "response stream answer"
+
+    class _FakeTok:
+        def decode(self, _ids, skip_special_tokens=True):
+            return raw
+
+    class _FakeEngine:
+        MODEL = "qwen-test"
+        capacity_tokens_per_slot = 4096
+        tok = _FakeTok()
+
+        def capacity_ok(self, _prompt_tokens, _max_tokens):
+            return True
+
+        async def submit_stream(self, *_args, **_kwargs):
+            for _ in raw:
+                yield [1]
+            yield {
+                "finish_reason": "stop",
+                "prompt_tokens": 1,
+                "completion_tokens": len(raw),
+            }
+
+    class _FakeRequest:
+        async def is_disconnected(self):
+            return False
+
+        async def json(self):
+            return {
+                "model": "qwen-test",
+                "input": "say it",
+                "stream": True,
+                "max_output_tokens": 32,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+
+    async def _tokenize_chat(*_args, **_kwargs):
+        return [0]
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server_app, "engine", _FakeEngine())
+    monkeypatch.setattr(server_app, "_tokenize_chat", _tokenize_chat)
+    monkeypatch.setattr(server_app, "_debug_log_input", _noop)
+    monkeypatch.setattr(server_app, "_debug_log_stream_output", _noop)
+
+    async def _run():
+        response = await server_app.responses_api(_FakeRequest())
+        return [chunk async for chunk in response.body_iterator]
+
+    events = _parse_sse(asyncio.run(_run()))
+    payloads = [event["data"] for event in events]
+    assert [event["event"] for event in events][-1] == "response.completed"
+    assert "response.done" not in [event["event"] for event in events]
+    assert [payload["sequence_number"] for payload in payloads] == list(range(len(payloads)))
+    text = "".join(
+        payload["delta"] for payload in payloads if payload["type"] == "response.output_text.delta"
+    )
+    assert text == raw
+
+
 @pytest.mark.parametrize("endpoint", ["anthropic", "responses"])
 def test_qwen_non_thinking_compat_endpoints_keep_html_in_content(monkeypatch, endpoint):
     """Every chat-template endpoint must use the request-scoped thinking mode."""

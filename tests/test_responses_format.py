@@ -92,6 +92,39 @@ def test_build_response_text_only():
     assert resp["usage"]["input_tokens"] == 10
     assert resp["usage"]["input_tokens_details"]["cached_tokens"] == 7
     assert resp["usage"]["total_tokens"] == 13
+    assert resp["max_output_tokens"] is None
+    assert resp["incomplete_details"] is None
+
+
+def test_build_response_length_is_incomplete():
+    resp = responses_format.build_response(
+        model="qwen3.8",
+        text="partial",
+        finish_reason="length",
+        prompt_tokens=10,
+        completion_tokens=32,
+        max_output_tokens=32,
+    )
+
+    assert resp["status"] == "incomplete"
+    assert resp["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert resp["max_output_tokens"] == 32
+
+
+def test_responses_sse_event_has_ordering_metadata():
+    raw = responses_format.sse_event(
+        "response.created",
+        7,
+        {"response": {"id": "resp_x"}},
+    )
+
+    assert raw.startswith("event: response.created\n")
+    payload = json.loads(raw.split("data: ", 1)[1])
+    assert payload == {
+        "type": "response.created",
+        "sequence_number": 7,
+        "response": {"id": "resp_x"},
+    }
 
 
 def test_build_response_with_tool_call():
@@ -120,12 +153,22 @@ def test_build_response_with_tool_call():
 
 
 def test_snapshot_has_required_fields():
-    snap = responses_format.snapshot("resp_x", 123, "qwen3.6", "in_progress", [], None)
+    snap = responses_format.snapshot(
+        "resp_x",
+        123,
+        "qwen3.6",
+        "in_progress",
+        [],
+        None,
+        max_output_tokens=128,
+    )
     assert snap["id"] == "resp_x"
     assert snap["object"] == "response"
     assert snap["status"] == "in_progress"
     assert snap["output"] == []
     assert snap["usage"] is None
+    assert snap["max_output_tokens"] == 128
+    assert snap["incomplete_details"] is None
 
 
 def test_parse_input_empty_is_falsey():

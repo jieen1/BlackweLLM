@@ -18,8 +18,10 @@ vLLM runtime dependency; do not add multi-model or multi-GPU routing here.
 - `POST /v1/messages/count_tokens` — Anthropic token counting (Claude
   Desktop calls this before sending).
 - `POST /v1/responses` — OpenAI Responses API (used by Codex CLI). Streaming
-  lifecycle events (`response.created` / `in_progress` / `output_text.delta` /
-  `completed` / `done`) and non-streaming, with 15s idle keepalive comments.
+  lifecycle events carry monotonically increasing `sequence_number` values;
+  successful requests end at `response.completed` and token-limited requests
+  at `response.incomplete` (the Realtime-only `response.done` event is not
+  emitted), with 15s idle keepalive comments.
 - `GET /v1/models` — model card; `max_model_len` reports the live per-slot
   context ceiling (`capacity_tokens_per_slot`).
 - `GET /metrics` — Prometheus exposition in the `blackwellm:*` namespace.

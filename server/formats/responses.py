@@ -138,17 +138,26 @@ def snapshot(
     status: str,
     output: list[dict],
     usage: dict | None,
+    *,
+    max_output_tokens: int | None = None,
+    incomplete_details: dict | None = None,
 ) -> dict:
-    """The full Responses object carried by created/in_progress/completed/done."""
+    """Build the full Responses object carried by lifecycle events.
+
+    ``max_output_tokens`` and ``incomplete_details`` are deliberately kept
+    on the snapshot instead of being synthesized only in the HTTP handler:
+    non-streaming and streaming Responses must expose the same terminal
+    status contract.
+    """
     return {
         "id": resp_id,
         "object": "response",
         "created_at": created_at,
         "status": status,
         "error": None,
-        "incomplete_details": None,
+        "incomplete_details": incomplete_details,
         "instructions": None,
-        "max_output_tokens": None,
+        "max_output_tokens": max_output_tokens,
         "model": model,
         "output": output,
         "parallel_tool_calls": True,
@@ -164,6 +173,30 @@ def snapshot(
         "metadata": {},
         "user": None,
     }
+
+
+def terminal_status(finish_reason: str) -> tuple[str, dict | None]:
+    """Map an engine finish reason to the Responses terminal status.
+
+    A generation that consumes ``max_output_tokens`` is not a successful
+    completion, even when it ended on a token boundary.  Reporting it as
+    ``completed`` makes clients stop with a partial/empty answer and discard
+    the actual truncation reason.
+    """
+    if finish_reason == "length":
+        return "incomplete", {"reason": "max_output_tokens"}
+    return "completed", None
+
+
+def sse_event(event_type: str, sequence_number: int, payload: dict) -> str:
+    """Serialize one OpenAI Responses HTTP SSE event.
+
+    Responses streaming events are ordered records.  ``sequence_number`` is
+    required by the wire schema (and used by SDKs for resume/filtering); it is
+    not the same thing as the SSE ``event:`` line.
+    """
+    data = {"type": event_type, "sequence_number": sequence_number, **payload}
+    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def build_usage(
@@ -189,6 +222,7 @@ def build_response(
     committed_token_ids: list[int] | None = None,
     reasoning_content: str | None = None,
     prefix_cache_hit_tokens: int = 0,
+    max_output_tokens: int | None = None,
 ) -> dict:
     """Build a non-streaming Responses response.
 
@@ -208,13 +242,16 @@ def build_response(
                 json.dumps(tc["arguments"], ensure_ascii=False),
             )
         )
+    status, incomplete_details = terminal_status(finish_reason)
     resp = snapshot(
         resp_id,
         created_at,
         model,
-        "completed",
+        status,
         output,
         build_usage(prompt_tokens, completion_tokens, prefix_cache_hit_tokens),
+        max_output_tokens=max_output_tokens,
+        incomplete_details=incomplete_details,
     )
     if committed_token_ids is not None:
         resp["debug_committed_token_ids"] = committed_token_ids
