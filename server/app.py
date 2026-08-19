@@ -91,23 +91,46 @@ DEFAULT_MAX_TOKENS = 16384
 # backend, it does not invent which checkpoint to serve.
 SERVER_MODEL_PATH = os.environ.get("QSR_SERVER_MODEL_PATH", "poolside/Laguna-S-2.1-NVFP4")
 
-SERVER_CAPACITY = int(os.environ.get("QSR_SERVER_CAPACITY", "1"))
-# Laguna default bumped 1->2: its non-DFlash decode graph owns one dedicated
-# capture slot. Qwen and DSV4 capture against stable pooled metadata/real rows
-# and need no extra server slot; ServerEngine computes this per backend.
-SERVER_NUM_SLOTS = int(os.environ.get("QSR_SERVER_NUM_SLOTS", "2"))
-SERVER_BLOCK_SIZE = int(os.environ.get("QSR_SERVER_BLOCK_SIZE", "64"))
-# Laguna's SparkInfer attention uses 64-token pages.  The default below is
-# currently 128K per slot.
+
+def _is_qwen36_family_model(model_path: str) -> bool:
+    """Recognize Qwen3.6/Qwen3.8 checkpoints handled by ``qwen36``.
+
+    The backend name is resolved from ``config.json`` later, but an explicit
+    ``QSR_SERVER_BACKEND=qwen36`` is also enough to identify a local snapshot
+    whose directory name carries no model-family hint. This only chooses safe
+    launcher defaults before weights load; Laguna keeps its conservative ones.
+    """
+    normalized = model_path.casefold().replace("-", ".").replace("_", ".")
+    backend_hint = os.environ.get("QSR_SERVER_BACKEND", "").casefold()
+    return (
+        "qwen3.6" in normalized
+        or "qwen3.8" in normalized
+        or backend_hint == "qwen36"
+    )
+
+
+_QWEN_DSPARK_DEFAULT_PROFILE = _is_qwen36_family_model(SERVER_MODEL_PATH)
+_QWEN_DSPARK_POOL_BYTES = 19_629_342_720
+
+SERVER_CAPACITY = int(
+    os.environ.get("QSR_SERVER_CAPACITY", "4" if _QWEN_DSPARK_DEFAULT_PROFILE else "1")
+)
+# Qwen's measured DSpark profile uses four live slots. Laguna's non-DFlash
+# decode graph keeps its conservative two-slot launcher default.
+SERVER_NUM_SLOTS = int(
+    os.environ.get("QSR_SERVER_NUM_SLOTS", "4" if _QWEN_DSPARK_DEFAULT_PROFILE else "2")
+)
+# Qwen3.8's latest same-toolchain DSpark parity run used 128-token pages;
+# Laguna's SparkInfer attention continues to require 64-token pages.
+SERVER_BLOCK_SIZE = int(
+    os.environ.get("QSR_SERVER_BLOCK_SIZE", "128" if _QWEN_DSPARK_DEFAULT_PROFILE else "64")
+)
 # The KV cache pool size is now determined by GPU memory profiling (see
 # server/engine.py _load_model → profile_kv_cache_blocks), NOT by the old
 # fixed formula (num_slots + 1) * blocks_per_slot. blocks_per_slot is the
 # per-slot MAXIMUM context ceiling; the actual pool is sized to fit the GPU.
-# The E2E check sets its OWN smaller blocks_per_slot (its prompts are moderate),
-# so it does not pay for the full long-context pool.
-# Laguna default (2048 × 64 = 128K/slot) is conservative pending the SWA
-# ring-buffer optimization above -- see notes/2026-07-23-laguna-server-
-# integration-plan.md for the memory math.
+# The Qwen DSpark default is 2048 × 128 = 256K per slot; Laguna remains
+# 2048 × 64 = 128K per slot pending its SWA ring-buffer optimization.
 SERVER_BLOCKS_PER_SLOT = int(os.environ.get("QSR_SERVER_BLOCKS_PER_SLOT", "2048"))
 # Laguna default flipped 0->1 (2026-07-27): decode CUDA Graph is now wired
 # into decode_batch_sampled (runtime/backends/laguna.py's
@@ -144,7 +167,10 @@ SERVER_ENABLE_SESSION_AFFINITY = os.environ.get("QSR_SERVER_ENABLE_SESSION_AFFIN
 SERVER_SESSION_TTL_S = float(os.environ.get("QSR_SERVER_SESSION_TTL_S", "30.0"))
 # Laguna default: ``auto``. FP8 KV has not been validated for Laguna, so an
 # explicit override remains required before it can be used in production.
-SERVER_KV_CACHE_DTYPE = os.environ.get("QSR_SERVER_KV_CACHE_DTYPE", "auto")
+SERVER_KV_CACHE_DTYPE = os.environ.get(
+    "QSR_SERVER_KV_CACHE_DTYPE",
+    "fp8_e4m3" if _QWEN_DSPARK_DEFAULT_PROFILE else "auto",
+)
 SERVER_GPU_MEM_UTIL = float(os.environ.get("QSR_SERVER_GPU_MEM_UTIL", "0.85"))
 SERVER_PRODUCTION = os.environ.get("QSR_SERVER_PRODUCTION", "1") != "0"
 # DFlash speculative decoding (2026-07-27, notes/2026-07-27-dflash-server-
@@ -155,29 +181,71 @@ SERVER_PRODUCTION = os.environ.get("QSR_SERVER_PRODUCTION", "1") != "0"
 # until it has run in production for a while, not flipped on by default yet.
 SERVER_ENABLE_DFLASH = os.environ.get("QSR_SERVER_ENABLE_DFLASH", "0") != "0"
 # MTP speculative decoding (2026-08-03, Track B / B3): qwen36's own draft
-# head, the sibling of SERVER_ENABLE_DFLASH above (Laguna's). Default OFF
-# for the same reason: this landing is the first time it is reachable from
-# the serving path at all, so main's shipping behaviour must stay unchanged
-# (plain per-token decode) until MTP has run through the same acceptance/
-# correctness gate DFlash did before its own default flip. See
-# runtime/backends/qwen36_mtp.py for the round driver and the (token,
-# hidden) pairing fix this landing carries.
+# head. It remains an explicit rollback path now that the measured external
+# DSpark profile is the Qwen default. See runtime/backends/qwen36_mtp.py for
+# the round driver and the (token, hidden) pairing fix this path carries.
 SERVER_ENABLE_MTP = os.environ.get("QSR_SERVER_ENABLE_MTP", "0") != "0"
 SERVER_MTP_K = int(os.environ.get("QSR_SERVER_MTP_K", "4"))
-# Qwen3.8 DSpark uses a separate RadixArk draft checkpoint.  It is opt-in
-# because loading it costs additional GPU memory and the first implementation
-# is eager-only; the target checkpoint itself remains usable with native MTP.
-SERVER_ENABLE_DSPARK = os.environ.get("QSR_SERVER_ENABLE_DSPARK", "0") != "0"
+# Qwen3.6/Qwen3.8 DSpark uses a separate RadixArk draft checkpoint. The
+# measured Qwen profile is now the default for a Qwen checkpoint; Laguna and
+# generic imports remain unchanged. Set QSR_SERVER_ENABLE_DSPARK=0 (or use
+# --mtp) for the explicit native-MTP rollback.
+SERVER_ENABLE_DSPARK = os.environ.get(
+    "QSR_SERVER_ENABLE_DSPARK", "1" if _QWEN_DSPARK_DEFAULT_PROFILE else "0"
+) != "0"
 SERVER_DSPARK_DRAFT_MODEL = os.environ.get(
     "QSR_SERVER_DSPARK_DRAFT_MODEL", "RadixArk/Qwen3.8-27B-DSpark"
 )
 SERVER_DSPARK_K = int(os.environ.get("QSR_SERVER_DSPARK_K", "7"))
+SERVER_DSPARK_VERIFY_MODE = os.environ.get(
+    "QSR_QWEN36_DSPARK_VERIFY_MODE",
+    "compact" if _QWEN_DSPARK_DEFAULT_PROFILE else "static",
+).strip().lower()
+SERVER_DSPARK_REQUIRE_CG = os.environ.get(
+    "QSR_QWEN36_DSPARK_REQUIRE_CG",
+    "1" if _QWEN_DSPARK_DEFAULT_PROFILE and SERVER_ENABLE_CUDAGRAPH else "0",
+) != "0"
+
+
+def _apply_qwen_dspark_runtime_defaults() -> None:
+    """Install the measured DSpark knobs before the backend is constructed.
+
+    These are environment-backed because the same low-level switches are
+    useful to the standalone profiling runbooks. ``setdefault`` preserves an
+    operator's explicit A/B choice and keeps the Laguna process untouched.
+    """
+    if not SERVER_ENABLE_DSPARK:
+        return
+    defaults = {
+        "QSR_QWEN36_DSPARK_CUDA_GRAPH": "1" if SERVER_ENABLE_CUDAGRAPH else "0",
+        "QSR_QWEN36_DSPARK_REQUIRE_CG": "1" if SERVER_DSPARK_REQUIRE_CG else "0",
+        "QSR_QWEN36_DSPARK_VERIFY_MODE": SERVER_DSPARK_VERIFY_MODE,
+        "QSR_PREFILL_CHUNK": "8192",
+        "QSR_ADMISSION_COALESCE_MS": "10",
+        "QSR_QWEN36_PREFILL_ATTN_BACKEND": "flashinfer",
+        "QSR_QWEN36_GDN_PREFILL_BACKEND": "flashinfer",
+        "QSR_QWEN36_MLP_FP4_QUANT": "flashinfer",
+        "QSR_QWEN36_MLP_W4A4": "1",
+        "QSR_QWEN36_MLP_W4A4_ALL": "1",
+        "QSR_PREFIX_CACHE_IN_BATCH_DEDUP": "1",
+    }
+    for key, value in defaults.items():
+        os.environ.setdefault(key, value)
+
+
 # Qwen dynamic KV Phase 4. ``legacy`` remains the rollback/default until the
 # full 4x256K GPU matrix (Phase 5) is green. ``strict`` guarantees every
 # configured slot's full context; ``elastic`` takes an explicit byte budget
 # but still uses conservative full-sequence admission (no unsafe overcommit).
-SERVER_QWEN_KV_MODE = os.environ.get("QSR_QWEN_KV_MODE", "legacy")
-SERVER_QWEN_KV_POOL_BYTES = int(os.environ.get("QSR_QWEN_KV_POOL_BYTES", "0"))
+SERVER_QWEN_KV_MODE = os.environ.get(
+    "QSR_QWEN_KV_MODE", "elastic" if _QWEN_DSPARK_DEFAULT_PROFILE else "legacy"
+)
+SERVER_QWEN_KV_POOL_BYTES = int(
+    os.environ.get(
+        "QSR_QWEN_KV_POOL_BYTES",
+        str(_QWEN_DSPARK_POOL_BYTES) if _QWEN_DSPARK_DEFAULT_PROFILE else "0",
+    )
+)
 SERVER_QWEN_KV_WATERMARK_BUNDLES = int(
     os.environ.get("QSR_QWEN_KV_WATERMARK_BUNDLES", "8")
 )
@@ -503,6 +571,11 @@ async def lifespan(app: FastAPI):
     set_active_parser(SERVER_TOOL_CALL_PARSER)
     logger.info("tool_call_parser=%s", SERVER_TOOL_CALL_PARSER)
 
+    # Apply the measured Qwen DSpark profile before model construction. The
+    # low-level backend reads these switches while allocating/capturing its
+    # graphs, so changing them after ServerEngine.start() would be too late.
+    _apply_qwen_dspark_runtime_defaults()
+
     # Track A migration step 5 (docs/architecture.md §3.5.5): the backend
     # name used to be the hardcoded constant SERVER_MODEL_BACKEND. It is now
     # resolved from the checkpoint's own config.json -- registry's first
@@ -567,7 +640,7 @@ async def lifespan(app: FastAPI):
     logger.info(
         "engine ready: backend=%s model=%s capacity=%d num_slots=%d capacity_tokens_per_slot=%d "
         "cudagraph=%s prefix_cache=%s session_affinity=%s ttl=%.1fs dflash=%s "
-        "mtp=%s(K=%d,resync=%s) dspark=%s(K=%d,draft=%s)",
+        "mtp=%s(K=%d,resync=%s) dspark=%s(K=%d,draft=%s,verify=%s,require_cg=%s)",
         engine.backend_name,
         engine.MODEL,
         engine.capacity,
@@ -584,6 +657,8 @@ async def lifespan(app: FastAPI):
         SERVER_ENABLE_DSPARK,
         SERVER_DSPARK_K,
         SERVER_DSPARK_DRAFT_MODEL,
+        SERVER_DSPARK_VERIFY_MODE,
+        SERVER_DSPARK_REQUIRE_CG,
     )
     # Cyclic-GC pauses land in the decode hot loop as 50-150 ms host stalls:
     # the 2026-08-06 128K/c4 node trace measured 667 GPU-idle gaps >0.5 ms
@@ -1648,9 +1723,10 @@ def main() -> None:
         "--dspark",
         action="store_true",
         help=(
-            "Enable Qwen3.8 DSpark speculative decoding (qwen36 backend only). "
+            "Enable Qwen3.6/Qwen3.8 DSpark speculative decoding (qwen36 backend only). "
             "Loads a separate five-layer draft checkpoint and uses gamma=7 by "
-            "default; prefix caching and MTP are disabled for this path."
+            "default; persistent prefix caching is supported, and MTP is "
+            "disabled for this path."
         ),
     )
     parser.add_argument(
@@ -1729,11 +1805,13 @@ def main() -> None:
         os.environ["QSR_SERVER_ENABLE_DFLASH"] = "1"
     if args.mtp:
         os.environ["QSR_SERVER_ENABLE_MTP"] = "1"
+        os.environ["QSR_SERVER_ENABLE_DSPARK"] = "0"
     os.environ["QSR_SERVER_MTP_K"] = str(args.mtp_k)
     if args.mtp_resync:
         os.environ["QSR_SERVER_MTP_RESYNC"] = "1"
     if args.dspark:
         os.environ["QSR_SERVER_ENABLE_DSPARK"] = "1"
+        os.environ["QSR_SERVER_ENABLE_MTP"] = "0"
     os.environ["QSR_SERVER_DSPARK_DRAFT_MODEL"] = args.dspark_draft_model
     os.environ["QSR_SERVER_DSPARK_K"] = str(args.dspark_k)
     os.environ["QSR_TOOL_CALL_PARSER"] = args.tool_call_parser

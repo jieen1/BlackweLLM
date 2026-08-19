@@ -28,8 +28,8 @@ vLLM runtime dependency; do not add multi-model or multi-GPU routing here.
   prompt-prefix-overlap, P4a prefix-cache hit-rate, and P4b session-affinity
   instrumentation.
 
-Decoding is greedy (MTP verify requires a greedy match). `n != 1` is a clean
-400. A request whose `prompt + max_tokens + K` would exceed the per-slot
+Decoding is greedy (DSpark/MTP verify requires a greedy match). `n != 1` is a
+clean 400. A request whose `prompt + max_tokens + K` would exceed the per-slot
 capacity is rejected with a clean 400 BEFORE it reaches the runtime (this is
 what keeps the server from triggering the known whole-batch attention crash).
 Non-streaming responses carry non-standard `debug_committed_token_ids` /
@@ -38,24 +38,29 @@ Non-streaming responses carry non-standard `debug_committed_token_ids` /
 
 ## Configuration
 
-Set via env (read at import) or `python -m server.app` flags. "Deployed" is
-the best-quality profile from `scripts/run_qwen36_quality.sh server start best`
-(2026-08-05): 3 × 256K slots on a 96 GB card.
+Set via env (read at import) or `python -m server.app` flags. The current
+Qwen deployed profile is DSpark K=7 with four 256K logical slots, block size
+128, elastic FP8 KV and persistent prefix cache; the MTP values below are
+kept as historical/rollback settings.
 
 | Env | Flag | Code default | Deployed | Meaning |
 | --- | --- | --- | --- | --- |
-| `QSR_SERVER_CAPACITY` | `--capacity` | 4 | 3 | concurrent production slots |
-| `QSR_SERVER_NUM_SLOTS` | `--num-slots` | 8 | 4 | total physical slots (capacity + 1 CG warmup slot) |
-| `QSR_SERVER_BLOCK_SIZE` | — | 16 (`qwen36`), 64 (`laguna`) | 16 | KV block size (tokens/block); Laguna sparkinfer requires 64 |
-| `QSR_SERVER_BLOCKS_PER_SLOT` | `--blocks-per-slot` | 16384 (`qwen36`), 2048 (`laguna`) | 16384 | per-slot KV ceiling (`× block_size` tokens) ⇒ **256K** for qwen36, **128K** for Laguna |
+| `QSR_SERVER_CAPACITY` | `--capacity` | 4 (Qwen), 1 (Laguna) | 4 | concurrent production slots |
+| `QSR_SERVER_NUM_SLOTS` | `--num-slots` | 4 (Qwen), 2 (Laguna) | 4 | total physical slots |
+| `QSR_SERVER_BLOCK_SIZE` | — | 128 (Qwen), 64 (Laguna) | 128 | KV block size (tokens/block); Laguna sparkinfer requires 64 |
+| `QSR_SERVER_BLOCKS_PER_SLOT` | `--blocks-per-slot` | 2048 | 2048 | per-slot KV ceiling (`× block_size` tokens) ⇒ **256K** for Qwen, **128K** for Laguna |
 | `QSR_SERVER_ENABLE_CUDAGRAPH` | `--no-cudagraph` | 1 | 1 | captured decode graph |
 | `QSR_SERVER_ENABLE_PREFIX_CACHE` | `--no-prefix-cache` | 1 | 1 | persistent prefix cache (P4a) |
 | `QSR_SERVER_ENABLE_SESSION_AFFINITY` | `--session-affinity` | 0 | 0 | opt-in warm-slot retention (P4b) |
 | `QSR_SERVER_SESSION_TTL_S` | `--session-ttl-s` | 30.0 | 30.0 | warm-slot retention TTL seconds (P4b) |
-| `QSR_SERVER_ENABLE_MTP` | `--mtp` | 0 | 1 | MTP speculative decoding (Qwen3.6) |
+| `QSR_SERVER_ENABLE_MTP` | `--mtp` | 0 | 0 | explicit native-MTP rollback path |
 | `QSR_SERVER_MTP_K` | `--mtp-k` | 4 | 3 | MTP speculative depth (historical K=3) |
+| `QSR_SERVER_ENABLE_DSPARK` | `--dspark` | 1 (Qwen), 0 (Laguna) | 1 | default Qwen speculative decoding path |
+| `QSR_SERVER_DSPARK_K` | `--dspark-k` | 7 | 7 | DSpark draft depth |
 | `QSR_SERVER_ENABLE_DFLASH` | `--dflash` | 0 | 0 | DFlash speculative engine (Laguna) |
-| `QSR_SERVER_KV_CACHE_DTYPE` | — | fp8_e4m3 | fp8_e4m3 | KV cache dtype |
+| `QSR_SERVER_KV_CACHE_DTYPE` | — | fp8_e4m3 (Qwen), auto (Laguna) | fp8_e4m3 | KV cache dtype |
+| `QSR_QWEN_KV_MODE` | `--qwen-kv-mode` | elastic (Qwen), legacy (Laguna) | elastic | Qwen KV allocation mode |
+| `QSR_QWEN_KV_POOL_BYTES` | `--qwen-kv-pool-bytes` | 19629342720 (Qwen) | 19629342720 | Qwen DSpark physical KV budget |
 | `QSR_SERVER_GPU_MEM_UTIL` | — | 0.85 | 0.92 | `gpu_memory_utilization` |
 | `QSR_SERVER_PRODUCTION` | — | 1 | 1 | production slot layout (vs. diagnostic layout) |
 | `QSR_SERVED_MODEL_NAME` | — | engine MODEL | `qwen3.6` | name(s) reported by `/v1/models` (space-separated list) |

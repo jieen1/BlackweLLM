@@ -504,6 +504,7 @@ class Qwen36Backend:
             # a performance run cannot be mistaken for an MTP run.
             "dspark_verify_graph_replays": 0,
             "dspark_draft_graph_replays": 0,
+            "dspark_thinking_force_batched_replays": 0,
             "dspark_verify_width_histogram": [],
         }
 

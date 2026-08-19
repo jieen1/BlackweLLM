@@ -128,6 +128,52 @@ def test_compact_without_dynamic_policy_uses_full_ragged_width() -> None:
     assert engine._verify_widths([0, 1, 2, 3]) == [7, 7, 7, 7]
 
 
+def test_thinking_force_biases_compact_logits_in_place() -> None:
+    engine = Qwen36DSparkEngine.__new__(Qwen36DSparkEngine)
+    engine.backend = SimpleNamespace(stats={})
+    engine.device = torch.device("cpu")
+    logits = torch.zeros(6, 32)
+    logits[4, 11] = 5.0
+
+    applied = engine._apply_thinking_forces_to_logits(
+        logits,
+        [3, 7],
+        row_starts=[0, 3],
+        row_limits=[3, 3],
+        force_positions={7: 1},
+        force_token_ids={7: 19},
+    )
+
+    assert applied is True
+    assert int(logits[4].argmax()) == 19
+    assert engine.backend.stats["dspark_thinking_force_batched_replays"] == 1
+
+
+def test_compact_thinking_force_stays_on_ragged_batch_path(monkeypatch) -> None:
+    engine = Qwen36DSparkEngine.__new__(Qwen36DSparkEngine)
+    engine.verify_mode = "compact"
+    engine.k = 3
+    captured: dict[str, object] = {}
+
+    def fake_ragged(*args, **kwargs):
+        captured.update(kwargs)
+        return {0: {"committed": [99]}}
+
+    monkeypatch.setattr(engine, "_round_batch_ragged", fake_ragged)
+
+    result = engine.round_batch(
+        [0],
+        {0: 10},
+        {0: [11, 12, 13]},
+        thinking_force_positions={0: 2},
+        thinking_force_token_ids={0: 99},
+    )
+
+    assert result == {0: {"committed": [99]}}
+    assert captured["thinking_force_positions"] == {0: 2}
+    assert captured["thinking_force_token_ids"] == {0: 99}
+
+
 def test_ragged_target_taps_skip_padded_request_tail() -> None:
     tap0 = torch.arange(12, dtype=torch.float32).view(6, 2)
     tap1 = tap0 + 100

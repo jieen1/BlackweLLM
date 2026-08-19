@@ -1,6 +1,6 @@
 # notes/ 索引
 
-> 编制日期：2026-08-19 · 共 238 篇（`git ls-files notes | wc -l`，包含本次新增）
+> 编制日期：2026-08-19 · 共 239 篇（`git ls-files notes | wc -l`，包含本次新增）
 
 `notes/` 是**调查记录与证据档案**，不是文档。它的价值在于：当一个结论被
 质疑时，能翻出当初的实测数据、复现命令和被排除的假设。
@@ -125,6 +125,7 @@ Track F（性能，机会主义）的输入。
 
 | 文件 | 内容 |
 |---|---|
+| `2026-08-19-qwen38-dspark-default-thinking-e2e.md` | **Qwen3.8 DSpark 默认路径验收**：清理进程自动选择 DSpark K=7；thinking 关闭与 32-token 限制均真实 HTTP 通过；预算边界保留 compact ragged verify 批处理并完成 CUDA Graph replay；4×131K 冷/热性能与历史 DSpark 基线在噪声范围内，输出 SHA 一致 |
 | `2026-08-19-qwen38-dspark-optimization-stop.md` | **Qwen3.8 DSpark 同口径 profiling 收敛记录**：4×131072、K=7、CG/prefix-cache/FP8 KV、同 prompt SHA 下，local warm `443.74/450.88 tok/s` 对 SGLang steady `392.49 tok/s`；FlashInfer target verify kernel 未显示 local 固有劣势；graph-fused context-KV、ragged tier、RMS/FP8 fusion 均无稳定净收益，未经证实的实验代码已清理，后续优化暂停并保留全部 fixture/trace 证据 |
 | `2026-08-16-w8a8-gemm-roofline-bandwidth-floor.md` | 🟢 **W8A8/W4A4 GEMM roofline 定案：decode 已至 DRAM 带宽地板**。真冷（每次冲刷 L2）测得大 GEMM 1024-1280 GB/s（57-71% 峰值）；nsys 表观 10.64ms/轮中 3.69ms 是 prefill 长尾混入（最小间隔 348ms>>轮 38ms 证明），剔除后真实 decode W8A8≈6.9ms 与真冷孤立求和吻合——**无隐藏缺口，kernel 无空间**。N32 tile 实验负面回退。bench 方法学教训：逐次 sync 放大、轮转足迹 ≤L2 造成双峰假象，真冷需足迹≥1.5×L2 或主动冲刷。剩余杠杆仅减字节/提有效 M/小 kernel 融合（~17%） |
 | `2026-08-16-vllm-extensible-kv-cache.md` | 🟢 **vLLM extensible-KV-cache 分支调研 + SM120 动态物理 KV 实施规划（Phase 5.5 候选）**。分支（`origin/extensible-kv-cache`，16 commits，未合 main）用 CUDA VMM 预留全容量 VA、先提交 1 block 跑 warmup/图捕获、捕获后按实测内存定稿池大小。本机 E1 全过（2 MiB granule、36 GiB VA 零物理、**图捕获后补页 replay 正确**、VA 稳定）；**E2 性能奇偶**：copy/read/write/随机 128KiB 页走读全部 ±2% 内，增长零化 1.7µs/128KiB 页 = 0.006% 解码步。对 runtime：补上动态 arena 缺的"物理提交动态"层，根治 S7 手工容量配置与启动 OOM，并把 31.5 GiB 闲置转化为并发容量（→更大有效 M，归因笔记 54% GEMM 的结构性解法）。规划 Phase A-D + 验收总账 + 风险。脚本 `scripts/b4_vmm_extensible_experiments.py` |

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reproduce the 2026-08-15 Qwen3.8 128K decode matrix.
+# Reproduce the latest Qwen3.8 DSpark 128K decode matrix.
 #
 # Start the server in one terminal:
 #   scripts/run_qwen38_128k_decode_bench.sh server
@@ -18,9 +18,9 @@ model_path=${QSR_BENCH_MODEL_PATH:-/home/bot/.cache/huggingface/hub/models--unsl
 tokenizer_path=${QSR_BENCH_TOKENIZER_PATH:-/home/bot/.cache/huggingface/hub/models--unsloth--Qwen3.6-27B-NVFP4/snapshots/ccdaab7e68af2409599b8949a8f2685703c9bae5}
 run_tag=${QSR_BENCH_TAG:-$(date -u +%Y%m%d_%H%M%S)}
 result_dir=${QSR_BENCH_RESULT_DIR:-${repo_root}/benchmarks/fixtures}
-speculative=${QSR_BENCH_SPECULATIVE:-mtp}
+speculative=${QSR_BENCH_SPECULATIVE:-dspark}
 dspark_draft_model=${QSR_BENCH_DSPARK_MODEL_PATH:-/home/bot/.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-DSpark/snapshots/85ef153be924f17ce4bf62726954eeaa4a73e854}
-block_size=${QSR_BENCH_BLOCK_SIZE:-32}
+block_size=${QSR_BENCH_BLOCK_SIZE:-128}
 blocks_per_slot=${QSR_BENCH_BLOCKS_PER_SLOT:-$((262144 / block_size))}
 
 case "${speculative}" in
@@ -76,16 +76,23 @@ case ${1:-} in
         export QSR_SERVER_MODEL_PATH="${model_path}"
         export QSR_SERVER_BACKEND=qwen36
         export QSR_SERVED_MODEL_NAME=qwen3.8
-        # block_size 32 (2026-08-16): measured strictly better than 16 on the
-        # 131072-token workload (c1 107.99 vs 105.14 tok/s, TTFT 56.95 vs
-        # 60.17 s) and far better than 64 (c4 warm 51.8 at bs64 vs 70.0 at
-        # bs32 -- 64-token pages degrade the decode attention page walk).
+        # The current DSpark parity profile (2026-08-19) uses block_size 128,
+        # the same page shape as the retained SGLang comparison. Override with
+        # QSR_BENCH_BLOCK_SIZE for an explicit historical A/B.
         export QSR_SERVER_BLOCK_SIZE="${block_size}"
         export QSR_SERVER_KV_CACHE_DTYPE=fp8_e4m3
         export QSR_SERVER_ENABLE_CUDAGRAPH=1
         export QSR_SERVER_ENABLE_PREFIX_CACHE=${QSR_BENCH_PREFIX_CACHE:-1}
         export QSR_SERVER_ENABLE_MTP=0
         export QSR_SERVER_ENABLE_DSPARK=0
+        export QSR_PREFILL_CHUNK=${QSR_PREFILL_CHUNK:-8192}
+        export QSR_ADMISSION_COALESCE_MS=${QSR_ADMISSION_COALESCE_MS:-10}
+        export QSR_PREFIX_CACHE_IN_BATCH_DEDUP=${QSR_PREFIX_CACHE_IN_BATCH_DEDUP:-1}
+        export QSR_QWEN36_MLP_FP4_QUANT=${QSR_QWEN36_MLP_FP4_QUANT:-flashinfer}
+        export QSR_QWEN36_MLP_W4A4=${QSR_QWEN36_MLP_W4A4:-1}
+        export QSR_QWEN36_MLP_W4A4_ALL=${QSR_QWEN36_MLP_W4A4_ALL:-1}
+        export QSR_QWEN36_PREFILL_ATTN_BACKEND=${QSR_QWEN36_PREFILL_ATTN_BACKEND:-flashinfer}
+        export QSR_QWEN36_GDN_PREFILL_BACKEND=${QSR_QWEN36_GDN_PREFILL_BACKEND:-flashinfer}
         export QSR_QWEN36_DSPARK_CUDA_GRAPH=1
         export QSR_QWEN36_DSPARK_REQUIRE_CG=0
         export QSR_SERVER_REQUEST_TIMEOUT_S=900
@@ -98,6 +105,7 @@ case ${1:-} in
             unset QSR_PROFILE_ROUNDS
         fi
         if [[ "${speculative}" == "dspark" ]]; then
+            export QSR_SERVER_ENABLE_DSPARK=1
             export QSR_QWEN36_DSPARK_VERIFY_MODE=${QSR_BENCH_DSPARK_VERIFY_MODE:-compact}
             export QSR_QWEN36_DSPARK_REQUIRE_CG=1
         elif [[ "${speculative}" == "plain" ]]; then
@@ -123,7 +131,7 @@ case ${1:-} in
         run_cell 4 2
         ;;
     *)
-        echo "usage: $0 {server|c1|c4} (QSR_BENCH_SPECULATIVE=mtp|dspark|plain)" >&2
+        echo "usage: $0 {server|c1|c4} (QSR_BENCH_SPECULATIVE=dspark|mtp|plain)" >&2
         exit 2
         ;;
 esac

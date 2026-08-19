@@ -8,10 +8,11 @@ machine, one process, no tensor/pipeline parallelism.** Narrowing is the point �
 it is what lets the engine delete the abstractions that generic frameworks
 must carry, and hand-write the paths that matter.
 
-Production models today: **`poolside/Laguna-S-2.1-NVFP4`** and
-**`unsloth/Qwen3.6-27B-NVFP4`** — the latter served by the self-built `qwen36`
-backend with MTP speculative decoding, CUDA Graphs, persistent prefix cache and
-FP8 KV. `Qwen3.6-25B-A3B` is the next roadmap target — see
+Production models today: **`poolside/Laguna-S-2.1-NVFP4`** and the Qwen3.x
+27B checkpoints served by the self-built `qwen36` backend. Qwen defaults to
+DSpark K=7 with CUDA Graphs, persistent prefix cache, dynamic KV and FP8 KV;
+native MTP remains an explicit rollback path. `Qwen3.6-25B-A3B` is the next
+roadmap target — see
 [`docs/roadmap.md`](docs/roadmap.md).
 
 [中文说明](#中文说明) · [Documentation index](docs/README.md)
@@ -22,15 +23,16 @@ FP8 KV. `Qwen3.6-25B-A3B` is the next roadmap target — see
 
 | | |
 |---|---|
-| **Servable models** | `Laguna-S-2.1-NVFP4`, `Qwen3.6-27B-NVFP4` |
+| **Servable models** | `Laguna-S-2.1-NVFP4`, Qwen3.x 27B NVFP4 checkpoints |
 | **Planned** | `Qwen3.6-25B-A3B` and derivatives |
 | **Hardware** | SM120 only (RTX PRO 6000 Blackwell, RTX 5090), single GPU |
 | **Dependencies** | Zero vLLM in the production path; SparkInfer for SM120 kernels |
 | **Maturity** | Pre-1.0. See [Known issues](#known-issues) before deploying. |
 
-Qwen3.6-27B-NVFP4 became servable on the self-built runtime on 2026-08-05
-(MTP K=3 + CUDA Graph + prefix cache + FP8 KV), and its quality baseline was
-re-established on that path — see [Quality validation](#quality-validation).
+Qwen3.x 27B became servable on the self-built runtime on 2026-08-05. The
+current default serving path is the measured DSpark profile; the historical
+MTP K=3 quality path remains available explicitly — see [Quality
+validation](#quality-validation).
 The retired vLLM-era execution path remains read-only under
 `oracle/qwen36_vllm/` as an offline reference.
 
@@ -53,8 +55,8 @@ entire distributed abstraction layer simply does not exist.
 - **Fixed-slot continuous batching** — dedicated engine thread owns the CUDA
   context; the asyncio side never blocks
 - **DFlash speculative decoding** — 96.3–100% acceptance on Laguna
-- **MTP speculative decoding (Qwen3.6)** — K=3, anchor/draft/sync/verify CUDA
-  Graphs captured at load and replayed in the live serving path
+- **DSpark speculative decoding (Qwen3.x)** — K=7, ragged verify + draft/verify
+  CUDA Graphs captured at load and replayed in the live serving path
 - **CUDA Graph capture** — decode, draft, sync, verify graphs (DFlash + MTP)
 - **Prefix caching** — content-addressed, reference-counted, LRU eviction
 - **OpenAI + Anthropic APIs** — `/v1/chat/completions`, `/v1/completions`,
@@ -98,9 +100,9 @@ tracked as roadmap item D2 (memory planner).
 
 ## Quality validation
 
-Measured on **Qwen3.6-27B-NVFP4**, served by this repo's own runtime
-(`qwen36` backend, MTP K=3 + CUDA Graphs + persistent prefix cache + FP8 KV;
-no external engine). The 2026-08-05 rerun used parameters identical to the
+Measured on **Qwen3.6-27B-NVFP4**, served by this repo's own runtime's
+historical quality path (`qwen36` backend, MTP K=3 + CUDA Graphs + persistent
+prefix cache + FP8 KV; no external engine). The 2026-08-05 rerun used parameters identical to the
 historical July run and re-established the numbers on the current build —
 orchestrator: [`scripts/run_qwen36_quality.sh`](scripts/run_qwen36_quality.sh)
 (parallel, resumable); full evidence:
@@ -120,7 +122,7 @@ passes, 18 new, 20 regressions; raw length distributions equivalent), not
 truncation. Historical methodology:
 [`notes/2026-07-22-quality-baseline-and-official-scores.md`](notes/2026-07-22-quality-baseline-and-official-scores.md).
 
-### Qwen3.6 server performance grid (2026-08-05)
+### Qwen3.6 server performance grid (historical MTP path, 2026-08-05)
 
 Full server-side context × concurrency grid on the best serving profile
 (MTP K=3, decode + MTP CUDA Graphs, persistent prefix cache, FP8 e4m3 KV,
@@ -209,8 +211,9 @@ the production CUDA Graph gate, and a bit-level router oracle — all run throug
 ```
 blackwellm/
 ├── runtime/           Core inference engine
-│   ├── backends/          LagunaBackend (DFlash), Qwen36Backend (MTP K=3,
-│   │                      persistent prefix + GDN recurrent state), CUDA
+│   ├── backends/          LagunaBackend (DFlash), Qwen36Backend (DSpark K=7
+│   │                      default; native MTP rollback; persistent prefix +
+│   │                      GDN recurrent state), CUDA
 │   │                      Graph lifecycle, SparkInfer attn/MoE adapters
 │   ├── model/             Self-built model graph (decoder, linear, embedding, attention)
 │   ├── kernels/           Own SM120 kernels (.cu) + Triton kernels
@@ -278,15 +281,16 @@ python -m server.app --host 0.0.0.0 --port 8000
 > These four variables are coupled: get them wrong and you either OOM at load
 > time or silently waste VRAM. Automating this is roadmap item D2.
 
-### Serve Qwen3.6-27B (MTP + CUDA Graph + prefix cache)
+### Serve Qwen3.x-27B (DSpark + CUDA Graph + prefix cache)
 
-The quality orchestrator ships a ready "best" profile — 3 × 256K slots,
-MTP K=3, decode + MTP CUDA Graphs, persistent prefix cache, FP8 KV,
-`gpu_memory_utilization=0.92`:
+Point `QSR_SERVER_MODEL_PATH` at a local Qwen3.6/3.8-27B checkpoint. The
+launcher selects the measured DSpark profile automatically: K=7, four slots,
+128-token KV pages, a 256K logical ceiling, elastic 19,629,342,720-byte KV,
+FP8 KV, persistent prefix cache, compact ragged verify and CUDA Graphs:
 
 ```bash
-bash scripts/run_qwen36_quality.sh server start best   # port 8300
-bash scripts/run_qwen36_quality.sh server stop         # stop
+QSR_SERVER_MODEL_PATH=/path/to/Qwen3.8-27B-NVFP4 \
+  python -m server.app --host 0.0.0.0 --port 8300
 ```
 
 Same self-built server (no vLLM), model id `qwen3.6`, callable through
@@ -335,14 +339,18 @@ plus the Laguna run in
 
 | Env variable | Default | Description |
 |---|---|---|
-| `QSR_SERVER_CAPACITY` | `1` | Max concurrent requests |
-| `QSR_SERVER_NUM_SLOTS` | `2` | Total internal slots (one extra for CG warmup) |
-| `QSR_SERVER_BLOCKS_PER_SLOT` | `2048` | KV blocks per slot (×64 = tokens) |
+| `QSR_SERVER_CAPACITY` | `1` (Laguna), `4` (Qwen) | Max concurrent requests |
+| `QSR_SERVER_NUM_SLOTS` | `2` (Laguna), `4` (Qwen) | Total internal slots |
+| `QSR_SERVER_BLOCKS_PER_SLOT` | `2048` | KV blocks per slot (×64 Laguna / ×128 Qwen) |
 | `QSR_SERVER_PRODUCTION` | `1` | Production mode: skip validation slots |
 | `QSR_SERVER_ENABLE_CUDAGRAPH` | `1` | Enable CUDA Graph capture |
-| `QSR_SERVER_ENABLE_PREFIX_CACHE` | `0` | Enable prefix caching |
-| `QSR_SERVER_ENABLE_MTP` | `0` | Enable MTP speculative decoding (Qwen3.6) |
+| `QSR_SERVER_ENABLE_PREFIX_CACHE` | `1` | Enable prefix caching |
+| `QSR_SERVER_ENABLE_MTP` | `0` | Explicit native-MTP rollback path for Qwen3.x |
 | `QSR_SERVER_MTP_K` | `4` | MTP speculative depth (quality/historical profile: 3) |
+| `QSR_SERVER_ENABLE_DSPARK` | `1` (Qwen), `0` (Laguna) | Enable DSpark speculative decoding |
+| `QSR_SERVER_DSPARK_K` | `7` | DSpark draft depth |
+| `QSR_QWEN_KV_MODE` | `elastic` (Qwen), `legacy` (Laguna) | Qwen KV allocation mode |
+| `QSR_QWEN_KV_POOL_BYTES` | `19629342720` (Qwen) | Qwen DSpark physical KV budget |
 | `QSR_SERVER_ENABLE_DFLASH` | `0` | Enable DFlash speculative engine (Laguna) |
 | `QSR_SERVER_REQUEST_TIMEOUT_S` | `600` | Server-side request cap; `0` disables (quality/longctx profiles) |
 | `QSR_SERVED_MODEL_NAME` | model ID | Advertised model name(s) |
@@ -413,7 +421,8 @@ been repaired; what remains open:
 
 ## Limitations
 
-- **Two models** — `Laguna-S-2.1-NVFP4` and `Qwen3.6-27B-NVFP4`; `Qwen3.6-25B-A3B` pending
+- **Two model families** — `Laguna-S-2.1-NVFP4` and Qwen3.x 27B NVFP4;
+  `Qwen3.6-25B-A3B` pending
 - **Single GPU** — no tensor/pipeline/expert parallelism, by design
 - **SM120 only** — compute capability 12.0 required, by design
 - **Sampling disables speculation** — `temperature > 0` falls back to
@@ -428,10 +437,10 @@ Full plan: [`docs/roadmap.md`](docs/roadmap.md).
   model abstraction design — **done** (2026-08-01/02)
 - **M2/M3** — model abstraction + Qwen3.6-27B correctness and serving —
   **substantially landed** on the self-built path (2026-08-05): `qwen36`
-  backend, MTP K=3 + CUDA Graphs, persistent prefix cache, quality baseline
-  re-established, one-command `server start best`
-- **M4 (in progress)** — Qwen3.6-27B performance tuning; MTP speculation is
-  already wired (K=3, CUDA-Graph captured); optimization continues per roadmap
+  backend, historical MTP quality path, persistent prefix cache, quality
+  baseline re-established
+- **M4 (in progress)** — Qwen3.x-27B performance tuning; DSpark K=7 is now the
+  measured default, with native MTP retained for rollback/A-B validation
 - **M5 (Dec)** — `Qwen3.6-25B-A3B` bring-up and serving
 - **M6 (Jan 2027)** — soak testing, release gates, `0.2.0`
 - **M6 (Jan 2027)** — soak testing, release gates, `0.2.0`
@@ -453,9 +462,9 @@ Apache 2.0 — see [LICENSE](LICENSE).
 （SM120 / CC 12.0）、单机、单进程、无张量/流水线并行。收窄本身就是价值来源——
 它让这个引擎可以删掉通用框架不得不背的抽象，并把关键路径手写出来。
 
-**当前可服务模型**：`poolside/Laguna-S-2.1-NVFP4` 与
-`unsloth/Qwen3.6-27B-NVFP4`（自研 `qwen36` 后端，MTP K=3 + CUDA Graph +
-持久前缀缓存 + FP8 KV，2026-08-05 起可服务；质量基线已在新路径上复现）。
+**当前可服务模型**：`poolside/Laguna-S-2.1-NVFP4` 与 Qwen3.x 27B NVFP4
+检查点（自研 `qwen36` 后端，默认 DSpark K=7 + CUDA Graph + 持久前缀缓存 +
+FP8 KV；历史 MTP K=3 质量路径仍可显式启用）。
 **下一个路线图目标**是 `Qwen3.6-25B-A3B`。
 
 完整中文文档见 [`docs/README.md`](docs/README.md)：

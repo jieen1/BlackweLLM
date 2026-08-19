@@ -423,7 +423,7 @@ class ServerEngine:
         if enable_dspark and backend != "qwen36":
             raise ValueError(
                 f"enable_dspark requires backend='qwen36' (got {backend!r}); "
-                "DSpark is the Qwen3.8 external draft path"
+                "DSpark is the Qwen3.x external draft path"
             )
         if enable_dspark and (enable_dflash or enable_mtp):
             raise ValueError("DSpark is mutually exclusive with DFlash and MTP")
@@ -658,8 +658,8 @@ class ServerEngine:
         # SGLang-style wave admission: when the GPU is idle and the first
         # request of a concurrent wave has arrived, briefly collect wakeups
         # already in flight before starting a long prefill.  Keep the default
-        # off until a deployment opts in; the benchmarked Qwen3.8 DSpark
-        # service enables it explicitly because a 128K c4 wave otherwise
+        # off outside the measured Qwen DSpark profile; that profile enables
+        # it because a 128K c4 wave otherwise
         # entered as [1] + [3] and paid two separate prefill schedules.
         configured_coalesce_ms = os.environ.get("QSR_ADMISSION_COALESCE_MS", "0")
         try:
@@ -847,12 +847,14 @@ class ServerEngine:
         that was already stale before this B3 change touched the file.
 
         No DFlash for this backend (DFlash is Laguna's own draft model).
-        Qwen3.6's native speculative story is MTP; Qwen3.8 additionally has
-        the separate DSpark draft wired below via ``self.enable_dspark``.
+        Qwen3.6's native speculative story is MTP, while the measured Qwen3.x
+        default uses the separate external DSpark draft wired below via
+        ``self.enable_dspark``. MTP remains an explicit rollback path.
         DSpark captures fixed-width target-verify and greedy-draft CUDA Graphs;
         its separate draft KV remains a legacy physical allocation even when
-        the target uses the dynamic arena. Prefix caching stays disabled until
-        the draft-KV family has a snapshot/restore implementation.
+        the target uses the dynamic arena. The draft-KV family participates in
+        the persistent prefix snapshot/restore path, which is why the measured
+        Qwen default can keep prefix caching enabled.
 
         ``enable_cudagraph`` captures here, before ``start()``'s admission
         loop can hand out a slot, for the same reason Laguna does -- plus
@@ -1026,7 +1028,7 @@ class ServerEngine:
                 )
             self.runner.enable_dspark(draft_model)
             logger.info(
-                "Qwen3.8 DSpark speculative decode wired: draft=%s K=%d cg_status=%s",
+                "Qwen DSpark speculative decode wired: draft=%s K=%d cg_status=%s",
                 self.dspark_draft_model,
                 draft_model.gamma,
                 self.runner._dspark.cg_status,  # noqa: SLF001 -- load-time observability

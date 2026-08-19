@@ -63,6 +63,73 @@ class TestPrefixCacheDefault:
         assert app_mod.SERVER_ENABLE_PREFIX_CACHE is False
 
 
+class TestQwenDSparkDefault:
+    @pytest.mark.parametrize(
+        "model_path",
+        [
+            "unsloth/Qwen3.6-27B-NVFP4",
+            "unsloth/Qwen3.8-27B-NVFP4",
+        ],
+    )
+    def test_qwen_model_selects_measured_dspark_profile(self, monkeypatch, model_path):
+        app_mod = _reimport_app_with(
+            monkeypatch,
+            QSR_SERVER_MODEL_PATH=model_path,
+            QSR_SERVER_CAPACITY=None,
+            QSR_SERVER_NUM_SLOTS=None,
+            QSR_SERVER_BLOCK_SIZE=None,
+            QSR_SERVER_BLOCKS_PER_SLOT=None,
+            QSR_SERVER_KV_CACHE_DTYPE=None,
+            QSR_SERVER_ENABLE_CUDAGRAPH=None,
+            QSR_SERVER_ENABLE_DSPARK=None,
+            QSR_SERVER_ENABLE_MTP=None,
+            QSR_QWEN_KV_MODE=None,
+            QSR_QWEN_KV_POOL_BYTES=None,
+            QSR_QWEN36_DSPARK_VERIFY_MODE=None,
+            QSR_QWEN36_DSPARK_REQUIRE_CG=None,
+        )
+
+        assert app_mod.SERVER_ENABLE_DSPARK is True
+        assert app_mod.SERVER_ENABLE_MTP is False
+        assert app_mod.SERVER_CAPACITY == 4
+        assert app_mod.SERVER_NUM_SLOTS == 4
+        assert app_mod.SERVER_BLOCK_SIZE == 128
+        assert app_mod.SERVER_BLOCKS_PER_SLOT == 2048
+        assert app_mod.SERVER_KV_CACHE_DTYPE == "fp8_e4m3"
+        assert app_mod.SERVER_QWEN_KV_MODE == "elastic"
+        assert app_mod.SERVER_QWEN_KV_POOL_BYTES == 19_629_342_720
+        assert app_mod.SERVER_DSPARK_K == 7
+        assert app_mod.SERVER_DSPARK_VERIFY_MODE == "compact"
+        assert app_mod.SERVER_DSPARK_REQUIRE_CG is True
+
+    def test_explicit_zero_keeps_qwen_native_path_available(self, monkeypatch):
+        app_mod = _reimport_app_with(
+            monkeypatch,
+            QSR_SERVER_MODEL_PATH="unsloth/Qwen3.8-27B-NVFP4",
+            QSR_SERVER_ENABLE_DSPARK="0",
+        )
+        assert app_mod.SERVER_ENABLE_DSPARK is False
+
+    def test_qwen_backend_hint_selects_profile_for_local_snapshot(self, monkeypatch):
+        app_mod = _reimport_app_with(
+            monkeypatch,
+            QSR_SERVER_MODEL_PATH="/models/private-qwen-checkpoint",
+            QSR_SERVER_BACKEND="qwen36",
+            QSR_SERVER_ENABLE_DSPARK=None,
+            QSR_SERVER_ENABLE_MTP=None,
+            QSR_SERVER_CAPACITY=None,
+            QSR_SERVER_NUM_SLOTS=None,
+            QSR_SERVER_BLOCK_SIZE=None,
+            QSR_SERVER_KV_CACHE_DTYPE=None,
+            QSR_QWEN_KV_MODE=None,
+            QSR_QWEN_KV_POOL_BYTES=None,
+        )
+        assert app_mod.SERVER_ENABLE_DSPARK is True
+        assert app_mod.SERVER_ENABLE_MTP is False
+        assert app_mod.SERVER_BLOCK_SIZE == 128
+        assert app_mod.SERVER_QWEN_KV_MODE == "elastic"
+
+
 class TestFlagShapeMatchesDefault:
     """A CLI flag's *shape* declares what the default must be.
 

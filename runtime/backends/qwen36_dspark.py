@@ -1006,6 +1006,112 @@ class Qwen36DSparkEngine:
             }
         return decisions
 
+    def _apply_thinking_forces_to_logits(
+        self,
+        logits: torch.Tensor,
+        slots: list[int],
+        *,
+        row_starts: list[int],
+        row_limits: list[int],
+        force_positions: Mapping[int, int],
+        force_token_ids: Mapping[int, int],
+    ) -> bool:
+        """Bias budget-boundary rows while retaining the batched verify graph.
+
+        The graph's accept epilogue is captured against the unconstrained
+        logits.  A thinking budget can change the first rejected position, so
+        forced rounds must recompute the small greedy accept decision from the
+        graph-owned logits after applying the one-entry bias.  This is a rare
+        boundary path; ordinary DSpark rounds continue to use the fused device
+        accept outputs without this extra reduction.
+
+        ``row_starts``/``row_limits`` describe request-major layouts for both
+        fixed-width ``[B, Q, V]`` output (after flattening) and compact ragged
+        ``[sum(Q), V]`` output.
+        """
+        if not force_positions:
+            return False
+        if set(force_positions) != set(force_token_ids):
+            raise ValueError("thinking force positions and token ids must cover the same slots")
+        if len(row_starts) != len(slots) or len(row_limits) != len(slots):
+            raise ValueError("DSpark thinking force row metadata must match slots")
+        if logits.ndim == 3:
+            vocab_size = int(logits.shape[-1])
+            flat_logits = logits.reshape(-1, vocab_size)
+        elif logits.ndim == 2:
+            vocab_size = int(logits.shape[-1])
+            flat_logits = logits
+        else:
+            raise ValueError(
+                "DSpark thinking force expects rank-2 or rank-3 logits, "
+                f"got shape={tuple(logits.shape)}"
+            )
+
+        flat_rows: list[int] = []
+        forced_tokens: list[int] = []
+        for index, slot in enumerate(slots):
+            if slot not in force_positions:
+                continue
+            position = int(force_positions[slot])
+            token_id = int(force_token_ids[slot])
+            if not 0 <= position < int(row_limits[index]):
+                raise ValueError(
+                    "thinking force position is outside the DSpark verify rows: "
+                    f"slot={slot}, position={position}, rows={row_limits[index]}"
+                )
+            if not 0 <= token_id < vocab_size:
+                raise ValueError(
+                    "thinking force token is outside the DSpark model vocabulary: "
+                    f"slot={slot}, token={token_id}, vocab={vocab_size}"
+                )
+            flat_rows.append(int(row_starts[index]) + position)
+            forced_tokens.append(token_id)
+
+        if not flat_rows:
+            return False
+        row_indices = torch.tensor(flat_rows, dtype=torch.long, device=logits.device)
+        token_indices = torch.tensor(forced_tokens, dtype=torch.long, device=logits.device)
+        flat_logits.index_put_(
+            (row_indices, token_indices),
+            flat_logits.new_full((len(flat_rows),), 1.0e9),
+        )
+        self.backend.stats.setdefault("dspark_thinking_force_batched_replays", 0)
+        self.backend.stats["dspark_thinking_force_batched_replays"] += 1
+        return True
+
+    def _full_verify_drafts(
+        self,
+        slots: list[int],
+        anchors: Mapping[int, int],
+        drafts_by_slot: Mapping[int, list[int] | torch.Tensor],
+    ) -> torch.Tensor:
+        """Materialize ``anchor + K drafts`` for a forced accept reduction."""
+        full = torch.empty((len(slots), self.k + 1), dtype=torch.long, device=self.device)
+        full[:, 0] = torch.tensor(
+            [int(anchors[slot]) for slot in slots], dtype=torch.long, device=self.device
+        )
+        for row, slot in enumerate(slots):
+            draft = drafts_by_slot[slot]
+            if isinstance(draft, torch.Tensor):
+                if draft.ndim == 2 and tuple(draft.shape) == (1, self.k):
+                    draft = draft[0]
+                if draft.ndim != 1 or draft.numel() != self.k:
+                    raise ValueError(
+                        "DSpark forced verify drafts must have shape [K] or [1, K]; "
+                        f"got {tuple(draft.shape)}"
+                    )
+                full[row, 1:].copy_(draft.to(device=self.device, dtype=torch.long))
+            else:
+                values = [int(token) for token in draft]
+                if len(values) != self.k:
+                    raise ValueError(
+                        f"DSpark forced verify received {len(values)} drafts; expected {self.k}"
+                    )
+                full[row, 1:] = torch.tensor(
+                    values, dtype=torch.long, device=self.device
+                )
+        return full
+
     def _sync_target_hidden(
         self,
         slot: int,
@@ -1524,10 +1630,17 @@ class Qwen36DSparkEngine:
         params_per_slot: Mapping[int, SamplingParams],
         return_logprobs: bool,
         top_logprobs: int,
+        thinking_force_positions: Mapping[int, int],
+        thinking_force_token_ids: Mapping[int, int],
     ) -> dict[int, dict[str, Any]]:
         """Run one unified request-major ragged DSpark verify round."""
 
-        widths = self._verify_widths(slots)
+        forced = bool(thinking_force_positions)
+        # A force can land at any position in the K+1 target block.  Keep the
+        # whole active batch at full width for that rare boundary round so the
+        # corrected decision can use the same vectorized K-token reducer as a
+        # normal fixed-width verify.  The steady-state planner is untouched.
+        widths = [self.k] * len(slots) if forced else self._verify_widths(slots)
         verify_lens = [int(width) + 1 for width in widths]
         for width in widths:
             self.backend.stats["dspark_verify_width_histogram"][width] += 1
@@ -1550,6 +1663,8 @@ class Qwen36DSparkEngine:
                     return_logprobs=return_logprobs,
                     top_logprobs=top_logprobs,
                     _accept_cap=width,
+                    thinking_force_position=thinking_force_positions.get(slot),
+                    thinking_force_token_id=thinking_force_token_ids.get(slot),
                 )
                 for slot, width in zip(slots, widths, strict=True)
             }
@@ -1572,7 +1687,29 @@ class Qwen36DSparkEngine:
         self.stats["verify_graph_replays"] += 1
         self.backend.stats.setdefault("dspark_verify_graph_replays", 0)
         self.backend.stats["dspark_verify_graph_replays"] += 1
-        decisions = self._decisions_from_device_accept(slots, accepted, committed, self.k)
+        compact_starts: list[int] = []
+        compact_offset = 0
+        for verify_len in verify_lens:
+            compact_starts.append(compact_offset)
+            compact_offset += int(verify_len)
+        force_applied = self._apply_thinking_forces_to_logits(
+            logits_flat,
+            slots,
+            row_starts=compact_starts,
+            row_limits=verify_lens,
+            force_positions=thinking_force_positions,
+            force_token_ids=thinking_force_token_ids,
+        )
+        if force_applied:
+            full_drafts = self._full_verify_drafts(slots, anchors, drafts_by_slot)
+            decisions = determine_accept_reject_batch(
+                slots,
+                full_drafts,
+                logits_flat[: len(slots) * (self.k + 1)],
+                self.k,
+            )
+        else:
+            decisions = self._decisions_from_device_accept(slots, accepted, committed, self.k)
         round_profile.phase("accept_decision")
 
         accepted_counts: list[int] = []
@@ -1596,7 +1733,7 @@ class Qwen36DSparkEngine:
             committed_by_slot[slot] = committed_row
         round_profile.phase("commit")
 
-        if graph.context_kv_fused:
+        if graph.context_kv_fused and not force_applied:
             # The verify CUDA graph already projected/scattered every
             # request-local candidate row into the draft cache.  Only the
             # accepted prefix is live for the next draft block; rejected
@@ -1620,9 +1757,15 @@ class Qwen36DSparkEngine:
 
         next_anchors = [committed_by_slot[slot][-1] for slot in slots]
         next_lens = [self.backend.pool.slot_state(slot).num_tokens_seen for slot in slots]
-        device_next_anchors, device_next_lens = graph.next_draft_inputs(
-            len(slots), accepted, committed
-        )
+        if force_applied:
+            # The graph-owned accept outputs were produced before the budget
+            # bias.  Host decisions above are authoritative for this boundary
+            # round, so do not feed stale graph metadata into the next draft.
+            device_next_anchors = device_next_lens = None
+        else:
+            device_next_anchors, device_next_lens = graph.next_draft_inputs(
+                len(slots), accepted, committed
+            )
         next_drafts_by_slot = self._forward_draft_batch(
             slots,
             next_anchors,
@@ -1695,29 +1838,9 @@ class Qwen36DSparkEngine:
             raise ValueError(
                 "thinking force positions and token ids must cover the same slots"
             )
-        forced_slots = position_keys
-        if forced_slots.intersection(slots):
-            normalized_drafts = {
-                slot: (value.tolist() if isinstance(value, torch.Tensor) else value)
-                for slot, value in drafts_by_slot.items()
-            }
-            return {
-                slot: self.round(
-                    slot,
-                    anchors[slot],
-                    normalized_drafts[slot],
-                    params=params_per_slot.get(slot),
-                    return_logprobs=return_logprobs,
-                    top_logprobs=top_logprobs,
-                    thinking_force_position=thinking_force_positions.get(slot),
-                    thinking_force_token_id=(
-                        thinking_force_token_ids.get(slot)
-                        if thinking_force_token_ids is not None
-                        else None
-                    ),
-                )
-                for slot in slots
-            }
+        forced_slots = position_keys.intersection(slots)
+        if forced_slots != position_keys:
+            raise ValueError("thinking force maps contain a slot outside the active DSpark batch")
         if _verify_gamma is None and self.verify_mode == "compact":
             return self._round_batch_ragged(
                 slots,
@@ -1726,17 +1849,25 @@ class Qwen36DSparkEngine:
                 params_per_slot=params_per_slot,
                 return_logprobs=return_logprobs,
                 top_logprobs=top_logprobs,
+                thinking_force_positions=thinking_force_positions or {},
+                thinking_force_token_ids=thinking_force_token_ids or {},
             )
 
         caps: dict[int, int] | None = None
-        if _verify_gamma is None and self.verify_mode in {"cap-accept", "compact"}:
+        if forced_slots:
+            # Force positions are defined against the full K+1 target verify
+            # block.  A boundary round must not be shortened by the dynamic
+            # width planner before the constrained row is visible.
+            verify_gamma = self.k
+        elif _verify_gamma is None and self.verify_mode in {"cap-accept", "compact"}:
             widths = self._verify_widths(slots)
             if self.verify_mode == "compact":
                 raise RuntimeError("compact DSpark dispatch must enter _round_batch_ragged")
             else:
                 caps = dict(zip(slots, widths, strict=True))
 
-        verify_gamma = self.k if _verify_gamma is None else int(_verify_gamma)
+        if not forced_slots:
+            verify_gamma = self.k if _verify_gamma is None else int(_verify_gamma)
         if not 0 <= verify_gamma <= self.k:
             raise ValueError(f"DSpark verify width must be in [0,{self.k}], got {verify_gamma}")
         self.backend.stats["dspark_verify_width_histogram"][verify_gamma] += len(slots)
@@ -1764,6 +1895,16 @@ class Qwen36DSparkEngine:
                     return_logprobs=return_logprobs,
                     top_logprobs=top_logprobs,
                     _accept_cap=(fallback_caps.get(slot) if fallback_caps is not None else None),
+                    thinking_force_position=(
+                        thinking_force_positions.get(slot)
+                        if thinking_force_positions is not None
+                        else None
+                    ),
+                    thinking_force_token_id=(
+                        thinking_force_token_ids.get(slot)
+                        if thinking_force_token_ids is not None
+                        else None
+                    ),
                 )
                 for slot in slots
             }
@@ -1833,7 +1974,23 @@ class Qwen36DSparkEngine:
         self.backend.stats["dspark_verify_graph_replays"] += 1
         round_profile.phase("verify_replay")
 
-        if self.capture_device_accept and verify_graph is not None:
+        force_applied = self._apply_thinking_forces_to_logits(
+            logits_batch,
+            slots,
+            row_starts=[index * (verify_gamma + 1) for index in range(batch)],
+            row_limits=[verify_gamma + 1] * batch,
+            force_positions=thinking_force_positions or {},
+            force_token_ids=thinking_force_token_ids or {},
+        )
+        if force_applied:
+            full_drafts = self._full_verify_drafts(slots, anchors, drafts_by_slot)
+            decisions = determine_accept_reject_batch(
+                slots,
+                full_drafts,
+                logits_batch.reshape(-1, logits_batch.shape[-1]),
+                self.k,
+            )
+        elif self.capture_device_accept and verify_graph is not None:
             decisions = self._decisions_from_device_accept(
                 slots, graph_result[3], graph_result[4], verify_gamma
             )
