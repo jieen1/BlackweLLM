@@ -526,6 +526,45 @@ class TestTeacherForcedSync:
         assert engine.stats["batched_verify_replays"] == 1
         assert backend.stats["mtp_verify_graph_slots"] == 2
 
+    def test_thinking_force_stays_inside_batched_verify_replay(self) -> None:
+        """A budget boundary must not demote the whole MTP batch to B=1."""
+        backend, model = _backend(num_slots=2)
+        backend.enable_mtp(num_speculative_tokens=3, enable_resync=False)
+        engine: Qwen36MTPEngine = backend._mtp
+
+        class _BatchedVerify:
+            def __init__(self) -> None:
+                self.calls: list[tuple[list[int], list[list[int]], list[int]]] = []
+
+            def replay(self, slots, tokens, past_lens):
+                self.calls.append((list(slots), tokens, list(past_lens)))
+                hidden = torch.tensor(tokens, dtype=torch.float32).unsqueeze(-1)
+                return hidden, model.compute_logits(hidden)
+
+        verify = _BatchedVerify()
+        engine._verify_cg = verify
+        for slot in (0, 1):
+            engine._caches[slot].seq_len = 2
+            backend.pool.slot_kv_len[slot] = 7
+            backend.pool.slot_state(slot).num_tokens_seen = 7
+
+        result = engine.round_batch(
+            [0, 1],
+            {0: 10, 1: 20},
+            {0: [11, 12, 13], 1: [21, 22, 23]},
+            thinking_force_positions={0: 2},
+            thinking_force_token_ids={0: 99},
+        )
+
+        assert len(verify.calls) == 1
+        assert result[0]["committed"] == [11, 12, 99]
+        assert result[0]["num_accepted"] == 2
+        assert result[1]["committed"] == [21, 22, 23, 24]
+        assert result[1]["num_accepted"] == 3
+        assert engine.stats["batched_verify_replays"] == 1
+        assert engine.stats["thinking_force_batched_replays"] == 1
+        assert backend.stats["mtp_thinking_force_batched_replays"] == 1
+
     def test_multi_slot_round_with_device_drafts_fills_preallocated_verify_tokens(
         self,
     ) -> None:

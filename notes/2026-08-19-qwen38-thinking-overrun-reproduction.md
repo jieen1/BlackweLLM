@@ -179,3 +179,29 @@ early-stopping 指令和 `</think>`，再继续生成最终答案；官方 quick
 
 因此该能力是 sampler-level 的真实 token 约束，而不是响应层截断、字符串拼接
 或二次请求续生成。
+
+## MTP batch 边界的 runtime 优化与实测（2026-08-19）
+
+首版虽然在 MTP verify logits 上强制了 end token，但只要一个 slot 触发预算，
+`round_batch` 就会整体退回 per-slot `round()`。这保证了正确性，却破坏了 B-wide
+verify；它不是可接受的最终 runtime 性能路径。
+
+后续改为在 batched CUDA-Graph verify 返回的 `[B, K+1, vocab]` logits 上直接做
+request-major/position-major 的单点 bias，再进入已有的向量化 accept/reject。这样
+预算边界不再离开同一批次的 verify graph；temperature>0 的 sampled MTP 仍保留
+单 slot 路径，因为该路径的 rejection-sampling 概率张量尚未批处理。
+
+真实 Qwen3.8、SM120、MTP K=3、4 并发、greedy、同 prompt 对照：
+
+| 场景 | wall time | 每请求 completion | verify graph | B-wide verify | 结果 |
+|---|---:|---:|---:|---:|---|
+| 无预算 | 4.638 s | 147 | 46 次 / 180 slot | 46 | `14.043478260869565` |
+| budget=32 | 0.798 s | 51/34/34/34 | 18 次 / 51 slot | 11 | `14.043478260869565` / `14` |
+
+budget=32 的该轮记录 `mtp_thinking_force_batched_replays=3`，证明 force 已在
+batched verify logits 上执行；服务启动时 anchor/draft/sync/verify CUDA Graph
+也均为 `captured`。另用 `temperature=0.6` 的真实 MTP 请求复核，budget=32 返回
+`13`，completion 31 tokens，finish_reason=`stop`。
+
+这里的 wall-time 对比证明的是硬预算对长思考请求的端到端收益，不把它冒充为
+单 token kernel 加速；batch counter 才是本次底层 MTP 路径是否保持 graph 的门禁。

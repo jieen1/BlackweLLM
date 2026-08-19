@@ -361,6 +361,7 @@ class Qwen36MTPEngine:
             "verify_graph_replays": 0,
             "verify_graph_slots": 0,
             "batched_verify_replays": 0,
+            "thinking_force_batched_replays": 0,
             "draft_graph_replays": 0,
             "draft_graph_slots": 0,
             "batched_draft_replays": 0,
@@ -386,6 +387,73 @@ class Qwen36MTPEngine:
         if batch_size > 1:
             self.stats["batched_verify_replays"] += 1
             self.backend.stats["mtp_batched_verify_replays"] += 1
+
+    def _apply_thinking_forces_to_batch_logits(
+        self,
+        logits: torch.Tensor,
+        slots: list[int],
+        force_positions: dict[int, int],
+        force_token_ids: dict[int, int],
+    ) -> None:
+        """Bias forced target rows without leaving the batched verify graph.
+
+        ``round_batch`` is the greedy-only path, so adding a large finite bias
+        is equivalent to masking every other vocabulary entry and avoids a
+        full-vocabulary fill on the graph-owned output.  The row layout is
+        request-major, then verify position, matching
+        :func:`determine_accept_reject_batch`.
+
+        The force is deliberately applied after graph replay and before the
+        vectorized accept/reject decision.  Thus a forced end token rejects
+        any draft at that position and prevents later speculative tokens from
+        being committed under the wrong context, while all other slots remain
+        in the same B-wide verify replay.
+        """
+        if not force_positions:
+            return
+        if logits.ndim != 3:
+            raise ValueError(
+                "batched thinking force expects [batch, verify_rows, vocab] logits, "
+                f"got shape={tuple(logits.shape)}"
+            )
+        batch_size, verify_rows, vocab_size = logits.shape
+        if batch_size != len(slots):
+            raise ValueError(
+                "batched thinking force logits batch does not match slots: "
+                f"batch={batch_size}, slots={len(slots)}"
+            )
+
+        flat_rows: list[int] = []
+        forced_tokens: list[int] = []
+        for batch_index, slot in enumerate(slots):
+            if slot not in force_positions:
+                continue
+            position = int(force_positions[slot])
+            token_id = int(force_token_ids[slot])
+            if not 0 <= position < verify_rows:
+                raise ValueError(
+                    "thinking force position is outside the batched verify block: "
+                    f"slot={slot}, position={position}, rows={verify_rows}"
+                )
+            if not 0 <= token_id < vocab_size:
+                raise ValueError(
+                    "thinking force token is outside the batched model vocabulary: "
+                    f"slot={slot}, token={token_id}, vocab={vocab_size}"
+                )
+            flat_rows.append(batch_index * verify_rows + position)
+            forced_tokens.append(token_id)
+
+        if not flat_rows:
+            return
+        flat_logits = logits.reshape(-1, vocab_size)
+        row_indices = torch.tensor(flat_rows, dtype=torch.long, device=logits.device)
+        token_indices = torch.tensor(forced_tokens, dtype=torch.long, device=logits.device)
+        flat_logits.index_put_(
+            (row_indices, token_indices),
+            flat_logits.new_full((len(flat_rows),), 1.0e9),
+        )
+        self.stats["thinking_force_batched_replays"] += 1
+        self.backend.stats["mtp_thinking_force_batched_replays"] += 1
 
     def _record_draft_graph_replay(self, batch_size: int) -> None:
         """Record use of the B-wide chained draft graph, not just capture."""
@@ -1116,8 +1184,10 @@ class Qwen36MTPEngine:
                     f"token={thinking_force_token_id}, vocab={all_logits.shape[-1]}"
                 )
             forced_row = all_logits[thinking_force_position]
-            forced_row.fill_(float("-inf"))
-            forced_row[thinking_force_token_id] = 0.0
+            # This is the sampled/per-slot fallback.  Biasing one entry is
+            # sampler-equivalent to a full-row mask and avoids rewriting the
+            # vocabulary at the rare budget boundary.
+            forced_row[thinking_force_token_id] = 1.0e9
 
         sampled = params is not None and not params.is_greedy
         if sampled:
@@ -1224,8 +1294,7 @@ class Qwen36MTPEngine:
             raise ValueError(
                 "thinking force positions and token ids must cover the same slots"
             )
-        forced_slots = position_keys
-        if self._verify_cg is None or forced_slots.intersection(slots) or any(
+        if self._verify_cg is None or any(
             params_per_slot is not None
             and params_per_slot.get(slot) is not None
             and not params_per_slot[slot].is_greedy
@@ -1355,6 +1424,12 @@ class Qwen36MTPEngine:
         round_profile.phase("verify_replay")
         self._record_verify_graph_replay(len(slots))
         round_profile.phase("compute_logits")
+        self._apply_thinking_forces_to_batch_logits(
+            all_logits,
+            slots,
+            thinking_force_positions or {},
+            thinking_force_token_ids or {},
+        )
         if round_profile.cuda_events:
             _post_verify_ev = torch.cuda.Event(enable_timing=True)
         decisions = determine_accept_reject_batch(

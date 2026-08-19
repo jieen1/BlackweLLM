@@ -493,6 +493,7 @@ class Qwen36Backend:
             "mtp_verify_graph_replays": 0,
             "mtp_verify_graph_slots": 0,
             "mtp_batched_verify_replays": 0,
+            "mtp_thinking_force_batched_replays": 0,
             "mtp_draft_graph_replays": 0,
             "mtp_draft_graph_slots": 0,
             "mtp_batched_draft_replays": 0,
@@ -1489,8 +1490,10 @@ class Qwen36Backend:
                     raise ValueError(
                         f"forced token {forced_token} is outside vocabulary size {logits.shape[-1]}"
                     )
-                logits[row].fill_(float("-inf"))
-                logits[row, forced_token] = 0.0
+                # Bias one entry instead of rewriting the full vocabulary row
+                # at the rare budget boundary.  Sampling's temperature/top-k/
+                # top-p transforms still select this token deterministically.
+                logits[row, forced_token] = 1.0e9
 
         next_tokens: list[int] = []
         for i, params in enumerate(params_list):

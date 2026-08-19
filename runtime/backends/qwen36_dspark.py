@@ -1298,8 +1298,9 @@ class Qwen36DSparkEngine:
                     f"token={thinking_force_token_id}, vocab={all_logits.shape[-1]}"
                 )
             forced_row = all_logits[thinking_force_position]
-            forced_row.fill_(float("-inf"))
-            forced_row[thinking_force_token_id] = 0.0
+            # The force is applied after the verify graph; touch only the
+            # selected entry instead of rewriting the whole vocabulary row.
+            forced_row[thinking_force_token_id] = 1.0e9
 
         sampled = params is not None and not params.is_greedy
         if sampled:
