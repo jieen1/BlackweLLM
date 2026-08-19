@@ -569,6 +569,41 @@ class TestPrefixCacheTwoFamilies:
         assert backend.stats["prefix_persistent_restores"] == 2
         assert state.result[0]["anchor"] == (prompt[-1] + 1) % _VOCAB
 
+    def test_dynamic_arena_same_slot_rolling_hit_restores_cached_pages(self) -> None:
+        """A reset clears the row, so a local hit must remap KV before suffix.
+
+        The dynamic arena publishes the rolling prefix before ``reset_slot``
+        clears the slot row.  The same-slot restore path still owns the
+        checkpoint, but it must revive the cached page before writing the
+        follow-up token; otherwise the request silently computes against a
+        null prefix and later prefix publication fails.
+        """
+        backend = _backend(
+            num_slots=2,
+            block_size=64,
+            dynamic_arena=True,
+            pool_bundles=20,
+            enable_persistent_prefix_cache=False,
+        )
+        prompt = list(range(64))
+        _run(backend, 0, prompt, steps=0)
+        published = backend.pool._page_table_host[0][0]  # noqa: SLF001
+        backend.pool.k_pools[0][published].fill_(7.0)
+        backend.reset_slot(0)
+        assert backend.pool._arena.bundles[published].block_hash is not None  # noqa: SLF001
+
+        backend.model.forward_lengths.clear()
+        state = backend.prefill_chunked_begin([0], [prompt + [777]])
+
+        assert backend.model.forward_lengths == [1]
+        assert state.result[0]["anchor"] == (777 + 1) % _VOCAB
+        assert backend.pool.slot_kv_len[0] == 65
+        restored = backend.pool._page_table_host[0][0]  # noqa: SLF001
+        assert restored != 0
+        assert restored != published  # partial page was COW-detached for suffix
+        assert torch.all(backend.pool.k_pools[0][restored] == 7.0)
+        assert backend.pool._arena.bundles[published].block_hash is not None  # noqa: SLF001
+
     def test_repeated_full_prompt_hits_stay_persistent_across_generations(self) -> None:
         """A full-prompt repeat must not orphan the persistent hash index.
 

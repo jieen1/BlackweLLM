@@ -166,6 +166,7 @@ def classify_decode_slots(
     active: dict[int, dict],
     grammar_slots: list[int],
     mtp_capable: bool,
+    sampled_mtp_capable: bool = True,
 ) -> tuple[list[int], list[int]]:
     """Split one round's active slots into (mtp_slots, plain_sampled_slots).
 
@@ -183,14 +184,20 @@ def classify_decode_slots(
 
     Only grammar-constrained requests (structured output has no mask hook
     into the speculative verify step yet -- see E-N1,
-    ``docs/api-layer-design.md`` §7.1) or every request on a backend with
-    no MTP capability at all still go through the plain
+    ``docs/api-layer-design.md`` §7.1), sampled requests on a backend whose
+    verify implementation cannot safely sample, or every request on a
+    backend with no MTP capability at all go through the plain
     ``decode_batch_sampled`` path (``plain_sampled_slots``).
     """
     if not mtp_capable:
         return [], list(active_slots)
-    mtp_slots = [s for s in active_slots if s not in grammar_slots]
-    plain_sampled_slots = [s for s in active_slots if s in grammar_slots]
+    mtp_slots = [
+        s
+        for s in active_slots
+        if s not in grammar_slots
+        and (sampled_mtp_capable or not active[s].get("sampled", False))
+    ]
+    plain_sampled_slots = [s for s in active_slots if s not in mtp_slots]
     return mtp_slots, plain_sampled_slots
 
 
@@ -284,6 +291,7 @@ class GenerationRequest:
     logprobs: bool = False
     top_logprobs: int = 0
     thinking_budget: ThinkingBudgetConfig | None = None
+    stop_on_tool_call: bool = False
 
 
 class StreamChannel:
@@ -1351,6 +1359,7 @@ class ServerEngine:
         logprobs: bool = False,
         top_logprobs: int = 0,
         thinking_budget: ThinkingBudgetConfig | None = None,
+        stop_on_tool_call: bool = False,
     ) -> dict:
         """Submit a generation request. Resolves when generation completes."""
         loop = asyncio.get_running_loop()
@@ -1366,6 +1375,7 @@ class ServerEngine:
             logprobs=logprobs,
             top_logprobs=top_logprobs,
             thinking_budget=thinking_budget,
+            stop_on_tool_call=stop_on_tool_call,
         )
         req._admitted_at = time.perf_counter()
         self._req_deque.append(req)
@@ -1386,6 +1396,7 @@ class ServerEngine:
         logprobs: bool = False,
         top_logprobs: int = 0,
         thinking_budget: ThinkingBudgetConfig | None = None,
+        stop_on_tool_call: bool = False,
     ):
         """Submit a streaming generation request. Yields token-id lists as
         each MTP round commits them. Final yield is the result dict."""
@@ -1408,6 +1419,7 @@ class ServerEngine:
             logprobs=logprobs,
             top_logprobs=top_logprobs,
             thinking_budget=thinking_budget,
+            stop_on_tool_call=stop_on_tool_call,
         )
         req._admitted_at = time.perf_counter()
         self._req_deque.append(req)
@@ -1667,6 +1679,15 @@ class ServerEngine:
             "thinking_state": thinking_state,
         }
         st = self.active[slot]
+        if req.stop_on_tool_call:
+            # Keep tool completion detection in the same parser/state machine
+            # used by the HTTP response layer.  It is intentionally separate
+            # from the client-facing StreamProcessor: the latter may already
+            # have emitted ordinary text and freezes only once the tool XML
+            # begins, while this tracker owns the scheduler terminal decision.
+            st["tool_tracker"] = StreamProcessor(
+                self.tok, thinking_capable=_STOP_TRACKER_THINKING_CAPABLE
+            )
         if stop_sequences:
             # N2: private tracker, separate from the client-facing
             # StreamProcessor app.py builds from the same token stream --
@@ -1699,6 +1720,16 @@ class ServerEngine:
             del self.active[slot]
             return
 
+        tool_complete = self._tool_call_check_token(st, anchor)
+        if tool_complete:
+            if stop_sequences:
+                self._flush_stop_pending(st)
+            elif req.stream_channel is not None:
+                self._stream_put(req.stream_channel, [anchor])
+            self._finish_request(slot, req, st["committed_tokens"], "tool_calls")
+            del self.active[slot]
+            return
+
         if not stop_sequences and req.stream_channel is not None:
             self._stream_put(req.stream_channel, [anchor])
 
@@ -1707,6 +1738,14 @@ class ServerEngine:
             self._finish_request(slot, req, st["committed_tokens"], finish_reason="length")
             del self.active[slot]
             return
+
+    def _tool_call_check_token(self, st: dict, tok: int) -> bool:
+        """Feed one token and report a newly complete parsed tool call."""
+        tracker: StreamProcessor | None = st.get("tool_tracker")
+        if tracker is None:
+            return False
+        tracker.add_tokens([tok])
+        return bool(tracker.complete_tool_calls())
 
     def _stop_check_token(self, st: dict, tok: int) -> str | None:
         """Feed one just-committed token through the slot's stop-sequence
@@ -2361,7 +2400,15 @@ class ServerEngine:
         # an MTP-capable backend (Laguna+DFlash) now routes BOTH greedy and
         # sampled requests through the MTP branch -- see classify_decode_slots.
         mtp_slots, plain_sampled_slots = classify_decode_slots(
-            active_slots, self.active, [], self.runner.has_speculative_decode
+            active_slots,
+            self.active,
+            [],
+            self.runner.has_speculative_decode,
+            sampled_mtp_capable=getattr(
+                self.runner,
+                "supports_sampled_speculative_decode",
+                not self.enable_dspark,
+            ),
         )
 
         self.stats["rounds"] += 1
@@ -2450,6 +2497,18 @@ class ServerEngine:
                         continue
                 elif req.stream_channel is not None:
                     self._stream_put(req.stream_channel, [tok])
+                if self._tool_call_check_token(st, tok):
+                    if stop_sequences:
+                        self._flush_stop_pending(st)
+                    self._finish_request(
+                        s,
+                        req,
+                        st["committed_tokens"],
+                        "tool_calls",
+                        logprobs_data=st.get("logprobs_acc"),
+                    )
+                    newly_finished.append(s)
+                    continue
                 if len(st["committed_tokens"]) >= req.max_tokens:
                     self._flush_stop_pending(st)
                     self._finish_request(
@@ -2530,6 +2589,7 @@ class ServerEngine:
                 # everything the backend drafted past it.
                 stop_sequences = st.get("stop_sequences")
                 matched_stop: str | None = None
+                tool_complete = False
                 finish_reason: str | None = None
                 kept: list[int] = []
                 for t in new_tokens:
@@ -2548,12 +2608,18 @@ class ServerEngine:
                         if matched_stop is not None:
                             finish_reason = "stop"
                             break
+                    tool_complete = self._tool_call_check_token(st, t)
+                    if tool_complete:
+                        finish_reason = "tool_calls"
+                        break
                 if kept:
                     st["last_progress_round"] = self.stats["rounds"]
                     if self.enable_dspark:
                         self.stats["dspark_committed_tokens"] += len(kept)
                 if matched_stop is not None:
                     self._drop_stop_pending_from_committed(st)
+                elif stop_sequences and tool_complete:
+                    self._flush_stop_pending(st)
                 elif not stop_sequences and kept and req.stream_channel is not None:
                     self._stream_put(req.stream_channel, kept)
                 if finish_reason is None and len(st["committed_tokens"]) >= req.max_tokens:

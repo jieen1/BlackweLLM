@@ -461,6 +461,31 @@ class TestPhase3PrefixCache:
         assert pool._arena.bundles[bundle_ids[0]].ref_cnt == 1
         pool._arena._assert_invariants()
 
+    def test_published_live_partial_page_detaches_before_decode_write(self) -> None:
+        """A prompt-boundary hash must stay immutable while its source decodes.
+
+        Exact prompt entries are published before the first decode step.  For
+        a non-page-aligned prompt the first generated token lands in the same
+        physical page as the cached prompt tail.  A refcount-only COW check
+        treated that page as private at refcount=1 and corrupted every later
+        prefix restore from the hash index.
+        """
+        pool = _dynamic_pool(num_slots=2, max_seq_len=256, pool_bundles=16)
+        pool.prepare_kv_writes(0, 0, 64)
+        source = pool._page_table_host[0][0]
+        pool.k_pools[0][source].fill_(7.0)
+        keys = self._keys(1)
+        pool.publish_committed_blocks(0, 64, keys, self._BLOCK)
+
+        pool.prepare_kv_writes(0, 64, 1)
+
+        target = pool._page_table_host[0][0]
+        assert target != source
+        assert pool._arena.bundles[source].block_hash is not None
+        assert torch.all(pool.k_pools[0][source] == 7.0)
+        assert pool._arena.bundles[target].block_hash is None
+        pool._arena._assert_invariants()
+
     def test_reset_releases_restored_bundles_back_to_cache(self) -> None:
         pool = _dynamic_pool(num_slots=2, max_seq_len=256, pool_bundles=16)
         pool.prepare_kv_writes(0, 0, 128)

@@ -308,10 +308,10 @@ SERVER_THINKING_CAPABLE = os.environ.get("QSR_THINKING_CAPABLE", "1") != "0"
 _DEFAULT_SERVER_THINKING_TOKEN_BUDGET = 8192
 _thinking_budget_env = os.environ.get("QSR_THINKING_TOKEN_BUDGET")
 if _thinking_budget_env is None:
-    # Keep enough output headroom for the runtime's default max_tokens=16K.
-    # Qwen Cloud's 128K default is appropriate when the client also grants a
-    # 128K output window; it would otherwise let a local 16K completion spend
-    # its entire allowance inside <think> and return no answer.
+    # The request-level resolver bounds this implicit ceiling against the
+    # caller's completion window.  Keep the environment value as the
+    # operator's desired ceiling instead of assuming every client grants the
+    # runtime's own output window.
     SERVER_THINKING_TOKEN_BUDGET: int | None = _DEFAULT_SERVER_THINKING_TOKEN_BUDGET
 else:
     try:
@@ -950,9 +950,18 @@ def _resolve_thinking_token_budget(
     native_reasoning_effort: bool = True,
     enable_effort_budget: bool = False,
     default_budget: int | None = None,
+    max_tokens: int | None = None,
 ) -> int | None:
-    """Resolve and validate a budget after template switches are merged."""
+    """Resolve and validate a budget after template switches are merged.
+
+    Explicit budgets are API contracts and remain exact.  Service defaults
+    and effort-derived fallbacks are policy ceilings, however: a client can
+    send a smaller completion window than the service default.  Reserve half
+    of that window for visible output so a reasoning loop cannot consume the
+    entire response and surface only as ``finish_reason=length``.
+    """
     budget = _validate_thinking_token_budget(value)
+    explicit_budget = budget is not None
     if budget is None:
         for controls in (reasoning, thinking):
             if not isinstance(controls, dict):
@@ -961,6 +970,7 @@ def _resolve_thinking_token_budget(
                 candidate = controls.get(key)
                 if candidate is not None:
                     budget = _validate_thinking_token_budget(candidate)
+                    explicit_budget = True
                     break
             if budget is not None:
                 break
@@ -990,6 +1000,8 @@ def _resolve_thinking_token_budget(
                 "thinking_token_budget requires thinking mode; remove "
                 "enable_thinking=false or the budget"
             )
+    if budget is not None and max_tokens is not None and not explicit_budget:
+        budget = min(budget, max(1, max_tokens // 2))
     return budget
 
 
@@ -1052,6 +1064,7 @@ async def _submit_with_thinking_budget(
     stop_sequences: list[str] | None = None,
     logprobs: bool = False,
     top_logprobs: int = 0,
+    stop_on_tool_call: bool = False,
 ) -> dict:
     """Submit one request with a sampler-level thinking constraint."""
     result = await engine_ref.submit(
@@ -1063,6 +1076,7 @@ async def _submit_with_thinking_budget(
         logprobs=logprobs,
         top_logprobs=top_logprobs,
         thinking_budget=thinking_budget,
+        stop_on_tool_call=stop_on_tool_call,
     )
     generated_ids = list(result.get("committed_token_ids", []))
     processor.add_tokens(generated_ids)
@@ -1085,6 +1099,7 @@ async def _submit_stream_with_thinking_budget(
     stop_sequences: list[str] | None = None,
     logprobs: bool = False,
     top_logprobs: int = 0,
+    stop_on_tool_call: bool = False,
 ):
     """Streaming counterpart of :func:`_submit_with_thinking_budget`."""
     generated_ids: list[int] = []
@@ -1100,6 +1115,7 @@ async def _submit_stream_with_thinking_budget(
         logprobs=logprobs,
         top_logprobs=top_logprobs,
         thinking_budget=thinking_budget,
+        stop_on_tool_call=stop_on_tool_call,
     ):
         if isinstance(item, dict):
             result = item
@@ -1391,6 +1407,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             if getattr(engine, "backend_name", None) == "qwen36"
             else None
         ),
+        max_tokens=max_tokens,
     )
 
     prompt_ids = await _tokenize_chat(
@@ -1448,6 +1465,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 stop_sequences=stop_sequences,
                 logprobs=bool(req.logprobs),
                 top_logprobs=req.top_logprobs or 0,
+                # Some agent clients (including OpenCode's OpenAI-compatible
+                # adapter) put the tool contract in the prompt and omit the
+                # JSON `tools` field.  The active parser is authoritative for
+                # the wire format, so stop after a complete parsed call even
+                # when the request did not repeat the schema.
+                stop_on_tool_call=True,
             ):
                 if await request.is_disconnected():
                     if _cancel_ref[0]:
@@ -1585,6 +1608,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         stop_sequences=stop_sequences,
         logprobs=bool(req.logprobs),
         top_logprobs=req.top_logprobs or 0,
+        stop_on_tool_call=True,
     )
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
     # Same state machine as the streaming path (server/formats/stream.py) --
@@ -2368,6 +2392,7 @@ async def anthropic_messages(request: Request):
             if getattr(engine, "backend_name", None) == "qwen36"
             else None
         ),
+        max_tokens=max_tokens,
     )
 
     prompt_ids = await _tokenize_chat(
@@ -2426,6 +2451,7 @@ async def anthropic_messages(request: Request):
                 sampling_params=sampling_params,
                 cancel_ref=_cancel_ref,
                 stop_sequences=stop_sequences,
+                stop_on_tool_call=True,
             ):
                 if await request.is_disconnected():
                     if _cancel_ref[0]:
@@ -2565,6 +2591,7 @@ async def anthropic_messages(request: Request):
         processor=proc,
         sampling_params=sampling_params,
         stop_sequences=stop_sequences,
+        stop_on_tool_call=True,
     )
     _raw_anth = await _tokenize_decode(engine, result["committed_token_ids"])
     # Same state machine as the streaming path (server/formats/stream.py).
@@ -2652,6 +2679,7 @@ async def responses_api(request: Request):
             if getattr(engine, "backend_name", None) == "qwen36"
             else None
         ),
+        max_tokens=max_tokens,
     )
     prompt_ids = await _tokenize_chat(
         engine,
@@ -2734,6 +2762,7 @@ async def responses_api(request: Request):
                     sampling_params=sampling_params,
                     cancel_ref=_cancel_ref,
                     stop_sequences=None,
+                    stop_on_tool_call=True,
                 ):
                     if await request.is_disconnected():
                         if _cancel_ref[0]:
@@ -2948,6 +2977,7 @@ async def responses_api(request: Request):
         processor=proc,
         sampling_params=sampling_params,
         stop_sequences=None,
+        stop_on_tool_call=True,
     )
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
     text = proc.content_text()

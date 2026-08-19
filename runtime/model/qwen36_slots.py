@@ -873,10 +873,14 @@ class Qwen36SlotPool:
         if self.dynamic_arena:
             # Phase 2 dynamic arena: hand out physical bundles on demand.
             # A null entry (0) gets a fresh private bundle; a shared entry
-            # (arena refcnt > 1) is COW-cloned. Private entries (refcnt == 1)
-            # are already writable and left alone. All bookkeeping stays in
-            # the arena; the device table is synced once at the end (one
-            # copy per chunk, not per token -- plan §6.6).
+            # (arena refcnt > 1) or a published entry (block_hash != None) is
+            # COW-cloned. A published bundle is read-only even when this is
+            # its only live reference: the hash index still promises the old
+            # bytes to every future prefix hit. This is the exact-prompt
+            # continuation case where the source is live at refcnt=1 and its
+            # first decode token lands in the prompt's partial page.
+            # All bookkeeping stays in the arena; the device table is synced
+            # once at the end (one copy per chunk, not per token -- plan §6.6).
             replacements: list[tuple[int, int, int]] = []
             for logical_page in logical_pages:
                 source_page = row[logical_page]
@@ -885,9 +889,12 @@ class Qwen36SlotPool:
                     replacements.append((logical_page, source_page, target_page))
                     row[logical_page] = target_page
                     self._slot_bundles[slot].add(target_page)
-                elif self._arena.bundles[source_page].ref_cnt > 1:
+                elif (
+                    self._arena.bundles[source_page].ref_cnt > 1
+                    or self._arena.bundles[source_page].block_hash is not None
+                ):
                     # COW detach: the slot transfers its reference from the
-                    # shared source to a fresh private clone.
+                    # shared or published source to a fresh private clone.
                     target_page = self._arena.ensure_writable(source_page, owner=f"slot-{slot}")
                     self._arena.decref([source_page], owner=f"slot-{slot}")
                     self._slot_bundles[slot].discard(source_page)

@@ -60,6 +60,22 @@ class TestClassifyDecodeSlots:
         assert mtp_slots == [1]
         assert plain_sampled_slots == [2]
 
+    def test_sampled_verify_unsupported_backend_falls_back_to_plain(self):
+        active = {
+            1: {"sampled": False},
+            2: {"sampled": True},
+            3: {"sampled": True},
+        }
+        mtp_slots, plain_sampled_slots = classify_decode_slots(
+            [1, 2, 3],
+            active,
+            grammar_slots=[],
+            mtp_capable=True,
+            sampled_mtp_capable=False,
+        )
+        assert mtp_slots == [1]
+        assert plain_sampled_slots == [2, 3]
+
     def test_non_mtp_backend_routes_everything_to_plain_sampled(self):
         """Laguna without DFlash (mtp_capable=False): even a 'greedy' slot
         skips MTP -- unaffected by E2-b, DFlash still has to be enabled at

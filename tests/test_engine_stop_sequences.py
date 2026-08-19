@@ -87,7 +87,11 @@ def _drain_channel_buf(channel: StreamChannel) -> list[int]:
 
 
 def _make_req(
-    engine: ServerEngine, stop_sequences, stream: bool = False, request_id: str = "req-1"
+    engine: ServerEngine,
+    stop_sequences,
+    stream: bool = False,
+    request_id: str = "req-1",
+    stop_on_tool_call: bool = False,
 ) -> tuple[GenerationRequest, StreamChannel | None]:
     from runtime.sampling import SamplingParams
 
@@ -101,6 +105,7 @@ def _make_req(
         stream_channel=channel,
         sampling_params=SamplingParams(temperature=0.0),
         stop_sequences=stop_sequences,
+        stop_on_tool_call=stop_on_tool_call,
     )
     return req, channel
 
@@ -406,3 +411,72 @@ class TestStopPendingFlushedOnNaturalFinish:
         assert result["matched_stop_sequence"] is None
         assert result["committed_token_ids"] == [10, 11]
         assert _drain_channel_buf(channel) == [10, 11]
+
+
+class TestToolCallTerminalCondition:
+    """A parsed tool block ends the scheduler request before model chatter
+    after ``</tool_call>`` can turn into a visible repetition loop."""
+
+    @staticmethod
+    def _set_qwen_parser():
+        from server.formats.tool_parsers import get_active_parser, set_active_parser
+
+        previous = get_active_parser().name
+        set_active_parser("qwen3_coder")
+        return previous
+
+    def test_plain_decode_stops_after_complete_tool_block(self):
+        previous = self._set_qwen_parser()
+        try:
+            id_to_str = {
+                10: "prefix ",
+                11: (
+                    "<tool_call><function=read><parameter=path>x</parameter>"
+                    "</function></tool_call>"
+                ),
+                12: "</function>",
+            }
+            runner = _FakeRunner(has_speculative_decode=False, rounds=[{0: [11]}, {0: [12]}])
+            engine = _bare_step_sync_engine(id_to_str, runner)
+            req, channel = _make_req(engine, None, stream=True, stop_on_tool_call=True)
+            engine._activate_slot(0, req, anchor=10, drafts=[])
+
+            _run_step_sync_until_finished(engine, 0, max_rounds=3)
+            _pump(engine)
+
+            result = req.future.result()
+            assert result["finish_reason"] == "tool_calls"
+            assert result["committed_token_ids"] == [10, 11]
+            assert _drain_channel_buf(channel) == [10, 11]
+        finally:
+            from server.formats.tool_parsers import set_active_parser
+
+            set_active_parser(previous)
+
+    def test_mtp_round_discards_tokens_after_complete_tool_block(self):
+        previous = self._set_qwen_parser()
+        try:
+            id_to_str = {
+                10: "prefix ",
+                11: (
+                    "<tool_call><function=read><parameter=path>x</parameter>"
+                    "</function></tool_call>"
+                ),
+                12: "</function>",
+            }
+            runner = _FakeRunner(has_speculative_decode=True, rounds=[{0: [11, 12]}])
+            engine = _bare_step_sync_engine(id_to_str, runner)
+            req, channel = _make_req(engine, None, stream=True, stop_on_tool_call=True)
+            engine._activate_slot(0, req, anchor=10, drafts=[])
+
+            _run_step_sync_until_finished(engine, 0, max_rounds=3)
+            _pump(engine)
+
+            result = req.future.result()
+            assert result["finish_reason"] == "tool_calls"
+            assert result["committed_token_ids"] == [10, 11]
+            assert _drain_channel_buf(channel) == [10, 11]
+        finally:
+            from server.formats.tool_parsers import set_active_parser
+
+            set_active_parser(previous)

@@ -90,6 +90,24 @@ def test_service_default_budget_is_skipped_when_thinking_is_disabled() -> None:
     ) is None
 
 
+def test_implicit_budget_leaves_visible_output_headroom() -> None:
+    assert _resolve_thinking_token_budget(
+        None,
+        {"enable_thinking": True},
+        default_budget=8192,
+        max_tokens=8192,
+    ) == 4096
+
+
+def test_explicit_budget_is_not_rewritten_by_completion_window() -> None:
+    assert _resolve_thinking_token_budget(
+        8192,
+        {"enable_thinking": True},
+        default_budget=4096,
+        max_tokens=1024,
+    ) == 8192
+
+
 @pytest.mark.parametrize("value", ["minimal", "max", "bogus", 2])
 def test_invalid_reasoning_effort_is_rejected(value: object) -> None:
     with pytest.raises(HTTPException, match="reasoning_effort must be one of"):

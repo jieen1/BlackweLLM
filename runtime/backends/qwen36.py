@@ -589,6 +589,19 @@ class Qwen36Backend:
         """
         return self._mtp is not None or self._dspark is not None
 
+    @property
+    def supports_sampled_speculative_decode(self) -> bool:
+        """Whether the active speculative driver supports sampled verify.
+
+        DSpark's captured verify path is greedy.  Its eager sampled fallback
+        reaches SparkInfer's legacy paged-attention ingress, which is not a
+        supported production kernel shape and raises at request time.  Keep
+        sampled DSpark traffic on the backend's ordinary sampler until that
+        kernel contract is implemented; greedy DSpark remains on the fast
+        verify path.
+        """
+        return self._dspark is None
+
     def enable_mtp(self, *, num_speculative_tokens: int, enable_resync: bool | None = None) -> None:
         """Attach the owned MTP round driver before any production slot is
         used -- same "capture/wire before real use" window
@@ -2235,6 +2248,18 @@ class Qwen36Backend:
             else:
                 self.pool.share_prefix_kv(source_slot, slot, length)
             self.stats["prefix_cross_slot_restores"] += 1
+        elif self.pool.dynamic_arena:
+            # ``reset_slot`` clears the logical row after publishing its
+            # bundles to the arena.  A same-slot rolling hit therefore has
+            # the checkpoint and token metadata, but no live page-table
+            # mapping to write against.  Restore the cached pages before
+            # the suffix prefill; otherwise the suffix allocates fresh pages
+            # while the skipped prefix remains null, yielding a plausible
+            # wrong continuation and a later publish failure.
+            keys = _chained_block_keys(prompt_ids, length, self.block_size)
+            restored, _bundle_ids = self.pool.restore_prefix_from_arena(slot, length, keys)
+            if restored < length:
+                return 0
         self.pool.restore_recurrent_state(slot, tensors)
         self.pool.rewind_slot(slot, length)
         if self._mtp is not None:

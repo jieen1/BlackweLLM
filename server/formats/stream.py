@@ -429,3 +429,13 @@ class StreamProcessor:
         an entry there, not a change here.
         """
         return parse_tool_calls(self.content_text(), parser=self._tool_parser)
+
+    def complete_tool_calls(self) -> list[dict]:
+        """Return tool calls whose outer blocks are complete so far.
+
+        The engine uses this as a token-level terminal condition for requests
+        that supplied tools.  Keeping the check here makes the scheduler use
+        the same reasoning stripping and parser registry as the HTTP layer,
+        instead of trying to recognize model-family XML in ``server/engine``.
+        """
+        return parse_tool_calls(self.content_text(), parser=self._tool_parser)[1]
