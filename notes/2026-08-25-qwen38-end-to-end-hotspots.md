@@ -94,3 +94,59 @@ measured verify regime, but broader shapes still need separate evidence before
 any selector changes. Do not spend the next pass changing DFlash2 acceptance
 semantics or disabling split-KV unless a new profile proves that premise has
 changed.
+
+## Follow-up gates (2026-08-25)
+
+The post-head optimization probes were run against fresh isolated processes;
+the existing service was not changed. The exact compact baseline remained
+169.115 warm decode tok/s and 585.235 aggregate tok/s at 128K/C=4. A static
+verify-layout A/B used the same prompts, FP8 KV, prefix cache, CUDA Graphs,
+DFlash2 K=7, and quality fixture, but measured only 132.375 warm decode tok/s
+and 467.71 aggregate tok/s. Acceptance and output SHA were unchanged, so the
+static layout is rejected rather than promoted. Evidence:
+`/tmp/server_perf_grid_qwen38_dynamic_128k_c4_qwen38_static_20260825.json`.
+
+The following candidates were measured and rejected:
+
+- FlashInfer `use_fp16_qk_reduction=True` on the real B=4/Q=7/H=24/HK=4/D=256
+  FP8-KV geometry: 819.936 us median versus 821.856 us with the default,
+  exact output equality, and no meaningful speedup. The candidate's plan
+  compilation was also much slower, so it remains disabled.
+- The real QKV W4A4 shape `[M, 14336] @ [14336, 5120]` showed no better b12x
+  tile than the current selector: `(64, 128)` was effectively tied with the
+  default, `(64, 64)` was slower, and larger tiles were slower. No QKV tile
+  change was made.
+- A full sweep of the real MLP-down shape `[28, 5120] @ [5120, 17408]`
+  confirmed the existing explicit TMA `(64, 64)` choice at about 29.408 us;
+  all tested alternatives were slower and numerically identical.
+- FlashInfer public `mm_fp4(backend=b12x)` measured about 38.368 us for
+  down, 52.832 us for gate/up, and 26.080 us for QKV on the same quantized
+  inputs. It is not a replacement for the runtime's direct b12x path; the
+  runtime's measured down tile was about 29.4 us.
+- FlashInfer `trtllm-gen` could not compile in this CUDA 13.4 environment
+  because the installed headers lack the oversized-shared-memory driver API
+  symbols. `backend=auto` consequently selected FA2 and reproduced the
+  existing approximately 820 us result. No production fallback was changed.
+
+Two opt-in planner experiments are retained as evidence, not defaults:
+`QSR_BENCH_DSPARK_VERIFY_MODE=fast` reached 173.29 decode / 595.8525
+aggregate tok/s, but historical M32+adaptive quality is below the M16+frozen
+fixture; and page-count-only replanning measured 166.72 / 572.13 tok/s, below
+the exact baseline. Their artifacts are
+`/tmp/qwen38_gittensor_dflash2_fast_verify_128k_c4_20260825.json` and
+`/tmp/server_perf_grid_qwen38_replan_pagecounts_128k_c4_20260825.json`.
+
+A one-round phase trace showed the current `accept_decision` wait at roughly
+47--50 ms, while setup, verify-fill, graph launch, commit, target-hidden
+synchronization, and draft batching were sub-millisecond to roughly 1.2 ms
+apart from occasional measurement outliers. The host `.tolist()` in
+`_decisions_from_device_accept` is a synchronization point, but it is not the
+source of that wait. The trace used one profiling round and is diagnostic, not
+a performance comparison; a fair profile must use the normal warm benchmark
+settings. Evidence:
+`/tmp/server_perf_grid_qwen38_dynamic_128k_c4_qwen38_profile_current_20260825.json`.
+
+These gates leave the full-attention verify path as the next high-confidence
+optimization target. No production code was changed by this follow-up pass;
+the current promoted code remains the native FP8 head plus the shape-scoped
+MLP-down TMA tile.
