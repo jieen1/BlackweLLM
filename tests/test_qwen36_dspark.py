@@ -15,6 +15,7 @@ from runtime.backends.qwen36_dspark import (  # noqa: E402
     _flatten_target_taps_ragged,
 )
 from runtime.dspark_config import DSparkDraftConfig  # noqa: E402
+from runtime.kernels.fused_rms_norm import rms_norm, rms_norm_layered  # noqa: E402
 from runtime.model.qwen36_dspark import (  # noqa: E402
     Qwen36DSparkDraftForCausalLM,
 )
@@ -117,6 +118,22 @@ def test_cuda_graph_health_is_vacuously_true_before_capture() -> None:
 
     engine.cg_status["verify"] = "failed"
     assert engine.cuda_graphs_healthy() is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
+def test_cuda_layered_rms_norm_matches_per_layer_calls() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(72)
+    x = torch.randn(
+        5, 4, 8, 128, generator=generator, device="cuda", dtype=torch.bfloat16
+    ).contiguous()
+    weight = torch.randn(5, 128, generator=generator, device="cuda", dtype=torch.bfloat16)
+
+    expected = torch.stack(
+        [rms_norm(x[layer], weight[layer], 1e-6) for layer in range(x.shape[0])], dim=0
+    )
+    actual = rms_norm_layered(x, weight, 1e-6)
+
+    assert torch.equal(actual, expected)
 
 
 def test_slot_mapping_uses_host_known_contiguous_range_without_gpu_reduction() -> None:
@@ -235,6 +252,31 @@ def test_ragged_target_taps_skip_padded_request_tail() -> None:
         [0.0, 1.0, 100.0, 101.0],
         [2.0, 3.0, 102.0, 103.0],
         [8.0, 9.0, 108.0, 109.0],
+    ]
+
+
+def test_fixed_target_taps_compact_before_feature_concat() -> None:
+    tap0 = torch.arange(24, dtype=torch.float32).view(2, 3, 4)
+    tap1 = tap0 + 100
+
+    full = _flatten_target_taps_ragged(
+        [tap0, tap1],
+        batch_size=2,
+        accepted_counts=[3, 3],
+        expected_features=8,
+    )
+    partial = _flatten_target_taps_ragged(
+        [tap0, tap1],
+        batch_size=2,
+        accepted_counts=[2, 1],
+        expected_features=8,
+    )
+
+    assert full.shape == (6, 8)
+    assert partial.tolist() == [
+        [0.0, 1.0, 2.0, 3.0, 100.0, 101.0, 102.0, 103.0],
+        [4.0, 5.0, 6.0, 7.0, 104.0, 105.0, 106.0, 107.0],
+        [12.0, 13.0, 14.0, 15.0, 112.0, 113.0, 114.0, 115.0],
     ]
 
 

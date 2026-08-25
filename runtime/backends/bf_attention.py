@@ -165,10 +165,11 @@ class BFAttention(nn.Module):
         # layer instead of 6 Python ops (288→48 kernels/step).
         #
         # fused_kv_scatter is FP8-only (it divides by scale and casts to
-        # float8e4nv). The target path uses it; DFlash2 deliberately keeps its
-        # draft cache in native BF16 and takes the plain-write branch below.
-        # That branch preserves the non-FP8 guarantee: native caches are
-        # written without quantization or checkpoint scale application.
+        # float8e4nv). Both target and DFlash2 use it by default; DFlash2 can
+        # explicitly fall back to its official BF16 draft cache and take the
+        # plain-write branch below. That branch preserves the non-FP8
+        # guarantee: native caches are written without quantization or
+        # checkpoint scale application.
         if sm is not None and k is not None and v is not None and self.kv_cache is not None:
             k_cache = self.kv_cache[0]
             v_cache = self.kv_cache[1]

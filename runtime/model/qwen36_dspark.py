@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from runtime.dspark_config import DSparkDraftConfig
-from runtime.kernels.fused_rms_norm import TritonRMSNorm, rms_norm
+from runtime.kernels.fused_rms_norm import TritonRMSNorm, rms_norm_layered
 from runtime.kernels.rope import apply_rotary_embedding_inplace
 from runtime.model._prefix import maybe_prefix
 from runtime.model._weight_loading import default_weight_loader
@@ -236,11 +236,7 @@ class Qwen36DSparkDraftModel(nn.Module):
             self._build_fused_kv_buffers()
         context_states = self.project_target_hidden(target_hidden)
         all_k, all_v = self._project_context_kv(context_states)
-        normed_k = torch.empty_like(all_k)
-        for layer_idx in range(self._num_attn_layers):
-            normed_k[layer_idx] = rms_norm(
-                all_k[layer_idx], self._k_norm_weights[layer_idx], self._rms_norm_eps
-            )
+        normed_k = rms_norm_layered(all_k, self._k_norm_weights, self._rms_norm_eps)
         all_k_flat = normed_k.view(self._num_attn_layers * context_states.shape[0], self._kv_size)
         apply_rotary_embedding_inplace(
             context_positions.repeat(self._num_attn_layers),

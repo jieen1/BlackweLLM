@@ -166,8 +166,8 @@ from runtime.model.flashinfer_prefill import (
     FlashInferVerifyAttention,
 )
 from runtime.model.fp8_lm_head import (
-    QSR_NATIVE_QWEN38_LM_HEAD_FP8_ENV,
     NativeFP8LMHead,
+    native_fp8_lm_head_enabled,
 )
 from runtime.model.gguf_linear import (
     GgufEmbedding,
@@ -6954,7 +6954,7 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
                 )
             return prepared
 
-        if os.environ.get(QSR_NATIVE_QWEN38_LM_HEAD_FP8_ENV) != "1":
+        if not native_fp8_lm_head_enabled(self.config):
             return False
         if not isinstance(self.lm_head, PlainLinear):
             return False

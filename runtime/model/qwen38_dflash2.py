@@ -21,6 +21,7 @@ part of the fixed CUDA Graph contract.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterable
 from types import SimpleNamespace
 
@@ -87,6 +88,18 @@ def _grouped_dynamic_convolve(
         raise ValueError("DFlash2 hidden size must be divisible by conv group size")
     groups = hidden_size // group_size
     taps = base.shape[0]
+    if hidden.device.type == "cuda" and os.environ.get("QSR_QWEN38_DFLASH2_FUSED_CONV", "1") != "0":
+        from runtime.kernels.dflash2_conv import fused_grouped_dynamic_convolve
+
+        fused = fused_grouped_dynamic_convolve(
+            hidden,
+            dynamic,
+            base,
+            group_size,
+            block_size,
+        )
+        if fused is not None:
+            return fused
     blocks = hidden.reshape(batch, length, groups, group_size)
     dynamic = dynamic.reshape(batch, length, taps, groups, 1).to(hidden.dtype)
     output = torch.zeros_like(blocks)
@@ -280,10 +293,12 @@ class Qwen38DFlash2DecoderLayer(LagunaDecoderLayerSelfBuilt):
             prefix=prefix,
             layer_idx=layer_idx,
             attention_prefix=attention_prefix,
-            # The official DFlash2 reference keeps its five-layer draft KV
-            # cache in BF16. The target model's independent KV family stays
-            # FP8; this is deliberately scoped to the draft layers.
-            kv_cache_dtype="bfloat16",
+            # Keep the DFlash2 draft cache on the same FP8 KV path as the
+            # target.  The draft only attends to a sliding window, so the
+            # reduced cache traffic is material at decode; the environment
+            # override is retained for a correctness/quality bisect against
+            # the official BF16 reference cache.
+            kv_cache_dtype=os.environ.get("QSR_QWEN38_DFLASH2_KV_CACHE_DTYPE", "fp8"),
         )
         self.attention_conv = GroupedDynamicCausalConv(
             config.hidden_size, conv_kernel_size, conv_group_size, config.block_size

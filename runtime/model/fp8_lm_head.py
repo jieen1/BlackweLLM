@@ -1,21 +1,26 @@
-"""Optional native FP8 execution for a plain Qwen lm_head.
+"""Native FP8 execution for an eligible plain Qwen lm_head.
 
 The ModelOpt W4A4 Qwen3.8 export intentionally leaves ``lm_head`` in BF16.
 That is the largest single read-only matrix in the decode path, so its
-BF16 GEMM is visible in every DFlash2 and DSpark round.  This module is an
-explicit serving-time experiment: it quantizes that already-loaded BF16
-matrix once to per-output-channel E4M3 and uses SparkInfer's native SM120
-FP8 GEMM with dynamic per-token activation scales.
+BF16 GEMM is visible in every DFlash2 and DSpark round.  This module
+quantizes that already-loaded BF16 matrix once to per-output-channel E4M3
+and uses SparkInfer's native SM120 FP8 GEMM with dynamic per-token
+activation scales.  It is enabled by default only for the ModelOpt
+checkpoint family that was measured here; ``QSR_NATIVE_QWEN38_LM_HEAD_FP8=0``
+provides an immediate BF16 rollback, while ``=1`` explicitly enables the
+eligible plain-head path.
 
 The class is constructed only after checkpoint loading and is deliberately
 not a checkpoint-loading module.  Keeping the conversion behind a loader
-hook means the ordinary BF16 path remains the exact default, while the
-quantized object can be shared by target and DFlash2 draft models before
+hook means compressed-tensors and GGUF checkpoints remain untouched, while
+the quantized object can be shared by target and DFlash2 draft models before
 CUDA Graph capture.
 """
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -28,6 +33,24 @@ QSR_NATIVE_QWEN38_LM_HEAD_FP8_ENV = "QSR_NATIVE_QWEN38_LM_HEAD_FP8"
 
 _FP8_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 _FP8_SCALE_FLOOR = 1.0 / (_FP8_MAX * 512.0)
+
+
+def native_fp8_lm_head_enabled(config: Mapping[str, Any]) -> bool:
+    """Return whether the eligible ModelOpt head should use native FP8.
+
+    The explicit environment setting always wins. Without one, only the
+    ModelOpt format opts in: the compressed-tensors/Unsloth route has its own
+    checkpoint-native head policy and must not be changed by this optimization.
+    """
+
+    explicit = os.environ.get(QSR_NATIVE_QWEN38_LM_HEAD_FP8_ENV)
+    if explicit is not None:
+        return explicit == "1"
+    quantization_config = config.get("quantization_config")
+    return (
+        isinstance(quantization_config, Mapping)
+        and quantization_config.get("quant_method") == "modelopt"
+    )
 
 
 class NativeFP8LMHead(nn.Module):
@@ -56,7 +79,7 @@ class NativeFP8LMHead(nn.Module):
         # TensorFP8LinearWeight is an immutable dataclass owned by b12x.  It
         # is intentionally kept as a private execution cache rather than a
         # state_dict entry: this object is produced after checkpoint loading
-        # and is rebuilt from the BF16 checkpoint when the opt-in is enabled.
+        # and is rebuilt from the BF16 checkpoint when the path is enabled.
         self._packed_weight = packed_weight
 
     @classmethod
@@ -118,4 +141,8 @@ class NativeFP8LMHead(nn.Module):
         return output.view(*shape[:-1], self.output_size)
 
 
-__all__ = ["NativeFP8LMHead", "QSR_NATIVE_QWEN38_LM_HEAD_FP8_ENV"]
+__all__ = [
+    "NativeFP8LMHead",
+    "QSR_NATIVE_QWEN38_LM_HEAD_FP8_ENV",
+    "native_fp8_lm_head_enabled",
+]

@@ -149,6 +149,39 @@ def _flatten_target_taps_ragged(
     if not normalized:
         raise ValueError("DSpark target hidden capture returned no layer taps")
 
+    if verify_lens is None and all(tap.ndim == 3 for tap in normalized):
+        # The fixed-width graph is the common static DFlash2 path.  Build the
+        # feature-concatenated tensor once, then compact request rows from it.
+        # The old request-major loop performed one feature ``cat`` per request
+        # and one more ``cat`` per tap, even when every request accepted the
+        # full graph width.  That allocation/launch fan-out sits directly in
+        # ``target_hidden_sync`` after every target verify.
+        combined = torch.cat(normalized, dim=-1)
+        if combined.shape[-1] != expected_features:
+            raise ValueError(
+                "DSpark target hidden feature dim mismatch: "
+                f"expected {expected_features}, got {combined.shape[-1]}"
+            )
+        query_len = int(combined.shape[1])
+        if any(int(count) < 0 or int(count) > query_len for count in accepted_counts):
+            raise ValueError(
+                "DSpark accepted counts must fit the fixed verify width: "
+                f"counts={accepted_counts}, width={query_len}"
+            )
+        if all(int(count) == query_len for count in accepted_counts):
+            # ``combined`` is contiguous after cat, so this is a view and
+            # avoids a second device allocation for the usual full-accept
+            # DFlash2 round.
+            return combined.reshape(-1, expected_features)
+        rows = [
+            combined[row, : int(count)]
+            for row, count in enumerate(accepted_counts)
+            if int(count) > 0
+        ]
+        if not rows:
+            return combined.new_empty((0, expected_features))
+        return torch.cat(rows, dim=0)
+
     rows: list[torch.Tensor] = []
     compact_offset = 0
     for request, accepted_count in enumerate(accepted_counts):

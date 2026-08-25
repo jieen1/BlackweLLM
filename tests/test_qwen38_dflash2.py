@@ -168,7 +168,8 @@ def test_dflash2_flashinfer_topk_flattens_position_axes(monkeypatch):
     assert torch.equal(indices, expected_indices)
 
 
-def test_dflash2_decoder_uses_bfloat16_draft_kv_cache():
+def test_dflash2_decoder_uses_fp8_draft_kv_cache_by_default(monkeypatch):
+    monkeypatch.delenv("QSR_QWEN38_DFLASH2_KV_CACHE_DTYPE", raising=False)
     config = DFlash2DraftConfig.from_dict(_config())
     layer = Qwen38DFlash2DecoderLayer(
         _dflash2_hf_config(config),
@@ -180,8 +181,8 @@ def test_dflash2_decoder_uses_bfloat16_draft_kv_cache():
         conv_group_size=config.conv_group_size,
     )
     attention = layer.self_attn.attn
-    assert attention.kv_cache_dtype == "bfloat16"
-    assert attention.kv_cache_torch_dtype is torch.bfloat16
+    assert attention.kv_cache_dtype == "fp8"
+    assert attention.kv_cache_torch_dtype is torch.float8_e4m3fn
     assert not attention.has_checkpoint_kv_scale
 
 

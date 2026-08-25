@@ -10,7 +10,8 @@ runtime's ONE and ONLY attention kernel. This is not a placeholder or a
 system -- there is no second kernel anywhere on this runtime's roadmap,
 and this class is written on the assumption that there never will be.**
 Every attribute below is hardcoded to sparkinfer's real, single
-kernel requirement (target FP8 KV cache or DFlash2 native BF16 cache, no
+kernel requirement (target and DFlash2 use FP8 KV cache by default, with an
+explicit DFlash2 BF16 rollback, no
 attention sinks, per-tensor rather than per-head KV scales) rather than
 derived through config-driven branching the way real
 vLLM's ``Attention`` has to, because vLLM genuinely serves many backends/
@@ -47,9 +48,10 @@ laguna_cuda_graph.py, not guessed from vLLM's own internal usage:
   capture. Placeholder value only; always overwritten before first
   real forward.
 - ``kv_cache_dtype``/``kv_cache_torch_dtype``: read by bf_attention.py /
-  laguna.py respectively. The target model uses FP8; the separate DFlash2
-  draft uses native BF16. Both are real production paths, so the dtype is
-  explicit rather than inferred from a generic cache policy.
+  laguna.py respectively. The target and separate DFlash2 draft use FP8 by
+  default; ``QSR_QWEN38_DFLASH2_KV_CACHE_DTYPE=bf16`` preserves the official
+  draft reference as an explicit rollback. Both are real production paths, so
+  the dtype is explicit rather than inferred from a generic cache policy.
 - ``sliding_window``/``is_swa``: NOT read off this object by laguna.py's
   layer-group bookkeeping (that logic recomputes window/group info
   straight from ``hf_config.layer_types``/``hf_config.sliding_window``,
@@ -83,7 +85,7 @@ laguna_cuda_graph.py, not guessed from vLLM's own internal usage:
   here at all.
 
 This runtime only ever runs one attention kernel (sparkinfer) against the
-target's NVFP4/FP8 cache and DFlash2's native BF16 cache -- so unlike vLLM's
+target's NVFP4/FP8 cache and DFlash2's FP8-or-explicit-BF16 cache -- so unlike vLLM's
 ``Attention``, which has to stay generic over many backends/quant schemes/model
 families, this class hardcodes those two real cases directly instead of
 branching on config values to re-derive it (no "is kv_cache_dtype auto,
@@ -157,9 +159,10 @@ class SelfBuiltAttentionPlaceholder(nn.Module):
                 "unsupported self-built attention KV cache dtype: "
                 f"{kv_cache_dtype!r}; expected 'fp8' or 'bfloat16'"
             )
-        # The target model uses FP8. DFlash2 is a separate BF16 checkpoint
-        # whose reference implementation uses a BF16 DynamicCache; its draft
-        # layers opt into bfloat16 explicitly at construction time.
+        # The target model and DFlash2 draft use FP8 by default. DFlash2 is a
+        # separate BF16 checkpoint whose reference implementation uses a BF16
+        # DynamicCache; its draft layers can opt back to bfloat16 explicitly
+        # at construction time.
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_cache_torch_dtype = (
             torch.float8_e4m3fn if kv_cache_dtype == "fp8" else torch.bfloat16

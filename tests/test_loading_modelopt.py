@@ -35,7 +35,7 @@ from runtime.loading.modelopt import (  # noqa: E402
     quantized_layers_map,
     unpack_nvfp4_to_fp32,
 )
-from runtime.model.fp8_lm_head import NativeFP8LMHead
+from runtime.model.fp8_lm_head import NativeFP8LMHead, native_fp8_lm_head_enabled
 from runtime.model.modelopt_linear import (
     QSR_QWEN36_MODEL_OPT_FP4_QUANT_ENV,
     FusedModelOptNVFP4W4A4QKV,
@@ -266,6 +266,25 @@ class TestModelOptNvfp4W4A4Linear:
 
 
 class TestNativeQwen38LmHead:
+    def test_modelopt_is_default_and_compressed_tensors_is_unchanged(self, monkeypatch):
+        monkeypatch.delenv("QSR_NATIVE_QWEN38_LM_HEAD_FP8", raising=False)
+
+        assert native_fp8_lm_head_enabled(
+            {"quantization_config": {"quant_method": "modelopt"}}
+        )
+        assert not native_fp8_lm_head_enabled(
+            {"quantization_config": {"quant_method": "compressed-tensors"}}
+        )
+
+    def test_explicit_setting_overrides_checkpoint_default(self, monkeypatch):
+        monkeypatch.setenv("QSR_NATIVE_QWEN38_LM_HEAD_FP8", "0")
+        assert not native_fp8_lm_head_enabled(
+            {"quantization_config": {"quant_method": "modelopt"}}
+        )
+
+        monkeypatch.setenv("QSR_NATIVE_QWEN38_LM_HEAD_FP8", "1")
+        assert native_fp8_lm_head_enabled({})
+
     def test_conversion_requires_cuda_resident_weights(self):
         linear = PlainLinear(32, 4)
 
