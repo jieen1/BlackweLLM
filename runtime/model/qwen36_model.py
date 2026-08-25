@@ -4835,6 +4835,24 @@ def _mlp_w4a4_prefill_enabled() -> bool:
 _W4A4_PREFILL_MIN_ROWS = 64
 
 
+def _qwen38_w4a4_decode_mma_tiler(
+    *, m: int, output_size: int, input_size: int
+) -> tuple[int, int] | None:
+    """Return the measured MLP-down tile for Qwen3.8 verify shapes.
+
+    The default b12x FP4 selector uses ``(64, 128)`` for wide-N decode.  On
+    the real Qwen3.8 Gittensor W4A4 MLP-down shape ``[M, 17408] @
+    [17408, 5120]`` the ``(64, 64)`` TMA plan is faster for the speculative
+    verify regimes (M=8..32), while M=1 and large prefill retain the default
+    selector.  Keep this exact-shape exception local to the Qwen3.8 path so
+    other NVFP4 checkpoints do not inherit an unmeasured tile choice.
+    """
+
+    if 8 <= int(m) <= 32 and (int(output_size), int(input_size)) == (5120, 17408):
+        return (64, 64)
+    return None
+
+
 def _w4a4_all_rows_enabled() -> bool:
     """Routes EVERY MLP forward (decode and verify included) through the
     W4A4 blockscaled path -- the historical single-kernel-family /
@@ -5377,15 +5395,27 @@ class Qwen36MLP(nn.Module):
 
         def gemm(name: str, a_packed: torch.Tensor, a_sf: torch.Tensor) -> torch.Tensor:
             b_p, b_sf, alpha, _igs = prepared[name]
-            return blockscaled.mm(
-                (a_packed, a_sf),
-                (b_p, b_sf),
+            mma_tiler = None
+            if name == "down":
+                mma_tiler = _qwen38_w4a4_decode_mma_tiler(
+                    m=m,
+                    output_size=self.hidden_size,
+                    input_size=self.intermediate_size,
+                )
+            kwargs = dict(
                 alpha=alpha,
                 ab_dtype="float4_e2m1fn",
                 sf_dtype="float8_e4m3fn",
                 c_dtype="bfloat16",
                 sf_vec_size=16,
                 expected_m=m,
+            )
+            if mma_tiler is not None:
+                kwargs.update(mma_tiler_mn=mma_tiler, load_path="tma", swap_ab=False)
+            return blockscaled.mm(
+                (a_packed, a_sf),
+                (b_p, b_sf),
+                **kwargs,
             )[:, :, 0]
 
         if self._w4a4_gate_up_fused:

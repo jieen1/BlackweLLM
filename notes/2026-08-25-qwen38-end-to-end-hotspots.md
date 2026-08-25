@@ -56,6 +56,16 @@ The candidate produced the same output SHA as the baseline. Acceptance was
 candidate is not promoted to the default until broader natural-language
 quality and acceptance coverage is complete.
 
+The next pass kept the native FP8 head and changed only the exact Gittensor
+W4A4 MLP-down shape `[M, 17408] @ [17408, 5120]`: DFlash2 verify rows M=8..32
+use b12x's measured TMA `(64, 64)` MMA tile; M=1, large prefill, and all other
+shapes retain the default selector. The isolated c4 result was 171.52 and
+170.28 tok/s for the two warm waves, versus 170.43 and 167.80 tok/s for the
+same service before the tile change (mean +1.06%). Both runs had 896 accepted
+tokens, 1020 committed tokens, and the same output SHA. The c1 cold result was
+247.52 tok/s; it is recorded but not used as the primary comparison because
+the optimization target is steady-state batched decode.
+
 Targeted regression tests pass (`39 passed`), touched-file ruff and full
 repository ruff pass, and the CUDA-Graph replay smoke test showed stable
 eager/replay outputs after capture.
@@ -63,6 +73,8 @@ eager/replay outputs after capture.
 ## Next whole-chain candidates
 
 The next profiling pass should target the 30.3% FlashInfer verify-attention
-share and the 26.1% W4A4 dense-GEMM share. Do not spend the next pass changing
-DFlash2 acceptance semantics or disabling split-KV unless a new profile proves
-that premise has changed.
+share. The W4A4 dense-GEMM path now has a shape-scoped decode tile for the
+measured verify regime, but broader shapes still need separate evidence before
+any selector changes. Do not spend the next pass changing DFlash2 acceptance
+semantics or disabling split-KV unless a new profile proves that premise has
+changed.

@@ -14,7 +14,10 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from runtime.model.qwen36_model import Qwen36MLP  # noqa: E402
+from runtime.model.qwen36_model import (  # noqa: E402
+    Qwen36MLP,
+    _qwen38_w4a4_decode_mma_tiler,
+)
 from tests.test_qwen36_mtp_head import _tiny_config  # noqa: E402
 
 
@@ -55,6 +58,19 @@ def _dispatch_recording(monkeypatch, mlp: Qwen36MLP, *, w4a4_available: bool):
 
 
 class TestW4a4OnlyDispatch:
+    def test_qwen38_decode_down_tile_is_shape_scoped(self) -> None:
+        assert _qwen38_w4a4_decode_mma_tiler(m=8, output_size=5120, input_size=17408) == (
+            64,
+            64,
+        )
+        assert _qwen38_w4a4_decode_mma_tiler(m=32, output_size=5120, input_size=17408) == (
+            64,
+            64,
+        )
+        assert _qwen38_w4a4_decode_mma_tiler(m=1, output_size=5120, input_size=17408) is None
+        assert _qwen38_w4a4_decode_mma_tiler(m=64, output_size=5120, input_size=17408) is None
+        assert _qwen38_w4a4_decode_mma_tiler(m=32, output_size=5120, input_size=5120) is None
+
     def test_all_w4a4_routes_every_row_to_w4a4(self, monkeypatch) -> None:
         mlp = _nvfp4_mlp()
         calls = _dispatch_recording(monkeypatch, mlp, w4a4_available=True)
