@@ -189,6 +189,11 @@ iq2_mma16_kernel(
                                + (float)cu2[3]*su[2][1]*xs1b + (float)cu3[3]*su[3][1]*xs1b;
             }
         }
+        // All warps must finish reading this kblock's shared-memory tiles
+        // before the next iteration overwrites them.  Without this barrier,
+        // faster warps can stage the next block while slower warps still use
+        // the previous block, producing an intermittent gate/up mismatch.
+        __syncthreads();
     }
 
 #pragma unroll 1

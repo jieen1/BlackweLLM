@@ -179,13 +179,13 @@ def fused_kv_scatter(
         k_cache = k_cache.view(torch.float8_e4m3fn)
         v_cache = v_cache.view(torch.float8_e4m3fn)
 
-    # Long prefill and DSpark hidden-KV injection use a dense Qwen geometry
-    # (4 KV heads x 256 dimensions).  Match SGLang's row-oriented writer for
-    # that regime; M=1 decode and unusual layouts retain the established
-    # head-oriented kernel because its smaller launch footprint is better
-    # there and it is already covered by the existing correctness tests.
+    # Long prefill uses a dense Qwen geometry. Match SGLang's row-oriented
+    # writer for that regime. M=1 decode, DSpark context injection, and unusual
+    # layouts retain the established head-oriented kernel because the direct
+    # small-M A/B did not show a stable benefit for the row launch.
     total_cols = num_kv_heads * head_dim
-    if num_tokens >= 128 and total_cols <= 1024:
+    use_long_row = num_tokens >= 128 and total_cols <= 1024
+    if use_long_row:
         block_cols = 1024
         _fused_kv_scatter_row_kernel[
             (num_tokens, triton.cdiv(total_cols, block_cols))

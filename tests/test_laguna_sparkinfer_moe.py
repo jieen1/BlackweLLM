@@ -4,7 +4,7 @@
 import pytest
 
 torch = pytest.importorskip("torch")
-pytest.importorskip("sparkinfer")
+pytest.importorskip("b12x")
 
 from runtime.backends import laguna_sparkinfer_moe as moe
 
@@ -31,7 +31,7 @@ def test_layers_can_share_one_routed_output_arena(monkeypatch: pytest.MonkeyPatc
     second = moe.SparkinferMoELayer(object(), object(), device="cpu", output_arena=arena)
 
     monkeypatch.setattr(moe, "build_tp_moe_fp4_binding", lambda **kwargs: kwargs)
-    monkeypatch.setattr(moe, "sparkinfer_moe_fp4", lambda *, binding: binding["output"])
+    monkeypatch.setattr(moe, "b12x_moe_fp4", lambda *, binding: binding["output"])
 
     hidden = torch.empty(16, moe.HIDDEN_SIZE, dtype=torch.bfloat16)
     topk_ids = torch.zeros(16, moe.TOP_K, dtype=torch.int64)

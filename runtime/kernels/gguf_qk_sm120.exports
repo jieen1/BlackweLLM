@@ -1,0 +1,28 @@
+{
+  global:
+    qsr_gguf_qk_abi_version;
+    qsr_gguf_quantize_q8_sm120;
+    qsr_gguf_quantize_q8_f32_sm120;
+    qsr_gguf_gemm_q8_sm120;
+    qsr_gguf_gemm_q8_prequantized_sm120;
+    qsr_gguf_gemm_q8_prequantized_cached_sm120;
+    qsr_gguf_gemm_q8_mmq_sm120;
+    qsr_gguf_gemm_q8_f32_sm120;
+    qsr_gguf_gemm_q8_prequantized_f32_sm120;
+    qsr_gguf_gemm_q8_prequantized_cached_f32_sm120;
+    qsr_gguf_gemm_q8_mixed_sm120;
+    qsr_gguf_gemm_q8_mixed_f32_sm120;
+    qsr_gguf_gemm_q8_mixed_cached_sm120;
+    qsr_gguf_gemm_q8_mixed_cached_f32_sm120;
+    qsr_gguf_gemm_direct_mixed_sm120;
+    qsr_gguf_gemm_direct_mixed_f32_sm120;
+    qsr_gguf_gemm_direct_mixed_cached_sm120;
+    qsr_gguf_gemm_direct_mixed_cached_f32_sm120;
+    qsr_gguf_gemm_sm120;
+    qsr_gguf_gemm_f32_sm120;
+    qsr_gguf_gemm_direct_cached_sm120;
+    qsr_gguf_gemm_direct_cached_f32_sm120;
+    qsr_gguf_dequant_rows_sm120;
+    qsr_gguf_dequant_rows_f32_sm120;
+  local: *;
+};

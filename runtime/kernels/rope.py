@@ -94,8 +94,12 @@ def _rope_kernel(
     new_x = x_val * cos - y_val * sin
     new_y = y_val * cos + x_val * sin
 
-    tl.store(x_base + x_off, new_x.to(tl.bfloat16), mask=mask)
-    tl.store(x_base + y_off, new_y.to(tl.bfloat16), mask=mask)
+    # Triton casts to the pointer element type at the store boundary.  The
+    # old hard-coded BF16 store silently rounded the GGUF F32 reference path
+    # after every rotary operation; keeping the pointer dtype here preserves
+    # BF16 for the established service path and F32 for the GGUF path.
+    tl.store(x_base + x_off, new_x, mask=mask)
+    tl.store(x_base + y_off, new_y, mask=mask)
 
 
 def apply_rotary_embedding_inplace(
@@ -151,6 +155,40 @@ def compute_cos_sin_cache_default(
     sin = freqs.sin()
     cache = torch.cat((cos, sin), dim=-1)
     return cache.to(dtype)
+
+
+def compute_cos_sin_cache_qwen_mrope_text(
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    sections: tuple[int, int, int, int] | list[int],
+    dtype: torch.dtype,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Build Qwen3.5's interleaved-MRoPE cache for text positions.
+
+    Qwen3.5 stores four rotary sections in GGUF and llama.cpp selects the
+    interleaved temporal/height/width layout.  A text batch has one scalar
+    position per token; llama.cpp broadcasts that same position over all
+    three axes.  The selected frequencies therefore reduce exactly to the
+    ordinary NeoX cache, but validating and carrying the checkpoint's
+    partition here prevents silently treating a multimodal checkpoint as a
+    different rotary contract.  Image/video position tensors need a separate
+    three-axis API and are intentionally outside this text-only runtime.
+    """
+
+    normalized_sections = tuple(int(section) for section in sections)
+    if len(normalized_sections) != 4 or any(section < 0 for section in normalized_sections):
+        raise ValueError(
+            "Qwen MRoPE sections must be four non-negative integers, "
+            f"got {sections!r}"
+        )
+    if sum(normalized_sections) * 2 != rotary_dim:
+        raise ValueError(
+            "Qwen MRoPE sections must cover the rotary dimension: "
+            f"sections={normalized_sections}, rotary_dim={rotary_dim}"
+        )
+    return compute_cos_sin_cache_default(rotary_dim, max_position, base, dtype, device)
 
 
 def _yarn_find_correction_dim(

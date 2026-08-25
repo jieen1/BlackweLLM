@@ -57,9 +57,7 @@ def _load_flashinfer() -> tuple[Any, ...] | None:
     # invokes ninja for a first-time backend specialization.
     venv_ninja = os.path.join(os.path.dirname(sys.executable), "ninja")
     if os.path.isfile(venv_ninja) and shutil.which("ninja") is None:
-        os.environ["PATH"] = os.path.dirname(venv_ninja) + os.pathsep + os.environ.get(
-            "PATH", ""
-        )
+        os.environ["PATH"] = os.path.dirname(venv_ninja) + os.pathsep + os.environ.get("PATH", "")
 
     # This machine has flashinfer-python 0.6.16.post3 and a cached 0.6.13
     # cubin package.  The kernels are bit-checked below at integration time;
@@ -75,7 +73,11 @@ def _load_flashinfer() -> tuple[Any, ...] | None:
             _FLASHINFER_IMPORT_REPORTED = True
         return None
 
-    _FLASHINFER_IMPORT = (BatchPrefillWithPagedKVCacheWrapper,)
+    try:
+        from flashinfer import top_k
+    except (ImportError, AttributeError):
+        top_k = None
+    _FLASHINFER_IMPORT = (BatchPrefillWithPagedKVCacheWrapper, top_k)
     return _FLASHINFER_IMPORT
 
 
@@ -83,6 +85,44 @@ def flashinfer_dspark_available() -> bool:
     """Return whether the optional non-causal paged path can be constructed."""
 
     return _load_flashinfer() is not None
+
+
+def flashinfer_deterministic_topk(
+    logits: torch.Tensor, top_k: int
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Run the optional FlashInfer deterministic top-k operator."""
+
+    imported = _load_flashinfer()
+    if imported is None or imported[1] is None:
+        return None
+    return imported[1](logits, top_k, sorted=True, deterministic=True)
+
+
+def compact_dflash_window(
+    sequence_length: int, *, window_size: int, page_size: int
+) -> tuple[int, int]:
+    """Return ``(local_length, first_page)`` for a paged suffix window.
+
+    SGLang's compact DFlash cache keeps the most recent ``window_size``
+    committed tokens, then moves the left edge back to a page boundary.  The
+    resulting local sequence can therefore be up to ``page_size - 1`` tokens
+    longer than the nominal window.  Query positions and cache write
+    locations stay absolute; only the attention page-table view is rebased.
+    """
+
+    sequence_length = int(sequence_length)
+    window_size = int(window_size)
+    page_size = int(page_size)
+    if sequence_length < 0:
+        raise ValueError(f"DFlash sequence_length must be non-negative, got {sequence_length}")
+    if window_size <= 0:
+        raise ValueError(f"DFlash window_size must be positive, got {window_size}")
+    if page_size <= 0:
+        raise ValueError(f"DFlash page_size must be positive, got {page_size}")
+    visible_length = min(sequence_length, window_size)
+    visible_start = sequence_length - visible_length
+    aligned_start = visible_start - (visible_start % page_size)
+    return sequence_length - aligned_start, aligned_start // page_size
 
 
 class FlashInferDSparkAttentionImpl:
@@ -110,12 +150,14 @@ class FlashInferDSparkAttentionImpl:
         use_cuda_graph: bool = False,
         slot: int = 0,
         batch_size: int = 1,
+        window_left: int = -1,
+        kv_cache_dtype: str | torch.dtype = "fp8",
         workspace_buffer: torch.Tensor | None = None,
     ) -> None:
         imported = _load_flashinfer()
         if imported is None:
             raise RuntimeError("FlashInfer is unavailable")
-        (wrapper_type,) = imported
+        wrapper_type, _ = imported
 
         if num_tokens <= 0 or max_pages <= 0 or page_size <= 0:
             raise ValueError(
@@ -129,7 +171,17 @@ class FlashInferDSparkAttentionImpl:
         self.head_size = int(head_size)
         self.num_kv_heads = int(num_kv_heads)
         self.scale = float(scale)
-        self.kv_cache_dtype = "fp8_e4m3"
+        if kv_cache_dtype in {"fp8", "fp8_e4m3", torch.float8_e4m3fn}:
+            self.kv_cache_dtype = "fp8_e4m3"
+            self.kv_cache_torch_dtype = torch.float8_e4m3fn
+        elif kv_cache_dtype in {"bfloat16", torch.bfloat16}:
+            self.kv_cache_dtype = "bfloat16"
+            self.kv_cache_torch_dtype = torch.bfloat16
+        else:
+            raise ValueError(
+                "unsupported DSpark FlashInfer KV cache dtype: "
+                f"{kv_cache_dtype!r}; expected FP8 or BF16"
+            )
         self.supports_quant_query_input = False
         self.page_size = int(page_size)
         self.max_pages = int(max_pages)
@@ -140,14 +192,15 @@ class FlashInferDSparkAttentionImpl:
         self.device = device
         self.use_cuda_graph = bool(use_cuda_graph)
         self.slot = int(slot)
+        if window_left < -1:
+            raise ValueError(f"DSpark FlashInfer window_left must be >= -1, got {window_left}")
+        self.window_left = int(window_left)
         # SGLang's FlashInfer paged-prefill path leaves split-KV enabled for
         # the DSpark draft block.  The old local rollout disabled it because
         # the graph metadata update had not yet been compared with SGLang.
         # Keep a kill switch for bisecting a bad cubin/runtime combination,
         # but make the SGLang-equivalent path the production default.
-        self.disable_split_kv = _env_flag(
-            "QSR_DSPARK_FLASHINFER_DISABLE_SPLIT_KV", default=False
-        )
+        self.disable_split_kv = _env_flag("QSR_DSPARK_FLASHINFER_DISABLE_SPLIT_KV", default=False)
         self._prepared_metadata: object | None = None
         self._planned = False
 
@@ -161,22 +214,18 @@ class FlashInferDSparkAttentionImpl:
                     )
                 ),
             )
-            workspace_buffer = torch.empty(
-                workspace_bytes, dtype=torch.uint8, device=device
-            )
+            workspace_buffer = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
         self.workspace_buffer = workspace_buffer
 
         self._qo_indptr = (
-            torch.arange(self.batch_size + 1, dtype=torch.int32, device=device)
-            * self.num_tokens
+            torch.arange(self.batch_size + 1, dtype=torch.int32, device=device) * self.num_tokens
         )
         # The graph owns a capacity-sized *compact* page-index buffer.  The
         # per-request ranges are repacked into its prefix on each replay;
         # this is necessary because FlashInfer treats indptr as a compact
         # CSR range and cannot skip unused page ids between requests.
         self._kv_indptr = (
-            torch.arange(self.batch_size + 1, dtype=torch.int32, device=device)
-            * self.max_pages
+            torch.arange(self.batch_size + 1, dtype=torch.int32, device=device) * self.max_pages
         )
         self._kv_indices = torch.arange(
             self.batch_size * self.max_pages,
@@ -206,9 +255,7 @@ class FlashInferDSparkAttentionImpl:
             self.batch_size + 1, dtype=torch.int32, device="cpu", pin_memory=True
         )
         self._qo_indptr_host = (
-            torch.arange(
-                self.batch_size + 1, dtype=torch.int32, device="cpu", pin_memory=True
-            )
+            torch.arange(self.batch_size + 1, dtype=torch.int32, device="cpu", pin_memory=True)
             * self.num_tokens
         )
         self._kv_lens_host = torch.empty(
@@ -227,9 +274,7 @@ class FlashInferDSparkAttentionImpl:
             qo_indptr_buf=self._qo_indptr if self.use_cuda_graph else None,
             paged_kv_indptr_buf=self._kv_indptr if self.use_cuda_graph else None,
             paged_kv_indices_buf=self._kv_indices if self.use_cuda_graph else None,
-            paged_kv_last_page_len_buf=(
-                self._last_page_len if self.use_cuda_graph else None
-            ),
+            paged_kv_last_page_len_buf=(self._last_page_len if self.use_cuda_graph else None),
             backend=os.environ.get("QSR_DSPARK_FLASHINFER_BACKEND", "fa2"),
         )
 
@@ -247,7 +292,16 @@ class FlashInferDSparkAttentionImpl:
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        """Write projected context K/V using the runtime's FP8 scatter."""
+        """Write projected context K/V in the configured cache dtype."""
+
+        if self.kv_cache_torch_dtype == torch.bfloat16:
+            k_cache, v_cache = kv_cache.unbind(0)
+            block_size = k_cache.shape[1]
+            block_idx = torch.div(slot_mapping, block_size, rounding_mode="floor")
+            block_off = torch.remainder(slot_mapping, block_size)
+            k_cache.index_put_((block_idx, block_off), key.to(k_cache.dtype))
+            v_cache.index_put_((block_idx, block_off), value.to(v_cache.dtype))
+            return
 
         k_cache = kv_cache[0].view(torch.float8_e4m3fn)
         v_cache = kv_cache[1].view(torch.float8_e4m3fn)
@@ -281,9 +335,10 @@ class FlashInferDSparkAttentionImpl:
             causal=False,
             sm_scale=self.scale,
             q_data_type=torch.bfloat16,
-            kv_data_type=torch.float8_e4m3fn,
+            kv_data_type=self.kv_cache_torch_dtype,
             o_data_type=torch.bfloat16,
             max_token_per_sequence=self.num_tokens,
+            window_left=self.window_left,
             # Match SGLang's paged-prefill draft path: split the long KV
             # dimension so all SMs participate at 128K context.  The graph
             # wrapper keeps its plan metadata at fixed addresses; replay only
@@ -341,7 +396,7 @@ class FlashInferDSparkAttentionImpl:
         wrapper._token_pos_in_items_len = 0  # noqa: SLF001
         wrapper._max_item_len_ptr = None  # noqa: SLF001
         wrapper._cached_q_data_type = torch.bfloat16  # noqa: SLF001
-        wrapper._cached_kv_data_type = torch.float8_e4m3fn  # noqa: SLF001
+        wrapper._cached_kv_data_type = self.kv_cache_torch_dtype  # noqa: SLF001
         wrapper._cached_o_data_type = torch.bfloat16  # noqa: SLF001
         wrapper._block_tables = None  # noqa: SLF001
 
@@ -364,7 +419,7 @@ class FlashInferDSparkAttentionImpl:
             self.head_size,
             self.head_size,
             False,
-            -1,
+            self.window_left,
             -1,
             self.disable_split_kv,
             0,
@@ -455,9 +510,7 @@ class FlashInferDSparkAttentionImpl:
         kv_indices = getattr(metadata, "flashinfer_kv_indices", None)
         last_page_len = getattr(metadata, "flashinfer_kv_last_page_len", None)
         if any(value is None for value in (qo_indptr, kv_indptr, kv_indices, last_page_len)):
-            raise ValueError(
-                "DSpark FlashInfer metadata is missing paged layout tensors"
-            )
+            raise ValueError("DSpark FlashInfer metadata is missing paged layout tensors")
         self._plan(qo_indptr, kv_indptr, kv_indices, last_page_len)
         self._prepared_metadata = metadata
 
@@ -492,15 +545,20 @@ class FlashInferDSparkAttentionImpl:
         elif not self._planned:
             raise RuntimeError("DSpark FlashInfer CUDA graph was not planned")
 
-        # Draft checkpoints have no KV calibration parameters; the cache is
-        # written with scale=1.0.  Keep these scalar arguments explicit so the
-        # FP8 kernel does not infer a different calibration contract.
-        self._wrapper.run(
-            q,
-            (key_cache, value_cache),
-            k_scale=1.0,
-            v_scale=1.0,
-            out=output[:num_actual_tokens],
-        )
+        if self.kv_cache_torch_dtype == torch.bfloat16:
+            self._wrapper.run(
+                q,
+                (key_cache, value_cache),
+                out=output[:num_actual_tokens],
+            )
+        else:
+            # FP8 callers must provide the runtime's explicit scale contract.
+            self._wrapper.run(
+                q,
+                (key_cache, value_cache),
+                k_scale=1.0,
+                v_scale=1.0,
+                out=output[:num_actual_tokens],
+            )
         del layer
         return output

@@ -34,6 +34,7 @@ import torch
 from runtime.backends.bf_attention import bf_attn_context, replace_laguna_attention
 from runtime.backends.flashinfer_dspark_attn import (
     FlashInferDSparkAttentionImpl,
+    compact_dflash_window,
     flashinfer_dspark_available,
 )
 from runtime.backends.laguna_sparkinfer_attn import (
@@ -54,6 +55,7 @@ from runtime.logprobs import compute_logprobs
 from runtime.mtp_accept import (
     determine_accept_reject_batch,
     sample_accept_reject,
+    sample_accept_reject_sparse,
 )
 from runtime.round_profile import round_profile
 from runtime.sampling import (
@@ -190,10 +192,16 @@ class Qwen36DSparkEngine:
             raise ValueError("Qwen36DSparkEngine requires a CUDA device")
         if not draft_model.config.target_layer_ids:
             raise ValueError("DSpark draft has no target hidden-state taps")
-        if draft_model.gamma != draft_model.config.block_size:
+        expected_gamma = (
+            draft_model.config.block_size - 1
+            if getattr(draft_model, "is_dflash2", False)
+            else draft_model.config.block_size
+        )
+        if draft_model.gamma != expected_gamma:
             raise ValueError(
-                "DSpark gamma must equal the draft block_size; "
-                f"got gamma={draft_model.gamma}, block_size={draft_model.config.block_size}"
+                "external Qwen draft gamma does not match its block contract; "
+                f"got gamma={draft_model.gamma}, expected={expected_gamma}, "
+                f"block_size={draft_model.config.block_size}"
             )
 
         self.backend = backend
@@ -202,10 +210,21 @@ class Qwen36DSparkEngine:
         self.device = backend.device
         self.dtype = backend.dtype
         self.k = int(draft_model.gamma)
+        # DFlash2 evaluates the anchor plus K masked rows. Legacy DSpark's
+        # query width equals its proposal width, so keep this distinction out
+        # of the target verify/accept code below.
+        self._draft_query_tokens = (
+            self.k + 1 if getattr(draft_model, "is_dflash2", False) else self.k
+        )
+        if getattr(draft_model, "is_dflash2", False):
+            set_block_size = getattr(draft_model.model, "set_block_size", None)
+            if set_block_size is not None:
+                set_block_size(self._draft_query_tokens)
         self.page_size = backend.pool.page_size
         self.pages_per_slot = backend.pool.pages_per_slot
         self.max_seq_len = backend.max_seq_len
         self._draft_probs: dict[int, torch.Tensor] = {}
+        self._draft_sparse_probs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         # Confidence is produced by the same draft graph that produces the
         # token block.  Keep a graph-owned view until the following target
         # verify chooses its width; unlike tokens, it must never be converted
@@ -269,13 +288,19 @@ class Qwen36DSparkEngine:
         self.backend.stats["dspark_verify_width_histogram"] = [0] * (self.k + 1)
         self.capture_aux_hidden_states = True
         self.capture_device_accept = os.environ.get("QSR_QWEN36_DSPARK_FUSED_ACCEPT", "1") != "0"
+        # Every production caller below constructs a contiguous range from
+        # host-known scalar bounds.  Keep that fact explicit so cache mapping
+        # does not synchronize the GPU just to rediscover the same bounds.
+        # ``0`` is a diagnostic rollback for comparisons against the old
+        # generic arbitrary-position validation path.
+        self._fast_slot_mapping = (
+            os.environ.get("QSR_QWEN36_DSPARK_FAST_SLOT_MAPPING", "1") != "0"
+        )
         # Ordinary SGLang DSpark pools inject accepted hidden rows after the
         # ragged verify graph.  Keep the graph-folded variant opt-in: it is a
         # specialized pool optimization, not the standard DSpark contract,
         # and this runtime's generic cache writer is not that pool API.
-        self.fuse_context_kv = (
-            os.environ.get("QSR_QWEN36_DSPARK_FUSED_CONTEXT_KV", "0") != "0"
-        )
+        self.fuse_context_kv = os.environ.get("QSR_QWEN36_DSPARK_FUSED_CONTEXT_KV", "0") != "0"
         self.verify_mode = os.environ.get("QSR_QWEN36_DSPARK_VERIFY_MODE", "static").strip().lower()
         if self.verify_mode not in {"static", "cap-accept", "compact"}:
             raise ValueError(
@@ -332,6 +357,8 @@ class Qwen36DSparkEngine:
             self.device.type == "cuda"
             and os.environ.get("QSR_QWEN36_DSPARK_CUDA_GRAPH", "1") != "0"
         )
+        if getattr(draft_model, "is_dflash2", False) and not self._use_cuda_graph:
+            raise RuntimeError("DFlash2 requires CUDA Graphs; set QSR_QWEN36_DSPARK_CUDA_GRAPH=1")
         self._verify_cg = None
         self._verify_ragged_cg = None
         self._verify_cg_by_width: dict[int, Any] = {}
@@ -346,8 +373,28 @@ class Qwen36DSparkEngine:
             os.environ.get("QSR_QWEN36_DSPARK_FLASHINFER", "1") != "0"
             and flashinfer_dspark_available()
         )
+        if getattr(draft_model, "is_dflash2", False) and not self.use_flashinfer_draft:
+            raise RuntimeError(
+                "DFlash2 requires the FlashInfer draft attention path: its layers are "
+                "non-causal sliding-window attention, which the legacy causal SparkInfer "
+                "fallback cannot represent"
+            )
         self._flashinfer_workspace_buffer: torch.Tensor | None = None
         self._flashinfer_draft_impl: FlashInferDSparkAttentionImpl | None = None
+        self._draft_window_left = int(
+            getattr(draft_model.config, "sliding_window", -1) - 1
+            if getattr(draft_model, "is_dflash2", False)
+            else -1
+        )
+        if self._draft_window_left < -1:
+            raise ValueError(
+                f"DFlash2 sliding_window must be -1 or non-negative, got {self._draft_window_left}"
+            )
+        self._use_compact_draft_cache = (
+            getattr(draft_model, "is_dflash2", False)
+            and self._draft_window_left >= 0
+            and os.environ.get("QSR_QWEN36_DSPARK_COMPACT_DRAFT_CACHE", "1") != "0"
+        )
         if self.use_flashinfer_draft:
             workspace_bytes = max(
                 64 * 1024 * 1024,
@@ -387,7 +434,13 @@ class Qwen36DSparkEngine:
                 attn.num_kv_heads,
                 attn.head_size,
             )
-            self._draft_kv_caches[name] = torch.zeros(shape, dtype=torch.uint8, device=self.device)
+            cache_dtype = getattr(attn, "kv_cache_torch_dtype", torch.float8_e4m3fn)
+            if cache_dtype not in (torch.float8_e4m3fn, torch.bfloat16):
+                raise ValueError(
+                    "unsupported DSpark draft KV cache dtype: "
+                    f"{cache_dtype!r}; expected FP8 or BF16"
+                )
+            self._draft_kv_caches[name] = torch.zeros(shape, dtype=cache_dtype, device=self.device)
         bind_laguna_kv_cache(self._draft_kv_caches, self._draft_attn_layers, [])
         self._patch_attention()
 
@@ -595,7 +648,9 @@ class Qwen36DSparkEngine:
         )
         from runtime.backends.qwen36_mtp_cudagraph import attempt_mtp_cg_capture
 
-        strict = os.environ.get("QSR_QWEN36_DSPARK_REQUIRE_CG", "0") == "1"
+        strict = getattr(self.draft_model, "is_dflash2", False) or (
+            os.environ.get("QSR_QWEN36_DSPARK_REQUIRE_CG", "0") == "1"
+        )
         draft_statuses: list[str] = []
         for batch_size in range(1, self.backend.num_slots + 1):
 
@@ -638,6 +693,7 @@ class Qwen36DSparkEngine:
             if status == "failed":
                 self._verify_ragged_cg = None
         else:
+
             def _capture_verify() -> None:
                 from runtime.backends.qwen36_mtp_cudagraph import Qwen36MTPVerifyCudaGraph
 
@@ -711,7 +767,7 @@ class Qwen36DSparkEngine:
                 head_size=attn.head_size,
                 scale=attn.head_size**-0.5,
                 num_kv_heads=attn.num_kv_heads,
-                window_left=-1,
+                window_left=self._draft_window_left,
             )
 
         parents_by_name = {
@@ -728,9 +784,12 @@ class Qwen36DSparkEngine:
             self._draft_kv_caches,
             resolve_parent=resolve_parent,
             prefill_capacity_by_window_left={
-                -1: (self.k, self.pages_per_slot),
+                self._draft_window_left: (
+                    self._draft_query_tokens,
+                    self.pages_per_slot,
+                ),
             },
-            max_batch=self.k,
+            max_batch=self._draft_query_tokens,
         )
 
         if self.use_flashinfer_draft:
@@ -742,8 +801,10 @@ class Qwen36DSparkEngine:
                 num_kv_heads=first_attn.num_kv_heads,
                 page_size=self.page_size,
                 max_pages=self.pages_per_slot,
-                num_tokens=self.k,
+                num_tokens=self._draft_query_tokens,
                 device=self.device,
+                window_left=self._draft_window_left,
+                kv_cache_dtype=first_attn.kv_cache_dtype,
                 workspace_buffer=self._flashinfer_workspace_buffer,
             )
             for attn in self._draft_attn_layers.values():
@@ -760,9 +821,57 @@ class Qwen36DSparkEngine:
             device=self.device,
         ).view(1, -1)
 
-    def _slot_mapping(self, slot: int, positions: torch.Tensor) -> torch.Tensor:
+    def _draft_attention_page_table(
+        self, slot: int, kv_len: int, num_tokens: int
+    ) -> tuple[torch.Tensor, int]:
+        """Build the local paged view used by a DFlash sliding-window block."""
+
+        page_table = self._page_table(slot)
+        if not self._use_compact_draft_cache:
+            return page_table, int(kv_len)
+        local_len, first_page = compact_dflash_window(
+            int(kv_len),
+            window_size=self._draft_window_left + 1,
+            page_size=self.page_size,
+        )
+        total_len = local_len + int(num_tokens)
+        num_pages = (total_len + self.page_size - 1) // self.page_size
+        if first_page + num_pages > self.pages_per_slot:
+            raise RuntimeError(
+                "DFlash compact page view exceeds the draft slot: "
+                f"slot={slot}, kv_len={kv_len}, local_len={local_len}, "
+                f"first_page={first_page}, pages={num_pages}, capacity={self.pages_per_slot}"
+            )
+        compact = torch.zeros_like(page_table)
+        compact[0, :num_pages].copy_(page_table[0, first_page : first_page + num_pages])
+        return compact, local_len
+
+    def _slot_mapping(
+        self,
+        slot: int,
+        positions: torch.Tensor,
+        *,
+        position_start: int | None = None,
+        position_count: int | None = None,
+    ) -> torch.Tensor:
         positions = positions.to(device=self.device, dtype=torch.long).reshape(-1)
-        if positions.numel() and (
+        if self._fast_slot_mapping and (position_start is not None or position_count is not None):
+            if position_start is None or position_count is None:
+                raise ValueError("position_start and position_count must be provided together")
+            start = int(position_start)
+            count = int(position_count)
+            if count != positions.numel():
+                raise ValueError(
+                    "DSpark slot-mapping range does not match positions: "
+                    f"count={count}, positions={positions.numel()}"
+                )
+            end = start + count
+            if start < 0 or end > self.max_seq_len:
+                raise RuntimeError(
+                    f"DSpark draft position outside cache: slot={slot}, "
+                    f"range=[{start}, {end - 1}], max_seq_len={self.max_seq_len}"
+                )
+        elif positions.numel() and (
             int(positions.min().item()) < 0 or int(positions.max().item()) >= self.max_seq_len
         ):
             raise RuntimeError(
@@ -810,9 +919,7 @@ class Qwen36DSparkEngine:
         host_slot_mapping.zero_()
         compact_offset = 0
         row_stride = self.pages_per_slot * self.page_size
-        for slot, past_len, verify_len in zip(
-            slots, past_lens, verify_lens, strict=True
-        ):
+        for slot, past_len, verify_len in zip(slots, past_lens, verify_lens, strict=True):
             self._validate_slot(int(slot))
             past_len = int(past_len)
             verify_len = int(verify_len)
@@ -866,39 +973,52 @@ class Qwen36DSparkEngine:
     ) -> list[int] | torch.Tensor:
         """Run one ``bonus + mask`` draft block and return gamma tokens."""
 
-        if kv_len < 0 or kv_len + self.k > self.max_seq_len:
+        if kv_len < 0 or kv_len + self._draft_query_tokens > self.max_seq_len:
             raise RuntimeError(
-                f"DSpark draft block does not fit: kv_len={kv_len}, gamma={self.k}, "
+                f"DSpark draft block does not fit: kv_len={kv_len}, "
+                f"query_tokens={self._draft_query_tokens}, gamma={self.k}, "
                 f"max_seq_len={self.max_seq_len}"
             )
         graph = self._draft_cg.get(1)
         if graph is not None and (params is None or params.is_greedy):
             self._draft_probs.pop(slot, None)
+            self._draft_sparse_probs.pop(slot, None)
             self.stats["draft_graph_replays"] += 1
             return self._replay_draft_graph(graph, slot, anchor_token, kv_len)
         input_ids = torch.full(
-            (1, self.k),
+            (1, self._draft_query_tokens),
             self.draft_model.config.mask_token_id,
             dtype=torch.long,
             device=self.device,
         )
         input_ids[0, 0] = int(anchor_token)
-        positions = torch.arange(kv_len, kv_len + self.k, dtype=torch.long, device=self.device)
-        page_table = self._page_table(slot)
-        slot_mapping = self._slot_mapping(slot, positions)
+        positions = torch.arange(
+            kv_len, kv_len + self._draft_query_tokens, dtype=torch.long, device=self.device
+        )
+        page_table, attention_kv_len = self._draft_attention_page_table(
+            slot, kv_len, self._draft_query_tokens
+        )
+        slot_mapping = self._slot_mapping(
+            slot,
+            positions,
+            position_start=kv_len,
+            position_count=self._draft_query_tokens,
+        )
         if self.use_flashinfer_draft:
-            total_len = kv_len + self.k
+            total_len = attention_kv_len + self._draft_query_tokens
             pages = (total_len + self.page_size - 1) // self.page_size
             last_page_len = total_len - (pages - 1) * self.page_size
             metadata = SparkinferAttnMetadata(
                 mode="extend",
                 page_table=page_table,
                 cache_seqlens=torch.tensor([total_len], dtype=torch.int32, device=self.device),
-                cu_seqlens_q=torch.tensor([0, self.k], dtype=torch.int32, device=self.device),
-                num_actual_tokens=self.k,
-                window_left=-1,
+                cu_seqlens_q=torch.tensor(
+                    [0, self._draft_query_tokens], dtype=torch.int32, device=self.device
+                ),
+                num_actual_tokens=self._draft_query_tokens,
+                window_left=self._draft_window_left,
                 flashinfer_qo_indptr=torch.tensor(
-                    [0, self.k], dtype=torch.int32, device=self.device
+                    [0, self._draft_query_tokens], dtype=torch.int32, device=self.device
                 ),
                 flashinfer_kv_indptr=torch.tensor(
                     [0, pages], dtype=torch.int32, device=self.device
@@ -910,36 +1030,54 @@ class Qwen36DSparkEngine:
             )
         else:
             # SparkInfer's paged extend kernel is causal within each request,
-            # so the fallback models the K masked rows as K independent
-            # one-token requests.  They share the same slot page table and
-            # each sees the complete context+K cache.
-            page_table = page_table.expand(self.k, -1)
+            # so the fallback models the query rows as independent one-token
+            # requests. DFlash2 is rejected before reaching this branch when
+            # FlashInfer is unavailable because it needs non-causal attention.
+            page_table = page_table.expand(self._draft_query_tokens, -1)
             metadata = SparkinferAttnMetadata(
                 mode="extend",
                 page_table=page_table,
                 cache_seqlens=torch.tensor(
-                    [kv_len + self.k] * self.k, dtype=torch.int32, device=self.device
+                    [kv_len + self._draft_query_tokens] * self._draft_query_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
                 ),
-                cu_seqlens_q=torch.arange(self.k + 1, dtype=torch.int32, device=self.device),
-                num_actual_tokens=self.k,
-                window_left=-1,
+                cu_seqlens_q=torch.arange(
+                    self._draft_query_tokens + 1, dtype=torch.int32, device=self.device
+                ),
+                num_actual_tokens=self._draft_query_tokens,
+                window_left=self._draft_window_left,
             )
         attn_metadata = {name: metadata for name in self._draft_layer_names}
         slot_mappings = {name: slot_mapping for name in self._draft_layer_names}
         with bf_attn_context(attn_metadata, slot_mappings):
             draft_hidden = self.draft_model(input_ids, positions)
-        draft_hidden = draft_hidden.reshape(1, self.k, -1)
+        draft_hidden = draft_hidden.reshape(1, self._draft_query_tokens, -1)
+        if getattr(self.draft_model, "is_dflash2", False):
+            # The first row is the anchor/noise row. DFlash2 proposes from the
+            # following K masked rows, matching the reference block_size=K+1
+            # contract.
+            draft_hidden = draft_hidden[:, 1:, :]
         if params is None or params.is_greedy:
 
             def sample_fn(logits: torch.Tensor, _step: int) -> torch.Tensor:
                 return logits.argmax(dim=-1)
 
             self._draft_probs.pop(slot, None)
+            self._draft_sparse_probs.pop(slot, None)
+            if hasattr(self.draft_model, "set_sampling_context"):
+                self.draft_model.set_sampling_context(temperature=0.0, generator=None)
         else:
             generator = make_generator(params.seed, str(self.device))
 
             def sample_fn(logits: torch.Tensor, _step: int) -> torch.Tensor:
                 return sample_from_logits(logits, params, generator=generator)
+
+            if hasattr(self.draft_model, "set_sampling_context"):
+                self.draft_model.set_sampling_context(
+                    temperature=params.temperature,
+                    generator=generator,
+                )
 
         draft_tokens, corrected_logits, confidence = self.draft_model.sample_block(
             draft_hidden,
@@ -948,15 +1086,24 @@ class Qwen36DSparkEngine:
             capture_confidence=self.capture_confidence,
         )
         if params is not None and not params.is_greedy:
-            self._draft_probs[slot] = compute_sampling_distribution(
-                corrected_logits[0], params
-            ).detach()
+            sparse_indices = getattr(self.draft_model, "last_candidate_indices", None)
+            sparse_probs = getattr(self.draft_model, "last_candidate_probs", None)
+            if sparse_indices is not None and sparse_probs is not None:
+                self._draft_sparse_probs[slot] = (
+                    sparse_indices[0].detach(),
+                    sparse_probs[0].detach(),
+                )
+                self._draft_probs.pop(slot, None)
+            else:
+                self._draft_probs[slot] = compute_sampling_distribution(
+                    corrected_logits[0], params
+                ).detach()
         if confidence is None:
             self._draft_confidence.pop(slot, None)
         else:
             self._draft_confidence[slot] = confidence[0]
         self.stats["draft_forwards"] += 1
-        self._draft_kv_len[slot] = max(self._draft_kv_len[slot], kv_len + self.k)
+        self._draft_kv_len[slot] = max(self._draft_kv_len[slot], kv_len + self._draft_query_tokens)
         return [int(token) for token in draft_tokens[0].tolist()]
 
     def _replay_draft_graph(
@@ -974,7 +1121,9 @@ class Qwen36DSparkEngine:
             tokens = graph.replay(anchor_token, kv_len)
         self.backend.stats.setdefault("dspark_draft_graph_replays", 0)
         self.backend.stats["dspark_draft_graph_replays"] += 1
-        self._draft_kv_len[slot] = max(self._draft_kv_len[slot], int(kv_len) + self.k)
+        self._draft_kv_len[slot] = max(
+            self._draft_kv_len[slot], int(kv_len) + self._draft_query_tokens
+        )
         return tokens
 
     @staticmethod
@@ -1107,9 +1256,7 @@ class Qwen36DSparkEngine:
                     raise ValueError(
                         f"DSpark forced verify received {len(values)} drafts; expected {self.k}"
                     )
-                full[row, 1:] = torch.tensor(
-                    values, dtype=torch.long, device=self.device
-                )
+                full[row, 1:] = torch.tensor(values, dtype=torch.long, device=self.device)
         return full
 
     def _sync_target_hidden(
@@ -1155,7 +1302,12 @@ class Qwen36DSparkEngine:
             dtype=torch.long,
             device=self.device,
         )
-        slot_mapping = self._slot_mapping(slot, positions)
+        slot_mapping = self._slot_mapping(
+            slot,
+            positions,
+            position_start=position_offset,
+            position_count=query_len,
+        )
         self.draft_model.precompute_and_store_context_kv(
             combined,
             positions,
@@ -1228,6 +1380,7 @@ class Qwen36DSparkEngine:
     def reset_slot(self, slot: int) -> None:
         self._validate_slot(slot)
         self._draft_probs.pop(slot, None)
+        self._draft_sparse_probs.pop(slot, None)
         self._draft_confidence.pop(slot, None)
         self._spec_rows.reset_slot(slot)
         self._spec_state_col[slot] = 0
@@ -1416,15 +1569,26 @@ class Qwen36DSparkEngine:
                 # row from a custom sampler.
                 draft_values = [int(token) for token in draft_row.tolist()]
             draft_probs = self._draft_probs.pop(slot, None)
-            if draft_probs is None:
-                raise RuntimeError("DSpark sampled verify has no draft probability block")
             target_probs = compute_sampling_distribution(all_logits, params)
-            decision = sample_accept_reject(
-                draft_values,
-                draft_probs,
-                target_probs,
-                generator=make_generator(params.seed, str(self.device)),
-            )
+            sparse = self._draft_sparse_probs.pop(slot, None)
+            if sparse is not None:
+                draft_indices, sparse_probs = sparse
+                decision = sample_accept_reject_sparse(
+                    draft_values,
+                    draft_indices,
+                    sparse_probs,
+                    target_probs,
+                    generator=make_generator(params.seed, str(self.device)),
+                )
+            else:
+                if draft_probs is None:
+                    raise RuntimeError("DSpark sampled verify has no draft probability block")
+                decision = sample_accept_reject(
+                    draft_values,
+                    draft_probs,
+                    target_probs,
+                    generator=make_generator(params.seed, str(self.device)),
+                )
             self.stats["sampled_rounds"] += 1
         else:
             # Greedy acceptance is vectorized on device and drains only the
@@ -1541,7 +1705,14 @@ class Qwen36DSparkEngine:
                 device=self.device,
             )
             position_parts.append(positions)
-            mapping_parts.append(self._slot_mapping(slot, positions))
+            mapping_parts.append(
+                self._slot_mapping(
+                    slot,
+                    positions,
+                    position_start=int(offset),
+                    position_count=int(count),
+                )
+            )
         positions = torch.cat(position_parts)
         slot_mapping = torch.cat(mapping_parts)
         self.draft_model.precompute_and_store_context_kv(
@@ -1608,7 +1779,9 @@ class Qwen36DSparkEngine:
             self.backend.stats.setdefault("dspark_draft_graph_replays", 0)
             self.backend.stats["dspark_draft_graph_replays"] += 1
             for slot, kv_len in zip(slots, kv_lens, strict=True):
-                self._draft_kv_len[slot] = max(self._draft_kv_len[slot], int(kv_len) + self.k)
+                self._draft_kv_len[slot] = max(
+                    self._draft_kv_len[slot], int(kv_len) + self._draft_query_tokens
+                )
             return {slot: tokens[row] for row, slot in enumerate(slots)}
 
         return {
@@ -1647,8 +1820,7 @@ class Qwen36DSparkEngine:
 
         graph = self._verify_ragged_cg
         all_greedy = all(
-            params_per_slot.get(slot) is None or params_per_slot[slot].is_greedy
-            for slot in slots
+            params_per_slot.get(slot) is None or params_per_slot[slot].is_greedy for slot in slots
         )
         if graph is None or not self.capture_device_accept or not all_greedy:
             # This is only a capture-failure/sampling fallback.  It is kept
@@ -1835,9 +2007,7 @@ class Qwen36DSparkEngine:
         position_keys = set(thinking_force_positions or ())
         token_keys = set(thinking_force_token_ids or ())
         if position_keys != token_keys:
-            raise ValueError(
-                "thinking force positions and token ids must cover the same slots"
-            )
+            raise ValueError("thinking force positions and token ids must cover the same slots")
         forced_slots = position_keys.intersection(slots)
         if forced_slots != position_keys:
             raise ValueError("thinking force maps contain a slot outside the active DSpark batch")

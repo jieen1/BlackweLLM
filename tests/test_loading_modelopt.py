@@ -27,12 +27,19 @@ from runtime.loading.modelopt import (  # noqa: E402
     NVFP4_GROUP_SIZE,
     QUANT_ALGO_FP8,
     QUANT_ALGO_NVFP4,
+    QUANT_ALGO_NVFP4_W4A4,
     QUANT_ALGO_UNQUANTIZED,
     classify_module,
     dequantize_fp8,
     dequantize_nvfp4,
     quantized_layers_map,
     unpack_nvfp4_to_fp32,
+)
+from runtime.model.modelopt_linear import (
+    QSR_QWEN36_MODEL_OPT_FP4_QUANT_ENV,
+    FusedModelOptNVFP4W4A4QKV,
+    ModelOptNVFP4W4A4Linear,
+    _modelopt_flashinfer_fp4_quant_enabled,
 )
 
 
@@ -59,6 +66,39 @@ class TestQuantizedLayersMap:
             "model.language_model.layers.0.self_attn.q_proj": "FP8",
         }
 
+    def test_expands_static_qwen_w4a4_config_group(self):
+        config = {
+            "num_hidden_layers": 2,
+            "layer_types": ["linear_attention", "full_attention"],
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "config_groups": {
+                    "group_0": {
+                        "targets": ["Linear"],
+                        "weights": {
+                            "type": "float",
+                            "num_bits": 4,
+                            "group_size": 16,
+                            "dynamic": False,
+                        },
+                        "input_activations": {
+                            "type": "float",
+                            "num_bits": 4,
+                            "group_size": 16,
+                            "dynamic": False,
+                        },
+                    }
+                },
+            },
+        }
+        result = quantized_layers_map(config)
+        assert len(result) == 13
+        assert result["model.language_model.layers.0.linear_attn.in_proj_qkv"] == (
+            QUANT_ALGO_NVFP4_W4A4
+        )
+        assert result["model.language_model.layers.1.self_attn.o_proj"] == (QUANT_ALGO_NVFP4_W4A4)
+        assert "model.language_model.layers.0.linear_attn.in_proj_a" not in result
+
 
 class TestClassifyModule:
     def test_fp8(self):
@@ -66,6 +106,9 @@ class TestClassifyModule:
 
     def test_nvfp4(self):
         assert classify_module("x", {"x": "W4A16_NVFP4"}) == QUANT_ALGO_NVFP4
+
+    def test_nvfp4_w4a4(self):
+        assert classify_module("x", {"x": "W4A4_NVFP4"}) == QUANT_ALGO_NVFP4_W4A4
 
     def test_absent_is_unquantized(self):
         assert classify_module("x", {}) == QUANT_ALGO_UNQUANTIZED
@@ -170,3 +213,88 @@ class TestDequantizeNvfp4:
         # down_proj real shape: [5120, 17408] weight -> [5120, 8704] packed,
         # weight_scale [5120, 1088] (17408 // 16 == 1088, B0-2 verified).
         assert NVFP4_GROUP_SIZE == 16
+
+
+class TestModelOptNvfp4W4A4Linear:
+    def test_activation_quantizer_switch_defaults_to_flashinfer_and_is_reversible(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv(QSR_QWEN36_MODEL_OPT_FP4_QUANT_ENV, raising=False)
+        assert _modelopt_flashinfer_fp4_quant_enabled()
+
+        monkeypatch.setenv(QSR_QWEN36_MODEL_OPT_FP4_QUANT_ENV, "flashinfer")
+        assert _modelopt_flashinfer_fp4_quant_enabled()
+
+        monkeypatch.setenv(QSR_QWEN36_MODEL_OPT_FP4_QUANT_ENV, "local")
+        assert not _modelopt_flashinfer_fp4_quant_enabled()
+
+    def test_loads_input_scale_and_normalizes_modelopt_scales_for_b12x(self):
+        lin = ModelOptNVFP4W4A4Linear(32, 2)
+        lin.weight.data.zero_()
+        lin.weight_scale.data.fill_(1.0)
+        lin.weight_scale_2.data.fill_(0.25)
+        lin.input_scale.data.fill_(0.5)
+
+        _, _, weight_gs, activation_gs = lin.nvfp4_w4a4_components_for_fuse()
+
+        assert "input_scale" in dict(lin.named_parameters())
+        assert weight_gs.item() == 4.0
+        assert activation_gs.item() == 2.0
+
+    def test_cpu_forward_keeps_exact_modelopt_w4a16_reference(self):
+        lin = ModelOptNVFP4W4A4Linear(32, 1)
+        lin.weight.data.fill_(0x22)  # E2M1 code 1.0 in both nibbles
+        lin.weight_scale.data.fill_(1.0)
+        lin.weight_scale_2.data.fill_(0.25)
+        lin.input_scale.data.fill_(0.5)
+
+        out = lin(torch.ones(1, 32, dtype=torch.bfloat16))
+        assert out.item() == 8.0
+
+
+class TestFusedModelOptNvfp4W4A4QKV:
+    @staticmethod
+    def _projections() -> tuple[
+        ModelOptNVFP4W4A4Linear,
+        ModelOptNVFP4W4A4Linear,
+        ModelOptNVFP4W4A4Linear,
+    ]:
+        projections = (
+            ModelOptNVFP4W4A4Linear(32, 8),
+            ModelOptNVFP4W4A4Linear(32, 4),
+            ModelOptNVFP4W4A4Linear(32, 4),
+        )
+        for projection in projections:
+            projection.weight.data.zero_()
+            projection.weight_scale.data.fill_(1.0)
+            projection.weight_scale_2.data.fill_(0.25)
+            projection.input_scale.data.fill_(0.5)
+        return projections
+
+    def test_matching_calibration_is_accepted_without_touching_parameters(self):
+        q_proj, k_proj, v_proj = self._projections()
+        fused = FusedModelOptNVFP4W4A4QKV(q_proj, k_proj, v_proj)
+
+        raw = fused._validate_raw_parameters()
+
+        assert len(raw) == 8
+        assert not fused.ready
+        assert q_proj.weight.numel() == 8 * 16
+        assert k_proj.weight.numel() == 4 * 16
+        assert v_proj.weight.numel() == 4 * 16
+
+    def test_mismatched_input_calibration_rejects_shared_quantization(self):
+        q_proj, k_proj, v_proj = self._projections()
+        v_proj.input_scale.data.fill_(0.75)
+        fused = FusedModelOptNVFP4W4A4QKV(q_proj, k_proj, v_proj)
+
+        with pytest.raises(ValueError, match="matching input_scale"):
+            fused._validate_raw_parameters()
+
+    def test_mismatched_weight_calibration_rejects_shared_alpha(self):
+        q_proj, k_proj, v_proj = self._projections()
+        k_proj.weight_scale_2.data.fill_(0.5)
+        fused = FusedModelOptNVFP4W4A4QKV(q_proj, k_proj, v_proj)
+
+        with pytest.raises(ValueError, match="matching weight_scale_2"):
+            fused._validate_raw_parameters()

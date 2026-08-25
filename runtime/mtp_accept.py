@@ -353,3 +353,82 @@ def sample_accept_reject(
     bonus = int(torch.multinomial(target_probs[k], 1, generator=generator).item())
     committed.append(bonus)
     return {"num_accepted": k, "committed": committed, "rejected_at": None}
+
+
+def sample_accept_reject_sparse(
+    draft_tokens: list[int],
+    draft_indices: torch.Tensor,
+    draft_probs: torch.Tensor,
+    target_probs: torch.Tensor,
+    *,
+    generator: torch.Generator | None = None,
+) -> dict:
+    """Rejection sampling when the draft distribution is top-k sparse.
+
+    DFlash2's selector samples from a distribution over its ``top_k`` target
+    candidates rather than materializing a ``[K, vocab]`` row.  The standard
+    acceptance proof is unchanged: ``q(token)`` is the sparse probability for
+    the proposed token, and the rejection residual subtracts each candidate's
+    mass from the target row with ``scatter_add_``.  This keeps the exact
+    sampled distribution while avoiding a second full-vocabulary draft tensor.
+    """
+
+    k = len(draft_tokens)
+    if draft_indices.ndim != 2 or draft_indices.shape[0] != k:
+        raise ValueError(
+            "draft_indices must have shape [K, top_k], "
+            f"got {tuple(draft_indices.shape)} for K={k}"
+        )
+    if draft_probs.shape != draft_indices.shape:
+        raise ValueError(
+            "draft_probs must have the same shape as draft_indices, "
+            f"got {tuple(draft_probs.shape)} vs {tuple(draft_indices.shape)}"
+        )
+    if target_probs.ndim != 2 or target_probs.shape[0] < k + 1:
+        raise ValueError(
+            "target_probs must contain K verifier rows plus one bonus row; "
+            f"got {tuple(target_probs.shape)} for K={k}"
+        )
+    if draft_indices.device != draft_probs.device or draft_indices.device != target_probs.device:
+        raise ValueError(
+            "sparse draft indices, probabilities, and target probabilities "
+            "must share a device"
+        )
+
+    committed: list[int] = []
+    for position, token in enumerate(draft_tokens):
+        indices = draft_indices[position].long()
+        sparse_row = draft_probs[position]
+        match = indices == int(token)
+        q_token = sparse_row.masked_select(match).sum()
+        p_token = target_probs[position, int(token)]
+        if q_token <= 0:
+            accept_prob = torch.zeros((), dtype=target_probs.dtype, device=target_probs.device)
+        else:
+            accept_prob = torch.clamp(p_token / q_token, max=1.0)
+        uniform = torch.rand(
+            (), generator=generator, dtype=torch.float64, device=target_probs.device
+        )
+        if bool(uniform < accept_prob):
+            committed.append(int(token))
+            continue
+
+        residual = target_probs[position].clone()
+        residual.scatter_add_(0, indices, -sparse_row)
+        residual.clamp_min_(0.0)
+        total = residual.sum()
+        if total > 0:
+            residual = residual / total
+        else:
+            residual = target_probs[position]
+        recovered = int(torch.multinomial(residual, 1, generator=generator).item())
+        committed.append(recovered)
+        return {
+            "num_accepted": position,
+            "committed": committed,
+            "rejected_at": position,
+        }
+
+    bonus = int(torch.multinomial(target_probs[k], 1, generator=generator).item())
+    committed.append(bonus)
+    return {"num_accepted": k, "committed": committed, "rejected_at": None}

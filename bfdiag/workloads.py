@@ -68,7 +68,7 @@ def summarize_dynamic_route_tile_trace(
     if len(token_map) % physical_tiles_capacity:
         raise ValueError("token_map length is not divisible by physical tile capacity")
 
-    from sparkinfer.moe.fused_moe._impl import _deterministic_route_tile_dependencies
+    from b12x.moe.fused_moe._impl import _deterministic_route_tile_dependencies
 
     tile_m = len(token_map) // physical_tiles_capacity
     active_tiles = expert_tile_base[-1]
@@ -139,7 +139,7 @@ def capture_dynamic_route_tile_trace(backend: Any) -> dict[str, int]:
 
 def audit_sparkinfer_workspace(backend: Any) -> dict[str, Any]:
     """Persist the live SparkInfer core-arena view map for one warm backend."""
-    from sparkinfer.moe.fused_moe._impl import (
+    from b12x.moe.fused_moe._impl import (
         _core_workspace_view_map,
         _dynamic_core_workspace_liveness_map,
     )
@@ -1294,7 +1294,7 @@ def diagnose_dflash_verify_split_kv_chunking(
     device = torch.device("cuda")
 
     def make_plan(*, cache_seqlen: int, enable_cuda_graph: bool, num_pages: int):
-        from sparkinfer.attention.paged.planner import create_paged_plan
+        from b12x.attention.paged.planner import create_paged_plan
 
         q = torch.zeros(
             NUM_QUERY_PER_REQ, num_q_heads, head_dim, dtype=torch.bfloat16, device=device

@@ -186,12 +186,22 @@ SERVER_ENABLE_DFLASH = os.environ.get("QSR_SERVER_ENABLE_DFLASH", "0") != "0"
 # the round driver and the (token, hidden) pairing fix this path carries.
 SERVER_ENABLE_MTP = os.environ.get("QSR_SERVER_ENABLE_MTP", "0") != "0"
 SERVER_MTP_K = int(os.environ.get("QSR_SERVER_MTP_K", "4"))
+# Qwen3.8 DFlash2 is an explicit, isolated opt-in. It loads a separate
+# checkpoint; greedy draft/verify uses the captured native path, while sampled
+# draft sampling remains eager because its request-local RNG is not graph-safe.
+# DFlash2 never silently replaces the existing NVFP4+DSpark service profile.
+SERVER_ENABLE_DFLASH2 = os.environ.get("QSR_SERVER_ENABLE_DFLASH2", "0") != "0"
+SERVER_DFLASH2_DRAFT_MODEL = os.environ.get(
+    "QSR_SERVER_DFLASH2_DRAFT_MODEL", "/home/bot/models/Qwen3.8-27B-DFlash2"
+)
+SERVER_DFLASH2_K = int(os.environ.get("QSR_SERVER_DFLASH2_K", "7"))
 # Qwen3.6/Qwen3.8 DSpark uses a separate RadixArk draft checkpoint. The
 # measured Qwen profile is now the default for a Qwen checkpoint; Laguna and
 # generic imports remain unchanged. Set QSR_SERVER_ENABLE_DSPARK=0 (or use
 # --mtp) for the explicit native-MTP rollback.
 SERVER_ENABLE_DSPARK = os.environ.get(
-    "QSR_SERVER_ENABLE_DSPARK", "1" if _QWEN_DSPARK_DEFAULT_PROFILE else "0"
+    "QSR_SERVER_ENABLE_DSPARK",
+    "0" if SERVER_ENABLE_DFLASH2 else "1" if _QWEN_DSPARK_DEFAULT_PROFILE else "0",
 ) != "0"
 SERVER_DSPARK_DRAFT_MODEL = os.environ.get(
     "QSR_SERVER_DSPARK_DRAFT_MODEL", "RadixArk/Qwen3.8-27B-DSpark"
@@ -214,16 +224,30 @@ def _apply_qwen_dspark_runtime_defaults() -> None:
     useful to the standalone profiling runbooks. ``setdefault`` preserves an
     operator's explicit A/B choice and keeps the Laguna process untouched.
     """
-    if not SERVER_ENABLE_DSPARK:
+    # GGUF Q6 keeps the native linear weights in F32.  FlashInfer's GDN
+    # prefill kernel only accepts fp16/bf16, so it cannot be the implicit
+    # default for this checkpoint family.  Keep the measured FlashInfer path
+    # for NVFP4 and select the compatible FLA path for GGUF without changing
+    # any operator-supplied override.
+    is_gguf = Path(SERVER_MODEL_PATH).suffix.casefold() == ".gguf"
+    if is_gguf:
+        # The server's production target path should use the SM120 BF16 graph
+        # by default.  The loader retains F32 as its standalone bring-up
+        # default, and an operator can explicitly restore it for diagnosis.
+        os.environ.setdefault("QSR_GGUF_COMPUTE_DTYPE", "bf16")
+    if not (SERVER_ENABLE_DSPARK or SERVER_ENABLE_DFLASH2):
         return
+    gdn_prefill_backend = "fla" if is_gguf else "flashinfer"
     defaults = {
         "QSR_QWEN36_DSPARK_CUDA_GRAPH": "1" if SERVER_ENABLE_CUDAGRAPH else "0",
-        "QSR_QWEN36_DSPARK_REQUIRE_CG": "1" if SERVER_DSPARK_REQUIRE_CG else "0",
+        "QSR_QWEN36_DSPARK_REQUIRE_CG": (
+            "1" if SERVER_ENABLE_DFLASH2 else "1" if SERVER_DSPARK_REQUIRE_CG else "0"
+        ),
         "QSR_QWEN36_DSPARK_VERIFY_MODE": SERVER_DSPARK_VERIFY_MODE,
         "QSR_PREFILL_CHUNK": "8192",
         "QSR_ADMISSION_COALESCE_MS": "10",
         "QSR_QWEN36_PREFILL_ATTN_BACKEND": "flashinfer",
-        "QSR_QWEN36_GDN_PREFILL_BACKEND": "flashinfer",
+        "QSR_QWEN36_GDN_PREFILL_BACKEND": gdn_prefill_backend,
         "QSR_QWEN36_MLP_FP4_QUANT": "flashinfer",
         "QSR_QWEN36_MLP_W4A4": "1",
         "QSR_QWEN36_MLP_W4A4_ALL": "1",
@@ -231,6 +255,17 @@ def _apply_qwen_dspark_runtime_defaults() -> None:
     }
     for key, value in defaults.items():
         os.environ.setdefault(key, value)
+    if is_gguf and SERVER_ENABLE_DFLASH2:
+        # Keep packed GGUF weights resident and dequantize only genuine
+        # prefill-sized batches into a short-lived BF16 matrix.  The fresh
+        # SM120 A/B is materially faster than resident BF16 for the Q6 target
+        # because it removes the packed M>1 prefill bottleneck without paying
+        # the resident model-sized BF16 cache.  The helper keeps M=8 DFlash2
+        # eager warmups and all graph replay on the packed path.
+        # ``setdefault`` preserves explicit resident-BF16 and packed rollback
+        # choices made by an operator.
+        os.environ.setdefault("QSR_GGUF_DEQUANTIZE_WEIGHTS", "0")
+        os.environ.setdefault("QSR_GGUF_NATIVE_PREFILL_DEQUANT", "1")
 
 
 # Qwen dynamic KV Phase 4. ``legacy`` remains the rollback/default until the
@@ -523,11 +558,14 @@ def _resolve_chat_template_kwargs(
     return resolved
 
 # Selects which server/formats/tool_parsers/ shape to decode tool calls
-# with -- mirrors vLLM's --tool-call-parser NAME. Default matches this
-# project's currently (and so far only) production model, poolside/
-# Laguna-S-2.1-NVFP4. A model with a differently-shaped tool-call output
-# needs its own ToolCallParser registered there, then selected here.
-SERVER_TOOL_CALL_PARSER = os.environ.get("QSR_TOOL_CALL_PARSER", "poolside_v1")
+# with -- mirrors vLLM's --tool-call-parser NAME. GGUF Qwen3.8 emits the
+# qwen3_coder XML shape; keep Laguna's poolside_v1 default and preserve the
+# existing NVFP4/Qwen service choice unless the checkpoint is the explicit
+# local GGUF path. An operator-supplied parser always wins.
+_DEFAULT_TOOL_CALL_PARSER = (
+    "qwen3_coder" if Path(SERVER_MODEL_PATH).suffix.casefold() == ".gguf" else "poolside_v1"
+)
+SERVER_TOOL_CALL_PARSER = os.environ.get("QSR_TOOL_CALL_PARSER", _DEFAULT_TOOL_CALL_PARSER)
 
 engine: ServerEngine | None = None
 
@@ -792,6 +830,9 @@ async def lifespan(app: FastAPI):
         enable_dspark=SERVER_ENABLE_DSPARK,
         dspark_draft_model=SERVER_DSPARK_DRAFT_MODEL,
         dspark_num_speculative_tokens=SERVER_DSPARK_K,
+        enable_dflash2=SERVER_ENABLE_DFLASH2,
+        dflash2_draft_model=SERVER_DFLASH2_DRAFT_MODEL,
+        dflash2_num_speculative_tokens=SERVER_DFLASH2_K,
         checkpoint_budget_multiple=(SERVER_CHECKPOINT_BUDGET_MULTIPLE or None),
         qwen_kv_mode=SERVER_QWEN_KV_MODE,
         qwen_kv_pool_bytes=SERVER_QWEN_KV_POOL_BYTES,
@@ -808,7 +849,8 @@ async def lifespan(app: FastAPI):
         "engine ready: backend=%s served_model=%s checkpoint=%s capacity=%d "
         "num_slots=%d capacity_tokens_per_slot=%d "
         "cudagraph=%s prefix_cache=%s session_affinity=%s ttl=%.1fs dflash=%s "
-        "mtp=%s(K=%d,resync=%s) dspark=%s(K=%d,draft=%s,verify=%s,require_cg=%s)",
+        "mtp=%s(K=%d,resync=%s) dspark=%s(K=%d,draft=%s,verify=%s,require_cg=%s) "
+        "dflash2=%s(K=%d,draft=%s)",
         engine.backend_name,
         _default_served_model_name(engine),
         engine.MODEL,
@@ -828,6 +870,9 @@ async def lifespan(app: FastAPI):
         SERVER_DSPARK_DRAFT_MODEL,
         SERVER_DSPARK_VERIFY_MODE,
         SERVER_DSPARK_REQUIRE_CG,
+        SERVER_ENABLE_DFLASH2,
+        SERVER_DFLASH2_K,
+        SERVER_DFLASH2_DRAFT_MODEL,
     )
     # Cyclic-GC pauses land in the decode hot loop as 50-150 ms host stalls:
     # the 2026-08-06 128K/c4 node trace measured 667 GPU-idle gaps >0.5 ms
@@ -1995,6 +2040,29 @@ def main() -> None:
         default=SERVER_DSPARK_K,
         help="DSpark draft tokens per round; must match draft config block_size. Default 7.",
     )
+    parser.add_argument(
+        "--dflash2",
+        action="store_true",
+        help=(
+            "Enable Qwen3.8 DFlash2 speculative decoding with an explicit local "
+            "GGUF target and DFlash2 draft checkpoint. This is opt-in and is "
+            "mutually exclusive with --dspark/--mtp."
+        ),
+    )
+    parser.add_argument(
+        "--dflash2-draft-model",
+        default=SERVER_DFLASH2_DRAFT_MODEL,
+        help=(
+            "Local DFlash2 draft directory or cached Hugging Face id. "
+            f"Default: {SERVER_DFLASH2_DRAFT_MODEL}."
+        ),
+    )
+    parser.add_argument(
+        "--dflash2-k",
+        type=int,
+        default=SERVER_DFLASH2_K,
+        help="DFlash2 speculative tokens per round; block_size=8 reserves 7 proposals. Default 7.",
+    )
     from server.formats.tool_parsers import available_parsers
 
     parser.add_argument(
@@ -2017,6 +2085,9 @@ def main() -> None:
         parser.error(
             "--session-affinity requires the prefix cache (cannot combine with --no-prefix-cache)"
         )
+
+    if (args.dflash2 or SERVER_ENABLE_DFLASH2) and (args.dspark or args.mtp or args.dflash):
+        parser.error("--dflash2 is mutually exclusive with --dspark, --mtp, and --dflash")
 
     # N8 (docs/architecture.md §3.5.6): fail before setting any env var or
     # touching uvicorn, not after minutes of model loading. ServerEngine.
@@ -2055,17 +2126,26 @@ def main() -> None:
     os.environ["QSR_SERVER_SESSION_TTL_S"] = str(args.session_ttl_s)
     if args.dflash:
         os.environ["QSR_SERVER_ENABLE_DFLASH"] = "1"
+        os.environ["QSR_SERVER_ENABLE_DFLASH2"] = "0"
     if args.mtp:
         os.environ["QSR_SERVER_ENABLE_MTP"] = "1"
         os.environ["QSR_SERVER_ENABLE_DSPARK"] = "0"
+        os.environ["QSR_SERVER_ENABLE_DFLASH2"] = "0"
     os.environ["QSR_SERVER_MTP_K"] = str(args.mtp_k)
     if args.mtp_resync:
         os.environ["QSR_SERVER_MTP_RESYNC"] = "1"
     if args.dspark:
         os.environ["QSR_SERVER_ENABLE_DSPARK"] = "1"
         os.environ["QSR_SERVER_ENABLE_MTP"] = "0"
+        os.environ["QSR_SERVER_ENABLE_DFLASH2"] = "0"
     os.environ["QSR_SERVER_DSPARK_DRAFT_MODEL"] = args.dspark_draft_model
     os.environ["QSR_SERVER_DSPARK_K"] = str(args.dspark_k)
+    if args.dflash2:
+        os.environ["QSR_SERVER_ENABLE_DFLASH2"] = "1"
+        os.environ["QSR_SERVER_ENABLE_DSPARK"] = "0"
+        os.environ["QSR_SERVER_ENABLE_MTP"] = "0"
+    os.environ["QSR_SERVER_DFLASH2_DRAFT_MODEL"] = args.dflash2_draft_model
+    os.environ["QSR_SERVER_DFLASH2_K"] = str(args.dflash2_k)
     os.environ["QSR_TOOL_CALL_PARSER"] = args.tool_call_parser
 
     # Runs before uvicorn imports the app module, so the model is not loaded

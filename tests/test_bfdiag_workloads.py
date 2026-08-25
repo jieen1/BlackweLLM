@@ -116,7 +116,7 @@ def test_workspace_audit_attributes_a_shared_arena_by_view() -> None:
 
 
 def test_dynamic_route_tile_trace_reports_exact_order_dependency_cycles() -> None:
-    pytest.importorskip("sparkinfer")
+    pytest.importorskip("b12x")
     trace = summarize_dynamic_route_tile_trace(
         token_map=[0, 3, 2, 1],
         expert_row_counts=[2, 2],

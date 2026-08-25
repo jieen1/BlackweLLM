@@ -1,6 +1,6 @@
 # 模型支持矩阵与接入指南
 
-> 编制日期：2026-08-01 · 最后更新：2026-08-05
+> 编制日期：2026-08-01 · 最后更新：2026-08-21
 >
 > 这份文档回答两个问题：**现在支持哪些模型**，以及**接入一个新模型要做什么**。
 > 排期见 [`roadmap.md`](roadmap.md)，架构设计见 [`architecture.md`](architecture.md)。
@@ -13,6 +13,7 @@
 |---|---|---|
 | `poolside/Laguna-S-2.1-NVFP4` | ✅ **生产** | DFlash 投机、前缀缓存、CUDA Graph 全开 |
 | `Qwen3.6-27B`（NVFP4 文本版，`unsloth/Qwen3.6-27B-NVFP4`） | ✅ **可服务**（2026-08-05） | 自研 `qwen36` 后端；MTP K=3 + MTP/decode CUDA Graph + 持久前缀缓存 + FP8 KV；质量基线已复现 |
+| `Qwen3.8-27B-UD-Q6_K_XL.gguf` + DFlash2 | ✅ **原生接入，显式 opt-in**（2026-08-21） | SM120 原生 GGUF Q/K kernel、F32 full-attention、DFlash2 draft；target decode、draft、fixed/ragged verify CUDA Graph 均已实机捕获。服务默认改为 packed 权重 + 仅 `M≥32` transient BF16/cuBLAS prefill：同口径 4K fresh A/B warm TTFT `3.7755→1.1630 s`、wall `4.1234→1.5194 s`，decode 约 `89.63→87.73 tok/s`（测量噪声内持平），接受率 `28/31`、输出 SHA 不变；resident BF16 仍可显式回退（历史 `81.905 tok/s`），现有 NVFP4+DSpark 历史基线为 `232.045 tok/s`、`0.6365 s`。完整质量/长上下文/并发矩阵仍待独立门禁，见 [`notes/2026-08-20-qwen38-q6-dflash2-performance.md`](../notes/2026-08-20-qwen38-q6-dflash2-performance.md)、[`notes/2026-08-21-qwen38-q6-sglang-tc-blockm.md`](../notes/2026-08-21-qwen38-q6-sglang-tc-blockm.md) 与 [`notes/2026-08-21-qwen38-q6-transient-prefill.md`](../notes/2026-08-21-qwen38-q6-transient-prefill.md) |
 | `Qwen3.6-25B-A3B` | 🔴 **计划中**（M4→M5） | 架构参数尚未确认 |
 | 上述两者的社区微调 / 再量化衍生版 | 🔴 计划中 | 目标是 `config.json` 架构字段一致即自动可用 |
 | 其他一切 | ❌ 不支持 | 见 [`roadmap.md`](roadmap.md) §3「不做清单」 |

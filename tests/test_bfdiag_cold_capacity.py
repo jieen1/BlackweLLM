@@ -222,7 +222,7 @@ def test_persist_record_writes_a_self_describing_artifact(tmp_path) -> None:
 
 
 def test_route_tile_trace_preserves_only_valid_physical_rows() -> None:
-    pytest.importorskip("sparkinfer")
+    pytest.importorskip("b12x")
     trace = _route_tile_trace_from_host(
         token_map=[0, 3, 2, 1, 0, 0],
         expert_row_counts=[2, 2],

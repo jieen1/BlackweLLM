@@ -147,6 +147,12 @@ class Qwen36DSparkDraftModel(nn.Module):
                 "DSpark target_hidden feature dim mismatch: expected [N, "
                 f"{expected}], got {tuple(target_hidden.shape)}"
             )
+        # The Q6 GGUF target keeps correctness-critical taps in F32 while the
+        # official DFlash2 draft weights are BF16.  This projector is the
+        # deliberate precision boundary between the two models; make it
+        # explicit instead of relying on F.linear to reject mixed dtypes.
+        if target_hidden.dtype != self.fc.weight.dtype:
+            target_hidden = target_hidden.to(dtype=self.fc.weight.dtype)
         return self.hidden_norm(self.fc(target_hidden))
 
     def forward(self, inputs_embeds: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:

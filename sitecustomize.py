@@ -9,10 +9,8 @@ import inspect
 import os
 from pathlib import Path
 
-
 if os.environ.get("QSR_DSPARK_DUMP_ALL_LAYERS") not in (None, "", "0"):
     import torch
-
     from vllm.model_executor.models.interfaces import EagleModelMixin
     from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 

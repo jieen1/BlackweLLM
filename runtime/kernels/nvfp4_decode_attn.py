@@ -20,6 +20,7 @@ fp8 at BLOCK_K=128 -> 32 KiB each, fits SM120's 99 KiB.
 """
 
 from __future__ import annotations
+
 import os
 
 import torch
@@ -58,7 +59,11 @@ def _unpack_kv_half(
     64 KiB by itself)."""
     # one half is D/2 elements = D/4 code bytes; nibble-unpack to D/2 elems
     byte_cols = tl.arange(0, D // 4)
-    c_off = phys[:, None] * (H * (D // 2)) + pid_h * (D // 2) + (half_start // 2 + byte_cols)[None, :]
+    c_off = (
+        phys[:, None] * (H * (D // 2))
+        + pid_h * (D // 2)
+        + (half_start // 2 + byte_cols)[None, :]
+    )
     kc = tl.load(CODES + c_off, mask=row_mask[:, None], other=0)
     lo = (kc & 0x0F).to(tl.int32)
     hi = ((kc >> 4) & 0x0F).to(tl.int32)
@@ -121,7 +126,11 @@ def nvfp4_decode_partial_kernel(
     # this program's GQA query heads: [pid_h*GQA, pid_h*GQA+GQA), padded
     q_rows = tl.arange(0, PADDED_GQA)
     q_rmask = q_rows < GQA
-    q_off = pid_q * NUM_Q_HEADS * HEAD_DIM + (pid_h * GQA + q_rows)[:, None] * HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
+    q_off = (
+        pid_q * NUM_Q_HEADS * HEAD_DIM
+        + (pid_h * GQA + q_rows)[:, None] * HEAD_DIM
+        + tl.arange(0, HEAD_DIM)[None, :]
+    )
     q = tl.load(Q + q_off, mask=q_rmask[:, None], other=0.0)  # [PADDED_GQA, D] bf16
 
     m_i = tl.full((PADDED_GQA, 1), -float("inf"), dtype=tl.float32)
@@ -201,14 +210,30 @@ def nvfp4_decode_merge_kernel(
     ql = qh % GQA
     nparts = N_SPLIT * NUM_KV_HEADS
     m = tl.load(OUT_M + r * nparts * GQA + kh * N_SPLIT * GQA + ql + tl.arange(0, N_SPLIT) * GQA)
-    l = tl.load(OUT_L + r * nparts * GQA + kh * N_SPLIT * GQA + ql + tl.arange(0, N_SPLIT) * GQA)
-    acc = tl.load(OUT_ACC + r * nparts * GQA * HEAD_DIM + kh * N_SPLIT * GQA * HEAD_DIM + ql * HEAD_DIM + tl.arange(0, N_SPLIT)[:, None] * GQA * HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :])
+    l_val = tl.load(
+        OUT_L
+        + r * nparts * GQA
+        + kh * N_SPLIT * GQA
+        + ql
+        + tl.arange(0, N_SPLIT) * GQA
+    )
+    acc = tl.load(
+        OUT_ACC
+        + r * nparts * GQA * HEAD_DIM
+        + kh * N_SPLIT * GQA * HEAD_DIM
+        + ql * HEAD_DIM
+        + tl.arange(0, N_SPLIT)[:, None] * GQA * HEAD_DIM
+        + tl.arange(0, HEAD_DIM)[None, :]
+    )
     m_max = tl.max(m)
     scale = tl.exp2((m - m_max) * 1.4426950408889634)
-    lsum = tl.sum(l * scale)
+    lsum = tl.sum(l_val * scale)
     acc_sum = tl.sum(acc * scale[:, None], axis=0)
     out = acc_sum / lsum
-    tl.store(OUT + r * NUM_Q_HEADS * HEAD_DIM + qh * HEAD_DIM + tl.arange(0, HEAD_DIM), out.to(tl.bfloat16))
+    tl.store(
+        OUT + r * NUM_Q_HEADS * HEAD_DIM + qh * HEAD_DIM + tl.arange(0, HEAD_DIM),
+        out.to(tl.bfloat16),
+    )
 
 
 def nvfp4_decode_attention(
@@ -241,7 +266,6 @@ def nvfp4_decode_attention(
     """
     total_q = q.shape[0]
     padded_gqa = max(8, (gqa + 7) // 8 * 8)
-    n_parts = n_split * num_kv_heads
     out_m = torch.full((total_q, n_split, num_kv_heads, gqa), -float("inf"), device=q.device)
     out_l = torch.zeros_like(out_m)
     out_acc = torch.zeros((total_q, n_split, num_kv_heads, gqa, head_dim), device=q.device)

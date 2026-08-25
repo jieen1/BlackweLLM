@@ -66,6 +66,7 @@ pytest.importorskip("b12x")
 
 from runtime.model.qwen36_model import (  # noqa: E402
     Qwen36Attention,
+    Qwen36DecoderLayer,
     Qwen36ForCausalLMSelfBuilt,
     _kv_to_cache_dtype,
     _store_batched_kv_rows,
@@ -264,6 +265,26 @@ class TestQwen36AttentionConstructionGating:
         cache_bf16 = attn_bf16.new_cache(device=torch.device("cpu"), dtype=torch.bfloat16)
         assert cache_bf16.k_cache.dtype == torch.bfloat16
         assert cache_bf16.v_cache.dtype == torch.bfloat16
+
+    def test_modelopt_w4a4_uses_sglang_missing_scale_fallback(self) -> None:
+        config = _tiny_config()
+        config["quantization_config"] = {"quant_method": "modelopt"}
+        q_proj_name = "model.language_model.layers.1.self_attn.q_proj"
+        layer = Qwen36DecoderLayer(
+            config,
+            1,
+            {q_proj_name: "W4A4_NVFP4"},
+            max_seq_len=64,
+            enable_fp8_kv=True,
+        )
+        assert layer.self_attn is not None
+        attn = layer.self_attn
+        assert attn.kv_cache_dtype == torch.float8_e4m3fn
+        assert attn.kv_scale_source == "modelopt_default_1.0"
+        assert "k_scale" not in dict(attn.named_parameters())
+        assert "v_scale" not in dict(attn.named_parameters())
+        assert torch.equal(attn.k_scale, torch.ones(1))
+        assert torch.equal(attn.v_scale, torch.ones(1))
 
 
 def test_batched_kv_store_keeps_bf16_fallback_semantics() -> None:

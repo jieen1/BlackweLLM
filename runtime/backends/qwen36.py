@@ -350,6 +350,11 @@ class Qwen36Backend:
         self.block_size = block_size
         self.device = torch.device(device)
         self.dtype = dtype
+        self._uses_dense_gguf = bool(
+            isinstance(getattr(model, "config", None), dict)
+            and model.config.get("weight_format") == "gguf"
+            and model.config.get("gguf_compute_dtype") == "float32"
+        )
         self.enable_prefix_cache = enable_prefix_cache
         # The scratch-arena cache is a CUDA production feature.  Keeping the
         # CPU/stub default on the established rolling-slot model avoids making
@@ -439,9 +444,10 @@ class Qwen36Backend:
             # SGLang/FlashInfer compiles its FA2 module from the live query
             # shape. Pay that compile before the first admission; otherwise
             # TTFT includes a one-time 10--20s JIT stall.
-            self.pool.warmup_prefill_attention_driver(
-                batch=1, tokens_per_slot=self._prefill_chunk_tokens()
-            )
+            if not self._uses_dense_gguf:
+                self.pool.warmup_prefill_attention_driver(
+                    batch=1, tokens_per_slot=self._prefill_chunk_tokens()
+                )
 
         # -- prefix cache bookkeeping (same shape as LagunaBackend's) ------
         self._prefix_cache_tokens: list[list[int] | None] = [None] * num_slots
@@ -593,14 +599,11 @@ class Qwen36Backend:
     def supports_sampled_speculative_decode(self) -> bool:
         """Whether the active speculative driver supports sampled verify.
 
-        DSpark's captured verify path is greedy.  Its eager sampled fallback
-        reaches SparkInfer's legacy paged-attention ingress, which is not a
-        supported production kernel shape and raises at request time.  Keep
-        sampled DSpark traffic on the backend's ordinary sampler until that
-        kernel contract is implemented; greedy DSpark remains on the fast
-        verify path.
+        Legacy DSpark remains greedy-only.  DFlash2's selector exposes the
+        sparse proposal distribution required by exact rejection sampling;
+        its eager verify path is therefore eligible for sampled requests.
         """
-        return self._dspark is None
+        return self._dspark is None or getattr(self._dspark.draft_model, "is_dflash2", False)
 
     def enable_mtp(self, *, num_speculative_tokens: int, enable_resync: bool | None = None) -> None:
         """Attach the owned MTP round driver before any production slot is
@@ -655,6 +658,20 @@ class Qwen36Backend:
         from runtime.backends.qwen36_dspark import Qwen36DSparkEngine
 
         self._dspark = Qwen36DSparkEngine(self, draft_model)
+
+    def enable_dflash2(self, draft_model: Qwen36DSparkDraftForCausalLM) -> None:
+        """Attach an external Qwen3.8 DFlash2 draft through the DSpark driver.
+
+        DFlash2 deliberately reuses the existing target verify/rollback and
+        draft-cache ownership.  The model-specific distinction is carried by
+        ``draft_model.is_dflash2``; this explicit entry point keeps callers
+        from having to know that the shared engine is named after its older
+        DSpark implementation.
+        """
+
+        if not getattr(draft_model, "is_dflash2", False):
+            raise TypeError("enable_dflash2 requires a DFlash2 draft model")
+        self.enable_dspark(draft_model)
 
     def ensure_kv_blocks(self, num_blocks: int) -> None:
         """Commit at least ``num_blocks`` of the extensible KV pool's prefix

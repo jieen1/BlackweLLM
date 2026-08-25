@@ -42,6 +42,11 @@
 | `2026-08-10-sglang-dsv4-deep-dive.md` | **SGLang DeepSeek V4 完整调研**——MLA/MoE/HC 结构、SM120 注意力 kernel 选择（FlashInfer sparse_mla_sm120 + Triton tiled 备选）、MTP/DSpark verify 批量机制、decode 调度。结论：SGLang 无魔法 M=1 kernel，破墙靠 DSpark/MTP（M=γ+1）+ FP8/NVFP4 减字节 |
 | `2026-08-10-laguna-optimization-path.md` | **Laguna 性能优化完整路径调研**——CG decode 元数据烤进图、融合元数据 kernel、向量化纪律（5.6×）、fused_kv_scatter/fused_rms_norm、MoE 单 kernel 38μs/层、带宽账方法论（必须冷缓存）、DFlash M=16 摊销原理。DSV4 已抄 argmax 烤进图，缺 kernel 融合 + 布局重排 |
 | `2026-08-10-m1-decode-deep-dive.md` | **M=1 decode 深度调研结论总览**——四路交叉印证：q8_0 对齐是根因（非 latency）、ds4 实测数字、行动清单按 ROI |
+| `2026-08-21-qwen38-q6-sglang-mmq.md` | **Qwen3.8 Q6_K_XL 动态混合量化的 SGLang MMQ 适配实测**——Q6_SPLIT row-tail 与 Q5_K 伴随格式均已覆盖；最新 Q6-only fresh A/B 仅低个位数且未定案，Q5 MMQ 约慢 1.8%；全量 MMQ、MMVQ、固定形状 fast path 均被实测否决 |
+| `2026-08-21-qwen38-q6-sglang-tc-blockm.md` | **参考 SGLang tile reuse 的 Q6 packed TC 按形状 M-tile 优化**——M=8 保持 DFlash2 verify，Q5/Q6 大 prefill 按格式使用 `BLOCK_M=64`，其它大 M 使用 32；隔离 A/B TTFT 约降 64.5%、decode 约升 9.2%，输出 SHA/接受数不变 |
+| `2026-08-21-qwen38-q6-transient-prefill.md` | **Q6+DFlash2 transient prefill dequantization**——仅 M≥32 走短生命周期 BF16/cuBLAS，M=8 verify 保持 packed/Graph-safe；fresh A/B TTFT 约降 68.9%、请求 wall 约降 63.1%，接受率和输出 SHA 不变 |
+| `2026-08-23-qwen38-modelopt-gdn-batched-projections.md` | **Qwen3.8 Gittensor ModelOpt W4A4 GDN verify 批处理**——同口径 128K/c1/DSpark K=7/FP8 KV，decode 96.90→160.32 tok/s（+65.4%）、E2E 93.75→151.11 tok/s（+61.2%），接受统计与 completion SHA 不变；Unsloth mixed FP8 路径保持原有选择 |
+| `2026-08-23-qwen38-modelopt-fp4-quantizer.md` | **Gittensor ModelOpt W4A4 激活量化 A/B**——FlashInfer SM120 CuTe-DSL 量化在真实 DSpark 128K 服务中约提升 1.7–2.0%，接受统计与 completion SHA 不变；现为默认，`local` 通过环境变量回滚 |
 | `2026-08-10-dsv4-q8-warprow-gate-regression.md` | **DSV4 Q8_0 warp-per-row 优化未过门禁的完整说明**——单 kernel 正确（与 tl.dot maxdiff 0）但门禁 3-workload 漂移（0.99903 vs 基线 0.99999988）。含现象、已确证事实、尝试方案、未解疑点（soa_planes 懒构建与 graph pool 交互、逐层定位建议）。已回滚，门禁 PASS。**接手者先读此文档** |
 | `2026-08-10-dsv4-prefill-moe-kernel-deep-dive.md` | **DSV4 prefill MoE kernel 性能深挖**——dp4a 已落地并将 76 提到 129 tok/s；2026-08-11 复测 64-row 稳态 131.8–133.3 tok/s。MoE 占 M32 chunk 83%，route-M1 IQ2 解码已接近指令流上限；warp-row 只再快 1.2×。达到 1K 必须改为 bounded superchunk + expert-grouped Tensor-Core 路线。含长上下文状态和显存边界。 |
 | `2026-08-11-dsv4-phase2-int8-mma.md` | **Phase 2：IQ2 INT8 Tensor-Core grouped MoE**——exact `mma.sync.m16n8k16` 已落地并达到 cos 1.0；真实 1024-token 形状 gate+up 14.8 ms、grouped routed pipeline 32 ms（router/shared expert 未包含），未过旧 2K 的 router+routed+shared `<=6.5 ms/layer` kill gate。exact 路径保留为 oracle；K32 在 1K 新预算下重新成为主线，当前合同见 `../docs/dsv4-prefill-1k-implementation-plan.md`。 |
@@ -125,6 +130,7 @@ Track F（性能，机会主义）的输入。
 
 | 文件 | 内容 |
 |---|---|
+| `2026-08-20-qwen38-q6-dflash2-performance.md` | **Qwen3.8 Q6 GGUF + DFlash2 与现有 NVFP4 + DSpark 严格 A/B**：Q6 packed `51.255 tok/s`，resident BF16 `81.905 tok/s`，NVFP4+DSpark `232.045 tok/s`；三者均 `28/28` 接受且 Graph replay；resident 路径显著降低 Q6 prefill/verify，但仍慢于 NVFP4 |
 | `2026-08-19-qwen38-dspark-default-thinking-e2e.md` | **Qwen3.8 DSpark 默认路径验收**：清理进程自动选择 DSpark K=7；thinking 关闭与 32-token 限制均真实 HTTP 通过；预算边界保留 compact ragged verify 批处理并完成 CUDA Graph replay；4×131K 冷/热性能与历史 DSpark 基线在噪声范围内，输出 SHA 一致 |
 | `2026-08-19-qwen38-dspark-optimization-stop.md` | **Qwen3.8 DSpark 同口径 profiling 收敛记录**：4×131072、K=7、CG/prefix-cache/FP8 KV、同 prompt SHA 下，local warm `443.74/450.88 tok/s` 对 SGLang steady `392.49 tok/s`；FlashInfer target verify kernel 未显示 local 固有劣势；graph-fused context-KV、ragged tier、RMS/FP8 fusion 均无稳定净收益，未经证实的实验代码已清理，后续优化暂停并保留全部 fixture/trace 证据 |
 | `2026-08-16-w8a8-gemm-roofline-bandwidth-floor.md` | 🟢 **W8A8/W4A4 GEMM roofline 定案：decode 已至 DRAM 带宽地板**。真冷（每次冲刷 L2）测得大 GEMM 1024-1280 GB/s（57-71% 峰值）；nsys 表观 10.64ms/轮中 3.69ms 是 prefill 长尾混入（最小间隔 348ms>>轮 38ms 证明），剔除后真实 decode W8A8≈6.9ms 与真冷孤立求和吻合——**无隐藏缺口，kernel 无空间**。N32 tile 实验负面回退。bench 方法学教训：逐次 sync 放大、轮转足迹 ≤L2 造成双峰假象，真冷需足迹≥1.5×L2 或主动冲刷。剩余杠杆仅减字节/提有效 M/小 kernel 融合（~17%） |

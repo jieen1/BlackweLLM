@@ -164,15 +164,11 @@ class BFAttention(nn.Module):
         # vLLM's compiled C++ reshape_and_cache_flash). Single kernel per
         # layer instead of 6 Python ops (288→48 kernels/step).
         #
-        # fused_kv_scatter is FP8-only (always divides by scale and casts
-        # to float8e4nv) -- production KV cache dtype is always FP8 (see
-        # SelfBuiltAttentionPlaceholder's hardcoded kv_cache_dtype="fp8",
-        # runtime/model/plain_attention.py), so that's the only path
-        # exercised end-to-end. The plain-write branch below restores the
-        # pre-4e99b7c "non-fp8 caches keep their native representation,
-        # unscaled" guarantee for any non-FP8 kv_cache_torch_dtype -- it
-        # was silently dropped when the scatter moved from 6 Python ops to
-        # this single fused kernel, since the kernel was written FP8-only.
+        # fused_kv_scatter is FP8-only (it divides by scale and casts to
+        # float8e4nv). The target path uses it; DFlash2 deliberately keeps its
+        # draft cache in native BF16 and takes the plain-write branch below.
+        # That branch preserves the non-FP8 guarantee: native caches are
+        # written without quantization or checkpoint scale application.
         if sm is not None and k is not None and v is not None and self.kv_cache is not None:
             k_cache = self.kv_cache[0]
             v_cache = self.kv_cache[1]

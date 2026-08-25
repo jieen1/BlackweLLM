@@ -391,6 +391,9 @@ class ServerEngine:
         enable_dspark: bool = False,
         dspark_draft_model: str = "RadixArk/Qwen3.8-27B-DSpark",
         dspark_num_speculative_tokens: int = 7,
+        enable_dflash2: bool = False,
+        dflash2_draft_model: str = "/home/bot/models/Qwen3.8-27B-DFlash2",
+        dflash2_num_speculative_tokens: int = 7,
         checkpoint_budget_multiple: int | None = None,
         qwen_kv_mode: str = "legacy",
         qwen_kv_pool_bytes: int = 0,
@@ -434,15 +437,32 @@ class ServerEngine:
                 f"enable_dspark requires backend='qwen36' (got {backend!r}); "
                 "DSpark is the Qwen3.x external draft path"
             )
+        if enable_dflash2 and backend != "qwen36":
+            raise ValueError(
+                f"enable_dflash2 requires backend='qwen36' (got {backend!r}); "
+                "DFlash2 is the Qwen3.x external draft path"
+            )
+        if enable_dspark and enable_dflash2:
+            raise ValueError("DSpark and DFlash2 are mutually exclusive")
         if enable_dspark and (enable_dflash or enable_mtp):
             raise ValueError("DSpark is mutually exclusive with DFlash and MTP")
+        if enable_dflash2 and (enable_dflash or enable_mtp):
+            raise ValueError("DFlash2 is mutually exclusive with DFlash and MTP")
+        if enable_dflash2 and not enable_cudagraph:
+            raise ValueError("DFlash2 requires CUDA Graphs; do not disable enable_cudagraph")
         if dspark_num_speculative_tokens <= 0:
             raise ValueError("dspark_num_speculative_tokens must be positive")
-        if enable_dspark and enable_session_affinity:
-            raise ValueError("DSpark currently does not support session affinity")
+        if dflash2_num_speculative_tokens <= 0:
+            raise ValueError("dflash2_num_speculative_tokens must be positive")
+        if (enable_dspark or enable_dflash2) and enable_session_affinity:
+            raise ValueError("external Qwen speculative decoding does not support session affinity")
         self.enable_dspark = enable_dspark
         self.dspark_draft_model = dspark_draft_model
         self.dspark_num_speculative_tokens = dspark_num_speculative_tokens
+        self.enable_dflash2 = enable_dflash2
+        self.dflash2_draft_model = dflash2_draft_model
+        self.dflash2_num_speculative_tokens = dflash2_num_speculative_tokens
+        self._external_qwen_spec_enabled = enable_dspark or enable_dflash2
         self.checkpoint_budget_multiple = checkpoint_budget_multiple
         self.qwen_kv_extensible = qwen_kv_extensible
         self.qwen_kv_commit_buffer_gb = qwen_kv_commit_buffer_gb
@@ -516,6 +536,8 @@ class ServerEngine:
             # admission from accepting a request whose speculative tail cannot
             # fit before the draft checkpoint is loaded.
             self.K = dspark_num_speculative_tokens
+        elif enable_dflash2:
+            self.K = dflash2_num_speculative_tokens
 
         # CUDA Graph slot budget:
         # - Laguna decode CG (M=1) captures against ONE dedicated slot (the
@@ -619,7 +641,21 @@ class ServerEngine:
             # trust_remote_code=True; without it, config validation falls
             # onto a generic path that chokes on Laguna's yarn
             # rope_parameters (KeyError: 'original_max_position_embeddings').
-            self.tok = AutoTokenizer.from_pretrained(self.MODEL, trust_remote_code=True)
+            tokenizer_source = self.MODEL
+            is_qwen_gguf = backend == "qwen36" and Path(self.MODEL).suffix.casefold() == ".gguf"
+            if is_qwen_gguf:
+                tokenizer_source = os.environ.get("QSR_SERVER_TOKENIZER_PATH", "")
+                if not tokenizer_source:
+                    raise RuntimeError(
+                        "Qwen GGUF serving requires QSR_SERVER_TOKENIZER_PATH pointing "
+                        "to a compatible HuggingFace tokenizer directory"
+                    )
+                if not (Path(tokenizer_source) / "tokenizer.json").is_file():
+                    raise RuntimeError(
+                        f"Qwen GGUF tokenizer path {tokenizer_source!r} lacks tokenizer.json; "
+                        "set QSR_SERVER_TOKENIZER_PATH to a local tokenizer directory"
+                    )
+            self.tok = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
             if backend == "qwen36":
                 configured_effort = apply_qwen_default_reasoning_effort(self.tok)
                 if configured_effort is not None:
@@ -632,7 +668,7 @@ class ServerEngine:
             try:
                 from transformers import GenerationConfig
 
-                gen_cfg_eos = GenerationConfig.from_pretrained(self.MODEL).eos_token_id
+                gen_cfg_eos = GenerationConfig.from_pretrained(tokenizer_source).eos_token_id
             except Exception:
                 gen_cfg_eos = self.eos_token_id
             if isinstance(gen_cfg_eos, (list, tuple, set)):
@@ -760,7 +796,14 @@ class ServerEngine:
             # a DSpark-native surface so benchmark artifacts state exactly
             # which speculative engine produced them.
             "dspark_acceptance_histogram": (
-                [0] * (dspark_num_speculative_tokens + 2) if enable_dspark else []
+                [0]
+                * (
+                    dflash2_num_speculative_tokens + 2
+                    if enable_dflash2
+                    else dspark_num_speculative_tokens + 2
+                )
+                if enable_dspark or enable_dflash2
+                else []
             ),
             "dspark_rounds": 0,
             "dspark_accepted_tokens": 0,
@@ -890,7 +933,12 @@ class ServerEngine:
 
         from runtime.backends.qwen36 import Qwen36Backend
         from runtime.laguna_config import _resolve_laguna_model_dir
-        from runtime.model_loading import load_qwen36_dspark_draft_model, load_qwen36_model
+        from runtime.model_loading import (
+            load_qwen36_dspark_draft_model,
+            load_qwen36_model,
+            load_qwen38_dflash2_draft_model,
+            load_qwen38_gguf_model,
+        )
 
         if self.enable_dflash:
             # capabilities.speculative_decode is True for this backend (B3),
@@ -907,14 +955,35 @@ class ServerEngine:
             )
 
         max_model_len = self.blocks_per_slot * self.block_size
-        target_model_path = _resolve_laguna_model_dir(self.MODEL)
-        model = load_qwen36_model(
-            target_model_path,
-            device="cuda",
-            dtype=torch.bfloat16,
-            max_seq_len=max_model_len,
-            enable_mtp=self.enable_mtp,
-        )
+        requested_model_path = Path(self.MODEL)
+        if requested_model_path.suffix.casefold() == ".gguf":
+            if not requested_model_path.is_file():
+                raise FileNotFoundError(
+                    f"Qwen GGUF checkpoint does not exist: {requested_model_path}"
+                )
+            if self.enable_dspark:
+                raise ValueError(
+                    "legacy DSpark cannot be paired with a GGUF Qwen target; "
+                    "use enable_dflash2 with the Qwen3.8 DFlash2 checkpoint"
+                )
+            target_model_path = requested_model_path
+            model = load_qwen38_gguf_model(
+                target_model_path,
+                device="cuda",
+                dtype=torch.float32,
+                max_seq_len=max_model_len,
+                warmup_attention=False,
+            )
+            logger.info("Qwen GGUF target loaded from %s", target_model_path)
+        else:
+            target_model_path = _resolve_laguna_model_dir(self.MODEL)
+            model = load_qwen36_model(
+                target_model_path,
+                device="cuda",
+                dtype=torch.bfloat16,
+                max_seq_len=max_model_len,
+                enable_mtp=self.enable_mtp,
+            )
         dynamic_arena = self.qwen_kv_mode != "legacy"
         pool_bundles = None
         bundle_bytes = _qwen_kv_bundle_bytes(model, include_mtp=self.enable_mtp)
@@ -982,13 +1051,22 @@ class ServerEngine:
                     "QSR_PREFILL_CHUNK must be a positive integer, "
                     f"got {self._prefill_chunk_size}"
                 )
+        model_config = getattr(model, "config", {})
+        target_dtype = (
+            torch.bfloat16
+            if model_config.get("weight_format") == "gguf"
+            and model_config.get("gguf_compute_dtype") == "bfloat16"
+            else torch.float32
+            if model_config.get("weight_format") == "gguf"
+            else torch.bfloat16
+        )
         self.runner = Qwen36Backend(
             model,
             num_slots=self.num_slots,
             max_seq_len=max_model_len,
             block_size=self.block_size,
             device="cuda",
-            dtype=torch.bfloat16,
+            dtype=target_dtype,
             enable_prefix_cache=self.enable_prefix_cache,
             enable_persistent_prefix_cache=None,
             checkpoint_budget_multiple=self.checkpoint_budget_multiple,
@@ -1008,8 +1086,8 @@ class ServerEngine:
             speculative_k = (
                 self.mtp_num_speculative_tokens
                 if self.enable_mtp
-                else self.dspark_num_speculative_tokens
-                if self.enable_dspark
+                else self.K
+                if self._external_qwen_spec_enabled
                 else 0
             )
             self.runner.ensure_kv_blocks(1 + self.num_slots * (speculative_k + 2))
@@ -1050,8 +1128,32 @@ class ServerEngine:
                 draft_model.gamma,
                 self.runner._dspark.cg_status,  # noqa: SLF001 -- load-time observability
             )
+        if self.enable_dflash2:
+            draft_model = load_qwen38_dflash2_draft_model(
+                model,
+                draft_model_path=self.dflash2_draft_model,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            if draft_model.gamma != self.dflash2_num_speculative_tokens:
+                raise ValueError(
+                    "DFlash2 draft block size does not match the server reservation: "
+                    f"draft={draft_model.gamma}, configured={self.dflash2_num_speculative_tokens}"
+                )
+            self.runner.enable_dflash2(draft_model)
+            logger.info(
+                "Qwen DFlash2 speculative decode wired: draft=%s K=%d cg_status=%s",
+                self.dflash2_draft_model,
+                draft_model.gamma,
+                self.runner._dspark.cg_status,  # noqa: SLF001 -- load-time observability
+            )
         if self._enable_cudagraph:
             graph_batch_size = self.runner.capture_decode_cuda_graph()
+            if self.enable_dflash2 and graph_batch_size != self.num_slots:
+                raise RuntimeError(
+                    "DFlash2 requires a captured target decode CUDA Graph for every slot; "
+                    f"captured={graph_batch_size}, required={self.num_slots}"
+                )
             if graph_batch_size is not None:
                 logger.info(
                     "Qwen3.6 decode CUDA Graph captured at load (max batch_size=%d)",
@@ -1150,10 +1252,10 @@ class ServerEngine:
                 "(MTP is Qwen3.6's mechanism; DSV4's is DSpark, not served). "
                 "Start the server with QSR_SERVER_ENABLE_MTP=0."
             )
-        if self.enable_dspark:
+        if self._external_qwen_spec_enabled:
             raise ValueError(
-                "enable_dspark is not supported by the deepseek_v4 backend; "
-                "DSpark is not wired for DSV4 in this runtime"
+                "external Qwen speculative decoding is not supported by the deepseek_v4 backend; "
+                "DSpark/DFlash2 are not wired for DSV4 in this runtime"
             )
 
         max_model_len = self.blocks_per_slot * self.block_size
@@ -2416,7 +2518,7 @@ class ServerEngine:
             sampled_mtp_capable=getattr(
                 self.runner,
                 "supports_sampled_speculative_decode",
-                not self.enable_dspark,
+                not self._external_qwen_spec_enabled,
             ),
         )
 
@@ -2570,7 +2672,7 @@ class ServerEngine:
                 na = decision.get("num_accepted", 0)
                 if req.logprobs and "logprobs" in decision:
                     st.setdefault("logprobs_acc", []).extend(decision["logprobs"])
-                if self.enable_dspark:
+                if self._external_qwen_spec_enabled:
                     self.stats["dspark_rounds"] += 1
                     self.stats["dspark_accepted_tokens"] += na
                     dspark_hist = self.stats["dspark_acceptance_histogram"]
@@ -2623,7 +2725,7 @@ class ServerEngine:
                         break
                 if kept:
                     st["last_progress_round"] = self.stats["rounds"]
-                    if self.enable_dspark:
+                    if self._external_qwen_spec_enabled:
                         self.stats["dspark_committed_tokens"] += len(kept)
                 if matched_stop is not None:
                     self._drop_stop_pending_from_committed(st)

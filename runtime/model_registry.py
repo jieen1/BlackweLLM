@@ -40,6 +40,7 @@ from runtime.architecture import (
     UnsupportedArchitectureError,
     parse_architecture,
     parse_dsv4_gguf_architecture,
+    parse_qwen35_gguf_architecture,
     validate_text_only,
 )
 
@@ -118,7 +119,7 @@ SUPPORTED_QUANT_FORMATS: dict[str, frozenset[str | None]] = {
     # one that fits the 96 GB card; other mixes of the same model (IQ3_XXS,
     # MXFP4-lossless, ...) are different points on the size/quality curve and
     # are refused until deliberately added, per the (method, format) discipline.
-    "gguf": frozenset({"iq2_xs+q8_0"}),
+    "gguf": frozenset({"iq2_xs+q8_0", "q4_k+q5_k+q6_k+q8_0"}),
 }
 
 
@@ -269,10 +270,33 @@ def resolve_gguf_checkpoint(path: str | Path) -> Resolution:
     """
     header = read_gguf_header(Path(path))
     gguf_arch = header.kv.get("general.architecture")
+    if gguf_arch == "qwen35":
+        tensor_type_names = frozenset(tensor.type_name for tensor in header.tensors)
+        spec = parse_qwen35_gguf_architecture(
+            header.kv, tensor_type_names=tensor_type_names
+        )
+        validate_text_only(spec, language_model_only=True)
+        family = _family_for(spec)
+        if family.backend not in IMPLEMENTED_BACKENDS:
+            raise UnsupportedArchitectureError(
+                f"{spec.architecture!r} resolves to the {family.backend!r} backend, "
+                f"which is not implemented yet; implemented backends are "
+                f"{sorted(IMPLEMENTED_BACKENDS)}"
+            )
+        # The extra GGUF NextN block is not the existing safetensors MTP head;
+        # DFlash2 is an external companion and is enabled by its own opt-in
+        # launch path. Do not advertise speculative decoding until that pair
+        # has passed its correctness gate.
+        return Resolution(
+            spec=spec,
+            backend=family.backend,
+            loader=_loader_for(spec),
+            speculative=None,
+        )
     if gguf_arch != "deepseek4":
         raise UnsupportedArchitectureError(
             f"GGUF architecture {gguf_arch!r} is not supported; this runtime "
-            "only serves 'deepseek4' GGUF files (DeepSeek-V4 family)"
+            "only serves 'deepseek4' and 'qwen35' GGUF files"
         )
     tensor_type_names = frozenset(tensor.type_name for tensor in header.tensors)
     mtp_layers = sum(1 for t in header.tensors if t.name.startswith("mtp."))

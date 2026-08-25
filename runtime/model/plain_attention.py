@@ -10,8 +10,9 @@ runtime's ONE and ONLY attention kernel. This is not a placeholder or a
 system -- there is no second kernel anywhere on this runtime's roadmap,
 and this class is written on the assumption that there never will be.**
 Every attribute below is hardcoded to sparkinfer's real, single
-requirement (FP8 KV cache, no attention sinks, per-tensor not per-head KV
-scales) rather than derived through config-driven branching the way real
+kernel requirement (target FP8 KV cache or DFlash2 native BF16 cache, no
+attention sinks, per-tensor rather than per-head KV scales) rather than
+derived through config-driven branching the way real
 vLLM's ``Attention`` has to, because vLLM genuinely serves many backends/
 model families and this runtime genuinely does not. If this runtime ever
 needs a second attention kernel, that is a real architecture change --
@@ -46,12 +47,9 @@ laguna_cuda_graph.py, not guessed from vLLM's own internal usage:
   capture. Placeholder value only; always overwritten before first
   real forward.
 - ``kv_cache_dtype``/``kv_cache_torch_dtype``: read by bf_attention.py /
-  laguna.py respectively. ``kv_cache_torch_dtype`` specifically is only
-  consumed on a branch this runtime's real config never takes in
-  production (FP8 KV cache is always active -- verified via
-  EngineArgs.create_engine_config()), so it's computed defensively
-  rather than left unset, but is not GPU-bit-exact-critical the way
-  the scale handling below is.
+  laguna.py respectively. The target model uses FP8; the separate DFlash2
+  draft uses native BF16. Both are real production paths, so the dtype is
+  explicit rather than inferred from a generic cache policy.
 - ``sliding_window``/``is_swa``: NOT read off this object by laguna.py's
   layer-group bookkeeping (that logic recomputes window/group info
   straight from ``hf_config.layer_types``/``hf_config.sliding_window``,
@@ -84,10 +82,10 @@ laguna_cuda_graph.py, not guessed from vLLM's own internal usage:
   class's "positive/duplicate/no-scale" branching logic does NOT apply
   here at all.
 
-This runtime only ever runs one attention kernel (sparkinfer) against one
-checkpoint format (NVFP4, FP8 KV cache) -- so unlike vLLM's ``Attention``,
-which has to stay generic over many backends/quant schemes/model
-families, this class hardcodes that one real case directly instead of
+This runtime only ever runs one attention kernel (sparkinfer) against the
+target's NVFP4/FP8 cache and DFlash2's native BF16 cache -- so unlike vLLM's
+``Attention``, which has to stay generic over many backends/quant schemes/model
+families, this class hardcodes those two real cases directly instead of
 branching on config values to re-derive it (no "is kv_cache_dtype auto,
 fp8, or something else" resolution, no backend registry, no
 ``AttentionBackendEnum``/``get_attn_backend`` real implementation,
@@ -136,6 +134,7 @@ class SelfBuiltAttentionPlaceholder(nn.Module):
         per_layer_sliding_window: int | None = None,
         prefix: str = "",
         sinks: torch.Tensor | None = None,
+        kv_cache_dtype: str = "fp8",
     ) -> None:
         # sparkinfer has no attention-sink kernel, and Laguna's real
         # config never sets attention_sink=True (verified against the
@@ -153,21 +152,18 @@ class SelfBuiltAttentionPlaceholder(nn.Module):
         self.sliding_window = per_layer_sliding_window
         self.is_swa = per_layer_sliding_window is not None
 
-        # This runtime's one real KV-cache dtype, hardcoded rather than
-        # re-derived (see module docstring's architectural premise): FP8,
-        # always -- true for BOTH real models this runtime loads, verified
-        # directly rather than assumed to be the same reason for both:
-        # the main model's checkpoint declares a real FP8 kv_cache_scheme
-        # (real Attention.__init__ would resolve cache_dtype to "fp8" from
-        # it too); the DFlash draft model's checkpoint has NO
-        # quantization_config at all (confirmed against its config.json),
-        # but its KV cache is still unconditionally allocated as FP8
-        # (stored uint8) by runtime/backends/laguna_dflash.py's
-        # _alloc_draft_kv_cache -- a hardcoded decision independent of
-        # cache_config/quant_config, not something this class needs to
-        # rederive either.
-        self.kv_cache_dtype = "fp8"
-        self.kv_cache_torch_dtype = torch.float8_e4m3fn
+        if kv_cache_dtype not in {"fp8", "bfloat16"}:
+            raise ValueError(
+                "unsupported self-built attention KV cache dtype: "
+                f"{kv_cache_dtype!r}; expected 'fp8' or 'bfloat16'"
+            )
+        # The target model uses FP8. DFlash2 is a separate BF16 checkpoint
+        # whose reference implementation uses a BF16 DynamicCache; its draft
+        # layers opt into bfloat16 explicitly at construction time.
+        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_cache_torch_dtype = (
+            torch.float8_e4m3fn if kv_cache_dtype == "fp8" else torch.bfloat16
+        )
 
         # Placeholder; always overwritten by bind_kv_cache()/laguna.py
         # before any real forward call (see module docstring).
@@ -203,7 +199,9 @@ class SelfBuiltAttentionPlaceholder(nn.Module):
         # "attn_head") KV-cache quantization strategy -- see module
         # docstring.
         self.has_checkpoint_kv_scale = (
-            quant_config is not None and quant_config.kv_cache_scheme is not None
+            self.kv_cache_dtype == "fp8"
+            and quant_config is not None
+            and quant_config.kv_cache_scheme is not None
         )
         if self.has_checkpoint_kv_scale:
             cache_config.cache_dtype = "fp8"

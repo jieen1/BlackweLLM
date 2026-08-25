@@ -139,27 +139,113 @@ NVFP4_GROUP_SIZE = 16
 
 QUANT_ALGO_FP8 = "FP8"
 QUANT_ALGO_NVFP4 = "W4A16_NVFP4"
+QUANT_ALGO_NVFP4_W4A4 = "W4A4_NVFP4"
 QUANT_ALGO_UNQUANTIZED = "unquantized"
 
-_KNOWN_ALGOS = (QUANT_ALGO_FP8, QUANT_ALGO_NVFP4)
+_KNOWN_ALGOS = (QUANT_ALGO_FP8, QUANT_ALGO_NVFP4, QUANT_ALGO_NVFP4_W4A4)
+
+
+def _is_static_w4a4_group(group: Any) -> bool:
+    """Return whether a ModelOpt config group declares static NVFP4 W4A4.
+
+    Older Qwen ModelOpt exports describe W4A16 with a weight-only group and
+    therefore have no activation scheme.  Qwen3.8's RTX5090 export instead
+    has one compact group with both operands declared as static 4-bit float,
+    block size 16.  Keep this predicate deliberately strict so a future
+    ModelOpt group is not silently routed through the wrong ABI.
+    """
+    if not isinstance(group, dict) or group.get("targets") != ["Linear"]:
+        return False
+    weights = group.get("weights")
+    activations = group.get("input_activations")
+    return all(
+        isinstance(spec, dict)
+        and spec.get("type") == "float"
+        and spec.get("num_bits") == 4
+        and spec.get("group_size") == NVFP4_GROUP_SIZE
+        and spec.get("dynamic") is False
+        for spec in (weights, activations)
+    )
+
+
+def _modelopt_w4a4_layers_map(config: dict[str, Any]) -> dict[str, str]:
+    """Expand Qwen3.8's coarse ModelOpt W4A4 group to graph module names.
+
+    The export intentionally omits ``quantized_layers``.  Its ``Linear``
+    target plus the architecture's ``layer_types`` is sufficient to name the
+    text projections that the self-built Qwen graph constructs.  Modules in
+    ``ignore`` (embedding, lm_head, GDN conv/a/b, vision and MTP) remain
+    unquantized by construction and are not included here.
+    """
+    quant_config = config.get("quantization_config")
+    if not isinstance(quant_config, dict):
+        return {}
+    groups = quant_config.get("config_groups")
+    if not isinstance(groups, dict) or not any(
+        _is_static_w4a4_group(group) for group in groups.values()
+    ):
+        return {}
+
+    layer_types = config.get("layer_types")
+    num_layers = int(config.get("num_hidden_layers", 0))
+    if not isinstance(layer_types, list) or len(layer_types) != num_layers:
+        raise ValueError(
+            "static ModelOpt W4A4 requires a layer_types list matching "
+            f"num_hidden_layers={num_layers}; got {type(layer_types).__name__} "
+            f"with length {len(layer_types) if isinstance(layer_types, list) else 'n/a'}"
+        )
+
+    quantized: dict[str, str] = {}
+    for layer_idx, layer_type in enumerate(layer_types):
+        prefix = f"model.language_model.layers.{layer_idx}"
+        if layer_type == "linear_attention":
+            projections = (
+                "linear_attn.in_proj_qkv",
+                "linear_attn.in_proj_z",
+                "linear_attn.out_proj",
+            )
+        elif layer_type == "full_attention":
+            projections = (
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+            )
+        else:
+            raise ValueError(
+                f"static ModelOpt W4A4 has unsupported Qwen layer_types[{layer_idx}]="
+                f"{layer_type!r}"
+            )
+        for projection in (
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+            *projections,
+        ):
+            quantized[f"{prefix}.{projection}"] = QUANT_ALGO_NVFP4_W4A4
+    return quantized
 
 
 def quantized_layers_map(config: dict[str, Any]) -> dict[str, str]:
-    """Return ``{module_dotted_name: quant_algo}`` from ``config.json``'s
-    ``quantization_config.quantized_layers``. Empty dict (never ``None``)
-    when the checkpoint declares no quantization at all, so callers can
-    always do a plain ``dict.get(name)`` without a None-check first."""
+    """Return ``{module_dotted_name: quant_algo}`` for a ModelOpt export.
+
+    Legacy Qwen exports carry an explicit ``quantized_layers`` mapping.  The
+    Qwen3.8 static W4A4 export uses the newer coarse ``config_groups`` form;
+    that form is expanded from its architecture metadata by
+    :func:`_modelopt_w4a4_layers_map`.
+    """
     quant_config = config.get("quantization_config")
     if not isinstance(quant_config, dict):
         return {}
     layers = quant_config.get("quantized_layers")
-    if not isinstance(layers, dict):
-        return {}
-    return {name: entry.get("quant_algo") for name, entry in layers.items()}
+    if isinstance(layers, dict):
+        return {name: entry.get("quant_algo") for name, entry in layers.items()}
+    return _modelopt_w4a4_layers_map(config)
 
 
 def classify_module(module_name: str, quantized: dict[str, str]) -> str:
     """Which of :data:`QUANT_ALGO_FP8` / :data:`QUANT_ALGO_NVFP4` /
+    :data:`QUANT_ALGO_NVFP4_W4A4` /
     :data:`QUANT_ALGO_UNQUANTIZED` ``module_name`` (a dotted module path
     with no ``.weight``/``.weight_scale`` etc. suffix, e.g.
     ``"model.language_model.layers.0.mlp.gate_proj"``) is.

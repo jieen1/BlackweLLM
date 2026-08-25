@@ -21,6 +21,7 @@ default of ON, so the flag's existence is itself a specification.
 from __future__ import annotations
 
 import importlib
+import os
 import pathlib
 
 import pytest
@@ -128,6 +129,86 @@ class TestQwenDSparkDefault:
         assert app_mod.SERVER_ENABLE_MTP is False
         assert app_mod.SERVER_BLOCK_SIZE == 128
         assert app_mod.SERVER_QWEN_KV_MODE == "elastic"
+
+    def test_qwen_gguf_defaults_to_fla_gdn_prefill(self, monkeypatch):
+        app_mod = _reimport_app_with(
+            monkeypatch,
+            QSR_SERVER_MODEL_PATH="/models/Qwen3.8-27B-UD-Q6_K_XL.gguf",
+            QSR_SERVER_BACKEND="qwen36",
+            QSR_SERVER_ENABLE_DFLASH2="1",
+            QSR_SERVER_ENABLE_DSPARK="0",
+            QSR_SERVER_ENABLE_MTP="0",
+            QSR_SERVER_ENABLE_CUDAGRAPH="1",
+            QSR_QWEN36_GDN_PREFILL_BACKEND=None,
+            QSR_GGUF_DEQUANTIZE_WEIGHTS=None,
+            QSR_GGUF_NATIVE_PREFILL_DEQUANT=None,
+        )
+
+        app_mod._apply_qwen_dspark_runtime_defaults()
+        assert os.environ["QSR_QWEN36_GDN_PREFILL_BACKEND"] == "fla"
+        assert os.environ["QSR_GGUF_DEQUANTIZE_WEIGHTS"] == "0"
+        assert os.environ["QSR_GGUF_NATIVE_PREFILL_DEQUANT"] == "1"
+
+    def test_qwen_gguf_resident_bf16_opt_out_is_preserved(self, monkeypatch):
+        app_mod = _reimport_app_with(
+            monkeypatch,
+            QSR_SERVER_MODEL_PATH="/models/Qwen3.8-27B-UD-Q6_K_XL.gguf",
+            QSR_SERVER_BACKEND="qwen36",
+            QSR_SERVER_ENABLE_DFLASH2="1",
+            QSR_SERVER_ENABLE_DSPARK="0",
+            QSR_GGUF_DEQUANTIZE_WEIGHTS="0",
+            QSR_GGUF_NATIVE_PREFILL_DEQUANT=None,
+        )
+
+        app_mod._apply_qwen_dspark_runtime_defaults()
+        assert os.environ["QSR_GGUF_DEQUANTIZE_WEIGHTS"] == "0"
+        assert os.environ["QSR_GGUF_NATIVE_PREFILL_DEQUANT"] == "1"
+
+    def test_qwen_gguf_transient_prefill_opt_out_is_preserved(self, monkeypatch):
+        app_mod = _reimport_app_with(
+            monkeypatch,
+            QSR_SERVER_MODEL_PATH="/models/Qwen3.8-27B-UD-Q6_K_XL.gguf",
+            QSR_SERVER_BACKEND="qwen36",
+            QSR_SERVER_ENABLE_DFLASH2="1",
+            QSR_SERVER_ENABLE_DSPARK="0",
+            QSR_GGUF_NATIVE_PREFILL_DEQUANT="0",
+        )
+
+        app_mod._apply_qwen_dspark_runtime_defaults()
+        assert os.environ["QSR_GGUF_NATIVE_PREFILL_DEQUANT"] == "0"
+
+    def test_qwen_gguf_target_only_defaults_to_bf16_graph(self, monkeypatch):
+        app_mod = _reimport_app_with(
+            monkeypatch,
+            QSR_SERVER_MODEL_PATH="/models/Qwen3.8-27B-UD-Q6_K_XL.gguf",
+            QSR_SERVER_BACKEND="qwen36",
+            QSR_SERVER_ENABLE_DFLASH2="0",
+            QSR_SERVER_ENABLE_DSPARK="0",
+            QSR_SERVER_ENABLE_MTP="0",
+            QSR_GGUF_COMPUTE_DTYPE=None,
+        )
+
+        app_mod._apply_qwen_dspark_runtime_defaults()
+        assert os.environ["QSR_GGUF_COMPUTE_DTYPE"] == "bf16"
+
+    def test_qwen_gguf_selects_qwen3_coder_tool_parser(self, monkeypatch):
+        app_mod = _reimport_app_with(
+            monkeypatch,
+            QSR_SERVER_MODEL_PATH="/models/Qwen3.8-27B-UD-Q6_K_XL.gguf",
+            QSR_SERVER_BACKEND="qwen36",
+            QSR_TOOL_CALL_PARSER=None,
+        )
+
+        assert app_mod.SERVER_TOOL_CALL_PARSER == "qwen3_coder"
+
+    def test_laguna_keeps_poolside_tool_parser_default(self, monkeypatch):
+        app_mod = _reimport_app_with(
+            monkeypatch,
+            QSR_SERVER_MODEL_PATH="poolside/Laguna-S-2.1-NVFP4",
+            QSR_TOOL_CALL_PARSER=None,
+        )
+
+        assert app_mod.SERVER_TOOL_CALL_PARSER == "poolside_v1"
 
 
 class TestFlagShapeMatchesDefault:

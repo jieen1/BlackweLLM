@@ -375,7 +375,10 @@ def check_torch_version(gpu: GpuProbe | None = None) -> CheckResult:
     """
     gpu = gpu if gpu is not None else probe_gpu()
     required = " or ".join(".".join(map(str, v)) for v in VERIFIED_TORCH_VERSIONS)
-    expected = f"{required} (release segment only; verified builds: 2.13.0a0+gitcf30153, {VERIFIED_TORCH_VERSION})"
+    expected = (
+        f"{required} (release segment only; verified builds: "
+        f"2.13.0a0+gitcf30153, {VERIFIED_TORCH_VERSION})"
+    )
     if not gpu.torch_importable or gpu.torch_version is None:
         return CheckResult(
             name="torch_version",
@@ -671,27 +674,26 @@ def check_checkpoint_config(checkpoint_path: str | Path) -> CheckResult:
     if path.is_file() and path.suffix == ".gguf":
         # GGUF checkpoints carry no config.json; the header KV pairs are the
         # identity (registry's resolve_gguf_checkpoint parses them).  Verify
-        # the header parses as a DSV4 file here so a corrupt/mismatched
-        # GGUF fails fast at preflight rather than mid-load.
+        # the header parses as one of the GGUF architectures this runtime
+        # serves so a corrupt/mismatched file fails fast at preflight rather
+        # than mid-load.
         try:
             from loader.gguf_header import read_gguf_header
 
             header = read_gguf_header(path)
             arch = header.kv.get("general.architecture")
             actual = f"gguf arch={arch!r} tensors={len(header.tensors)}"
-            expected = "a parseable deepseek4 GGUF header"
-            passed = arch == "deepseek4"
-            remediation = (
-                "Verify the GGUF file is the DeepSeek-V4-Flash quant-mix "
-                "artifact (bullerwins/DeepSeek-V4-Flash-0731-GGUF)."
-            )
+            expected_architectures = {"deepseek4", "qwen35"}
+            expected = "a parseable deepseek4 or qwen35 GGUF header"
+            passed = arch in expected_architectures
+            remediation = "Verify the GGUF file belongs to a supported runtime architecture."
         except Exception as exc:  # noqa: BLE001 - any header failure is fatal here
             return CheckResult(
                 name="checkpoint_config",
                 passed=False,
                 severity="fatal",
                 actual=f"cannot read/parse GGUF header: {exc}",
-                expected="a parseable deepseek4 GGUF header",
+                expected="a parseable deepseek4 or qwen35 GGUF header",
                 remediation="Re-download or repair the GGUF; the header is corrupt/unreadable.",
             )
         return CheckResult(

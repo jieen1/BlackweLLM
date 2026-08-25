@@ -49,6 +49,8 @@ kept as historical/rollback settings.
 | --- | --- | --- | --- | --- |
 | `QSR_SERVER_CAPACITY` | `--capacity` | 4 (Qwen), 1 (Laguna) | 4 | concurrent production slots |
 | `QSR_SERVER_NUM_SLOTS` | `--num-slots` | 4 (Qwen), 2 (Laguna) | 4 | total physical slots |
+| `QSR_SERVER_MODEL_PATH` | — | Laguna HF id | deployment-specific | checkpoint path or HF id |
+| `QSR_SERVER_TOKENIZER_PATH` | — | unset | deployment-specific | required for a local Qwen GGUF target; compatible HF tokenizer directory |
 | `QSR_SERVER_BLOCK_SIZE` | — | 128 (Qwen), 64 (Laguna) | 128 | KV block size (tokens/block); Laguna sparkinfer requires 64 |
 | `QSR_SERVER_BLOCKS_PER_SLOT` | `--blocks-per-slot` | 2048 | 2048 | per-slot KV ceiling (`× block_size` tokens) ⇒ **256K** for Qwen, **128K** for Laguna |
 | `QSR_SERVER_ENABLE_CUDAGRAPH` | `--no-cudagraph` | 1 | 1 | captured decode graph |
@@ -59,6 +61,19 @@ kept as historical/rollback settings.
 | `QSR_SERVER_MTP_K` | `--mtp-k` | 4 | 3 | MTP speculative depth (historical K=3) |
 | `QSR_SERVER_ENABLE_DSPARK` | `--dspark` | 1 (Qwen), 0 (Laguna) | 1 | default Qwen speculative decoding path |
 | `QSR_SERVER_DSPARK_K` | `--dspark-k` | 7 | 7 | DSpark draft depth |
+| `QSR_QWEN36_GDN_BATCH_LARGE_PROJECTIONS` | — | `auto` | `auto` | batch GDN `qkvz`/`out_proj` over the DSpark verify window for native ModelOpt W4A4 (and qualified raw-FP8); `0` restores the sequential rollback path, `1` forces the experiment |
+| `QSR_QWEN36_MODEL_OPT_FP4_QUANT` | — | `flashinfer` | `local` | ModelOpt W4A4 activation quantizer; default selects SGLang's SM120 CuTe-DSL implementation, while `local` is the rollback |
+| `QSR_QWEN36_DSPARK_FAST_SLOT_MAPPING` | — | `1` | `1` | use host-known contiguous position bounds in DSpark cache mapping; `0` restores generic GPU min/max validation for A/B diagnostics |
+| `QSR_SERVER_ENABLE_DFLASH2` | `--dflash2` | 0 | 0 | opt-in Qwen3.8 Q6 GGUF + DFlash2 path; CUDA Graph is mandatory |
+| `QSR_SERVER_DFLASH2_DRAFT_MODEL` | `--dflash2-draft-model` | `/home/bot/models/Qwen3.8-27B-DFlash2` | local | DFlash2 draft directory or cached model id |
+| `QSR_SERVER_DFLASH2_K` | `--dflash2-k` | 7 | 7 | DFlash2 proposal depth (`block_size=8` → 7 proposals) |
+| `QSR_GGUF_DEQUANTIZE_WEIGHTS` | — | 0 | 0 for Q6+DFlash2 | resident BF16 cuBLAS weights; adds about 26.7 GiB in the measured capacity-1 process; set 1 for the resident-BF16 rollback |
+| `QSR_GGUF_NATIVE_PREFILL_DEQUANT` | — | 0 | 1 for Q6+DFlash2 | transient BF16/cuBLAS only for genuine prefill batches (M≥32); DFlash2 M=8 verify remains packed and graph-safe; 512 MiB per-projection cap by default |
+| `QSR_GGUF_TC_BLOCK_M` | — | `auto` | `auto` | packed Q6 tensor-core M tile: 8 for DFlash2 verify, 32 for ordinary small batches, Q5/Q6 widen to 64 for large prefill; numeric 8/16/32/64 values are A/B overrides |
+| `QSR_GGUF_NATIVE_MMQ` | — | 0 | 0 | experimental SGLang-style Q6_K MMQ; only M=8 DFlash2 verify and wide MLP shapes; latest fresh A/B is about +1.4% over a two-sample baseline, so default TC stays unchanged |
+| `QSR_GGUF_NATIVE_MMQ_Q5` | — | 0 | 0 | separate Q5_K MMQ experiment for Qwen3.8's dynamic Q6_K_XL file; latest fixed 4K+DFlash2 A/B was about 1.8% slower, so it remains disabled |
+| `QSR_GGUF_NATIVE_MMQ_Q8` | — | 0 | 0 | separate Q8_0 MMQ experiment; disabled by default because the fixed 4K smoke fell to 16/31 DFlash2 acceptance and changed output SHA |
+| `QSR_GGUF_NATIVE_MMQ_LM_HEAD` | — | 0 | 0 | separate Q8_0 vocabulary-head MMQ A/B; the isolated kernel is faster at N=248320 but the fresh end-to-end decode result was not a stable net gain, so it remains opt-in |
 | `QSR_SERVER_ENABLE_DFLASH` | `--dflash` | 0 | 0 | DFlash speculative engine (Laguna) |
 | `QSR_SERVER_KV_CACHE_DTYPE` | — | fp8_e4m3 (Qwen), auto (Laguna) | fp8_e4m3 | KV cache dtype |
 | `QSR_QWEN_KV_MODE` | `--qwen-kv-mode` | elastic (Qwen), legacy (Laguna) | elastic | Qwen KV allocation mode |
@@ -72,6 +87,69 @@ kept as historical/rollback settings.
 | `QSR_DEBUG_REQUESTS` | — | 1 | 1 | log raw request/response (see **Raw I/O logging**); legacy alias `QSR_DEBUG_ANTHROPIC` |
 
 CLI also accepts `--host` / `--port` (default `127.0.0.1:8000`).
+
+### Qwen3.8 Q6_K_XL + DFlash2
+
+The native Qwen3.8 path accepts the local `unsloth/Qwen3.8-27B-GGUF`
+`Qwen3.8-27B-UD-Q6_K_XL.gguf` checkpoint and the separate DFlash2 draft
+directory. It keeps Q/K/V and the full-attention reduction in F32, uses the
+native SM120 GGUF kernels, and captures target decode, DFlash2 draft, and
+fixed/ragged verify CUDA Graphs. DFlash2 refuses startup if any required Graph
+is disabled or fails to capture; the existing NVFP4 service remains unchanged
+because this path is opt-in.
+
+The server profile defaults this explicit Q6+DFlash2 path to compact packed
+weights plus transient BF16 prefill dequantization. For each genuine
+prefill-sized projection, one BF16 matrix is created, used by cuBLAS, and
+released; DFlash2's M=8 eager warmups and all captured verify/decode graphs stay
+on the packed tensor-core path. This avoids the resident model-sized BF16
+cache while materially reducing Q6 TTFT. Set
+`QSR_GGUF_NATIVE_PREFILL_DEQUANT=0` to keep the fully packed path, or set
+`QSR_GGUF_DEQUANTIZE_WEIGHTS=1` to select the resident-BF16 rollback. The local
+`.gguf` path also selects the Qwen3.8 `qwen3_coder` tool parser automatically;
+`QSR_TOOL_CALL_PARSER` remains an explicit override.
+
+For a controlled packed-path experiment, set `QSR_GGUF_NATIVE_MMQ=1` together
+with the Q6 split/Q8 activation settings. The route is shape-gated and does not
+change resident BF16 mode, prefill, M=1 decode, or the existing NVFP4 service.
+`QSR_GGUF_NATIVE_MMQ_Q5=1` is a separate opt-in for the Q5 gate matrices inside
+the same dynamic Q6_K_XL file; it is not a different checkpoint and is not part
+of the recommended profile.
+`QSR_GGUF_NATIVE_MMQ_Q8=1` is intentionally not part of the recommended profile
+until its quality regression is fixed.
+`QSR_GGUF_NATIVE_MMQ_LM_HEAD=1` is a narrower vocabulary-head experiment;
+although the isolated `N=248320` kernel is faster, the fresh end-to-end Q6
+decode A/B did not show a stable net gain, so it remains disabled by default.
+
+Example (use an isolated process and the `torch-nightly` environment):
+
+```bash
+QSR_SERVER_MODEL_PATH=/home/bot/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q6_K_XL.gguf \
+QSR_SERVER_TOKENIZER_PATH=/home/bot/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-NVFP4/snapshots/9c73e2daee1d0fd494ffbd1d8753f2174a953796 \
+QSR_SERVER_ENABLE_DFLASH2=1 \
+QSR_SERVER_DFLASH2_DRAFT_MODEL=/home/bot/models/Qwen3.8-27B-DFlash2 \
+python -m server.app --dflash2
+```
+
+The DFlash2 loader expects a model directory (or its `config.json`), not the
+binary `model.safetensors` file. Under the same isolated 4K/c=1/32-token
+workload, the earlier shape-aware packed-TC-only path
+(`QSR_GGUF_DEQUANTIZE_WEIGHTS=0`, `QSR_GGUF_TC_BLOCK_M=auto`) reached
+**84.605 tok/s decode**, **5.444 s TTFT**, and **5.814 s/request** warm mean;
+the previous fixed-M=8 compact baseline was **77.465 tok/s**, **15.338 s TTFT**,
+and **15.741 s/request**. The current default adds transient prefill
+dequantization: a fresh A/B measured warm TTFT **1.163 s** and wall
+**1.519 s** (two warm samples), with decode in the same noise band at about
+**87.7 tok/s**. Resident BF16 is an explicit rollback; its earlier
+fresh-process result was **81.905 tok/s** with **3.71 s TTFT**. The existing
+NVFP4+DSpark profile reached **232.045 tok/s** with **0.6365 s TTFT**. The
+SGLang-derived change is shape-aware: forcing M=32 everywhere improved prefill
+but reduced DFlash2 decode to about 68 tok/s, so the fixed M=8 verify tile is
+preserved. All Q6 variants in this A/B had 28/31 DFlash2 acceptance and the
+same completion SHA; the required Graph replays remained captured. The full
+quality/long-context/concurrency benchmark is a separate gate; raw methodology
+and caveats are in
+[`notes/2026-08-20-qwen38-q6-dflash2-performance.md`](../notes/2026-08-20-qwen38-q6-dflash2-performance.md).
 
 ### Long context (256K)
 

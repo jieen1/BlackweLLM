@@ -119,6 +119,51 @@ def test_cuda_graph_health_is_vacuously_true_before_capture() -> None:
     assert engine.cuda_graphs_healthy() is False
 
 
+def test_slot_mapping_uses_host_known_contiguous_range_without_gpu_reduction() -> None:
+    engine = Qwen36DSparkEngine.__new__(Qwen36DSparkEngine)
+    engine.device = torch.device("cpu")
+    engine.pages_per_slot = 8
+    engine.page_size = 16
+    engine.max_seq_len = 64
+    engine._fast_slot_mapping = True
+
+    positions = torch.arange(12, 16, dtype=torch.long)
+
+    assert engine._slot_mapping(
+        2,
+        positions,
+        position_start=12,
+        position_count=4,
+    ).tolist() == [268, 269, 270, 271]
+
+    with pytest.raises(ValueError, match="does not match positions"):
+        engine._slot_mapping(
+            2,
+            positions,
+            position_start=12,
+            position_count=3,
+        )
+    with pytest.raises(RuntimeError, match="outside cache"):
+        engine._slot_mapping(
+            2,
+            positions,
+            position_start=62,
+            position_count=4,
+        )
+
+
+def test_slot_mapping_rollback_keeps_arbitrary_position_validation() -> None:
+    engine = Qwen36DSparkEngine.__new__(Qwen36DSparkEngine)
+    engine.device = torch.device("cpu")
+    engine.pages_per_slot = 8
+    engine.page_size = 16
+    engine.max_seq_len = 64
+    engine._fast_slot_mapping = False
+
+    with pytest.raises(RuntimeError, match="outside cache"):
+        engine._slot_mapping(0, torch.tensor([-1, 2], dtype=torch.long))
+
+
 def test_compact_without_dynamic_policy_uses_full_ragged_width() -> None:
     engine = Qwen36DSparkEngine.__new__(Qwen36DSparkEngine)
     engine.verify_mode = "compact"

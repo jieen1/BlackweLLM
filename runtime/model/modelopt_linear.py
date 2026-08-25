@@ -115,6 +115,9 @@ metric reads directly.
 
 from __future__ import annotations
 
+import logging
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -125,6 +128,60 @@ from runtime.loading.modelopt import (
     dequantize_nvfp4,
 )
 from runtime.model._weight_loading import default_weight_loader
+
+logger = logging.getLogger("qwen_sm120_runtime.modelopt_linear")
+
+# The Qwen3.8 Gittensor export is the only production format that enters the
+# native ModelOpt W4A4 classes below.  Keep its activation-quantizer A/B
+# isolated from the legacy W4A16 ModelOpt and compressed-tensors/Unsloth
+# routes.  ``flashinfer`` is the SM120 default, matching the CuTe-DSL
+# quantizer selected by SGLang; ``local`` remains the explicit rollback.
+QSR_QWEN36_MODEL_OPT_FP4_QUANT_ENV = "QSR_QWEN36_MODEL_OPT_FP4_QUANT"
+
+
+def _modelopt_flashinfer_fp4_quant_enabled() -> bool:
+    """Return whether ModelOpt W4A4 uses SGLang's SM120 quantizer."""
+
+    value = os.environ.get(QSR_QWEN36_MODEL_OPT_FP4_QUANT_ENV, "flashinfer").strip().lower()
+    if value not in {"local", "flashinfer"}:
+        logger.warning(
+            "ignoring invalid %s=%r; expected local or flashinfer",
+            QSR_QWEN36_MODEL_OPT_FP4_QUANT_ENV,
+            value,
+        )
+        return False
+    return value == "flashinfer"
+
+
+def _quantize_modelopt_w4a4_activation(
+    x: torch.Tensor, global_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a ModelOpt W4A4 activation into grouped b12x scale storage.
+
+    The local Triton quantizer returns linear E4M3 scales, while FlashInfer
+    returns the final 128x4-swizzled storage.  Normalize both here so the two
+    W4A4 callers below differ only in the quantization kernel, not in the
+    ``blockscaled.mm`` ABI.  The production default is FlashInfer's SM120
+    CuTe-DSL implementation; ``QSR_QWEN36_MODEL_OPT_FP4_QUANT=local`` is the
+    rollback for A/B and debugging.
+    """
+
+    if _modelopt_flashinfer_fp4_quant_enabled():
+        from runtime.model.flashinfer_nvfp4 import quantize_nvfp4_activation
+
+        packed, swizzled = quantize_nvfp4_activation(x, global_scale, backend="cute-dsl")
+        return packed, swizzled.unsqueeze(0).view(torch.uint8)
+
+    from runtime.backends._sparkinfer_import import ensure_sparkinfer_path
+
+    ensure_sparkinfer_path()
+    from b12x._lib.intrinsics import swizzle_block_scale
+
+    from runtime.kernels.nvfp4_quant import quantize_nvfp4_activation
+
+    packed, linear = quantize_nvfp4_activation(x, global_scale)
+    storage = swizzle_block_scale(linear.view(torch.float8_e4m3fn).unsqueeze(0)).view(torch.uint8)
+    return packed, storage
 
 
 class ModelOptFP8Linear(nn.Module):
@@ -291,3 +348,272 @@ class ModelOptNVFP4Linear(nn.Module):
         for name in ("weight", "weight_scale", "weight_scale_2"):
             param = getattr(self, name)
             param.data = param.data.new_empty(0)
+
+
+class ModelOptNVFP4W4A4Linear(ModelOptNVFP4Linear):
+    """Static ModelOpt NVFP4 W4A4 Linear for the Qwen3.8 export.
+
+    This is intentionally a separate class from :class:`ModelOptNVFP4Linear`:
+    the older Qwen3.6 ModelOpt checkpoint is W4A16 and must retain its
+    weight-only semantics.  Qwen3.8 stores a real activation-side
+    ``input_scale`` and declares both operands as static block-16 NVFP4.
+    On CUDA this class builds the same SM120 ``blockscaled.mm`` operand ABI
+    used by ``Qwen36MLP``; on CPU/non-CUDA it falls back to the exact
+    BF16-dequant reference so loader and shape tests remain torch-only.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        group_size: int = NVFP4_GROUP_SIZE,
+        bias: bool = False,
+    ) -> None:
+        super().__init__(input_size, output_size, group_size=group_size, bias=bias)
+        self.input_scale = nn.Parameter(torch.empty((), dtype=torch.float32), requires_grad=False)
+        self.input_scale.weight_loader = default_weight_loader
+        self._w4a4_prepared: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+
+    def nvfp4_w4a4_components_for_fuse(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return W4A4 operands in b12x's global-scale convention.
+
+        ModelOpt writes ``weight_scale_2`` and ``input_scale`` as reciprocal
+        export scales.  The b12x quantizer/GEMM ABI expects the corresponding
+        quantizer-side global scales, so both are inverted here exactly once;
+        callers can then use ``alpha = 1 / (activation_gs * weight_gs)`` for
+        both ModelOpt and compressed-tensors NVFP4.
+        """
+        weight_global_scale = 1.0 / self.weight_scale_2.data.reshape(()).to(torch.float32)
+        activation_global_scale = 1.0 / self.input_scale.data.reshape(()).to(torch.float32)
+        return (
+            self.weight.data,
+            self.weight_scale.data,
+            weight_global_scale,
+            activation_global_scale,
+        )
+
+    def _ensure_w4a4_ready(self) -> None:
+        if self._w4a4_prepared is not None:
+            return
+        from runtime.backends._sparkinfer_import import ensure_sparkinfer_path
+
+        ensure_sparkinfer_path()
+        from b12x._lib.intrinsics import as_grouped_scale_view, swizzle_block_scale
+
+        weight, weight_scale, weight_global_scale, activation_global_scale = (
+            self.nvfp4_w4a4_components_for_fuse()
+        )
+        if weight_global_scale.numel() != 1 or activation_global_scale.numel() != 1:
+            raise ValueError("ModelOpt W4A4 global scales must be scalar tensors")
+        if (
+            not torch.isfinite(weight_global_scale).all()
+            or not torch.isfinite(activation_global_scale).all()
+        ):
+            raise ValueError("ModelOpt W4A4 global scales must be finite")
+        if weight_global_scale.item() == 0 or activation_global_scale.item() == 0:
+            raise ValueError("ModelOpt W4A4 global scales must be non-zero")
+        out_dim, in_dim = weight.shape[0], weight.shape[1] * 2
+        scale_storage = swizzle_block_scale(weight_scale.unsqueeze(0).contiguous()).view(
+            torch.uint8
+        )
+        weight_scale_view = as_grouped_scale_view(scale_storage, out_dim, in_dim)
+        alpha = (1.0 / (weight_global_scale * activation_global_scale)).reshape(1).contiguous()
+        self._w4a4_prepared = (weight.unsqueeze(-1), weight_scale_view, alpha)
+
+    def _forward_w4a4(self, x: torch.Tensor) -> torch.Tensor:
+        from b12x._lib.intrinsics import as_grouped_scale_view
+        from b12x.gemm import blockscaled
+
+        orig_shape = x.shape
+        x2d = x.reshape(-1, self.input_size)
+        if not x2d.is_contiguous():
+            x2d = x2d.contiguous()
+        if x2d.dtype != torch.bfloat16:
+            x2d = x2d.to(torch.bfloat16)
+        m = x2d.shape[0]
+        a_packed, a_scale_storage = _quantize_modelopt_w4a4_activation(
+            x2d, 1.0 / self.input_scale.data
+        )
+        a_scale_view = as_grouped_scale_view(a_scale_storage, m, self.input_size)
+        assert self._w4a4_prepared is not None
+        b_packed, b_scale_view, alpha = self._w4a4_prepared
+        output = blockscaled.mm(
+            (a_packed.unsqueeze(-1), a_scale_view),
+            (b_packed, b_scale_view),
+            alpha=alpha,
+            ab_dtype="float4_e2m1fn",
+            sf_dtype="float8_e4m3fn",
+            c_dtype="bfloat16",
+            sf_vec_size=16,
+            expected_m=m,
+        )[:, :, 0]
+        if self.bias is not None:
+            output = output + self.bias
+        output = output.reshape(*orig_shape[:-1], self.output_size)
+        return output.to(x.dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device.type != "cuda":
+            return super().forward(x)
+        self._ensure_w4a4_ready()
+        return self._forward_w4a4(x)
+
+    def free_nvfp4_raw_params(self) -> None:
+        super().free_nvfp4_raw_params()
+        self.input_scale.data = self.input_scale.data.new_empty(0)
+
+
+class FusedModelOptNVFP4W4A4QKV:
+    """Fused full-attention Q/K/V projection for ModelOpt W4A4 weights.
+
+    The Qwen3.8 ModelOpt export uses the same input calibration for the three
+    full-attention projections.  When their second-level weight scales also
+    match, one activation quantization and one block-scaled GEMM are
+    mathematically equivalent to the three independent projections.  Keeping
+    the scale checks here is important: one shared ``alpha`` cannot represent
+    three different calibration pairs without changing the model.
+
+    This object deliberately owns no ``nn.Parameter``.  The checkpoint loader
+    and ``state_dict`` therefore continue to see the original three linears.
+    The merged packed weights/scales are built lazily after loading, following
+    ``FusedFP8ChannelQKV``'s ownership and CUDA-graph warmup pattern.
+    """
+
+    def __init__(
+        self,
+        q_proj: ModelOptNVFP4W4A4Linear,
+        k_proj: ModelOptNVFP4W4A4Linear,
+        v_proj: ModelOptNVFP4W4A4Linear,
+    ) -> None:
+        projections = (q_proj, k_proj, v_proj)
+        if any(proj.bias is not None for proj in projections):
+            raise ValueError("fused ModelOpt W4A4 QKV requires bias-less projections")
+        if any(proj.input_size != q_proj.input_size for proj in projections):
+            raise ValueError("fused ModelOpt W4A4 QKV requires a shared input size")
+        if any(proj.group_size != q_proj.group_size for proj in projections):
+            raise ValueError("fused ModelOpt W4A4 QKV requires a shared group size")
+        self._q = q_proj
+        self._k = k_proj
+        self._v = v_proj
+        self._weight: torch.Tensor | None = None
+        self._weight_scale: torch.Tensor | None = None
+        self._alpha: torch.Tensor | None = None
+        self._activation_global_scale: torch.Tensor | None = None
+        self._out_split: tuple[int, int, int] | None = None
+
+    @property
+    def ready(self) -> bool:
+        """Whether the merged CUDA operands have been prepared."""
+        return self._weight is not None
+
+    @staticmethod
+    def _same_scalar(left: torch.Tensor, right: torch.Tensor) -> bool:
+        return (
+            left.numel() == 1
+            and right.numel() == 1
+            and torch.equal(left.reshape(()), right.reshape(()))
+        )
+
+    def _validate_raw_parameters(self) -> tuple[torch.Tensor, ...]:
+        weights = tuple(proj.weight.data for proj in (self._q, self._k, self._v))
+        scales = tuple(proj.weight_scale.data for proj in (self._q, self._k, self._v))
+        if any(weight.numel() == 0 for weight in weights):
+            raise RuntimeError("fused ModelOpt W4A4 QKV needs raw weights before they are released")
+        if any(scale.numel() == 0 for scale in scales):
+            raise RuntimeError(
+                "fused ModelOpt W4A4 QKV needs raw block scales before they are released"
+            )
+        if any(weight.ndim != 2 or scale.ndim != 2 for weight, scale in zip(weights, scales)):
+            raise ValueError("fused ModelOpt W4A4 QKV requires rank-2 raw tensors")
+        if any(weight.shape[1] != self._q.input_size // 2 for weight in weights):
+            raise ValueError("fused ModelOpt W4A4 QKV has an unexpected packed input width")
+        if any(scale.shape[1] != self._q.input_size // self._q.group_size for scale in scales):
+            raise ValueError("fused ModelOpt W4A4 QKV has an unexpected block-scale width")
+        input_scales = tuple(proj.input_scale.data for proj in (self._q, self._k, self._v))
+        weight_scales_2 = tuple(proj.weight_scale_2.data for proj in (self._q, self._k, self._v))
+        if not all(self._same_scalar(input_scales[0], scale) for scale in input_scales[1:]):
+            raise ValueError("fused ModelOpt W4A4 QKV requires matching input_scale values")
+        if not all(self._same_scalar(weight_scales_2[0], scale) for scale in weight_scales_2[1:]):
+            raise ValueError("fused ModelOpt W4A4 QKV requires matching weight_scale_2 values")
+        return weights + scales + (input_scales[0], weight_scales_2[0])
+
+    def prepare(self) -> None:
+        """Prepare the merged block-scaled operand once, outside graph replay."""
+        if self._weight is not None:
+            return
+        from runtime.backends._sparkinfer_import import ensure_sparkinfer_path
+
+        ensure_sparkinfer_path()
+        from b12x._lib.intrinsics import as_grouped_scale_view, swizzle_block_scale
+
+        raw = self._validate_raw_parameters()
+        q_weight, k_weight, v_weight = raw[:3]
+        q_scale, k_scale, v_scale = raw[3:6]
+        input_scale, weight_scale_2 = raw[6:]
+        merged_weight = torch.cat((q_weight, k_weight, v_weight), dim=0).contiguous()
+        merged_scale = torch.cat((q_scale, k_scale, v_scale), dim=0).contiguous()
+        output_size = merged_weight.shape[0]
+        input_size = self._q.input_size
+        scale_view = as_grouped_scale_view(
+            swizzle_block_scale(merged_scale.unsqueeze(0)).view(torch.uint8),
+            output_size,
+            input_size,
+        )
+        weight_global_scale = 1.0 / weight_scale_2.reshape(()).to(torch.float32)
+        activation_global_scale = 1.0 / input_scale.reshape(()).to(torch.float32)
+        if (
+            not torch.isfinite(weight_global_scale).all()
+            or not torch.isfinite(activation_global_scale).all()
+        ):
+            raise ValueError("fused ModelOpt W4A4 QKV scales must be finite")
+        if weight_global_scale.item() == 0 or activation_global_scale.item() == 0:
+            raise ValueError("fused ModelOpt W4A4 QKV scales must be non-zero")
+        self._weight = merged_weight
+        self._weight_scale = scale_view
+        self._alpha = (1.0 / (weight_global_scale * activation_global_scale)).reshape(1)
+        self._activation_global_scale = activation_global_scale
+        self._out_split = (q_weight.shape[0], k_weight.shape[0], v_weight.shape[0])
+
+    def __call__(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self.prepare()
+        assert self._weight is not None
+        assert self._weight_scale is not None
+        assert self._alpha is not None
+        assert self._activation_global_scale is not None
+        assert self._out_split is not None
+        from b12x._lib.intrinsics import as_grouped_scale_view
+        from b12x.gemm import blockscaled
+
+        original_shape = x.shape
+        x2d = x.reshape(-1, self._q.input_size)
+        if not x2d.is_contiguous():
+            x2d = x2d.contiguous()
+        if x2d.dtype != torch.bfloat16:
+            x2d = x2d.to(torch.bfloat16)
+        m = x2d.shape[0]
+        a_packed, a_scale_storage = _quantize_modelopt_w4a4_activation(
+            x2d, self._activation_global_scale
+        )
+        a_scale_view = as_grouped_scale_view(a_scale_storage, m, self._q.input_size)
+        output = blockscaled.mm(
+            (a_packed.unsqueeze(-1), a_scale_view),
+            (self._weight.unsqueeze(-1), self._weight_scale),
+            alpha=self._alpha,
+            ab_dtype="float4_e2m1fn",
+            sf_dtype="float8_e4m3fn",
+            c_dtype="bfloat16",
+            sf_vec_size=16,
+            expected_m=m,
+        )[:, :, 0]
+        q_size, k_size, v_size = self._out_split
+        lead = original_shape[:-1]
+        q_end = q_size
+        k_end = q_end + k_size
+        return (
+            output[:, :q_end].view(*lead, q_size).to(x.dtype),
+            output[:, q_end:k_end].view(*lead, k_size).to(x.dtype),
+            output[:, k_end : k_end + v_size].view(*lead, v_size).to(x.dtype),
+        )

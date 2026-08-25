@@ -578,6 +578,11 @@ class Qwen36MTPVerifyCudaGraph:
         attn_drivers: list[Qwen36VerifyGraphAttention | None] = [None] * self.pool.num_layers
         attn_outputs: list[torch.Tensor | None] = [None] * self.pool.num_layers
         share_flashinfer = _share_verify_flashinfer_enabled()
+        native_f32 = bool(
+            isinstance(getattr(self.model, "config", None), dict)
+            and self.model.config.get("weight_format") == "gguf"
+            and self.model.config.get("gguf_compute_dtype") == "float32"
+        )
         shared_flashinfer = None
         for layer in self.pool.model.model.layers:
             if layer.layer_type != "full_attention":
@@ -599,6 +604,7 @@ class Qwen36MTPVerifyCudaGraph:
                 kv_dtype=k_pool.dtype,
                 device=self.device,
                 shared_flashinfer=shared_flashinfer if share_flashinfer else None,
+                native_f32=native_f32,
             )
             if share_flashinfer and shared_flashinfer is None:
                 shared_flashinfer = attn_drivers[layer.layer_idx]._flashinfer  # noqa: SLF001
@@ -933,6 +939,11 @@ class Qwen36MTPRaggedVerifyCudaGraph:
         attn_drivers: list[Qwen36VerifyGraphAttention | None] = [None] * self.pool.num_layers
         attn_outputs: list[torch.Tensor | None] = [None] * self.pool.num_layers
         share_flashinfer = _share_verify_flashinfer_enabled()
+        native_f32 = bool(
+            isinstance(getattr(self.model, "config", None), dict)
+            and self.model.config.get("weight_format") == "gguf"
+            and self.model.config.get("gguf_compute_dtype") == "float32"
+        )
         shared_flashinfer = None
         for layer in self.pool.model.model.layers:
             if layer.layer_type != "full_attention":
@@ -954,6 +965,7 @@ class Qwen36MTPRaggedVerifyCudaGraph:
                 kv_dtype=k_pool.dtype,
                 device=self.device,
                 shared_flashinfer=shared_flashinfer if share_flashinfer else None,
+                native_f32=native_f32,
             )
             if share_flashinfer and shared_flashinfer is None:
                 shared_flashinfer = attn_drivers[layer.layer_idx]._flashinfer  # noqa: SLF001

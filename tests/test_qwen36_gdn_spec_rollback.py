@@ -22,9 +22,12 @@ pytest.importorskip("fla")
 pytest.importorskip("b12x")
 
 from runtime.model import qwen36_model as qwen36_model_module  # noqa: E402
+from runtime.model.gguf_linear import GgufLinear  # noqa: E402
+from runtime.model.modelopt_linear import ModelOptNVFP4W4A4Linear  # noqa: E402
 from runtime.model.qwen36_model import (  # noqa: E402
     GdnLayerState,
     Qwen36GatedDeltaNet,
+    _bmm_project,
     commit_spec_snapshot,
 )
 
@@ -41,6 +44,43 @@ class TestGdnFusedGateSwitch:
         assert qwen36_model_module._qwen36_gdn_fused_gates_enabled() is True
 
 
+class TestGdnBatchedLargeProjectionSwitch:
+    def test_auto_enables_only_modelopt_w4a4_or_qualified_fp8(self, monkeypatch) -> None:
+        gdn = type("GdnProbe", (), {})()
+        gdn.in_proj_qkvz = ModelOptNVFP4W4A4Linear(16, 32)
+        gdn.out_proj = ModelOptNVFP4W4A4Linear(32, 16)
+        monkeypatch.delenv(
+            qwen36_model_module.QSR_QWEN36_GDN_BATCH_LARGE_PROJECTIONS_ENV,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            qwen36_model_module, "fp8_channel_raw_execution_uses_all_layers", lambda: False
+        )
+        assert qwen36_model_module._qwen36_gdn_batch_large_projections_enabled(gdn) is True
+
+        gdn.in_proj_qkvz = torch.nn.Linear(16, 32)
+        assert qwen36_model_module._qwen36_gdn_batch_large_projections_enabled(gdn) is False
+
+        # Preserve the pre-existing qualified raw-FP8 contract for the
+        # Unsloth route even when its concrete Linear type is not ModelOpt.
+        monkeypatch.setattr(
+            qwen36_model_module, "fp8_channel_raw_execution_uses_all_layers", lambda: True
+        )
+        assert qwen36_model_module._qwen36_gdn_batch_large_projections_enabled(gdn) is True
+
+    def test_explicit_switch_overrides_format_detection(self, monkeypatch) -> None:
+        gdn = type("GdnProbe", (), {})()
+        gdn.in_proj_qkvz = torch.nn.Linear(16, 32)
+        gdn.out_proj = torch.nn.Linear(32, 16)
+        env = qwen36_model_module.QSR_QWEN36_GDN_BATCH_LARGE_PROJECTIONS_ENV
+
+        monkeypatch.setenv(env, "1")
+        assert qwen36_model_module._qwen36_gdn_batch_large_projections_enabled(gdn) is True
+
+        monkeypatch.setenv(env, "0")
+        assert qwen36_model_module._qwen36_gdn_batch_large_projections_enabled(gdn) is False
+
+
 def _state(seed: float) -> GdnLayerState:
     return GdnLayerState(
         conv_state=torch.full((1, 4, 4), seed),
@@ -54,6 +94,23 @@ def _snapshots(count: int) -> list[GdnLayerState]:
     tensors are filled with ``float(j)``, so "did we copy snapshot 2, not
     1 or 3" is checkable by value, not just by not-raising."""
     return [_state(float(j)) for j in range(count)]
+
+
+def test_bmm_project_uses_logical_matrix_for_packed_gguf_linear() -> None:
+    """GDN verify must not treat GGUF's flat byte payload as a 2-D weight."""
+
+    linear = GgufLinear(256, 2, "Q6_K")
+    raw = torch.zeros_like(linear.weight)
+    raw.view(2, 210)[:, 208] = 0
+    raw.view(2, 210)[:, 209] = 0x3C  # Q6_K block scale = fp16(1.0)
+    with torch.no_grad():
+        linear.weight.copy_(raw)
+    hidden = torch.randn(1, 3, 256)
+
+    expected = linear(hidden)
+    actual = _bmm_project(linear, hidden)
+
+    torch.testing.assert_close(actual, expected)
 
 
 class TestCommitSpecSnapshotSelection:

@@ -71,6 +71,7 @@ from runtime.model.qwen36_model import (
     Qwen36GenerationState,
     Qwen36PagedAttentionCache,
     Qwen36PrefillBatch,
+    gguf_f32_bf16_attention_enabled,
 )
 from runtime.model.vmm_extensible import (
     ExtensibleKVCacheBuffers,
@@ -167,6 +168,14 @@ class Qwen36SlotPool:
         self.num_slots = num_slots
         self.device = torch.device(device)
         self.dtype = dtype
+        self._attention_dtype = (
+            torch.bfloat16
+            if gguf_f32_bf16_attention_enabled()
+            and isinstance(getattr(model, "config", None), dict)
+            and model.config.get("weight_format") == "gguf"
+            and model.config.get("gguf_compute_dtype") == "float32"
+            else dtype
+        )
         self.page_size = _PAGED_ATTENTION_PAGE_SIZE
         self.pages_per_slot = (max_seq_len + self.page_size - 1) // self.page_size
         self.max_seq_len = self.pages_per_slot * self.page_size
@@ -279,12 +288,18 @@ class Qwen36SlotPool:
             if layer.layer_type == "linear_attention":
                 num_recurrent += 1
                 gdn = layer.linear_attn
+                state_dtype_for_layer = getattr(gdn, "state_dtype", None)
+                recurrent_dtype = (
+                    state_dtype_for_layer(dtype)
+                    if state_dtype_for_layer is not None
+                    else dtype
+                )
                 conv = torch.zeros(
                     self._num_rows,
                     gdn.conv_dim,
                     gdn.conv_kernel_size,
                     device=self.device,
-                    dtype=dtype,
+                    dtype=recurrent_dtype,
                 )
                 recurrent = torch.zeros(
                     self._num_rows,
@@ -292,7 +307,7 @@ class Qwen36SlotPool:
                     gdn.head_k_dim,
                     gdn.head_v_dim,
                     device=self.device,
-                    dtype=dtype,
+                    dtype=recurrent_dtype,
                 )
                 self.conv_pools[i] = _mark_static(conv)
                 self.recurrent_pools[i] = _mark_static(recurrent)
@@ -398,7 +413,7 @@ class Qwen36SlotPool:
                         attn.num_heads,
                         attn.head_dim,
                         device=self.device,
-                        dtype=dtype,
+                        dtype=self._attention_dtype,
                     )
                 )
                 layer_max = getattr(attn, "max_seq_len", None)
@@ -1235,13 +1250,19 @@ class Qwen36SlotPool:
             old_recurrent = self.recurrent_pools[layer_idx]
             assert old_conv is not None and old_recurrent is not None
             gdn = layer.linear_attn
+            state_dtype_for_layer = getattr(gdn, "state_dtype", None)
+            recurrent_dtype = (
+                state_dtype_for_layer(self.dtype)
+                if state_dtype_for_layer is not None
+                else self.dtype
+            )
             conv = _mark_static(
                 torch.zeros(
                     total_gdn_rows,
                     gdn.conv_dim,
                     gdn.conv_kernel_size,
                     device=self.device,
-                    dtype=self.dtype,
+                    dtype=recurrent_dtype,
                 )
             )
             recurrent = _mark_static(
@@ -1251,7 +1272,7 @@ class Qwen36SlotPool:
                     gdn.head_k_dim,
                     gdn.head_v_dim,
                     device=self.device,
-                    dtype=self.dtype,
+                    dtype=recurrent_dtype,
                 )
             )
             conv[: self._num_rows].copy_(old_conv)
@@ -1935,12 +1956,18 @@ class Qwen36SlotPool:
             "page_size": self.page_size,
             "pages_per_slot": self.pages_per_slot,
             "num_cache_pages": self._num_rows * self.pages_per_slot,
-            "dtype": self.dtype,
+            "dtype": self._attention_dtype,
             # The KV pools' own dtype (BF16 unless FP8 KV was enabled --
             # see __init__'s _kv_dtype uniformity check), NOT necessarily
             # self.dtype (the compute dtype) now that the two can diverge.
             "kv_dtype": self._kv_dtype,
             "device": self.device,
+            "native_f32": bool(
+                isinstance(getattr(self.model, "config", None), dict)
+                and self.model.config.get("weight_format") == "gguf"
+                and self.model.config.get("gguf_compute_dtype") == "float32"
+                and not gguf_f32_bf16_attention_enabled()
+            ),
         }
 
     def ensure_decode_workspaces(self, max_batch: int) -> None:

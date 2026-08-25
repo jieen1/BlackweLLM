@@ -24,6 +24,9 @@ logger = logging.getLogger("qwen_sm120_runtime.flashinfer_gdn")
 _CHUNK_GATED_DELTA_RULE = None
 _IMPORT_ERROR: BaseException | None = None
 _IMPORT_REPORTED = False
+_DECODE_GATED_DELTA_RULE = None
+_DECODE_IMPORT_ERROR: BaseException | None = None
+_DECODE_IMPORT_REPORTED = False
 
 
 def load_chunk_gated_delta_rule():
@@ -50,6 +53,100 @@ def load_chunk_gated_delta_rule():
 
     _CHUNK_GATED_DELTA_RULE = chunk_gated_delta_rule
     return _CHUNK_GATED_DELTA_RULE
+
+
+def load_gated_delta_rule_decode():
+    """Return FlashInfer's single-token GDN kernel, or ``None``.
+
+    The decode kernel is optional for the same reason as the extend kernel:
+    CPU-only tests and installations without the SM120 FlashInfer image must
+    retain the FLA implementation.  Keep this import separate from the
+    extend loader because the two FlashInfer modules have independent binary
+    availability and compile caches.
+    """
+
+    global _DECODE_GATED_DELTA_RULE, _DECODE_IMPORT_ERROR, _DECODE_IMPORT_REPORTED
+    if _DECODE_GATED_DELTA_RULE is not None:
+        return _DECODE_GATED_DELTA_RULE
+    if _DECODE_IMPORT_ERROR is not None:
+        return None
+
+    os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
+    try:
+        from flashinfer.gdn_decode import gated_delta_rule_decode
+    except BaseException as exc:  # optional dependency; caller falls back
+        _DECODE_IMPORT_ERROR = exc
+        if not _DECODE_IMPORT_REPORTED:
+            logger.warning("FlashInfer GDN decode unavailable; using FLA: %s", exc)
+            _DECODE_IMPORT_REPORTED = True
+        return None
+
+    _DECODE_GATED_DELTA_RULE = gated_delta_rule_decode
+    return _DECODE_GATED_DELTA_RULE
+
+
+class FlashInferGDNDecode:
+    """Run one Qwen GGUF GDN decode step through FlashInfer's native kernel.
+
+    The GGUF contract stores ``ssm_a`` as the negative decay coefficient,
+    while FlashInfer exposes the usual ``A_log`` parameter and computes
+    ``-exp(A_log) * softplus(a + dt_bias)`` internally.  The cached
+    ``log(-ssm_a)`` conversion below is algebraically identical and keeps the
+    recurrent state in the runtime's existing contiguous ``[B, H, K, V]``
+    layout.  FlashInfer currently consumes BF16 q/k/v/a/b, so the adapter
+    rounds only those transient inputs; the persistent state and fixed
+    scalars remain F32.
+    """
+
+    def __init__(self) -> None:
+        fn = load_gated_delta_rule_decode()
+        if fn is None:
+            raise RuntimeError("FlashInfer GDN decode is unavailable")
+        self._fn = fn
+        self._a_log_source: torch.Tensor | None = None
+        self._a_log_argument: torch.Tensor | None = None
+
+    def _a_log(self, decay: torch.Tensor) -> torch.Tensor:
+        if self._a_log_source is not decay or self._a_log_argument is None:
+            if torch.any(decay >= 0):
+                raise ValueError(
+                    "FlashInfer GDN decode requires GGUF negative ssm_a values"
+                )
+            self._a_log_argument = (-decay).log()
+            self._a_log_source = decay
+        return self._a_log_argument
+
+    def run(
+        self,
+        *,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        a: torch.Tensor,
+        beta_logits: torch.Tensor,
+        dt_bias: torch.Tensor,
+        decay: torch.Tensor,
+        recurrent_state: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(BF16 output, updated state)`` for one decode token."""
+
+        # The current GGUF GVA mapping is expanded by the caller before this
+        # boundary.  Passing H == HV avoids the decode kernel's alternate
+        # grouped-head mapping, which differs from llama.cpp's GGUF tiling
+        # convention even though the ordinary FlashInfer prefill path uses
+        # its native H < HV form.
+        output, state = self._fn(
+            q=query.to(torch.bfloat16),
+            k=key.to(torch.bfloat16),
+            v=value.to(torch.bfloat16),
+            state=recurrent_state,
+            A_log=self._a_log(decay),
+            a=a.to(torch.bfloat16),
+            dt_bias=dt_bias,
+            b=beta_logits.to(torch.bfloat16),
+            use_qk_l2norm=True,
+        )
+        return output, state
 
 
 class FlashInferGDNPrefill:

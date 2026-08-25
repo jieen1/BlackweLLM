@@ -41,7 +41,7 @@ def test_cuda_graph_attention_rebinds_when_model_buffers_move(monkeypatch):
     # the real sparkinfer submodules -- unlike the plain
     # `from runtime.backends... import ...` above (which only reaches
     # sparkinfer lazily/conditionally), this needs the actual package.
-    pytest.importorskip("sparkinfer")
+    pytest.importorskip("b12x")
     bindings = []
 
     def build_binding(**kwargs):
@@ -50,11 +50,11 @@ def test_cuda_graph_attention_rebinds_when_model_buffers_move(monkeypatch):
         return binding
 
     monkeypatch.setattr(
-        "sparkinfer.attention.paged._scratch.build_paged_attention_binding",
+        "b12x.attention.paged._scratch.build_paged_attention_binding",
         build_binding,
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged._forward.paged_attention_forward",
+        "b12x.attention.paged._forward.paged_attention_forward",
         lambda *, binding: None,
     )
 
@@ -92,7 +92,7 @@ def test_cuda_graph_attention_rebinds_when_model_buffers_move(monkeypatch):
 
 def test_prefill_workspace_reuses_plan_only_within_one_metadata_object(monkeypatch):
     """Layer-group sharing must not reuse a plan after the next forward."""
-    pytest.importorskip("sparkinfer")
+    pytest.importorskip("b12x")
     calls: list[str] = []
 
     class FakeWorkspace:
@@ -115,19 +115,19 @@ def test_prefill_workspace_reuses_plan_only_within_one_metadata_object(monkeypat
             calls.append("plan_metadata")
 
     monkeypatch.setattr(
-        "sparkinfer.attention.paged.workspace.PagedAttentionWorkspace",
+        "b12x.attention.paged.workspace.PagedAttentionWorkspace",
         FakeWorkspace,
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged.planner.create_paged_plan",
+        "b12x.attention.paged.planner.create_paged_plan",
         lambda *args, **kwargs: calls.append("plan") or object(),
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged._scratch.build_paged_attention_binding",
+        "b12x.attention.paged._scratch.build_paged_attention_binding",
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged._forward.paged_attention_forward",
+        "b12x.attention.paged._forward.paged_attention_forward",
         lambda *, binding: calls.append("forward"),
     )
 
@@ -180,7 +180,7 @@ def test_prefill_workspace_never_rebuilds_across_varying_real_shapes(monkeypatch
     (mode, window_left)), it must build exactly once no matter how many
     distinct real shapes are seen.
     """
-    pytest.importorskip("sparkinfer")
+    pytest.importorskip("b12x")
     calls: list[str] = []
 
     class FakeWorkspace:
@@ -203,19 +203,19 @@ def test_prefill_workspace_never_rebuilds_across_varying_real_shapes(monkeypatch
             pass
 
     monkeypatch.setattr(
-        "sparkinfer.attention.paged.workspace.PagedAttentionWorkspace",
+        "b12x.attention.paged.workspace.PagedAttentionWorkspace",
         FakeWorkspace,
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged.planner.create_paged_plan",
+        "b12x.attention.paged.planner.create_paged_plan",
         lambda *args, **kwargs: object(),
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged._scratch.build_paged_attention_binding",
+        "b12x.attention.paged._scratch.build_paged_attention_binding",
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged._forward.paged_attention_forward",
+        "b12x.attention.paged._forward.paged_attention_forward",
         lambda *, binding: None,
     )
 
@@ -262,7 +262,7 @@ def test_prefill_workspace_verify_mode_without_declared_capacity_raises_loud_err
     declare_verify_capacity() raises a clear, actionable RuntimeError from
     this class itself, without ever reaching sparkinfer.
     """
-    pytest.importorskip("sparkinfer")
+    pytest.importorskip("b12x")
 
     workspace = SparkinferPrefillWorkspace(
         torch.device("cpu"), max_total_q=8192, max_page_table_width=4096
@@ -287,7 +287,7 @@ def test_prefill_workspace_verify_mode_without_declared_capacity_raises_loud_err
 
 
 def test_declare_verify_capacity_rejects_degenerate_query_len():
-    pytest.importorskip("sparkinfer")
+    pytest.importorskip("b12x")
     workspace = SparkinferPrefillWorkspace(
         torch.device("cpu"), max_total_q=8192, max_page_table_width=4096
     )
@@ -298,7 +298,7 @@ def test_declare_verify_capacity_rejects_degenerate_query_len():
 
 
 def test_declare_verify_capacity_is_monotonic():
-    pytest.importorskip("sparkinfer")
+    pytest.importorskip("b12x")
     workspace = SparkinferPrefillWorkspace(
         torch.device("cpu"), max_total_q=8192, max_page_table_width=4096
     )
@@ -325,7 +325,7 @@ def test_prefill_workspace_verify_mode_sizes_capacity_from_the_real_eager_planne
     wrong on real GPU, see _work_item_capacity's docstring and
     notes/2026-08-01-c1-c2-gpu-investigation.md's follow-up section.
     """
-    pytest.importorskip("sparkinfer")
+    pytest.importorskip("b12x")
     calls: list[str] = []
 
     class FakeWorkspace:
@@ -363,23 +363,23 @@ def test_prefill_workspace_verify_mode_sizes_capacity_from_the_real_eager_planne
         raise AssertionError("plan_verify_graph_capacity is the wrong-mode capacity source")
 
     monkeypatch.setattr(
-        "sparkinfer.attention.paged.workspace.PagedAttentionWorkspace",
+        "b12x.attention.paged.workspace.PagedAttentionWorkspace",
         FakeWorkspace,
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged.planner.create_paged_plan",
+        "b12x.attention.paged.planner.create_paged_plan",
         fake_create_paged_plan,
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged.planner.plan_verify_graph_capacity",
+        "b12x.attention.paged.planner.plan_verify_graph_capacity",
         fake_plan_verify_graph_capacity,
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged._scratch.build_paged_attention_binding",
+        "b12x.attention.paged._scratch.build_paged_attention_binding",
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged._forward.paged_attention_forward",
+        "b12x.attention.paged._forward.paged_attention_forward",
         lambda *, binding: None,
     )
 
@@ -424,7 +424,7 @@ def test_prefill_workspace_extend_mode_still_uses_eager_extend_heuristic(monkeyp
     eager_extend_work_items_capacity (unchanged from before the C-1 fix) --
     only verify's capacity source changed.
     """
-    pytest.importorskip("sparkinfer")
+    pytest.importorskip("b12x")
     calls: list[str] = []
 
     class FakeWorkspace:
@@ -450,19 +450,19 @@ def test_prefill_workspace_extend_mode_still_uses_eager_extend_heuristic(monkeyp
             pass
 
     monkeypatch.setattr(
-        "sparkinfer.attention.paged.workspace.PagedAttentionWorkspace",
+        "b12x.attention.paged.workspace.PagedAttentionWorkspace",
         FakeWorkspace,
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged.planner.create_paged_plan",
+        "b12x.attention.paged.planner.create_paged_plan",
         lambda *args, **kwargs: object(),
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged._scratch.build_paged_attention_binding",
+        "b12x.attention.paged._scratch.build_paged_attention_binding",
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
     monkeypatch.setattr(
-        "sparkinfer.attention.paged._forward.paged_attention_forward",
+        "b12x.attention.paged._forward.paged_attention_forward",
         lambda *, binding: None,
     )
 

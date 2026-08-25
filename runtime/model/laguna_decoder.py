@@ -209,6 +209,7 @@ class LagunaAttentionSelfBuilt(nn.Module):
         attention_sink: bool = False,
         layer_idx: int | None = None,
         attention_prefix: str | None = None,
+        kv_cache_dtype: str = "fp8",
     ) -> None:
         super().__init__()
         if layer_idx is None:
@@ -362,6 +363,7 @@ class LagunaAttentionSelfBuilt(nn.Module):
             per_layer_sliding_window=self.sliding_window,
             prefix=maybe_prefix(attention_prefix, "attn"),
             sinks=sinks,
+            kv_cache_dtype=kv_cache_dtype,
         )
 
         self.q_norm = TritonRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -412,6 +414,7 @@ class LagunaDecoderLayerSelfBuilt(nn.Module):
         layer_idx: int | None = None,
         attention_prefix: str | None = None,
         max_model_len: int | None = None,
+        kv_cache_dtype: str = "fp8",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -446,6 +449,7 @@ class LagunaDecoderLayerSelfBuilt(nn.Module):
                 if attention_prefix is not None
                 else None
             ),
+            kv_cache_dtype=kv_cache_dtype,
         )
 
         mlp_only_layers = [] if not hasattr(config, "mlp_only_layers") else config.mlp_only_layers

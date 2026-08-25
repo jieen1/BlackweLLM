@@ -2,9 +2,10 @@
 
 The target verify graph lives next to the existing Qwen36 MTP verify graph:
 DSpark only changes the source of the speculative tokens and the hidden taps
-that are returned.  The draft is different from MTP's autoregressive head:
-all ``gamma`` draft hidden states are produced by one masked dense forward,
-then the small Markov recurrence is unrolled inside the same captured graph.
+that are returned.  The legacy draft uses one masked dense forward followed by
+a small Markov recurrence; DFlash2 uses the same masked forward followed by
+its fixed top-k predecessor/successor selector.  Both greedy paths remain in
+the captured graph.
 
 Each serving slot owns one graph because its draft KV pages are fixed tensor
 addresses.  The graph's page table, sequence length, input anchor, and token
@@ -20,7 +21,10 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from runtime.backends.bf_attention import bf_attn_context
-from runtime.backends.flashinfer_dspark_attn import FlashInferDSparkAttentionImpl
+from runtime.backends.flashinfer_dspark_attn import (
+    FlashInferDSparkAttentionImpl,
+    compact_dflash_window,
+)
 from runtime.backends.laguna_cuda_graph import (
     _SparkinferCGExtendImpl,
     _SparkinferCGExtendMetadata,
@@ -40,10 +44,13 @@ class Qwen36DSparkDraftCudaGraph:
         self.engine = engine
         self.slot = slot
         self.device = engine.device
-        self.num_tokens = engine.k
+        self.is_dflash2 = bool(getattr(engine.draft_model, "is_dflash2", False))
+        self.num_tokens = engine._draft_query_tokens if self.is_dflash2 else engine.k
+        self.proposal_tokens = engine.k
         self.page_size = engine.page_size
         self.pages_per_slot = engine.pages_per_slot
         self.max_seq_len = engine.max_seq_len
+        self.use_compact_draft_cache = engine._use_compact_draft_cache
 
         if slot < 0 or slot >= engine.backend.num_slots:
             raise ValueError(f"invalid DSpark draft graph slot: {slot}")
@@ -65,7 +72,7 @@ class Qwen36DSparkDraftCudaGraph:
         self._slot_mapping = torch.zeros(self.num_tokens, dtype=torch.long, device=self.device)
         self._pos_offset = torch.arange(self.num_tokens, dtype=torch.long, device=self.device)
         self._page_offset = torch.arange(self.pages_per_slot, dtype=torch.int32, device=self.device)
-        self._tokens = torch.zeros(1, self.num_tokens, dtype=torch.long, device=self.device)
+        self._tokens = torch.zeros(1, self.proposal_tokens, dtype=torch.long, device=self.device)
 
         self._workspace: Any | None = None
         self._metadata: Any | None = None
@@ -136,7 +143,7 @@ class Qwen36DSparkDraftCudaGraph:
             self._cu_seqlens_q,
             mode="extend",
             enable_cuda_graph=True,
-            window_left=-1,
+            window_left=self.engine._draft_window_left,
         )
         workspace._ensure_capacity(plan)
         workspace._copy_runtime_metadata(
@@ -161,6 +168,8 @@ class Qwen36DSparkDraftCudaGraph:
             device=self.device,
             use_cuda_graph=True,
             slot=self.slot,
+            window_left=self.engine._draft_window_left,
+            kv_cache_dtype=first_attn.kv_cache_dtype,
             workspace_buffer=self.engine._flashinfer_workspace_buffer,
         )
         page_table = torch.arange(
@@ -175,7 +184,7 @@ class Qwen36DSparkDraftCudaGraph:
             cache_seqlens=torch.zeros(1, dtype=torch.int32, device=self.device),
             cu_seqlens_q=torch.tensor([0, self.num_tokens], dtype=torch.int32, device=self.device),
             num_actual_tokens=self.num_tokens,
-            window_left=-1,
+            window_left=self.engine._draft_window_left,
         )
 
     def _fill_buffers(self, anchor_token: int, kv_len: int) -> None:
@@ -189,8 +198,23 @@ class Qwen36DSparkDraftCudaGraph:
         self._input_ids[0, 0] = int(anchor_token)
         torch.add(self._pos_offset, kv_len, out=self._positions)
         page_row = self.slot * self.pages_per_slot + self._page_offset
-        self._page_table.copy_(page_row.view(1, -1).expand(self.num_tokens, -1))
-        self._cache_seqlens.fill_(kv_len + self.num_tokens)
+        attention_kv_len = kv_len
+        if self.use_compact_draft_cache:
+            attention_kv_len, first_page = compact_dflash_window(
+                kv_len,
+                window_size=self.engine._draft_window_left + 1,
+                page_size=self.page_size,
+            )
+            num_pages = (attention_kv_len + self.num_tokens + self.page_size - 1) // self.page_size
+            self._page_table.zero_()
+            self._page_table[:, :num_pages].copy_(
+                page_row[first_page : first_page + num_pages].view(1, -1).expand(
+                    self.num_tokens, -1
+                )
+            )
+        else:
+            self._page_table.copy_(page_row.view(1, -1).expand(self.num_tokens, -1))
+        self._cache_seqlens.fill_(attention_kv_len + self.num_tokens)
         self._slot_mapping.copy_(
             self.slot * self.pages_per_slot * self.page_size + self._positions,
             non_blocking=True,
@@ -198,15 +222,18 @@ class Qwen36DSparkDraftCudaGraph:
         if self.engine.use_flashinfer_draft:
             assert self._flashinfer_impl is not None
             assert self._flash_metadata is not None
-            self._flashinfer_impl.update_graph_metadata(kv_len)
-            self._flash_metadata.cache_seqlens[0] = kv_len + self.num_tokens
+            self._flashinfer_impl.update_graph_metadata(
+                attention_kv_len, page_table=self._page_table[:1]
+            )
+            self._flash_metadata.page_table.copy_(self._page_table[:1])
+            self._flash_metadata.cache_seqlens[0] = attention_kv_len + self.num_tokens
             return
         assert self._workspace is not None
         self._workspace.update_prefill_graph_replay_metadata(
             self._page_table,
             self._cache_seqlens,
             self._cu_seqlens_q,
-            window_left=-1,
+            window_left=self.engine._draft_window_left,
         )
 
     def _patch_impls_for_capture(self) -> None:
@@ -237,6 +264,15 @@ class Qwen36DSparkDraftCudaGraph:
         with bf_attn_context(self._attn_metadata, self._slot_mappings):
             hidden = draft_model(self._input_ids, self._positions)
         hidden = hidden.reshape(1, self.num_tokens, -1)
+        if self.is_dflash2:
+            draft_tokens, _, _ = draft_model.sample_block(
+                hidden[:, 1:, :],
+                anchor_tokens=self._input_ids[:, 0],
+                sampler=lambda logits, _step: logits.argmax(dim=-1),
+                capture_confidence=False,
+            )
+            self._tokens.copy_(draft_tokens)
+            return self._tokens
         base_logits = draft_model.compute_base_logits(hidden)
 
         # Keep the official DSpark recurrence in the captured region.  This
@@ -281,9 +317,10 @@ class Qwen36DSparkDraftCudaGraph:
             self.engine._draft_graph_pool = self._graph_pool  # noqa: SLF001
             self._captured = True
             logger.info(
-                "Captured Qwen3.8 DSpark draft CUDA Graph: slot=%d K=%d",
+                "Captured Qwen3.8 DSpark draft CUDA Graph: slot=%d query=%d proposals=%d",
                 self.slot,
                 self.num_tokens,
+                self.proposal_tokens,
             )
         finally:
             self._restore_impls()
@@ -311,8 +348,9 @@ class Qwen36DSparkDraftBatchCudaGraph:
     The legacy class above is retained as a compatibility fallback for
     callers that explicitly construct a slot graph.  Production DSpark uses
     this batch-bucket graph: every layer sees one flattened ``B*K`` forward,
-    one non-causal paged-attention launch, and one Markov recurrence over the
-    B rows.  Slot ids and context lengths are replay metadata, never graph
+    one non-causal paged-attention launch, and one fixed greedy proposal head
+    over the B rows (Markov for legacy DSpark, top-k path selection for
+    DFlash2).  Slot ids and context lengths are replay metadata, never graph
     captured addresses.
     """
 
@@ -320,10 +358,13 @@ class Qwen36DSparkDraftBatchCudaGraph:
         self.engine = engine
         self.batch_size = int(batch_size)
         self.device = engine.device
-        self.num_tokens = engine.k
+        self.is_dflash2 = bool(getattr(engine.draft_model, "is_dflash2", False))
+        self.num_tokens = engine._draft_query_tokens if self.is_dflash2 else engine.k
+        self.proposal_tokens = engine.k
         self.page_size = engine.page_size
         self.pages_per_slot = engine.pages_per_slot
         self.max_seq_len = engine.max_seq_len
+        self.use_compact_draft_cache = engine._use_compact_draft_cache
         if not 1 <= self.batch_size <= engine.backend.num_slots:
             raise ValueError(f"invalid DSpark draft graph batch size: {batch_size}")
 
@@ -342,6 +383,9 @@ class Qwen36DSparkDraftBatchCudaGraph:
         )
         self._kv_len_host = torch.empty(
             self.batch_size, dtype=torch.long, device="cpu", pin_memory=True
+        )
+        self._attention_kv_len_host = torch.empty(
+            self.batch_size, dtype=torch.int32, device="cpu", pin_memory=True
         )
         self._slot_host = torch.empty(
             self.batch_size, dtype=torch.long, device="cpu", pin_memory=True
@@ -371,7 +415,7 @@ class Qwen36DSparkDraftBatchCudaGraph:
         )
         self._pos_offset = torch.arange(self.num_tokens, dtype=torch.long, device=self.device)
         self._tokens = torch.zeros(
-            self.batch_size, self.num_tokens, dtype=torch.long, device=self.device
+            self.batch_size, self.proposal_tokens, dtype=torch.long, device=self.device
         )
         self._confidence = (
             torch.zeros(
@@ -412,6 +456,7 @@ class Qwen36DSparkDraftBatchCudaGraph:
                 batch_size=self.batch_size,
                 device=self.device,
                 use_cuda_graph=True,
+                kv_cache_dtype=first_attn.kv_cache_dtype,
                 workspace_buffer=self.engine._flashinfer_workspace_buffer,
             )
             page_table = torch.arange(
@@ -425,7 +470,7 @@ class Qwen36DSparkDraftBatchCudaGraph:
                 cache_seqlens=self._cache_seqlens,
                 cu_seqlens_q=self._cu_seqlens_q,
                 num_actual_tokens=self.batch_size * self.num_tokens,
-                window_left=-1,
+                window_left=self.engine._draft_window_left,
             )
             return
 
@@ -468,7 +513,7 @@ class Qwen36DSparkDraftBatchCudaGraph:
             self._cu_seqlens_q,
             mode="extend",
             enable_cuda_graph=True,
-            window_left=-1,
+            window_left=self.engine._draft_window_left,
         )
         workspace._ensure_capacity(plan)
         workspace._copy_runtime_metadata(
@@ -573,19 +618,52 @@ class Qwen36DSparkDraftBatchCudaGraph:
             self._kv_lens.copy_(self._kv_len_host, non_blocking=True)
         self._slot_ids.copy_(self._slot_host, non_blocking=True)
         self._input_ids[:, 0].copy_(self._anchors)
+        if host_kv_lens is not None:
+            source_kv_lens = [int(value) for value in host_kv_lens]
+        elif device_inputs:
+            source_kv_lens = [int(value) for value in kv_lens.tolist()]
+        else:
+            source_kv_lens = [int(value) for value in kv_lens]
         torch.add(
             self._kv_lens[:, None],
             self._pos_offset[None, :],
             out=self._positions.view(self.batch_size, self.num_tokens),
         )
+        attention_kv_lens: list[int] = []
         for row, slot in enumerate(slots):
             # DSpark owns a separate contiguous KV allocation.  The target
             # pool's dynamic page table is not a valid address map here: its
             # physical rows may be reused or non-contiguous, while this
             # draft cache is always laid out as slot*pages_per_slot.
-            self._page_table[row].copy_(self._slot_page_tables[slot])
+            page_row = self._slot_page_tables[slot]
+            attention_kv_len = source_kv_lens[row]
+            if self.use_compact_draft_cache:
+                attention_kv_len, first_page = compact_dflash_window(
+                    attention_kv_len,
+                    window_size=self.engine._draft_window_left + 1,
+                    page_size=self.page_size,
+                )
+                num_pages = (
+                    attention_kv_len + self.num_tokens + self.page_size - 1
+                ) // self.page_size
+                if first_page + num_pages > self.pages_per_slot:
+                    raise RuntimeError(
+                        "DFlash compact page view exceeds the draft slot: "
+                        f"row={row}, slot={slot}, kv_len={source_kv_lens[row]}, "
+                        f"first_page={first_page}, pages={num_pages}, "
+                        f"capacity={self.pages_per_slot}"
+                    )
+                self._page_table[row].zero_()
+                self._page_table[row, :num_pages].copy_(
+                    page_row[first_page : first_page + num_pages]
+                )
+            else:
+                self._page_table[row].copy_(page_row)
+            attention_kv_lens.append(attention_kv_len)
+        for row, attention_kv_len in enumerate(attention_kv_lens):
+            self._attention_kv_len_host[row] = attention_kv_len
         torch.add(
-            self._kv_lens,
+            self._attention_kv_len_host.to(device=self.device, non_blocking=True),
             self.num_tokens,
             out=self._cache_seqlens,
         )
@@ -603,16 +681,21 @@ class Qwen36DSparkDraftBatchCudaGraph:
             # scheduler bookkeeping, so pass that list explicitly instead of
             # making the adapter synchronously copy device lengths to CPU.
             metadata_kv_lens = host_kv_lens if host_kv_lens is not None else kv_lens
+            if self.use_compact_draft_cache:
+                metadata_kv_lens = attention_kv_lens
             self._flashinfer_impl.update_graph_metadata(
                 metadata_kv_lens, page_table=self._page_table
             )
+            assert self._flash_metadata is not None
+            self._flash_metadata.page_table.copy_(self._page_table)
+            self._flash_metadata.cache_seqlens.copy_(self._cache_seqlens)
             return
         assert self._workspace is not None
         self._workspace.update_prefill_graph_replay_metadata(
             self._page_table,
             self._cache_seqlens,
             self._cu_seqlens_q,
-            window_left=-1,
+            window_left=self.engine._draft_window_left,
         )
 
     def _forward(self) -> torch.Tensor:
@@ -622,6 +705,15 @@ class Qwen36DSparkDraftBatchCudaGraph:
         with bf_attn_context(self._attn_metadata, self._slot_mappings):
             hidden = draft_model(self._input_ids, self._positions)
         hidden = hidden.reshape(self.batch_size, self.num_tokens, -1)
+        if self.is_dflash2:
+            draft_tokens, _, _ = draft_model.sample_block(
+                hidden[:, 1:, :],
+                anchor_tokens=self._input_ids[:, 0],
+                sampler=lambda logits, _step: logits.argmax(dim=-1),
+                capture_confidence=False,
+            )
+            self._tokens.copy_(draft_tokens)
+            return self._tokens
         base_logits = draft_model.compute_base_logits(hidden)
         previous = self._input_ids[:, 0]
         for step in range(self.num_tokens):
@@ -673,9 +765,10 @@ class Qwen36DSparkDraftBatchCudaGraph:
             self.engine._draft_graph_pool = self._graph_pool  # noqa: SLF001
             self._captured = True
             logger.info(
-                "Captured Qwen3.8 DSpark draft BxK CUDA Graph: batch=%d K=%d",
+                "Captured Qwen3.8 DSpark draft BxK CUDA Graph: batch=%d query=%d proposals=%d",
                 self.batch_size,
                 self.num_tokens,
+                self.proposal_tokens,
             )
         finally:
             self._restore_impls()

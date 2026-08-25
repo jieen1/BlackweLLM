@@ -271,6 +271,101 @@ _DSV4_RATIOS = {0: "sliding_attention", 4: "csa_attention", 128: "hca_attention"
 #: plain tensor: norms, sinks, APE, embeddings-as-bf16, routing tables, ...).
 _DSV4_QUANT_TYPES = ("iq2_xs", "q8_0")
 
+# Qwen3.8's UD Q6_K_XL file is a standard GGML mixed K-quant file. The
+# importance-mix is part of the checkpoint identity, just like DSV4's
+# IQ2_XS/Q8_0 mix above; a different mix must not silently enter this loader.
+_QWEN35_QUANT_TYPES = ("q4_k", "q5_k", "q6_k", "q8_0")
+
+
+def parse_qwen35_gguf_architecture(
+    kv: dict[str, Any],
+    *,
+    tensor_type_names: frozenset[str],
+) -> ArchitectureSpec:
+    """Build an :class:`ArchitectureSpec` for a text-only Qwen3.8 GGUF.
+
+    ``qwen35.block_count`` includes the one NextN/MTP block. The target trunk
+    is therefore ``block_count - nextn_predict_layers``; making that boundary
+    explicit is important because the extra block has a different role even
+    though it shares the same GGUF namespace.
+    """
+
+    block_count = int(kv.get("qwen35.block_count", 0))
+    nextn_layers = int(kv.get("qwen35.nextn_predict_layers", 0))
+    trunk_layers = block_count - nextn_layers
+    if block_count <= 0 or nextn_layers <= 0 or trunk_layers <= 0:
+        raise UnsupportedArchitectureError(
+            "Qwen3.8 GGUF requires positive qwen35.block_count and "
+            "qwen35.nextn_predict_layers with a non-empty target trunk"
+        )
+    interval = int(kv.get("qwen35.full_attention_interval", 0))
+    if interval <= 0:
+        raise UnsupportedArchitectureError(
+            "Qwen3.8 GGUF is missing a positive qwen35.full_attention_interval"
+        )
+
+    layers = tuple(
+        LayerSpec(
+            index=index,
+            attention="full_attention" if (index + 1) % interval == 0 else "linear_attention",
+            mlp="dense",
+            cache=(
+                CACHE_PAGED_KV
+                if (index + 1) % interval == 0
+                else CACHE_RECURRENT
+            ),
+        )
+        for index in range(trunk_layers)
+    )
+    quant_types = sorted(
+        name.lower() for name in tensor_type_names if name.lower() in _QWEN35_QUANT_TYPES
+    )
+    unknown_types = sorted(
+        name.lower()
+        for name in tensor_type_names
+        if name.lower() not in _QWEN35_QUANT_TYPES
+        and not name.lower().startswith(("f32", "bf16", "f16", "i8", "i16", "i32", "i64"))
+    )
+    if unknown_types:
+        raise UnsupportedArchitectureError(
+            f"Qwen3.8 GGUF contains unsupported tensor types {unknown_types}; "
+            f"supported quant types are {_QWEN35_QUANT_TYPES}"
+        )
+    vocab = kv.get("tokenizer.ggml.tokens")
+    key_length = int(kv.get("qwen35.attention.key_length", 0))
+    rope_dim = int(kv.get("qwen35.rope.dimension_count", 0))
+    return ArchitectureSpec(
+        architecture="Qwen3_5ForConditionalGeneration",
+        model_type=str(kv.get("general.architecture", "")),
+        vocab_size=len(vocab) if isinstance(vocab, list) else 0,
+        hidden_size=int(kv.get("qwen35.embedding_length", 0)),
+        num_hidden_layers=trunk_layers,
+        max_position_embeddings=int(kv.get("qwen35.context_length", 0)),
+        num_attention_heads=int(kv.get("qwen35.attention.head_count", 0)),
+        num_key_value_heads=int(kv.get("qwen35.attention.head_count_kv", 0)),
+        head_dim=key_length,
+        sliding_window=None,
+        attn_output_gate=True,
+        layers=layers,
+        rope={
+            "default": RopeSpec(
+                rope_type="default",
+                theta=float(kv.get("qwen35.rope.freq_base", 10000.0)),
+                partial_rotary_factor=rope_dim / key_length if key_length else 1.0,
+            )
+        },
+        quant=QuantSpec(
+            method="gguf",
+            format="+".join(quant_types) or "none",
+            kv_num_bits=None,
+            kv_type=None,
+        ),
+        moe=None,
+        mtp_layers=nextn_layers,
+        has_vision_tower=False,
+        declares_language_model_only=None,
+    )
+
 
 def parse_dsv4_gguf_architecture(
     kv: dict[str, Any],

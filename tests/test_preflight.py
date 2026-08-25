@@ -314,6 +314,21 @@ def test_checkpoint_config_passes_for_valid_json(tmp_path) -> None:
     assert "laguna" in result.actual
 
 
+def test_checkpoint_config_accepts_qwen35_gguf(tmp_path, monkeypatch) -> None:
+    target = tmp_path / "qwen38.gguf"
+    target.write_bytes(b"placeholder")
+
+    class Header:
+        kv = {"general.architecture": "qwen35"}
+        tensors = (object(), object())
+
+    monkeypatch.setattr("loader.gguf_header.read_gguf_header", lambda _: Header())
+    result = check_checkpoint_config(target)
+
+    assert result.passed
+    assert "qwen35" in result.actual
+
+
 def test_checkpoint_config_fails_when_missing(tmp_path) -> None:
     result = check_checkpoint_config(tmp_path)
     assert not result.passed

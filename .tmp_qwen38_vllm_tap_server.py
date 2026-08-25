@@ -6,10 +6,8 @@ import sys
 from pathlib import Path
 
 import torch
-
-from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 from vllm.model_executor.models.interfaces import EagleModelMixin
-
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
 _original_propose = DSparkSpeculator.propose
 _signature = inspect.signature(_original_propose)
@@ -19,7 +17,9 @@ _latest_layer_states = []
 _original_maybe_add_hidden_state = EagleModelMixin._maybe_add_hidden_state
 
 
-def _maybe_add_hidden_state_with_capture(self, aux_hidden_states, layer_idx, hidden_states, residual):
+def _maybe_add_hidden_state_with_capture(
+    self, aux_hidden_states, layer_idx, hidden_states, residual
+):
     global _latest_layer_states
     if os.environ.get("QSR_DSPARK_DUMP_ALL_LAYERS") not in (None, "", "0"):
         if layer_idx == 0:

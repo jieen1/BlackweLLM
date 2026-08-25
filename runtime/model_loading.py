@@ -70,6 +70,8 @@ from typing import Any
 
 import torch
 
+from loader.gguf_header import read_gguf_header
+from runtime.dflash2_config import load_dflash2_config, validate_dflash2_target
 from runtime.dspark_config import load_and_validate_dspark_pair
 from runtime.loading.common import (
     apply_kv_cache_scale_post_load,
@@ -79,6 +81,7 @@ from runtime.loading.common import (
     record_checkpoint_tensor_names,
     warn_on_unconsumed_tensor_families,
 )
+from runtime.loading.gguf import PACKED_QUANT_TYPES, iterate_gguf_checkpoint
 from runtime.loading.language_model_only import (
     LanguageModelOnlyStats,
     filter_language_model_only,
@@ -87,6 +90,7 @@ from runtime.model.laguna_dflash_model import LagunaDraftForCausalLMSelfBuilt
 from runtime.model.laguna_model import LagunaForCausalLMSelfBuilt
 from runtime.model.qwen36_dspark import Qwen36DSparkDraftForCausalLM
 from runtime.model.qwen36_model import Qwen36ForCausalLMSelfBuilt
+from runtime.model.qwen38_dflash2 import Qwen38DFlash2DraftForCausalLM
 
 
 def load_laguna_model(
@@ -213,20 +217,213 @@ def _build_qwen36_model_config(model_path: str) -> dict[str, Any]:
     text_config = raw.get("text_config")
     merged = dict(text_config) if isinstance(text_config, dict) else dict(raw)
     merged["quantization_config"] = raw.get("quantization_config")
+    # The self-built model consumes the flattened text config, but the
+    # DFlash2 pair validator also needs the family identity after loading.
+    # Preserve these top-level fields when Qwen3.5 nests the language config;
+    # without them an NVFP4 target looked like an anonymous dict and could not
+    # be paired with the otherwise format-agnostic DFlash2 draft.
+    for key in ("architectures", "model_type"):
+        if key in raw:
+            merged[key] = raw[key]
     return merged
 
 
-#: FP8 KV cache gate (2026-08-03 follow-up -- see ``runtime/model/
-#: qwen36_model.py``'s module docstring for the checkpoint fact this
-#: exists to use: the standard checkpoint ships real per-layer
-#: ``k_scale``/``v_scale`` for every full-attention layer, unlike the
-#: modelopt one). Default OFF -- production keeps shipping the established
-#: BF16 KV path regardless of this env var's presence until this flag's
-#: default is deliberately flipped in a follow-up commit backed by a
-#: passing B1-R gate. ``load_qwen36_model``'s own ``enable_fp8_kv``
-#: parameter reads this only when left at its own default (``None``), same
-#: two-layer "explicit argument wins, env var is only the outermost
-#: default" pattern ``runtime/checkpoints.py``'s env vars use.
+def _build_qwen38_gguf_model_config(model_path: str | Path) -> dict[str, Any]:
+    """Build the flat Qwen3.8 target config from a ``qwen35`` GGUF header."""
+
+    header = read_gguf_header(Path(model_path))
+    kv = header.kv
+    if kv.get("general.architecture") != "qwen35":
+        raise ValueError(
+            f"Qwen3.8 GGUF loader expects general.architecture='qwen35', got "
+            f"{kv.get('general.architecture')!r}"
+        )
+    block_count = int(kv.get("qwen35.block_count", 0))
+    if block_count != 65:
+        raise ValueError(
+            f"Qwen3.8 GGUF loader expects 65 blocks (64 trunk + 1 NextN), got {block_count}"
+        )
+    vocab = kv.get("tokenizer.ggml.tokens")
+    vocab_size = len(vocab) if isinstance(vocab, list) else 0
+    if vocab_size != int(kv.get("qwen35.vocab_size", vocab_size or 0)):
+        raise ValueError("Qwen3.8 GGUF tokenizer vocabulary metadata is inconsistent")
+
+    packed_types = {tensor.type_name for tensor in header.tensors} & PACKED_QUANT_TYPES
+    format_name = "+".join(sorted(type_name.lower() for type_name in packed_types))
+    if not format_name:
+        raise ValueError("Qwen3.8 GGUF has no supported packed quantized tensors")
+
+    quantized: dict[str, str] = {}
+    embedding_type: str | None = None
+
+    for tensor in header.tensors:
+        type_name = tensor.type_name
+        if tensor.name == "token_embd.weight":
+            embedding_type = type_name
+            continue
+        if tensor.name == "output.weight":
+            if type_name in PACKED_QUANT_TYPES:
+                quantized["lm_head"] = f"gguf_{type_name.lower()}"
+            continue
+        pieces = tensor.name.split(".")
+        if len(pieces) < 3 or pieces[0] != "blk":
+            continue
+        layer_idx = int(pieces[1])
+        if layer_idx >= 64:
+            continue
+        suffix = ".".join(pieces[2:])
+        root = f"model.language_model.layers.{layer_idx}"
+        mapping = {
+            "attn_q.weight": f"{root}.self_attn.q_proj",
+            "attn_k.weight": f"{root}.self_attn.k_proj",
+            "attn_v.weight": f"{root}.self_attn.v_proj",
+            "attn_output.weight": f"{root}.self_attn.o_proj",
+            "attn_qkv.weight": f"{root}.linear_attn.in_proj_qkv",
+            "attn_gate.weight": f"{root}.linear_attn.in_proj_z",
+            "ssm_alpha.weight": f"{root}.linear_attn.in_proj_a",
+            "ssm_beta.weight": f"{root}.linear_attn.in_proj_b",
+            "ssm_out.weight": f"{root}.linear_attn.out_proj",
+            "ffn_gate.weight": f"{root}.mlp.gate_proj",
+            "ffn_up.weight": f"{root}.mlp.up_proj",
+            "ffn_down.weight": f"{root}.mlp.down_proj",
+        }
+        dotted_name = mapping.get(suffix)
+        if dotted_name is not None and type_name in PACKED_QUANT_TYPES:
+            quantized[dotted_name] = f"gguf_{type_name.lower()}"
+
+    if embedding_type not in PACKED_QUANT_TYPES:
+        raise ValueError(
+            f"Qwen3.8 GGUF token_embd.weight must use a supported packed type, got "
+            f"{embedding_type!r}"
+        )
+
+    layer_types = [
+        "full_attention" if index % 4 == 3 else "linear_attention" for index in range(64)
+    ]
+    raw_rope_sections = kv.get("qwen35.rope.dimension_sections")
+    if not isinstance(raw_rope_sections, list) or len(raw_rope_sections) != 4:
+        raise ValueError(
+            "Qwen3.8 GGUF must declare four qwen35.rope.dimension_sections values"
+        )
+    rope_sections = tuple(int(section) for section in raw_rope_sections)
+    rotary_dim = int(kv["qwen35.rope.dimension_count"])
+    if sum(rope_sections) * 2 != rotary_dim:
+        raise ValueError(
+            "Qwen3.8 GGUF MRoPE sections do not cover dimension_count: "
+            f"sections={rope_sections}, dimension_count={rotary_dim}"
+        )
+    merged: dict[str, Any] = {
+        "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "model_type": "qwen3_5",
+        "weight_format": "gguf",
+        "gguf_path": str(model_path),
+        "gguf_embedding_type": embedding_type,
+        "gguf_quantized": quantized,
+        "quantization_config": {"quant_method": "gguf", "format": format_name},
+        "vocab_size": vocab_size,
+        "hidden_size": int(kv["qwen35.embedding_length"]),
+        "intermediate_size": int(kv["qwen35.feed_forward_length"]),
+        "num_hidden_layers": 64,
+        "num_attention_heads": int(kv["qwen35.attention.head_count"]),
+        "num_key_value_heads": int(kv["qwen35.attention.head_count_kv"]),
+        "head_dim": int(kv["qwen35.attention.key_length"]),
+        "max_position_embeddings": int(kv["qwen35.context_length"]),
+        "rms_norm_eps": float(kv["qwen35.attention.layer_norm_rms_epsilon"]),
+        # Qwen3.8 GGUF stores ordinary RMSNorm scales (around 1.0).  The
+        # legacy Qwen3.6 safetensors path uses the zero-centred Gemma-style
+        # convention and therefore defaults to True in the model graph.
+        "rms_norm_zero_centered": False,
+        # qwen35 GGUF stores the fixed GDN scalars in their llama.cpp form:
+        # F32 conv/norm/dt parameters and ssm_a = -exp(A_log).  Preserve that
+        # representation through the model instead of round-tripping it
+        # through a BF16 log parameter.
+        "gguf_gdn_scalar_dtype": "float32",
+        "gguf_ssm_a_is_negative": True,
+        "hidden_act": "silu",
+        "attention_bias": False,
+        "attn_output_gate": True,
+        "tie_word_embeddings": False,
+        "layer_types": layer_types,
+        "rope_parameters": {
+            "rope_type": "interleaved",
+            "rope_theta": float(kv["qwen35.rope.freq_base"]),
+            "partial_rotary_factor": int(kv["qwen35.rope.dimension_count"])
+            / int(kv["qwen35.attention.key_length"]),
+            "mrope_section": rope_sections,
+        },
+        "full_attention_interval": int(kv["qwen35.full_attention_interval"]),
+        "linear_num_key_heads": int(kv["qwen35.ssm.group_count"]),
+        "linear_num_value_heads": int(kv["qwen35.ssm.time_step_rank"]),
+        "linear_key_head_dim": int(kv["qwen35.ssm.state_size"]),
+        "linear_value_head_dim": int(kv["qwen35.ssm.state_size"]),
+        "linear_conv_kernel_dim": int(kv["qwen35.ssm.conv_kernel"]),
+        "mtp_num_hidden_layers": int(kv.get("qwen35.nextn_predict_layers", 1)),
+    }
+    return merged
+
+
+def load_qwen38_gguf_model(
+    model_path: str | Path,
+    *,
+    device: torch.device | str = "cuda",
+    dtype: torch.dtype = torch.float32,
+    max_seq_len: int = 4096,
+    warmup_attention: bool = False,
+) -> Qwen36ForCausalLMSelfBuilt:
+    """Load the Qwen3.8 Q6_K_XL GGUF target in an isolated process.
+
+    This entry point intentionally has no relationship to the existing
+    NVFP4 service defaults. On SM120/BF16, packed Q4_K/Q5_K/Q6_K/Q8_0
+    tensors dispatch to the native raw-pointer Q/K kernels and stay packed
+    for the model lifetime. GGML's recurrent scalars remain F32, while the
+    graph compute dtype defaults to the caller's ``dtype``.  The explicit
+    ``QSR_GGUF_COMPUTE_DTYPE=bf16`` override is useful for the production
+    SM120 fast path: it keeps the file-format scalar contract but avoids
+    forcing every recurrent/attention intermediate through F32.  The
+    ``QSR_GGUF_COMPUTE_DTYPE=float32`` setting restores the exact bring-up
+    path. ``QSR_GGUF_NATIVE=0`` is the explicit torch dequantization oracle
+    used for numerical diagnosis and CPU-compatible fallback tests.
+    """
+
+    torch.set_grad_enabled(False)
+    model_config = _build_qwen38_gguf_model_config(model_path)
+    compute_dtype = os.environ.get("QSR_GGUF_COMPUTE_DTYPE", "").strip().lower()
+    if compute_dtype and compute_dtype not in {"float32", "bf16", "bfloat16"}:
+        raise ValueError(
+            "QSR_GGUF_COMPUTE_DTYPE must be float32 or bf16, "
+            f"got {compute_dtype!r}"
+        )
+    if compute_dtype in {"bf16", "bfloat16"}:
+        dtype = torch.bfloat16
+    elif compute_dtype == "float32":
+        dtype = torch.float32
+    model_config["gguf_compute_dtype"] = "float32" if dtype == torch.float32 else "bfloat16"
+    target_device = torch.device(device)
+    with default_torch_dtype(dtype), target_device:
+        model = Qwen36ForCausalLMSelfBuilt(
+            model_config,
+            max_seq_len=max_seq_len,
+            enable_mtp=False,
+            enable_fp8_kv=False,
+        )
+        loaded_param_names = model.load_gguf_weights(
+            iterate_gguf_checkpoint(Path(model_path), device=target_device)
+        )
+        assert_all_params_loaded(model, loaded_param_names, context="load_qwen38_gguf_model")
+    model.eval()
+    if warmup_attention and target_device.type == "cuda":
+        model.warmup_attention_shapes(device=target_device, dtype=dtype)
+        model.warmup_gdn_prefill_shapes(device=target_device, dtype=dtype)
+    return model
+
+
+#: FP8 KV cache gate (2026-08-03 follow-up). The standard checkpoint consumes
+#: real per-layer ``k_scale``/``v_scale`` tensors; the ModelOpt W4A4
+#: checkpoint has no such tensors and uses the explicit 1.0 fallback in
+#: ``runtime/model/qwen36_model.py``. ``load_qwen36_model``'s own
+#: ``enable_fp8_kv`` parameter reads this only when left at its own default
+#: (``None``), same two-layer "explicit argument wins, env var is only the
+#: outermost default" pattern ``runtime/checkpoints.py``'s env vars use.
 QSR_QWEN36_FP8_KV_ENV = "QSR_QWEN36_FP8_KV"
 
 
@@ -281,20 +478,14 @@ def load_qwen36_model(
 
     ``enable_fp8_kv`` (default ``None``, 2026-08-03 follow-up): FP8-e4m3
     KV cache for every backbone full-attention layer (never the MTP head,
-    which has no checkpoint scale to consume). ``None`` resolves from
-    ``QSR_QWEN36_FP8_KV`` (``"1"`` -> True, anything else including unset
-    -> False) at call time, so a caller that never mentions this parameter
-    gets exactly today's env-driven default; pass an explicit ``True``/
-    ``False`` to override the environment for one call (every test in
-    ``tests/test_qwen36_fp8_kv.py`` does this, precisely so the suite
-    never depends on ambient environment state). Requires the checkpoint
-    to ship real ``self_attn.k_scale``/``v_scale`` tensors for every
-    full-attention layer -- true for the standard (``unsloth/``)
-    checkpoint, NOT true for the modelopt (``nvidia/``) one (see
-    ``runtime/model/qwen36_model.py``'s module docstring) -- passing True
-    against a checkpoint that ships neither tensor fails loudly at
-    ``assert_all_params_loaded`` below rather than silently running FP8
-    KV with an unset 1.0 scale.
+    which remains BF16 unless its separate experimental switch is enabled).
+    ``None`` resolves from ``QSR_QWEN36_FP8_KV`` (``"1"`` -> True, anything
+    else including unset -> False) at call time, so a caller that never
+    mentions this parameter gets the env-driven default; pass an explicit
+    ``True``/``False`` to override the environment for one call. Standard
+    checkpoints use their real ``self_attn.k_scale``/``v_scale`` tensors;
+    ModelOpt W4A4 checkpoints use 1.0 when those tensors are absent, matching
+    SGLang's ModelOpt KV-cache method.
 
     Disables autograd globally (``torch.set_grad_enabled(False)``), same
     as ``LagunaBackend.__init__`` (``runtime/backends/laguna.py:266``) --
@@ -420,6 +611,46 @@ def load_qwen36_dspark_draft_model(
             model,
             loaded_param_names,
             context="load_qwen36_dspark_draft_model",
+            expected_unloaded=frozenset({"embed_tokens.weight", "lm_head.weight"}),
+        )
+    model.attach_shared_modules(
+        embed_tokens=target_model.model.embed_tokens,
+        lm_head=target_model.lm_head,
+    )
+    return model.eval()
+
+
+def load_qwen38_dflash2_draft_model(
+    target_model: Qwen36ForCausalLMSelfBuilt,
+    *,
+    draft_model_path: str | Path,
+    device: torch.device | str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+) -> Qwen38DFlash2DraftForCausalLM:
+    """Load the DFlash2 draft and attach the Qwen3.8 target's shared heads.
+
+    The target model is already constructed by either the GGUF or compressed-
+    tensors Qwen3.8 loader; its flattened config is the source of truth for
+    the pair check.  This function only reads the separate DFlash2 safetensors
+    file and never changes service defaults or a running backend.
+    """
+
+    draft_config = load_dflash2_config(draft_model_path)
+    validate_dflash2_target(target_model.config, draft_config)
+    target_layer_count = len(target_model.model.layers)
+    target_device = torch.device(device)
+    with default_torch_dtype(dtype), target_device:
+        model = Qwen38DFlash2DraftForCausalLM(
+            draft_config,
+            target_layer_count=target_layer_count,
+        )
+        loaded_param_names = model.load_weights(
+            iterate_safetensors_checkpoint(str(draft_model_path))
+        )
+        assert_all_params_loaded(
+            model,
+            loaded_param_names,
+            context="load_qwen38_dflash2_draft_model",
             expected_unloaded=frozenset({"embed_tokens.weight", "lm_head.weight"}),
         )
     model.attach_shared_modules(

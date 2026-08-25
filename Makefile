@@ -172,6 +172,28 @@ verify-iq2-mma16-tc: ## Verify the generated IQ2 MMA16 TC ABI and dynamic depend
 	@! readelf -d $(IQ2_MMA16_TC_LIBRARY) | grep -Ei 'libtorch|vllm'
 	@! ldd $(IQ2_MMA16_TC_LIBRARY) | grep -Ei 'libtorch|vllm'
 
+GGUF_QK_SOURCE = runtime/kernels/gguf_qk_sm120.cu
+GGUF_QK_EXPORTS = runtime/kernels/gguf_qk_sm120.exports
+GGUF_QK_GENERATED_DIR = runtime/kernels/_generated
+GGUF_QK_LIBRARY = $(GGUF_QK_GENERATED_DIR)/gguf_qk_sm120.so
+GGUF_QK_MANIFEST = $(GGUF_QK_GENERATED_DIR)/gguf_qk_sm120.manifest.json
+GGUF_QK_FLAGS = -std=c++17 -O3 --shared -Xcompiler -fPIC -Xcompiler -fvisibility=hidden -gencode arch=compute_120f,code=sm_120f -cudart static -Xlinker --version-script=$(GGUF_QK_EXPORTS)
+
+build-gguf-qk: ## Build native SM120 GGML Q4/Q5/Q6/Q8 GEMM and embedding kernels
+	@mkdir -p $(GGUF_QK_GENERATED_DIR)
+	@set -eu; tmp_library="$(GGUF_QK_LIBRARY).tmp"; \
+	$(NVCC) $(GGUF_QK_FLAGS) $(GGUF_QK_SOURCE) -o "$$tmp_library"; \
+	mv "$$tmp_library" "$(GGUF_QK_LIBRARY)"
+	@$(PYTHON) -c 'import hashlib,json,subprocess,sys; from pathlib import Path; library=Path(sys.argv[1]); manifest=Path(sys.argv[2]); source=Path(sys.argv[3]); flags=sys.argv[4]; payload={"abi_version":12,"target_sm":"sm_120f","nvcc":subprocess.check_output([sys.argv[5],"--version"],text=True).strip(),"ptxas":subprocess.check_output(["ptxas","--version"],text=True).strip(),"compile_flags":flags,"source_sha256":hashlib.sha256(source.read_bytes()).hexdigest(),"runtime_git_sha":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"library_sha256":hashlib.sha256(library.read_bytes()).hexdigest(),"provenance":{"license":"Apache-2.0","upstream":"llama.cpp/sglang GGML K-quant layout","specialization":"Q8_1 DP4A GEMV, SGLang-style Q6_K MMQ verify tile, exact BF16/F32 mixed-format GEMV, shared activation quantization and mixed-format single-launch decode GEMV, exact GEMV activation staging, CTA-shared Q8_1 decode activation"}}; temporary=manifest.with_suffix(".tmp"); temporary.write_text(json.dumps(payload,indent=2,sort_keys=True)+"\n"); temporary.replace(manifest)' "$(GGUF_QK_LIBRARY)" "$(GGUF_QK_MANIFEST)" "$(GGUF_QK_SOURCE)" "$(GGUF_QK_FLAGS)" "$(NVCC)"
+	@$(MAKE) verify-gguf-qk
+
+verify-gguf-qk: ## Verify the generated GGML K-quant ABI and dependencies
+	@test -f $(GGUF_QK_LIBRARY)
+	@test -f $(GGUF_QK_MANIFEST)
+	@nm -D --defined-only $(GGUF_QK_LIBRARY) | awk '{print $$3}' | grep -Ex 'qsr_gguf_(qk_abi_version|quantize_q8_sm120|quantize_q8_f32_sm120|gemm_q8_sm120|gemm_q8_prequantized_sm120|gemm_q8_prequantized_cached_sm120|gemm_q8_mmq_sm120|gemm_q8_f32_sm120|gemm_q8_prequantized_f32_sm120|gemm_q8_prequantized_cached_f32_sm120|gemm_q8_mixed_sm120|gemm_q8_mixed_f32_sm120|gemm_q8_mixed_cached_sm120|gemm_q8_mixed_cached_f32_sm120|gemm_direct_mixed_sm120|gemm_direct_mixed_f32_sm120|gemm_direct_mixed_cached_sm120|gemm_direct_mixed_cached_f32_sm120|gemm_sm120|gemm_f32_sm120|gemm_direct_cached_sm120|gemm_direct_cached_f32_sm120|dequant_rows_sm120|dequant_rows_f32_sm120)' | wc -l | grep -qx 24
+	@! readelf -d $(GGUF_QK_LIBRARY) | grep -Ei 'libtorch|vllm'
+	@! ldd $(GGUF_QK_LIBRARY) | grep -Ei 'libtorch|vllm'
+
 
 verify-sparkinfer: ## Report which SparkInfer checkout the warm bfdiag daemon actually loaded
 	@bf exec scripts/verify_sparkinfer_load.py --timeout-s 60
@@ -180,4 +202,4 @@ clean: ## Remove build and test caches
 	rm -rf .pytest_cache .ruff_cache build dist *.egg-info
 	find . -type d -name __pycache__ -not -path './.venv/*' -exec rm -rf {} + 2>/dev/null || true
 
-.PHONY: help install install-cuda lint format format-check test verify-cuda smoke workloads build-laguna-router verify-laguna-router build-fp8-w8a8 verify-fp8-w8a8 serve build-iq2-mma16 verify-iq2-mma16 build-iq2-mma16-tc verify-iq2-mma16-tc verify-sparkinfer clean
+.PHONY: help install install-cuda lint format format-check test verify-cuda smoke workloads build-laguna-router verify-laguna-router build-fp8-w8a8 verify-fp8-w8a8 serve build-iq2-mma16 verify-iq2-mma16 build-iq2-mma16-tc verify-iq2-mma16-tc build-gguf-qk verify-gguf-qk verify-sparkinfer clean
