@@ -165,6 +165,10 @@ from runtime.model.flashinfer_prefill import (
     FlashInferPagedPrefill,
     FlashInferVerifyAttention,
 )
+from runtime.model.fp8_lm_head import (
+    QSR_NATIVE_QWEN38_LM_HEAD_FP8_ENV,
+    NativeFP8LMHead,
+)
 from runtime.model.gguf_linear import (
     GgufEmbedding,
     GgufLinear,
@@ -500,6 +504,17 @@ def _make_linear_for_algorithm(
             f"{sorted(_LINEAR_FACTORY_FOR_ALGO)} (plus {QUANT_ALGO_UNQUANTIZED!r}). Failing "
             "loudly here beats silently loading this module's raw checkpoint bytes as if "
             "they were plain BF16."
+        )
+    if algo == QUANT_ALGO_NVFP4:
+        # ModelOpt W4A16 MLP projections are fused one level up by
+        # Qwen36MLP.  The standalone lm_head has no sibling projection to
+        # fuse with, so mark only that module for the b12x native dense
+        # W4A16 route; the base class remains the exact BF16 fallback.
+        return factory(
+            in_features,
+            out_features,
+            bias=False,
+            native_w4a16=dotted_name == "lm_head",
         )
     return factory(in_features, out_features, bias=False)
 
@@ -6885,6 +6900,48 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         if freed and next(self.parameters()).device.type == "cuda":
             torch.cuda.empty_cache()
         return freed
+
+    def prepare_native_lm_head(self) -> bool:
+        """Prepare an optional native quantized lm_head before graph capture.
+
+        ModelOpt W4A4 Qwen3.8 leaves the full-vocabulary head unquantized.
+        When explicitly enabled, replace only that plain head with the
+        post-load native FP8 cache.  GGUF and checkpoint-native compressed
+        heads do not match ``PlainLinear`` and therefore remain untouched.
+        The hook also gives the loader one model-level place to prepare a
+        shared head before DFlash2 attaches it and CUDA Graphs are captured.
+        """
+
+        prepare = getattr(self.lm_head, "prepare_native_w4a16", None)
+        if prepare is not None:
+            prepared = bool(prepare())
+            if prepared:
+                logger.info(
+                    "prepared native ModelOpt lm_head: implementation=%s shape=(%d,%d)",
+                    type(self.lm_head).__name__,
+                    self.lm_head.output_size,
+                    self.lm_head.input_size,
+                )
+            return prepared
+
+        if os.environ.get(QSR_NATIVE_QWEN38_LM_HEAD_FP8_ENV) != "1":
+            return False
+        if not isinstance(self.lm_head, PlainLinear):
+            return False
+        if self.config.get("weight_format") == "gguf":
+            return False
+        if self.config.get("vocab_size") != 248320 or self.config.get("hidden_size") != 5120:
+            return False
+        if self.quantized.get("lm_head", QUANT_ALGO_UNQUANTIZED) != QUANT_ALGO_UNQUANTIZED:
+            return False
+
+        self.lm_head = NativeFP8LMHead.from_plain_linear(self.lm_head)
+        logger.info(
+            "prepared native Qwen3.8 FP8 lm_head: shape=(%d,%d)",
+            self.lm_head.output_size,
+            self.lm_head.input_size,
+        )
+        return True
 
     def warmup_attention_shapes(self, *, device: torch.device | str, dtype: torch.dtype) -> None:
         """Pay sparkinfer's one-time CuTe compile for both attention modes

@@ -19,7 +19,7 @@ after warmup (each kernel variant pays its one-time CuTe compile during
 warmup, exactly as production does); split-vs-unsplit output cross-check
 before trusting any speed number.
 
-Run: ~/.venvs/vllm/bin/python scripts/probe_qwen36_verify_attn_split.py
+Run: /home/bot/.venvs/torch-nightly/bin/python scripts/probe_qwen36_verify_attn_split.py
 """
 
 from __future__ import annotations
@@ -41,10 +41,14 @@ import torch  # noqa: E402
 
 assert torch.cuda.is_available(), "probe requires the GPU"
 
-from sparkinfer.attention.paged._forward import paged_attention_forward  # noqa: E402
-from sparkinfer.attention.paged._scratch import build_paged_attention_binding  # noqa: E402
-from sparkinfer.attention.paged.planner import create_paged_plan  # noqa: E402
-from sparkinfer.attention.paged.workspace import PagedAttentionWorkspace  # noqa: E402
+from runtime.backends._sparkinfer_import import ensure_sparkinfer_path  # noqa: E402
+
+ensure_sparkinfer_path()
+
+from b12x.attention.paged._forward import paged_attention_forward  # noqa: E402
+from b12x.attention.paged._scratch import build_paged_attention_binding  # noqa: E402
+from b12x.attention.paged.planner import create_paged_plan  # noqa: E402
+from b12x.attention.paged.workspace import PagedAttentionWorkspace  # noqa: E402
 
 # ---- real Qwen3.6-27B full-attention geometry (verified from config.json) ----
 NUM_Q_HEADS = 24
@@ -61,6 +65,22 @@ DEVICE = torch.device("cuda")
 LOCK_NAME = "verify-attn-split-probe"
 torch.manual_seed(7)
 torch.set_grad_enabled(False)
+
+
+def _gpu_lock(action: str) -> bool:
+    """Serialize the probe when the optional local lock helper exists."""
+
+    lock_tool = Path("/tmp/gpu_lock.sh")
+    if not lock_tool.exists():
+        print("[probe] /tmp/gpu_lock.sh unavailable; proceeding on an idle GPU", flush=True)
+        return action == "acquire"
+    result = subprocess.run(
+        [str(lock_tool), action, LOCK_NAME, "120"],
+        capture_output=True,
+        text=True,
+    )
+    print(result.stdout.strip() or result.stderr.strip(), flush=True)
+    return result.returncode == 0
 
 
 def describe(plan, label: str) -> None:
@@ -121,11 +141,7 @@ def time_plan(make_plan, q, kc, vc, pt, cs, cu, out, iters=50):
 
 
 def main() -> None:
-    r = subprocess.run(
-        ["/tmp/gpu_lock.sh", "acquire", LOCK_NAME, "120"], capture_output=True, text=True
-    )
-    print(r.stdout.strip() or r.stderr.strip())
-    locked = r.returncode == 0
+    locked = _gpu_lock("acquire")
     try:
         kc = (torch.randn(NUM_PAGES, PAGE_SIZE, NUM_KV_HEADS, HEAD_DIM, device=DEVICE) * 0.5).to(
             torch.float8_e4m3fn
@@ -163,43 +179,51 @@ def main() -> None:
                 print(f"    [eager default] FAILED: {type(e).__name__}: {e}")
                 ms_a, out_a = None, None
 
-            # graph-style plan with generous work-item capacity: the shape of
-            # plan the MTP verify GRAPH capture can reach when its workspace
-            # capacity admits chunks.
-            for budget in (64, 192):
+            # Graph-style plans with generous work-item capacity: the shape
+            # of plan the MTP verify GRAPH capture can reach when its
+            # workspace capacity admits chunks.  Compare the current
+            # split-KV policy against a true unsplit plan; the production
+            # adapter exposes the same switch through
+            # QSR_QWEN36_VERIFY_FLASHINFER_DISABLE_SPLIT_KV.
+            for disable_split in (False, True):
+                for budget in (64, 192):
 
-                def graph_plan(b=budget):
-                    return create_paged_plan(
-                        q,
-                        kc,
-                        vc,
-                        pt,
-                        cs,
-                        cu,
-                        mode=mode,
-                        enable_cuda_graph=True,
-                        graph_chunk_policy=True,
-                        max_batch_size_if_split=b,
-                        window_left=-1,
-                    )
+                    def graph_plan(b=budget, unsplit=disable_split):
+                        return create_paged_plan(
+                            q,
+                            kc,
+                            vc,
+                            pt,
+                            cs,
+                            cu,
+                            mode=mode,
+                            disable_split_kv=unsplit,
+                            enable_cuda_graph=True,
+                            graph_chunk_policy=True,
+                            max_batch_size_if_split=b,
+                            window_left=-1,
+                        )
 
-                try:
-                    p = graph_plan()
-                    describe(p, f"graph cap={budget}")
-                    ms_b, out_b, _ = time_plan(graph_plan, q, kc, vc, pt, cs, cu, out)
-                    print(f"    [graph cap={budget}] {ms_b:.3f} ms/call")
-                    if out_a is not None:
-                        diff = (out_a.float() - out_b.float()).abs().max().item()
-                        denom = out_a.float().abs().max().item()
-                        rel = diff / max(denom, 1e-9)
-                        print(f"    [cross-check vs eager] max_abs={diff:.3e} rel={rel:.3e}")
-                    if ms_a:
-                        print(f"    [speedup vs eager] {ms_a / ms_b:.2f}x")
-                except Exception as e:  # noqa: BLE001
-                    print(f"    [graph cap={budget}] FAILED: {type(e).__name__}: {e}")
+                    try:
+                        p = graph_plan()
+                        label = f"graph unsplit={disable_split} cap={budget}"
+                        describe(p, label)
+                        ms_b, out_b, _ = time_plan(graph_plan, q, kc, vc, pt, cs, cu, out)
+                        print(f"    [{label}] {ms_b:.3f} ms/call")
+                        if out_a is not None:
+                            diff = (out_a.float() - out_b.float()).abs().max().item()
+                            denom = out_a.float().abs().max().item()
+                            rel = diff / max(denom, 1e-9)
+                            print(
+                                f"    [cross-check vs eager] max_abs={diff:.3e} rel={rel:.3e}"
+                            )
+                        if ms_a:
+                            print(f"    [speedup vs eager] {ms_a / ms_b:.2f}x")
+                    except Exception as e:  # noqa: BLE001
+                        print(f"    [{label}] FAILED: {type(e).__name__}: {e}")
     finally:
         if locked:
-            subprocess.run(["/tmp/gpu_lock.sh", "release", LOCK_NAME], capture_output=True)
+            _gpu_lock("release")
 
 
 if __name__ == "__main__":

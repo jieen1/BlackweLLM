@@ -35,12 +35,15 @@ from runtime.loading.modelopt import (  # noqa: E402
     quantized_layers_map,
     unpack_nvfp4_to_fp32,
 )
+from runtime.model.fp8_lm_head import NativeFP8LMHead
 from runtime.model.modelopt_linear import (
     QSR_QWEN36_MODEL_OPT_FP4_QUANT_ENV,
     FusedModelOptNVFP4W4A4QKV,
+    ModelOptNVFP4Linear,
     ModelOptNVFP4W4A4Linear,
     _modelopt_flashinfer_fp4_quant_enabled,
 )
+from runtime.model.plain_linear import PlainLinear
 
 
 class TestQuantizedLayersMap:
@@ -216,6 +219,16 @@ class TestDequantizeNvfp4:
 
 
 class TestModelOptNvfp4W4A4Linear:
+    def test_native_w4a16_head_is_a_cuda_only_optional_path(self):
+        lin = ModelOptNVFP4Linear(32, 1, native_w4a16=True)
+        lin.weight.data.fill_(0x22)
+        lin.weight_scale.data.fill_(1.0)
+        lin.weight_scale_2.data.fill_(0.25)
+
+        assert not lin.prepare_native_w4a16()
+        out = lin(torch.ones(1, 32, dtype=torch.bfloat16))
+        assert out.item() == 8.0
+
     def test_activation_quantizer_switch_defaults_to_flashinfer_and_is_reversible(
         self, monkeypatch
     ):
@@ -250,6 +263,14 @@ class TestModelOptNvfp4W4A4Linear:
 
         out = lin(torch.ones(1, 32, dtype=torch.bfloat16))
         assert out.item() == 8.0
+
+
+class TestNativeQwen38LmHead:
+    def test_conversion_requires_cuda_resident_weights(self):
+        linear = PlainLinear(32, 4)
+
+        with pytest.raises(RuntimeError, match="requires CUDA"):
+            NativeFP8LMHead.from_plain_linear(linear)
 
 
 class TestFusedModelOptNvfp4W4A4QKV:

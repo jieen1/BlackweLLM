@@ -102,21 +102,20 @@ Two things were tried, in order, on ``work/nvfp4-gemm-20260802``:
    ``forward()`` below is simply never called for those three submodules
    in ordinary inference.
 
-``lm_head`` (the one NVFP4 module ``Qwen36MLP`` doesn't own) stays on this
-class's plain dequant-to-BF16 ``forward()`` deliberately: it is a single
-non-gated projection (no SwiGLU partner to fuse with), the W4A16 MoE
-kernel's ABI has no bare single-GEMM entry point (see ``Qwen36MLP``
-docstring), and its BF16 dequant cache is cheap in isolation (~1.2 GiB for
-one ``[248320, 2560]`` tensor, not 49.7 GiB across 192 MLP Linears) --
-paying that instead of routing final logits through an approximate kernel
-is the correct trade given logits are what every downstream correctness
-metric reads directly.
+``lm_head`` (the one NVFP4 module ``Qwen36MLP`` doesn't own) now has a
+standalone b12x W4A16 path when the model factory marks it as the head.  The
+packed weights are prepared before CUDA Graph capture and the kernel keeps
+the exact weight-only BF16-activation contract.  Unsupported shapes, CPU
+fixtures, and an explicit ``QSR_NATIVE_MODEL_OPT_W4A16_LM_HEAD=0`` rollback
+still use the original dequant-to-BF16 ``F.linear`` path, preserving the
+reference behavior for every other ModelOpt Linear.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -137,6 +136,18 @@ logger = logging.getLogger("qwen_sm120_runtime.modelopt_linear")
 # routes.  ``flashinfer`` is the SM120 default, matching the CuTe-DSL
 # quantizer selected by SGLang; ``local`` remains the explicit rollback.
 QSR_QWEN36_MODEL_OPT_FP4_QUANT_ENV = "QSR_QWEN36_MODEL_OPT_FP4_QUANT"
+QSR_NATIVE_MODEL_OPT_W4A16_LM_HEAD_ENV = "QSR_NATIVE_MODEL_OPT_W4A16_LM_HEAD"
+
+
+def _native_modelopt_w4a16_lm_head_enabled() -> bool:
+    """Return whether the native W4A16 ModelOpt lm_head is enabled.
+
+    The default is on for the supported SM120 path.  Keeping an explicit
+    process-level rollback makes the optimized and reference paths easy to
+    compare without changing model construction or service configuration.
+    """
+
+    return os.environ.get(QSR_NATIVE_MODEL_OPT_W4A16_LM_HEAD_ENV, "1").strip() != "0"
 
 
 def _modelopt_flashinfer_fp4_quant_enabled() -> bool:
@@ -239,13 +250,30 @@ class ModelOptFP8Linear(nn.Module):
         return F.linear(x, self._weight_bf16, self.bias)
 
 
+@dataclass(frozen=True)
+class _NativeW4A16Runtime:
+    """Stable per-M launch state for the standalone W4A16 GEMM."""
+
+    packed_route_indices: torch.Tensor
+    block_expert_ids: torch.Tensor
+    packed_route_count: torch.Tensor
+    topk_weights: torch.Tensor
+    c_tmp: torch.Tensor
+    locks: torch.Tensor
+    grid_x: int
+
+
 class ModelOptNVFP4Linear(nn.Module):
-    """Block-scaled NVFP4 (E2M1) weight-only-quantized Linear, dequantized to
-    BF16 once and computed as a plain ``F.linear`` -- see module docstring
-    for why this class does NOT itself run a real NVFP4 GEMM (that lives in
-    :class:`~runtime.model.qwen36_model.Qwen36MLP`, fused across this
-    class's three MLP-projection instances) and for the tried-and-reverted
-    ``sparkinfer.gemm.blockscaled.mm`` attempt.
+    """Block-scaled ModelOpt NVFP4 Linear with a safe reference fallback.
+
+    MLP projections remain owned by
+    :class:`~runtime.model.qwen36_model.Qwen36MLP`, which fuses their three
+    projections through b12x's W4A16 path.  The standalone ``lm_head`` now
+    has its own b12x W4A16 route when explicitly marked by the model factory;
+    every other instance retains the established BF16-dequantized
+    ``F.linear`` behavior.  The native head route is prepared before CUDA
+    Graph capture and falls back to this reference path for unsupported
+    shapes or devices.
 
     Checkpoint shape (verified against real safetensors headers, B0-2):
     ``weight`` is ``[out, in // 2]`` ``uint8`` (two 4-bit codes/byte);
@@ -263,6 +291,7 @@ class ModelOptNVFP4Linear(nn.Module):
         *,
         group_size: int = NVFP4_GROUP_SIZE,
         bias: bool = False,
+        native_w4a16: bool = False,
     ) -> None:
         super().__init__()
         if input_size % 2 != 0:
@@ -274,6 +303,7 @@ class ModelOptNVFP4Linear(nn.Module):
         self.input_size = input_size
         self.output_size = output_size
         self.group_size = group_size
+        self._native_w4a16_requested = bool(native_w4a16)
 
         self.weight = nn.Parameter(
             torch.empty(output_size, input_size // 2, dtype=torch.uint8), requires_grad=False
@@ -297,6 +327,184 @@ class ModelOptNVFP4Linear(nn.Module):
             self.bias.weight_loader = default_weight_loader
 
         self._weight_bf16: torch.Tensor | None = None
+        self._native_w4a16_weight: torch.Tensor | None = None
+        self._native_w4a16_scale_i32: torch.Tensor | None = None
+        self._native_w4a16_global_scale: torch.Tensor | None = None
+        self._native_w4a16_kernel: object | None = None
+        self._native_w4a16_lut: torch.Tensor | None = None
+        self._native_w4a16_runtime: dict[int, _NativeW4A16Runtime] = {}
+        self._native_w4a16_disabled_reason: str | None = None
+
+    def prepare_native_w4a16(self) -> bool:
+        """Prepare the standalone W4A16 head before graph capture.
+
+        Preparation is deliberately explicit at the model boundary: b12x
+        repacking and CuTe compilation allocate and compile, neither of which
+        belongs inside a CUDA Graph capture.  The returned boolean is a
+        capability result; callers may retain the exact BF16 fallback when
+        this optional acceleration is unavailable.
+        """
+
+        if not self._native_w4a16_requested or not _native_modelopt_w4a16_lm_head_enabled():
+            return False
+        if self.weight.device.type != "cuda":
+            return False
+        if self._native_w4a16_weight is not None:
+            return True
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("native ModelOpt W4A16 lm_head preparation cannot run in capture")
+        if self.weight.numel() == 0:
+            self._native_w4a16_disabled_reason = "raw NVFP4 weight was released"
+            return False
+        try:
+            from runtime.backends._sparkinfer_import import ensure_sparkinfer_path
+
+            ensure_sparkinfer_path()
+            from b12x._lib.quant.sqg_e4m3 import sqg_xor_cheb_t12_lut
+            from b12x.moe._shared.kernels.w4a16.kernel import compile_w4a16_gemm
+            from b12x.moe._shared.kernels.w4a16.prepare import (
+                prepare_w4a16_modelopt_nvfp4_linear_weights,
+            )
+
+            packed = prepare_w4a16_modelopt_nvfp4_linear_weights(
+                self.weight.data,
+                self.weight_scale.data,
+                self.weight_scale_2.data,
+                params_dtype=torch.bfloat16,
+            )
+            # The head is called with decode/verify-sized batches.  The
+            # compiled kernel accepts a smaller active_m at launch, so one
+            # max-M=32 specialization covers all production head shapes and
+            # keeps the graph/runtime cache bounded.
+            kernel = compile_w4a16_gemm(
+                size_m=32,
+                size_n=packed.output_size,
+                size_k=packed.input_size,
+                num_experts=1,
+                top_k=1,
+                mul_topk_weights=False,
+                tile_n=256,
+                tile_k=64,
+                moe_block_size=32,
+                max_m_blocks=1,
+                element_dtype="bf16",
+                weight_layout="packed",
+                scale_format="e4m3_k16",
+                w13_layout="packed",
+                dense_route_fast_path=True,
+            )
+            self._native_w4a16_weight = packed.weight.reshape(-1)
+            self._native_w4a16_scale_i32 = packed.scale.view(torch.int32).reshape(-1)
+            self._native_w4a16_global_scale = packed.global_scale.reshape(1)
+            self._native_w4a16_kernel = kernel
+            self._native_w4a16_lut = sqg_xor_cheb_t12_lut(self.weight.device).reshape(-1)
+            self._prepare_native_w4a16_runtime()
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            self._native_w4a16_disabled_reason = str(exc)
+            logger.warning("native ModelOpt W4A16 lm_head disabled: %s", exc)
+            return False
+        return True
+
+    def _prepare_native_w4a16_runtime(self) -> None:
+        """Allocate fixed route/scratch tensors outside CUDA Graph capture."""
+
+        if self._native_w4a16_kernel is None:
+            raise RuntimeError("native W4A16 kernel is not compiled")
+        from b12x.moe._shared.kernels.w4a16.host import packed_gemm_scratch_elements
+        from b12x.moe._shared.kernels.w4a16.route_pack import pack_topk_routes_by_expert
+
+        kernel = self._native_w4a16_kernel
+        sms = torch.cuda.get_device_properties(self.weight.device).multi_processor_count
+        for m in (1, 2, 3, 4, 8, 16, 32):
+            if m in self._native_w4a16_runtime:
+                continue
+            topk_ids = torch.zeros((m, 1), device=self.weight.device, dtype=torch.int32)
+            packed_route_indices, block_expert_ids, packed_route_count = (
+                pack_topk_routes_by_expert(topk_ids, 32, 1)
+            )
+            c_tmp = torch.empty(
+                packed_gemm_scratch_elements(
+                    size_n=self.output_size,
+                    route_slots=int(packed_route_indices.numel()),
+                    moe_block_size=32,
+                    sms=sms,
+                ),
+                device=self.weight.device,
+                dtype=torch.float32,
+            )
+            self._native_w4a16_runtime[m] = _NativeW4A16Runtime(
+                packed_route_indices=packed_route_indices.contiguous(),
+                block_expert_ids=block_expert_ids.contiguous(),
+                packed_route_count=packed_route_count.contiguous(),
+                topk_weights=torch.ones((m,), device=self.weight.device, dtype=torch.float32),
+                c_tmp=c_tmp,
+                locks=torch.zeros((4 * 256,), device=self.weight.device, dtype=torch.int32),
+                grid_x=max(
+                    1,
+                    min(
+                        int(sms) * int(kernel.blocks_per_sm),
+                        self.output_size // int(kernel.tile_n),
+                    ),
+                ),
+            )
+
+    def _forward_native_w4a16(self, x: torch.Tensor) -> torch.Tensor | None:
+        """Run the prepared native head, or return ``None`` for fallback."""
+
+        if (
+            not self._native_w4a16_requested
+            or not _native_modelopt_w4a16_lm_head_enabled()
+            or self.bias is not None
+            or x.device.type != "cuda"
+            or x.dtype != torch.bfloat16
+        ):
+            return None
+        if self._native_w4a16_weight is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "native ModelOpt W4A16 lm_head was not prepared before CUDA Graph capture"
+                )
+            if not self.prepare_native_w4a16():
+                return None
+        m = int(x.reshape(-1, self.input_size).shape[0])
+        if m > 32:
+            return None
+        runtime = self._native_w4a16_runtime.get(m)
+        if runtime is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"native ModelOpt W4A16 lm_head has no capture runtime for M={m}"
+                )
+            self._prepare_native_w4a16_runtime()
+            runtime = self._native_w4a16_runtime.get(m)
+        if runtime is None:
+            return None
+        x_2d = x.reshape(-1, self.input_size).contiguous()
+        output = torch.empty((m, self.output_size), device=x.device, dtype=x.dtype)
+        kernel = self._native_w4a16_kernel
+        assert kernel is not None
+        assert self._native_w4a16_scale_i32 is not None
+        assert self._native_w4a16_global_scale is not None
+        assert self._native_w4a16_lut is not None
+        kernel.compiled(
+            x_2d,
+            x_2d,
+            self._native_w4a16_weight,
+            output,
+            self._native_w4a16_scale_i32,
+            self._native_w4a16_global_scale,
+            runtime.packed_route_indices,
+            runtime.block_expert_ids,
+            runtime.packed_route_count,
+            runtime.topk_weights,
+            runtime.c_tmp,
+            runtime.locks,
+            self._native_w4a16_lut,
+            m,
+            grid_x=runtime.grid_x,
+            stream=torch.cuda.current_stream(x.device).cuda_stream,
+        )
+        return output.reshape(*x.shape[:-1], self.output_size)
 
     def _ensure_ready(self) -> None:
         if self._weight_bf16 is None:
@@ -308,6 +516,9 @@ class ModelOptNVFP4Linear(nn.Module):
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        native = self._forward_native_w4a16(x)
+        if native is not None:
+            return native
         self._ensure_ready()
         return F.linear(x, self._weight_bf16, self.bias)
 

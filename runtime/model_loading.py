@@ -568,6 +568,12 @@ def load_qwen36_model(
 
     model._vision_filter_stats = vision_filter_stats
     model.eval()
+    if target_device.type == "cuda":
+        # Prepare optional standalone quantized heads before any backend can
+        # capture decode/verify graphs.  The target lm_head is later shared
+        # by DFlash2, so doing this once here covers both target and draft
+        # calls without changing the established fallback for other formats.
+        model.prepare_native_lm_head()
     if warmup_attention and target_device.type == "cuda":
         model.warmup_attention_shapes(device=target_device, dtype=dtype)
         model.warmup_gdn_prefill_shapes(device=target_device, dtype=dtype)
