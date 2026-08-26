@@ -126,6 +126,7 @@ from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gat
 from torch import nn
 
 from runtime.kernels.fused_kv_scatter import fused_kv_scatter
+from runtime.kernels.gdn_conv import fused_causal_conv_silu
 from runtime.kernels.gguf_paged_attention import paged_f32_attention
 from runtime.kernels.rope import (
     apply_rotary_embedding_inplace,
@@ -221,6 +222,16 @@ QSR_QWEN36_FUSED_KV_SCATTER_ENV = "QSR_QWEN36_FUSED_KV_SCATTER"
 # kernel.  ``auto`` selects it when the optional package is available and
 # retains the tested FLA path otherwise; ``fla`` is the explicit bisect switch.
 QSR_QWEN36_GDN_PREFILL_BACKEND_ENV = "QSR_QWEN36_GDN_PREFILL_BACKEND"
+# Fused causal conv+SiLU Triton kernel for the GDN prefill path. Default on:
+# bit-exact against the eager pair (tests/test_qwen36_gdn_conv_fusion.py) and
+# ~5x faster on the 8192-token chunk shape. ``0`` restores the eager
+# ``F.conv1d + F.silu`` pair for bisection.
+QSR_QWEN36_GDN_CONV_FUSION_ENV = "QSR_QWEN36_GDN_CONV_FUSION"
+
+
+def _gdn_conv_fusion_enabled() -> bool:
+    value = os.environ.get(QSR_QWEN36_GDN_CONV_FUSION_ENV, "1")
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
 # Native FlashInfer SM120 single-token GDN decode.  ``auto`` is intentionally
 # not the default during bring-up: the kernel rounds transient q/k/v/a/b to
 # BF16, so model-level acceptance must clear before this replaces the exact
@@ -1521,6 +1532,16 @@ class Qwen36GatedDeltaNet(nn.Module):
         historical dtype path.
         """
         if self._gguf_scalar_dtype is None:
+            # Fused causal conv+SiLU: one launch, one read and one write of
+            # the [B, C, L] activation instead of a generic depthwise conv
+            # plus a separate SiLU pass. Bit-for-bit identical to the eager
+            # pair on the transposed production layout (verified elementwise
+            # in tests/test_qwen36_gdn_conv_fusion.py); returns None outside
+            # its contract and falls back below.
+            if _gdn_conv_fusion_enabled():
+                fused = fused_causal_conv_silu(x, self.conv1d.weight, padding=padding)
+                if fused is not None:
+                    return fused
             out = F.conv1d(
                 x,
                 self.conv1d.weight,
