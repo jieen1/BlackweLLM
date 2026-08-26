@@ -314,7 +314,10 @@ class SparkinferMoEOutputArena:
     expert into a distinct tensor on the single engine CUDA stream.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, hidden_size: int = HIDDEN_SIZE) -> None:
+        if hidden_size <= 0:
+            raise ValueError(f"hidden_size must be positive, got {hidden_size}")
+        self._hidden_size = hidden_size
         self._buffer: torch.Tensor | None = None
 
     @property
@@ -334,7 +337,7 @@ class SparkinferMoEOutputArena:
         ):
             buffer = torch.empty(
                 batch_tokens,
-                HIDDEN_SIZE,
+                self._hidden_size,
                 dtype=hidden.dtype,
                 device=hidden.device,
             )
