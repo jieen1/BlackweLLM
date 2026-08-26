@@ -143,9 +143,31 @@ def test_slot_mapping_uses_host_known_contiguous_range_without_gpu_reduction() -
     engine.page_size = 16
     engine.max_seq_len = 64
     engine._fast_slot_mapping = True
+    engine._draft_narrow_rows = False
+    engine.draft_row_pages = engine.pages_per_slot
 
     positions = torch.arange(12, 16, dtype=torch.long)
 
+    assert engine._slot_mapping(
+        2,
+        positions,
+        position_start=12,
+        position_count=4,
+    ).tolist() == [268, 269, 270, 271]
+
+    # Narrow rows wrap the page id but keep the intra-page offset.
+    engine._draft_narrow_rows = True
+    engine.draft_row_pages = 5
+    engine.draft_ring_pages = 4
+    assert engine._slot_mapping(
+        2,
+        positions,
+        position_start=12,
+        position_count=4,
+    ).tolist() == [172, 173, 174, 175]
+
+    engine._draft_narrow_rows = False
+    engine.draft_row_pages = engine.pages_per_slot
     assert engine._slot_mapping(
         2,
         positions,
@@ -291,6 +313,8 @@ def test_prefix_lifecycle_preserves_and_copies_the_draft_kv_family() -> None:
     cache = torch.zeros((2, 6, 4, 1, 1), dtype=torch.uint8)
     cache[:, :3].fill_(7)
     engine._draft_kv_caches = {"layer": cache}
+    engine._draft_narrow_rows = False
+    engine.draft_row_pages = engine.pages_per_slot
 
     assert engine.preserve_prefix(0, 8) is True
     assert engine.can_restore_prefix(0, 8) is True
@@ -322,6 +346,8 @@ def test_persistent_prefix_snapshot_round_trips_through_the_draft_scratch_row() 
     cache = torch.zeros((2, 9, 4, 1, 1), dtype=torch.uint8)
     cache[:, :2].fill_(11)
     engine._draft_kv_caches = {"layer": cache}
+    engine._draft_narrow_rows = False
+    engine.draft_row_pages = engine.pages_per_slot
 
     assert engine.snapshot_prefix_to_scratch(0, 8, scratch_pages=(1, 2)) is True
     cache[:, :2].zero_()

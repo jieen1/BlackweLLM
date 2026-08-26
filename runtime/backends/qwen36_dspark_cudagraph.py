@@ -49,6 +49,9 @@ class Qwen36DSparkDraftCudaGraph:
         self.proposal_tokens = engine.k
         self.page_size = engine.page_size
         self.pages_per_slot = engine.pages_per_slot
+        self.draft_row_pages = engine.draft_row_pages
+        self.draft_ring_pages = engine.draft_ring_pages
+        self._draft_narrow_rows = engine._draft_narrow_rows
         self.max_seq_len = engine.max_seq_len
         self.use_compact_draft_cache = engine._use_compact_draft_cache
 
@@ -163,7 +166,7 @@ class Qwen36DSparkDraftCudaGraph:
             scale=first_attn.scale,
             num_kv_heads=first_attn.num_kv_heads,
             page_size=self.page_size,
-            max_pages=self.pages_per_slot,
+            max_pages=self.draft_row_pages,
             num_tokens=self.num_tokens,
             device=self.device,
             use_cuda_graph=True,
@@ -197,7 +200,15 @@ class Qwen36DSparkDraftCudaGraph:
         self._input_ids.fill_(self.engine.draft_model.config.mask_token_id)
         self._input_ids[0, 0] = int(anchor_token)
         torch.add(self._pos_offset, kv_len, out=self._positions)
-        page_row = self.slot * self.pages_per_slot + self._page_offset
+        if self._draft_narrow_rows:
+            # Ring ids: (slot base + absolute local page) % ring, in the
+            # row's narrow address space.
+            page_row = (
+                self.slot * self.draft_row_pages
+                + self._page_offset % self.draft_ring_pages
+            )
+        else:
+            page_row = self.slot * self.pages_per_slot + self._page_offset
         attention_kv_len = kv_len
         if self.use_compact_draft_cache:
             attention_kv_len, first_page = compact_dflash_window(
@@ -207,18 +218,34 @@ class Qwen36DSparkDraftCudaGraph:
             )
             num_pages = (attention_kv_len + self.num_tokens + self.page_size - 1) // self.page_size
             self._page_table.zero_()
-            self._page_table[:, :num_pages].copy_(
-                page_row[first_page : first_page + num_pages].view(1, -1).expand(
-                    self.num_tokens, -1
+            if self._draft_narrow_rows:
+                ring = (first_page + torch.arange(num_pages, device=self.device)) % (
+                    self.draft_ring_pages
                 )
-            )
+                self._page_table[:, :num_pages].copy_(
+                    page_row[ring].view(1, -1).expand(self.num_tokens, -1)
+                )
+            else:
+                self._page_table[:, :num_pages].copy_(
+                    page_row[first_page : first_page + num_pages].view(1, -1).expand(
+                        self.num_tokens, -1
+                    )
+                )
         else:
             self._page_table.copy_(page_row.view(1, -1).expand(self.num_tokens, -1))
         self._cache_seqlens.fill_(attention_kv_len + self.num_tokens)
-        self._slot_mapping.copy_(
-            self.slot * self.pages_per_slot * self.page_size + self._positions,
-            non_blocking=True,
-        )
+        if self._draft_narrow_rows:
+            positions = self._positions
+            page_ids = positions // self.page_size
+            intra = positions - page_ids * self.page_size
+            narrow_page = (page_ids + self.slot * self.pages_per_slot) % self.draft_ring_pages
+            flat = (self.slot * self.draft_row_pages + narrow_page) * self.page_size + intra
+            self._slot_mapping.copy_(flat, non_blocking=True)
+        else:
+            self._slot_mapping.copy_(
+                self.slot * self.pages_per_slot * self.page_size + self._positions,
+                non_blocking=True,
+            )
         if self.engine.use_flashinfer_draft:
             assert self._flashinfer_impl is not None
             assert self._flash_metadata is not None
@@ -363,6 +390,9 @@ class Qwen36DSparkDraftBatchCudaGraph:
         self.proposal_tokens = engine.k
         self.page_size = engine.page_size
         self.pages_per_slot = engine.pages_per_slot
+        self.draft_row_pages = engine.draft_row_pages
+        self.draft_ring_pages = engine.draft_ring_pages
+        self._draft_narrow_rows = engine._draft_narrow_rows
         self.max_seq_len = engine.max_seq_len
         self.use_compact_draft_cache = engine._use_compact_draft_cache
         if not 1 <= self.batch_size <= engine.backend.num_slots:
@@ -394,16 +424,27 @@ class Qwen36DSparkDraftBatchCudaGraph:
         self._kv_lens = torch.empty(self.batch_size, dtype=torch.long, device=self.device)
         self._slot_ids = torch.empty(self.batch_size, dtype=torch.long, device=self.device)
         self._slot_bases = torch.empty(self.batch_size, dtype=torch.long, device=self.device)
-        self._slot_page_tables = torch.arange(
-            engine.backend.num_slots * self.pages_per_slot,
-            dtype=torch.int32,
-            device=self.device,
-        ).view(engine.backend.num_slots, self.pages_per_slot)
+        if self._draft_narrow_rows:
+            local = torch.arange(self.pages_per_slot, device=self.device)
+            row_base = (
+                torch.arange(engine.backend.num_slots, device=self.device) * self.draft_row_pages
+            )
+            table = (local % self.draft_ring_pages)[None, :] + row_base[:, None]
+            self._slot_page_tables = table.to(torch.int32)
+        else:
+            self._slot_page_tables = torch.arange(
+                engine.backend.num_slots * self.pages_per_slot,
+                dtype=torch.int32,
+                device=self.device,
+            ).view(engine.backend.num_slots, self.pages_per_slot)
         self._positions = torch.zeros(
             self.batch_size * self.num_tokens, dtype=torch.long, device=self.device
         )
         self._page_table = torch.zeros(
-            self.batch_size, self.pages_per_slot, dtype=torch.int32, device=self.device
+            self.batch_size,
+            getattr(self, "draft_row_pages", 0) or self.pages_per_slot,
+            dtype=torch.int32,
+            device=self.device,
         )
         self._cache_seqlens = torch.zeros(self.batch_size, dtype=torch.int32, device=self.device)
         self._cu_seqlens_q = (
@@ -451,7 +492,7 @@ class Qwen36DSparkDraftBatchCudaGraph:
                 scale=first_attn.scale,
                 num_kv_heads=first_attn.num_kv_heads,
                 page_size=self.page_size,
-                max_pages=self.pages_per_slot,
+                max_pages=self.draft_row_pages,
                 num_tokens=self.num_tokens,
                 batch_size=self.batch_size,
                 device=self.device,
@@ -459,11 +500,16 @@ class Qwen36DSparkDraftBatchCudaGraph:
                 kv_cache_dtype=first_attn.kv_cache_dtype,
                 workspace_buffer=self.engine._flashinfer_workspace_buffer,
             )
+            meta_width = (
+                self.draft_row_pages
+                if getattr(self, "_draft_narrow_rows", False)
+                else self.pages_per_slot
+            )
             page_table = torch.arange(
-                self.batch_size * self.pages_per_slot,
+                self.batch_size * meta_width,
                 dtype=torch.int32,
                 device=self.device,
-            ).view(self.batch_size, self.pages_per_slot)
+            ).view(self.batch_size, meta_width)
             self._flash_metadata = SparkinferAttnMetadata(
                 mode="extend",
                 page_table=page_table,
@@ -646,17 +692,30 @@ class Qwen36DSparkDraftBatchCudaGraph:
                 num_pages = (
                     attention_kv_len + self.num_tokens + self.page_size - 1
                 ) // self.page_size
-                if first_page + num_pages > self.pages_per_slot:
+                if self._draft_narrow_rows:
+                    if num_pages > self.draft_ring_pages:
+                        raise RuntimeError(
+                            "DFlash compact page view exceeds the narrow draft row: "
+                            f"row={row}, slot={slot}, pages={num_pages}, "
+                            f"capacity={self.draft_ring_pages}"
+                        )
+                    ring = (first_page + torch.arange(num_pages, device=self.device)) % (
+                        self.draft_ring_pages
+                    )
+                    self._page_table[row].zero_()
+                    self._page_table[row, :num_pages].copy_(page_row[ring])
+                elif first_page + num_pages > self.pages_per_slot:
                     raise RuntimeError(
                         "DFlash compact page view exceeds the draft slot: "
                         f"row={row}, slot={slot}, kv_len={source_kv_lens[row]}, "
                         f"first_page={first_page}, pages={num_pages}, "
                         f"capacity={self.pages_per_slot}"
                     )
-                self._page_table[row].zero_()
-                self._page_table[row, :num_pages].copy_(
-                    page_row[first_page : first_page + num_pages]
-                )
+                else:
+                    self._page_table[row].zero_()
+                    self._page_table[row, :num_pages].copy_(
+                        page_row[first_page : first_page + num_pages]
+                    )
             else:
                 self._page_table[row].copy_(page_row)
             attention_kv_lens.append(attention_kv_len)
@@ -667,13 +726,24 @@ class Qwen36DSparkDraftBatchCudaGraph:
             self.num_tokens,
             out=self._cache_seqlens,
         )
-        self._slot_bases.copy_(self._slot_ids)
-        self._slot_bases.mul_(self.pages_per_slot * self.page_size)
-        torch.add(
-            self._slot_bases[:, None],
-            self._positions.view(self.batch_size, -1),
-            out=self._slot_mapping.view(self.batch_size, self.num_tokens),
-        )
+        if self._draft_narrow_rows:
+            positions = self._positions.view(self.batch_size, -1)
+            page_ids = positions // self.page_size
+            intra = positions - page_ids * self.page_size
+            abs_page = self._slot_ids[:, None] * self.pages_per_slot + page_ids
+            narrow_page = abs_page % self.draft_ring_pages
+            flat = (self._slot_ids[:, None] * self.draft_row_pages + narrow_page) * (
+                self.page_size
+            ) + intra
+            self._slot_mapping.view(self.batch_size, -1).copy_(flat)
+        else:
+            self._slot_bases.copy_(self._slot_ids)
+            self._slot_bases.mul_(self.pages_per_slot * self.page_size)
+            torch.add(
+                self._slot_bases[:, None],
+                self._positions.view(self.batch_size, -1),
+                out=self._slot_mapping.view(self.batch_size, self.num_tokens),
+            )
         if self.engine.use_flashinfer_draft:
             assert self._flashinfer_impl is not None
             # FlashInfer's split-KV planner still consumes host-known lengths.

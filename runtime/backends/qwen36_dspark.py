@@ -428,6 +428,28 @@ class Qwen36DSparkEngine:
             and self._draft_window_left >= 0
             and os.environ.get("QSR_QWEN36_DSPARK_COMPACT_DRAFT_CACHE", "1") != "0"
         )
+        # Narrow physical rows for the draft KV family. In compact mode the
+        # sliding-window view only ever reads the last ``window + page``
+        # tokens, so each row keeps just enough pages for that window plus
+        # one slack page and every absolute page id maps to
+        # ``id % draft_row_pages``. The mapping is a pure function of the
+        # absolute page number, so prefix preserve/restore stays consistent
+        # without tracking physical history. Saves ~12.4 GiB at 4 slots
+        # (12.50 -> ~0.12 GiB for the 5-layer DFlash2 draft).
+        self._draft_narrow_rows = (
+            self._use_compact_draft_cache
+            and os.environ.get("QSR_QWEN36_DSPARK_DRAFT_NARROW_ROWS", "1") != "0"
+        )
+        if self._draft_narrow_rows:
+            # Window span can reach window+slack+query pages; add one more
+            # page and RESERVE the last one exclusively for the fused-context
+            # epilogue's scratch rows, whose addresses must stay unique.
+            window_tokens = self._draft_window_left + 1 + self._draft_query_tokens
+            self.draft_row_pages = -(-window_tokens // self.page_size) + 2
+            self.draft_ring_pages = self.draft_row_pages - 1
+        else:
+            self.draft_row_pages = self.pages_per_slot
+            self.draft_ring_pages = self.pages_per_slot
         if self.use_flashinfer_draft:
             workspace_bytes = max(
                 64 * 1024 * 1024,
@@ -457,7 +479,7 @@ class Qwen36DSparkEngine:
         # make an exact prompt restore valid after the source slot continues
         # decoding or is reused by another request.
         self.scratch_row = backend.num_slots
-        total_blocks = (backend.num_slots + 1) * self.pages_per_slot
+        total_blocks = (backend.num_slots + 1) * self.draft_row_pages
         self._draft_kv_caches: dict[str, torch.Tensor] = {}
         for name, attn in self._draft_attn_layers.items():
             shape = (
@@ -586,12 +608,27 @@ class Qwen36DSparkEngine:
                 f"DSpark prefix exceeds slot page capacity: pages={pages}, "
                 f"capacity={self.pages_per_slot}"
             )
-        source_start = source_slot * self.pages_per_slot
-        target_start = target_slot * self.pages_per_slot
-        for cache in self._draft_kv_caches.values():
-            cache[:, target_start : target_start + pages].copy_(
-                cache[:, source_start : source_start + pages]
-            )
+        # Narrow rows: only the trailing window survives physically; older
+        # pages are invisible to the sliding window either way.
+        tail = min(pages, self.draft_row_pages)
+        first = pages - tail
+        source_start = source_slot * self.draft_row_pages
+        target_start = target_slot * self.draft_row_pages
+        if self._draft_narrow_rows:
+            offs = torch.arange(
+                first, pages, dtype=torch.long, device=self.device
+            ) % (self.draft_ring_pages)
+            source_ids = source_start + offs
+            target_ids = target_start + offs
+            for cache in self._draft_kv_caches.values():
+                cache[:, target_ids] = cache[:, source_ids]
+        else:
+            source_start += first
+            target_start += first
+            for cache in self._draft_kv_caches.values():
+                cache[:, target_start : target_start + tail].copy_(
+                    cache[:, source_start : source_start + tail]
+                )
         self._draft_kv_len[target_slot] = kv_len
         self._cached_prefix_len[target_slot] = 0
 
@@ -617,16 +654,35 @@ class Qwen36DSparkEngine:
             raise ValueError("DSpark scratch prefix needs one distinct page per logical page")
         if any(page < 0 or page >= self.pages_per_slot for page in scratch_pages):
             raise ValueError("DSpark scratch prefix page is outside the scratch row")
-        source_start = source_slot * self.pages_per_slot
-        scratch_start = self.scratch_row * self.pages_per_slot
-        source_pages = torch.arange(
-            source_start, source_start + pages, dtype=torch.long, device=self.device
-        )
-        scratch_page_tensor = torch.tensor(
-            [scratch_start + page for page in scratch_pages], dtype=torch.long, device=self.device
-        )
-        for cache in self._draft_kv_caches.values():
-            cache[:, scratch_page_tensor] = cache[:, source_pages]
+        source_start = source_slot * self.draft_row_pages
+        scratch_start = self.scratch_row * self.draft_row_pages
+        if self._draft_narrow_rows:
+            tail = min(pages, self.draft_row_pages)
+            first = pages - tail
+            kept = scratch_pages[first:]
+            offs = torch.arange(first, pages, dtype=torch.long, device=self.device) % (
+                self.draft_ring_pages
+            )
+            source_ids = source_start + offs
+            scratch_ids = torch.tensor(
+                [scratch_start + (page % (
+                self.draft_ring_pages
+            )) for page in kept],
+                dtype=torch.long,
+                device=self.device,
+            )
+            for cache in self._draft_kv_caches.values():
+                cache[:, scratch_ids] = cache[:, source_ids]
+        else:
+            source_pages = torch.arange(
+                source_start, source_start + pages, dtype=torch.long, device=self.device
+            )
+            scratch_page_tensor = torch.tensor(
+                [scratch_start + page for page in scratch_pages], dtype=torch.long,
+                device=self.device,
+            )
+            for cache in self._draft_kv_caches.values():
+                cache[:, scratch_page_tensor] = cache[:, source_pages]
         self._scratch_valid_pages.update(scratch_pages)
         return True
 
@@ -648,16 +704,35 @@ class Qwen36DSparkEngine:
             raise ValueError("DSpark scratch prefix page is outside the scratch row")
         if not set(scratch_pages).issubset(self._scratch_valid_pages):
             return False
-        target_start = target_slot * self.pages_per_slot
-        scratch_start = self.scratch_row * self.pages_per_slot
-        target_pages = torch.arange(
-            target_start, target_start + pages, dtype=torch.long, device=self.device
-        )
-        scratch_page_tensor = torch.tensor(
-            [scratch_start + page for page in scratch_pages], dtype=torch.long, device=self.device
-        )
-        for cache in self._draft_kv_caches.values():
-            cache[:, target_pages] = cache[:, scratch_page_tensor]
+        target_start = target_slot * self.draft_row_pages
+        scratch_start = self.scratch_row * self.draft_row_pages
+        if self._draft_narrow_rows:
+            tail = min(pages, self.draft_row_pages)
+            first = pages - tail
+            kept = scratch_pages[first:]
+            offs = torch.arange(first, pages, dtype=torch.long, device=self.device) % (
+                self.draft_ring_pages
+            )
+            target_ids = target_start + offs
+            scratch_ids = torch.tensor(
+                [scratch_start + (page % (
+                self.draft_ring_pages
+            )) for page in kept],
+                dtype=torch.long,
+                device=self.device,
+            )
+            for cache in self._draft_kv_caches.values():
+                cache[:, target_ids] = cache[:, scratch_ids]
+        else:
+            target_pages = torch.arange(
+                target_start, target_start + pages, dtype=torch.long, device=self.device
+            )
+            scratch_page_tensor = torch.tensor(
+                [scratch_start + page for page in scratch_pages], dtype=torch.long,
+                device=self.device,
+            )
+            for cache in self._draft_kv_caches.values():
+                cache[:, target_pages] = cache[:, scratch_page_tensor]
         self._draft_kv_len[target_slot] = kv_len
         self._cached_prefix_len[target_slot] = 0
         return True
@@ -819,7 +894,7 @@ class Qwen36DSparkEngine:
             prefill_capacity_by_window_left={
                 self._draft_window_left: (
                     self._draft_query_tokens,
-                    self.pages_per_slot,
+                    self.draft_row_pages,
                 ),
             },
             max_batch=self._draft_query_tokens,
@@ -833,7 +908,7 @@ class Qwen36DSparkEngine:
                 scale=first_attn.scale,
                 num_kv_heads=first_attn.num_kv_heads,
                 page_size=self.page_size,
-                max_pages=self.pages_per_slot,
+                max_pages=self.draft_row_pages,
                 num_tokens=self._draft_query_tokens,
                 device=self.device,
                 window_left=self._draft_window_left,
@@ -846,10 +921,11 @@ class Qwen36DSparkEngine:
     def _page_table(self, slot: int) -> torch.Tensor:
         if slot < 0 or slot >= self.backend.num_slots:
             raise ValueError(f"invalid DSpark slot {slot}")
-        base = slot * self.pages_per_slot
+        base = slot * self.draft_row_pages
+        width = self.draft_row_pages if self._draft_narrow_rows else self.pages_per_slot
         return torch.arange(
             base,
-            base + self.pages_per_slot,
+            base + width,
             dtype=torch.int32,
             device=self.device,
         ).view(1, -1)
@@ -869,6 +945,20 @@ class Qwen36DSparkEngine:
         )
         total_len = local_len + int(num_tokens)
         num_pages = (total_len + self.page_size - 1) // self.page_size
+        if self._draft_narrow_rows:
+            if num_pages > self.draft_row_pages:
+                raise RuntimeError(
+                    "DFlash compact page view exceeds the narrow draft row: "
+                    f"slot={slot}, kv_len={kv_len}, pages={num_pages}, "
+                    f"capacity={self.draft_row_pages}"
+                )
+            base = slot * self.draft_row_pages
+            ring = (first_page + torch.arange(num_pages, device=self.device)) % (
+                self.draft_ring_pages
+            )
+            compact = torch.zeros_like(page_table)
+            compact[0, :num_pages] = base + ring
+            return compact, local_len
         if first_page + num_pages > self.pages_per_slot:
             raise RuntimeError(
                 "DFlash compact page view exceeds the draft slot: "
@@ -912,6 +1002,13 @@ class Qwen36DSparkEngine:
                 f"range=[{int(positions.min().item())}, {int(positions.max().item())}], "
                 f"max_seq_len={self.max_seq_len}"
             )
+        if self._draft_narrow_rows:
+            page_ids = positions // self.page_size
+            intra = positions - page_ids * self.page_size
+            narrow_page = (page_ids + slot * self.pages_per_slot) % (
+                self.draft_ring_pages
+            )
+            return (slot * self.draft_row_pages + narrow_page) * self.page_size + intra
         base = slot * self.pages_per_slot * self.page_size
         return base + positions
 
@@ -951,7 +1048,7 @@ class Qwen36DSparkEngine:
         host_positions.zero_()
         host_slot_mapping.zero_()
         compact_offset = 0
-        row_stride = self.pages_per_slot * self.page_size
+        row_stride = self.draft_row_pages * self.page_size
         for slot, past_len, verify_len in zip(slots, past_lens, verify_lens, strict=True):
             self._validate_slot(int(slot))
             past_len = int(past_len)
@@ -965,17 +1062,39 @@ class Qwen36DSparkEngine:
                     )
                 index = compact_offset + column
                 host_positions[index] = position
-                host_slot_mapping[index] = int(slot) * row_stride + position
+                if self._draft_narrow_rows:
+                    pos = int(position)
+                    page_ids = pos // self.page_size
+                    intra = pos - page_ids * self.page_size
+                    narrow_page = (page_ids + int(slot) * self.pages_per_slot) % (
+                        self.draft_row_pages
+                    )
+                    host_slot_mapping[index] = (
+                        int(slot) * self.draft_row_pages + narrow_page
+                    ) * self.page_size + intra
+                else:
+                    host_slot_mapping[index] = int(slot) * row_stride + position
             compact_offset += verify_len
 
         scratch_base = self.scratch_row * row_stride
+        # Narrow rows: epilogue scratch lives on the row's RESERVED last page,
+        # contiguous and disjoint from every ring page.
+        scratch_reserved_base = self.scratch_row * self.draft_row_pages * self.page_size + (
+            (self.draft_row_pages - 1) * self.page_size
+        )
+
+        def _scratch_flat(scratch_position: int) -> int:
+            if self._draft_narrow_rows:
+                return scratch_reserved_base + scratch_position
+            return scratch_base + scratch_position
+
         for index in range(compact_offset, capacity):
             # Invalid target rows are never consumed by ragged attention, but
             # they still pass through the fixed-shape MLP/projection body.
             # Give each one a unique scratch address to avoid scatter races.
             scratch_position = index - compact_offset
             host_positions[index] = scratch_position
-            host_slot_mapping[index] = scratch_base + scratch_position
+            host_slot_mapping[index] = _scratch_flat(scratch_position)
 
     def inject_dspark_context_kv(
         self,
