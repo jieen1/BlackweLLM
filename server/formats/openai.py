@@ -11,7 +11,12 @@ import time
 import uuid
 from typing import Any
 
-from server.formats.content import extract_text
+from server.formats.content import (
+    content_has_images,
+    content_has_videos,
+    extract_text,
+    normalize_content_blocks,
+)
 from server.formats.tools import format_tool_calls_openai, parse_tool_calls
 
 
@@ -22,6 +27,12 @@ def parse_chat_messages(body: dict) -> list[dict]:
     Also handles tool_calls in assistant messages and tool role messages.
     """
     messages = []
+
+    def content_for_template(field: Any, *, allow_images: bool = True) -> Any:
+        if allow_images and (content_has_images(field) or content_has_videos(field)):
+            return normalize_content_blocks(field)
+        return extract_text(field)
+
     for msg in body.get("messages", []):
         role = msg.get("role", "user")
         entry: dict[str, Any] = {"role": role}
@@ -31,7 +42,7 @@ def parse_chat_messages(body: dict) -> list[dict]:
             if "tool_call_id" in msg:
                 entry["tool_call_id"] = msg["tool_call_id"]
         elif role == "assistant" and "tool_calls" in msg:
-            entry["content"] = extract_text(msg.get("content"))
+            entry["content"] = content_for_template(msg.get("content"))
             # Chat template expects arguments as dict, not JSON string
             converted_calls = []
             for tc in msg["tool_calls"]:
@@ -47,7 +58,7 @@ def parse_chat_messages(body: dict) -> list[dict]:
                 converted_calls.append(tc_copy)
             entry["tool_calls"] = converted_calls
         else:
-            entry["content"] = extract_text(msg.get("content"))
+            entry["content"] = content_for_template(msg.get("content"))
 
         # Qwen3.6 and Qwen3.8 chat templates consume this field when
         # preserve_thinking=True.  Dropping it here silently erased prior

@@ -21,6 +21,11 @@ import time
 import uuid
 from typing import Any
 
+from server.formats.content import (
+    content_has_images,
+    content_has_videos,
+    normalize_content_blocks,
+)
 from server.formats.tools import parse_tool_calls
 
 
@@ -31,6 +36,33 @@ def _block_text(block: Any) -> str:
     if isinstance(block, dict):
         return str(block.get("text") or block.get("refusal") or "")
     return ""
+
+
+def _input_content(content: Any) -> Any:
+    """Normalize Responses text/image items to the shared chat shape."""
+
+    if not isinstance(content, list):
+        return _block_text(content)
+    blocks: list[dict] = []
+    for block in content:
+        if not isinstance(block, dict):
+            if _block_text(block):
+                blocks.append({"type": "text", "text": _block_text(block)})
+            continue
+        block_type = str(block.get("type", "")).lower()
+        if block_type in {"input_image", "image", "image_url"}:
+            payload = block.get("image_url", block.get("image"))
+            blocks.append({"type": "image", "image_url": payload})
+        elif block_type in {"input_video", "video", "video_url"}:
+            payload = block.get("video_url", block.get("video"))
+            blocks.append({"type": "video", "video": payload})
+        elif block_type in {"input_text", "text"}:
+            blocks.append({"type": "text", "text": _block_text(block)})
+        elif _block_text(block):
+            blocks.append({"type": "text", "text": _block_text(block)})
+    if content_has_images(blocks) or content_has_videos(blocks):
+        return normalize_content_blocks(blocks)
+    return "\n".join(block["text"] for block in blocks if block.get("text"))
 
 
 def parse_input(body: dict) -> list[dict]:
@@ -46,9 +78,9 @@ def parse_input(body: dict) -> list[dict]:
         if isinstance(instructions, str):
             messages.append({"role": "system", "content": instructions})
         elif isinstance(instructions, list):
-            text = "\n".join(_block_text(b) for b in instructions if _block_text(b))
-            if text:
-                messages.append({"role": "system", "content": text})
+            content = _input_content(instructions)
+            if content:
+                messages.append({"role": "system", "content": content})
 
     raw_input = body.get("input")
     if isinstance(raw_input, str):
@@ -65,11 +97,7 @@ def parse_input(body: dict) -> list[dict]:
                     # system-level instructions.
                     role = "system"
                 content = item.get("content")
-                if isinstance(content, list):
-                    text = "\n".join(_block_text(b) for b in content if _block_text(b))
-                else:
-                    text = _block_text(content)
-                messages.append({"role": role, "content": text})
+                messages.append({"role": role, "content": _input_content(content)})
             elif itype == "function_call":
                 args = item.get("arguments", "")
                 if isinstance(args, str):

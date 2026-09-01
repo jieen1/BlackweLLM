@@ -232,6 +232,8 @@ QSR_QWEN36_GDN_CONV_FUSION_ENV = "QSR_QWEN36_GDN_CONV_FUSION"
 def _gdn_conv_fusion_enabled() -> bool:
     value = os.environ.get(QSR_QWEN36_GDN_CONV_FUSION_ENV, "1")
     return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
 # Native FlashInfer SM120 single-token GDN decode.  ``auto`` is intentionally
 # not the default during bring-up: the kernel rounds transient q/k/v/a/b to
 # BF16, so model-level acceptance must clear before this replaces the exact
@@ -406,6 +408,7 @@ def _gdn_prefill_l2norm(x: torch.Tensor) -> torch.Tensor:
     if isinstance(normalized, tuple):
         normalized = normalized[0]
     return normalized
+
 
 #: Checkpoint tensor suffixes this loader deliberately never consumes into
 #: a Parameter. Empty since the 2026-08-03 FP8 follow-up: ``ModelOptFP8Linear``
@@ -643,9 +646,7 @@ def _gdn_fused_checkpoint_slice(
             # second source carries the same calibration value.
             if first_shard:
                 param.data.copy_(tensor.reshape(()))
-            elif not torch.equal(
-                param.data.reshape(()), tensor.reshape(()).to(param.device)
-            ):
+            elif not torch.equal(param.data.reshape(()), tensor.reshape(()).to(param.device)):
                 raise RuntimeError(
                     f"GDN fused scalar mismatch for {mapped_name!r}: "
                     f"{fused_name!r} already received a different calibration "
@@ -761,9 +762,13 @@ class Qwen36RMSNormGated(nn.Module):
         eps: float = 1e-6,
         *,
         weight_dtype: torch.dtype | None = None,
+        gate_act: str = "silu",
     ) -> None:
         super().__init__()
         self.eps = eps
+        if gate_act not in ("silu", "sigmoid"):
+            raise ValueError(f"gate_act must be silu or sigmoid, got {gate_act!r}")
+        self.gate_act = gate_act
         weight = torch.ones(dim, dtype=weight_dtype)
         self.weight = nn.Parameter(weight)
         self.weight.weight_loader = default_weight_loader
@@ -774,7 +779,8 @@ class Qwen36RMSNormGated(nn.Module):
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
         x = self.weight * x.to(input_dtype)
-        x = x * F.silu(gate.to(torch.float32))
+        g = gate.to(torch.float32)
+        x = x * (torch.sigmoid(g) if self.gate_act == "sigmoid" else F.silu(g))
         return x.to(input_dtype)
 
 
@@ -1157,10 +1163,14 @@ class Qwen36GatedDeltaNet(nn.Module):
         )
         self.A_log.weight_loader = default_weight_loader
 
+        gate_act = config.get("output_gate_type", "silu")
+        if gate_act in ("swish", "silu"):
+            gate_act = "silu"
         self.norm = Qwen36RMSNormGated(
             self.head_v_dim,
             eps=self.eps,
             weight_dtype=self._gguf_scalar_dtype,
+            gate_act=gate_act,
         )
 
         prefix = f"model.language_model.layers.{layer_idx}.linear_attn"
@@ -1174,9 +1184,7 @@ class Qwen36GatedDeltaNet(nn.Module):
         z_name = f"{prefix}.in_proj_z"
         qkv_algo = quantized.get(qkv_name, QUANT_ALGO_UNQUANTIZED)
         z_algo = quantized.get(z_name, QUANT_ALGO_UNQUANTIZED)
-        if qkv_algo != z_algo and not (
-            qkv_algo.startswith("gguf_") and z_algo.startswith("gguf_")
-        ):
+        if qkv_algo != z_algo and not (qkv_algo.startswith("gguf_") and z_algo.startswith("gguf_")):
             raise ValueError(
                 f"GDN layer {layer_idx}: in_proj_qkv uses {qkv_algo!r}, but "
                 f"in_proj_z uses {z_algo!r}; historical qkvz fusion requires "
@@ -1378,8 +1386,7 @@ class Qwen36GatedDeltaNet(nn.Module):
         """Run the SGLang-compatible chunk path or the legacy FLA fallback."""
         use_flashinfer = self._flashinfer_gdn_prefill_enabled(query)
         use_vllm_prefill_prep = (
-            os.environ.get(QSR_QWEN36_GDN_PREFILL_VLLM_PREP_ENV, "1") == "1"
-            and query.is_cuda
+            os.environ.get(QSR_QWEN36_GDN_PREFILL_VLLM_PREP_ENV, "1") == "1" and query.is_cuda
         )
         if use_vllm_prefill_prep:
             query = _gdn_prefill_l2norm(query)
@@ -1775,9 +1782,7 @@ class Qwen36GatedDeltaNet(nn.Module):
         batch_size, seq_len, _ = hidden_states.shape
         mixed_qkvz = self._project_qkvz(hidden_states)
         mixed_qkv = mixed_qkvz[..., : self.conv_dim].transpose(1, 2)
-        z = mixed_qkvz[..., self.conv_dim :].reshape(
-            batch_size, seq_len, -1, self.head_v_dim
-        )
+        z = mixed_qkvz[..., self.conv_dim :].reshape(batch_size, seq_len, -1, self.head_v_dim)
         b, a = self._project_ba(hidden_states).split(self.num_v_heads, dim=-1)
 
         if has_previous_state:
@@ -1820,6 +1825,8 @@ class Qwen36GatedDeltaNet(nn.Module):
         spec_conv_pool: torch.Tensor | None = None,
         spec_recurrent_pool: torch.Tensor | None = None,
         batch_large_projections: bool = False,
+        fp32_intermediate_states: torch.Tensor | None = None,
+        fp32_commit_inputs: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, list[GdnLayerState] | None]:
         """B3: MTP verify's GDN forward -- K candidate positions, K+1
         materialized state snapshots, no chunk algorithm involved.
@@ -2001,11 +2008,16 @@ class Qwen36GatedDeltaNet(nn.Module):
             and query.is_cuda
             and query.dtype == torch.bfloat16
         )
-        if not fuse_indexed_gates:
+        use_fp32_verify = (
+            fp32_intermediate_states is not None or fp32_commit_inputs is not None
+        )
+        if use_fp32_verify and state.recurrent_state.dtype != torch.float32:
+            raise TypeError("FP32 GDN verify requires a float32 committed state")
+        if not fuse_indexed_gates and not use_fp32_verify:
             beta = b.sigmoid()
             g = self._decay_scale() * F.softplus(a.float() + self.dt_bias)
 
-        if self.repeat > 1:
+        if self.repeat > 1 and not use_fp32_verify:
             query, key = self._expand_gdn_query_key_heads(query, key)
 
         # The multistep kernel advances the whole speculative sequence in one
@@ -2058,7 +2070,39 @@ class Qwen36GatedDeltaNet(nn.Module):
             and spec_source_index is not None
             and spec_source_index.shape == (batch_size,)
         )
-        if use_multistep:
+        if use_fp32_verify:
+            from runtime.kernels.flashnext_gdn_verify import flashnext_gdn_verify
+
+            assert fp32_intermediate_states is not None
+            verify_q = query.contiguous()
+            verify_k = key.contiguous()
+            verify_v = value.contiguous()
+            if fp32_commit_inputs is not None:
+                # Retain the exact graph-owned tensors consumed by the verify
+                # kernel.  They are only a few MiB across all GDN layers and
+                # let commit recompute the selected FP32 state instead of
+                # keeping four 12-MiB state candidates per layer resident.
+                fp32_commit_inputs.clear()
+                fp32_commit_inputs.update(
+                    q=verify_q,
+                    k=verify_k,
+                    v=verify_v,
+                    a=a,
+                    b=b,
+                )
+            core_attn_out = flashnext_gdn_verify(
+                q=verify_q,
+                k=verify_k,
+                v=verify_v,
+                a=a,
+                b=b,
+                a_log=self.A_log.float(),
+                dt_bias=self.dt_bias,
+                initial_state=state.recurrent_state.contiguous(),
+                intermediate_states=fp32_intermediate_states,
+            )
+            recurrent_states = None
+        elif use_multistep:
             # The multistep kernel requires an innermost-contiguous layout;
             # FLA's sequential entry point does not, which is why this never
             # surfaced before. `mixed_qkv` arrives transposed and is then
@@ -2140,11 +2184,12 @@ class Qwen36GatedDeltaNet(nn.Module):
                         )
                 else:
                     assert spec_rows_by_request is not None
-                    assert recurrent_states is not None
-                    for batch_idx, rows in enumerate(spec_rows_by_request):
-                        rows[j].recurrent_state.copy_(
-                            recurrent_states[batch_idx : batch_idx + 1, j + 1]
-                        )
+                    if not use_fp32_verify:
+                        assert recurrent_states is not None
+                        for batch_idx, rows in enumerate(spec_rows_by_request):
+                            rows[j].recurrent_state.copy_(
+                                recurrent_states[batch_idx : batch_idx + 1, j + 1]
+                            )
 
         # ---- batched norm, once over all `seq_len` positions' recurrent
         # outputs (was: once per position, inside the loop). RMSNormGated
@@ -3053,13 +3098,9 @@ class Qwen36DecodeGraphAttention:
         self.page_size = page_size
         self._default_descale = torch.ones(1, dtype=torch.float32, device=device)
         if native_f32:
-            self.page_table = torch.zeros(
-                batch, pages_per_slot, dtype=torch.int32, device=device
-            )
+            self.page_table = torch.zeros(batch, pages_per_slot, dtype=torch.int32, device=device)
             self.cache_seqlens = torch.ones(batch, dtype=torch.int32, device=device)
-            self.cu_seqlens_q = torch.arange(
-                batch + 1, dtype=torch.int32, device=device
-            )
+            self.cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=device)
             self._workspace = None
             return
         # See Qwen36BatchedDecodeAttention's matching comment: this driver
@@ -3202,16 +3243,14 @@ class Qwen36VerifyGraphAttention:
             self._cu_seqlens_q = (
                 torch.arange(batch + 1, dtype=torch.int32, device=device) * verify_tokens
             )
-            self.page_table = torch.empty(
-                batch, pages_per_slot, dtype=torch.int32, device=device
-            )
+            self.page_table = torch.empty(batch, pages_per_slot, dtype=torch.int32, device=device)
             self.cache_seqlens = torch.empty(batch, dtype=torch.int32, device=device)
             self._metadata_bound = False
             self._last_bound_replay_page_key = None
             return
-        requested_backend = os.environ.get(
-            QSR_QWEN36_VERIFY_ATTN_BACKEND_ENV, "auto"
-        ).strip().lower()
+        requested_backend = (
+            os.environ.get(QSR_QWEN36_VERIFY_ATTN_BACKEND_ENV, "auto").strip().lower()
+        )
         if requested_backend not in {"auto", "sparkinfer", "flashinfer"}:
             raise ValueError(
                 f"{QSR_QWEN36_VERIFY_ATTN_BACKEND_ENV} must be one of "
@@ -3240,9 +3279,7 @@ class Qwen36VerifyGraphAttention:
             except Exception as exc:
                 if requested_backend == "flashinfer":
                     raise
-                logger.warning(
-                    "Qwen verify FlashInfer unavailable; using SparkInfer: %s", exc
-                )
+                logger.warning("Qwen verify FlashInfer unavailable; using SparkInfer: %s", exc)
         if self._flashinfer is None:
             self._workspace = PagedAttentionWorkspace.for_contract(
                 mode="verify",
@@ -3282,9 +3319,7 @@ class Qwen36VerifyGraphAttention:
             # FlashInfer owns its compact CSR metadata.  These placeholders
             # are replaced by the graph family's stable caller buffers in
             # bind_runtime_metadata().
-            self.page_table = torch.empty(
-                batch, pages_per_slot, dtype=torch.int32, device=device
-            )
+            self.page_table = torch.empty(batch, pages_per_slot, dtype=torch.int32, device=device)
             self.cache_seqlens = torch.empty(batch, dtype=torch.int32, device=device)
         self._metadata_bound = False
         self._last_bound_replay_page_key: object | None = None
@@ -3570,12 +3605,9 @@ class Qwen36Attention(nn.Module):
         # part of the loader contract.
         self.enable_fp8_kv = enable_fp8_kv
         self._gguf_f32 = (
-            config.get("weight_format") == "gguf"
-            and config.get("gguf_compute_dtype") == "float32"
+            config.get("weight_format") == "gguf" and config.get("gguf_compute_dtype") == "float32"
         )
-        self._gguf_f32_bf16_attention = (
-            self._gguf_f32 and gguf_f32_bf16_attention_enabled()
-        )
+        self._gguf_f32_bf16_attention = self._gguf_f32 and gguf_f32_bf16_attention_enabled()
         self.kv_cache_dtype = (
             _FP8_KV_DTYPE
             if enable_fp8_kv
@@ -3634,9 +3666,7 @@ class Qwen36Attention(nn.Module):
         self._gguf_kv_fused: GgufMergedLinear | None = None
         self._gguf_qk_fused: GgufMergedLinear | None = None
         self._gguf_qv_fused: GgufMergedLinear | None = None
-        if (
-            _gguf_merged_projection_enabled(config)
-        ):
+        if _gguf_merged_projection_enabled(config):
             if (
                 isinstance(self.q_proj, GgufLinear)
                 and isinstance(self.k_proj, GgufLinear)
@@ -3647,12 +3677,8 @@ class Qwen36Attention(nn.Module):
             quantized, f"{prefix}.o_proj", self.num_heads * self.head_dim, self.hidden_size
         )
         zero_centered = bool(config.get("rms_norm_zero_centered", True))
-        self.q_norm = Qwen36RMSNorm(
-            self.head_dim, eps=self.eps, zero_centered=zero_centered
-        )
-        self.k_norm = Qwen36RMSNorm(
-            self.head_dim, eps=self.eps, zero_centered=zero_centered
-        )
+        self.q_norm = Qwen36RMSNorm(self.head_dim, eps=self.eps, zero_centered=zero_centered)
+        self.k_norm = Qwen36RMSNorm(self.head_dim, eps=self.eps, zero_centered=zero_centered)
 
         # Fused one-launch QKV W8A8 GEMM (native route only), built lazily on
         # first forward from the three projections' raw FP8 weights.  Kept as
@@ -3817,26 +3843,30 @@ class Qwen36Attention(nn.Module):
         )
         rows = write_index.shape[0]
         kv_heads = self.num_kv_heads
-        k_codes_rows = nvfp4_k_codes.view(-1, kv_heads, self.head_dim // 2)[
-            write_index
-        ].reshape(-1, self.head_dim // 2)
-        k_scales_rows = nvfp4_k_scales.view(-1, kv_heads, self.head_dim // 16)[
-            write_index
-        ].reshape(-1, self.head_dim // 16)
-        v_codes_rows = nvfp4_v_codes.view(-1, kv_heads, self.head_dim // 2)[
-            write_index
-        ].reshape(-1, self.head_dim // 2)
-        v_scales_rows = nvfp4_v_scales.view(-1, kv_heads, self.head_dim // 16)[
-            write_index
-        ].reshape(-1, self.head_dim // 16)
-        k_un = unpack_nvfp4_kv(k_codes_rows, k_scales_rows).to(torch.bfloat16).view(
-            rows, kv_heads, self.head_dim
+        k_codes_rows = nvfp4_k_codes.view(-1, kv_heads, self.head_dim // 2)[write_index].reshape(
+            -1, self.head_dim // 2
         )
-        v_un = unpack_nvfp4_kv(v_codes_rows, v_scales_rows).to(torch.bfloat16).view(
-            rows, kv_heads, self.head_dim
+        k_scales_rows = nvfp4_k_scales.view(-1, kv_heads, self.head_dim // 16)[write_index].reshape(
+            -1, self.head_dim // 16
+        )
+        v_codes_rows = nvfp4_v_codes.view(-1, kv_heads, self.head_dim // 2)[write_index].reshape(
+            -1, self.head_dim // 2
+        )
+        v_scales_rows = nvfp4_v_scales.view(-1, kv_heads, self.head_dim // 16)[write_index].reshape(
+            -1, self.head_dim // 16
+        )
+        k_un = (
+            unpack_nvfp4_kv(k_codes_rows, k_scales_rows)
+            .to(torch.bfloat16)
+            .view(rows, kv_heads, self.head_dim)
+        )
+        v_un = (
+            unpack_nvfp4_kv(v_codes_rows, v_scales_rows)
+            .to(torch.bfloat16)
+            .view(rows, kv_heads, self.head_dim)
         )
         if os.environ.get("QSR_NVFP4_ATTN_DEBUG", "0") == "1":
-            print(f"[nvfp4-write] rows={rows} {( _t.perf_counter()-_t0)*1e3:.2f}ms", flush=True)
+            print(f"[nvfp4-write] rows={rows} {(_t.perf_counter() - _t0) * 1e3:.2f}ms", flush=True)
         return k_un, v_un
 
     def _prepare_w4a4_qkv(self) -> None:
@@ -3866,8 +3896,7 @@ class Qwen36Attention(nn.Module):
             # three-projection path in that case and make the reason visible
             # once per layer.
             logger.warning(
-                "qwen36 layer=%s W4A4 QKV fusion unavailable; "
-                "using separate projections: %s",
+                "qwen36 layer=%s W4A4 QKV fusion unavailable; using separate projections: %s",
                 self.layer_idx,
                 exc,
             )
@@ -3958,9 +3987,14 @@ class Qwen36Attention(nn.Module):
             raise ValueError("dense attention K/V shapes must match")
         key = key.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
         value = value.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-        scores = torch.einsum(
-            "qhd,khd->hqk", query.float(), key.float(),
-        ) * self.scaling
+        scores = (
+            torch.einsum(
+                "qhd,khd->hqk",
+                query.float(),
+                key.float(),
+            )
+            * self.scaling
+        )
         key_positions = torch.arange(key.shape[0], device=query.device, dtype=torch.long)
         allowed = key_positions.unsqueeze(0) <= query_positions.to(torch.long).unsqueeze(1)
         scores = scores.masked_fill(~allowed.unsqueeze(0), torch.finfo(scores.dtype).min)
@@ -4000,18 +4034,14 @@ class Qwen36Attention(nn.Module):
             and cache.k_cache.dtype == torch.float32
             and cache.v_cache.dtype == torch.float32
         ):
-            cache_seqlens = torch.tensor(
-                [total_len], dtype=torch.int32, device=query.device
-            )
+            cache_seqlens = torch.tensor([total_len], dtype=torch.int32, device=query.device)
             return paged_f32_attention(
                 query,
                 cache.k_cache,
                 cache.v_cache,
                 cache.page_table,
                 cache_seqlens,
-                torch.arange(
-                    past_len, total_len, device=query.device, dtype=torch.long
-                ),
+                torch.arange(past_len, total_len, device=query.device, dtype=torch.long),
                 num_q_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_dim,
@@ -4024,9 +4054,7 @@ class Qwen36Attention(nn.Module):
             cache.page_table[0],
             total_len,
         )
-        positions = torch.arange(
-            past_len, total_len, device=query.device, dtype=torch.long
-        )
+        positions = torch.arange(past_len, total_len, device=query.device, dtype=torch.long)
         return self._dense_attention_kernel(query, key, value, positions)
 
     def _dense_attention_batched(
@@ -4144,9 +4172,7 @@ class Qwen36Attention(nn.Module):
                 total_length,
             )
             outputs.append(
-                self._dense_attention_kernel(
-                    query[start:end], key, value, request_positions
-                )
+                self._dense_attention_kernel(query[start:end], key, value, request_positions)
             )
         if not outputs:
             return query.new_empty((0, self.num_heads, self.head_dim))
@@ -4186,9 +4212,7 @@ class Qwen36Attention(nn.Module):
         query = query_flat.view(seq_len, self.num_heads, self.head_dim)
         key = key_flat.view(seq_len, self.num_kv_heads, self.head_dim)
 
-        _rt = self._kv_nvfp4_roundtrip(
-            key, value, None, None, None, None, write_index=None
-        )
+        _rt = self._kv_nvfp4_roundtrip(key, value, None, None, None, None, write_index=None)
         if _rt is not None:
             key, value = _rt
         k_to_store, v_to_store = _kv_to_cache_dtype(
@@ -4211,14 +4235,8 @@ class Qwen36Attention(nn.Module):
                 total_len=total_len,
             )
         else:
-            attention_query = (
-                query.to(torch.bfloat16)
-                if self._gguf_f32_bf16_attention
-                else query
-            )
-            workspace = self._workspace_for(
-                mode, cache, attention_query.dtype, query.device
-            )
+            attention_query = query.to(torch.bfloat16) if self._gguf_f32_bf16_attention else query
+            workspace = self._workspace_for(mode, cache, attention_query.dtype, query.device)
             output = torch.empty(
                 seq_len,
                 self.num_heads,
@@ -4441,9 +4459,7 @@ class Qwen36Attention(nn.Module):
                 )
                 use_fused_prepare = False
         if not use_fused_prepare:
-            q_and_gate = q_and_gate.view(
-                batch_size, seq_len, self.num_heads, self.head_dim * 2
-            )
+            q_and_gate = q_and_gate.view(batch_size, seq_len, self.num_heads, self.head_dim * 2)
             query, gate = torch.chunk(q_and_gate, 2, dim=-1)
             gate = gate.reshape(batch_size, seq_len, -1)
             kv_shape = (batch_size, seq_len, self.num_kv_heads, self.head_dim)
@@ -4451,9 +4467,7 @@ class Qwen36Attention(nn.Module):
             key = self.k_norm(key_raw.view(*kv_shape)).reshape(
                 total_q, self.num_kv_heads, self.head_dim
             )
-            value = value_raw.view(*kv_shape).reshape(
-                total_q, self.num_kv_heads, self.head_dim
-            )
+            value = value_raw.view(*kv_shape).reshape(total_q, self.num_kv_heads, self.head_dim)
             query_flat = query.reshape(total_q, self.num_heads * self.head_dim).contiguous()
             key_flat = key.reshape(total_q, self.num_kv_heads * self.head_dim).contiguous()
             apply_rotary_embedding_inplace(positions, query_flat, self.head_dim, cos_sin_cache)
@@ -4589,9 +4603,7 @@ class Qwen36Attention(nn.Module):
             from runtime.kernels.nvfp4_decode_attn import nvfp4_decode_attention
 
             qo_len = total_q // attn.batch
-            q2r = torch.repeat_interleave(
-                torch.arange(attn.batch, device=query.device), qo_len
-            )
+            q2r = torch.repeat_interleave(torch.arange(attn.batch, device=query.device), qo_len)
             qpos = torch.repeat_interleave(attn.cache_seqlens, qo_len) + torch.arange(
                 qo_len, device=query.device
             ).repeat(attn.batch)
@@ -4659,12 +4671,8 @@ class Qwen36Attention(nn.Module):
                     fused_qk_rmsnorm_rope_gate,
                 )
 
-                q_gate = q_and_gate.reshape(
-                    total_q, self.num_heads, 2 * self.head_dim
-                )
-                key_3d = key_raw.reshape(
-                    total_q, self.num_kv_heads, self.head_dim
-                )
+                q_gate = q_and_gate.reshape(total_q, self.num_heads, 2 * self.head_dim)
+                key_3d = key_raw.reshape(total_q, self.num_kv_heads, self.head_dim)
                 query_flat, key_flat, gate = fused_qk_rmsnorm_rope_gate(
                     q_gate,
                     key_3d,
@@ -4692,14 +4700,10 @@ class Qwen36Attention(nn.Module):
                     exc,
                 )
 
-        q_and_gate = q_and_gate.reshape(
-            total_q, self.num_heads, self.head_dim * 2
-        )
+        q_and_gate = q_and_gate.reshape(total_q, self.num_heads, self.head_dim * 2)
         query, gate = torch.chunk(q_and_gate, 2, dim=-1)
         query = self.q_norm(query)
-        key = self.k_norm(
-            key_raw.reshape(total_q, self.num_kv_heads, self.head_dim)
-        )
+        key = self.k_norm(key_raw.reshape(total_q, self.num_kv_heads, self.head_dim))
         query_flat = query.reshape(total_q, self.num_heads * self.head_dim).contiguous()
         key_flat = key.reshape(total_q, self.num_kv_heads * self.head_dim).contiguous()
         apply_rotary_embedding_inplace(positions, query_flat, self.head_dim, cos_sin_cache)
@@ -5325,9 +5329,7 @@ class Qwen36MLP(nn.Module):
             gate_up_w = torch.cat((gate_w, up_w), dim=0).contiguous().unsqueeze(-1)
             gate_up_scale = as_grouped_scale_view(
                 swizzle_block_scale(
-                    torch.cat((gate_scale, up_scale), dim=0)
-                    .unsqueeze(0)
-                    .contiguous()
+                    torch.cat((gate_scale, up_scale), dim=0).unsqueeze(0).contiguous()
                 ).view(torch.uint8),
                 gate_w.shape[0] * 2,
                 gate_w.shape[1] * 2,
@@ -5385,6 +5387,7 @@ class Qwen36MLP(nn.Module):
             from runtime.model.flashinfer_nvfp4 import (
                 quantize_nvfp4_activation as flashinfer_quant,
             )
+
             if self._w4a4_gate_up_fused:
                 from runtime.model.flashinfer_nvfp4 import (
                     silu_and_mul_nvfp4_quantize as flashinfer_silu_quant,
@@ -5401,9 +5404,7 @@ class Qwen36MLP(nn.Module):
         def quant_operand(t2d: torch.Tensor, gs: torch.Tensor):
             if flashinfer_quant is None:
                 a_packed, sf_linear = quantize_nvfp4_activation(t2d, gs)
-                sw = swizzle_block_scale(
-                    sf_linear.view(torch.float8_e4m3fn).unsqueeze(0)
-                )
+                sw = swizzle_block_scale(sf_linear.view(torch.float8_e4m3fn).unsqueeze(0))
             else:
                 # FlashInfer already returns its 2-D swizzled scale storage;
                 # b12x only needs the leading batch dimension for its grouped
@@ -5457,9 +5458,7 @@ class Qwen36MLP(nn.Module):
             # materializing ``inter`` and removes the separate SiLU, multiply,
             # and activation-quantizer launches.  The gate half is first,
             # matching both ``F.silu(gate) * up`` and the merged FC1 layout.
-            gate_up_for_quant = (
-                gate_up if gate_up.is_contiguous() else gate_up.contiguous()
-            )
+            gate_up_for_quant = gate_up if gate_up.is_contiguous() else gate_up.contiguous()
             a_down_packed, sf_swizzled = flashinfer_silu_quant(
                 gate_up_for_quant, prepared["down"][3]
             )
@@ -5471,9 +5470,7 @@ class Qwen36MLP(nn.Module):
             )
         else:
             inter = F.silu(gate) * up
-            a_down_p, a_down_sf = quant_operand(
-                inter.contiguous(), prepared["down"][3]
-            )
+            a_down_p, a_down_sf = quant_operand(inter.contiguous(), prepared["down"][3])
         out = gemm("down", a_down_p, a_down_sf)
         return out.reshape(*orig_shape[:-1], self.hidden_size)
 
@@ -5667,8 +5664,7 @@ class Qwen36DecoderLayer(nn.Module):
                 enable_fp8_kv
                 and isinstance(quantization_config, dict)
                 and quantization_config.get("quant_method") == "modelopt"
-                and quantized.get(q_proj_name)
-                in (QUANT_ALGO_NVFP4, QUANT_ALGO_NVFP4_W4A4)
+                and quantized.get(q_proj_name) in (QUANT_ALGO_NVFP4, QUANT_ALGO_NVFP4_W4A4)
             )
             self.self_attn = Qwen36Attention(
                 config,
@@ -5755,18 +5751,10 @@ class Qwen36DecoderLayer(nn.Module):
                 write_index=batch.write_index,
                 attn=batch.attn,
                 output=batch.attn_outputs[i],
-                nvfp4_k_codes=(
-                    None if batch.nvfp4_k_codes is None else batch.nvfp4_k_codes[i]
-                ),
-                nvfp4_k_scales=(
-                    None if batch.nvfp4_k_scales is None else batch.nvfp4_k_scales[i]
-                ),
-                nvfp4_v_codes=(
-                    None if batch.nvfp4_v_codes is None else batch.nvfp4_v_codes[i]
-                ),
-                nvfp4_v_scales=(
-                    None if batch.nvfp4_v_scales is None else batch.nvfp4_v_scales[i]
-                ),
+                nvfp4_k_codes=(None if batch.nvfp4_k_codes is None else batch.nvfp4_k_codes[i]),
+                nvfp4_k_scales=(None if batch.nvfp4_k_scales is None else batch.nvfp4_k_scales[i]),
+                nvfp4_v_codes=(None if batch.nvfp4_v_codes is None else batch.nvfp4_v_codes[i]),
+                nvfp4_v_scales=(None if batch.nvfp4_v_scales is None else batch.nvfp4_v_scales[i]),
             )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -5824,18 +5812,10 @@ class Qwen36DecoderLayer(nn.Module):
                 write_index=batch.write_index,
                 attn=batch.attn,
                 output=batch.attn_outputs[i],
-                nvfp4_k_codes=(
-                    None if batch.nvfp4_k_codes is None else batch.nvfp4_k_codes[i]
-                ),
-                nvfp4_k_scales=(
-                    None if batch.nvfp4_k_scales is None else batch.nvfp4_k_scales[i]
-                ),
-                nvfp4_v_codes=(
-                    None if batch.nvfp4_v_codes is None else batch.nvfp4_v_codes[i]
-                ),
-                nvfp4_v_scales=(
-                    None if batch.nvfp4_v_scales is None else batch.nvfp4_v_scales[i]
-                ),
+                nvfp4_k_codes=(None if batch.nvfp4_k_codes is None else batch.nvfp4_k_codes[i]),
+                nvfp4_k_scales=(None if batch.nvfp4_k_scales is None else batch.nvfp4_k_scales[i]),
+                nvfp4_v_codes=(None if batch.nvfp4_v_codes is None else batch.nvfp4_v_codes[i]),
+                nvfp4_v_scales=(None if batch.nvfp4_v_scales is None else batch.nvfp4_v_scales[i]),
             )
         mark("attention", op_started if profile_ops else 0.0)
 
@@ -5942,9 +5922,7 @@ class Qwen36MTPLayer(nn.Module):
         )
         self.mlp = Qwen36MLP(config, 0, quantized, weight_prefix=f"{weight_prefix}.mlp")
         zero_centered = bool(config.get("rms_norm_zero_centered", True))
-        self.input_layernorm = Qwen36RMSNorm(
-            hidden_size, eps=eps, zero_centered=zero_centered
-        )
+        self.input_layernorm = Qwen36RMSNorm(hidden_size, eps=eps, zero_centered=zero_centered)
         self.post_attention_layernorm = Qwen36RMSNorm(
             hidden_size, eps=eps, zero_centered=zero_centered
         )
@@ -6015,9 +5993,7 @@ class Qwen36MTPHead(nn.Module):
         self.pre_fc_norm_embedding = Qwen36RMSNorm(
             hidden_size, eps=eps, zero_centered=zero_centered
         )
-        self.pre_fc_norm_hidden = Qwen36RMSNorm(
-            hidden_size, eps=eps, zero_centered=zero_centered
-        )
+        self.pre_fc_norm_hidden = Qwen36RMSNorm(hidden_size, eps=eps, zero_centered=zero_centered)
         self.fc = _make_linear(quantized, "mtp.fc", hidden_size * 2, hidden_size)
         self.layers = nn.ModuleList(
             [
@@ -6043,9 +6019,7 @@ class Qwen36MTPHead(nn.Module):
                 attn = layer.self_attn
                 attn.k_scale.data.fill_(1.0 / float(torch.finfo(torch.float8_e4m3fn).max))
                 attn.v_scale.data.fill_(1.0 / float(torch.finfo(torch.float8_e4m3fn).max))
-        self.norm = Qwen36RMSNorm(
-            hidden_size, eps=eps, zero_centered=zero_centered
-        )
+        self.norm = Qwen36RMSNorm(hidden_size, eps=eps, zero_centered=zero_centered)
 
     def new_cache(self, *, device: torch.device, dtype: torch.dtype) -> Qwen36PagedAttentionCache:
         return self.layers[0].self_attn.new_cache(device=device, dtype=dtype)
@@ -6237,11 +6211,9 @@ class Qwen36TextModelSelfBuilt(nn.Module):
 
         per_layer_hidden: list[torch.Tensor] = []
         aux_hidden_states: list[torch.Tensor] = []
-        debug_all_layers = (
-            capture_aux_hidden_states
-            and os.environ.get("QSR_DSPARK_DUMP_ALL_LAYERS")
-            not in (None, "", "0")
-        )
+        debug_all_layers = capture_aux_hidden_states and os.environ.get(
+            "QSR_DSPARK_DUMP_ALL_LAYERS"
+        ) not in (None, "", "0")
         debug_row_cap = max(1, int(os.environ.get("QSR_DSPARK_DUMP_ALL_LAYERS_ROWS", "8")))
         debug_all: list[torch.Tensor] = []
         residual: torch.Tensor | None = None
@@ -6626,9 +6598,9 @@ class Qwen36TextModelSelfBuilt(nn.Module):
                 conv_pool = batch.gdn_conv_pools[layer.layer_idx]
                 recurrent_pool = batch.gdn_recurrent_pools[layer.layer_idx]
                 assert conv_pool is not None and recurrent_pool is not None
-                padded_hidden = hidden_states.index_select(
-                    0, batch.gdn_padded_to_compact
-                ).view(batch_size, max_verify_tokens, -1)
+                padded_hidden = hidden_states.index_select(0, batch.gdn_padded_to_compact).view(
+                    batch_size, max_verify_tokens, -1
+                )
                 source = GdnLayerState(
                     conv_state=conv_pool.index_select(0, batch.gdn_source_index),
                     recurrent_state=recurrent_pool[:batch_size],
@@ -6784,9 +6756,7 @@ class Qwen36TextModelSelfBuilt(nn.Module):
             )
             if profile_layers:
                 layer_end.record()
-                layer_events.append(
-                    (layer.layer_idx, layer.layer_type, layer_start, layer_end)
-                )
+                layer_events.append((layer.layer_idx, layer.layer_type, layer_start, layer_end))
         assert residual is not None
         hidden_states, _ = self.norm(hidden_states, residual)
         if profile_layers:
@@ -6882,8 +6852,7 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
                 quantized,
                 max_seq_len=max_seq_len,
                 enable_fp8_kv=(
-                    enable_fp8_kv
-                    and os.environ.get(QSR_QWEN36_MTP_FP8_KV_ENV, "0") != "0"
+                    enable_fp8_kv and os.environ.get(QSR_QWEN36_MTP_FP8_KV_ENV, "0") != "0"
                 ),
             )
             if enable_mtp
@@ -7087,9 +7056,7 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
         # points.  Use a length larger than the exposed append cases for the
         # initial call, then the exact small continuation which previously
         # paid the JIT.  Each state is private to this warmup.
-        initial_hidden = torch.zeros(
-            1, 300, self.config["hidden_size"], device=device, dtype=dtype
-        )
+        initial_hidden = torch.zeros(1, 300, self.config["hidden_size"], device=device, dtype=dtype)
         continuation_hidden = torch.zeros(
             1, 13, self.config["hidden_size"], device=device, dtype=dtype
         )
@@ -7449,9 +7416,7 @@ class Qwen36ForCausalLMSelfBuilt(nn.Module):
                     # Meta scans validate names/shapes without materializing
                     # the checkpoint. The sign check is necessarily deferred
                     # to a real load because meta tensors have no values.
-                    loaded_weight = torch.empty(
-                        param.shape, dtype=param.dtype, device="meta"
-                    )
+                    loaded_weight = torch.empty(param.shape, dtype=param.dtype, device="meta")
                 elif not torch.all(loaded_weight < 0):
                     raise ValueError("Qwen3.8 GGUF ssm_a must contain negative values")
                 elif not self.config.get("gguf_ssm_a_is_negative", False):

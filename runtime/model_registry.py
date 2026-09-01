@@ -149,6 +149,15 @@ REGISTRY: tuple[ArchitectureFamily, ...] = (
         backend="qwen36",
         speculative="mtp",
     ),
+    # Qwen3.8 Flash-Next (Qwen4Exp) is a distinct text graph: 48 alternating
+    # GDN/QSA layers, PLE injection, and one in-checkpoint MTP layer.  It must
+    # not fall through to the older Qwen3.6 loader merely because both expose
+    # a ``text_config`` section.
+    ArchitectureFamily(
+        architecture="Qwen4ExpForConditionalGeneration",
+        backend="flashnext",
+        speculative="mtp",
+    ),
     # DSV4-Flash (GGUF). Registered so resolution is testable and the error
     # for it is honest; IMPLEMENTED_BACKENDS below is what keeps it from
     # claiming to work before the backend has served a real request.
@@ -173,7 +182,7 @@ REGISTRY: tuple[ArchitectureFamily, ...] = (
 #: nothing has exercised, which is the failure mode this repo keeps
 #: re-learning (N8: a capability claimed by silence, swallowed by
 #: try/except, unnoticed for three years).
-IMPLEMENTED_BACKENDS = frozenset({"laguna", "qwen36", "deepseek_v4"})
+IMPLEMENTED_BACKENDS = frozenset({"laguna", "qwen36", "flashnext", "deepseek_v4"})
 
 
 @dataclass(frozen=True)

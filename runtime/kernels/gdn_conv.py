@@ -99,6 +99,76 @@ if triton is not None:
             )
 
     @triton.jit
+    def _causal_conv_silu_2d_kernel(
+        x_ptr,
+        w_ptr,
+        out_ptr,
+        L,
+        out_len,
+        stride_x_b,
+        stride_x_c,
+        stride_x_l,
+        stride_w_c,
+        stride_w_k,
+        stride_o_b,
+        stride_o_c,
+        stride_o_l,
+        pad,
+        C,
+        K: tl.constexpr,
+        DILATION: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+        BLOCK_L: tl.constexpr,
+    ):
+        """Parallelize both sequence tiles and channel tiles.
+
+        The original prefill kernel launched only one program per 64-token
+        tile and looped over every 128-channel tile inside that program.  At
+        Flash-Next's 10,240 channels a 109-token prompt therefore launched
+        just two CTAs, each serially executing 80 channel tiles.  Making the
+        channel tile a grid axis exposes 160 independent CTAs at the same
+        shape without changing accumulation order inside an output element.
+        """
+        l_block = tl.program_id(0)
+        c_block = tl.program_id(1)
+        batch = tl.program_id(2)
+        ls = l_block * BLOCK_L + tl.arange(0, BLOCK_L)
+        cs = c_block * BLOCK_C + tl.arange(0, BLOCK_C)
+        l_mask = ls < out_len
+        c_mask = cs < C
+        acc = tl.zeros((BLOCK_L, BLOCK_C), dtype=tl.float32)
+        for k in tl.static_range(K):
+            src = ls + k * DILATION - pad
+            xv = tl.load(
+                x_ptr
+                + batch * stride_x_b
+                + cs[None, :] * stride_x_c
+                + src[:, None] * stride_x_l,
+                mask=l_mask[:, None]
+                & c_mask[None, :]
+                & (src[:, None] >= 0)
+                & (src[:, None] < L),
+                other=0.0,
+            )
+            wv = tl.load(
+                w_ptr + cs * stride_w_c + k * stride_w_k,
+                mask=c_mask,
+                other=0.0,
+            )
+            acc += wv[None, :].to(tl.float32) * xv.to(tl.float32)
+
+        rounded = tl.cast(acc, tl.bfloat16).to(tl.float32)
+        output = rounded / (1.0 + tl.exp(-rounded))
+        tl.store(
+            out_ptr
+            + batch * stride_o_b
+            + cs[None, :] * stride_o_c
+            + ls[:, None] * stride_o_l,
+            tl.cast(output, tl.bfloat16),
+            mask=l_mask[:, None] & c_mask[None, :],
+        )
+
+    @triton.jit
     def _conv_step_kernel(
         x_ptr,
         w_ptr,
@@ -116,6 +186,7 @@ if triton is not None:
         pad,
         C,
         K: tl.constexpr,
+        DILATION: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
         pid_c = tl.program_id(0)
@@ -127,7 +198,7 @@ if triton is not None:
         c_mask = cs < C
         acc = tl.zeros((BLOCK_C,), dtype=tl.float32)
         for k in tl.static_range(K):
-            src = t + k - pad
+            src = t + k * DILATION - pad
             xv = tl.load(
                 x_ptr + b * stride_x_b + cs * stride_x_c + src * stride_x_l,
                 mask=c_mask & (src >= 0) & (src < L),
@@ -151,6 +222,7 @@ def fused_causal_conv_silu(
     *,
     padding: int,
     out_len: int | None = None,
+    dilation: int = 1,
 ) -> torch.Tensor | None:
     """Run the fused causal depthwise conv+SiLU, or return ``None``.
 
@@ -172,11 +244,14 @@ def fused_causal_conv_silu(
     k = weight.shape[2]
     if k < 1 or k > 8:
         return None
-    if padding != k - 1 and padding != 0:
+    if dilation < 1:
         return None
-    full_len = seq_len + 2 * padding - k + 1
+    effective_kernel = dilation * (k - 1) + 1
+    if padding != effective_kernel - 1 and padding != 0:
+        return None
+    full_len = seq_len + 2 * padding - effective_kernel + 1
     if out_len is None:
-        if padding == k - 1:
+        if padding == effective_kernel - 1:
             # The caller truncates the right-padded tail away
             # (``[:, :, :input_len]``), so those columns are never consumed;
             # computing them would only add work and read past the input.
@@ -190,7 +265,7 @@ def fused_causal_conv_silu(
         # The FP32 (GGUF) eager conv contracts FMAs differently; fusing it
         # changed results by 1 ULP, so it stays on the eager path.
         return None
-    if padding == k - 1 and channels % 128 != 0:
+    if padding == effective_kernel - 1 and channels % 128 != 0:
         return None
 
     out = torch.empty((batch, channels, out_len), dtype=x.dtype, device=x.device)
@@ -214,14 +289,20 @@ def fused_causal_conv_silu(
             padding,
             channels,
             K=k,
+            DILATION=dilation,
             BLOCK_C=block_c,
             num_warps=4,
         )
         return out
 
-    block_l = 64
-    grid = (triton.cdiv(out_len, block_l), batch)
-    _causal_conv_silu_kernel[grid](
+    block_c = 128
+    block_l = 32
+    grid = (
+        triton.cdiv(out_len, block_l),
+        triton.cdiv(channels, block_c),
+        batch,
+    )
+    _causal_conv_silu_2d_kernel[grid](
         x,
         weight,
         out,
@@ -236,9 +317,10 @@ def fused_causal_conv_silu(
         out.stride(1),
         out.stride(2),
         padding,
-        num_c_blocks=channels // 128,
+        channels,
         K=k,
-        BLOCK_C=128,
+        DILATION=dilation,
+        BLOCK_C=block_c,
         BLOCK_L=block_l,
         num_warps=4,
     )

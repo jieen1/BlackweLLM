@@ -1,0 +1,6 @@
+{
+  global:
+    qsr_flashnext_qsa_topk_abi_version;
+    qsr_flashnext_qsa_topk_sm120;
+  local: *;
+};

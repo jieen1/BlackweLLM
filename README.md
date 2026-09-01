@@ -19,6 +19,11 @@ cache. All numbers measured 2026-08-25/26 with
 [`benchmarks/server_perf_grid.py`](benchmarks/server_perf_grid.py) against a
 freshly started server; completion SHA-256 verified identical across runs.
 
+These are the historical Qwen3.8 DSpark/DFlash2 benchmark profiles. The current
+Qwen3.8 Flash-Next application has a separate one-slot/MTP launch contract and
+is documented in [`docs/qwen38-flash-next-ops.md`](docs/qwen38-flash-next-ops.md);
+do not use the numbers below as a Flash-Next baseline.
+
 | Scenario | Result |
 |---|---|
 | Decode @ 128K context, c=4 | **169 tok/s per request** |
@@ -76,21 +81,23 @@ Requirements: NVIDIA SM120 GPU (RTX PRO 6000 Blackwell / RTX 5090), driver ≥
 580, CUDA 13.x, Python 3.12+, [SparkInfer/b12x](https://github.com/local-inference-lab/sparkinfer)
 kernels.
 
-```bash
-make install          # editable install with dev + serving extras
+For the current Qwen3.8 Flash-Next checkpoint, use the reproducible
+[Flash-Next operations guide](docs/qwen38-flash-next-ops.md). It pins the
+validated Python 3.14 environment, `flashnext` backend, `127.0.0.1:8300`,
+one-slot/256K profile, MTP `K=3`, CUDA Graphs, prefix cache and all required
+SM120 tuning flags. The generic `make serve` target is intentionally only a
+thin development wrapper; it does not select a model or a production profile.
 
-# serve Qwen3.8-27B-NVFP4 + DFlash2 draft, 4 slots × 256K context
-export QSR_SERVER_MODEL_PATH=/path/to/Qwen3.8-27B-NVFP4
-export QSR_SERVER_DFLASH2_DRAFT_MODEL=/path/to/Qwen3.8-27B-DFlash2
-export QSR_SERVER_BACKEND=qwen36
-export QSR_SERVED_MODEL_NAME=qwen3.8
-export QSR_SERVER_KV_CACHE_DTYPE=fp8_e4m3
-export QSR_SERVER_ENABLE_CUDAGRAPH=1
-export QSR_SERVER_ENABLE_PREFIX_CACHE=1
-export QSR_SERVER_ENABLE_DFLASH2=1
-export QSR_SERVER_DFLASH2_K=7
-export QSR_THINKING_CAPABLE=1
-python -m server.app --host 0.0.0.0 --port 8300 --capacity 4
+```bash
+cd /home/bot/project/qwen-sm120-runtime
+export QSR_SERVER_MODEL_PATH=/home/bot/models/Qwen3.8-Flash-Next-NVFP4-RadixArk
+export QSR_SERVER_BACKEND=flashnext
+export QSR_SERVED_MODEL_NAME="qwen3.8 qwen3.8-flash-next"
+export QSR_SERVER_ENABLE_CUDAGRAPH=1 QSR_SERVER_ENABLE_PREFIX_CACHE=1
+export QSR_SERVER_ENABLE_MTP=1 QSR_SERVER_MTP_K=3
+exec /home/bot/.venvs/torch-nightly/bin/python -m server.app \
+  --host 127.0.0.1 --port 8300 --capacity 1 --num-slots 1 \
+  --blocks-per-slot 2048 --qwen-kv-mode legacy --mtp --mtp-k 3
 ```
 
 ### Call it

@@ -29,6 +29,22 @@ import pytest
 pytest.importorskip("fastapi")
 
 
+def test_gpu_process_lock_rejects_second_owner(tmp_path, monkeypatch):
+    import server.app as app_mod
+
+    lock_path = tmp_path / "gpu.lock"
+    monkeypatch.setenv("QSR_GPU_LOCK_PATH", str(lock_path))
+    first_fd = app_mod._acquire_gpu_process_lock()
+    try:
+        with pytest.raises(RuntimeError, match="already owns the GPU lock"):
+            app_mod._acquire_gpu_process_lock()
+    finally:
+        import fcntl
+
+        fcntl.flock(first_fd, fcntl.LOCK_UN)
+        os.close(first_fd)
+
+
 def _reimport_app_with(monkeypatch, **env: str | None):
     """Re-import server.app under a patched environment and hand back the module.
 
@@ -196,6 +212,16 @@ class TestQwenDSparkDefault:
             monkeypatch,
             QSR_SERVER_MODEL_PATH="/models/Qwen3.8-27B-UD-Q6_K_XL.gguf",
             QSR_SERVER_BACKEND="qwen36",
+            QSR_TOOL_CALL_PARSER=None,
+        )
+
+        assert app_mod.SERVER_TOOL_CALL_PARSER == "qwen3_coder"
+
+    def test_flashnext_nvfp4_selects_qwen3_coder_tool_parser(self, monkeypatch):
+        app_mod = _reimport_app_with(
+            monkeypatch,
+            QSR_SERVER_MODEL_PATH="/models/Qwen3.8-Flash-Next-NVFP4-RadixArk",
+            QSR_SERVER_BACKEND=None,
             QSR_TOOL_CALL_PARSER=None,
         )
 

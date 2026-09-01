@@ -5,6 +5,7 @@ import hashlib
 import pytest
 
 pytest.importorskip("transformers")
+pytest.importorskip("aiohttp")
 
 from benchmarks.server_perf_grid import (
     _completion_evidence,

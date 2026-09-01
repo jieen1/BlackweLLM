@@ -196,6 +196,7 @@ def classify_decode_slots(
         s
         for s in active_slots
         if s not in grammar_slots
+        and active[s].get("speculative_enabled", True)
         and (sampled_mtp_capable or not active[s].get("sampled", False))
     ]
     plain_sampled_slots = [s for s in active_slots if s not in mtp_slots]
@@ -216,7 +217,7 @@ def _cuda_graph_extra_slots(
     """Return dedicated server slots required only for graph capture."""
     if not enable_cudagraph or enable_dflash:
         return 0
-    if backend in {"deepseek_v4", "qwen36"}:
+    if backend in {"deepseek_v4", "qwen36", "flashnext"}:
         return 0
     return 1
 
@@ -293,6 +294,9 @@ class GenerationRequest:
     top_logprobs: int = 0
     thinking_budget: ThinkingBudgetConfig | None = None
     stop_on_tool_call: bool = False
+    # Prepared CPU-side visual patches for Flash-Next. Image requests use the
+    # target path only until multimodal MTP state is implemented.
+    vision_inputs: Any | None = None
 
 
 class StreamChannel:
@@ -423,11 +427,11 @@ class ServerEngine:
         # Qwen36Backend (which does not exist for a Laguna instance) --
         # same "fail loud at construction, not deep inside a request" rule
         # enable_session_affinity's own guard above follows.
-        if enable_mtp and backend != "qwen36":
+        if enable_mtp and backend not in {"qwen36", "flashnext"}:
             raise ValueError(
-                f"enable_mtp requires backend='qwen36' (got {backend!r}); MTP is "
-                "the qwen36 draft head, not a Laguna capability (that is DFlash, "
-                "enable_dflash)"
+                f"enable_mtp requires a Qwen-family backend (got {backend!r}); "
+                "MTP is implemented by qwen36 and flashnext, not Laguna "
+                "(that backend uses DFlash)"
             )
         self.enable_mtp = enable_mtp
         self.mtp_num_speculative_tokens = mtp_num_speculative_tokens
@@ -504,6 +508,17 @@ class ServerEngine:
         self.qwen_kv_watermark_bundles = qwen_kv_watermark_bundles
         self.qwen_kv_full_sequence_must_fit = qwen_kv_full_sequence_must_fit
         self.MODEL = model
+        self.vision_enabled = False
+        self.vision_checkpoint: str | None = None
+        self.image_token_id: int | None = None
+        if backend == "flashnext":
+            vision_env = os.environ.get("QSR_FLASHNEXT_VISION", "1").strip().lower()
+            if vision_env not in {"0", "1", "false", "true", "off", "on"}:
+                raise ValueError(
+                    "QSR_FLASHNEXT_VISION must be 0 or 1, "
+                    f"got {vision_env!r}"
+                )
+            self.vision_enabled = vision_env in {"1", "true", "on"}
         self.K = 0
 
         if enable_dflash:
@@ -656,15 +671,21 @@ class ServerEngine:
                         "set QSR_SERVER_TOKENIZER_PATH to a local tokenizer directory"
                     )
             self.tok = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
-            if backend == "qwen36":
+            if backend in {"qwen36", "flashnext"}:
                 configured_effort = apply_qwen_default_reasoning_effort(self.tok)
                 if configured_effort is not None:
                     logger.info(
-                        "Qwen reasoning template default configured to effort=%s; "
+                        "Qwen reasoning template default configured to effort=%s "
+                        "(backend=%s); "
                         "request-level effort remains explicit-only",
                         configured_effort,
+                        backend,
                     )
             self.eos_token_id = self.tok.eos_token_id
+            if backend == "flashnext":
+                configured_image_token_id = getattr(self.tok, "image_token_id", None)
+                if configured_image_token_id is not None:
+                    self.image_token_id = int(configured_image_token_id)
             try:
                 from transformers import GenerationConfig
 
@@ -835,7 +856,16 @@ class ServerEngine:
         "constructed after ``self.runner`` exists" for whatever caller reads
         it, real load or fake.
         """
-        return SlotResourceManager(self.runner, self.architecture_spec, block_size=self.block_size)
+        # Flash-Next owns fixed token-indexed QSA pools and can checkpoint its
+        # recurrent state at any token boundary; unlike paged Qwen/DSV4
+        # caches, it must not be floored to the server's 128-token attention
+        # page when reconciling the second (GDN/PLE) cache family.
+        cache_block_size = getattr(self.runner, "prefix_cache_block_size", self.block_size)
+        return SlotResourceManager(
+            self.runner,
+            self.architecture_spec,
+            block_size=cache_block_size,
+        )
 
     # -- model loading (engine thread only) --------------------------------
     def _load_model(self) -> None:
@@ -849,10 +879,180 @@ class ServerEngine:
         """
         if self.backend_name == "qwen36":
             self._load_qwen36_model()
+        elif self.backend_name == "flashnext":
+            self._load_flashnext_model()
         elif self.backend_name == "deepseek_v4":
             self._load_deepseek_model()
         else:
             self._load_laguna_model()
+
+    def _load_flashnext_model(self) -> None:
+        """Load the native Qwen3.8 Flash-Next text graph.
+
+        Flash-Next is not a Qwen3.6 checkpoint with a different name: its
+        ``Qwen4ExpForConditionalGeneration`` graph has 48 GDN/QSA layers, a
+        PLE table, and a separate in-checkpoint MTP block.  Keep its loader
+        and state ownership in the dedicated backend so a path typo cannot
+        silently dispatch through ``Qwen36Backend``.
+        """
+        from runtime.backends.flashnext import FlashNextBackend
+        from runtime.laguna_config import _resolve_laguna_model_dir
+        from runtime.model.flashnext.model import load_flashnext_model
+
+        if self.enable_dflash or self.enable_dspark or self.enable_dflash2:
+            raise ValueError(
+                "Flash-Next uses its in-checkpoint MTP head; DFlash, DSpark, "
+                "and DFlash2 are not valid with backend='flashnext'"
+            )
+        if self.qwen_kv_mode != "legacy":
+            raise ValueError(
+                "Flash-Next currently owns QSA/GDN state directly and requires "
+                "qwen_kv_mode='legacy'"
+            )
+        checkpoint = Path(self.MODEL)
+        if not checkpoint.is_dir():
+            checkpoint = Path(_resolve_laguna_model_dir(self.MODEL))
+        if not (checkpoint / "config.json").is_file():
+            raise FileNotFoundError(
+                f"Flash-Next checkpoint directory does not contain config.json: {checkpoint}"
+            )
+        max_model_len = self.blocks_per_slot * self.block_size
+        # Flash-Next's large-M recurrent/QSA path is only numerically gated
+        # through 1024-token chunks.  Larger chunks are faster in a warm
+        # microbenchmark, but they change the b12x/GDN reduction order and
+        # fail the same-prompt state/logit gate (2048: cosine ~= 0.876/0.779;
+        # 8192 is worse).  Keep the quality-safe value as the production
+        # default; an explicit opt-in is required for experiments so a
+        # generic QSR_PREFILL_CHUNK=8192 from another backend cannot silently
+        # corrupt Flash-Next generations.
+        configured_prefill_chunk = os.environ.get("QSR_PREFILL_CHUNK", "1024")
+        try:
+            self._prefill_chunk_size = int(configured_prefill_chunk)
+        except ValueError as exc:
+            raise ValueError(
+                "QSR_PREFILL_CHUNK must be a positive integer, "
+                f"got {configured_prefill_chunk!r}"
+            ) from exc
+        if self._prefill_chunk_size <= 0:
+            raise ValueError(
+                "QSR_PREFILL_CHUNK must be a positive integer, "
+                f"got {self._prefill_chunk_size}"
+            )
+        allow_unsafe_chunk = os.environ.get(
+            "QSR_FLASHNEXT_ALLOW_UNSAFE_PREFILL_CHUNK", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if self._prefill_chunk_size > 1024 and not allow_unsafe_chunk:
+            logger.warning(
+                "QSR_PREFILL_CHUNK=%d is not numerically gated for Flash-Next; "
+                "using 1024 (set QSR_FLASHNEXT_ALLOW_UNSAFE_PREFILL_CHUNK=1 "
+                "only for explicit experiments)",
+                self._prefill_chunk_size,
+            )
+            self._prefill_chunk_size = 1024
+        ple_resident = os.environ.get("QSR_FLASHNEXT_PLE_RESIDENT", "0") == "1"
+        # A row contains one 160-byte FP8 vector for one hash head.  The
+        # production context is 256K and the checkpoint emits 16 heads per
+        # token, so 4M rows cover one complete context's lookup working set
+        # while remaining a small host-RAM reservation (~1 GiB worst case with
+        # Python object overhead).  Keep smaller-context deployments bounded
+        # instead of paying the 4M-entry list cost unconditionally.
+        default_ple_cache_rows = min(4_194_304, max(131_072, max_model_len * 16))
+        ple_cache_rows = int(
+            os.environ.get("QSR_FLASHNEXT_PLE_CACHE_ROWS", str(default_ple_cache_rows))
+        )
+        ple_cache_pages = int(os.environ.get("QSR_FLASHNEXT_PLE_CACHE_PAGES", "0"))
+        ple_io_workers = int(os.environ.get("QSR_FLASHNEXT_PLE_IO_WORKERS", "32"))
+        logger.info(
+            "loading Qwen3.8 Flash-Next target from %s (max_context=%d, MTP=%s, "
+            "PLE=%s, ple_cache_rows=%d, ple_cache_pages=%d, vision=%s, "
+            "image_max_pixels=%s, io=%s, prefill_chunk=%d)",
+            checkpoint,
+            max_model_len,
+            self.enable_mtp,
+            "resident" if ple_resident else "stream",
+            ple_cache_rows,
+            ple_cache_pages,
+            self.vision_enabled,
+            os.environ.get("QSR_FLASHNEXT_IMAGE_MAX_PIXELS", "1048576"),
+            os.environ.get("QSR_FLASHNEXT_PLE_IO", "auto"),
+            self._prefill_chunk_size,
+        )
+
+        def progress(done: int, total: int) -> None:
+            if done == total or done == 1 or done % 8 == 0:
+                logger.info("Flash-Next weight load: %d/%d layers", done, total)
+
+        model = load_flashnext_model(
+            checkpoint,
+            device="cuda",
+            enable_vision=self.vision_enabled,
+            ple_resident=ple_resident,
+            ple_cache_rows=ple_cache_rows,
+            ple_cache_pages=ple_cache_pages,
+            ple_io_workers=ple_io_workers,
+            progress=progress,
+        )
+        self.vision_checkpoint = str(checkpoint)
+        if self.image_token_id is None:
+            configured_image_token_id = getattr(model.cfg, "image_token_id", None)
+            if configured_image_token_id is not None:
+                self.image_token_id = int(configured_image_token_id)
+        self.runner = FlashNextBackend(
+            model,
+            num_slots=self.num_slots,
+            max_seq_len=max_model_len,
+            device="cuda",
+            checkpoint_path=str(checkpoint),
+            enable_mtp=self.enable_mtp,
+            mtp_num_speculative_tokens=self.mtp_num_speculative_tokens,
+            enable_prefix_cache=self.enable_prefix_cache,
+        )
+        if self._enable_cudagraph:
+            graph_batch_size = self.runner.capture_decode_cuda_graph()
+            if graph_batch_size is not None:
+                logger.info(
+                    "Flash-Next target%s CUDA Graph captured (batch_size=%d)",
+                    " + MTP verify" if self.enable_mtp else "",
+                    graph_batch_size,
+                )
+            else:
+                logger.warning(
+                    "Flash-Next CUDA Graph capture failed; falling back to eager target decode"
+                )
+        # Emit the resolved memory/precision profile once the graph has been
+        # captured.  This is intentionally based on live tensor ownership,
+        # not only nvidia-smi: the latter also includes driver and allocator
+        # reservations and made the previous BF16-vs-FP8 capacity decision
+        # unnecessarily opaque.
+        memory = self.runner.memory_breakdown()
+        mtp_model = getattr(self.runner, "_mtp_model", None)
+        mtp_mlp = getattr(mtp_model, "mlp", None)
+        mtp_dtype = getattr(mtp_mlp, "expert_dtype", None)
+        logger.info(
+            "Flash-Next memory profile: mtp_expert_dtype=%s, target_model=%.2f GiB, "
+            "mtp_model=%.2f GiB, sessions=%.2f GiB, explicit=%.2f GiB, "
+            "torch_reserved=%.2f GiB, driver_free=%.2f GiB",
+            mtp_dtype,
+            memory.get("model_tensor_bytes", 0) / 2**30,
+            (
+                memory.get("mtp_model_parameters", 0)
+                + memory.get("mtp_model_buffers", 0)
+                + memory.get("mtp_auxiliary_tensors", 0)
+            )
+            / 2**30,
+            memory.get("session_tensor_bytes", 0) / 2**30,
+            memory.get("explicit_tensor_bytes", 0) / 2**30,
+            memory.get("torch_reserved", 0) / 2**30,
+            memory.get("driver_free_bytes", 0) / 2**30,
+        )
+        logger.info(
+            "Qwen3.8 Flash-Next model loaded: backend=flashnext, num_slots=%d, "
+            "max_context=%d, mtp=%s(K=%d)",
+            self.num_slots,
+            max_model_len,
+            self.enable_mtp,
+            self.mtp_num_speculative_tokens,
+        )
 
     def _warmup_qwen36_full_forward(self) -> None:
         """One real short prefill through the whole model, then reset the slot.
@@ -1471,6 +1671,7 @@ class ServerEngine:
         top_logprobs: int = 0,
         thinking_budget: ThinkingBudgetConfig | None = None,
         stop_on_tool_call: bool = False,
+        vision_inputs: Any | None = None,
     ) -> dict:
         """Submit a generation request. Resolves when generation completes."""
         loop = asyncio.get_running_loop()
@@ -1487,6 +1688,7 @@ class ServerEngine:
             top_logprobs=top_logprobs,
             thinking_budget=thinking_budget,
             stop_on_tool_call=stop_on_tool_call,
+            vision_inputs=vision_inputs,
         )
         req._admitted_at = time.perf_counter()
         self._req_deque.append(req)
@@ -1508,6 +1710,7 @@ class ServerEngine:
         top_logprobs: int = 0,
         thinking_budget: ThinkingBudgetConfig | None = None,
         stop_on_tool_call: bool = False,
+        vision_inputs: Any | None = None,
     ):
         """Submit a streaming generation request. Yields token-id lists as
         each MTP round commits them. Final yield is the result dict."""
@@ -1531,6 +1734,7 @@ class ServerEngine:
             top_logprobs=top_logprobs,
             thinking_budget=thinking_budget,
             stop_on_tool_call=stop_on_tool_call,
+            vision_inputs=vision_inputs,
         )
         req._admitted_at = time.perf_counter()
         self._req_deque.append(req)
@@ -1767,6 +1971,7 @@ class ServerEngine:
             not self.production
             and req.sampling_params.is_greedy
             and forced_anchor is None
+            and req.vision_inputs is None
         ):
             self._admission_bootstrap_check(slot, req, anchor)
 
@@ -1783,6 +1988,7 @@ class ServerEngine:
             "drafts": drafts,
             "committed_tokens": [],
             "sampled": not req.sampling_params.is_greedy,
+            "speculative_enabled": req.vision_inputs is None,
             "last_token": anchor,
             "last_progress_round": self.stats["rounds"],
             "start_time": time.perf_counter(),
@@ -1813,6 +2019,20 @@ class ServerEngine:
             st["stop_pending_ids"] = []
             st["stop_pending_text"] = ""
         tracer.request_admitted(req.request_id, slot, len(req.prompt_ids))
+        # The trace entry is created here because this is the first point at
+        # which the request has a validated anchor.  Preserve the actual
+        # prefill start separately so ``prefill_ms`` does not silently stay at
+        # zero (the old call site never invoked ``prefill_done``) and does not
+        # mislabel queue/reset time as GPU prefill.
+        prefill_started_at = getattr(
+            req,
+            "_prefill_started_at",
+            getattr(req, "_admitted_at", req._prefill_done_at),
+        )
+        tracer.prefill_done(
+            req.request_id,
+            max(0.0, (req._prefill_done_at - prefill_started_at) * 1000.0),
+        )
 
         # The anchor is the request's first generated token -- it must go
         # through the same stop-sequence check as every later token (a
@@ -2239,6 +2459,7 @@ class ServerEngine:
                     self.stats["session_warm_fallbacks"] += 1
                     self.waiting.insert(0, req)
                     continue
+                req._prefill_started_at = time.perf_counter()
                 try:
                     res = self.runner.mtp_prefill_warm_continue(slot, req.prompt_ids, prior_len)
                 except Exception:
@@ -2406,6 +2627,16 @@ class ServerEngine:
                         if not req.sampling_params.is_greedy
                     }
                     prefill_kwargs = self._thinking_prefill_kwargs(admit_now)
+                    vision_inputs_per_slot = {
+                        slot: req.vision_inputs
+                        for slot, req in admit_now
+                        if req.vision_inputs is not None
+                    }
+                    if vision_inputs_per_slot:
+                        prefill_kwargs["vision_inputs_per_slot"] = vision_inputs_per_slot
+                    prefill_started_at = time.perf_counter()
+                    for _slot, req in admit_now:
+                        req._prefill_started_at = prefill_started_at
                     prefill_state = self.runner.prefill_chunked_begin(
                         new_slots,
                         new_prompts,

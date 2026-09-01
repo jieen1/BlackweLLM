@@ -7,6 +7,7 @@ from fastapi import HTTPException
 
 from server.app import (
     ChatCompletionRequest,
+    _is_opencode_title_request,
     _resolve_chat_template_kwargs,
     _resolve_engine_chat_template_kwargs,
     _resolve_thinking_token_budget,
@@ -25,6 +26,69 @@ def test_openai_request_preserves_reasoning_effort() -> None:
         request.chat_template_kwargs,
         reasoning_effort=request.reasoning_effort,
     ) == {"reasoning_effort": "low", "enable_thinking": True}
+
+
+def test_openai_request_accepts_camel_case_effort_alias() -> None:
+    request = ChatCompletionRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "What is 2+2?"}],
+            "reasoningEffort": "low",
+        }
+    )
+
+    assert request.reasoning_effort == "low"
+
+
+def test_opencode_title_request_is_detected_without_changing_completion_window() -> None:
+    request = ChatCompletionRequest.model_validate(
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a title generator. You output ONLY a thread title."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Generate a title for this conversation:\n"
+                        "\"Check the service\""
+                    ),
+                },
+            ],
+            "max_tokens": 8192,
+            "reasoning_effort": "medium",
+        }
+    )
+
+    assert _is_opencode_title_request(request)
+    assert request.max_tokens == 8192
+
+
+def test_opencode_title_detection_does_not_match_tool_requests() -> None:
+    request = ChatCompletionRequest.model_validate(
+        {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a title generator. Output only a title.",
+                },
+                {
+                    "role": "user",
+                    "content": "Generate a title for this conversation:",
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "bash", "parameters": {}},
+                }
+            ],
+        }
+    )
+
+    assert not _is_opencode_title_request(request)
 
 
 def test_none_maps_to_qwen_hard_thinking_switch() -> None:
@@ -56,6 +120,49 @@ def test_qwen_downgrades_explicit_template_high_effort_to_medium() -> None:
         engine,
         {"reasoning_effort": "xhigh"},
     ) == {"reasoning_effort": "medium"}
+
+
+@pytest.mark.parametrize(
+    ("requested", "effective"),
+    [
+        ("minimal", "low"),
+        ("low", "low"),
+        ("medium", "medium"),
+        ("high", "xhigh"),
+        ("xhigh", "xhigh"),
+        ("max", "xhigh"),
+    ],
+)
+def test_flashnext_accepts_opencode_effort_aliases(
+    requested: str, effective: str
+) -> None:
+    engine = type("Engine", (), {"backend_name": "flashnext"})()
+
+    assert _resolve_engine_chat_template_kwargs(
+        engine,
+        None,
+        reasoning_effort=requested,
+    ) == {"reasoning_effort": effective, "enable_thinking": True}
+
+
+def test_flashnext_normalizes_nested_reasoning_effort() -> None:
+    engine = type("Engine", (), {"backend_name": "flashnext"})()
+
+    assert _resolve_engine_chat_template_kwargs(
+        engine,
+        None,
+        reasoning={"effort": "high"},
+        thinking={"level": "minimal"},
+    ) == {"reasoning_effort": "xhigh", "enable_thinking": True}
+
+
+def test_flashnext_explicit_template_alias_is_normalized() -> None:
+    engine = type("Engine", (), {"backend_name": "flashnext"})()
+
+    assert _resolve_engine_chat_template_kwargs(
+        engine,
+        {"reasoning_effort": "high"},
+    ) == {"reasoning_effort": "xhigh"}
 
 
 def test_unspecified_effort_leaves_request_kwargs_unchanged() -> None:
@@ -104,13 +211,11 @@ def test_nested_reasoning_and_root_enable_switch_are_not_dropped() -> None:
     ) == {"enable_thinking": True, "reasoning_effort": "low"}
 
 
-def test_non_native_template_gets_a_real_effort_budget() -> None:
+def test_reasoning_effort_never_synthesizes_a_thinking_budget() -> None:
     assert _resolve_thinking_token_budget(
         None,
         {"enable_thinking": True, "reasoning_effort": "low"},
-        native_reasoning_effort=False,
-        enable_effort_budget=True,
-    ) == 4096
+    ) is None
 
 
 def test_nested_budget_overrides_the_effort_default() -> None:
@@ -118,33 +223,13 @@ def test_nested_budget_overrides_the_effort_default() -> None:
         None,
         {"enable_thinking": True},
         reasoning={"effort": "low", "budget_tokens": 37},
-        native_reasoning_effort=False,
     ) == 37
 
 
-def test_service_default_budget_is_skipped_when_thinking_is_disabled() -> None:
-    assert _resolve_thinking_token_budget(
-        None,
-        {"enable_thinking": False},
-        default_budget=131072,
-    ) is None
-
-
-def test_implicit_budget_leaves_visible_output_headroom() -> None:
-    assert _resolve_thinking_token_budget(
-        None,
-        {"enable_thinking": True},
-        default_budget=8192,
-        max_tokens=8192,
-    ) == 4096
-
-
-def test_explicit_budget_is_not_rewritten_by_completion_window() -> None:
+def test_explicit_budget_is_not_rewritten_by_reasoning_effort() -> None:
     assert _resolve_thinking_token_budget(
         8192,
         {"enable_thinking": True},
-        default_budget=4096,
-        max_tokens=1024,
     ) == 8192
 
 

@@ -54,7 +54,7 @@ class TestMtpRejectedForWrongBackend:
         # Raises before ServerEngine.__init__ reaches AutoTokenizer.from_
         # pretrained (this module's own docstring) -- genuinely torch- and
         # transformers-free, unlike the two tests below.
-        with pytest.raises(ValueError, match="enable_mtp requires backend='qwen36'"):
+        with pytest.raises(ValueError, match="enable_mtp requires a Qwen-family backend"):
             ServerEngine(
                 backend="laguna",
                 capacity=1,

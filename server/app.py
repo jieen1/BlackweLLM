@@ -21,6 +21,7 @@ Capabilities (B1/C1 采样全链路 + streaming + tool calling):
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import functools
 import json
 import logging
@@ -28,12 +29,13 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field
 
 from runtime.sampling import PersistentSeed, SamplingParams
 from runtime.structured_output import ResponseFormat
@@ -92,6 +94,14 @@ DEFAULT_MAX_TOKENS = 16384
 SERVER_MODEL_PATH = os.environ.get("QSR_SERVER_MODEL_PATH", "poolside/Laguna-S-2.1-NVFP4")
 
 
+def _is_flashnext_model(model_path: str) -> bool:
+    """Recognize the distinct Qwen3.8 Flash-Next checkpoint family."""
+    normalized = model_path.casefold().replace("-", ".").replace("_", ".")
+    return "flash.next" in normalized or "flashnext" in normalized or (
+        os.environ.get("QSR_SERVER_BACKEND", "").casefold() == "flashnext"
+    )
+
+
 def _is_qwen36_family_model(model_path: str) -> bool:
     """Recognize Qwen3.6/Qwen3.8 checkpoints handled by ``qwen36``.
 
@@ -100,6 +110,8 @@ def _is_qwen36_family_model(model_path: str) -> bool:
     whose directory name carries no model-family hint. This only chooses safe
     launcher defaults before weights load; Laguna keeps its conservative ones.
     """
+    if _is_flashnext_model(model_path):
+        return False
     normalized = model_path.casefold().replace("-", ".").replace("_", ".")
     backend_hint = os.environ.get("QSR_SERVER_BACKEND", "").casefold()
     return (
@@ -109,21 +121,31 @@ def _is_qwen36_family_model(model_path: str) -> bool:
     )
 
 
+_FLASHNEXT_DEFAULT_PROFILE = _is_flashnext_model(SERVER_MODEL_PATH)
 _QWEN_DSPARK_DEFAULT_PROFILE = _is_qwen36_family_model(SERVER_MODEL_PATH)
 _QWEN_DSPARK_POOL_BYTES = 19_629_342_720
 
 SERVER_CAPACITY = int(
-    os.environ.get("QSR_SERVER_CAPACITY", "4" if _QWEN_DSPARK_DEFAULT_PROFILE else "1")
+    os.environ.get(
+        "QSR_SERVER_CAPACITY",
+        "1" if _FLASHNEXT_DEFAULT_PROFILE else "4" if _QWEN_DSPARK_DEFAULT_PROFILE else "1",
+    )
 )
 # Qwen's measured DSpark profile uses four live slots. Laguna's non-DFlash
 # decode graph keeps its conservative two-slot launcher default.
 SERVER_NUM_SLOTS = int(
-    os.environ.get("QSR_SERVER_NUM_SLOTS", "4" if _QWEN_DSPARK_DEFAULT_PROFILE else "2")
+    os.environ.get(
+        "QSR_SERVER_NUM_SLOTS",
+        "1" if _FLASHNEXT_DEFAULT_PROFILE else "4" if _QWEN_DSPARK_DEFAULT_PROFILE else "2",
+    )
 )
 # Qwen3.8's latest same-toolchain DSpark parity run used 128-token pages;
 # Laguna's SparkInfer attention continues to require 64-token pages.
 SERVER_BLOCK_SIZE = int(
-    os.environ.get("QSR_SERVER_BLOCK_SIZE", "128" if _QWEN_DSPARK_DEFAULT_PROFILE else "64")
+    os.environ.get(
+        "QSR_SERVER_BLOCK_SIZE",
+        "128" if (_FLASHNEXT_DEFAULT_PROFILE or _QWEN_DSPARK_DEFAULT_PROFILE) else "64",
+    )
 )
 # The KV cache pool size is now determined by GPU memory profiling (see
 # server/engine.py _load_model → profile_kv_cache_blocks), NOT by the old
@@ -157,7 +179,10 @@ SERVER_ENABLE_CUDAGRAPH = os.environ.get("QSR_SERVER_ENABLE_CUDAGRAPH", "1") != 
 # `python -m server.app` with no flags silently ran without the cache while
 # `--no-prefix-cache` was a no-op. `test_prefix_cache_default_is_on` now
 # pins this so it cannot drift back unnoticed.
-SERVER_ENABLE_PREFIX_CACHE = os.environ.get("QSR_SERVER_ENABLE_PREFIX_CACHE", "1") != "0"
+SERVER_ENABLE_PREFIX_CACHE = os.environ.get(
+    "QSR_SERVER_ENABLE_PREFIX_CACHE",
+    "1",
+) != "0"
 # P4b session affinity (notes/2026-07-20-p4b-session-affinity-plan.md): opt-in
 # warm-slot retention. Default OFF => byte-for-byte P4a (without a session_id, or
 # with the flag off, _finish_request does the unconditional reset_slot). Requires
@@ -184,8 +209,12 @@ SERVER_ENABLE_DFLASH = os.environ.get("QSR_SERVER_ENABLE_DFLASH", "0") != "0"
 # head. It remains an explicit rollback path now that the measured external
 # DSpark profile is the Qwen default. See runtime/backends/qwen36_mtp.py for
 # the round driver and the (token, hidden) pairing fix this path carries.
-SERVER_ENABLE_MTP = os.environ.get("QSR_SERVER_ENABLE_MTP", "0") != "0"
-SERVER_MTP_K = int(os.environ.get("QSR_SERVER_MTP_K", "4"))
+SERVER_ENABLE_MTP = os.environ.get(
+    "QSR_SERVER_ENABLE_MTP", "1" if _FLASHNEXT_DEFAULT_PROFILE else "0"
+) != "0"
+SERVER_MTP_K = int(
+    os.environ.get("QSR_SERVER_MTP_K", "3" if _FLASHNEXT_DEFAULT_PROFILE else "4")
+)
 # Qwen3.8 DFlash2 is an explicit, isolated opt-in. It loads a separate
 # checkpoint; greedy draft/verify uses the captured native path, while sampled
 # draft sampling remains eager because its request-local RNG is not graph-safe.
@@ -201,7 +230,11 @@ SERVER_DFLASH2_K = int(os.environ.get("QSR_SERVER_DFLASH2_K", "7"))
 # --mtp) for the explicit native-MTP rollback.
 SERVER_ENABLE_DSPARK = os.environ.get(
     "QSR_SERVER_ENABLE_DSPARK",
-    "0" if SERVER_ENABLE_DFLASH2 else "1" if _QWEN_DSPARK_DEFAULT_PROFILE else "0",
+    "0"
+    if SERVER_ENABLE_DFLASH2 or _FLASHNEXT_DEFAULT_PROFILE
+    else "1"
+    if _QWEN_DSPARK_DEFAULT_PROFILE
+    else "0",
 ) != "0"
 SERVER_DSPARK_DRAFT_MODEL = os.environ.get(
     "QSR_SERVER_DSPARK_DRAFT_MODEL", "RadixArk/Qwen3.8-27B-DSpark"
@@ -273,12 +306,21 @@ def _apply_qwen_dspark_runtime_defaults() -> None:
 # configured slot's full context; ``elastic`` takes an explicit byte budget
 # but still uses conservative full-sequence admission (no unsafe overcommit).
 SERVER_QWEN_KV_MODE = os.environ.get(
-    "QSR_QWEN_KV_MODE", "elastic" if _QWEN_DSPARK_DEFAULT_PROFILE else "legacy"
+    "QSR_QWEN_KV_MODE",
+    (
+        "legacy"
+        if _FLASHNEXT_DEFAULT_PROFILE
+        else "elastic"
+        if _QWEN_DSPARK_DEFAULT_PROFILE
+        else "legacy"
+    ),
 )
 SERVER_QWEN_KV_POOL_BYTES = int(
     os.environ.get(
         "QSR_QWEN_KV_POOL_BYTES",
-        str(_QWEN_DSPARK_POOL_BYTES) if _QWEN_DSPARK_DEFAULT_PROFILE else "0",
+        str(_QWEN_DSPARK_POOL_BYTES)
+        if _QWEN_DSPARK_DEFAULT_PROFILE and not _FLASHNEXT_DEFAULT_PROFILE
+        else "0",
     )
 )
 SERVER_QWEN_KV_WATERMARK_BUNDLES = int(
@@ -340,21 +382,6 @@ if SERVER_REASONING_MODE not in ("expose", "strip"):
 # thinking-strip-bug.md) turned on: prepending unconditionally, on the endpoint
 # that has no template, ate whole responses.
 SERVER_THINKING_CAPABLE = os.environ.get("QSR_THINKING_CAPABLE", "1") != "0"
-_DEFAULT_SERVER_THINKING_TOKEN_BUDGET = 8192
-_thinking_budget_env = os.environ.get("QSR_THINKING_TOKEN_BUDGET")
-if _thinking_budget_env is None:
-    # The request-level resolver bounds this implicit ceiling against the
-    # caller's completion window.  Keep the environment value as the
-    # operator's desired ceiling instead of assuming every client grants the
-    # runtime's own output window.
-    SERVER_THINKING_TOKEN_BUDGET: int | None = _DEFAULT_SERVER_THINKING_TOKEN_BUDGET
-else:
-    try:
-        SERVER_THINKING_TOKEN_BUDGET = int(_thinking_budget_env)
-    except ValueError as exc:
-        raise RuntimeError("QSR_THINKING_TOKEN_BUDGET must be a positive integer") from exc
-    if SERVER_THINKING_TOKEN_BUDGET <= 0:
-        raise RuntimeError("QSR_THINKING_TOKEN_BUDGET must be a positive integer")
 
 # Qwen3.8's template uses ``reasoning_effort`` as a Jinja variable.  OpenAI
 # clients, however, commonly put it at the request root (and the Responses
@@ -367,28 +394,19 @@ else:
 # resolver runs.  This prevents the old high -> xhigh alias from silently
 # activating Qwen3.8's effectively unbounded thinking path.
 _REASONING_EFFORT_VALUES = ("low", "medium", "xhigh", "none")
-_QWEN_UNSUPPORTED_REASONING_EFFORTS = frozenset({"high", "xhigh", "max"})
-_DEFAULT_REASONING_EFFORT_BUDGETS = {
-    # Qwen's published API mapping: low=4K, medium=16K, xhigh=full
-    # 256K-class budget.  ``high`` is not a runtime level.
-    "low": 4096,
-    "medium": 16384,
-    "xhigh": 262144,
+# The Flash-Next tokenizer is deliberately narrower than the generic
+# OpenAI/OpenCode effort vocabulary: its template implements exactly
+# ``low``, ``medium`` and ``xhigh`` (plus the separate ``enable_thinking``
+# switch).  Keep the public compatibility aliases at the adapter boundary so
+# clients can use their normal ``high``/``max`` controls without making the
+# Jinja template reject the request.  Qwen36 has a different compatibility
+# contract and still uses ``_qwen_compat_effort`` below.
+_FLASHNEXT_REASONING_EFFORT_ALIASES = {
+    "minimal": "low",
+    "high": "xhigh",
+    "max": "xhigh",
 }
-
-
-def _supports_native_reasoning_effort(engine_ref) -> bool:
-    """Whether the loaded chat template consumes ``reasoning_effort``.
-
-    Qwen3.8 exposes the variable in its template.  Some Qwen-compatible
-    checkpoints expose only the thinking switch; for those, an effort request
-    still needs a real runtime effect, so the caller maps it to a bounded
-    thinking span instead of silently forwarding an ignored Jinja kwarg.
-    """
-    template = getattr(getattr(engine_ref, "tok", None), "chat_template", "")
-    return isinstance(template, str) and "reasoning_effort" in template
-
-
+_QWEN_UNSUPPORTED_REASONING_EFFORTS = frozenset({"high", "xhigh", "max"})
 def _default_served_model_name(engine_ref) -> str:
     """Return the stable public model id, independent of snapshot paths."""
     configured = os.environ.get("QSR_SERVED_MODEL_NAME")
@@ -396,36 +414,22 @@ def _default_served_model_name(engine_ref) -> str:
         return configured.split()[0]
     if getattr(engine_ref, "backend_name", None) == "qwen36":
         return "qwen3.8"
+    if getattr(engine_ref, "backend_name", None) == "flashnext":
+        return "qwen3.8-flash-next"
     return engine_ref.MODEL
-
-
-def _reasoning_effort_budget(effort: str) -> int:
-    """Return the fallback token budget for templates without effort levels."""
-    normalized = effort.lower()
-    default = _DEFAULT_REASONING_EFFORT_BUDGETS[normalized]
-    env_name = f"QSR_THINKING_BUDGET_{normalized.upper()}"
-    configured = os.environ.get(env_name)
-    if configured is None:
-        return default
-    try:
-        budget = int(configured)
-    except ValueError as exc:
-        raise _invalid_request(f"{env_name} must be a positive integer") from exc
-    if budget <= 0:
-        raise _invalid_request(f"{env_name} must be a positive integer")
-    return budget
 
 
 def _qwen_compat_effort(value: object) -> object:
     """Map unsupported high-effort compatibility values to medium.
 
     Claude/Anthropic clients use ``max`` while the local OpenAI-compatible
-    relay currently forwards that as ``reasoning_effort=high``.  Qwen3.8 does
-    not have a usable high path, so accepting that value and then translating
-    it to xhigh is a dangerous silent behavior.  Keep the client-facing
-    request working, but make the runtime contract unambiguous: Qwen only
-    executes low, medium, xhigh, or disabled thinking, and the relay's high
-    compatibility value executes as medium.
+    relay currently forwards that as ``reasoning_effort=high``.  The legacy
+    Qwen36 checkpoint has no validated high-effort path, so accepting that
+    value and then translating it to xhigh is a dangerous silent behavior.
+    Keep the client-facing request working, but make the Qwen36 runtime
+    contract unambiguous: it executes low, medium, or disabled thinking, and
+    the relay's high compatibility value executes as medium.  Flash-Next is
+    handled separately because its native template *does* define xhigh.
     """
     if isinstance(value, str) and value.lower() in _QWEN_UNSUPPORTED_REASONING_EFFORTS:
         return "medium"
@@ -443,7 +447,8 @@ def _resolve_engine_chat_template_kwargs(
 ) -> dict | None:
     """Resolve request controls after applying the loaded model's contract."""
     requested_effort = reasoning_effort
-    if getattr(engine_ref, "backend_name", None) == "qwen36":
+    backend_name = getattr(engine_ref, "backend_name", None)
+    if backend_name == "qwen36":
         if chat_template_kwargs:
             chat_template_kwargs = dict(chat_template_kwargs)
             for key in ("effort", "reasoning_effort", "level"):
@@ -470,6 +475,44 @@ def _resolve_engine_chat_template_kwargs(
                     if key in thinking
                 },
             }
+    elif backend_name == "flashnext":
+        # Qwen3.8 Flash-Next's shipped template validates the exact set
+        # ``low|medium|xhigh``.  OpenCode's standard variants and several
+        # OpenAI-compatible relays use ``minimal|high|max`` instead; normalize
+        # those aliases before the generic resolver reaches the Jinja layer.
+        def _flashnext_effort(value: object) -> object:
+            if isinstance(value, str):
+                return _FLASHNEXT_REASONING_EFFORT_ALIASES.get(
+                    value.lower(), value
+                )
+            return value
+
+        if chat_template_kwargs:
+            chat_template_kwargs = dict(chat_template_kwargs)
+            for key in ("effort", "reasoning_effort", "level"):
+                if key in chat_template_kwargs:
+                    chat_template_kwargs[key] = _flashnext_effort(
+                        chat_template_kwargs[key]
+                    )
+        reasoning_effort = _flashnext_effort(reasoning_effort)
+        if isinstance(reasoning, dict):
+            reasoning = {
+                **reasoning,
+                **{
+                    key: _flashnext_effort(reasoning[key])
+                    for key in ("effort", "reasoning_effort", "level")
+                    if key in reasoning
+                },
+            }
+        if isinstance(thinking, dict):
+            thinking = {
+                **thinking,
+                **{
+                    key: _flashnext_effort(thinking[key])
+                    for key in ("effort", "reasoning_effort", "level")
+                    if key in thinking
+                },
+            }
     resolved = _resolve_chat_template_kwargs(
         chat_template_kwargs,
         reasoning_effort=reasoning_effort,
@@ -477,9 +520,10 @@ def _resolve_engine_chat_template_kwargs(
         reasoning=reasoning,
         thinking=thinking,
     )
-    if DEBUG_REQUESTS and getattr(engine_ref, "backend_name", None) == "qwen36":
+    if DEBUG_REQUESTS and backend_name in {"qwen36", "flashnext"}:
         logger.info(
-            "Qwen reasoning effort resolved: requested=%r effective=%r thinking=%r",
+            "Qwen reasoning effort resolved: backend=%s requested=%r effective=%r thinking=%r",
+            backend_name,
             requested_effort,
             resolved.get("reasoning_effort") if resolved else None,
             resolved.get("enable_thinking") if resolved else None,
@@ -558,16 +602,46 @@ def _resolve_chat_template_kwargs(
     return resolved
 
 # Selects which server/formats/tool_parsers/ shape to decode tool calls
-# with -- mirrors vLLM's --tool-call-parser NAME. GGUF Qwen3.8 emits the
-# qwen3_coder XML shape; keep Laguna's poolside_v1 default and preserve the
-# existing NVFP4/Qwen service choice unless the checkpoint is the explicit
-# local GGUF path. An operator-supplied parser always wins.
+# with -- mirrors vLLM's --tool-call-parser NAME. Qwen3.8 (including the
+# Flash-Next NVFP4 checkpoint) emits the qwen3_coder XML shape; Laguna emits
+# poolside_v1. An operator-supplied parser always wins.
 _DEFAULT_TOOL_CALL_PARSER = (
-    "qwen3_coder" if Path(SERVER_MODEL_PATH).suffix.casefold() == ".gguf" else "poolside_v1"
+    "qwen3_coder"
+    if _is_flashnext_model(SERVER_MODEL_PATH)
+    or Path(SERVER_MODEL_PATH).suffix.casefold() == ".gguf"
+    else "poolside_v1"
 )
 SERVER_TOOL_CALL_PARSER = os.environ.get("QSR_TOOL_CALL_PARSER", _DEFAULT_TOOL_CALL_PARSER)
 
 engine: ServerEngine | None = None
+_GPU_PROCESS_LOCK_FD: int | None = None
+
+
+def _acquire_gpu_process_lock() -> int:
+    """Reserve this host's single GPU before preflight/model loading.
+
+    The runtime is deliberately single-node/single-GPU. Starting a second
+    Flash-Next process while the first one owns a 256K session pool otherwise
+    lets both loaders consume nearly the whole card before either can report a
+    useful error. ``flock`` is released by the kernel when the process exits,
+    so a crashed service cannot leave a stale lock behind.
+    """
+    lock_path = os.environ.get("QSR_GPU_LOCK_PATH", "/tmp/qsr-gpu.lock")
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise RuntimeError(f"cannot open GPU process lock {lock_path!r}: {exc}") from exc
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(fd)
+        raise RuntimeError(
+            f"another qwen-sm120-runtime process already owns the GPU lock "
+            f"{lock_path!r}; refusing a second model load to prevent OOM"
+        ) from exc
+    os.ftruncate(fd, 0)
+    os.write(fd, f"pid={os.getpid()}\n".encode())
+    return fd
 
 
 def _new_stream_processor(tokenizer, chat_template_kwargs: dict | None = None) -> StreamProcessor:
@@ -621,6 +695,103 @@ async def _tokenize_chat(engine_ref, messages, tools=None, chat_template_kwargs=
         **(chat_template_kwargs or {}),
     )
     return await loop.run_in_executor(None, fn)
+
+
+async def _tokenize_multimodal_chat(
+    engine_ref,
+    messages,
+    tools=None,
+    chat_template_kwargs=None,
+):
+    """Tokenize text and prepare bounded Flash-Next image inputs.
+
+    The normal text path remains byte-for-byte unchanged. For an image
+    request, the chat template emits one image marker per source image; the
+    processor then supplies the exact patch-token count and this helper
+    expands each marker before capacity admission.
+    """
+
+    from runtime.model.flashnext.vision import (
+        build_mrope_positions,
+        expand_image_tokens,
+        extract_image_blocks,
+        has_video_blocks,
+        prepare_image_inputs,
+    )
+
+    image_blocks = extract_image_blocks(messages)
+    if has_video_blocks(messages):
+        raise ValueError(
+            "video inputs are not enabled yet; send still images to the Flash-Next runtime"
+        )
+    if image_blocks and getattr(engine_ref, "backend_name", None) != "flashnext":
+        raise ValueError(
+            "image inputs are currently supported only by the Flash-Next backend"
+        )
+
+    prompt_ids = await _tokenize_chat(
+        engine_ref,
+        messages,
+        tools=tools,
+        chat_template_kwargs=chat_template_kwargs,
+    )
+    if not image_blocks:
+        return list(prompt_ids), None
+    if not getattr(engine_ref, "vision_enabled", False):
+        raise ValueError(
+            "Flash-Next vision is disabled; set QSR_FLASHNEXT_VISION=1 and restart the server"
+        )
+    image_token_id = getattr(engine_ref, "image_token_id", None)
+    if image_token_id is None:
+        image_token_id = getattr(engine_ref.tok, "image_token_id", None)
+    if image_token_id is None:
+        raise ValueError("the loaded tokenizer does not define an image token id")
+    checkpoint = (
+        getattr(engine_ref, "vision_checkpoint", None)
+        or getattr(engine_ref, "MODEL", None)
+    )
+    loop = asyncio.get_running_loop()
+    prepare = functools.partial(
+        prepare_image_inputs,
+        messages,
+        checkpoint=checkpoint,
+    )
+    try:
+        prepared = await loop.run_in_executor(None, prepare)
+    except (RuntimeError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+    expanded = expand_image_tokens(
+        list(prompt_ids),
+        int(image_token_id),
+        prepared.image_token_counts,
+    )
+    vision_start_token_id = getattr(engine_ref.tok, "vision_start_token_id", None)
+    if vision_start_token_id is None:
+        loaded_model = getattr(getattr(engine_ref, "runner", None), "model", None)
+        loaded_cfg = getattr(loaded_model, "cfg", None)
+        vision_start_token_id = getattr(loaded_cfg, "vision_start_token_id", None)
+    rope_positions, next_rope_position = build_mrope_positions(
+        expanded,
+        image_token_id=int(image_token_id),
+        vision_start_token_id=vision_start_token_id,
+        image_grid_thw=prepared.image_grid_thw,
+        spatial_merge_size=int(getattr(prepared, "spatial_merge_size", 2)),
+    )
+    prepared = replace(
+        prepared,
+        rope_positions=rope_positions,
+        next_rope_position=next_rope_position,
+    )
+    logger.info(
+        "Flash-Next image request: images=%d source=%s resized=%s visual_tokens=%d "
+        "max_pixels=%d",
+        len(image_blocks),
+        prepared.source_sizes,
+        prepared.resized_sizes,
+        prepared.total_image_tokens,
+        prepared.max_pixels,
+    )
+    return expanded, prepared
 
 
 async def _tokenize_encode(engine_ref, text):
@@ -948,7 +1119,10 @@ class ChatCompletionRequest(BaseModel):
     # to the model's chat-template kwargs before tokenization; leaving this
     # field out makes pydantic silently ignore the client's setting and lets
     # Qwen3.8 fall back to its default xhigh instruction.
-    reasoning_effort: str | None = None
+    reasoning_effort: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_effort", "reasoningEffort"),
+    )
     # Qwen's model-specific sampler-level thinking budget. This is deliberately
     # separate from ``max_tokens``: the scheduler forces ``</think>`` at the
     # token boundary while preserving one continuous generation request.
@@ -963,6 +1137,57 @@ class ChatCompletionRequest(BaseModel):
     # Forwarded to the chat template (e.g. {"enable_thinking": False} for
     # non-thinking mode). Mirrors vLLM's chat_template_kwargs request field.
     chat_template_kwargs: dict | None = None
+
+
+def _message_text_for_protocol_detection(content: object) -> str:
+    """Return text from an OpenAI message content value.
+
+    OpenCode's title request uses plain strings today, but accepting the
+    standard text-part form keeps the protocol check stable if its client
+    serializer changes.  Non-text parts are intentionally ignored: an image
+    or tool payload must never make an unrelated request look like a title
+    request.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    text_parts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            text_parts.append(item)
+        elif isinstance(item, dict) and isinstance(item.get("text"), str):
+            text_parts.append(item["text"])
+    return "".join(text_parts)
+
+
+def _is_opencode_title_request(req: ChatCompletionRequest) -> bool:
+    """Identify OpenCode's internal title-generation protocol request.
+
+    OpenCode submits this as a normal chat completion before the first user
+    turn.  Its system contract explicitly says to output only a short title,
+    but the request omits ``enable_thinking``; Flash-Next therefore enters its
+    default xhigh ``<think>`` path and can occupy the single runtime slot for
+    a long time.  This is a protocol-mode correction, not a generation cap:
+    the title request keeps the caller's ``max_tokens`` and terminates via the
+    model's normal EOS/stream completion.
+    """
+    if req.tools or req.tool_choice not in (None, "none"):
+        return False
+    system_text = "\n".join(
+        _message_text_for_protocol_detection(message.get("content"))
+        for message in req.messages
+        if message.get("role") == "system"
+    ).casefold()
+    user_text = "\n".join(
+        _message_text_for_protocol_detection(message.get("content"))
+        for message in req.messages
+        if message.get("role") == "user"
+    ).casefold()
+    return (
+        "you are a title generator" in system_text
+        and "generate a title for this conversation" in user_text
+    )
 
 
 class CompletionRequest(BaseModel):
@@ -1064,24 +1289,18 @@ def _resolve_thinking_token_budget(
     value: object | None,
     chat_template_kwargs: dict | None,
     *,
-    reasoning_effort: str | None = None,
     reasoning: dict | None = None,
     thinking: dict | None = None,
-    native_reasoning_effort: bool = True,
-    enable_effort_budget: bool = False,
-    default_budget: int | None = None,
-    max_tokens: int | None = None,
 ) -> int | None:
-    """Resolve and validate a budget after template switches are merged.
+    """Resolve only an explicitly requested thinking budget.
 
-    Explicit budgets are API contracts and remain exact.  Service defaults
-    and effort-derived fallbacks are policy ceilings, however: a client can
-    send a smaller completion window than the service default.  Reserve half
-    of that window for visible output so a reasoning loop cannot consume the
-    entire response and surface only as ``finish_reason=length``.
+    Reasoning effort is a model/template control, not a hidden token quota.
+    In particular, this function must never synthesize a budget from the
+    server profile, ``max_tokens``, or an effort label.  A caller may still
+    send ``thinking_token_budget``/``budget_tokens`` when it intentionally
+    wants the low-level forced-end-marker contract.
     """
     budget = _validate_thinking_token_budget(value)
-    explicit_budget = budget is not None
     if budget is None:
         for controls in (reasoning, thinking):
             if not isinstance(controls, dict):
@@ -1090,38 +1309,15 @@ def _resolve_thinking_token_budget(
                 candidate = controls.get(key)
                 if candidate is not None:
                     budget = _validate_thinking_token_budget(candidate)
-                    explicit_budget = True
                     break
             if budget is not None:
                 break
-    if budget is None:
-        effort = reasoning_effort
-        if effort is None and chat_template_kwargs:
-            effort = chat_template_kwargs.get("reasoning_effort")
-        if isinstance(effort, str):
-            normalized = effort.lower()
-            if normalized == "high":
-                normalized = "xhigh"
-            if (
-                normalized in _DEFAULT_REASONING_EFFORT_BUDGETS
-                and not native_reasoning_effort
-                and enable_effort_budget
-            ):
-                budget = _reasoning_effort_budget(normalized)
-    if (
-        budget is None
-        and default_budget is not None
-        and not (chat_template_kwargs and chat_template_kwargs.get("enable_thinking") is False)
-    ):
-        budget = _validate_thinking_token_budget(default_budget)
     if budget is not None and chat_template_kwargs:
         if chat_template_kwargs.get("enable_thinking") is False:
             raise _invalid_request(
                 "thinking_token_budget requires thinking mode; remove "
                 "enable_thinking=false or the budget"
             )
-    if budget is not None and max_tokens is not None and not explicit_budget:
-        budget = min(budget, max(1, max_tokens // 2))
     return budget
 
 
@@ -1185,19 +1381,21 @@ async def _submit_with_thinking_budget(
     logprobs: bool = False,
     top_logprobs: int = 0,
     stop_on_tool_call: bool = False,
+    vision_inputs=None,
 ) -> dict:
     """Submit one request with a sampler-level thinking constraint."""
-    result = await engine_ref.submit(
-        prompt_ids,
-        max_tokens,
-        session_id=session_id,
-        sampling_params=sampling_params,
-        stop_sequences=stop_sequences,
-        logprobs=logprobs,
-        top_logprobs=top_logprobs,
-        thinking_budget=thinking_budget,
-        stop_on_tool_call=stop_on_tool_call,
-    )
+    submit_kwargs = {
+        "session_id": session_id,
+        "sampling_params": sampling_params,
+        "stop_sequences": stop_sequences,
+        "logprobs": logprobs,
+        "top_logprobs": top_logprobs,
+        "thinking_budget": thinking_budget,
+        "stop_on_tool_call": stop_on_tool_call,
+    }
+    if vision_inputs is not None:
+        submit_kwargs["vision_inputs"] = vision_inputs
+    result = await engine_ref.submit(prompt_ids, max_tokens, **submit_kwargs)
     generated_ids = list(result.get("committed_token_ids", []))
     processor.add_tokens(generated_ids)
     generation_logprobs = list(result.get("logprobs") or []) if logprobs else None
@@ -1220,23 +1418,25 @@ async def _submit_stream_with_thinking_budget(
     logprobs: bool = False,
     top_logprobs: int = 0,
     stop_on_tool_call: bool = False,
+    vision_inputs=None,
 ):
     """Streaming counterpart of :func:`_submit_with_thinking_budget`."""
     generated_ids: list[int] = []
     stream_ids: list[int] = []
     result: dict | None = None
-    async for item in engine_ref.submit_stream(
-        prompt_ids,
-        max_tokens,
-        session_id=session_id,
-        sampling_params=sampling_params,
-        cancel_ref=cancel_ref,
-        stop_sequences=stop_sequences,
-        logprobs=logprobs,
-        top_logprobs=top_logprobs,
-        thinking_budget=thinking_budget,
-        stop_on_tool_call=stop_on_tool_call,
-    ):
+    submit_kwargs = {
+        "session_id": session_id,
+        "sampling_params": sampling_params,
+        "cancel_ref": cancel_ref,
+        "stop_sequences": stop_sequences,
+        "logprobs": logprobs,
+        "top_logprobs": top_logprobs,
+        "thinking_budget": thinking_budget,
+        "stop_on_tool_call": stop_on_tool_call,
+    }
+    if vision_inputs is not None:
+        submit_kwargs["vision_inputs"] = vision_inputs
+    async for item in engine_ref.submit_stream(prompt_ids, max_tokens, **submit_kwargs):
         if isinstance(item, dict):
             result = item
             break
@@ -1473,6 +1673,12 @@ async def debug_stats():
             engine.stats["_memory_breakdown_dbg"] = memory_breakdown()
         except Exception:  # pragma: no cover - observability must not die
             logger.exception("memory breakdown failed; reporting without it")
+    ple_stats = getattr(engine.runner, "ple_stats", None)
+    if ple_stats is not None:
+        try:
+            engine.stats["_ple_stats_dbg"] = ple_stats()
+        except Exception:  # pragma: no cover - observability must not die
+            logger.exception("PLE stats failed; reporting without it")
     # Phase 0 KV capacity evidence (`.omx/plans/qwen38-dynamic-context-vllm-plan.md`):
     # formula KV bytes, measured tensor storage, and physical row layout from
     # the Qwen pool, present only when the backend opted in. This is the
@@ -1515,28 +1721,32 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         reasoning=req.reasoning,
         thinking=req.thinking,
     )
+    if _is_opencode_title_request(req):
+        # The title generator is an internal OpenCode protocol turn, not a
+        # user reasoning turn.  Its contract is "ONLY a thread title" and it
+        # has no tools; leaving Flash-Next's default thinking prompt enabled
+        # makes this bookkeeping request spend the single slot in a long
+        # reasoning loop before the real user request can be admitted.  Keep
+        # the completion window untouched and select the template's explicit
+        # non-thinking mode instead.
+        chat_template_kwargs = {"enable_thinking": False}
+        logger.info("OpenCode title request: using non-thinking template mode")
     thinking_token_budget = _resolve_thinking_token_budget(
         req.thinking_token_budget,
         chat_template_kwargs,
-        reasoning_effort=req.reasoning_effort,
         reasoning=req.reasoning,
         thinking=req.thinking,
-        native_reasoning_effort=_supports_native_reasoning_effort(engine),
-        enable_effort_budget=getattr(engine, "backend_name", None) == "qwen36",
-        default_budget=(
-            SERVER_THINKING_TOKEN_BUDGET
-            if getattr(engine, "backend_name", None) == "qwen36"
-            else None
-        ),
-        max_tokens=max_tokens,
     )
 
-    prompt_ids = await _tokenize_chat(
-        engine,
-        chat_messages,
-        tools=tools,
-        chat_template_kwargs=chat_template_kwargs,
-    )
+    try:
+        prompt_ids, vision_inputs = await _tokenize_multimodal_chat(
+            engine,
+            chat_messages,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+    except ValueError as exc:
+        raise _invalid_request(str(exc)) from exc
     await _debug_log_input(
         "OPENAI /v1/chat/completions", req.model_dump(), chat_messages, prompt_ids
     )
@@ -1592,6 +1802,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 # the wire format, so stop after a complete parsed call even
                 # when the request did not repeat the schema.
                 stop_on_tool_call=True,
+                vision_inputs=vision_inputs,
             ):
                 if await request.is_disconnected():
                     if _cancel_ref[0]:
@@ -1730,6 +1941,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         logprobs=bool(req.logprobs),
         top_logprobs=req.top_logprobs or 0,
         stop_on_tool_call=True,
+        vision_inputs=vision_inputs,
     )
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
     # Same state machine as the streaming path (server/formats/stream.py) --
@@ -1907,6 +2119,7 @@ def _run_startup_preflight() -> None:
 
 
 def main() -> None:
+    global _GPU_PROCESS_LOCK_FD
     import argparse
 
     import uvicorn
@@ -1996,9 +2209,9 @@ def main() -> None:
         "--mtp",
         action="store_true",
         help=(
-            "Enable MTP speculative decoding (qwen36 backend only). Sibling "
-            "of --dflash for Qwen3.6's own draft head -- see "
-            "runtime/backends/qwen36_mtp.py."
+            "Enable native MTP speculative decoding for the qwen36 or "
+            "flashnext backend. Qwen3.6 uses its draft head; Flash-Next uses "
+            "the qwen4_exp MTP path."
         ),
     )
     parser.add_argument(
@@ -2150,6 +2363,11 @@ def main() -> None:
 
     # Runs before uvicorn imports the app module, so the model is not loaded
     # yet -- a fatal environment mismatch costs seconds, not a failed load.
+    try:
+        _GPU_PROCESS_LOCK_FD = _acquire_gpu_process_lock()
+    except RuntimeError as exc:
+        parser.error(str(exc))
+
     if not args.skip_preflight:
         _run_startup_preflight()
 
@@ -2455,12 +2673,15 @@ async def anthropic_count_tokens(request: Request):
         reasoning=body.get("reasoning"),
         thinking=body.get("thinking"),
     )
-    prompt_ids = await _tokenize_chat(
-        engine,
-        chat_messages,
-        tools=tools,
-        chat_template_kwargs=chat_template_kwargs,
-    )
+    try:
+        prompt_ids, _vision_inputs = await _tokenize_multimodal_chat(
+            engine,
+            chat_messages,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+    except ValueError as exc:
+        raise _invalid_request(str(exc)) from exc
     if DEBUG_REQUESTS:
         logger.info(
             "ANTHROPIC count_tokens: msgs=%d system_chars=%d tools=%d -> input_tokens=%d",
@@ -2540,25 +2761,19 @@ async def anthropic_messages(request: Request):
             else None
         ),
         chat_template_kwargs,
-        reasoning_effort=body.get("reasoning_effort"),
         reasoning=body.get("reasoning"),
         thinking=anthropic_thinking,
-        native_reasoning_effort=_supports_native_reasoning_effort(engine),
-        enable_effort_budget=getattr(engine, "backend_name", None) == "qwen36",
-        default_budget=(
-            SERVER_THINKING_TOKEN_BUDGET
-            if getattr(engine, "backend_name", None) == "qwen36"
-            else None
-        ),
-        max_tokens=max_tokens,
     )
 
-    prompt_ids = await _tokenize_chat(
-        engine,
-        chat_messages,
-        tools=tools,
-        chat_template_kwargs=chat_template_kwargs,
-    )
+    try:
+        prompt_ids, vision_inputs = await _tokenize_multimodal_chat(
+            engine,
+            chat_messages,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+    except ValueError as exc:
+        raise _invalid_request(str(exc)) from exc
     await _debug_log_input("ANTHROPIC /v1/messages", body, chat_messages, prompt_ids)
 
     thinking_budget = await _tokenize_thinking_budget_config(engine, thinking_token_budget)
@@ -2610,6 +2825,7 @@ async def anthropic_messages(request: Request):
                 cancel_ref=_cancel_ref,
                 stop_sequences=stop_sequences,
                 stop_on_tool_call=True,
+                vision_inputs=vision_inputs,
             ):
                 if await request.is_disconnected():
                     if _cancel_ref[0]:
@@ -2750,6 +2966,7 @@ async def anthropic_messages(request: Request):
         sampling_params=sampling_params,
         stop_sequences=stop_sequences,
         stop_on_tool_call=True,
+        vision_inputs=vision_inputs,
     )
     _raw_anth = await _tokenize_decode(engine, result["committed_token_ids"])
     # Same state machine as the streaming path (server/formats/stream.py).
@@ -2828,24 +3045,18 @@ async def responses_api(request: Request):
     thinking_token_budget = _resolve_thinking_token_budget(
         responses_thinking_budget,
         chat_template_kwargs,
-        reasoning_effort=body.get("reasoning_effort", response_effort),
         reasoning=response_reasoning,
         thinking=body.get("thinking"),
-        native_reasoning_effort=_supports_native_reasoning_effort(engine),
-        enable_effort_budget=getattr(engine, "backend_name", None) == "qwen36",
-        default_budget=(
-            SERVER_THINKING_TOKEN_BUDGET
-            if getattr(engine, "backend_name", None) == "qwen36"
-            else None
-        ),
-        max_tokens=max_tokens,
     )
-    prompt_ids = await _tokenize_chat(
-        engine,
-        chat_messages,
-        tools=tools,
-        chat_template_kwargs=chat_template_kwargs,
-    )
+    try:
+        prompt_ids, vision_inputs = await _tokenize_multimodal_chat(
+            engine,
+            chat_messages,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+        )
+    except ValueError as exc:
+        raise _invalid_request(str(exc)) from exc
     await _debug_log_input("OPENAI /v1/responses", body, chat_messages, prompt_ids)
     thinking_budget = await _tokenize_thinking_budget_config(engine, thinking_token_budget)
     _validate_capacity(
@@ -2922,6 +3133,7 @@ async def responses_api(request: Request):
                     cancel_ref=_cancel_ref,
                     stop_sequences=None,
                     stop_on_tool_call=True,
+                    vision_inputs=vision_inputs,
                 ):
                     if await request.is_disconnected():
                         if _cancel_ref[0]:
@@ -3137,6 +3349,7 @@ async def responses_api(request: Request):
         sampling_params=sampling_params,
         stop_sequences=None,
         stop_on_tool_call=True,
+        vision_inputs=vision_inputs,
     )
     raw_text = await _tokenize_decode(engine, result["committed_token_ids"])
     text = proc.content_text()

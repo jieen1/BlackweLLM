@@ -1,0 +1,183 @@
+# Qwen3.8 Flash-Next 本地启动与 OpenCode 运维手册
+
+> 状态：当前本机可复现配置（2026-09-01）
+>
+> 适用模型：`Qwen3.8-Flash-Next-NVFP4-RadixArk`（`qwen4_exp`）
+>
+> 适用硬件：单张 NVIDIA Blackwell SM120，约 96 GiB 显存
+
+这份手册是当前 Flash-Next 服务的启动事实来源。仓库里的
+[`scripts/blackwellm_ctl.sh`](../scripts/blackwellm_ctl.sh) 是历史 Laguna
+控制脚本，默认端口为 `8100`，不会启动下面这套 Flash-Next 配置；不要把它
+当作当前应用的启动入口。
+
+## 当前验证过的服务形态
+
+| 项目 | 当前值 |
+| --- | --- |
+| Python | `/home/bot/.venvs/torch-nightly/bin/python`（3.14 nightly） |
+| checkpoint | `/home/bot/models/Qwen3.8-Flash-Next-NVFP4-RadixArk` |
+| backend | `flashnext` |
+| 监听 | `127.0.0.1:8300` |
+| 并发/物理 slot | `1 / 1`（单卡安全基线） |
+| KV block | `128 tokens × 2048 blocks/slot = 262144 tokens`（256K ceiling） |
+| KV 模式 | `legacy`（当前实测稳定配置） |
+| MTP | 开启，`K=3` |
+| CUDA Graph | 开启 |
+| persistent prefix cache | 开启 |
+| 视觉输入 | 开启（默认 1 MP 后处理面积上限） |
+
+256K 是每个 slot 的容量上限，不代表模型加载时立即为每个 token 分配显存。
+当前 `capacity=1` 是经过本机显存压力验证的安全服务配置；要提高并发或改变
+KV 模式，必须新进程重新加载并重新做 OOM/质量门禁，不能只改正在运行的进程。
+
+## 启动
+
+先确认没有占用 `8300` 的旧 Flash-Next 进程。下面的环境变量是当前运行服务
+实际使用的完整 profile；保持 `QSR_QWEN_KV_MODE=legacy`，不要为了“省显存”
+擅自改权重精度或切换到未经验证的 KV 配置。
+
+```bash
+cd /home/bot/project/qwen-sm120-runtime
+
+export HF_HUB_OFFLINE=1
+export QSR_SERVER_MODEL_PATH=/home/bot/models/Qwen3.8-Flash-Next-NVFP4-RadixArk
+export QSR_SERVER_BACKEND=flashnext
+export QSR_SERVED_MODEL_NAME="qwen3.8 qwen3.8-flash-next"
+export QSR_SERVER_PRODUCTION=1
+export QSR_SERVER_CAPACITY=1
+export QSR_SERVER_NUM_SLOTS=1
+export QSR_SERVER_BLOCK_SIZE=128
+export QSR_SERVER_BLOCKS_PER_SLOT=2048
+export QSR_SERVER_ENABLE_CUDAGRAPH=1
+export QSR_SERVER_ENABLE_PREFIX_CACHE=1
+export QSR_SERVER_ENABLE_MTP=1
+export QSR_SERVER_MTP_K=3
+export QSR_QWEN_KV_MODE=legacy
+export QSR_SERVER_GPU_MEM_UTIL=0.90
+export QSR_DISABLE_GC=1
+
+# Flash-Next 的已验证批量/图/PLE 配置
+export QSR_FLASHNEXT_BATCH_GDN_RECURRENCE=1
+export QSR_FLASHNEXT_BATCH_LM_HEAD=1
+export QSR_FLASHNEXT_BATCH_GDN_PROJECTIONS=1
+export QSR_FLASHNEXT_MTP_CONTINUATION_GRAPH=1
+export QSR_FLASHNEXT_MTP_SPARSE_GRAPH=1
+export QSR_FLASHNEXT_PLE_CACHE_ROWS=4194304
+export QSR_FLASHNEXT_PLE_IO=io_uring
+export QSR_FLASHNEXT_PLE_IO_WORKERS=32
+export QSR_FLASHNEXT_QSA_TOPK_RERANK=0
+export QSR_FLASHNEXT_HC_NORM_FUSION=0
+export QSR_FLASHNEXT_HC_NORM_APPLY_FUSION=1
+export QSR_FLASHNEXT_HC_POINTWISE_FUSION=1
+export QSR_TRACE=1
+
+exec /home/bot/.venvs/torch-nightly/bin/python -m server.app \
+  --host 127.0.0.1 --port 8300 \
+  --capacity 1 --num-slots 1 --blocks-per-slot 2048 \
+  --qwen-kv-mode legacy --mtp --mtp-k 3
+```
+
+首次加载 checkpoint、编译 CUDA kernel 和捕获 Graph 需要等待；启动期间不要
+重复启动第二个实例，也不要用相同端口发送大量测试请求。服务是前台进程，使用
+`Ctrl-C` 停止。后台启动时先用 `pgrep -af 'server.app.*--port 8300'` 找到
+精确 PID，再只终止该 PID。
+
+## 启动验证
+
+另开终端执行：
+
+```bash
+curl -fsS http://127.0.0.1:8300/health
+curl -fsS http://127.0.0.1:8300/v1/models | python -m json.tool
+curl -fsS http://127.0.0.1:8300/debug/stats | python -m json.tool
+```
+
+`/v1/models` 应至少列出：
+
+```text
+qwen3.8
+qwen3.8-flash-next
+```
+
+最小 OpenAI Chat smoke：
+
+```bash
+curl -N http://127.0.0.1:8300/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.8-flash-next",
+    "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+    "max_tokens": 8,
+    "stream": true,
+    "reasoning_effort": "low"
+  }'
+```
+
+需要检查真实端到端耗时、MTP 接受率和 prefix 命中时，查看
+`/debug/stats`、`/debug/traces` 与 `/metrics`；不要把单次 trace 中不一致的
+旧计时字段当作端到端基线。性能对比必须使用相同 prompt、上下文长度、输出长度
+和启动 profile，并按 `docs/diagnostics-guide.md` 先做 `bf diff`。
+
+## OpenCode / Windows 客户端
+
+OpenCode provider 的最小配置如下，模型名使用服务实际暴露的
+`qwen3.8-flash-next`：
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "blackwellm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8300/v1" },
+      "models": {
+        "qwen3.8-flash-next": {
+          "name": "Qwen3.8 Flash-Next (local)",
+          "reasoning": true,
+          "interleaved": { "field": "reasoning_content" },
+          "options": { "reasoningEffort": "medium" },
+          "variants": {
+            "none": { "reasoningEffort": "none" },
+            "minimal": { "reasoningEffort": "low" },
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "xhigh" },
+            "xhigh": { "reasoningEffort": "xhigh" },
+            "max": { "reasoningEffort": "xhigh" }
+          }
+        }
+      }
+    }
+  },
+  "model": "blackwellm/qwen3.8-flash-next"
+}
+```
+
+Flash-Next tokenizer 原生支持 `low`、`medium`、`xhigh`；OpenCode 的
+`minimal`/`high`/`max` 是 runtime 在请求边界归一化的别名。修改 Windows
+配置后必须完全退出并重新打开 OpenCode（包括托盘进程），配置不会热加载。
+
+如果 OpenCode 工作区位于 WSL 的 UNC 路径，并出现每轮等待约 80–90 秒、日志含
+`failed to add snapshot files`，在 Windows 的
+`%USERPROFILE%\\.config\\opencode\\opencode.jsonc` 中加入：
+
+```jsonc
+"snapshot": false
+```
+
+这是绕过 WSL symlink 无法加入 Git snapshot 的客户端兼容性设置，会关闭
+OpenCode 的 undo/revert snapshot；不会改变 runtime、模型或推理质量。加入后
+同样需要完全重启 OpenCode。
+
+## 常见错误
+
+- `model unavailable`：先确认 `/v1/models`，并使用精确模型 id
+  `qwen3.8-flash-next`；不要连接旧端口 `8100` 或历史 Laguna 服务。
+- 请求长时间卡住：先看服务进程是否仍在加载/捕获 Graph，再看 Windows
+  OpenCode 日志是否有 snapshot symlink 错误；runtime 已返回时不要重复提交请求。
+- OOM：不要在现有服务上动态增大 slot、并发或 256K 配额；停止后按新 profile
+  冷启动，逐项做显存与质量验证。
+- 输出/思考异常：保留 `QSR_TRACE=1`，采集 `/debug/traces` 和原始请求；先按
+  相同 prompt 做 `bf diff`，避免把不同 effort、prefix 命中状态或上下文长度混为
+  一个性能结论。

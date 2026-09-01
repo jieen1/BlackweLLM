@@ -1,10 +1,30 @@
 # Server
 
+## Current local Flash-Next profile
+
+The currently validated local application is Qwen3.8 Flash-Next, not the
+historical Laguna controller or the older Qwen3.8 DSpark benchmark profile.
+The exact Python 3.14 launch command, environment contract, health checks and
+OpenCode/Windows setup live in
+[`docs/qwen38-flash-next-ops.md`](../docs/qwen38-flash-next-ops.md).
+
+For orientation, the live profile is:
+
+- checkpoint `/home/bot/models/Qwen3.8-Flash-Next-NVFP4-RadixArk`;
+- `flashnext` backend on `127.0.0.1:8300`;
+- one production slot (`capacity=1`, `num_slots=1`), `block_size=128`,
+  `blocks_per_slot=2048` (256K per-slot ceiling);
+- legacy KV mode, MTP `K=3`, CUDA Graphs and persistent prefix cache enabled.
+
+Do not use `scripts/blackwellm_ctl.sh` for this profile: that script is a
+Laguna-oriented historical launcher and defaults to port `8100`.
+
 The server exposes the fixed-slot engine (`server/engine.py`'s
 `ServerEngine`, a continuous-batching wrapper around
-`runtime.backends.laguna.LagunaBackend` / `runtime.backends.qwen36.Qwen36Backend`)
-through OpenAI-, Anthropic- and Responses-compatible interfaces. It has no
-vLLM runtime dependency; do not add multi-model or multi-GPU routing here.
+`runtime.backends.laguna.LagunaBackend` / `runtime.backends.qwen36.Qwen36Backend`
+/ `runtime.backends.flashnext.FlashNextBackend`) through OpenAI-, Anthropic-
+and Responses-compatible interfaces. It has no vLLM runtime dependency; do not
+add multi-model or multi-GPU routing here.
 
 ## Endpoints
 
@@ -40,10 +60,11 @@ Non-streaming responses carry non-standard `debug_committed_token_ids` /
 
 ## Configuration
 
-Set via env (read at import) or `python -m server.app` flags. The current
-Qwen deployed profile is DSpark K=7 with four 256K logical slots, block size
-128, elastic FP8 KV and persistent prefix cache; the MTP values below are
-kept as historical/rollback settings.
+Set via env (read at import) or `python -m server.app` flags. The table below
+keeps the historical Qwen3.8 DSpark/DFlash2 deployment values for API
+compatibility and rollback reference. The current Flash-Next service uses the
+separate one-slot/MTP profile in [`docs/qwen38-flash-next-ops.md`](../docs/qwen38-flash-next-ops.md);
+do not infer its live settings from the historical `Deployed` column.
 
 | Env | Flag | Code default | Deployed | Meaning |
 | --- | --- | --- | --- | --- |
@@ -81,12 +102,111 @@ kept as historical/rollback settings.
 | `QSR_SERVER_GPU_MEM_UTIL` | — | 0.85 | 0.92 | `gpu_memory_utilization` |
 | `QSR_SERVER_PRODUCTION` | — | 1 | 1 | production slot layout (vs. diagnostic layout) |
 | `QSR_SERVED_MODEL_NAME` | — | `qwen3.8` for Qwen | `qwen3.8` | name(s) reported by `/v1/models` (space-separated list) |
-| `QSR_DEFAULT_REASONING_EFFORT` | — | `medium` for native Qwen | `medium` | in-memory Qwen template default; omitted requests keep request kwargs empty and explicit effort wins |
-| `QSR_THINKING_TOKEN_BUDGET` | — | 8192 for Qwen | 8192 | implicit `<think>` ceiling, bounded to half of `max_tokens`; explicit request budget wins |
+| `QSR_DEFAULT_REASONING_EFFORT` | — | `medium` for native Qwen/Flash-Next | `medium` | in-memory Qwen template default; omitted requests keep request kwargs empty and explicit effort wins |
 | `QSR_SERVER_REQUEST_TIMEOUT_S` | — | 600 | 0 | server-side request cap; 0 disables (long generations) |
 | `QSR_DEBUG_REQUESTS` | — | 1 | 1 | log raw request/response (see **Raw I/O logging**); legacy alias `QSR_DEBUG_ANTHROPIC` |
 
 CLI also accepts `--host` / `--port` (default `127.0.0.1:8000`).
+
+### Qwen3.8 Flash-Next reasoning effort
+
+The shipped Flash-Next tokenizer template is the authority for this model's
+thinking controls. It accepts the native effort values `low`, `medium`, and
+`xhigh`; `enable_thinking=false` disables the `<think>` block. It does not
+implement a distinct native `high` or `max` level. The runtime therefore
+normalizes common OpenAI/OpenCode aliases at the request boundary:
+
+| Client value | Flash-Next template value |
+| --- | --- |
+| `minimal` | `low` |
+| `low` | `low` |
+| `medium` | `medium` |
+| `high` | `xhigh` |
+| `xhigh` | `xhigh` |
+| `max` | `xhigh` |
+| `none` / `enable_thinking=false` | thinking disabled |
+
+For OpenCode 1.x, declare the model as reasoning-capable and add variants in
+the provider's `models` map. The installed local configuration uses this
+shape (the model-level default is `medium`):
+
+```json
+{
+  "provider": {
+    "blackwellm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8300/v1" },
+      "models": {
+        "qwen3.8-flash-next": {
+          "reasoning": true,
+          "interleaved": { "field": "reasoning_content" },
+          "options": { "reasoningEffort": "medium" },
+          "variants": {
+            "none": { "reasoningEffort": "none" },
+            "minimal": { "reasoningEffort": "low" },
+            "low": { "reasoningEffort": "low" },
+            "medium": { "reasoningEffort": "medium" },
+            "high": { "reasoningEffort": "xhigh" },
+            "xhigh": { "reasoningEffort": "xhigh" },
+            "max": { "reasoningEffort": "xhigh" }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Use OpenCode's `/variants` picker, `variant_cycle` keybind, or `opencode run
+--variant <name>`. The AI SDK sends the selected setting to this server as
+`reasoning_effort`; direct OpenAI-compatible callers can send that field (or
+`reasoning.effort` on the Responses API) themselves.
+
+### Qwen3.8 Flash-Next image input
+
+Flash-Next prefill uses a quality-gated **1024-token chunk** by default.  The
+generic `QSR_PREFILL_CHUNK` value is clamped to 1024 for this backend unless
+`QSR_FLASHNEXT_ALLOW_UNSAFE_PREFILL_CHUNK=1` is explicitly set for a numerical
+experiment; larger chunks currently change recurrent/MoE reduction order and
+are not production-safe.
+
+Flash-Next target verify batches the large GDN projections across the fixed
+`K+1` verify rows by default for the validated `qwen4_exp` checkpoint
+(`mamba_ssm_dtype=float32`).  This removes repeated M=1 GEMM launches without
+changing the FP32 recurrent-state contract.  Use the following switches only
+for an explicit A/B or rollback:
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `QSR_FLASHNEXT_BATCH_GDN_PROJECTIONS` | `auto` | `auto` enables the validated qwen4_exp batched path; `0` restores the per-row compatibility path; `1` forces the path only for a qualified format or an explicit BF16 validation override. |
+| `QSR_FLASHNEXT_ALLOW_BF16_BATCH_PROJECTIONS` | `0` | Allows `QSR_FLASHNEXT_BATCH_GDN_PROJECTIONS=1` for an unknown BF16 checkpoint. The validated qwen4_exp checkpoint does not need this escape hatch. |
+
+The active contract is exposed as `_cuda_graph_dbg.gdn_projections` in
+`/debug/stats` (for example `batched_bf16` or `per_row`).
+
+Flash-Next accepts still images on all three multimodal-compatible endpoints:
+OpenAI Chat Completions (`image_url`), Anthropic Messages (`image` with a URL
+or base64 `source`), and Responses (`input_image`). Images are decoded and
+resized on the CPU before patchification, then fused through the checkpoint's
+Qwen3-VL vision tower with the sglang-compatible three-axis MRoPE positions.
+Video blocks are rejected explicitly.
+
+Vision is enabled by default for the Flash-Next checkpoint. Set these before
+starting the server when tuning the quality/capacity trade-off:
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `QSR_FLASHNEXT_VISION` | `1` | load the BF16 vision tower (about 0.84 GiB) |
+| `QSR_FLASHNEXT_IMAGE_MAX_PIXELS` | `1048576` | post-decode area budget (1 MP; hard ceiling 16 MP) |
+| `QSR_FLASHNEXT_IMAGE_MIN_PIXELS` | `65536` | processor's minimum area budget |
+| `QSR_FLASHNEXT_IMAGE_MAX_TOKENS` | `4096` | total merged visual-token cap per request |
+| `QSR_FLASHNEXT_VISION_ATTN` | `sdpa` | vision attention implementation; `eager` is the fallback |
+
+The request log reports source dimensions, resized dimensions, and visual token
+count. Image requests use the target prefill path and intentionally skip the
+text-only MTP draft/verify loop; text requests retain CUDA-Graph/MTP behavior.
+This keeps visual position/state handling exact while preventing an unused MTP
+working set from consuming memory on the single GPU.
 
 ### Qwen3.8 Q6_K_XL + DFlash2
 
@@ -106,8 +226,9 @@ on the packed tensor-core path. This avoids the resident model-sized BF16
 cache while materially reducing Q6 TTFT. Set
 `QSR_GGUF_NATIVE_PREFILL_DEQUANT=0` to keep the fully packed path, or set
 `QSR_GGUF_DEQUANTIZE_WEIGHTS=1` to select the resident-BF16 rollback. The local
-`.gguf` path also selects the Qwen3.8 `qwen3_coder` tool parser automatically;
-`QSR_TOOL_CALL_PARSER` remains an explicit override.
+`.gguf` path and the Qwen3.8 Flash-Next NVFP4 checkpoint both select the Qwen3.8
+`qwen3_coder` tool parser automatically; `QSR_TOOL_CALL_PARSER` remains an
+explicit override.
 
 For a controlled packed-path experiment, set `QSR_GGUF_NATIVE_MMQ=1` together
 with the Q6 split/Q8 activation settings. The route is shape-gated and does not

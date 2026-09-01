@@ -194,6 +194,28 @@ verify-gguf-qk: ## Verify the generated GGML K-quant ABI and dependencies
 	@! readelf -d $(GGUF_QK_LIBRARY) | grep -Ei 'libtorch|vllm'
 	@! ldd $(GGUF_QK_LIBRARY) | grep -Ei 'libtorch|vllm'
 
+QSA_TOPK_SOURCE = runtime/kernels/flashnext_qsa_topk_sm120.cu
+QSA_TOPK_EXPORTS = runtime/kernels/flashnext_qsa_topk_sm120.exports
+QSA_TOPK_GENERATED_DIR = runtime/kernels/_generated
+QSA_TOPK_LIBRARY = $(QSA_TOPK_GENERATED_DIR)/flashnext_qsa_topk_sm120.so
+QSA_TOPK_MANIFEST = $(QSA_TOPK_GENERATED_DIR)/flashnext_qsa_topk_sm120.manifest.json
+QSA_TOPK_FLAGS = -std=c++17 -O3 --shared -Xcompiler -fPIC -Xcompiler -fvisibility=hidden -gencode arch=compute_120f,code=sm_120f -cudart static -Xlinker --version-script=$(QSA_TOPK_EXPORTS)
+
+build-flashnext-qsa-topk: ## Build the standalone SM120 QSA radix top-k artifact
+	@mkdir -p $(QSA_TOPK_GENERATED_DIR)
+	@set -eu; tmp_library="$(QSA_TOPK_LIBRARY).tmp"; \
+	$(NVCC) $(QSA_TOPK_FLAGS) $(QSA_TOPK_SOURCE) -o "$$tmp_library"; \
+	mv "$$tmp_library" "$(QSA_TOPK_LIBRARY)"
+	@$(PYTHON) -c 'import hashlib,json,subprocess,sys; from pathlib import Path; library=Path(sys.argv[1]); manifest=Path(sys.argv[2]); source=Path(sys.argv[3]); flags=sys.argv[4]; payload={"abi_version":2,"target_sm":"sm_120f","nvcc":subprocess.check_output([sys.argv[5],"--version"],text=True).strip(),"ptxas":subprocess.check_output(["ptxas","--version"],text=True).strip(),"compile_flags":flags,"source_sha256":hashlib.sha256(source.read_bytes()).hexdigest(),"runtime_git_sha":subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),"library_sha256":hashlib.sha256(library.read_bytes()).hexdigest(),"provenance":{"upstream":"sglang fast_topk radix selector","specialization":"Flash-Next QSA fixed block_topk=512, standalone SM120 ABI, torch.long output"}}; temporary=manifest.with_suffix(".tmp"); temporary.write_text(json.dumps(payload,indent=2,sort_keys=True)+"\n"); temporary.replace(manifest)' "$(QSA_TOPK_LIBRARY)" "$(QSA_TOPK_MANIFEST)" "$(QSA_TOPK_SOURCE)" "$(QSA_TOPK_FLAGS)" "$(NVCC)"
+	@$(MAKE) verify-flashnext-qsa-topk
+
+verify-flashnext-qsa-topk: ## Verify the standalone QSA top-k ABI and dependencies
+	@test -f $(QSA_TOPK_LIBRARY)
+	@test -f $(QSA_TOPK_MANIFEST)
+	@nm -D --defined-only $(QSA_TOPK_LIBRARY) | awk '{print $$3}' | grep -Ex 'qsr_flashnext_qsa_topk_(abi_version|sm120)' | wc -l | grep -qx 2
+	@! readelf -d $(QSA_TOPK_LIBRARY) | grep -Ei 'libtorch|vllm'
+	@! ldd $(QSA_TOPK_LIBRARY) | grep -Ei 'libtorch|vllm'
+
 
 verify-sparkinfer: ## Report which SparkInfer checkout the warm bfdiag daemon actually loaded
 	@bf exec scripts/verify_sparkinfer_load.py --timeout-s 60
@@ -202,4 +224,4 @@ clean: ## Remove build and test caches
 	rm -rf .pytest_cache .ruff_cache build dist *.egg-info
 	find . -type d -name __pycache__ -not -path './.venv/*' -exec rm -rf {} + 2>/dev/null || true
 
-.PHONY: help install install-cuda lint format format-check test verify-cuda smoke workloads build-laguna-router verify-laguna-router build-fp8-w8a8 verify-fp8-w8a8 serve build-iq2-mma16 verify-iq2-mma16 build-iq2-mma16-tc verify-iq2-mma16-tc build-gguf-qk verify-gguf-qk verify-sparkinfer clean
+.PHONY: help install install-cuda lint format format-check test verify-cuda smoke workloads build-laguna-router verify-laguna-router build-fp8-w8a8 verify-fp8-w8a8 serve build-iq2-mma16 verify-iq2-mma16 build-iq2-mma16-tc verify-iq2-mma16-tc build-gguf-qk verify-gguf-qk build-flashnext-qsa-topk verify-flashnext-qsa-topk verify-sparkinfer clean

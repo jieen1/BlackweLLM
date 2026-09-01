@@ -1,0 +1,417 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+torch = pytest.importorskip("torch")
+from torch import nn  # noqa: E402
+
+from runtime.backends.flashnext import (  # noqa: E402
+    FlashNextBackend,
+    _flashnext_batch_gdn_projections_enabled,
+    _flashnext_gdn_projection_mode,
+)
+
+
+def test_flashnext_gdn_projection_batching_is_safe_by_default(monkeypatch) -> None:
+    """BF16 Flash-Next GDNs must never enter the drift-prone batched path."""
+
+    model = SimpleNamespace(
+        layers=[
+            SimpleNamespace(
+                is_qsa=False,
+                attn=SimpleNamespace(
+                    in_proj_qkvz=nn.Linear(8, 16),
+                    out_proj=nn.Linear(16, 8),
+                ),
+            )
+        ]
+    )
+    monkeypatch.delenv("QSR_FLASHNEXT_BATCH_GDN_PROJECTIONS", raising=False)
+    assert _flashnext_batch_gdn_projections_enabled(model) is False
+
+    # A stale force flag must not re-enable a path that is unsupported for the
+    # loaded BF16 projection format.
+    monkeypatch.setenv("QSR_FLASHNEXT_BATCH_GDN_PROJECTIONS", "1")
+    assert _flashnext_batch_gdn_projections_enabled(model) is False
+
+    # The BF16 path is available only through a separately named, explicit
+    # validation override.  ``FN_BATCH_GDN_PROJECTIONS`` belongs to the
+    # standalone fn6 diagnostic and must never leak into serving implicitly.
+    monkeypatch.setenv("QSR_FLASHNEXT_ALLOW_BF16_BATCH_PROJECTIONS", "1")
+    assert _flashnext_batch_gdn_projections_enabled(model) is True
+
+
+def test_flashnext_qwen4_exp_bf16_contract_batches_by_default(monkeypatch) -> None:
+    """The validated Flash-Next checkpoint must not fall back to M=1 GEMMs."""
+
+    model = SimpleNamespace(
+        cfg=SimpleNamespace(model_type="qwen4_exp", mamba_ssm_dtype="float32"),
+        layers=[
+            SimpleNamespace(
+                is_qsa=False,
+                attn=SimpleNamespace(
+                    in_proj_qkvz=nn.Linear(8, 16),
+                    out_proj=nn.Linear(16, 8),
+                ),
+            )
+        ],
+    )
+    monkeypatch.delenv("QSR_FLASHNEXT_BATCH_GDN_PROJECTIONS", raising=False)
+    monkeypatch.delenv("QSR_FLASHNEXT_ALLOW_BF16_BATCH_PROJECTIONS", raising=False)
+    assert _flashnext_gdn_projection_mode(model) == "batched_bf16"
+    assert _flashnext_batch_gdn_projections_enabled(model) is True
+
+    # The explicit rollback remains available for numerical A/B tests.
+    monkeypatch.setenv("QSR_FLASHNEXT_BATCH_GDN_PROJECTIONS", "0")
+    assert _flashnext_gdn_projection_mode(model) == "disabled"
+    assert _flashnext_batch_gdn_projections_enabled(model) is False
+
+
+def test_chunked_prefill_syncs_partial_tail_at_its_real_width() -> None:
+    backend = object.__new__(FlashNextBackend)
+    backend.max_seq_len = 64
+    backend.device = torch.device("cpu")
+    backend._slot_tokens = [[]]
+    backend._last_logits = [None]
+    backend.stats = {
+        "prefill_requests": 0,
+        "decode_rounds": 0,
+        "decode_tokens": 0,
+        "mtp_rounds": 0,
+        "mtp_accepted_tokens": 0,
+        "prefill_chunks": 0,
+        "prefill_tokens": 0,
+        "prefill_target_ns": 0,
+        "prefill_mtp_sync_ns": 0,
+        "prefill_mtp_draft_ns": 0,
+        "prefill_trim_ns": 0,
+        "prefill_last_chunks": 0,
+        "prefill_last_tokens": 0,
+        "prefill_last_target_ns": 0,
+        "prefill_last_mtp_sync_ns": 0,
+        "prefill_last_mtp_draft_ns": 0,
+        "prefill_last_trim_ns": 0,
+    }
+    backend._reset_runtime = lambda slot: None
+    backend._trim_prefill_cuda_cache = lambda prompt_tokens: None
+
+    class _Target:
+        def prefill(self, token_ids):
+            return torch.zeros(8), torch.zeros(len(token_ids), 4)
+
+    sync_widths: list[tuple[int, int]] = []
+
+    class _Spec:
+        def sync_real_suffix(self, token_ids, hidden):
+            sync_widths.append((len(token_ids), hidden.shape[0]))
+            assert len(token_ids) == hidden.shape[0]
+            return 7, torch.zeros(1, 4)
+
+        def continue_draft(self, first, hidden):
+            return [first]
+
+    backend._targets = [_Target()]
+    backend._specs = [_Spec()]
+
+    result = backend._prefill_slot(
+        0,
+        list(range(10)),
+        forced_token=42,
+        chunk_size=4,
+    )
+
+    assert sync_widths == [(4, 4), (4, 4), (2, 2)]
+    assert result == {"anchor": 42, "draft_tokens": [7]}
+
+
+def test_flashnext_prefix_snapshot_restores_recurrent_state_without_qsa_copy() -> None:
+    """A retained prefix keeps fixed KV storage and restores only small state."""
+
+    backend = object.__new__(FlashNextBackend)
+    backend.enable_prefix_cache = True
+    backend.num_slots = 1
+    backend._slot_tokens = [[]]
+    backend._last_logits = [None]
+    backend._prefix_cache = [None]
+    backend._prefix_cache_tokens = [None]
+    backend._prefix_cache_kv_len = [0]
+    backend._pending_prefix_hits = {}
+    backend._specs = [None]
+    backend.stats = {}
+
+    class _Target:
+        def __init__(self) -> None:
+            self.qsa = torch.full((16, 2), 7.0)
+            self.sess = SimpleNamespace(
+                gdn={
+                    "gdn_0": SimpleNamespace(
+                        conv_state=torch.tensor([[1.0, 2.0]]),
+                        recurrent_state=torch.tensor([[3.0, 4.0]]),
+                        has_previous_state=True,
+                    )
+                },
+                ple_conv_state=torch.tensor([[5.0, 6.0]]),
+                rope_next=torch.tensor([11, 12, 13]),
+                window=[8, 9],
+                pos=4,
+                qsa_k={},
+                qsa_v={},
+                qsa_idx_k={},
+            )
+
+        def _zero_state(self, *, clear_kv: bool = True) -> None:
+            state = self.sess.gdn["gdn_0"]
+            state.conv_state.zero_()
+            state.recurrent_state.zero_()
+            state.has_previous_state = True
+            self.sess.ple_conv_state.zero_()
+            self.sess.pos = 0
+            self.sess.window = []
+            self.sess.rope_next = None
+            if clear_kv:
+                self.qsa.zero_()
+
+    target = _Target()
+    backend._targets = [target]
+
+    logits = torch.tensor([0.1, 0.9])
+    backend._capture_prefix_snapshot(
+        0,
+        [101, 102, 103, 104],
+        anchor=17,
+        draft_tokens=[18, 19, 20],
+        anchor_logits=logits,
+        mtp_ready=False,
+    )
+    target.sess.gdn["gdn_0"].conv_state.zero_()
+    target.sess.gdn["gdn_0"].recurrent_state.zero_()
+    target.sess.ple_conv_state.zero_()
+    target.sess.pos = 0
+    target.sess.window = []
+    target.sess.rope_next = None
+    backend._slot_tokens[0] = []
+
+    qsa_before = target.qsa.clone()
+    assert backend._prefix_hit_for_slot([101, 102, 103, 104, 105], 0).effective == 4
+    assert backend._prefix_hit_for_slot([101, 999], 0).effective == 0
+    backend._reset_runtime(0, preserve_prefix=True)
+    backend._restore_prefix_snapshot(0, [101, 102, 103, 104, 105], 4)
+
+    assert torch.equal(target.qsa, qsa_before)
+    assert torch.equal(target.sess.gdn["gdn_0"].conv_state, torch.tensor([[1.0, 2.0]]))
+    assert torch.equal(target.sess.gdn["gdn_0"].recurrent_state, torch.tensor([[3.0, 4.0]]))
+    assert torch.equal(target.sess.ple_conv_state, torch.tensor([[5.0, 6.0]]))
+    assert target.sess.pos == 4
+    assert target.sess.window == [8, 9]
+    assert torch.equal(target.sess.rope_next, torch.tensor([11, 12, 13]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA allocator")
+def test_trim_prefill_cuda_cache_only_for_long_prompts(monkeypatch):
+    backend = object.__new__(FlashNextBackend)
+    backend.device = torch.device("cuda")
+    calls: list[object] = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: calls.append(device))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty"))
+    monkeypatch.setenv("QSR_FLASHNEXT_TRIM_PREFILL_CACHE_TOKENS", "2048")
+
+    backend._trim_prefill_cuda_cache(2047)
+    assert calls == []
+    backend._trim_prefill_cuda_cache(2048)
+    assert calls == [torch.device("cuda"), "empty"]
+
+    monkeypatch.setenv("QSR_FLASHNEXT_TRIM_PREFILL_CACHE", "0")
+    backend._trim_prefill_cuda_cache(4096)
+    assert calls == [torch.device("cuda"), "empty"]
+
+
+def test_flashnext_backend_defaults_to_captured_verify_state(monkeypatch):
+    monkeypatch.delenv("QSR_FLASHNEXT_RECOMPUTE_VERIFY_STATE", raising=False)
+
+    captured: dict[str, object] = {}
+
+    def fake_new_session(model, device):
+        return SimpleNamespace(
+            qsa_k_pool={0: torch.empty(16, 1)},
+            qsa_v_pool={0: torch.empty(16, 1)},
+            qsa_idx_k_pool={0: torch.empty(16, 1)},
+            qsa_pooled_k_pool={0: torch.empty(16, 1)},
+            gdn={},
+            ple_conv_state=None,
+            token_buf=torch.empty(1, dtype=torch.long),
+            pos_buf=None,
+            ends_buf={},
+            hc_hidden_buf=None,
+            ple_emb_buf=None,
+            window=[],
+            pos=0,
+        )
+
+    def fake_prepare_graph_buffers(*args, **kwargs):
+        return None
+
+    def fake_graph_engine(*args, **kwargs):
+        return SimpleNamespace()
+
+    def fake_load_flashnext_mtp(*args, **kwargs):
+        return SimpleNamespace()
+
+    def fake_spec_engine(*args, **kwargs):
+        captured["recompute_recurrent_state"] = kwargs["recompute_recurrent_state"]
+        captured["batch_gdn_projections"] = kwargs["batch_gdn_projections"]
+        return SimpleNamespace(
+            verify=SimpleNamespace(buffers=SimpleNamespace()),
+            mtp_continuation_graph=None,
+            mtp_proposal_graphs={},
+        )
+
+    import runtime.model.flashnext.model as flashnext_model_mod
+    import runtime.model.flashnext.mtp as flashnext_mtp_mod
+    import runtime.model.flashnext.spec as flashnext_spec_mod
+
+    monkeypatch.setattr(flashnext_model_mod, "new_session", fake_new_session)
+    monkeypatch.setattr(flashnext_model_mod, "prepare_graph_buffers", fake_prepare_graph_buffers)
+    monkeypatch.setattr(flashnext_model_mod, "FlashNextGraphEngine", fake_graph_engine)
+    monkeypatch.setattr(flashnext_mtp_mod, "load_flashnext_mtp", fake_load_flashnext_mtp)
+    monkeypatch.setattr(flashnext_spec_mod, "FlashNextSpecEngine", fake_spec_engine)
+
+    model = SimpleNamespace(
+        cfg=SimpleNamespace(),
+        layers=[
+            SimpleNamespace(
+                is_qsa=False,
+                attn=SimpleNamespace(
+                    in_proj_qkvz=nn.Linear(8, 16),
+                    out_proj=nn.Linear(16, 8),
+                ),
+            )
+        ],
+    )
+    backend = FlashNextBackend(
+        model,
+        num_slots=1,
+        max_seq_len=64,
+        device="cpu",
+        checkpoint_path="dummy",
+        enable_mtp=True,
+    )
+
+    assert captured["recompute_recurrent_state"] is False
+    assert captured["batch_gdn_projections"] is False
+    assert backend._cg_status["gdn_projections"] == "per_row"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_memory_breakdown_deduplicates_verify_row_views() -> None:
+    backend = object.__new__(FlashNextBackend)
+    backend.device = torch.device("cuda")
+
+    class _TinyModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = []
+
+    backend.model = _TinyModel()
+    backend._mtp_model = None
+    backend._targets = [
+        SimpleNamespace(
+            sess=SimpleNamespace(
+                qsa_k_pool={},
+                qsa_v_pool={},
+                qsa_idx_k_pool={},
+                qsa_pooled_k_pool={},
+                qsa_k={},
+                qsa_v={},
+                qsa_idx_k={},
+                gdn={},
+                ple_conv_state=None,
+                token_buf=None,
+                pos_buf=None,
+                ends_buf={},
+                hc_hidden_buf=None,
+                ple_emb_buf=None,
+            ),
+            _logits=None,
+        )
+    ]
+
+    recurrent_rows = torch.zeros(2, 3, dtype=torch.float32, device="cuda")
+    verify_buffers = SimpleNamespace(
+        token_ids=torch.zeros(2, dtype=torch.long, device="cuda"),
+        positions=torch.zeros(2, dtype=torch.long, device="cuda"),
+        ple_embeddings=torch.zeros(2, 4, dtype=torch.bfloat16, device="cuda"),
+        gdn_rows={
+            0: [
+                SimpleNamespace(
+                    conv_state=torch.zeros(1, 2, dtype=torch.bfloat16, device="cuda"),
+                    recurrent_state=recurrent_rows[0:1],
+                ),
+                SimpleNamespace(
+                    conv_state=torch.zeros(1, 2, dtype=torch.bfloat16, device="cuda"),
+                    recurrent_state=recurrent_rows[1:2],
+                ),
+            ]
+        },
+        gdn_work={
+            0: SimpleNamespace(
+                conv_state=torch.zeros(1, 2, dtype=torch.bfloat16, device="cuda"),
+                recurrent_state=torch.zeros(1, 3, dtype=torch.float32, device="cuda"),
+            )
+        },
+        gdn_recurrent_rows={0: recurrent_rows},
+        ple_rows=[
+            torch.zeros(1, 2, dtype=torch.bfloat16, device="cuda"),
+            torch.zeros(1, 2, dtype=torch.bfloat16, device="cuda"),
+        ],
+    )
+    backend._specs = [
+        SimpleNamespace(
+            mtp_session=SimpleNamespace(
+                mtp_k_pool=None,
+                mtp_v_pool=None,
+                mtp_idx_k_pool=None,
+                mtp_pooled_k_pool=None,
+                shared_sparse_indices=None,
+                shared_sparse_valid=None,
+                sparse_graph_buffers=None,
+            ),
+            verify=SimpleNamespace(
+                buffers=verify_buffers,
+                _hc_hidden=None,
+                _logits=None,
+            ),
+            mtp_continuation_graph=None,
+            mtp_proposal_graphs={},
+        )
+    ]
+
+    def _nbytes(tensor: torch.Tensor) -> int:
+        return int(tensor.untyped_storage().nbytes())
+
+    expected_verify_bytes = sum(
+        _nbytes(tensor)
+        for tensor in (
+            verify_buffers.token_ids,
+            verify_buffers.positions,
+            verify_buffers.ple_embeddings,
+            recurrent_rows,
+            verify_buffers.gdn_rows[0][0].conv_state,
+            verify_buffers.gdn_rows[0][1].conv_state,
+            verify_buffers.gdn_work[0].conv_state,
+            verify_buffers.gdn_work[0].recurrent_state,
+            verify_buffers.ple_rows[0],
+            verify_buffers.ple_rows[1],
+        )
+    )
+
+    breakdown = backend.memory_breakdown()
+
+    assert breakdown["model_tensor_bytes"] == 0
+    assert breakdown["target_session_tensor_bytes"] == 0
+    assert breakdown["mtp_verify_state"] == expected_verify_bytes
+    assert breakdown["session_tensor_bytes"] == expected_verify_bytes
+    assert breakdown["explicit_tensor_bytes"] == expected_verify_bytes
+    assert breakdown["torch_allocated"] >= breakdown["explicit_tensor_bytes"]
+    assert breakdown["torch_reserved"] >= breakdown["torch_allocated"]

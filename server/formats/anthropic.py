@@ -11,7 +11,13 @@ import json
 import uuid
 from typing import Any
 
-from server.formats.content import extract_blocks, extract_text
+from server.formats.content import (
+    content_has_images,
+    content_has_videos,
+    extract_blocks,
+    extract_text,
+    normalize_content_blocks,
+)
 from server.formats.tools import format_tool_calls_anthropic, parse_tool_calls
 
 _BILLING_HEADER_PREFIX = "x-anthropic-billing-header"
@@ -63,7 +69,7 @@ _USER_TEXT_EXTRACT_TYPES = frozenset(
 
 # Content block types in user messages that are silently ignored.
 _USER_IGNORE_TYPES = frozenset(
-    {"image", "document", "mcp_tool_use", "mcp_tool_result", "container_upload"}
+    {"document", "mcp_tool_use", "mcp_tool_result", "container_upload"}
 )
 
 
@@ -75,7 +81,8 @@ def parse_messages(body: dict) -> list[dict]:
     - messages[].content: string | list of content blocks
     - text, thinking, redacted_thinking, tool_use, tool_result
     - server_tool_use, web_search_tool_result, search_result
-    - image, document, mcp_tool_use, mcp_tool_result (gracefully ignored)
+    - image/video are preserved for the request-layer capability check
+    - document, mcp_tool_use, mcp_tool_result (gracefully ignored)
     - Multi-turn conversations with user/assistant roles
     """
     chat_messages: list[dict] = []
@@ -86,9 +93,12 @@ def parse_messages(body: dict) -> list[dict]:
         system_field = _strip_billing_blocks(system_field)
     elif isinstance(system_field, str) and system_field.startswith(_BILLING_HEADER_PREFIX):
         system_field = ""
-    system_text = extract_text(system_field)
-    if system_text:
-        chat_messages.append({"role": "system", "content": system_text})
+    if content_has_images(system_field) or content_has_videos(system_field):
+        chat_messages.append({"role": "system", "content": normalize_content_blocks(system_field)})
+    else:
+        system_text = extract_text(system_field)
+        if system_text:
+            chat_messages.append({"role": "system", "content": system_text})
 
     for msg in body.get("messages", []):
         role = msg.get("role", "user")
@@ -96,11 +106,22 @@ def parse_messages(body: dict) -> list[dict]:
 
         if role == "assistant":
             text_parts = []
+            multimodal_parts: list[dict] = []
+            has_multimodal = False
             tool_calls = []
             for block in blocks:
                 btype = block.get("type", "text")
                 if btype == "text":
                     text_parts.append(block.get("text", ""))
+                    multimodal_parts.append({"type": "text", "text": block.get("text", "")})
+                elif btype == "image":
+                    has_multimodal = True
+                    multimodal_parts.append(
+                        normalize_content_blocks([block])[0]
+                    )
+                elif btype == "video":
+                    has_multimodal = True
+                    multimodal_parts.append(normalize_content_blocks([block])[0])
                 elif btype == "tool_use":
                     tool_calls.append(
                         {
@@ -114,18 +135,30 @@ def parse_messages(body: dict) -> list[dict]:
                     )
                 elif btype in _ASSISTANT_SKIP_TYPES:
                     pass  # thinking, redacted_thinking, server_tool_use: skip
-            entry: dict[str, Any] = {"role": "assistant", "content": "\n".join(text_parts)}
+            entry: dict[str, Any] = {
+                "role": "assistant",
+                "content": multimodal_parts if has_multimodal else "\n".join(text_parts),
+            }
             if tool_calls:
                 entry["tool_calls"] = tool_calls
             chat_messages.append(entry)
 
         elif role == "user":
             text_parts = []
+            multimodal_parts: list[dict] = []
+            has_multimodal = False
             tool_results = []
             for block in blocks:
                 btype = block.get("type", "text")
                 if btype == "text":
                     text_parts.append(block.get("text", ""))
+                    multimodal_parts.append({"type": "text", "text": block.get("text", "")})
+                elif btype == "image":
+                    has_multimodal = True
+                    multimodal_parts.append(normalize_content_blocks([block])[0])
+                elif btype == "video":
+                    has_multimodal = True
+                    multimodal_parts.append(normalize_content_blocks([block])[0])
                 elif btype == "tool_result":
                     result_content = block.get("content", "")
                     if isinstance(result_content, list):
@@ -149,12 +182,15 @@ def parse_messages(body: dict) -> list[dict]:
                         result_content = ""
                     if result_content:
                         text_parts.append(str(result_content))
+                        multimodal_parts.append({"type": "text", "text": str(result_content)})
                 elif btype in _USER_IGNORE_TYPES:
-                    pass  # image, document, mcp blocks: not supported, skip
+                    pass  # document and mcp blocks are not model inputs
             # tool results go first (they respond to the previous assistant turn)
             for tr in tool_results:
                 chat_messages.append(tr)
-            if text_parts:
+            if has_multimodal:
+                chat_messages.append({"role": "user", "content": multimodal_parts})
+            elif text_parts:
                 chat_messages.append({"role": "user", "content": "\n".join(text_parts)})
             elif not tool_results:
                 chat_messages.append({"role": "user", "content": ""})

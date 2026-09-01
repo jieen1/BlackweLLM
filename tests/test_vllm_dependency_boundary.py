@@ -21,6 +21,7 @@ _APPROVED_DIRECT_IMPORT_FILES: set[str] = set()
 
 _APPROVED_DIRECT_FLASHINFER_IMPORT_FILES: set[str] = {
     "runtime/backends/flashinfer_dspark_attn.py",
+    "runtime/backends/flashnext_moe.py",
     "runtime/model/flashinfer_nvfp4.py",
     "runtime/model/flashinfer_gdn.py",
     "runtime/model/flashinfer_prefill.py",
