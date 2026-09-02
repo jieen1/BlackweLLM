@@ -1172,9 +1172,8 @@ async def log_request_timing(request: Request, call_next):
     return response
 
 
-# -- schemas (loose OpenAI-compatible subset -- see module docstring for
-# the explicit, intentional deviations: greedy-only, non-streaming, plus
-# a debug-only extra field). --
+# -- schemas (loose OpenAI-compatible subset; the debug-only extra fields are
+# documented in the endpoint models below). --
 
 
 class ChatCompletionRequest(BaseModel):

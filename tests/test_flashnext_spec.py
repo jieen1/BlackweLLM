@@ -18,6 +18,7 @@ from runtime.model.flashnext.spec import (  # noqa: E402
     allocate_verify_buffers,
     verify_body,
 )
+from runtime.sampling import PersistentSeed, SamplingParams  # noqa: E402
 
 
 def test_verify_graph_can_share_fixed_scratch_between_serial_slots() -> None:
@@ -741,6 +742,105 @@ def test_sync_and_propose_replays_graph_with_precomputed_input_embeds() -> None:
     assert torch.equal(captured["graph_input_embeds"], input_embeds)
     assert engine.mtp_session.sync_len == 23474
     assert engine.mtp_session.pos == 23476
+
+
+def test_sampled_sync_and_propose_keeps_the_exact_draft_distributions() -> None:
+    """Sampled MTP must expose q for every sampled draft, not argmax one-hot."""
+
+    engine = object.__new__(FlashNextSpecEngine)
+    engine.device = torch.device("cpu")
+    engine.k = 3
+    engine.max_seq = 32
+    engine.mtp_session = SimpleNamespace(sync_len=0, pos=0)
+    engine.mtp_proposal_graphs = {}
+    engine.mtp_continuation_graph = None
+
+    def forward(embeds, target_hc_hidden, positions, sess, **kwargs):
+        del target_hc_hidden, positions, sess, kwargs
+        rows = embeds.shape[0]
+        mixed = torch.zeros(rows, 4, dtype=torch.bfloat16)
+        own_hc = torch.arange(rows * 4, dtype=torch.bfloat16).reshape(rows, 4)
+        return mixed, own_hc
+
+    calls = iter((1, 2, 3))
+
+    def lm_head(mixed):
+        logits = torch.zeros(mixed.shape[0], 5, dtype=torch.float32)
+        logits[:, next(calls)] = 2.0
+        return logits
+
+    engine.mtp = SimpleNamespace(forward=forward)
+    engine.model = SimpleNamespace(
+        cfg=SimpleNamespace(hc_count=1, hidden_size=4),
+        embed_tokens=lambda tokens: torch.zeros(tokens.shape[0], 4, dtype=torch.bfloat16),
+        lm_head=lm_head,
+    )
+    params = SamplingParams(
+        temperature=0.8,
+        top_k=0,
+        top_p=1.0,
+        seed=PersistentSeed(17),
+    )
+
+    drafts = FlashNextSpecEngine.sync_and_propose(
+        engine,
+        shifted_token_ids=[11, 12],
+        target_hc_hidden=torch.ones(2, 4, dtype=torch.bfloat16),
+        params=params,
+    )
+
+    assert len(drafts) == 3
+    assert engine.pending_draft_probs is not None
+    assert engine.pending_draft_probs.shape == (3, 5)
+    assert torch.allclose(engine.pending_draft_probs.sum(dim=-1), torch.ones(3))
+    assert torch.all(engine.pending_draft_probs.gather(1, torch.tensor(drafts).unsqueeze(1)) > 0)
+    assert engine.mtp_session.sync_len == 2
+    assert engine.mtp_session.pos == 4
+
+
+def test_sampled_round_uses_rejection_sampling_and_preserves_commit_shape() -> None:
+    engine = object.__new__(FlashNextSpecEngine)
+    engine.device = torch.device("cpu")
+    engine.k = 2
+    engine.target_session = SimpleNamespace(pos=5)
+    engine.mtp_session = SimpleNamespace(sync_len=5)
+    logits = torch.tensor(
+        [
+            [2.0, 0.0, 0.0, 0.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [0.0, 0.0, 2.0, 0.0],
+        ]
+    )
+    params = SamplingParams(temperature=0.7, seed=PersistentSeed(3))
+    from runtime.sampling import compute_sampling_distribution
+
+    engine.pending_draft_probs = compute_sampling_distribution(logits[:2], params)
+    engine.verify = SimpleNamespace(
+        replay=lambda tokens, past_len: (torch.ones(3, 8), logits),
+        eager=lambda tokens, past_len: (torch.ones(3, 8), logits),
+        commit=lambda count: None,
+        last_ple_seconds=0.0,
+    )
+    proposed: dict[str, object] = {}
+
+    def sync(tokens, hidden, *, params=None):
+        proposed["tokens"] = list(tokens)
+        proposed["params"] = params
+        return [8, 9]
+
+    engine.sync_and_propose = sync
+    result = FlashNextSpecEngine.round(
+        engine,
+        anchor_token=0,
+        drafts=[1, 2],
+        params=params,
+    )
+
+    assert result["num_accepted"] == 2
+    assert result["committed"][:2] == [1, 2]
+    assert len(result["committed"]) == 3
+    assert result["next_draft_tokens"] == [8, 9]
+    assert proposed["params"] is params
 
 
 @pytest.mark.parametrize(

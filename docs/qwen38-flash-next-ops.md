@@ -26,11 +26,11 @@
 | CUDA Graph | 开启 |
 | persistent prefix cache | 开启 |
 | 视觉输入 | 开启（默认 1 MP 后处理面积上限） |
-| 两槽冷启动显存 | `explicit=85.11 GiB`，`torch_reserved=86.24 GiB`，driver free 约 `6.82 GiB` |
+| 两槽冷启动显存 | `explicit=85.11 GiB`，`torch_reserved=86.76 GiB`，driver free 约 `6.05 GiB` |
 
 256K 是每个 slot 的容量上限，不代表模型加载时立即为每个 token 分配显存。
 当前 `capacity=2` / `num_slots=2` 已经过本机 FP8 冷启动、CUDA Graph 捕获和两路
-并发请求门禁；启动后余量约 6.8 GiB。此前三槽冷启动虽能通过，但余量只有约
+并发请求门禁；启动后余量约 6.05 GiB。此前三槽冷启动虽能通过，但余量只有约
 1.9 GiB，当前运行配置有意降为两槽。不要在不重新冷启动的情况下提高并发、
 上下文或 PLE 配额。
 
@@ -139,10 +139,11 @@ curl -N http://127.0.0.1:8300/v1/chat/completions \
 字段只有这三项；模型卡中的 `min_p`、presence penalty 和 repetition penalty
 尚未作为 runtime 采样字段实现，不能假装已经生效。
 
-Prefix cache 的 admission key 会同时携带 `sampled`/`greedy` 解码契约。采样请求
-会保存 target-only checkpoint，并可在相同 token 前缀上完整恢复；greedy/MTP 请求
-只接受带 MTP 状态的 checkpoint，绝不会误恢复 sampled checkpoint。两种模式的
-缓存因此不会互相污染，但仍要求 token 前缀和视觉 cache key 完全一致。
+Prefix cache 的 admission key 会同时携带 `sampled`/`greedy` 解码契约。两种模式
+都会保存 target + MTP 状态；采样命中时恢复真实 MTP 前缀、覆盖旧 anchor 并重新
+采样 draft/q 分布，greedy 命中则复用确定性 draft。模式不匹配的 checkpoint 不会
+被恢复，避免把另一请求的随机 proposal 状态带进来；仍要求 token 前缀和视觉
+cache key 完全一致。
 
 ## OpenCode / Windows 客户端
 

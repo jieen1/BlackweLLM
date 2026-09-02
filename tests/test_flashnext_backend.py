@@ -454,6 +454,58 @@ def test_flashnext_sampled_prefix_key_allows_target_only_checkpoint() -> None:
     )
 
 
+def test_flashnext_sampled_mtp_restore_rewinds_cached_anchor_row() -> None:
+    """A sampled cache hit must overwrite the old anchor before proposing."""
+
+    backend = object.__new__(FlashNextBackend)
+    backend.num_slots = 1
+    backend._prefix_cache = [
+        FlashNextPrefixSnapshot(
+            token_ids=(1, 2, 3, 4),
+            kv_len=4,
+            gdn={},
+            ple_conv_state=None,
+            rope_next=None,
+            window=(),
+            anchor=5,
+            draft_tokens=(6, 7, 8),
+            anchor_logits=torch.tensor([0.1, 0.9]),
+            mtp_sync_len=4,
+            mtp_pos=6,
+            mtp_ready=True,
+            decode_mode="sampled",
+            mtp_teacher_hidden=torch.ones(1, 4),
+        )
+    ]
+    backend._targets = [
+        SimpleNamespace(
+            sess=SimpleNamespace(
+                gdn={},
+                ple_conv_state=None,
+                window=[],
+                pos=0,
+                rope_next=None,
+            )
+        )
+    ]
+    backend._specs = [
+        SimpleNamespace(
+            mtp_session=SimpleNamespace(sync_len=0, pos=0),
+            verify=SimpleNamespace(),
+        )
+    ]
+    backend.stats = {}
+
+    backend._restore_prefix_snapshot(0, [1, 2, 3, 4, 9], 4)
+
+    assert backend._specs[0].mtp_session.sync_len == 3
+    assert backend._specs[0].mtp_session.pos == 3
+
+
+def test_flashnext_backend_advertises_sampled_mtp() -> None:
+    assert FlashNextBackend.supports_sampled_speculative_decode is True
+
+
 def test_flashnext_shift_teacher_force_embeds_handles_overlap() -> None:
     backend = object.__new__(FlashNextBackend)
     backend.device = torch.device("cpu")

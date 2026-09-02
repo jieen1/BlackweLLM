@@ -183,7 +183,9 @@ def determine_accept_reject_batch(
 # this) and SGLang implements for its EAGLE path. This module is a plain
 # eager/CPU-tensor re-derivation of that same algorithm -- not a novel one --
 # scoped for E2-a (CPU-only correctness) and reusable by E2-b's GPU
-# integration once it lands.
+# integration. Flash-Next's sampled MTP path now supplies the draft
+# distributions from its graph-backed proposer; other backends may continue
+# to use this helper independently.
 #
 # ``determine_accept_reject*`` above only ever needs to prove "picks the
 # same token the greedy target model would have picked" -- an equality
@@ -295,10 +297,9 @@ def sample_accept_reject(
             have normalized to) at the position where it produced
             ``draft_tokens[p]``. MUST be the distribution actually sampled
             from -- passing ``argmax``-derived probabilities here would
-            silently change the acceptance math (this is precisely the gap
-            E2-b has to close: today's draft forward always samples
-            greedily, so it has no non-degenerate ``q`` to hand this
-            function yet).
+            silently change the acceptance math.  The proposer must retain
+            the non-degenerate ``q`` row it actually sampled from; an
+            argmax-derived one-hot row does not implement sampled MTP.
         target_probs: ``[K+1, vocab]``. Rows ``0..K-1`` are the target
             (main) model's distribution at each of the K verify positions,
             used for that position's acceptance test. Row ``K`` is the
@@ -318,12 +319,10 @@ def sample_accept_reject(
         Same contract as ``determine_accept_reject_from_predictions``:
         ``{"num_accepted": int, "committed": list[int], "rejected_at":
         int | None}``. ``committed`` is the accepted draft prefix plus
-        EXACTLY one trailing recovery-or-bonus token, so this is a drop-in
-        return-shape match for ``_verify_only_accept_reject`` in
-        ``runtime/backends/laguna_dflash.py`` once E2-b wires the two
-        together -- E2-a does not touch that file (it needs a live GPU
-        model to actually produce ``draft_probs``, see the module-level
-        docstring's "not yet available" callout above).
+        EXACTLY one trailing recovery-or-bonus token.  Flash-Next uses this
+        return shape directly in its MTP verify/commit loop; DFlash callers
+        can use the same helper when their proposer exposes matching ``q``
+        rows.
     """
     k = len(draft_tokens)
     if draft_probs.shape[0] != k:

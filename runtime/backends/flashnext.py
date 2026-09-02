@@ -209,6 +209,14 @@ class FlashNextPrefixSnapshot:
     mtp_sync_len: int = 0
     mtp_pos: int = 0
     mtp_ready: bool = False
+    # The mode is part of the checkpoint contract.  Greedy and sampled MTP
+    # share the recurrent prefix but not the proposal RNG/distribution state;
+    # never restore one mode's speculative tail for the other.
+    decode_mode: str | None = None
+    # One target hidden row is enough to re-teacher-force the first sampled
+    # anchor after a full prefix hit.  The fixed MTP pools themselves remain
+    # in the slot allocation and are rewound to ``mtp_sync_len`` on restore.
+    mtp_teacher_hidden: torch.Tensor | None = None
 
 
 class FlashNextBackend:
@@ -223,10 +231,10 @@ class FlashNextBackend:
         kv_reservation=False,
         prefix_cache_dedup=False,
     )
-    # Flash-Next's verify implementation is greedy today.  Sampled requests
-    # remain correct on the plain target path instead of pretending that
-    # rejection sampling is implemented.
-    supports_sampled_speculative_decode = False
+    # Sampled MTP uses eager stochastic proposal/acceptance around the same
+    # fixed-width target verify graph.  Greedy requests still use the captured
+    # proposal graphs; the capability bit only controls scheduler routing.
+    supports_sampled_speculative_decode = True
 
     def __init__(
         self,
@@ -453,12 +461,12 @@ class FlashNextBackend:
     ) -> tuple[str, ...]:
         """Add the decode contract to the admission-time cache key.
 
-        A target-only checkpoint produced by sampled decode is safe for a
-        sampled continuation, but it does not contain the MTP state required
-        by a greedy continuation.  The scheduler reconciles prefixes before
-        calling ``prefill_chunked_begin``; carrying this small mode marker in
-        the existing opaque key lets the backend enforce that boundary
-        without changing the shared coordinator ABI.
+        Greedy and sampled continuations retain different speculative tails
+        (sampled also carries a request-local RNG/distribution contract).  The
+        scheduler reconciles prefixes before calling
+        ``prefill_chunked_begin``; carrying this small mode marker in the
+        existing opaque key lets the backend enforce that boundary without
+        changing the shared coordinator ABI.
         """
         mode = "sampled" if sampled else "greedy"
         vision_parts = vision_cache_key or (_PREFIX_CACHE_TEXT_KEY,)
@@ -557,6 +565,7 @@ class FlashNextBackend:
                     value.zero_()
         # A previous round normally clears this itself.  Clearing explicitly
         # makes cancellation and a failed request safe too.
+        spec.pending_draft_probs = None
         spec.verify._last_tokens = None  # noqa: SLF001 - lifecycle reset
 
     def _reset_runtime(self, slot: int, *, preserve_prefix: bool = False) -> None:
@@ -611,6 +620,27 @@ class FlashNextBackend:
         cache_mode, vision_cache_key = self._split_prefix_cache_key(prefix_cache_key)
         if not self._vision_cache_matches(vision_cache_key, entry.vision_cache_key):
             return PrefixHit(kv_hit=0, state_hit=0)
+        if (
+            cache_mode in {"greedy", "sampled"}
+            and entry.decode_mode in {"greedy", "sampled"}
+            and cache_mode != entry.decode_mode
+        ):
+            # The target checkpoint is shared, but the retained MTP pools are
+            # mode-specific.  A mode switch must cold-prefill (or use a
+            # separately captured checkpoint), never consume another mode's
+            # stochastic proposal state.
+            return PrefixHit(kv_hit=0, state_hit=0)
+        if (
+            cache_mode == entry.decode_mode
+            and entry.mtp_ready
+            and entry.decode_mode in {"greedy", "sampled"}
+            and entry.mtp_teacher_hidden is None
+        ):
+            # New-mode checkpoints carry the one boundary hidden row needed
+            # to repair an extension/full sampled hit.  Treat an incomplete
+            # legacy checkpoint as a miss instead of restoring an MTP pointer
+            # that the next shifted sync cannot authenticate.
+            return PrefixHit(kv_hit=0, state_hit=0)
         specs = getattr(self, "_specs", ())
         if (
             slot < len(specs)
@@ -618,10 +648,10 @@ class FlashNextBackend:
             and not entry.mtp_ready
             and cache_mode != "sampled"
         ):
-            # A target-only checkpoint is valid for sampled decode, but a
-            # greedy request must never restore it: greedy admission needs the
-            # matching MTP causal prefix as well.  ``cache_mode=None`` keeps
-            # direct legacy callers conservative.
+            # A target-only legacy checkpoint is valid for sampled decode, but
+            # a greedy request must never restore it: greedy admission needs
+            # the matching MTP causal prefix as well.  ``cache_mode=None``
+            # keeps direct legacy callers conservative.
             return PrefixHit(kv_hit=0, state_hit=0)
         limit = min(len(token_ids), entry.kv_len)
         if tuple(token_ids[:limit]) != entry.token_ids[:limit]:
@@ -658,6 +688,8 @@ class FlashNextBackend:
         anchor_logits: torch.Tensor,
         mtp_ready: bool,
         vision_cache_key: tuple[str, ...] | None = None,
+        decode_mode: str | None = None,
+        mtp_teacher_hidden: torch.Tensor | None = None,
     ) -> None:
         """Save only state needed to resume the just-computed prompt.
 
@@ -701,6 +733,12 @@ class FlashNextBackend:
             mtp_sync_len=int(mtp_sess.sync_len) if mtp_sess is not None else 0,
             mtp_pos=int(mtp_sess.pos) if mtp_sess is not None else 0,
             mtp_ready=mtp_sess is not None,
+            decode_mode=decode_mode,
+            mtp_teacher_hidden=(
+                mtp_teacher_hidden.detach().clone()
+                if torch.is_tensor(mtp_teacher_hidden)
+                else None
+            ),
         )
         self._prefix_cache[slot] = entry
         self._prefix_cache_tokens[slot] = list(entry.token_ids)
@@ -740,8 +778,25 @@ class FlashNextBackend:
         if spec is not None:
             if entry.mtp_ready:
                 mtp_sess = spec.mtp_session
-                mtp_sess.sync_len = entry.mtp_sync_len
-                mtp_sess.pos = entry.mtp_pos
+                if entry.decode_mode in {"greedy", "sampled"} and len(prompt_ids) > hit:
+                    # The cached proposal consumed the old anchor at L-1.
+                    # An extended prompt replaces that row with the first
+                    # suffix token, so rewind one row for the shifted
+                    # teacher sync below.
+                    mtp_sess.sync_len = max(entry.mtp_sync_len - 1, 0)
+                    mtp_sess.pos = mtp_sess.sync_len
+                elif entry.decode_mode == "sampled":
+                    # The cached proposal already consumed the old anchor at
+                    # position L-1.  Rewind that one row so a new request can
+                    # overwrite it with its own sampled anchor before
+                    # proposing fresh drafts.  The target hidden row for
+                    # exactly this boundary is kept in the snapshot.
+                    mtp_sess.sync_len = max(entry.mtp_sync_len - 1, 0)
+                    mtp_sess.pos = mtp_sess.sync_len
+                else:
+                    mtp_sess.sync_len = entry.mtp_sync_len
+                    mtp_sess.pos = entry.mtp_pos
+                spec.pending_draft_probs = None
                 # Any previous verify candidate is invalid after a slot reset;
                 # the next proposal overwrites it before use.
                 spec.verify._last_tokens = None  # noqa: SLF001 - lifecycle reset
@@ -1192,6 +1247,16 @@ class FlashNextBackend:
         suffix_ids = prompt_ids[prefix_hit:]
         target = self._targets[slot]
         spec = self._specs[slot]
+        sampled = params is not None and not params.is_greedy
+        decode_mode = "sampled" if sampled else "greedy"
+        prefix_mtp_resync = (
+            spec is not None
+            and prefix_hit > 0
+            and prefix_entry is not None
+            and prefix_entry.mtp_ready
+            and prefix_entry.decode_mode == decode_mode
+            and prefix_entry.mtp_teacher_hidden is not None
+        )
 
         if prefix_hit == len(prompt_ids):
             if prefix_entry is None:
@@ -1203,11 +1268,32 @@ class FlashNextBackend:
                 else self._sample(logits, params or SamplingParams())
             )
             greedy = params is None or params.is_greedy
-            drafts = (
-                list(prefix_entry.draft_tokens)
-                if forced_token is None and greedy and prefix_entry.mtp_ready
-                else []
-            )
+            if (
+                sampled
+                and spec is not None
+                and prefix_entry.mtp_ready
+                and prefix_entry.decode_mode == "sampled"
+            ):
+                teacher_hidden = prefix_entry.mtp_teacher_hidden
+                if teacher_hidden is None:
+                    raise RuntimeError(
+                        "Flash-Next sampled prefix hit is missing the target teacher hidden row"
+                    )
+                # Reuse the retained real MTP prefix rows, but sample a fresh
+                # anchor-conditioned draft and q distribution for this
+                # request.  Replaying cached sampled token ids would couple
+                # independent requests to the old request's RNG stream.
+                drafts = spec.sync_and_propose(
+                    [anchor],
+                    teacher_hidden,
+                    params=params,
+                )
+            else:
+                drafts = (
+                    list(prefix_entry.draft_tokens)
+                    if forced_token is None and greedy and prefix_entry.mtp_ready
+                    else []
+                )
             self._slot_tokens[slot] = list(prompt_ids)
             self._last_logits[slot] = logits
             self.stats["prefill_requests"] += 1
@@ -1244,6 +1330,7 @@ class FlashNextBackend:
             multimodal_embeds = None
         final_hidden: torch.Tensor | None = None
         final_chunk_start = 0
+        mtp_teacher_hidden: torch.Tensor | None = None
         target_ns = 0
         mtp_sync_ns = 0
         mtp_draft_ns = 0
@@ -1263,7 +1350,7 @@ class FlashNextBackend:
             target_ns += self._prefill_timestamp_ns() - started
         else:
             logits = None
-            greedy_mtp = spec is not None and (params is None or params.is_greedy)
+            mtp_enabled = spec is not None
             # The full fused embedding matrix is only needed for one target
             # chunk at a time. Move it back to host memory for long image
             # prompts so a 256K multimodal request does not retain another
@@ -1287,17 +1374,30 @@ class FlashNextBackend:
                             prefill_kwargs["rope_next_position"] = rope_next_position
                     logits, hidden_rows = target.prefill(suffix_ids[start:end], **prefill_kwargs)
                 target_ns += self._prefill_timestamp_ns() - started
-                if greedy_mtp and not final:
+                if mtp_enabled and not final:
                     # The next real token is available for teacher forcing;
                     # discard the first draft/hidden immediately and retain
                     # only the MTP session's updated state.
                     started = self._prefill_timestamp_ns()
                     sync_kwargs = {}
+                    sync_tokens = suffix_ids[start + 1 : end + 1]
+                    sync_hidden = hidden_rows
+                    if prefix_mtp_resync and start == 0:
+                        # The cached proposal's final row represented the old
+                        # anchor.  Replace it with the first real suffix token
+                        # before syncing the remaining rows of this chunk.
+                        sync_tokens = suffix_ids[: end + 1]
+                        sync_hidden = torch.cat(
+                            [prefix_entry.mtp_teacher_hidden, hidden_rows], dim=0
+                        )
                     if suffix_embeds is not None:
-                        sync_kwargs["input_embeds"] = suffix_embeds[start + 1 : end + 1]
+                        if prefix_mtp_resync and start == 0:
+                            sync_kwargs["input_embeds"] = suffix_embeds[: end + 1]
+                        else:
+                            sync_kwargs["input_embeds"] = suffix_embeds[start + 1 : end + 1]
                     spec.sync_real_suffix(
-                        suffix_ids[start + 1 : end + 1],
-                        hidden_rows,
+                        sync_tokens,
+                        sync_hidden,
                         **sync_kwargs,
                     )
                     mtp_sync_ns += self._prefill_timestamp_ns() - started
@@ -1306,7 +1406,7 @@ class FlashNextBackend:
                     final_chunk_start = start
                 del hidden_rows
             assert logits is not None
-            if greedy_mtp and final_hidden is None:
+            if mtp_enabled and final_hidden is None:
                 raise RuntimeError("chunked Flash-Next prefill produced no final hidden rows")
         if forced_token is not None:
             anchor = int(forced_token)
@@ -1314,9 +1414,12 @@ class FlashNextBackend:
             anchor = self._sample(logits, params or SamplingParams())
 
         drafts: list[int] = []
-        # The verify driver is greedy.  Do not seed it for a sampled request
-        # that the scheduler will route through plain target decode.
-        if spec is not None and (params is None or params.is_greedy):
+        if spec is not None:
+            if final_hidden is not None:
+                # The target hidden row at the prompt boundary lets a full
+                # prefix hit re-teacher-force the first sampled anchor while
+                # retaining the MTP real-prefix pools in place.
+                mtp_teacher_hidden = final_hidden[-1:].detach().clone()
             if suffix_embeds is not None and suffix_embeds.device.type == "cuda":
                 # Target prefill is complete.  Keep only a host copy for the
                 # teacher-forced MTP sync so the full multimodal matrix does
@@ -1327,21 +1430,37 @@ class FlashNextBackend:
             if not chunked:
                 assert final_hidden is not None
                 started = self._prefill_timestamp_ns()
-                shifted = [*suffix_ids[1:], anchor]
+                if prefix_mtp_resync:
+                    shifted = [*suffix_ids, anchor]
+                    sync_hidden = torch.cat(
+                        [prefix_entry.mtp_teacher_hidden, final_hidden], dim=0
+                    )
+                else:
+                    shifted = [*suffix_ids[1:], anchor]
+                    sync_hidden = final_hidden
                 sync_kwargs = {}
                 if suffix_embeds is not None:
-                    sync_kwargs["input_embeds"] = self._shift_teacher_force_embeds(
-                        suffix_embeds,
-                        anchor,
-                    )
-                if prefix_hit:
+                    if prefix_mtp_resync:
+                        anchor_embed = self.model.embed_tokens(
+                            torch.tensor([int(anchor)], dtype=torch.long, device=self.device)
+                        )[0].to(device=suffix_embeds.device, dtype=suffix_embeds.dtype)
+                        sync_kwargs["input_embeds"] = torch.cat(
+                            [suffix_embeds, anchor_embed.unsqueeze(0)], dim=0
+                        )
+                    else:
+                        sync_kwargs["input_embeds"] = self._shift_teacher_force_embeds(
+                            suffix_embeds,
+                            anchor,
+                        )
+                if sampled:
                     drafts = spec.sync_and_propose(
                         shifted,
-                        final_hidden,
+                        sync_hidden,
+                        params=params,
                         **sync_kwargs,
                     )
                 else:
-                    drafts = spec.sync_and_propose(shifted, final_hidden, **sync_kwargs)
+                    drafts = spec.sync_and_propose(shifted, sync_hidden, **sync_kwargs)
                 mtp_sync_ns += self._prefill_timestamp_ns() - started
             else:
                 # NEXTN consumes the hidden row for each target position and
@@ -1349,23 +1468,47 @@ class FlashNextBackend:
                 # time so a 256K prompt never materialises a multi-GB hidden
                 # matrix or retains allocator blocks of that size.
                 assert final_hidden is not None
-                shifted = suffix_ids[final_chunk_start + 1 :] + [anchor]
+                if prefix_mtp_resync and final_chunk_start == 0:
+                    shifted = suffix_ids + [anchor]
+                    sync_hidden = torch.cat(
+                        [prefix_entry.mtp_teacher_hidden, final_hidden], dim=0
+                    )
+                else:
+                    shifted = suffix_ids[final_chunk_start + 1 :] + [anchor]
+                    sync_hidden = final_hidden
                 started = self._prefill_timestamp_ns()
                 sync_kwargs = {}
                 if suffix_embeds is not None:
-                    sync_kwargs["input_embeds"] = self._shift_teacher_force_embeds(
-                        suffix_embeds[final_chunk_start:],
-                        anchor,
+                    if prefix_mtp_resync and final_chunk_start == 0:
+                        anchor_embed = self.model.embed_tokens(
+                            torch.tensor([int(anchor)], dtype=torch.long, device=self.device)
+                        )[0].to(device=suffix_embeds.device, dtype=suffix_embeds.dtype)
+                        sync_kwargs["input_embeds"] = torch.cat(
+                            [suffix_embeds, anchor_embed.unsqueeze(0)], dim=0
+                        )
+                    else:
+                        sync_kwargs["input_embeds"] = self._shift_teacher_force_embeds(
+                            suffix_embeds[final_chunk_start:],
+                            anchor,
+                        )
+                if sampled:
+                    drafts = spec.sync_and_propose(
+                        shifted,
+                        sync_hidden,
+                        params=params,
+                        **sync_kwargs,
                     )
-                first, first_hidden = spec.sync_real_suffix(
-                    shifted,
-                    final_hidden,
-                    **sync_kwargs,
-                )
-                mtp_sync_ns += self._prefill_timestamp_ns() - started
-                started = self._prefill_timestamp_ns()
-                drafts = spec.continue_draft(first, first_hidden)
-                mtp_draft_ns += self._prefill_timestamp_ns() - started
+                    mtp_sync_ns += self._prefill_timestamp_ns() - started
+                else:
+                    first, first_hidden = spec.sync_real_suffix(
+                        shifted,
+                        sync_hidden,
+                        **sync_kwargs,
+                    )
+                    mtp_sync_ns += self._prefill_timestamp_ns() - started
+                    started = self._prefill_timestamp_ns()
+                    drafts = spec.continue_draft(first, first_hidden)
+                    mtp_draft_ns += self._prefill_timestamp_ns() - started
                 del final_hidden
         del multimodal_embeds
         started = self._prefill_timestamp_ns()
@@ -1373,11 +1516,7 @@ class FlashNextBackend:
         trim_ns = self._prefill_timestamp_ns() - started
         self._slot_tokens[slot] = list(prompt_ids)
         self._last_logits[slot] = logits
-        greedy_mtp = spec is not None and (params is None or params.is_greedy)
-        # Target-only checkpoints are useful for sampled decode too.  Their
-        # admission key carries ``sampled`` and the matcher refuses them for
-        # greedy/MTP requests, so publishing them here cannot cross the state
-        # family boundary.
+        mtp_ready = spec is not None
         if cacheable_vision:
             self._capture_prefix_snapshot(
                 slot,
@@ -1386,7 +1525,9 @@ class FlashNextBackend:
                 draft_tokens=drafts,
                 anchor_logits=logits,
                 vision_cache_key=vision_cache_key,
-                mtp_ready=spec is not None and greedy_mtp,
+                mtp_ready=mtp_ready,
+                decode_mode=decode_mode,
+                mtp_teacher_hidden=mtp_teacher_hidden,
             )
         self.stats["prefill_requests"] += 1
         self.stats["prefill_chunks"] += chunks
@@ -1505,14 +1646,16 @@ class FlashNextBackend:
         thinking_force_positions: dict[int, int] | None = None,
         thinking_force_token_ids: dict[int, int] | None = None,
     ) -> dict[int, dict]:
-        if thinking_force_positions or thinking_force_token_ids:
-            raise ValueError("Flash-Next MTP does not support thinking-token forcing")
         params_per_slot = params_per_slot or {}
+        thinking_force_positions = thinking_force_positions or {}
+        thinking_force_token_ids = thinking_force_token_ids or {}
+        if set(thinking_force_positions) != set(thinking_force_token_ids):
+            raise ValueError(
+                "Flash-Next MTP thinking forcing requires matching position/token maps"
+            )
         result: dict[int, dict] = {}
         for slot in slots:
             params = params_per_slot.get(slot)
-            if params is not None and not params.is_greedy:
-                raise ValueError("Flash-Next MTP verify is greedy-only")
             spec = self._specs[slot]
             if spec is None:
                 raise RuntimeError("Flash-Next MTP is disabled")
@@ -1521,6 +1664,9 @@ class FlashNextBackend:
                 drafts[slot],
                 use_graph=self._captured and not self._mtp_verify_eager,
                 return_verify_logits=return_logprobs,
+                params=params,
+                thinking_force_position=thinking_force_positions.get(slot),
+                thinking_force_token_id=thinking_force_token_ids.get(slot),
             )
             committed = [int(token) for token in decision["committed"]]
             self._slot_tokens[slot].extend(committed)

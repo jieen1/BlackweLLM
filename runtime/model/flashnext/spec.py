@@ -27,6 +27,13 @@ from runtime.model.flashnext.qsa import (
     quantize_qsa_kv,
 )
 from runtime.model.qwen36_model import GdnLayerState
+from runtime.mtp_accept import sample_accept_reject
+from runtime.sampling import (
+    SamplingParams,
+    compute_sampling_distribution,
+    make_generator,
+    sample_from_logits,
+)
 
 if TYPE_CHECKING:
     from runtime.model.flashnext.model import (
@@ -1311,6 +1318,235 @@ class FlashNextMtpContinuationGraph:
         return self._tokens
 
 
+class FlashNextMtpSampledTeacherGraph:
+    """Captured teacher-sync row block for sampled MTP.
+
+    The sampled path cannot use :class:`FlashNextMtpProposalGraph` directly:
+    that graph hard-wires argmax tokens into the continuation chain.  The
+    teacher block itself is independent of the random draw, however, so it
+    can stay captured and return the final draft logits/hidden state.  Keeping
+    this part on the graph removes the expensive eager launch/allocator path
+    for the common ``anchor + accepted drafts`` sync widths while preserving
+    the exact request sampling distribution outside the graph.
+    """
+
+    def __init__(
+        self,
+        model: FlashNextModel,
+        mtp: FlashNextMTP,
+        sess: FlashNextMtpSession,
+        *,
+        device: torch.device | str,
+        graph_capacity: int,
+        query_len: int,
+        sparse_qsa: bool = False,
+    ) -> None:
+        if query_len <= 0:
+            raise ValueError("sampled MTP teacher graph requires query_len > 0")
+        self.model = model
+        self.mtp = mtp
+        self.sess = sess
+        self.graph_capacity = graph_capacity
+        self.query_len = query_len
+        self.sparse_qsa = sparse_qsa
+        _validate_pool_range(
+            getattr(sess, "mtp_k_pool", None),
+            0,
+            query_len,
+            "sampled MTP teacher graph capacity",
+        )
+        cfg = model.cfg
+        self.tokens = torch.zeros(query_len, dtype=torch.long, device=device)
+        self.target_hidden = torch.zeros(
+            query_len,
+            cfg.hc_count * cfg.hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.teacher_embeds = torch.zeros(
+            query_len,
+            cfg.hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.position = torch.zeros(1, dtype=torch.long, device=device)
+        self.position_offsets = torch.arange(query_len, dtype=torch.long, device=device)
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self._hidden: torch.Tensor | None = None
+        self._logits: torch.Tensor | None = None
+
+    def _body(self) -> tuple[torch.Tensor, torch.Tensor]:
+        positions = self.position + self.position_offsets
+        mixed, own_hidden = self.mtp.forward(
+            self.teacher_embeds,
+            self.target_hidden,
+            positions,
+            self.sess,
+            capture_sparse_indices=True,
+            graph_sparse_capacity=self.graph_capacity if self.sparse_qsa else None,
+            graph_dense_capacity=None if self.sparse_qsa else self.graph_capacity,
+        )
+        return own_hidden[-1:], self.model.lm_head(mixed[-1:]).float()
+
+    def capture(self) -> None:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                self._body()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._hidden, self._logits = self._body()
+        self.graph = graph
+        self.sess.mtp_k_pool.zero_()
+        self.sess.mtp_v_pool.zero_()
+        self.sess.mtp_idx_k_pool.zero_()
+        self.sess.mtp_pooled_k_pool.zero_()
+
+    def replay(
+        self,
+        shifted_token_ids: Sequence[int],
+        target_hidden: torch.Tensor,
+        position: int,
+        *,
+        input_embeds: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.graph is None:
+            raise RuntimeError("capture must run before sampled MTP teacher replay")
+        if len(shifted_token_ids) != self.query_len:
+            raise ValueError(
+                f"sampled teacher graph requires {self.query_len} rows, "
+                f"got {len(shifted_token_ids)}"
+            )
+        if position + self.query_len > self.graph_capacity:
+            raise ValueError("sampled MTP teacher graph exceeds graph capacity")
+        _validate_pool_range(
+            getattr(self.sess, "mtp_k_pool", None),
+            position,
+            self.query_len,
+            "sampled MTP teacher graph",
+        )
+        self.tokens.copy_(
+            torch.as_tensor(shifted_token_ids, dtype=torch.long, device=self.tokens.device)
+        )
+        if input_embeds is None:
+            input_embeds = self.model.embed_tokens(self.tokens)
+        if tuple(input_embeds.shape) != tuple(self.teacher_embeds.shape):
+            raise ValueError(
+                "sampled MTP teacher input_embeds must have shape "
+                f"{tuple(self.teacher_embeds.shape)}, got {tuple(input_embeds.shape)}"
+            )
+        self.teacher_embeds.copy_(
+            input_embeds.to(
+                device=self.teacher_embeds.device,
+                dtype=self.teacher_embeds.dtype,
+            )
+        )
+        if target_hidden.ndim == 3:
+            target_hidden = target_hidden.squeeze(0)
+        self.target_hidden.copy_(target_hidden)
+        self.position.fill_(position)
+        self.graph.replay()
+        return self._hidden, self._logits
+
+
+class FlashNextMtpSampledStepGraph:
+    """Captured one-token MTP step with logits as an external sample seam.
+
+    Random sampling remains outside CUDA Graph replay, but the recurrent MTP
+    forward and shared LM head stay on a fixed graph.  The next sampled token
+    is copied into the graph input buffer without a host ``.item()`` round
+    trip, so a K=3 proposal performs three graph replays and one final token
+    transfer instead of synchronizing once per draft row.
+    """
+
+    def __init__(
+        self,
+        model: FlashNextModel,
+        mtp: FlashNextMTP,
+        sess: FlashNextMtpSession,
+        *,
+        device: torch.device | str,
+        graph_capacity: int,
+        sparse_qsa: bool = False,
+    ) -> None:
+        self.model = model
+        self.mtp = mtp
+        self.sess = sess
+        self.graph_capacity = graph_capacity
+        self.sparse_qsa = sparse_qsa
+        _validate_pool_range(
+            getattr(sess, "mtp_k_pool", None),
+            0,
+            1,
+            "sampled MTP step graph capacity",
+        )
+        cfg = model.cfg
+        self.token = torch.zeros(1, dtype=torch.long, device=device)
+        self.hidden = torch.zeros(
+            1,
+            cfg.hc_count * cfg.hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.position = torch.zeros(1, dtype=torch.long, device=device)
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self._hidden: torch.Tensor | None = None
+        self._logits: torch.Tensor | None = None
+
+    def _body(self) -> tuple[torch.Tensor, torch.Tensor]:
+        embeds = self.model.embed_tokens(self.token)
+        mixed, own_hidden = self.mtp.forward(
+            embeds,
+            self.hidden,
+            self.position,
+            sess=self.sess,
+            reuse_sparse_indices=self.sparse_qsa,
+            graph_sparse_capacity=self.graph_capacity if self.sparse_qsa else None,
+            graph_dense_capacity=None if self.sparse_qsa else self.graph_capacity,
+        )
+        return own_hidden, self.model.lm_head(mixed).float()
+
+    def capture(self) -> None:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                self._body()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            self._hidden, self._logits = self._body()
+        self.graph = graph
+        self.sess.mtp_k_pool.zero_()
+        self.sess.mtp_v_pool.zero_()
+        self.sess.mtp_idx_k_pool.zero_()
+        self.sess.mtp_pooled_k_pool.zero_()
+
+    def replay(
+        self,
+        token: torch.Tensor,
+        hidden: torch.Tensor,
+        position: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.graph is None:
+            raise RuntimeError("capture must run before sampled MTP step replay")
+        if position + 1 > self.graph_capacity:
+            raise ValueError("sampled MTP step graph exceeds graph capacity")
+        _validate_pool_range(
+            getattr(self.sess, "mtp_k_pool", None),
+            position,
+            1,
+            "sampled MTP step graph",
+        )
+        self.token.copy_(token.reshape_as(self.token))
+        self.hidden.copy_(hidden)
+        self.position.fill_(position)
+        self.graph.replay()
+        return self._hidden, self._logits
+
+
 class FlashNextMtpProposalGraph:
     """Teacher-sync plus K-token proposal in one graph for a fixed suffix width."""
 
@@ -1537,12 +1773,15 @@ def new_mtp_session(
 
 
 class FlashNextSpecEngine:
-    """Greedy K-token MTP driver over the fixed-row target verify engine.
+    """K-token MTP driver over the fixed-row target verify engine.
 
     The MTP cache tracks only the teacher-forced real prefix in ``sync_len``;
     continuation rows after it are speculative and are overwritten on every
-    round.  This mirrors the proven Qwen36 MTP invariant and avoids treating
-    an accidentally accepted draft cache row as real context.
+    round.  Greedy requests use the captured proposal/continuation graphs.
+    Sampled requests use the same temperature/top-k/top-p distributions as
+    ordinary decode and the exact rejection-sampling contract from
+    :mod:`runtime.mtp_accept`; random draws stay outside the graph while the
+    fixed teacher/step MTP kernels use sampled-specific CUDA Graph seams.
     """
 
     def __init__(
@@ -1593,6 +1832,10 @@ class FlashNextSpecEngine:
             device=device,
             fixed_index_rows=k + 1,
         )
+        # The non-greedy proposer must retain q for the exact draft sequence
+        # consumed by the next verify round.  This is one compact K x vocab
+        # tensor (K=3 in production), not a second KV/state family.
+        self.pending_draft_probs: torch.Tensor | None = None
         # A graph must keep its attention extent static.  Cover the complete
         # dense QSA budget so ordinary generations do not fall off the graph
         # cliff after position 512.  This is only the single MTP layer and its
@@ -1618,6 +1861,39 @@ class FlashNextSpecEngine:
                 device=device,
                 graph_capacity=graph_capacity,
                 continuation_steps=k - 1,
+                sparse_qsa=mtp_sparse_graph,
+            )
+            if mtp_continuation_graph and k > 1
+            else None
+        )
+        # Sampled proposals cannot use the argmax-unrolled graphs below, but
+        # their teacher-sync block and each stochastic one-token continuation
+        # are still graph-safe.  Capture those fixed-width seams alongside
+        # the greedy graphs so exact rejection sampling does not pay eager
+        # allocator/launch overhead on every draft row.
+        self.mtp_sampled_teacher_graphs = (
+            {
+                query_len: FlashNextMtpSampledTeacherGraph(
+                    model,
+                    mtp,
+                    self.mtp_session,
+                    device=device,
+                    graph_capacity=graph_capacity,
+                    query_len=query_len,
+                    sparse_qsa=mtp_sparse_graph,
+                )
+                for query_len in range(1, k + 2)
+            }
+            if mtp_continuation_graph and k > 1
+            else {}
+        )
+        self.mtp_sampled_step_graph = (
+            FlashNextMtpSampledStepGraph(
+                model,
+                mtp,
+                self.mtp_session,
+                device=device,
+                graph_capacity=graph_capacity,
                 sparse_qsa=mtp_sparse_graph,
             )
             if mtp_continuation_graph and k > 1
@@ -1653,6 +1929,10 @@ class FlashNextSpecEngine:
             self.mtp_continuation_graph.capture()
         for graph in self.mtp_proposal_graphs.values():
             graph.capture()
+        for graph in self.mtp_sampled_teacher_graphs.values():
+            graph.capture()
+        if self.mtp_sampled_step_graph is not None:
+            self.mtp_sampled_step_graph.capture()
 
     def _validate_mtp_range(self, start: int, length: int, label: str) -> None:
         """Guard eager and graph MTP writes against the fixed cache extent."""
@@ -1678,7 +1958,13 @@ class FlashNextSpecEngine:
         target_hc_hidden: torch.Tensor,
         *,
         input_embeds: torch.Tensor | None = None,
-    ) -> tuple[int, torch.Tensor]:
+        params: SamplingParams | None = None,
+        return_probs: bool = False,
+        return_token_tensor: bool = False,
+    ) -> (
+        tuple[int | torch.Tensor, torch.Tensor]
+        | tuple[int | torch.Tensor, torch.Tensor, torch.Tensor | None]
+    ):
         """Teacher-force real target rows and produce the first draft.
 
         ``shifted_token_ids[i]`` is the real token after the target position
@@ -1703,69 +1989,173 @@ class FlashNextSpecEngine:
         start = sess.sync_len
         self._validate_mtp_range(start, query_len, "MTP sync")
         sess.pos = start
-        tokens = torch.as_tensor(
-            shifted_token_ids,
-            dtype=torch.long,
-            device=self.device,
+        sampled = params is not None and not params.is_greedy
+        sampled_graph = (
+            getattr(self, "mtp_sampled_teacher_graphs", {}).get(query_len)
+            if sampled
+            else None
         )
-        if input_embeds is None:
-            embeds = self.model.embed_tokens(tokens)
+        if (
+            sampled_graph is not None
+            and sampled_graph.graph is not None
+            and start + query_len <= sampled_graph.graph_capacity
+        ):
+            own_hc, first_logits = sampled_graph.replay(
+                shifted_token_ids,
+                target_hc_hidden,
+                start,
+                input_embeds=input_embeds,
+            )
         else:
-            if tuple(input_embeds.shape) != (
-                query_len,
-                self.model.cfg.hidden_size,
-            ):
-                raise ValueError(
-                    "MTP sync input_embeds must have shape "
-                    f"({query_len}, {self.model.cfg.hidden_size}), "
-                    f"got {tuple(input_embeds.shape)}"
-                )
-            embeds = input_embeds.to(device=self.device, dtype=torch.bfloat16)
-        positions = torch.arange(
-            start,
-            start + query_len,
-            dtype=torch.long,
-            device=self.device,
-        )
-        mixed, own_hc = self.mtp.forward(
-            embeds,
-            target_hc_hidden,
-            positions,
-            sess,
-            capture_sparse_indices=True,
-        )
+            tokens = torch.as_tensor(
+                shifted_token_ids,
+                dtype=torch.long,
+                device=self.device,
+            )
+            if input_embeds is None:
+                embeds = self.model.embed_tokens(tokens)
+            else:
+                if tuple(input_embeds.shape) != (
+                    query_len,
+                    self.model.cfg.hidden_size,
+                ):
+                    raise ValueError(
+                        "MTP sync input_embeds must have shape "
+                        f"({query_len}, {self.model.cfg.hidden_size}), "
+                        f"got {tuple(input_embeds.shape)}"
+                    )
+                embeds = input_embeds.to(device=self.device, dtype=torch.bfloat16)
+            positions = torch.arange(
+                start,
+                start + query_len,
+                dtype=torch.long,
+                device=self.device,
+            )
+            mixed, own_hc = self.mtp.forward(
+                embeds,
+                target_hc_hidden,
+                positions,
+                sess,
+                capture_sparse_indices=True,
+            )
+            first_logits = self.model.lm_head(mixed[-1:])
         sess.sync_len = start + query_len
         sess.pos = sess.sync_len
-        first_draft = int(self.model.lm_head(mixed[-1:]).argmax(dim=-1).item())
+        if sampled:
+            first_probs = compute_sampling_distribution(first_logits, params)
+            first_token = sample_from_logits(
+                first_logits,
+                params,
+                generator=make_generator(params.seed, str(self.device)),
+            )
+            # Keep the sampled id on device while chaining the remaining MTP
+            # rows.  ``.item()`` here used to force a CUDA sync before every
+            # continuation, turning the exact sampled path into one host
+            # round-trip per draft token.  The public/default ABI still
+            # returns an int; the sampled driver opts into the tensor form.
+            first_draft = (
+                first_token.reshape(-1)
+                if return_token_tensor
+                else int(first_token.item())
+            )
+        else:
+            first_probs = None
+            first_draft = int(first_logits.argmax(dim=-1).item())
+        if return_probs:
+            return first_draft, own_hc[-1:], first_probs
         return first_draft, own_hc[-1:]
 
     @torch.no_grad()
-    def continue_draft(self, first_draft: int, first_hidden: torch.Tensor) -> list[int]:
-        drafts = [int(first_draft)]
+    def continue_draft(
+        self,
+        first_draft: int | torch.Tensor,
+        first_hidden: torch.Tensor,
+        *,
+        params: SamplingParams | None = None,
+        first_probs: torch.Tensor | None = None,
+        return_probs: bool = False,
+    ) -> list[int] | tuple[list[int], torch.Tensor | None]:
+        sampled = params is not None and not params.is_greedy
+        if sampled and first_probs is None:
+            raise RuntimeError("sampled MTP continuation is missing the first draft distribution")
+        if torch.is_tensor(first_draft):
+            if first_draft.numel() != 1:
+                raise ValueError(
+                    "sampled MTP continuation first draft must contain one token, "
+                    f"got shape={tuple(first_draft.shape)}"
+                )
+            first_token = first_draft.reshape(-1).to(device=self.device, dtype=torch.long)
+            first_id = None
+        else:
+            first_token = torch.tensor(
+                [int(first_draft)], dtype=torch.long, device=self.device
+            )
+            first_id = int(first_draft)
+        drafts = [first_id] if first_id is not None else []
+        draft_token_tensors = [first_token] if sampled else []
+        draft_probs: list[torch.Tensor] = []
+        if sampled:
+            assert first_probs is not None
+            draft_probs.append(first_probs.squeeze(0))
         hidden = first_hidden
         sess = self.mtp_session
         self._validate_mtp_range(sess.pos, max(self.k - 1, 0), "MTP continuation")
-        if self.mtp_continuation_graph is not None and (
+        sampled_step_graph = (
+            getattr(self, "mtp_sampled_step_graph", None) if sampled else None
+        )
+        if not sampled and self.mtp_continuation_graph is not None and (
             sess.pos + self.k - 1 <= self.mtp_continuation_graph.graph_capacity
         ):
-            continuation = self.mtp_continuation_graph.replay(first_draft, hidden, sess.pos)
+            continuation = self.mtp_continuation_graph.replay(
+                int(first_token.item()), hidden, sess.pos
+            )
             sess.pos += self.k - 1
-            return [*drafts, *(int(token) for token in continuation.tolist())]
+            result = [*drafts, *(int(token) for token in continuation.tolist())]
+            return (result, None) if return_probs else result
         for _ in range(1, self.k):
-            token = drafts[-1]
-            embeds = self.model.embed_tokens(
-                torch.tensor([token], dtype=torch.long, device=self.device)
+            token_tensor = draft_token_tensors[-1] if sampled else torch.tensor(
+                [drafts[-1]], dtype=torch.long, device=self.device
             )
-            positions = torch.tensor([sess.pos], dtype=torch.long, device=self.device)
-            mixed, hidden = self.mtp.forward(
-                embeds,
-                hidden,
-                positions,
-                sess,
-                reuse_sparse_indices=True,
-            )
+            if (
+                sampled_step_graph is not None
+                and sampled_step_graph.graph is not None
+                and sess.pos < sampled_step_graph.graph_capacity
+            ):
+                hidden, logits = sampled_step_graph.replay(
+                    token_tensor,
+                    hidden,
+                    sess.pos,
+                )
+            else:
+                embeds = self.model.embed_tokens(token_tensor)
+                positions = torch.tensor([sess.pos], dtype=torch.long, device=self.device)
+                mixed, hidden = self.mtp.forward(
+                    embeds,
+                    hidden,
+                    positions,
+                    sess,
+                    reuse_sparse_indices=True,
+                )
+                logits = self.model.lm_head(mixed)
             sess.pos += 1
-            drafts.append(int(self.model.lm_head(mixed).argmax(dim=-1).item()))
+            if sampled:
+                probs = compute_sampling_distribution(logits, params)
+                next_token = sample_from_logits(
+                    logits,
+                    params,
+                    generator=make_generator(params.seed, str(self.device)),
+                ).reshape(-1)
+                draft_token_tensors.append(next_token)
+                draft_probs.append(probs.squeeze(0))
+            else:
+                drafts.append(int(logits.argmax(dim=-1).item()))
+        if sampled:
+            # One and only one H2D synchronization for the complete proposal.
+            # All K MTP forwards and random draws above stay on the CUDA
+            # stream, so the host no longer serializes every continuation row.
+            drafts = [int(token) for token in torch.cat(draft_token_tensors).tolist()]
+        if return_probs:
+            return drafts, torch.stack(draft_probs) if sampled else None
         return drafts
 
     def sync_and_propose(
@@ -1774,8 +2164,34 @@ class FlashNextSpecEngine:
         target_hc_hidden: torch.Tensor,
         *,
         input_embeds: torch.Tensor | None = None,
+        params: SamplingParams | None = None,
     ) -> list[int]:
         sess = self.mtp_session
+        sampled = params is not None and not params.is_greedy
+        if sampled:
+            # Sampling is deliberately outside the proposal graphs: the
+            # graphs return argmax token ids and cannot carry a fresh RNG
+            # draw.  The MTP forward itself remains the same, so target/MTP
+            # state alignment and sparse-cache writes are unchanged.
+            first, hidden, first_probs = self.sync_real_suffix(
+                shifted_token_ids,
+                target_hc_hidden,
+                input_embeds=input_embeds,
+                params=params,
+                return_probs=True,
+                return_token_tensor=True,
+            )
+            drafts, draft_probs = self.continue_draft(
+                first,
+                hidden,
+                params=params,
+                first_probs=first_probs,
+                return_probs=True,
+            )
+            if draft_probs is None:
+                raise RuntimeError("sampled MTP proposer did not produce draft distributions")
+            self.pending_draft_probs = draft_probs.detach()
+            return drafts
         graph = self.mtp_proposal_graphs.get(len(shifted_token_ids))
         if (
             graph is not None
@@ -1802,13 +2218,16 @@ class FlashNextSpecEngine:
             )
             sess.sync_len += graph.query_len
             sess.pos = sess.sync_len + self.k - 1
+            self.pending_draft_probs = None
             return [int(token) for token in drafts.tolist()]
         first, hidden = self.sync_real_suffix(
             shifted_token_ids,
             target_hc_hidden,
             input_embeds=input_embeds,
         )
-        return self.continue_draft(first, hidden)
+        drafts = self.continue_draft(first, hidden)
+        self.pending_draft_probs = None
+        return drafts
 
     @torch.no_grad()
     def round(
@@ -1818,8 +2237,17 @@ class FlashNextSpecEngine:
         *,
         use_graph: bool = True,
         return_verify_logits: bool = False,
+        params: SamplingParams | None = None,
+        thinking_force_position: int | None = None,
+        thinking_force_token_id: int | None = None,
     ) -> dict[str, object]:
-        """Verify, commit, teacher-sync and re-draft one greedy round."""
+        """Verify, commit, teacher-sync and re-draft one MTP round.
+
+        Greedy rounds retain the captured argmax path.  Non-greedy rounds
+        reuse the same target verify forward, but compare the draft's stored
+        ``q`` distribution with the target ``p`` distribution through exact
+        rejection sampling before committing the accepted prefix.
+        """
         if len(drafts) != self.k:
             raise ValueError(f"round requires K={self.k} drafts, got {len(drafts)}")
         past_len = self.target_session.pos
@@ -1832,26 +2260,70 @@ class FlashNextSpecEngine:
         run = self.verify.replay if use_graph else self.verify.eager
         verify_started = time.perf_counter()
         hc_hidden, logits = run(verify_tokens, past_len=past_len)
-        predictions = logits.argmax(dim=-1)
-        prediction_ids = predictions.tolist()
-        accepted_drafts = 0
-        for index, draft in enumerate(drafts):
-            if int(prediction_ids[index]) != int(draft):
-                break
-            accepted_drafts += 1
+        if (thinking_force_position is None) != (thinking_force_token_id is None):
+            raise ValueError(
+                "Flash-Next thinking force requires both a position and a token id"
+            )
+        if thinking_force_position is not None:
+            if not 0 <= thinking_force_position < logits.shape[0]:
+                raise ValueError(
+                    "Flash-Next thinking force position is outside the verify block: "
+                    f"position={thinking_force_position}, rows={logits.shape[0]}"
+                )
+            if not 0 <= thinking_force_token_id < logits.shape[-1]:
+                raise ValueError(
+                    "Flash-Next thinking force token is outside the vocabulary: "
+                    f"token={thinking_force_token_id}, vocab={logits.shape[-1]}"
+                )
+            # Verify output can be a CUDA-Graph-owned tensor.  Clone only for
+            # the rare thinking-budget boundary instead of mutating captured
+            # output that the next replay must overwrite.
+            logits = logits.clone()
+            logits[thinking_force_position].fill_(-torch.inf)
+            logits[thinking_force_position, thinking_force_token_id] = 0.0
+        sampled = params is not None and not params.is_greedy
+        if sampled:
+            if self.pending_draft_probs is None:
+                raise RuntimeError("sampled MTP verify is missing pending draft distributions")
+            target_probs = compute_sampling_distribution(logits, params)
+            decision = sample_accept_reject(
+                [int(token) for token in drafts],
+                self.pending_draft_probs,
+                target_probs,
+                generator=make_generator(params.seed, str(self.device)),
+            )
+            accepted_drafts = int(decision["num_accepted"])
+            committed = [int(token) for token in decision["committed"]]
+            prediction_ids = logits.argmax(dim=-1).tolist()
+        else:
+            predictions = logits.argmax(dim=-1)
+            prediction_ids = predictions.tolist()
+            accepted_drafts = 0
+            for index, draft in enumerate(drafts):
+                if int(prediction_ids[index]) != int(draft):
+                    break
+                accepted_drafts += 1
+            bonus = int(prediction_ids[accepted_drafts])
+            committed = [*(int(token) for token in drafts[:accepted_drafts]), bonus]
         verify_seconds = time.perf_counter() - verify_started
-        bonus = int(prediction_ids[accepted_drafts])
-        committed = [*(int(token) for token in drafts[:accepted_drafts]), bonus]
+        bonus = int(committed[-1])
 
         consumed_count = accepted_drafts + 1  # anchor + accepted draft prefix
         self.verify.commit(consumed_count)
 
         shifted_real = [*(int(token) for token in drafts[:accepted_drafts]), bonus]
         mtp_started = time.perf_counter()
-        next_drafts = self.sync_and_propose(
-            shifted_real,
-            hc_hidden[:consumed_count],
-        )
+        if sampled:
+            next_drafts = self.sync_and_propose(
+                shifted_real,
+                hc_hidden[:consumed_count],
+                params=params,
+            )
+        else:
+            next_drafts = self.sync_and_propose(
+                shifted_real,
+                hc_hidden[:consumed_count],
+            )
         mtp_seconds = time.perf_counter() - mtp_started
         if os.environ.get("QSR_FLASHNEXT_DEBUG_ROUNDS", "0") == "1":
             logger.info(
