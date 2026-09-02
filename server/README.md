@@ -210,10 +210,11 @@ starting the server when tuning the quality/capacity trade-off:
 | `QSR_FLASHNEXT_VISION_ATTN` | `sdpa` | vision attention implementation; `eager` is the fallback |
 
 The request log reports source dimensions, resized dimensions, and visual token
-count. Image requests use the target prefill path and intentionally skip the
-text-only MTP draft/verify loop; text requests retain CUDA-Graph/MTP behavior.
-This keeps visual position/state handling exact while preventing an unused MTP
-working set from consuming memory on the single GPU.
+count. Visual requests carry an authenticated image fingerprint through slot
+admission and prefix snapshots, so an identical image prefix can be restored
+without re-prefilling it. Their teacher-forced visual rows also feed the same
+MTP proposal path (including CUDA Graph replay when captured); different images
+are always treated as cache misses.
 
 ### Qwen3.8 Q6_K_XL + DFlash2
 

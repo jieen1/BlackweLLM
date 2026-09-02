@@ -84,14 +84,25 @@ class _FakeCacheAwareRunner:
         return SimpleNamespace(kv_len=0, is_fresh=True)
 
     def find_best_slot_for_prompt(
-        self, token_ids: list[int], free_slots: list[int]
+        self,
+        token_ids: list[int],
+        free_slots: list[int],
+        *,
+        prefix_cache_key: object | None = None,
     ) -> tuple[int, int]:
+        del prefix_cache_key
         self.find_best_slot_calls.append((list(token_ids), list(free_slots)))
         chosen = self._best_slot_by_prompt[tuple(token_ids)]
         assert chosen in free_slots
         return (chosen, 64)  # hit depth here is discarded by engine.py (§1.1)
 
-    def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
+    def reconcile_prefix_hit(
+        self,
+        token_ids: list[int],
+        *,
+        prefix_cache_key: object | None = None,
+    ) -> PrefixHit:
+        del token_ids, prefix_cache_key
         return PrefixHit(kv_hit=0, state_hit=0)
 
     def prefill_chunked_begin(
@@ -142,7 +153,13 @@ class _FakeNoCacheRunner:
     def slot_state(self, slot: int):
         return SimpleNamespace(kv_len=0, is_fresh=True)
 
-    def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
+    def reconcile_prefix_hit(
+        self,
+        token_ids: list[int],
+        *,
+        prefix_cache_key: object | None = None,
+    ) -> PrefixHit:
+        del token_ids, prefix_cache_key
         return PrefixHit(kv_hit=0, state_hit=0)
 
     def prefill_chunked_begin(
@@ -291,10 +308,14 @@ class TestCapabilityGatedSlotAssignment:
                 self.keyed_reconcile_calls.append((list(token_ids), prefix_cache_key))
                 return PrefixHit(kv_hit=0, state_hit=0)
 
-            def find_best_slot_for_prompt(self, token_ids, free_slots):
+            def find_best_slot_for_prompt(
+                self, token_ids, free_slots, *, prefix_cache_key=None
+            ):
+                del token_ids, free_slots, prefix_cache_key
                 raise AssertionError("plain slot matcher must not run for keyed vision requests")
 
-            def reconcile_prefix_hit(self, token_ids):
+            def reconcile_prefix_hit(self, token_ids, *, prefix_cache_key=None):
+                del token_ids, prefix_cache_key
                 raise AssertionError(
                     "plain prefix reconciliation must not run for keyed vision requests"
                 )

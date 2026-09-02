@@ -109,7 +109,13 @@ class _FakeWarmRunner:
         return self.warm_continue_result
 
     # -- cold admission path (fallback lands here) --
-    def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
+    def reconcile_prefix_hit(
+        self,
+        token_ids: list[int],
+        *,
+        prefix_cache_key: object | None = None,
+    ) -> PrefixHit:
+        del token_ids, prefix_cache_key
         # PrefixHit(0, 0): a fake standing in for a real backend must return
         # the same shape a real ModelBackend does (runtime/backends/
         # protocol.py) -- engine.py now reads .effective off this value.

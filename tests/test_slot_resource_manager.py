@@ -93,14 +93,25 @@ class _FakeBackend:
         marker_value = sum(ord(c) for c in self.marker)
         return (sum(token_ids) + marker_value * 1000) % 512
 
-    def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
+    def reconcile_prefix_hit(
+        self,
+        token_ids: list[int],
+        *,
+        prefix_cache_key: object | None = None,
+    ) -> PrefixHit:
+        del prefix_cache_key
         self.reconcile_calls.append(list(token_ids))
         depth = (self._tag(token_ids) // 64) * 64
         return PrefixHit(kv_hit=depth, state_hit=depth)
 
     def find_best_slot_for_prompt(
-        self, token_ids: list[int], free_slots: list[int]
+        self,
+        token_ids: list[int],
+        free_slots: list[int],
+        *,
+        prefix_cache_key: object | None = None,
     ) -> tuple[int, int]:
+        del prefix_cache_key
         self.find_best_slot_calls.append((list(token_ids), list(free_slots)))
         chosen = free_slots[self._tag(token_ids) % len(free_slots)]
         return (chosen, 64)
@@ -190,7 +201,13 @@ class _FakeTwoFamilyBackend(_FakeBackend):
         kv, state = self._per_slot.get(slot, (0, 0))
         return PrefixHit(kv_hit=kv, state_hit=state)
 
-    def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
+    def reconcile_prefix_hit(
+        self,
+        token_ids: list[int],
+        *,
+        prefix_cache_key: object | None = None,
+    ) -> PrefixHit:
+        del prefix_cache_key
         self.reconcile_calls.append(list(token_ids))
         best = PrefixHit(kv_hit=0, state_hit=0)
         for slot in self._per_slot:
