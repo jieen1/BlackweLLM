@@ -158,13 +158,13 @@ def qsa_kv_cache_dtype() -> torch.dtype:
     """Return the storage dtype for Flash-Next QSA K/V caches.
 
     Q/K indexer caches remain BF16 because the compressed-key score path is
-    numerically sensitive.  Main-attention K/V can use row-scaled INT8 or FP8
-    E4M3 to make three independent 256K sessions fit on the 96-GiB card. INT8
-    is the quality-first capacity profile; FP8 remains available for direct
-    comparisons.  The default stays BF16 so existing small-run behavior does
-    not change implicitly.
+    numerically sensitive.  Main-attention K/V uses row-scaled FP8 E4M3 by
+    default so the validated Flash-Next service profile can keep multiple
+    256K sessions on a 96-GiB card.  INT8 remains available as an explicit
+    quality/capacity experiment, while BF16 remains available for an explicit
+    reference run.
     """
-    value = os.environ.get("QSR_FLASHNEXT_QSA_KV_DTYPE", "bf16").strip().lower()
+    value = os.environ.get("QSR_FLASHNEXT_QSA_KV_DTYPE", "fp8").strip().lower()
     if value in {"bf16", "bfloat16", ""}:
         return torch.bfloat16
     if value in {"int8", "i8"}:
@@ -211,6 +211,24 @@ def qsa_index_cache_rows(
 
 def _qsa_cache_is_quantized(dtype: torch.dtype) -> bool:
     return dtype in {torch.int8, getattr(torch, "float8_e4m3fn", None)}
+
+
+def qsa_cache_index_copy_(
+    destination: torch.Tensor,
+    index: torch.Tensor,
+    source: torch.Tensor,
+) -> torch.Tensor:
+    """Copy rows into a QSA cache, including CUDA FP8 caches.
+
+    PyTorch's CUDA ``index_copy_`` kernel does not implement Float8 E4M3,
+    while ``index_put_`` does.  Keep the fast, established path for BF16 and
+    INT8, and use the graph-capturable indexed put only for FP8 storage.
+    """
+    if destination.dtype == getattr(torch, "float8_e4m3fn", None):
+        destination.index_put_((index,), source)
+    else:
+        destination.index_copy_(0, index, source)
+    return destination
 
 
 def quantize_qsa_kv(

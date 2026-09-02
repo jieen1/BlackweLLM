@@ -44,6 +44,7 @@ from runtime.model.flashnext.qsa import (
     _qsa_cache_is_quantized,
     load_qsa_attention,
     load_qsa_indexer,
+    qsa_cache_index_copy_,
     qsa_index_cache_rows,
     qsa_kv_cache_dtype,
     quantize_qsa_kv,
@@ -1595,8 +1596,8 @@ def decode_body(model: FlashNextModel, sess: FlashNextSession) -> torch.Tensor:
                     )
                 quantize_qsa_kv(k, k_row, k_scale_row)
                 quantize_qsa_kv(v, v_row, v_scale_row)
-                k_pool.index_copy_(0, pos, k_row)
-                v_pool.index_copy_(0, pos, v_row)
+                qsa_cache_index_copy_(k_pool, pos, k_row)
+                qsa_cache_index_copy_(v_pool, pos, v_row)
                 k_scale_pool.index_copy_(0, pos, k_scale_row)
                 v_scale_pool.index_copy_(0, pos, v_scale_row)
             else:

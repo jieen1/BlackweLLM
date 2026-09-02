@@ -29,6 +29,7 @@ from runtime.model.flashnext.qsa import (
     QsaDecodeAttention,
     QSAIndexer,
     _qsa_cache_is_quantized,
+    qsa_cache_index_copy_,
     quantize_qsa_kv,
 )
 
@@ -657,9 +658,24 @@ class FlashNextMTP(nn.Module):
                     "quantized MTP QSA updates require graph-owned row scratch"
                 )
             if rows > k_rows.shape[0]:
-                raise ValueError(
-                    "MTP QSA row scratch is too small: "
-                    f"rows={rows}, capacity={k_rows.shape[0]}"
+                # The proposal graph only needs K+1 rows, but teacher-forced
+                # suffix sync can contain the entire prompt.  Grow an eager
+                # temporary for that path; replacing the graph-owned scratch
+                # during capture would invalidate captured addresses.
+                if torch.cuda.is_current_stream_capturing():
+                    raise ValueError(
+                        "MTP QSA row scratch is too small during graph capture: "
+                        f"rows={rows}, capacity={k_rows.shape[0]}"
+                    )
+                scratch_shape = (rows, *k.shape[1:])
+                k_rows = torch.empty(scratch_shape, dtype=k_rows.dtype, device=k.device)
+                v_rows = torch.empty(scratch_shape, dtype=v_rows.dtype, device=v.device)
+                scale_shape = (rows, *k_scale_rows.shape[1:])
+                k_scale_rows = torch.empty(
+                    scale_shape, dtype=k_scale_rows.dtype, device=k.device
+                )
+                v_scale_rows = torch.empty(
+                    scale_shape, dtype=v_scale_rows.dtype, device=v.device
                 )
             k_rows = k_rows[:rows]
             v_rows = v_rows[:rows]
@@ -667,8 +683,8 @@ class FlashNextMTP(nn.Module):
             v_scale_rows = v_scale_rows[:rows]
             quantize_qsa_kv(k, k_rows, k_scale_rows)
             quantize_qsa_kv(v, v_rows, v_scale_rows)
-            sess.mtp_k_pool.index_copy_(0, pos, k_rows)
-            sess.mtp_v_pool.index_copy_(0, pos, v_rows)
+            qsa_cache_index_copy_(sess.mtp_k_pool, pos, k_rows)
+            qsa_cache_index_copy_(sess.mtp_v_pool, pos, v_rows)
             if k_scales is not None:
                 k_scales.index_copy_(0, pos, k_scale_rows)
             if v_scales is not None:

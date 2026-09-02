@@ -1,6 +1,6 @@
 # Qwen3.8 Flash-Next 本地启动与 OpenCode 运维手册
 
-> 状态：当前本机可复现配置（2026-09-01）
+> 状态：当前本机可复现配置（2026-09-02）
 >
 > 适用模型：`Qwen3.8-Flash-Next-NVFP4-RadixArk`（`qwen4_exp`）
 >
@@ -19,17 +19,19 @@
 | checkpoint | `/home/bot/models/Qwen3.8-Flash-Next-NVFP4-RadixArk` |
 | backend | `flashnext` |
 | 监听 | `127.0.0.1:8300` |
-| 并发/物理 slot | `1 / 1`（单卡安全基线） |
+| 并发/物理 slot | `3 / 3`（FP8 QSA 冷启动 + 三路并发 smoke 已验证） |
 | KV block | `128 tokens × 2048 blocks/slot = 262144 tokens`（256K ceiling） |
 | KV 模式 | `legacy`（当前实测稳定配置） |
 | MTP | 开启，`K=3` |
 | CUDA Graph | 开启 |
 | persistent prefix cache | 开启 |
 | 视觉输入 | 开启（默认 1 MP 后处理面积上限） |
+| 三槽冷启动显存 | `explicit=89.51 GiB`，`torch_reserved=91.09 GiB`，driver free 约 `1.89 GiB` |
 
 256K 是每个 slot 的容量上限，不代表模型加载时立即为每个 token 分配显存。
-当前 `capacity=1` 是经过本机显存压力验证的安全服务配置；要提高并发或改变
-KV 模式，必须新进程重新加载并重新做 OOM/质量门禁，不能只改正在运行的进程。
+当前 `capacity=3` / `num_slots=3` 已经过本机 FP8 冷启动、CUDA Graph 捕获和三路
+并发请求门禁；启动后余量只有约 1.9 GiB。不要在不重新冷启动的情况下提高并发、
+上下文或 PLE 配额，也不要把这个余量当作第四个 slot 的保证。
 
 ## 启动
 
@@ -45,8 +47,8 @@ export QSR_SERVER_MODEL_PATH=/home/bot/models/Qwen3.8-Flash-Next-NVFP4-RadixArk
 export QSR_SERVER_BACKEND=flashnext
 export QSR_SERVED_MODEL_NAME="qwen3.8 qwen3.8-flash-next"
 export QSR_SERVER_PRODUCTION=1
-export QSR_SERVER_CAPACITY=1
-export QSR_SERVER_NUM_SLOTS=1
+export QSR_SERVER_CAPACITY=3
+export QSR_SERVER_NUM_SLOTS=3
 export QSR_SERVER_BLOCK_SIZE=128
 export QSR_SERVER_BLOCKS_PER_SLOT=2048
 export QSR_SERVER_ENABLE_CUDAGRAPH=1
@@ -54,6 +56,9 @@ export QSR_SERVER_ENABLE_PREFIX_CACHE=1
 export QSR_SERVER_ENABLE_MTP=1
 export QSR_SERVER_MTP_K=3
 export QSR_QWEN_KV_MODE=legacy
+# Flash-Next QSA main-attention K/V: row-scaled FP8 E4M3.  BF16 is only for
+# explicit reference A/B runs; QSR_QWEN_KV_MODE does not select this dtype.
+export QSR_FLASHNEXT_QSA_KV_DTYPE=fp8_e4m3
 export QSR_SERVER_GPU_MEM_UTIL=0.90
 export QSR_DISABLE_GC=1
 
@@ -74,7 +79,7 @@ export QSR_TRACE=1
 
 exec /home/bot/.venvs/torch-nightly/bin/python -m server.app \
   --host 127.0.0.1 --port 8300 \
-  --capacity 1 --num-slots 1 --blocks-per-slot 2048 \
+  --capacity 3 --num-slots 3 --blocks-per-slot 2048 \
   --qwen-kv-mode legacy --mtp --mtp-k 3
 ```
 

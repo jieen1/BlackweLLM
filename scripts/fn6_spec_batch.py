@@ -1377,7 +1377,9 @@ def main() -> None:
         },
     }
     for name, state in speculative_states.items():
-        bad = int((~torch.isfinite(state)).sum())
+        # CUDA does not provide ``isfinite`` for Float8 E4M3.  Check the
+        # dequantized view so the FP8 cache quality gate remains active.
+        bad = int((~torch.isfinite(state.float())).sum())
         if bad:
             raise RuntimeError(f"speculative state {name} produced {bad} non-finite values")
 
@@ -1411,8 +1413,8 @@ def main() -> None:
     state_max_abs = []
 
     def record_state(name: str, got: torch.Tensor, expected: torch.Tensor) -> None:
-        got_bad = int((~torch.isfinite(got)).sum())
-        expected_bad = int((~torch.isfinite(expected)).sum())
+        got_bad = int((~torch.isfinite(got.float())).sum())
+        expected_bad = int((~torch.isfinite(expected.float())).sum())
         if got_bad or expected_bad:
             raise RuntimeError(
                 f"state comparison {name} encountered non-finite values: "

@@ -21,6 +21,7 @@ import torch
 
 from runtime.model.flashnext.qsa import (
     _qsa_cache_is_quantized,
+    qsa_cache_index_copy_,
     qsa_index_cache_rows,
     qsa_kv_cache_dtype,
     quantize_qsa_kv,
@@ -86,7 +87,7 @@ class FlashNextVerifyBuffers:
     # Fixed-width scratch for quantized QSA candidate rows.  Advanced indexing
     # such as ``pool[positions]`` returns a copy, so passing it to
     # ``quantize_qsa_kv`` silently dropped verify writes.  These graph-owned
-    # rows let us quantize first and commit with ``index_copy_`` instead.
+    # rows let us quantize first and commit with the dtype-aware indexed copy.
     qsa_k_rows: dict[int, torch.Tensor]
     qsa_v_rows: dict[int, torch.Tensor]
     qsa_k_scale_rows: dict[int, torch.Tensor]
@@ -225,7 +226,7 @@ def _write_qsa_verify_rows(
     every candidate row.  Besides being incorrect for batched verify, that
     expression creates an avoidable gather/scatter sequence in CUDA Graph
     capture.  Quantized caches use graph-owned row scratch followed by one
-    ``index_copy_``; BF16 caches can copy the projected rows directly.
+    dtype-aware indexed copy; BF16 caches can copy the projected rows directly.
     """
     if _qsa_cache_is_quantized(pool.dtype):
         rows = getattr(buffers, f"qsa_{key}_rows", {}).get(layer_idx)
@@ -236,7 +237,7 @@ def _write_qsa_verify_rows(
                 f"layer={layer_idx}, key={key}"
             )
         quantize_qsa_kv(values, rows, scale_rows)
-        pool.index_copy_(0, positions, rows)
+        qsa_cache_index_copy_(pool, positions, rows)
         scale_pool.index_copy_(0, positions, scale_rows)
     else:
         pool.index_copy_(0, positions, values)
@@ -409,8 +410,12 @@ def verify_body(
                             )
                         quantize_qsa_kv(row_k, k_rows[row : row + 1], k_scale_rows[row : row + 1])
                         quantize_qsa_kv(row_v, v_rows[row : row + 1], v_scale_rows[row : row + 1])
-                        k_pool.index_copy_(0, row_pos, k_rows[row : row + 1])
-                        v_pool.index_copy_(0, row_pos, v_rows[row : row + 1])
+                        qsa_cache_index_copy_(
+                            k_pool, row_pos, k_rows[row : row + 1]
+                        )
+                        qsa_cache_index_copy_(
+                            v_pool, row_pos, v_rows[row : row + 1]
+                        )
                         k_scales.index_copy_(0, row_pos, k_scale_rows[row : row + 1])
                         v_scales.index_copy_(0, row_pos, v_scale_rows[row : row + 1])
                     else:
@@ -1078,7 +1083,7 @@ class FlashNextMtpSession:
     # is an advanced-indexing copy; passing that copy to ``quantize_qsa_kv``
     # silently drops the write and can leave a captured MTP graph reading
     # stale/invalid cache data.  Keep enough rows for the largest proposal
-    # batch (K+1) and commit them with ``index_copy_``.
+    # batch (K+1) and commit them with the dtype-aware indexed copy.
     mtp_k_rows: torch.Tensor | None = None
     mtp_v_rows: torch.Tensor | None = None
     mtp_k_scale_rows: torch.Tensor | None = None

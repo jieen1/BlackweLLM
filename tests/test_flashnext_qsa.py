@@ -14,6 +14,7 @@ from runtime.model.flashnext.qsa import (  # noqa: E402
     QSAIndexer,
     load_qsa_attention,
     load_qsa_indexer,
+    qsa_cache_index_copy_,
     qsa_index_cache_rows,
     qsa_kv_cache_dtype,
     quantize_qsa_kv,
@@ -45,6 +46,27 @@ def test_int8_qsa_cache_uses_row_scaled_symmetric_quantization(monkeypatch):
     assert torch.isfinite(reconstructed).all()
     assert float(relative_error) < 0.01
     assert int(destination.abs().max()) <= 127
+
+
+def test_qsa_cache_defaults_to_fp8_for_flashnext(monkeypatch):
+    monkeypatch.delenv("QSR_FLASHNEXT_QSA_KV_DTYPE", raising=False)
+    fp8 = getattr(torch, "float8_e4m3fn", None)
+    if fp8 is None:
+        pytest.skip("torch.float8_e4m3fn is unavailable")
+    assert qsa_kv_cache_dtype() == fp8
+
+
+def test_qsa_cache_index_copy_supports_fp8():
+    fp8 = getattr(torch, "float8_e4m3fn", None)
+    if fp8 is None:
+        pytest.skip("torch.float8_e4m3fn is unavailable")
+    destination = torch.zeros(5, 2, 4, dtype=fp8)
+    source = torch.arange(16, dtype=torch.float32).reshape(2, 2, 4).to(fp8)
+    positions = torch.tensor([1, 3], dtype=torch.long)
+
+    qsa_cache_index_copy_(destination, positions, source)
+
+    torch.testing.assert_close(destination[positions].float(), source.float())
 
 
 def test_project_qk_shapes_and_finite(indexer):
