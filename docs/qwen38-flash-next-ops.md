@@ -19,19 +19,20 @@
 | checkpoint | `/home/bot/models/Qwen3.8-Flash-Next-NVFP4-RadixArk` |
 | backend | `flashnext` |
 | 监听 | `127.0.0.1:8300` |
-| 并发/物理 slot | `3 / 3`（FP8 QSA 冷启动 + 三路并发 smoke 已验证） |
+| 并发/物理 slot | `2 / 2`（FP8 QSA 冷启动 + 两路并发 smoke 已验证） |
 | KV block | `128 tokens × 2048 blocks/slot = 262144 tokens`（256K ceiling） |
 | KV 模式 | `legacy`（当前实测稳定配置） |
 | MTP | 开启，`K=3` |
 | CUDA Graph | 开启 |
 | persistent prefix cache | 开启 |
 | 视觉输入 | 开启（默认 1 MP 后处理面积上限） |
-| 三槽冷启动显存 | `explicit=89.51 GiB`，`torch_reserved=91.09 GiB`，driver free 约 `1.89 GiB` |
+| 两槽冷启动显存 | `explicit=85.11 GiB`，`torch_reserved=86.24 GiB`，driver free 约 `6.82 GiB` |
 
 256K 是每个 slot 的容量上限，不代表模型加载时立即为每个 token 分配显存。
-当前 `capacity=3` / `num_slots=3` 已经过本机 FP8 冷启动、CUDA Graph 捕获和三路
-并发请求门禁；启动后余量只有约 1.9 GiB。不要在不重新冷启动的情况下提高并发、
-上下文或 PLE 配额，也不要把这个余量当作第四个 slot 的保证。
+当前 `capacity=2` / `num_slots=2` 已经过本机 FP8 冷启动、CUDA Graph 捕获和两路
+并发请求门禁；启动后余量约 6.8 GiB。此前三槽冷启动虽能通过，但余量只有约
+1.9 GiB，当前运行配置有意降为两槽。不要在不重新冷启动的情况下提高并发、
+上下文或 PLE 配额。
 
 ## 启动
 
@@ -47,8 +48,8 @@ export QSR_SERVER_MODEL_PATH=/home/bot/models/Qwen3.8-Flash-Next-NVFP4-RadixArk
 export QSR_SERVER_BACKEND=flashnext
 export QSR_SERVED_MODEL_NAME="qwen3.8 qwen3.8-flash-next"
 export QSR_SERVER_PRODUCTION=1
-export QSR_SERVER_CAPACITY=3
-export QSR_SERVER_NUM_SLOTS=3
+export QSR_SERVER_CAPACITY=2
+export QSR_SERVER_NUM_SLOTS=2
 export QSR_SERVER_BLOCK_SIZE=128
 export QSR_SERVER_BLOCKS_PER_SLOT=2048
 export QSR_SERVER_ENABLE_CUDAGRAPH=1
@@ -79,7 +80,7 @@ export QSR_TRACE=1
 
 exec /home/bot/.venvs/torch-nightly/bin/python -m server.app \
   --host 127.0.0.1 --port 8300 \
-  --capacity 3 --num-slots 3 --blocks-per-slot 2048 \
+  --capacity 2 --num-slots 2 --blocks-per-slot 2048 \
   --qwen-kv-mode legacy --mtp --mtp-k 3
 ```
 
