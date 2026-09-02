@@ -86,6 +86,47 @@ def _drain_channel_buf(channel: StreamChannel) -> list[int]:
     return out
 
 
+def test_stream_channel_does_not_lose_wakeup_between_clear_and_wait() -> None:
+    """A token queued during Event.clear() must wake the stream consumer.
+
+    The engine thread appends to the deque while the asyncio side clears its
+    event.  An inline callback loop makes that exact interleaving deterministic
+    without sleeping or depending on scheduler timing.  Before the post-clear
+    buffer check, this test hangs until the timeout even though a token is
+    already queued.
+    """
+
+    class _InlineLoop:
+        def call_soon_threadsafe(self, callback, *args):
+            callback(*args)
+
+    async def _run() -> None:
+        channel = StreamChannel()
+        loop = _InlineLoop()
+
+        class _RaceEvent:
+            def __init__(self) -> None:
+                self.inner = asyncio.Event()
+                self.injected = False
+
+            def clear(self) -> None:
+                if not self.injected:
+                    self.injected = True
+                    channel.put([7], loop)
+                self.inner.clear()
+
+            def set(self) -> None:
+                self.inner.set()
+
+            async def wait(self) -> None:
+                await self.inner.wait()
+
+        channel._event = _RaceEvent()
+        assert await asyncio.wait_for(channel.get(), timeout=0.1) == [7]
+
+    asyncio.run(_run())
+
+
 def _make_req(
     engine: ServerEngine,
     stop_sequences,

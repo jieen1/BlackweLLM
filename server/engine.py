@@ -335,6 +335,13 @@ class StreamChannel:
             if self._event is None:
                 self._event = asyncio.Event()
             self._event.clear()
+            # ``put`` runs on the engine thread and can land between the
+            # buffer check and ``clear`` above.  Re-check after clearing so
+            # that a set event cannot be lost while a token is already queued
+            # (the old ordering could leave an OpenCode SSE consumer waiting
+            # forever while the GPU kept decoding).
+            if self._buf:
+                continue
             await self._event.wait()
         return self._buf.popleft()
 
