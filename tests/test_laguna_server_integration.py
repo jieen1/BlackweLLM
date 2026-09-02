@@ -1069,7 +1069,11 @@ def test_anthropic_no_messages_and_prompt_too_long_use_shared_invalid_request(mo
     assert too_long.status_code == 400
     body2 = too_long.json()
     assert body2["type"] == "error"
-    assert "prompt too long" in body2["error"]["message"]
+    assert body2["error"]["type"] == "context_length_exceeded"
+    assert body2["error"]["code"] == "context_length_exceeded"
+    assert "prompt is too long" in body2["error"]["message"]
+    assert "context window" in body2["error"]["message"]
+    assert "available_prompt_tokens(0)" in body2["error"]["message"]
 
 
 def test_validate_capacity_error_metric_not_double_counted(monkeypatch):
@@ -1096,3 +1100,114 @@ def test_validate_capacity_error_metric_not_double_counted(monkeypatch):
         server_app._validate_capacity([1, 2, 3], 10_000_000)
 
     assert calls == []
+
+
+def test_validate_capacity_includes_speculative_headroom_in_error_detail(monkeypatch):
+    from fastapi import HTTPException
+
+    from server import app as server_app
+
+    class _FakeEngine:
+        capacity_tokens_per_slot = 262144
+        K = 3
+
+        def capacity_ok(self, prompt_tokens, max_tokens):
+            return prompt_tokens + max_tokens + self.K <= self.capacity_tokens_per_slot
+
+    monkeypatch.setattr(server_app, "engine", _FakeEngine())
+
+    with pytest.raises(HTTPException) as excinfo:
+        server_app._validate_capacity([0] * 230142, 32000)
+
+    error = excinfo.value.detail["error"]
+    assert error["type"] == "context_length_exceeded"
+    assert error["code"] == "context_length_exceeded"
+    assert "prompt is too long" in error["message"]
+    assert "speculative_tokens(3)" in error["message"]
+    assert "262145" in error["message"]
+    assert "context window" in error["message"]
+    assert "available_prompt_tokens(230141)" in error["message"]
+
+
+def test_models_report_input_budget_and_reserved_speculative_tokens(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from server import app as server_app
+
+    class _FakeEngine:
+        MODEL = "flashnext-test"
+        backend_name = "flashnext"
+        capacity_tokens_per_slot = 262144
+        K = 3
+
+        def advertised_input_capacity(self, max_output_tokens):
+            return self.capacity_tokens_per_slot - max_output_tokens - self.K
+
+    monkeypatch.setattr(server_app, "engine", _FakeEngine())
+    monkeypatch.delenv("QSR_SERVED_MODEL_NAME", raising=False)
+    monkeypatch.delenv("QSR_SERVED_MAX_OUTPUT_TOKENS", raising=False)
+    client = TestClient(server_app.app)
+
+    resp = client.get("/v1/models")
+
+    assert resp.status_code == 200
+    card = resp.json()["data"][0]
+    assert card["id"] == "qwen3.8-flash-next"
+    assert card["root"] == "qwen3.8-flash-next"
+    assert card["max_model_len"] == 262144
+    assert card["context_length"] == 262144
+    assert card["max_output_tokens"] == 32000
+    assert card["input_token_limit"] == 230141
+    assert card["speculative_reserved_tokens"] == 3
+
+
+def test_responses_truncation_auto_shrinks_output_budget_to_capacity(monkeypatch):
+    from server import app as server_app
+
+    class _FakeTok:
+        def decode(self, _ids, skip_special_tokens=True):
+            return "ok"
+
+    class _FakeEngine:
+        MODEL = "qwen-test"
+        capacity_tokens_per_slot = 100
+        K = 3
+        tok = _FakeTok()
+
+        def capacity_ok(self, prompt_tokens, max_tokens):
+            return prompt_tokens + max_tokens + self.K <= self.capacity_tokens_per_slot
+
+        async def submit(self, prompt_ids, max_tokens, **_kwargs):
+            assert len(prompt_ids) == 90
+            assert max_tokens == 7
+            return {
+                "committed_token_ids": [1],
+                "finish_reason": "stop",
+                "prompt_tokens": len(prompt_ids),
+                "completion_tokens": 1,
+                "prefix_cache_hit_tokens": 0,
+            }
+
+    class _FakeRequest:
+        async def json(self):
+            return {
+                "model": "qwen-test",
+                "input": "say it",
+                "max_output_tokens": 32,
+                "truncation": "auto",
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+
+    async def _tokenize_multimodal_chat(*_args, **_kwargs):
+        return [0] * 90, None
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(server_app, "engine", _FakeEngine())
+    monkeypatch.setattr(server_app, "_tokenize_multimodal_chat", _tokenize_multimodal_chat)
+    monkeypatch.setattr(server_app, "_debug_log_input", _noop)
+
+    response = asyncio.run(server_app.responses_api(_FakeRequest()))
+    assert response["max_output_tokens"] == 7
+    assert response["truncation"] == "auto"

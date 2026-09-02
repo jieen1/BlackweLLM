@@ -1349,6 +1349,17 @@ class FlashNextMtpProposalGraph:
             dtype=torch.bfloat16,
             device=device,
         )
+        # The target teacher rows may already contain vision features.  Keep
+        # them in a graph-owned input buffer so the proposal graph can replay
+        # the exact same MTP path instead of falling back to eager execution
+        # whenever a multimodal prompt is admitted.  Text requests populate
+        # this buffer from the ordinary token embedding lookup before replay.
+        self.teacher_embeds = torch.zeros(
+            query_len,
+            cfg.hidden_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
         self.position = torch.zeros(1, dtype=torch.long, device=device)
         self.position_offsets = torch.arange(query_len, dtype=torch.long, device=device)
         self.graph: torch.cuda.CUDAGraph | None = None
@@ -1356,7 +1367,7 @@ class FlashNextMtpProposalGraph:
 
     def _body(self) -> torch.Tensor:
         positions = self.position + self.position_offsets
-        embeds = self.model.embed_tokens(self.tokens)
+        embeds = self.teacher_embeds
         mixed, own_hidden = self.mtp.forward(
             embeds,
             self.target_hidden,
@@ -1406,6 +1417,8 @@ class FlashNextMtpProposalGraph:
         shifted_token_ids: Sequence[int],
         target_hidden: torch.Tensor,
         position: int,
+        *,
+        input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.graph is None:
             raise RuntimeError("capture must run before MTP proposal replay")
@@ -1422,11 +1435,23 @@ class FlashNextMtpProposalGraph:
             self.query_len + self.k - 1,
             "MTP graph proposal",
         )
-        self.tokens.copy_(
-            torch.as_tensor(
-                shifted_token_ids,
-                dtype=torch.long,
-                device=self.tokens.device,
+        token_tensor = torch.as_tensor(
+            shifted_token_ids,
+            dtype=torch.long,
+            device=self.tokens.device,
+        )
+        self.tokens.copy_(token_tensor)
+        if input_embeds is None:
+            input_embeds = self.model.embed_tokens(token_tensor)
+        if tuple(input_embeds.shape) != tuple(self.teacher_embeds.shape):
+            raise ValueError(
+                "MTP proposal input_embeds must have shape "
+                f"{tuple(self.teacher_embeds.shape)}, got {tuple(input_embeds.shape)}"
+            )
+        self.teacher_embeds.copy_(
+            input_embeds.to(
+                device=self.teacher_embeds.device,
+                dtype=self.teacher_embeds.dtype,
             )
         )
         self.target_hidden.copy_(target_hidden)
@@ -1651,6 +1676,8 @@ class FlashNextSpecEngine:
         self,
         shifted_token_ids: Sequence[int],
         target_hc_hidden: torch.Tensor,
+        *,
+        input_embeds: torch.Tensor | None = None,
     ) -> tuple[int, torch.Tensor]:
         """Teacher-force real target rows and produce the first draft.
 
@@ -1681,7 +1708,19 @@ class FlashNextSpecEngine:
             dtype=torch.long,
             device=self.device,
         )
-        embeds = self.model.embed_tokens(tokens)
+        if input_embeds is None:
+            embeds = self.model.embed_tokens(tokens)
+        else:
+            if tuple(input_embeds.shape) != (
+                query_len,
+                self.model.cfg.hidden_size,
+            ):
+                raise ValueError(
+                    "MTP sync input_embeds must have shape "
+                    f"({query_len}, {self.model.cfg.hidden_size}), "
+                    f"got {tuple(input_embeds.shape)}"
+                )
+            embeds = input_embeds.to(device=self.device, dtype=torch.bfloat16)
         positions = torch.arange(
             start,
             start + query_len,
@@ -1733,6 +1772,8 @@ class FlashNextSpecEngine:
         self,
         shifted_token_ids: Sequence[int],
         target_hc_hidden: torch.Tensor,
+        *,
+        input_embeds: torch.Tensor | None = None,
     ) -> list[int]:
         sess = self.mtp_session
         graph = self.mtp_proposal_graphs.get(len(shifted_token_ids))
@@ -1740,21 +1781,33 @@ class FlashNextSpecEngine:
             graph is not None
             and len(shifted_token_ids) == graph.query_len
             and sess.sync_len + graph.query_len + self.k - 1 <= graph.graph_capacity
+            and (
+                not hasattr(graph, "graph")
+                or graph.graph is not None
+            )
         ):
             self._validate_mtp_range(
                 sess.sync_len,
                 graph.query_len + max(self.k - 1, 0),
                 "MTP proposal",
             )
+            replay_kwargs = {}
+            if input_embeds is not None:
+                replay_kwargs["input_embeds"] = input_embeds
             drafts = graph.replay(
                 shifted_token_ids,
                 target_hc_hidden,
                 sess.sync_len,
+                **replay_kwargs,
             )
             sess.sync_len += graph.query_len
             sess.pos = sess.sync_len + self.k - 1
             return [int(token) for token in drafts.tolist()]
-        first, hidden = self.sync_real_suffix(shifted_token_ids, target_hc_hidden)
+        first, hidden = self.sync_real_suffix(
+            shifted_token_ids,
+            target_hc_hidden,
+            input_embeds=input_embeds,
+        )
         return self.continue_draft(first, hidden)
 
     @torch.no_grad()

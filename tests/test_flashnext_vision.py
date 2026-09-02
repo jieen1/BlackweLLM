@@ -14,6 +14,7 @@ pytest.importorskip("torch")
 
 from runtime.model.flashnext.vision import (
     PreparedVisionInput,
+    build_image_cache_keys,
     build_mrope_positions,
     expand_image_tokens,
     prepare_image_inputs,
@@ -217,6 +218,37 @@ def test_prepared_input_is_cpu_side_and_reports_token_budget() -> None:
         max_image_tokens=4_096,
     )
     assert prepared.total_image_tokens == 2
+
+
+def test_build_image_cache_keys_changes_only_for_the_touched_image() -> None:
+    import numpy as np
+
+    pixels = np.arange(12, dtype=np.float32).reshape(3, 4)
+    grids = np.asarray([[1, 1, 2], [1, 1, 1]], dtype=np.int64)
+    base = build_image_cache_keys(
+        pixels,
+        grids,
+        source_sizes=((64, 64), (32, 32)),
+        resized_sizes=((64, 64), (32, 32)),
+        max_pixels=65_536,
+        max_image_tokens=256,
+        spatial_merge_size=1,
+    )
+    changed = pixels.copy()
+    changed[0, 0] = -1
+    mutated = build_image_cache_keys(
+        changed,
+        grids,
+        source_sizes=((64, 64), (32, 32)),
+        resized_sizes=((64, 64), (32, 32)),
+        max_pixels=65_536,
+        max_image_tokens=256,
+        spatial_merge_size=1,
+    )
+
+    assert len(base) == 2
+    assert base[0] != mutated[0]
+    assert base[1] == mutated[1]
 
 
 def test_mrope_positions_match_qwen_vl_image_run_layout() -> None:

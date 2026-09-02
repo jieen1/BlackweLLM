@@ -64,7 +64,7 @@ plus the same claim re-checked at the wiring boundary in
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from runtime.backends.protocol import PrefixHit
 
@@ -116,7 +116,12 @@ class SlotResourceManager:
     def needs_two_cache_families(self) -> bool:
         return self._spec.needs_two_cache_families
 
-    def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
+    def reconcile_prefix_hit(
+        self,
+        token_ids: list[int],
+        *,
+        prefix_cache_key: Any | None = None,
+    ) -> PrefixHit:
         """INV-A3-2 (``state_hit <= kv_hit``) is enforced by
         :class:`PrefixHit` itself (``runtime/backends/protocol.py``'s
         ``__post_init__``) regardless of which branch below answers -- this
@@ -130,17 +135,39 @@ class SlotResourceManager:
         later. Flooring is always safe: a shorter reusable prefix is a
         performance loss, never a correctness one.
         """
-        hit = self._backend.reconcile_prefix_hit(token_ids)
+        if prefix_cache_key is not None and hasattr(self._backend, "reconcile_prefix_hit_with_key"):
+            hit = self._backend.reconcile_prefix_hit_with_key(token_ids, prefix_cache_key)
+        else:
+            hit = self._backend.reconcile_prefix_hit(token_ids)
         if not self._spec.needs_two_cache_families:
             return hit
         return self._aligned(hit)
 
     def find_best_slot_for_prompt(
-        self, token_ids: list[int], free_slots: list[int]
+        self,
+        token_ids: list[int],
+        free_slots: list[int],
+        *,
+        prefix_cache_key: Any | None = None,
     ) -> tuple[int, int]:
         if not self._spec.needs_two_cache_families:
+            if prefix_cache_key is not None and hasattr(
+                self._backend, "find_best_slot_for_prompt_with_key"
+            ):
+                return self._backend.find_best_slot_for_prompt_with_key(
+                    token_ids,
+                    free_slots,
+                    prefix_cache_key,
+                )
             return self._backend.find_best_slot_for_prompt(token_ids, free_slots)
-        per_slot = getattr(self._backend, "prefix_hit_for_slot", None)
+        use_keyed_per_slot = prefix_cache_key is not None and hasattr(
+            self._backend, "prefix_hit_for_slot_with_key"
+        )
+        per_slot = getattr(
+            self._backend,
+            "prefix_hit_for_slot_with_key" if use_keyed_per_slot else "prefix_hit_for_slot",
+            None,
+        )
         if per_slot is None:
             raise NotImplementedError(_MISSING_PER_SLOT.format(cls=type(self._backend).__name__))
         if not free_slots:
@@ -148,7 +175,10 @@ class SlotResourceManager:
         best_slot = free_slots[0]
         best = PrefixHit(kv_hit=0, state_hit=0)
         for slot in free_slots:
-            hit = self._aligned(per_slot(token_ids, slot))
+            if use_keyed_per_slot:
+                hit = self._aligned(per_slot(token_ids, slot, prefix_cache_key))
+            else:
+                hit = self._aligned(per_slot(token_ids, slot))
             # Ordered by effective depth first, KV depth only as a
             # tie-break: among slots that can be resumed equally deep, the
             # one holding more matching KV is the better bet for the *next*

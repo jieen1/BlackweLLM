@@ -47,6 +47,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_UNCACHEABLE_VISION_PREFIX_KEY = "<uncacheable-vision-prefix>"
+
 
 def _flashnext_gdn_projection_mode(model: FlashNextModel) -> str:
     """Return the target-verify GDN projection execution contract.
@@ -201,6 +203,7 @@ class FlashNextPrefixSnapshot:
     anchor: int
     draft_tokens: tuple[int, ...]
     anchor_logits: torch.Tensor
+    vision_cache_key: tuple[str, ...] | None = None
     mtp_sync_len: int = 0
     mtp_pos: int = 0
     mtp_ready: bool = False
@@ -268,7 +271,13 @@ class FlashNextBackend:
         # /debug/stats compatibility surface.
         self._prefix_cache_tokens: list[list[int] | None] = [None] * num_slots
         self._prefix_cache_kv_len: list[int] = [0] * num_slots
-        self._pending_prefix_hits: dict[int, int] = {}
+        # Admission reconciliation can inspect all fresh slots before the
+        # scheduler starts each assigned prefill.  Keep the request identity
+        # alongside the depth so a hit found for another request/slot can
+        # never be consumed blindly after multi-slot admission.
+        self._pending_prefix_hits: dict[
+            int, tuple[int, tuple[int, ...], tuple[str, ...] | None]
+        ] = {}
         self._captured = False
         # Diagnostic escape hatch for isolating verify CUDA-Graph state from
         # the eager correctness path.  It never changes the model or token
@@ -417,6 +426,55 @@ class FlashNextBackend:
     def _target_session(self, slot: int) -> FlashNextSession:
         return self._targets[slot].sess
 
+    def prefix_cache_key_for_vision_inputs(
+        self, vision_inputs: object | None
+    ) -> tuple[str, ...] | None:
+        if vision_inputs is None:
+            return None
+        raw = getattr(vision_inputs, "image_cache_keys", None)
+        if raw is None:
+            return (_UNCACHEABLE_VISION_PREFIX_KEY,)
+        try:
+            keys = tuple(str(item) for item in raw)
+        except TypeError:
+            return (_UNCACHEABLE_VISION_PREFIX_KEY,)
+        if not keys or any(not key for key in keys):
+            return (_UNCACHEABLE_VISION_PREFIX_KEY,)
+        return keys
+
+    @staticmethod
+    def _vision_cache_matches(
+        current: tuple[str, ...] | None,
+        cached: tuple[str, ...] | None,
+    ) -> bool:
+        if current is None:
+            return cached is None
+        if current == (_UNCACHEABLE_VISION_PREFIX_KEY,):
+            return False
+        if cached is None:
+            return False
+        if cached == (_UNCACHEABLE_VISION_PREFIX_KEY,):
+            return False
+        return len(current) >= len(cached) and current[: len(cached)] == cached
+
+    def _shift_teacher_force_embeds(
+        self,
+        input_embeds: torch.Tensor,
+        anchor: int,
+    ) -> torch.Tensor:
+        if input_embeds.ndim != 2 or input_embeds.shape[0] <= 0:
+            raise ValueError(
+                "Flash-Next teacher-force embeddings must be a [tokens, hidden] tensor, "
+                f"got {tuple(input_embeds.shape)}"
+            )
+        if input_embeds.shape[0] > 1:
+            input_embeds[:-1].copy_(input_embeds[1:].clone())
+        anchor_embed = self.model.embed_tokens(
+            torch.tensor([int(anchor)], dtype=torch.long, device=self.device)
+        )[0].to(device=input_embeds.device, dtype=input_embeds.dtype)
+        input_embeds[-1].copy_(anchor_embed)
+        return input_embeds
+
     def _reset_mtp_state(
         self,
         spec: FlashNextSpecEngine | None,
@@ -480,7 +538,13 @@ class FlashNextBackend:
         # rows can never leak into a different prompt.
         self._reset_runtime(slot, preserve_prefix=self.enable_prefix_cache)
 
-    def _prefix_hit_for_slot(self, token_ids: list[int], slot: int) -> PrefixHit:
+    def _prefix_hit_for_slot(
+        self,
+        token_ids: list[int],
+        slot: int,
+        *,
+        prefix_cache_key: tuple[str, ...] | None = None,
+    ) -> PrefixHit:
         """Return an exact safe checkpoint boundary for one idle slot.
 
         Flash-Next has both QSA and recurrent state.  A token match is useful
@@ -498,6 +562,8 @@ class FlashNextBackend:
             return PrefixHit(kv_hit=0, state_hit=0)
         entry = entries[slot]
         if entry is None or not entry.token_ids:
+            return PrefixHit(kv_hit=0, state_hit=0)
+        if not self._vision_cache_matches(prefix_cache_key, entry.vision_cache_key):
             return PrefixHit(kv_hit=0, state_hit=0)
         specs = getattr(self, "_specs", ())
         if slot < len(specs) and specs[slot] is not None and not entry.mtp_ready:
@@ -523,6 +589,14 @@ class FlashNextBackend:
         """Coordinator hook for the two-cache-family admission path."""
         return self._prefix_hit_for_slot(token_ids, slot)
 
+    def prefix_hit_for_slot_with_key(
+        self,
+        token_ids: list[int],
+        slot: int,
+        prefix_cache_key: tuple[str, ...] | None,
+    ) -> PrefixHit:
+        return self._prefix_hit_for_slot(token_ids, slot, prefix_cache_key=prefix_cache_key)
+
     def _capture_prefix_snapshot(
         self,
         slot: int,
@@ -532,6 +606,7 @@ class FlashNextBackend:
         draft_tokens: list[int],
         anchor_logits: torch.Tensor,
         mtp_ready: bool,
+        vision_cache_key: tuple[str, ...] | None = None,
     ) -> None:
         """Save only state needed to resume the just-computed prompt.
 
@@ -571,6 +646,7 @@ class FlashNextBackend:
             anchor=int(anchor),
             draft_tokens=tuple(int(token) for token in draft_tokens),
             anchor_logits=anchor_logits.detach().clone(),
+            vision_cache_key=vision_cache_key,
             mtp_sync_len=int(mtp_sess.sync_len) if mtp_sess is not None else 0,
             mtp_pos=int(mtp_sess.pos) if mtp_sess is not None else 0,
             mtp_ready=mtp_sess is not None,
@@ -622,7 +698,11 @@ class FlashNextBackend:
         self.stats["prefix_cache_restores"] = self.stats.get("prefix_cache_restores", 0) + 1
 
     def _prepare_prefill_prefix(
-        self, slot: int, prompt_ids: list[int]
+        self,
+        slot: int,
+        prompt_ids: list[int],
+        *,
+        prefix_cache_key: tuple[str, ...] | None = None,
     ) -> tuple[int, FlashNextPrefixSnapshot | None]:
         """Reset a slot cold or retain/restore its exact prompt prefix."""
         # Lightweight unit fixtures from before the cache fields existed
@@ -631,9 +711,18 @@ class FlashNextBackend:
         if not hasattr(self, "_prefix_cache"):
             self._reset_runtime(slot)
             return 0, None
-        hit = self._pending_prefix_hits.pop(slot, None)
+        pending = self._pending_prefix_hits.pop(slot, None)
+        hit: int | None = None
+        if pending is not None:
+            pending_hit, pending_tokens, pending_key = pending
+            if pending_tokens == tuple(prompt_ids) and pending_key == prefix_cache_key:
+                hit = int(pending_hit)
         if hit is None:
-            hit = self._prefix_hit_for_slot(prompt_ids, slot).effective
+            hit = self._prefix_hit_for_slot(
+                prompt_ids,
+                slot,
+                prefix_cache_key=prefix_cache_key,
+            ).effective
         if hit > 0:
             entry = self._prefix_cache[slot]
             self._reset_runtime(slot, preserve_prefix=True)
@@ -709,11 +798,16 @@ class FlashNextBackend:
             totals[target] += nbytes
 
         def add_tree(target: str, value: object) -> None:
-            # Object identity only breaks cycles in the current traversal.
-            # Keeping ids globally is incorrect: short-lived root tuples are
-            # freed between slots and CPython can immediately reuse their id,
-            # which made a real third 256K session disappear from the report.
-            visiting: set[int] = set()
+            # A global visited set is required for LINEAR cost: a path-local
+            # set (with the id removed on unwind) re-expands every shared DAG
+            # subtree once per parent path, which made one /debug/stats scrape
+            # block for 37 s on the live Flash-Next server.  Global ids are
+            # only safe if objects cannot be freed and their ids recycled
+            # mid-traversal (that reuse once made a real 256K session
+            # disappear from the report), so pin every visited object for the
+            # duration of this traversal.
+            visited: set[int] = set()
+            pinned: list[object] = []
 
             def visit(item: object) -> None:
                 if item is None:
@@ -722,24 +816,22 @@ class FlashNextBackend:
                     add_tensor(target, item)
                     return
                 obj_id = id(item)
-                if obj_id in visiting:
+                if obj_id in visited:
                     return
-                visiting.add(obj_id)
-                try:
-                    if isinstance(item, Mapping):
-                        for child in item.values():
-                            visit(child)
-                        return
-                    if isinstance(item, (list, tuple, set)):
-                        for child in item:
-                            visit(child)
-                        return
-                    if not hasattr(item, "__dict__"):
-                        return
-                    for child in vars(item).values():
+                visited.add(obj_id)
+                pinned.append(item)
+                if isinstance(item, Mapping):
+                    for child in item.values():
                         visit(child)
-                finally:
-                    visiting.remove(obj_id)
+                    return
+                if isinstance(item, (list, tuple, set)):
+                    for child in item:
+                        visit(child)
+                    return
+                if not hasattr(item, "__dict__"):
+                    return
+                for child in vars(item).values():
+                    visit(child)
 
             visit(value)
 
@@ -1020,7 +1112,9 @@ class FlashNextBackend:
             raise ValueError(
                 f"prompt length {len(prompt_ids)} exceeds max_seq_len={self.max_seq_len}"
             )
-        if vision_inputs is not None:
+        prefix_cache_key = self.prefix_cache_key_for_vision_inputs(vision_inputs)
+        cacheable_vision = prefix_cache_key != (_UNCACHEABLE_VISION_PREFIX_KEY,)
+        if vision_inputs is not None and not cacheable_vision:
             # Token ids alone do not authenticate image pixels.  Do not reuse
             # a text prefix for a multimodal request (or publish one for a
             # later request); a vision-aware cache key can be added separately
@@ -1030,7 +1124,11 @@ class FlashNextBackend:
             prefix_hit, prefix_entry = 0, None
             self._reset_runtime(slot, preserve_prefix=False)
         else:
-            prefix_hit, prefix_entry = self._prepare_prefill_prefix(slot, prompt_ids)
+            prefix_hit, prefix_entry = self._prepare_prefill_prefix(
+                slot,
+                prompt_ids,
+                prefix_cache_key=prefix_cache_key,
+            )
         suffix_ids = prompt_ids[prefix_hit:]
         target = self._targets[slot]
         spec = self._specs[slot]
@@ -1060,8 +1158,15 @@ class FlashNextBackend:
             return {"anchor": anchor, "draft_tokens": drafts}
 
         multimodal_embeds: torch.Tensor | None = None
-        if vision_inputs is not None:
+        has_multimodal = vision_inputs is not None
+        suffix_embeds: torch.Tensor | None = None
+        suffix_rope_positions: torch.Tensor | None = None
+        if has_multimodal:
             multimodal_embeds = self.model.encode_multimodal(prompt_ids, vision_inputs)
+            suffix_embeds = multimodal_embeds[prefix_hit:]
+            rope_positions = getattr(vision_inputs, "rope_positions", None)
+            if rope_positions is not None:
+                suffix_rope_positions = torch.as_tensor(rope_positions)[:, prefix_hit:]
         # Keep activation and NEXTN teacher-sync working sets bounded for
         # 256K prompts.  Each target chunk advances the same persistent
         # recurrent/QSA state as one full prefill, so no state is duplicated.
@@ -1069,6 +1174,14 @@ class FlashNextBackend:
         if effective_chunk < 0:
             raise ValueError(f"prefill chunk_size must be non-negative, got {chunk_size}")
         chunked = effective_chunk > 0 and effective_chunk < len(suffix_ids)
+        if suffix_embeds is not None and suffix_embeds.device.type == "cuda" and chunked:
+            # The target prefill consumes one chunk at a time.  Keep the
+            # multimodal rows on the host between chunks, but retain the
+            # explicit ``has_multimodal`` flag below: dropping the CUDA owner
+            # must not make the target silently fall back to token embeddings
+            # for image-marker rows.
+            suffix_embeds = suffix_embeds.to("cpu")
+            multimodal_embeds = None
         final_hidden: torch.Tensor | None = None
         final_chunk_start = 0
         target_ns = 0
@@ -1077,43 +1190,37 @@ class FlashNextBackend:
         chunks = 1
         if not chunked:
             started = self._prefill_timestamp_ns()
-            if multimodal_embeds is None:
+            if not has_multimodal:
                 logits, final_hidden = target.prefill(suffix_ids)
             else:
-                rope_positions = getattr(vision_inputs, "rope_positions", None)
-                prefill_kwargs = {"input_embeds": multimodal_embeds}
-                if rope_positions is not None:
-                    prefill_kwargs["rope_positions"] = rope_positions
+                prefill_kwargs = {"input_embeds": suffix_embeds}
+                if suffix_rope_positions is not None:
+                    prefill_kwargs["rope_positions"] = suffix_rope_positions
                 rope_next_position = getattr(vision_inputs, "next_rope_position", None)
                 if rope_next_position is not None:
                     prefill_kwargs["rope_next_position"] = rope_next_position
-                logits, final_hidden = target.prefill(prompt_ids, **prefill_kwargs)
+                logits, final_hidden = target.prefill(suffix_ids, **prefill_kwargs)
             target_ns += self._prefill_timestamp_ns() - started
         else:
             logits = None
-            greedy_mtp = (
-                vision_inputs is None and spec is not None and (params is None or params.is_greedy)
-            )
+            greedy_mtp = spec is not None and (params is None or params.is_greedy)
             # The full fused embedding matrix is only needed for one target
             # chunk at a time. Move it back to host memory for long image
             # prompts so a 256K multimodal request does not retain another
             # ~1.25 GiB BF16 allocation on the already-full card.
-            if multimodal_embeds is not None and multimodal_embeds.device.type == "cuda":
-                multimodal_embeds = multimodal_embeds.to("cpu")
+            if suffix_embeds is not None and suffix_embeds.device.type == "cuda":
+                suffix_embeds = suffix_embeds.to("cpu")
             chunks = (len(suffix_ids) + effective_chunk - 1) // effective_chunk
             for start in range(0, len(suffix_ids), effective_chunk):
                 end = min(start + effective_chunk, len(suffix_ids))
                 final = end == len(suffix_ids)
                 started = self._prefill_timestamp_ns()
-                if multimodal_embeds is None:
+                if not has_multimodal:
                     logits, hidden_rows = target.prefill(suffix_ids[start:end])
                 else:
-                    rope_positions = getattr(vision_inputs, "rope_positions", None)
-                    if rope_positions is not None:
-                        rope_positions = torch.as_tensor(rope_positions)[:, start:end]
-                    prefill_kwargs = {"input_embeds": multimodal_embeds[start:end]}
-                    if rope_positions is not None:
-                        prefill_kwargs["rope_positions"] = rope_positions
+                    prefill_kwargs = {"input_embeds": suffix_embeds[start:end]}
+                    if suffix_rope_positions is not None:
+                        prefill_kwargs["rope_positions"] = suffix_rope_positions[:, start:end]
                     if final:
                         rope_next_position = getattr(vision_inputs, "next_rope_position", None)
                         if rope_next_position is not None:
@@ -1125,7 +1232,14 @@ class FlashNextBackend:
                     # discard the first draft/hidden immediately and retain
                     # only the MTP session's updated state.
                     started = self._prefill_timestamp_ns()
-                    spec.sync_real_suffix(suffix_ids[start + 1 : end + 1], hidden_rows)
+                    sync_kwargs = {}
+                    if suffix_embeds is not None:
+                        sync_kwargs["input_embeds"] = suffix_embeds[start + 1 : end + 1]
+                    spec.sync_real_suffix(
+                        suffix_ids[start + 1 : end + 1],
+                        hidden_rows,
+                        **sync_kwargs,
+                    )
                     mtp_sync_ns += self._prefill_timestamp_ns() - started
                 elif final:
                     final_hidden = hidden_rows
@@ -1142,16 +1256,32 @@ class FlashNextBackend:
         drafts: list[int] = []
         # The verify driver is greedy.  Do not seed it for a sampled request
         # that the scheduler will route through plain target decode.
-        if vision_inputs is None and spec is not None and (params is None or params.is_greedy):
+        if spec is not None and (params is None or params.is_greedy):
+            if suffix_embeds is not None and suffix_embeds.device.type == "cuda":
+                # Target prefill is complete.  Keep only a host copy for the
+                # teacher-forced MTP sync so the full multimodal matrix does
+                # not remain resident on the GPU while MTP allocates its
+                # temporary rows.
+                suffix_embeds = suffix_embeds.to("cpu")
+                multimodal_embeds = None
             if not chunked:
                 assert final_hidden is not None
                 started = self._prefill_timestamp_ns()
                 shifted = [*suffix_ids[1:], anchor]
+                sync_kwargs = {}
+                if suffix_embeds is not None:
+                    sync_kwargs["input_embeds"] = self._shift_teacher_force_embeds(
+                        suffix_embeds,
+                        anchor,
+                    )
                 if prefix_hit:
-                    first, first_hidden = spec.sync_real_suffix(shifted, final_hidden)
-                    drafts = spec.continue_draft(first, first_hidden)
+                    drafts = spec.sync_and_propose(
+                        shifted,
+                        final_hidden,
+                        **sync_kwargs,
+                    )
                 else:
-                    drafts = spec.sync_and_propose(shifted, final_hidden)
+                    drafts = spec.sync_and_propose(shifted, final_hidden, **sync_kwargs)
                 mtp_sync_ns += self._prefill_timestamp_ns() - started
             else:
                 # NEXTN consumes the hidden row for each target position and
@@ -1161,7 +1291,17 @@ class FlashNextBackend:
                 assert final_hidden is not None
                 shifted = suffix_ids[final_chunk_start + 1 :] + [anchor]
                 started = self._prefill_timestamp_ns()
-                first, first_hidden = spec.sync_real_suffix(shifted, final_hidden)
+                sync_kwargs = {}
+                if suffix_embeds is not None:
+                    sync_kwargs["input_embeds"] = self._shift_teacher_force_embeds(
+                        suffix_embeds[final_chunk_start:],
+                        anchor,
+                    )
+                first, first_hidden = spec.sync_real_suffix(
+                    shifted,
+                    final_hidden,
+                    **sync_kwargs,
+                )
                 mtp_sync_ns += self._prefill_timestamp_ns() - started
                 started = self._prefill_timestamp_ns()
                 drafts = spec.continue_draft(first, first_hidden)
@@ -1173,16 +1313,15 @@ class FlashNextBackend:
         trim_ns = self._prefill_timestamp_ns() - started
         self._slot_tokens[slot] = list(prompt_ids)
         self._last_logits[slot] = logits
-        greedy_mtp = (
-            vision_inputs is None and spec is not None and (params is None or params.is_greedy)
-        )
-        if vision_inputs is None and (spec is None or greedy_mtp):
+        greedy_mtp = spec is not None and (params is None or params.is_greedy)
+        if cacheable_vision and (spec is None or greedy_mtp):
             self._capture_prefix_snapshot(
                 slot,
                 prompt_ids,
                 anchor=anchor,
                 draft_tokens=drafts,
                 anchor_logits=logits,
+                vision_cache_key=prefix_cache_key,
                 mtp_ready=spec is not None and greedy_mtp,
             )
         self.stats["prefill_requests"] += 1
@@ -1376,6 +1515,13 @@ class FlashNextBackend:
             return None
 
     def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
+        return self.reconcile_prefix_hit_with_key(token_ids, None)
+
+    def reconcile_prefix_hit_with_key(
+        self,
+        token_ids: list[int],
+        prefix_cache_key: tuple[str, ...] | None,
+    ) -> PrefixHit:
         """Match the deepest retained same-slot Flash-Next checkpoint."""
         if not self.enable_prefix_cache or not token_ids:
             return PrefixHit(kv_hit=0, state_hit=0)
@@ -1384,11 +1530,15 @@ class FlashNextBackend:
         for slot in range(self.num_slots):
             if not self.slot_state(slot).is_fresh:
                 continue
-            hit = self._prefix_hit_for_slot(token_ids, slot)
+            hit = self._prefix_hit_for_slot(token_ids, slot, prefix_cache_key=prefix_cache_key)
             if hit.effective > best.effective:
                 best_slot, best = slot, hit
         if best_slot >= 0 and best.effective > 0:
-            self._pending_prefix_hits[best_slot] = best.effective
+            self._pending_prefix_hits[best_slot] = (
+                best.effective,
+                tuple(token_ids),
+                prefix_cache_key,
+            )
             self.stats["prefix_cache_hit_tokens"] = (
                 self.stats.get("prefix_cache_hit_tokens", 0) + best.effective
             )
@@ -1401,6 +1551,14 @@ class FlashNextBackend:
         token_ids: list[int],
         free_slots: list[int],
     ) -> tuple[int, int]:
+        return self.find_best_slot_for_prompt_with_key(token_ids, free_slots, None)
+
+    def find_best_slot_for_prompt_with_key(
+        self,
+        token_ids: list[int],
+        free_slots: list[int],
+        prefix_cache_key: tuple[str, ...] | None,
+    ) -> tuple[int, int]:
         if not free_slots:
             raise ValueError("find_best_slot_for_prompt requires a free slot")
         if not self.enable_prefix_cache:
@@ -1408,7 +1566,7 @@ class FlashNextBackend:
         best_slot = free_slots[0]
         best = PrefixHit(kv_hit=0, state_hit=0)
         for slot in free_slots:
-            hit = self._prefix_hit_for_slot(token_ids, slot)
+            hit = self._prefix_hit_for_slot(token_ids, slot, prefix_cache_key=prefix_cache_key)
             if (hit.effective, hit.kv_hit) > (best.effective, best.kv_hit):
                 best_slot, best = slot, hit
         return best_slot, best.effective

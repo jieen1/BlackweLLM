@@ -132,9 +132,12 @@ shape (the model-level default is `medium`):
 
 ```json
 {
+  "compaction": {
+    "reserved": 32003
+  },
   "provider": {
     "blackwellm": {
-      "npm": "@ai-sdk/openai-compatible",
+      "npm": "@ai-sdk/openai",
       "options": { "baseURL": "http://127.0.0.1:8300/v1" },
       "models": {
         "qwen3.8-flash-next": {
@@ -149,6 +152,10 @@ shape (the model-level default is `medium`):
             "high": { "reasoningEffort": "xhigh" },
             "xhigh": { "reasoningEffort": "xhigh" },
             "max": { "reasoningEffort": "xhigh" }
+          },
+          "limit": {
+            "context": 262144,
+            "output": 32000
           }
         }
       }
@@ -199,7 +206,7 @@ starting the server when tuning the quality/capacity trade-off:
 | `QSR_FLASHNEXT_VISION` | `1` | load the BF16 vision tower (about 0.84 GiB) |
 | `QSR_FLASHNEXT_IMAGE_MAX_PIXELS` | `1048576` | post-decode area budget (1 MP; hard ceiling 16 MP) |
 | `QSR_FLASHNEXT_IMAGE_MIN_PIXELS` | `65536` | processor's minimum area budget |
-| `QSR_FLASHNEXT_IMAGE_MAX_TOKENS` | `4096` | total merged visual-token cap per request |
+| `QSR_FLASHNEXT_IMAGE_MAX_TOKENS` | `16384` | total merged visual-token cap per request |
 | `QSR_FLASHNEXT_VISION_ATTN` | `sdpa` | vision attention implementation; `eager` is the fallback |
 
 The request log reports source dimensions, resized dimensions, and visual token

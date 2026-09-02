@@ -95,13 +95,20 @@ class _FakeCacheAwareRunner:
         return PrefixHit(kv_hit=0, state_hit=0)
 
     def prefill_chunked_begin(
-        self, slots, prompts_per_slot, chunk_size: int = 512, *, params_per_slot=None
+        self,
+        slots,
+        prompts_per_slot,
+        chunk_size: int = 512,
+        *,
+        params_per_slot=None,
+        vision_inputs_per_slot=None,
     ):
         # `params_per_slot` (E2-b) is accepted and ignored: this fake exercises
         # slot *assignment*, not sampling. Omitting it made every admission raise
         # TypeError inside ServerEngine's admission try/except, which fails the
         # futures and leaves the engine with nothing to do -- so `_step_sync`
         # reached its idle blocking read and the test hung instead of failing.
+        del vision_inputs_per_slot
         result = {s: {"anchor": 900 + s, "draft_tokens": []} for s in slots}
         return SimpleNamespace(done=True, result=result)
 
@@ -139,13 +146,20 @@ class _FakeNoCacheRunner:
         return PrefixHit(kv_hit=0, state_hit=0)
 
     def prefill_chunked_begin(
-        self, slots, prompts_per_slot, chunk_size: int = 512, *, params_per_slot=None
+        self,
+        slots,
+        prompts_per_slot,
+        chunk_size: int = 512,
+        *,
+        params_per_slot=None,
+        vision_inputs_per_slot=None,
     ):
         # `params_per_slot` (E2-b) is accepted and ignored: this fake exercises
         # slot *assignment*, not sampling. Omitting it made every admission raise
         # TypeError inside ServerEngine's admission try/except, which fails the
         # futures and leaves the engine with nothing to do -- so `_step_sync`
         # reached its idle blocking read and the test hung instead of failing.
+        del vision_inputs_per_slot
         result = {s: {"anchor": 700 + s, "draft_tokens": []} for s in slots}
         return SimpleNamespace(done=True, result=result)
 
@@ -212,6 +226,18 @@ def _req(engine: ServerEngine, prompt_ids: list[int], request_id: str) -> Genera
     )
 
 
+def _vision_req(
+    engine: ServerEngine,
+    prompt_ids: list[int],
+    request_id: str,
+    *,
+    vision_inputs: object,
+) -> GenerationRequest:
+    req = _req(engine, prompt_ids, request_id)
+    req.vision_inputs = vision_inputs
+    return req
+
+
 class TestCapabilityGatedSlotAssignment:
     def test_capability_true_uses_find_best_slot_for_prompt_and_honors_choice(self) -> None:
         # Two prompts, two free slots (0, 1); the fake deliberately picks the
@@ -246,6 +272,48 @@ class TestCapabilityGatedSlotAssignment:
         # hasattr(runner, "find_best_slot_for_prompt") == False did before.
         assert engine.active[0]["anchor"] == 700
         assert 1 in engine.free_slots
+
+    def test_vision_requests_forward_prefix_cache_keys_through_coordinator(self) -> None:
+        class _FakeVisionCacheRunner(_FakeCacheAwareRunner):
+            def __init__(self):
+                super().__init__({})
+                self.keyed_find_calls: list[tuple[list[int], list[int], object]] = []
+                self.keyed_reconcile_calls: list[tuple[list[int], object]] = []
+
+            def prefix_cache_key_for_vision_inputs(self, vision_inputs):
+                return tuple(vision_inputs.image_cache_keys)
+
+            def find_best_slot_for_prompt_with_key(self, token_ids, free_slots, prefix_cache_key):
+                self.keyed_find_calls.append((list(token_ids), list(free_slots), prefix_cache_key))
+                return free_slots[0], 64
+
+            def reconcile_prefix_hit_with_key(self, token_ids, prefix_cache_key):
+                self.keyed_reconcile_calls.append((list(token_ids), prefix_cache_key))
+                return PrefixHit(kv_hit=0, state_hit=0)
+
+            def find_best_slot_for_prompt(self, token_ids, free_slots):
+                raise AssertionError("plain slot matcher must not run for keyed vision requests")
+
+            def reconcile_prefix_hit(self, token_ids):
+                raise AssertionError(
+                    "plain prefix reconciliation must not run for keyed vision requests"
+                )
+
+        runner = _FakeVisionCacheRunner()
+        engine = _bare_admission_engine(runner, capacity=1)
+        engine.waiting = [
+            _vision_req(
+                engine,
+                [1, 2, 3],
+                "req-vision",
+                vision_inputs=SimpleNamespace(image_cache_keys=("img-a",)),
+            )
+        ]
+
+        engine._step_sync()
+
+        assert runner.keyed_find_calls == [([1, 2, 3], [0], ("img-a",))]
+        assert runner.keyed_reconcile_calls == [([1, 2, 3], ("img-a",))]
 
 
 class TestInBatchPrefixDedup:

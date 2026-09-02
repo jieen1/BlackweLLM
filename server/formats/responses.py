@@ -170,6 +170,7 @@ def snapshot(
     max_output_tokens: int | None = None,
     incomplete_details: dict | None = None,
     error: dict | None = None,
+    truncation: str = "disabled",
 ) -> dict:
     """Build the full Responses object carried by lifecycle events.
 
@@ -197,7 +198,7 @@ def snapshot(
         "tool_choice": "auto",
         "tools": [],
         "top_p": None,
-        "truncation": "disabled",
+        "truncation": truncation,
         "usage": usage,
         "metadata": {},
         "user": None,
@@ -254,6 +255,7 @@ def build_response(
     reasoning_content: str | None = None,
     prefix_cache_hit_tokens: int = 0,
     max_output_tokens: int | None = None,
+    truncation: str = "disabled",
 ) -> dict:
     """Build a non-streaming Responses response.
 
@@ -283,6 +285,7 @@ def build_response(
         build_usage(prompt_tokens, completion_tokens, prefix_cache_hit_tokens),
         max_output_tokens=max_output_tokens,
         incomplete_details=incomplete_details,
+        truncation=truncation,
     )
     if committed_token_ids is not None:
         resp["debug_committed_token_ids"] = committed_token_ids

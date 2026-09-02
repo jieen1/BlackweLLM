@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import binascii
 import functools
+import hashlib
 import io
 import math
 import os
@@ -31,7 +32,12 @@ _IMAGE_BLOCK_TYPES = frozenset({"image", "image_url", "input_image"})
 _VIDEO_BLOCK_TYPES = frozenset({"video", "video_url", "input_video"})
 _DEFAULT_MAX_PIXELS = 1_048_576  # 1 MP: enough detail without 16 MP bursts
 _DEFAULT_MIN_PIXELS = 65_536
-_DEFAULT_MAX_IMAGE_TOKENS = 4_096
+# 16384 covers realistic agent screenshot traffic (measured 2026-09-01: an
+# OpenCode turn with several ~1 MP screenshots produced 4350 visual tokens and
+# was rejected by the earlier 4096 default).  The per-image 1 MP pixel budget
+# still bounds each image; this total only caps the vision-tower burst, and
+# the prompt-capacity check keeps the whole request inside the 256K slot.
+_DEFAULT_MAX_IMAGE_TOKENS = 16_384
 _DEFAULT_FETCH_MAX_BYTES = 16 * 1024 * 1024
 _DEFAULT_MAX_DECODE_PIXELS = 100 * 1_000 * 1_000
 _DEFAULT_MAX_DIMENSION = 16_384
@@ -55,6 +61,7 @@ class PreparedVisionInput:
     resized_sizes: tuple[tuple[int, int], ...]
     max_pixels: int
     max_image_tokens: int
+    image_cache_keys: tuple[str, ...] = ()
     # Filled by the server after the chat template has expanded image markers.
     # Qwen4-Exp uses interleaved 3-axis MRoPE for multimodal prompts; keeping
     # these positions with the CPU-side image batch avoids recomputing them
@@ -415,6 +422,15 @@ def prepare_image_inputs(
             f"limit of {max_image_tokens}; lower image resolution or raise "
             "QSR_FLASHNEXT_IMAGE_MAX_TOKENS deliberately"
         )
+    image_cache_keys = build_image_cache_keys(
+        pixel_values,
+        image_grid_thw,
+        source_sizes=tuple(source_sizes),
+        resized_sizes=tuple(resized_sizes),
+        max_pixels=max_pixels,
+        max_image_tokens=max_image_tokens,
+        spatial_merge_size=merge_size,
+    )
     return PreparedVisionInput(
         pixel_values=pixel_values,
         image_grid_thw=image_grid_thw,
@@ -423,8 +439,78 @@ def prepare_image_inputs(
         resized_sizes=tuple(resized_sizes),
         max_pixels=max_pixels,
         max_image_tokens=max_image_tokens,
+        image_cache_keys=image_cache_keys,
         spatial_merge_size=merge_size,
     )
+
+
+def build_image_cache_keys(
+    pixel_values: Any,
+    image_grid_thw: Any,
+    *,
+    source_sizes: tuple[tuple[int, int], ...],
+    resized_sizes: tuple[tuple[int, int], ...],
+    max_pixels: int,
+    max_image_tokens: int,
+    spatial_merge_size: int,
+) -> tuple[str, ...]:
+    """Return one deterministic cache-authentication key per image.
+
+    Prefix-cache reuse must authenticate the actual processed vision payload,
+    not just the placeholder token ids in the text prompt. The key is built
+    from the exact patch rows the vision tower will consume plus the geometry
+    metadata that maps those rows back to image boundaries.
+    """
+
+    import numpy as np
+
+    grids = np.asarray(image_grid_thw, dtype=np.int64)
+    pixels = np.ascontiguousarray(np.asarray(pixel_values))
+    if grids.ndim != 2 or grids.shape[1] != 3:
+        raise ValueError(
+            "image_grid_thw must be a [num_images,3] array to build cache keys, "
+            f"got shape {tuple(grids.shape)}"
+        )
+    if len(source_sizes) != grids.shape[0] or len(resized_sizes) != grids.shape[0]:
+        raise ValueError(
+            "source_sizes and resized_sizes must match image_grid_thw rows: "
+            f"{len(source_sizes)=}, {len(resized_sizes)=}, {grids.shape[0]=}"
+        )
+
+    def digest_array(value: Any) -> bytes:
+        array = np.ascontiguousarray(np.asarray(value))
+        digest = hashlib.sha256()
+        digest.update(str(array.dtype).encode("utf-8"))
+        digest.update(str(tuple(array.shape)).encode("utf-8"))
+        digest.update(memoryview(array).cast("B"))
+        return digest.digest()
+
+    offset = 0
+    keys: list[str] = []
+    for index, grid in enumerate(grids):
+        patch_rows = int(grid[0] * grid[1] * grid[2])
+        next_offset = offset + patch_rows
+        if next_offset > pixels.shape[0]:
+            raise ValueError(
+                "pixel_values rows are shorter than image_grid_thw requires: "
+                f"need {next_offset}, have {pixels.shape[0]}"
+            )
+        digest = hashlib.sha256()
+        digest.update(digest_array(pixels[offset:next_offset]))
+        digest.update(digest_array(grid))
+        digest.update(str(source_sizes[index]).encode("utf-8"))
+        digest.update(str(resized_sizes[index]).encode("utf-8"))
+        digest.update(str(int(max_pixels)).encode("utf-8"))
+        digest.update(str(int(max_image_tokens)).encode("utf-8"))
+        digest.update(str(int(spatial_merge_size)).encode("utf-8"))
+        keys.append(digest.hexdigest())
+        offset = next_offset
+    if offset != pixels.shape[0]:
+        raise ValueError(
+            "image_grid_thw does not consume every pixel_values row: "
+            f"used {offset}, total {pixels.shape[0]}"
+        )
+    return tuple(keys)
 
 
 def expand_image_tokens(

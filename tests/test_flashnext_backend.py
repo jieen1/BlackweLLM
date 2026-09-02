@@ -9,6 +9,7 @@ from torch import nn  # noqa: E402
 
 from runtime.backends.flashnext import (  # noqa: E402
     FlashNextBackend,
+    FlashNextPrefixSnapshot,
     _flashnext_batch_gdn_projections_enabled,
     _flashnext_gdn_projection_mode,
 )
@@ -126,6 +127,64 @@ def test_chunked_prefill_syncs_partial_tail_at_its_real_width() -> None:
     assert result == {"anchor": 42, "draft_tokens": [7]}
 
 
+def test_chunked_visual_prefill_keeps_external_embeddings_for_every_chunk() -> None:
+    """Chunking must not turn image rows back into plain token embeddings."""
+
+    backend = object.__new__(FlashNextBackend)
+    backend.max_seq_len = 64
+    backend.device = torch.device("cpu")
+    backend.enable_prefix_cache = False
+    backend.num_slots = 1
+    backend._slot_tokens = [[]]
+    backend._last_logits = [None]
+    backend._specs = [None]
+    backend.stats = {
+        "prefill_requests": 0,
+        "prefill_chunks": 0,
+        "prefill_tokens": 0,
+        "prefill_target_ns": 0,
+        "prefill_mtp_sync_ns": 0,
+        "prefill_mtp_draft_ns": 0,
+        "prefill_trim_ns": 0,
+        "prefill_last_chunks": 0,
+        "prefill_last_tokens": 0,
+        "prefill_last_target_ns": 0,
+        "prefill_last_mtp_sync_ns": 0,
+        "prefill_last_mtp_draft_ns": 0,
+        "prefill_last_trim_ns": 0,
+    }
+    backend._reset_runtime = lambda slot: None
+    backend._trim_prefill_cuda_cache = lambda prompt_tokens: None
+    calls: list[tuple[list[int], torch.Tensor]] = []
+
+    class _Target:
+        def prefill(self, token_ids, *, input_embeds=None, **kwargs):
+            del kwargs
+            assert input_embeds is not None
+            calls.append((list(token_ids), input_embeds.clone()))
+            return torch.tensor([0.0, 1.0]), torch.zeros(len(token_ids), 4)
+
+    multimodal = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    backend.model = SimpleNamespace(
+        encode_multimodal=lambda prompt_ids, vision_inputs: multimodal.clone(),
+    )
+    backend._targets = [_Target()]
+
+    result = backend._prefill_slot(
+        0,
+        [10, 11, 12, 13, 14],
+        chunk_size=2,
+        vision_inputs=SimpleNamespace(image_cache_keys=("img-a",)),
+    )
+
+    assert [tokens for tokens, _embeds in calls] == [[10, 11], [12, 13], [14]]
+    torch.testing.assert_close(
+        torch.cat([embeds for _tokens, embeds in calls]),
+        multimodal,
+    )
+    assert result == {"anchor": 1, "draft_tokens": []}
+
+
 def test_flashnext_prefix_snapshot_restores_recurrent_state_without_qsa_copy() -> None:
     """A retained prefix keeps fixed KV storage and restores only small state."""
 
@@ -206,6 +265,189 @@ def test_flashnext_prefix_snapshot_restores_recurrent_state_without_qsa_copy() -
     assert target.sess.pos == 4
     assert target.sess.window == [8, 9]
     assert torch.equal(target.sess.rope_next, torch.tensor([11, 12, 13]))
+
+
+def test_vision_prefix_cache_requires_matching_image_keys() -> None:
+    backend = object.__new__(FlashNextBackend)
+    backend.enable_prefix_cache = True
+    backend.num_slots = 1
+    backend._prefix_cache = [
+        FlashNextPrefixSnapshot(
+            token_ids=(101, 102, 103, 104),
+            kv_len=4,
+            gdn={},
+            ple_conv_state=None,
+            rope_next=None,
+            window=(),
+            anchor=17,
+            draft_tokens=(),
+            anchor_logits=torch.tensor([0.1, 0.9]),
+            vision_cache_key=("img-a",),
+            mtp_ready=False,
+        )
+    ]
+    backend._specs = [None]
+
+    assert backend._prefix_hit_for_slot([101, 102, 103, 104, 105], 0).effective == 0
+    assert (
+        backend._prefix_hit_for_slot(
+            [101, 102, 103, 104, 105],
+            0,
+            prefix_cache_key=("img-a",),
+        ).effective
+        == 4
+    )
+    assert (
+        backend._prefix_hit_for_slot(
+            [101, 102, 103, 104, 105],
+            0,
+            prefix_cache_key=("img-a", "img-b"),
+        ).effective
+        == 4
+    )
+    assert (
+        backend._prefix_hit_for_slot(
+            [101, 102, 103, 104, 105],
+            0,
+            prefix_cache_key=("img-z",),
+        ).effective
+        == 0
+    )
+
+
+def test_flashnext_visual_prefix_cache_never_reuses_text_checkpoint() -> None:
+    backend = object.__new__(FlashNextBackend)
+    backend.enable_prefix_cache = True
+    backend.num_slots = 1
+    backend._slot_tokens = [[]]
+    backend._last_logits = [None]
+    backend._prefix_cache = [None]
+    backend._prefix_cache_tokens = [None]
+    backend._prefix_cache_kv_len = [0]
+    backend._pending_prefix_hits = {}
+    backend._specs = [None]
+    backend.stats = {}
+    backend._targets = [
+        SimpleNamespace(
+            sess=SimpleNamespace(
+                gdn={},
+                ple_conv_state=None,
+                rope_next=None,
+                window=[],
+                pos=0,
+                qsa_k={},
+                qsa_v={},
+                qsa_idx_k={},
+            )
+        )
+    ]
+    backend._capture_prefix_snapshot(
+        0,
+        [101, 102, 103],
+        anchor=104,
+        draft_tokens=[],
+        anchor_logits=torch.tensor([0.1, 0.9]),
+        vision_cache_key=None,
+        mtp_ready=False,
+    )
+
+    assert backend._prefix_hit_for_slot([101, 102, 103, 105], 0).effective == 3
+    assert (
+        backend._prefix_hit_for_slot(
+            [101, 102, 103, 105],
+            0,
+            prefix_cache_key=("image-a",),
+        ).effective
+        == 0
+    )
+
+
+def test_flashnext_visual_prefix_cache_key_must_match() -> None:
+    backend = object.__new__(FlashNextBackend)
+    backend.enable_prefix_cache = True
+    backend.num_slots = 1
+    backend._slot_tokens = [[]]
+    backend._last_logits = [None]
+    backend._prefix_cache = [None]
+    backend._prefix_cache_tokens = [None]
+    backend._prefix_cache_kv_len = [0]
+    backend._pending_prefix_hits = {}
+    backend._specs = [None]
+    backend.stats = {}
+    backend._targets = [
+        SimpleNamespace(
+            sess=SimpleNamespace(
+                gdn={},
+                ple_conv_state=None,
+                rope_next=None,
+                window=[],
+                pos=0,
+                qsa_k={},
+                qsa_v={},
+                qsa_idx_k={},
+            )
+        )
+    ]
+    backend._capture_prefix_snapshot(
+        0,
+        [201, 202, 203],
+        anchor=204,
+        draft_tokens=[],
+        anchor_logits=torch.tensor([0.3, 0.7]),
+        vision_cache_key=("image-a",),
+        mtp_ready=False,
+    )
+
+    assert (
+        backend._prefix_hit_for_slot(
+            [201, 202, 203, 205],
+            0,
+            prefix_cache_key=("image-a",),
+        ).effective
+        == 3
+    )
+    assert (
+        backend._prefix_hit_for_slot(
+            [201, 202, 203, 205],
+            0,
+            prefix_cache_key=("image-b",),
+        ).effective
+        == 0
+    )
+
+
+def test_flashnext_shift_teacher_force_embeds_handles_overlap() -> None:
+    backend = object.__new__(FlashNextBackend)
+    backend.device = torch.device("cpu")
+    backend.model = SimpleNamespace(
+        embed_tokens=lambda ids: torch.tensor(
+            [[float(ids[0]), float(ids[0]) + 0.5]],
+            dtype=torch.float32,
+        )
+    )
+    embeds = torch.tensor(
+        [
+            [1.0, 1.5],
+            [2.0, 2.5],
+            [3.0, 3.5],
+        ],
+        dtype=torch.float32,
+    )
+
+    shifted = backend._shift_teacher_force_embeds(embeds, anchor=9)
+
+    assert shifted is embeds
+    assert torch.equal(
+        shifted,
+        torch.tensor(
+            [
+                [2.0, 2.5],
+                [3.0, 3.5],
+                [9.0, 9.5],
+            ],
+            dtype=torch.float32,
+        ),
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA allocator")

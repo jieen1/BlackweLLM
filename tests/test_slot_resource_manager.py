@@ -106,6 +106,30 @@ class _FakeBackend:
         return (chosen, 64)
 
 
+class _FakeKeyedBackend(_FakeBackend):
+    def __init__(self, marker: str):
+        super().__init__(marker)
+        self.reconcile_keyed_calls: list[tuple[list[int], object]] = []
+        self.find_keyed_calls: list[tuple[list[int], list[int], object]] = []
+
+    def reconcile_prefix_hit_with_key(
+        self,
+        token_ids: list[int],
+        prefix_cache_key: object,
+    ) -> PrefixHit:
+        self.reconcile_keyed_calls.append((list(token_ids), prefix_cache_key))
+        return PrefixHit(kv_hit=128, state_hit=128)
+
+    def find_best_slot_for_prompt_with_key(
+        self,
+        token_ids: list[int],
+        free_slots: list[int],
+        prefix_cache_key: object,
+    ) -> tuple[int, int]:
+        self.find_keyed_calls.append((list(token_ids), list(free_slots), prefix_cache_key))
+        return free_slots[-1], 128
+
+
 class TestForwardingWhenNoSecondCacheFamily:
     """§5 point 3: pure forward, no second allocator instantiated."""
 
@@ -136,6 +160,18 @@ class TestForwardingWhenNoSecondCacheFamily:
         via_coordinator = mgr.find_best_slot_for_prompt(prompt, free_slots)
 
         assert via_coordinator == direct
+
+    def test_keyed_single_family_calls_backend_keyed_methods(self) -> None:
+        backend = _FakeKeyedBackend("laguna")
+        mgr = SlotResourceManager(backend, _spec(needs_two_cache_families=False))
+
+        hit = mgr.reconcile_prefix_hit([1, 2, 3], prefix_cache_key=("img-a",))
+        slot, depth = mgr.find_best_slot_for_prompt([1, 2, 3], [0, 1], prefix_cache_key=("img-a",))
+
+        assert hit == PrefixHit(kv_hit=128, state_hit=128)
+        assert backend.reconcile_keyed_calls == [([1, 2, 3], ("img-a",))]
+        assert (slot, depth) == (1, 128)
+        assert backend.find_keyed_calls == [([1, 2, 3], [0, 1], ("img-a",))]
 
 
 class _FakeTwoFamilyBackend(_FakeBackend):
@@ -173,6 +209,23 @@ class _FakeCrossSlotBackend(_FakeTwoFamilyBackend):
     def cross_slot_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
         self.cross_slot_calls.append(list(token_ids))
         return PrefixHit(kv_hit=self._remote[0], state_hit=self._remote[1])
+
+
+class _FakeKeyedTwoFamilyBackend(_FakeTwoFamilyBackend):
+    def __init__(self, marker: str, per_slot_by_key: dict[object, dict[int, tuple[int, int]]]):
+        super().__init__(marker, {})
+        self._per_slot_by_key = per_slot_by_key
+        self.keyed_calls: list[tuple[list[int], int, object]] = []
+
+    def prefix_hit_for_slot_with_key(
+        self,
+        token_ids: list[int],
+        slot: int,
+        prefix_cache_key: object,
+    ) -> PrefixHit:
+        self.keyed_calls.append((list(token_ids), slot, prefix_cache_key))
+        kv, state = self._per_slot_by_key[prefix_cache_key].get(slot, (0, 0))
+        return PrefixHit(kv_hit=kv, state_hit=state)
 
 
 class TestSecondCacheFamily:
@@ -234,6 +287,24 @@ class TestSecondCacheFamily:
         mgr = SlotResourceManager(backend, _spec(needs_two_cache_families=True), block_size=64)
         assert mgr.find_best_slot_for_prompt([1, 2, 3], [0]) == (0, 64)
         assert backend.cross_slot_calls == [[1, 2, 3]]
+
+    def test_find_best_slot_uses_keyed_per_slot_query_when_available(self) -> None:
+        backend = _FakeKeyedTwoFamilyBackend(
+            "q",
+            {
+                ("img-a",): {0: (960, 0), 1: (256, 256)},
+            },
+        )
+        mgr = SlotResourceManager(backend, _spec(needs_two_cache_families=True), block_size=64)
+
+        assert mgr.find_best_slot_for_prompt([1, 2, 3], [0, 1], prefix_cache_key=("img-a",)) == (
+            1,
+            256,
+        )
+        assert backend.keyed_calls == [
+            ([1, 2, 3], 0, ("img-a",)),
+            ([1, 2, 3], 1, ("img-a",)),
+        ]
 
     def test_no_free_slots_is_a_value_error_not_an_index_error(self) -> None:
         backend = _FakeTwoFamilyBackend("q", {0: (0, 0)})

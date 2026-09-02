@@ -133,9 +133,12 @@ OpenCode provider 的最小配置如下，模型名使用服务实际暴露的
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
+  "compaction": {
+    "reserved": 32003
+  },
   "provider": {
     "blackwellm": {
-      "npm": "@ai-sdk/openai-compatible",
+      "npm": "@ai-sdk/openai",
       "options": { "baseURL": "http://127.0.0.1:8300/v1" },
       "models": {
         "qwen3.8-flash-next": {
@@ -151,6 +154,10 @@ OpenCode provider 的最小配置如下，模型名使用服务实际暴露的
             "high": { "reasoningEffort": "xhigh" },
             "xhigh": { "reasoningEffort": "xhigh" },
             "max": { "reasoningEffort": "xhigh" }
+          },
+          "limit": {
+            "context": 262144,
+            "output": 32000
           }
         }
       }

@@ -1660,6 +1660,16 @@ class ServerEngine:
     def capacity_ok(self, prompt_len: int, max_tokens: int) -> bool:
         return prompt_len + max_tokens + self.K <= self.capacity_tokens_per_slot
 
+    def advertised_input_capacity(self, max_output_tokens: int) -> int:
+        """Return the largest prompt length that still fits this slot budget."""
+        return max(1, self.capacity_tokens_per_slot - max(0, int(max_output_tokens)) - self.K)
+
+    def prefix_cache_key_for_request(self, req: GenerationRequest) -> object | None:
+        build = getattr(self.runner, "prefix_cache_key_for_vision_inputs", None)
+        if build is None:
+            return None
+        return build(req.vision_inputs)
+
     async def submit(
         self,
         prompt_ids: list[int],
@@ -1988,7 +1998,11 @@ class ServerEngine:
             "drafts": drafts,
             "committed_tokens": [],
             "sampled": not req.sampling_params.is_greedy,
-            "speculative_enabled": req.vision_inputs is None,
+            # An empty draft list is a valid fallback (e.g. a graph/capacity
+            # edge or a non-cacheable multimodal request).  Routing that slot
+            # to MTP solely because it is greedy makes ``round`` fail with
+            # "requires K drafts" instead of using the correct target decode.
+            "speculative_enabled": bool(drafts),
             "last_token": anchor,
             "last_progress_round": self.stats["rounds"],
             "start_time": time.perf_counter(),
@@ -2561,9 +2575,11 @@ class ServerEngine:
                 # belongs to the caller"); only the call once gated moves to
                 # the coordinator (step 7-g).
                 if self.runner.capabilities.prefix_cache and remaining_slots:
+                    prefix_cache_key = self.prefix_cache_key_for_request(req)
                     best_slot, _hit = self.slot_resources.find_best_slot_for_prompt(
                         req.prompt_ids,
                         remaining_slots,
+                        prefix_cache_key=prefix_cache_key,
                     )
                     remaining_slots.remove(best_slot)
                 else:
@@ -2613,8 +2629,11 @@ class ServerEngine:
                     # A3 step 7-g: routed through the coordinator, not
                     # self.runner directly -- see self.slot_resources's docstring.
                     hit_depths = [
-                        self.slot_resources.reconcile_prefix_hit(p).effective
-                        for p in new_prompts
+                        self.slot_resources.reconcile_prefix_hit(
+                            prompt,
+                            prefix_cache_key=self.prefix_cache_key_for_request(req),
+                        ).effective
+                        for prompt, (_slot, req) in zip(new_prompts, admit_now)
                     ]
                     for _slot, req in admit_now:
                         _adm_phase(req, "reconcile")

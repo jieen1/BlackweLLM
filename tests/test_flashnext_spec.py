@@ -660,6 +660,89 @@ def test_sync_and_propose_uses_sparse_graph_past_dense_budget():
     assert engine.mtp_session.pos == 23476
 
 
+def test_sync_real_suffix_uses_precomputed_input_embeds() -> None:
+    engine = object.__new__(FlashNextSpecEngine)
+    engine.device = torch.device("cpu")
+    engine.k = 3
+    engine.max_seq = 16
+    engine.mtp_session = SimpleNamespace(sync_len=5, pos=0)
+    captured: dict[str, torch.Tensor] = {}
+
+    def forward(embeds, target_hc_hidden, positions, sess, **kwargs):
+        del sess, kwargs
+        captured["embeds"] = embeds.clone()
+        captured["target_hc_hidden"] = target_hc_hidden.clone()
+        captured["positions"] = positions.clone()
+        mixed = torch.zeros(2, 4, dtype=torch.bfloat16)
+        own_hc = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+        return mixed, own_hc
+
+    engine.mtp = SimpleNamespace(forward=forward)
+    engine.model = SimpleNamespace(
+        cfg=SimpleNamespace(hc_count=1, hidden_size=4),
+        embed_tokens=lambda _tokens: (_ for _ in ()).throw(
+            AssertionError("embed_tokens must not run when input_embeds is provided")
+        ),
+        lm_head=lambda mixed: torch.tensor(
+            [[0.0, 1.0], [0.0, 3.0]],
+            dtype=torch.float32,
+        )[: mixed.shape[0]],
+    )
+
+    input_embeds = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    first_draft, hidden = FlashNextSpecEngine.sync_real_suffix(
+        engine,
+        shifted_token_ids=[7, 8],
+        target_hc_hidden=torch.ones(2, 4, dtype=torch.bfloat16),
+        input_embeds=input_embeds,
+    )
+
+    assert first_draft == 1
+    assert torch.equal(captured["embeds"], input_embeds.to(dtype=torch.bfloat16))
+    assert torch.equal(captured["positions"], torch.tensor([5, 6], dtype=torch.long))
+    assert torch.equal(hidden, torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)[-1:])
+    assert engine.mtp_session.sync_len == 7
+    assert engine.mtp_session.pos == 7
+
+
+def test_sync_and_propose_replays_graph_with_precomputed_input_embeds() -> None:
+    engine = object.__new__(FlashNextSpecEngine)
+    engine.k = 3
+    engine.max_seq = 32768
+    engine.mtp_session = SimpleNamespace(sync_len=23472, pos=0)
+
+    class _Graph:
+        query_len = 2
+        graph_capacity = 32768
+
+        graph = object()
+
+        def replay(self, tokens, hidden, position, *, input_embeds=None):
+            captured["graph_tokens"] = list(tokens)
+            captured["graph_hidden"] = hidden.clone()
+            captured["graph_position"] = position
+            captured["graph_input_embeds"] = input_embeds.clone()
+            return torch.tensor([7, 8, 9], dtype=torch.long)
+
+    captured: dict[str, object] = {}
+    engine.mtp_proposal_graphs = {2: _Graph()}
+
+    input_embeds = torch.ones(2, 4, dtype=torch.bfloat16)
+    drafts = FlashNextSpecEngine.sync_and_propose(
+        engine,
+        shifted_token_ids=[5, 6],
+        target_hc_hidden=torch.ones(2, 4, dtype=torch.bfloat16),
+        input_embeds=input_embeds,
+    )
+
+    assert drafts == [7, 8, 9]
+    assert captured["graph_tokens"] == [5, 6]
+    assert captured["graph_position"] == 23472
+    assert torch.equal(captured["graph_input_embeds"], input_embeds)
+    assert engine.mtp_session.sync_len == 23474
+    assert engine.mtp_session.pos == 23476
+
+
 @pytest.mark.parametrize(
     ("prediction_ids", "expected_accepted", "expected_reject", "expected_teacher"),
     [
@@ -787,6 +870,44 @@ def test_sparse_graph_proposal_body_captures_then_reuses_sync_row():
         assert kwargs["reuse_sparse_indices"] is True
         assert kwargs["graph_sparse_capacity"] == 32768
         assert kwargs["graph_dense_capacity"] is None
+
+
+def test_proposal_graph_replay_populates_teacher_embedding_buffer():
+    """Visual teacher rows must reach the captured MTP graph input pointer."""
+
+    from runtime.model.flashnext.spec import FlashNextMtpProposalGraph
+
+    model = SimpleNamespace(
+        cfg=SimpleNamespace(hc_count=1, hidden_size=4),
+        embed_tokens=lambda tokens: tokens.to(torch.bfloat16).unsqueeze(-1).repeat(1, 4),
+    )
+    graph = object.__new__(FlashNextMtpProposalGraph)
+    graph.graph = object()
+    graph.query_len = 2
+    graph.k = 3
+    graph.graph_capacity = 32
+    graph.tokens = torch.zeros(2, dtype=torch.long)
+    graph.target_hidden = torch.zeros(2, 4, dtype=torch.bfloat16)
+    graph.teacher_embeds = torch.zeros(2, 4, dtype=torch.bfloat16)
+    graph.position = torch.zeros(1, dtype=torch.long)
+    graph.sess = SimpleNamespace(mtp_k_pool=torch.zeros(32, 1))
+    graph.model = model
+    replayed = []
+    graph.graph = SimpleNamespace(replay=lambda: replayed.append(True))
+    graph._drafts = torch.tensor([8, 9, 10], dtype=torch.long)
+
+    visual_embeds = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    drafts = graph.replay(
+        [5, 6],
+        torch.ones(2, 4, dtype=torch.bfloat16),
+        7,
+        input_embeds=visual_embeds,
+    )
+
+    assert drafts.tolist() == [8, 9, 10]
+    assert replayed == [True]
+    assert torch.equal(graph.teacher_embeds, visual_embeds.to(torch.bfloat16))
+    assert graph.tokens.tolist() == [5, 6]
 
 
 def test_verify_replay_rejects_cache_overflow_before_replay():

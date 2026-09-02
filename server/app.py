@@ -407,16 +407,54 @@ _FLASHNEXT_REASONING_EFFORT_ALIASES = {
     "max": "xhigh",
 }
 _QWEN_UNSUPPORTED_REASONING_EFFORTS = frozenset({"high", "xhigh", "max"})
+
+
 def _default_served_model_name(engine_ref) -> str:
     """Return the stable public model id, independent of snapshot paths."""
     configured = os.environ.get("QSR_SERVED_MODEL_NAME")
     if configured:
         return configured.split()[0]
+    if engine_ref is None:
+        return "qwen3.8-flash-next" if _FLASHNEXT_DEFAULT_PROFILE else "qwen3.8"
     if getattr(engine_ref, "backend_name", None) == "qwen36":
         return "qwen3.8"
     if getattr(engine_ref, "backend_name", None) == "flashnext":
         return "qwen3.8-flash-next"
     return engine_ref.MODEL
+
+
+def _served_max_output_tokens(engine_ref) -> int:
+    default = (
+        32_000
+        if getattr(engine_ref, "backend_name", None) == "flashnext"
+        else DEFAULT_MAX_TOKENS
+    )
+    raw = os.environ.get("QSR_SERVED_MAX_OUTPUT_TOKENS", str(default)).strip()
+    try:
+        resolved = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"QSR_SERVED_MAX_OUTPUT_TOKENS must be an integer, got {raw!r}") from exc
+    if resolved <= 0:
+        raise RuntimeError(
+            f"QSR_SERVED_MAX_OUTPUT_TOKENS must be positive, got {resolved}"
+        )
+    capacity = getattr(engine_ref, "capacity_tokens_per_slot", 0) or 0
+    speculative = max(0, int(getattr(engine_ref, "K", 0)))
+    if capacity > 0:
+        return min(resolved, max(1, capacity - speculative))
+    return resolved
+
+
+def _served_input_token_limit(engine_ref) -> int:
+    output_limit = _served_max_output_tokens(engine_ref)
+    advertised = getattr(engine_ref, "advertised_input_capacity", None)
+    if advertised is not None:
+        return int(advertised(output_limit))
+    capacity = getattr(engine_ref, "capacity_tokens_per_slot", 0) or 0
+    speculative = max(0, int(getattr(engine_ref, "K", 0)))
+    if capacity > 0:
+        return max(1, capacity - output_limit - speculative)
+    return max(1, output_limit)
 
 
 def _qwen_compat_effort(value: object) -> object:
@@ -1212,9 +1250,18 @@ class CompletionRequest(BaseModel):
     session_id: str | None = None
 
 
-def _invalid_request(message: str) -> HTTPException:
+def _invalid_request(
+    message: str,
+    *,
+    error_type: str = "invalid_request_error",
+    code: str | None = None,
+) -> HTTPException:
+    error = {"message": message, "type": error_type}
+    if code is not None:
+        error["code"] = code
     return HTTPException(
-        status_code=400, detail={"error": {"message": message, "type": "invalid_request_error"}}
+        status_code=400,
+        detail={"error": error},
     )
 
 
@@ -1266,7 +1313,7 @@ def _build_sampling_params(
 
 
 def _validate_and_resolve_max_tokens(max_tokens: int | None) -> int:
-    resolved = max_tokens if max_tokens is not None else DEFAULT_MAX_TOKENS
+    resolved = max_tokens if max_tokens is not None else _served_max_output_tokens(engine)
     if resolved <= 0:
         raise _invalid_request(f"max_tokens={max_tokens!r} must be >= 1.")
     return resolved
@@ -1527,21 +1574,59 @@ def _validate_capacity(
     # explicit call here would double-count.
     assert engine is not None
     reserved_tokens = max_tokens + extra_tokens
+    speculative_tokens = max(0, int(getattr(engine, "K", 0)))
     capacity_ok = getattr(engine, "capacity_ok", None)
     if capacity_ok is None:
         # Small API test doubles from before the dynamic-capacity helper only
         # expose the public ceiling.  Keep the validation useful for them
         # while production ServerEngine continues to own the exact policy.
-        fits = len(prompt_ids) + reserved_tokens <= engine.capacity_tokens_per_slot
+        fits = (
+            len(prompt_ids) + reserved_tokens + speculative_tokens
+            <= engine.capacity_tokens_per_slot
+        )
     else:
         fits = capacity_ok(len(prompt_ids), reserved_tokens)
     if not fits:
-        raise _invalid_request(
-            f"prompt too long: prompt_tokens({len(prompt_ids)}) + max_tokens({reserved_tokens}) = "
-            f"{len(prompt_ids) + reserved_tokens} exceeds this runtime's per-slot capacity of "
-            f"{engine.capacity_tokens_per_slot} tokens (blocks_per_slot * block_size). "
-            "Reduce the prompt length or max_tokens and retry."
+        parts = [
+            f"prompt_tokens({len(prompt_ids)})",
+            f"max_tokens({max_tokens})",
+        ]
+        if extra_tokens:
+            parts.append(f"extra_tokens({extra_tokens})")
+        if speculative_tokens:
+            parts.append(f"speculative_tokens({speculative_tokens})")
+        total = len(prompt_ids) + reserved_tokens + speculative_tokens
+        available_prompt_tokens = max(
+            0,
+            int(engine.capacity_tokens_per_slot) - reserved_tokens - speculative_tokens,
         )
+        raise _invalid_request(
+            "prompt is too long: "
+            f"{' + '.join(parts)} = {total} exceeds this runtime's context window of "
+            f"{engine.capacity_tokens_per_slot} tokens (blocks_per_slot * block_size). "
+            f"At this max_tokens setting, the largest admissible prompt is "
+            f"available_prompt_tokens({available_prompt_tokens}). "
+            "Reduce the prompt length or max_tokens and retry.",
+            error_type="context_length_exceeded",
+            code="context_length_exceeded",
+        )
+
+
+def _shrink_max_tokens_to_capacity(
+    prompt_ids: list[int], requested_max_tokens: int, *, extra_tokens: int = 0
+) -> int:
+    """Clamp output budget to the actual remaining per-slot capacity."""
+    assert engine is not None
+    speculative_tokens = max(0, int(getattr(engine, "K", 0)))
+    available = (
+        int(engine.capacity_tokens_per_slot)
+        - len(prompt_ids)
+        - max(0, int(extra_tokens))
+        - speculative_tokens
+    )
+    if available < 1:
+        _validate_capacity(prompt_ids, requested_max_tokens, extra_tokens=extra_tokens)
+    return min(int(requested_max_tokens), available)
 
 
 def _protocol_error_body(path: str, err: dict) -> dict:
@@ -1620,6 +1705,17 @@ async def health():
 
 @app.get("/debug/stats")
 async def debug_stats():
+    # The collection below walks the backend's full object graph
+    # (``memory_breakdown``) and can take tens of seconds.  Running it on the
+    # event loop froze EVERY endpoint -- including in-flight streaming chat
+    # responses -- for the duration of one scrape (measured 37 s on the live
+    # Flash-Next server, with /health unresponsive throughout).  Off-load it
+    # to a worker thread so the loop keeps serving while the debug snapshot
+    # is being built.
+    return await asyncio.to_thread(_collect_debug_stats)
+
+
+def _collect_debug_stats() -> dict:
     """Non-standard, this-project-only endpoint: exposes the engine's own
     round/admission counters so the E2E validation script (and any curious
     human) can directly confirm real multi-request batching happened
@@ -2383,6 +2479,10 @@ async def list_models():
     configured = os.environ.get("QSR_SERVED_MODEL_NAME")
     served = configured or _default_served_model_name(engine)
     names = served.split()
+    max_model_len = engine.capacity_tokens_per_slot if engine else 0
+    max_output_tokens = _served_max_output_tokens(engine)
+    input_token_limit = _served_input_token_limit(engine)
+    speculative_tokens = int(getattr(engine, "K", 0)) if engine else 0
     return {
         "object": "list",
         "data": [
@@ -2393,7 +2493,11 @@ async def list_models():
                 "owned_by": "qwen-sm120-runtime",
                 "root": _default_served_model_name(engine),
                 "parent": None,
-                "max_model_len": engine.capacity_tokens_per_slot if engine else 0,
+                "max_model_len": max_model_len,
+                "context_length": max_model_len,
+                "input_token_limit": input_token_limit,
+                "max_output_tokens": max_output_tokens,
+                "speculative_reserved_tokens": speculative_tokens,
                 "permission": [
                     {
                         "id": f"modelperm-{uuid.uuid4().hex[:24]}",
@@ -2540,12 +2644,19 @@ async def metrics_endpoint():
     # every case that isn't "at least one real capture attempt happened".
     lines.append(
         "# HELP blackwellm:dflash_cg_captured Whether a DFlash CUDA Graph is "
-        "captured (1) or degraded to its eager fallback (0)."
+        "captured (1) or degraded to its eager fallback (0); for Flash-Next "
+        "gdn_projections the fast batched projection contract reports 1."
     )
     lines.append("# TYPE blackwellm:dflash_cg_captured gauge")
     cg_status = snapshot.dflash_cg_status if snapshot is not None else ()
     for graph_name, status in cg_status:
-        captured = 1 if status == "captured" else 0
+        # Flash-Next surfaces the GDN projection execution CONTRACT as a mode
+        # string ("batched_bf16"/"batched_quantized"/"per_row"/"disabled")
+        # instead of a capture verdict (runtime/backends/flashnext.py sets
+        # _cg_status["gdn_projections"] to the mode, never to "captured").
+        # Any "batched*" mode is the fast path; only "captured" or "batched*"
+        # count as not-degraded here.
+        captured = 1 if status == "captured" or str(status).startswith("batched") else 0
         lines.append(
             f'blackwellm:dflash_cg_captured{{model_name="{served_model}",graph="{graph_name}"}} '
             f"{captured}"
@@ -3012,7 +3123,8 @@ async def responses_api(request: Request):
     body = await request.json()
     t0 = time.perf_counter()
 
-    max_tokens = _validate_and_resolve_max_tokens(body.get("max_output_tokens"))
+    requested_max_tokens = _validate_and_resolve_max_tokens(body.get("max_output_tokens"))
+    truncation_mode = str(body.get("truncation") or "disabled")
     model_name = body.get("model") or _default_served_model_name(engine)
     stream = body.get("stream", False)
     sampling_params = _build_sampling_params(
@@ -3059,10 +3171,14 @@ async def responses_api(request: Request):
         raise _invalid_request(str(exc)) from exc
     await _debug_log_input("OPENAI /v1/responses", body, chat_messages, prompt_ids)
     thinking_budget = await _tokenize_thinking_budget_config(engine, thinking_token_budget)
-    _validate_capacity(
-        prompt_ids,
-        max_tokens,
-    )
+    if truncation_mode == "auto":
+        max_tokens = _shrink_max_tokens_to_capacity(prompt_ids, requested_max_tokens)
+    else:
+        max_tokens = requested_max_tokens
+        _validate_capacity(
+            prompt_ids,
+            max_tokens,
+        )
 
     if stream:
 
@@ -3091,6 +3207,7 @@ async def responses_api(request: Request):
                 [],
                 None,
                 max_output_tokens=max_tokens,
+                truncation=truncation_mode,
             )
             # Responses lifecycle events carry the full snapshot under a
             # ``response`` key with a top-level ``type`` (the OpenAI SSE
@@ -3300,6 +3417,7 @@ async def responses_api(request: Request):
                 max_output_tokens=max_tokens,
                 incomplete_details=incomplete_details,
                 error=response_error,
+                truncation=truncation_mode,
             )
             completion_tokens = (
                 final_result.get("completion_tokens", len(proc.all_ids))
@@ -3378,4 +3496,5 @@ async def responses_api(request: Request):
         reasoning_content=reasoning_content,
         prefix_cache_hit_tokens=result.get("prefix_cache_hit_tokens", 0),
         max_output_tokens=max_tokens,
+        truncation=truncation_mode,
     )

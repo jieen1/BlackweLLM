@@ -361,6 +361,39 @@ class TestMetricsEndpointItself:
         assert 'blackwellm:dflash_cg_captured{model_name="test/model",graph="draft"} 1' in body
         assert 'blackwellm:dflash_cg_captured{model_name="test/model",graph="verify"} 0' in body
 
+    def test_scrape_reports_flashnext_gdn_projection_mode_as_captured(self, monkeypatch):
+        # Flash-Next stores the GDN projection execution contract (a mode
+        # string) in the same status map, never the literal "captured".
+        # A "batched*" mode is the fast path and must report 1; "per_row" /
+        # "disabled" are the eager fallbacks and must report 0.
+        engine = _FakeEngine(
+            _FakeSnapshotRunner(
+                [0, 0],
+                dflash_cg_status=(
+                    ("gdn_projections", "batched_bf16"),
+                    ("decode", "captured"),
+                ),
+            )
+        )
+        body = self._call(monkeypatch, engine)
+        assert (
+            'blackwellm:dflash_cg_captured{model_name="test/model",'
+            'graph="gdn_projections"} 1'
+        ) in body
+        assert 'blackwellm:dflash_cg_captured{model_name="test/model",graph="decode"} 1' in body
+
+        engine = _FakeEngine(
+            _FakeSnapshotRunner(
+                [0, 0],
+                dflash_cg_status=(("gdn_projections", "per_row"),),
+            )
+        )
+        body = self._call(monkeypatch, engine)
+        assert (
+            'blackwellm:dflash_cg_captured{model_name="test/model",'
+            'graph="gdn_projections"} 0'
+        ) in body
+
     def test_scrape_reports_backend_cuda_graph_activity_and_fallback_reason(self, monkeypatch):
         engine = _FakeEngine(
             _FakeSnapshotRunner(
@@ -407,6 +440,44 @@ class TestMetricsEndpointItself:
         assert result["_cuda_graph_dbg"] == {"decode": "captured"}
         assert result["_backend_snapshot_stats_dbg"] == {"decode_graph_replays": 3}
         assert result["_cuda_graph_fallback_reasons_dbg"] == {"not_captured": 1}
+
+    def test_debug_stats_does_not_block_the_event_loop(self, monkeypatch):
+        # Regression for the 2026-09-01 freeze: on the live Flash-Next server
+        # one /debug/stats scrape ran 37 s of blocking object-graph walking
+        # ON THE EVENT LOOP, and /health plus every in-flight streaming chat
+        # response were unresponsive for the whole duration. The collector
+        # must run off-loop: a heartbeat task keeps ticking while a slow
+        # memory_breakdown is in flight.
+        import asyncio
+        import time
+
+        pytest.importorskip("fastapi")
+        import server.app as app_module
+
+        class _SlowMemoryRunner(_FakeSnapshotRunner):
+            def memory_breakdown(self):
+                time.sleep(0.5)
+                return {"model_tensor_bytes": 1}
+
+        engine = _FakeEngine(_SlowMemoryRunner([0, 0]))
+        monkeypatch.setattr(app_module, "engine", engine)
+
+        async def scenario():
+            ticks: list[int] = [0]
+
+            async def heartbeat():
+                while True:
+                    ticks[0] += 1
+                    await asyncio.sleep(0.02)
+
+            beat = asyncio.create_task(heartbeat())
+            result = await app_module.debug_stats()
+            beat.cancel()
+            return result, ticks[0]
+
+        result, ticks = asyncio.run(scenario())
+        assert result["_memory_breakdown_dbg"] == {"model_tensor_bytes": 1}
+        assert ticks >= 5, f"event loop starved during debug_stats (ticks={ticks})"
 
     def test_endpoint_does_not_reach_past_the_contract(self, monkeypatch):
         # The nail this whole step is driven around. This backend carries a
