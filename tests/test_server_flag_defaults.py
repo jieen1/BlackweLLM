@@ -227,6 +227,17 @@ class TestQwenDSparkDefault:
 
         assert app_mod.SERVER_TOOL_CALL_PARSER == "qwen3_coder"
 
+    def test_flashnext_defaults_to_short_admission_coalesce(self, monkeypatch):
+        app_mod = _reimport_app_with(
+            monkeypatch,
+            QSR_SERVER_MODEL_PATH="/models/Qwen3.8-Flash-Next-NVFP4-RadixArk",
+            QSR_SERVER_BACKEND="flashnext",
+            QSR_ADMISSION_COALESCE_MS=None,
+        )
+
+        app_mod._apply_qwen_dspark_runtime_defaults()
+        assert os.environ["QSR_ADMISSION_COALESCE_MS"] == "10"
+
     def test_laguna_keeps_poolside_tool_parser_default(self, monkeypatch):
         app_mod = _reimport_app_with(
             monkeypatch,

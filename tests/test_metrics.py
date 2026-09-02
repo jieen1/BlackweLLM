@@ -319,6 +319,56 @@ class TestMetricsEndpointItself:
         # 4096/16 = 256 blocks, 32/16 = 2 blocks.
         assert 'blackwellm:kv_cache_used_blocks{model_name="test/model"} 258' in body
 
+    def test_scrape_counts_chunked_prefill_as_running(self, monkeypatch):
+        # A long prompt owns its slot before the first anchor promotes it to
+        # ``engine.active``.  Metrics must not report an idle server or zero
+        # KV usage during that admission-to-activation window.
+        engine = _FakeEngine(_FakeSnapshotRunner([2048, 0]), block_size=16)
+        engine.free_slots = [1]
+        engine._pending_prefill = object()
+        engine._pending_prefill_reqs = [(0, object())]
+        body = self._call(monkeypatch, engine)
+        assert 'blackwellm:num_requests_running{model_name="test/model"} 1' in body
+        assert 'blackwellm:num_requests_prefill{model_name="test/model"} 1' in body
+        assert 'blackwellm:num_occupied_slots{model_name="test/model"} 3' in body
+        assert 'blackwellm:kv_cache_used_blocks{model_name="test/model"} 128' in body
+
+    def test_health_counts_chunked_prefill(self, monkeypatch):
+        import asyncio
+
+        pytest.importorskip("fastapi")
+        import server.app as app_module
+
+        engine = _FakeEngine(_FakeSnapshotRunner([2048, 0]), num_slots=2)
+        engine.free_slots = [1]
+        engine._pending_prefill = object()
+        engine._pending_prefill_reqs = [(0, object())]
+        monkeypatch.setattr(app_module, "engine", engine)
+
+        result = asyncio.run(app_module.health())
+        assert result["active"] == 1
+        assert result["active_generating"] == 0
+        assert result["prefill"] == 1
+        assert result["occupied_slots"] == 1
+        assert result["waiting"] == 0
+
+    def test_health_counts_synchronous_prefill_begin(self, monkeypatch):
+        import asyncio
+
+        pytest.importorskip("fastapi")
+        import server.app as app_module
+
+        engine = _FakeEngine(_FakeSnapshotRunner([0]), num_slots=2)
+        engine.free_slots = [1]
+        engine._admission_inflight_reqs = [(0, object())]
+        monkeypatch.setattr(app_module, "engine", engine)
+
+        result = asyncio.run(app_module.health())
+        assert result["active"] == 1
+        assert result["active_generating"] == 0
+        assert result["prefill"] == 1
+        assert result["occupied_slots"] == 1
+
     def test_scrape_survives_a_backend_outside_the_contract(self, monkeypatch):
         class _NoContract:
             pass
@@ -478,6 +528,30 @@ class TestMetricsEndpointItself:
         result, ticks = asyncio.run(scenario())
         assert result["_memory_breakdown_dbg"] == {"model_tensor_bytes": 1}
         assert ticks >= 5, f"event loop starved during debug_stats (ticks={ticks})"
+
+    def test_debug_stats_uses_cached_memory_while_busy(self, monkeypatch):
+        import asyncio
+
+        pytest.importorskip("fastapi")
+        import server.app as app_module
+
+        class _BusyMemoryRunner(_FakeSnapshotRunner):
+            calls = 0
+
+            def memory_breakdown(self):
+                self.calls += 1
+                raise AssertionError("busy debug scrape must not walk the object graph")
+
+        runner = _BusyMemoryRunner([2048])
+        engine = _FakeEngine(runner, active={0: {}})
+        engine.stats["_memory_breakdown_dbg"] = {"model_tensor_bytes": 7}
+        monkeypatch.setattr(app_module, "engine", engine)
+
+        result = asyncio.run(app_module.debug_stats())
+        assert result["_memory_breakdown_dbg"] == {"model_tensor_bytes": 7}
+        assert result["_memory_breakdown_source"] == "startup_cache"
+        assert result["_memory_breakdown_stale"] is True
+        assert runner.calls == 0
 
     def test_endpoint_does_not_reach_past_the_contract(self, monkeypatch):
         # The nail this whole step is driven around. This backend carries a

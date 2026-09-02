@@ -728,6 +728,11 @@ class ServerEngine:
         # A5/B4: incremental chunked prefill state (None = no prefill in progress)
         self._pending_prefill = None  # ChunkedPrefillState | None
         self._pending_prefill_reqs: list[tuple[int, GenerationRequest]] = []
+        # ``prefill_chunked_begin`` performs the first GPU chunk synchronously
+        # before returning a state.  Mark its requests before entering that
+        # call so observability does not report an apparently idle engine
+        # during this admission-to-pending gap.
+        self._admission_inflight_reqs: list[tuple[int, GenerationRequest]] = []
         # SGLang's radix scheduler avoids putting exact duplicate prompts in
         # the same cold extend wave: the first request publishes the prefix,
         # and the remaining requests restore it on the next wave.  Keep only
@@ -972,7 +977,7 @@ class ServerEngine:
         logger.info(
             "loading Qwen3.8 Flash-Next target from %s (max_context=%d, MTP=%s, "
             "PLE=%s, ple_cache_rows=%d, ple_cache_pages=%d, vision=%s, "
-            "image_max_pixels=%s, io=%s, prefill_chunk=%d)",
+            "image_max_pixels=%s, io=%s, prefill_chunk=%d, admission_coalesce_ms=%g)",
             checkpoint,
             max_model_len,
             self.enable_mtp,
@@ -983,6 +988,7 @@ class ServerEngine:
             os.environ.get("QSR_FLASHNEXT_IMAGE_MAX_PIXELS", "1048576"),
             os.environ.get("QSR_FLASHNEXT_PLE_IO", "auto"),
             self._prefill_chunk_size,
+            self._admission_coalesce_s * 1000.0,
         )
 
         def progress(done: int, total: int) -> None:
@@ -1032,6 +1038,12 @@ class ServerEngine:
         # reservations and made the previous BF16-vs-FP8 capacity decision
         # unnecessarily opaque.
         memory = self.runner.memory_breakdown()
+        # ``/debug/stats`` serves this profile from a cache while traffic is
+        # active.  Re-walking the full Flash-Next object graph on every scrape
+        # can hold the GIL for tens of seconds and perturb a live decode round;
+        # an explicit idle refresh remains available for operators that need
+        # post-load allocator numbers.
+        self.stats["_memory_breakdown_dbg"] = dict(memory)
         mtp_model = getattr(self.runner, "_mtp_model", None)
         mtp_mlp = getattr(mtp_model, "mlp", None)
         mtp_dtype = getattr(mtp_mlp, "expert_dtype", None)
@@ -2710,13 +2722,17 @@ class ServerEngine:
                     prefill_started_at = time.perf_counter()
                     for _slot, req in admit_now:
                         req._prefill_started_at = prefill_started_at
-                    prefill_state = self.runner.prefill_chunked_begin(
-                        new_slots,
-                        new_prompts,
-                        chunk_size=self._prefill_chunk_size,
-                        params_per_slot=params_per_slot,
-                        **prefill_kwargs,
-                    )
+                    self._admission_inflight_reqs = admit_now
+                    try:
+                        prefill_state = self.runner.prefill_chunked_begin(
+                            new_slots,
+                            new_prompts,
+                            chunk_size=self._prefill_chunk_size,
+                            params_per_slot=params_per_slot,
+                            **prefill_kwargs,
+                        )
+                    finally:
+                        self._admission_inflight_reqs = []
                     for _slot, req in admit_now:
                         _adm_phase(req, "prefill_begin")
             except Exception as exc:

@@ -265,7 +265,7 @@ SERVER_DSPARK_REQUIRE_CG = os.environ.get(
 
 
 def _apply_qwen_dspark_runtime_defaults() -> None:
-    """Install the measured DSpark knobs before the backend is constructed.
+    """Install measured Qwen scheduling knobs before backend construction.
 
     These are environment-backed because the same low-level switches are
     useful to the standalone profiling runbooks. ``setdefault`` preserves an
@@ -282,6 +282,13 @@ def _apply_qwen_dspark_runtime_defaults() -> None:
         # by default.  The loader retains F32 as its standalone bring-up
         # default, and an operator can explicitly restore it for diagnosis.
         os.environ.setdefault("QSR_GGUF_COMPUTE_DTYPE", "bf16")
+    if _FLASHNEXT_DEFAULT_PROFILE:
+        # Flash-Next's first prefill chunk is synchronous.  A short bounded
+        # admission window lets simultaneous OpenCode turns enter the same
+        # prefill batch instead of paying two cold schedules, without adding
+        # a meaningful delay to a lone request.  This is deliberately only a
+        # scheduling default; the operator can set it to 0 for strict FCFS.
+        os.environ.setdefault("QSR_ADMISSION_COALESCE_MS", "10")
     if not (SERVER_ENABLE_DSPARK or SERVER_ENABLE_DFLASH2):
         return
     gdn_prefill_backend = "fla" if is_gguf else "flashinfer"
@@ -1769,37 +1776,93 @@ async def _unhandled_exception_handler(request, exc: Exception):
 @app.get("/health")
 async def health():
     assert engine is not None
+    capacity = getattr(engine, "capacity", engine.num_slots)
+    active_generating = len(engine.active)
+    prefill_requests = _pending_prefill_count(engine)
+    waiting_requests = _waiting_request_count(engine)
     return {
         "status": "ok",
-        "capacity": engine.capacity,
+        "capacity": capacity,
         "free_slots": len(engine.free_slots),
-        "active": len(engine.active),
-        "waiting": len(engine.waiting),
+        # A long chunked prefill owns a slot before it is promoted to
+        # ``engine.active``.  Count it here so health never reports an idle
+        # GPU while a request is spending tens of seconds in prefill.
+        "active": active_generating + prefill_requests,
+        "active_generating": active_generating,
+        "prefill": prefill_requests,
+        "occupied_slots": capacity - len(engine.free_slots),
+        "waiting": waiting_requests,
     }
 
 
 @app.get("/debug/stats")
-async def debug_stats():
+async def debug_stats(refresh_memory: bool = False):
     # The collection below walks the backend's full object graph
     # (``memory_breakdown``) and can take tens of seconds.  Running it on the
     # event loop froze EVERY endpoint -- including in-flight streaming chat
     # responses -- for the duration of one scrape (measured 37 s on the live
-    # Flash-Next server, with /health unresponsive throughout).  Off-load it
-    # to a worker thread so the loop keeps serving while the debug snapshot
-    # is being built.
-    return await asyncio.to_thread(_collect_debug_stats)
+    # Flash-Next server, with /health unresponsive throughout).  It is now a
+    # startup-cached, explicit-refresh diagnostic: normal scrapes never walk
+    # the object graph, and a refresh requested while the engine is busy is
+    # skipped rather than contending with GPU work.  The worker thread is
+    # retained for the one explicit idle refresh and for compatibility with
+    # the existing slow-runner regression test.
+    return await asyncio.to_thread(_collect_debug_stats, refresh_memory=refresh_memory)
 
 
-def _collect_debug_stats() -> dict:
+def _pending_prefill_count(engine_ref) -> int:
+    """Return requests currently occupying slots in chunked prefill.
+
+    ``ServerEngine`` deliberately keeps a request out of ``active`` until
+    its first anchor is available.  The pending list is therefore the
+    authoritative occupancy signal for the admission-to-activation gap.
+    Keep this helper defensive for the small fake engines used by the
+    torch-free endpoint tests.
+    """
+    pending = (
+        getattr(engine_ref, "_pending_prefill_reqs", ())
+        if getattr(engine_ref, "_pending_prefill", None) is not None
+        else ()
+    )
+    inflight = getattr(engine_ref, "_admission_inflight_reqs", ()) or ()
+    # The two lists overlap for only a tiny hand-off window; count distinct
+    # slots so a scrape cannot report one request twice.
+    slots = {slot for slot, _req in (*pending, *inflight)}
+    return len(slots)
+
+
+def _waiting_request_count(engine_ref) -> int:
+    """Count both drained and not-yet-drained request queues."""
+    waiting = len(getattr(engine_ref, "waiting", ()) or ())
+    incoming = len(getattr(engine_ref, "_req_deque", ()) or ())
+    return waiting + incoming
+
+
+def _engine_has_work(engine_ref) -> bool:
+    """Whether a debug snapshot would contend with serving work."""
+    return bool(
+        getattr(engine_ref, "active", None)
+        or getattr(engine_ref, "waiting", None)
+        or getattr(engine_ref, "_req_deque", None)
+        or getattr(engine_ref, "_pending_prefill", None) is not None
+        or getattr(engine_ref, "_admission_inflight_reqs", None)
+    )
+
+
+def _collect_debug_stats(*, refresh_memory: bool = False) -> dict:
     """Non-standard, this-project-only endpoint: exposes the engine's own
     round/admission counters so the E2E validation script (and any curious
     human) can directly confirm real multi-request batching happened
     (``admission_batch_sizes``/``round_batch_sizes`` containing entries
     > 1), rather than inferring it indirectly from timing alone."""
     assert engine is not None
+    # Work from a shallow copy.  The engine thread owns ``engine.stats`` and
+    # updates it every round; returning the live dict while the event-loop
+    # thread serializes it made a diagnostic request race with serving state.
+    stats = dict(engine.stats)
     snapshot = _backend_snapshot(engine.runner)
     if snapshot is not None:
-        engine.stats["_prefix_cache_dbg"] = {
+        stats["_prefix_cache_dbg"] = {
             f"slot_{p.slot}": {
                 "cached_len": p.cached_tokens,
                 "kv_len": p.cached_kv_len,
@@ -1817,9 +1880,9 @@ def _collect_debug_stats() -> dict:
         # yet (matches BackendSnapshot.dflash_cg_status's own "never missing"
         # contract), not omitted from the response, so a caller can
         # distinguish "no capture attempted" from "field doesn't exist".
-        engine.stats["_cuda_graph_dbg"] = dict(snapshot.dflash_cg_status)
-        engine.stats["_backend_snapshot_stats_dbg"] = dict(snapshot.runtime_stats)
-        engine.stats["_cuda_graph_fallback_reasons_dbg"] = dict(snapshot.cg_fallback_reasons)
+        stats["_cuda_graph_dbg"] = dict(snapshot.dflash_cg_status)
+        stats["_backend_snapshot_stats_dbg"] = dict(snapshot.runtime_stats)
+        stats["_cuda_graph_fallback_reasons_dbg"] = dict(snapshot.cg_fallback_reasons)
     # 2026-08-02 CG audit (docs/implementation-plan.md §7.3 C7-2, "activity
     # confirmation"): `_cuda_graph_dbg` above proves capture succeeded, not
     # that a real decode round actually replayed the captured graph instead
@@ -1833,21 +1896,38 @@ def _collect_debug_stats() -> dict:
     # counter to expose) and must not be assumed present.
     backend_stats = getattr(engine.runner, "stats", None)
     if backend_stats is not None:
-        engine.stats["_backend_stats_dbg"] = dict(backend_stats)
+        stats["_backend_stats_dbg"] = dict(backend_stats)
     # Memory probe: per-category CUDA byte accounting from the backend.  Only
     # present when the backend implements it (DeepseekV4Backend does); the
     # field is omitted entirely otherwise so this endpoint stays truthful for
     # backends that have not opted in.
     memory_breakdown = getattr(engine.runner, "memory_breakdown", None)
     if memory_breakdown is not None:
-        try:
-            engine.stats["_memory_breakdown_dbg"] = memory_breakdown()
-        except Exception:  # pragma: no cover - observability must not die
-            logger.exception("memory breakdown failed; reporting without it")
+        cached_memory = engine.stats.get("_memory_breakdown_dbg")
+        busy = _engine_has_work(engine)
+        # The server records one authoritative profile after model/graph load.
+        # Re-walking the model graph is opt-in and only allowed while idle;
+        # otherwise even an off-loop thread can hold the GIL long enough to
+        # stretch a live decode round by seconds.
+        if (refresh_memory or cached_memory is None) and not busy:
+            try:
+                fresh_memory = memory_breakdown()
+                stats["_memory_breakdown_dbg"] = fresh_memory
+                engine.stats["_memory_breakdown_dbg"] = fresh_memory
+                stats["_memory_breakdown_source"] = "refresh"
+            except Exception:  # pragma: no cover - observability must not die
+                logger.exception("memory breakdown failed; reporting without it")
+        elif cached_memory is not None:
+            stats["_memory_breakdown_dbg"] = cached_memory
+            stats["_memory_breakdown_source"] = "startup_cache"
+            if busy:
+                stats["_memory_breakdown_stale"] = True
+        elif busy:
+            stats["_memory_breakdown_skipped"] = "engine_busy"
     ple_stats = getattr(engine.runner, "ple_stats", None)
     if ple_stats is not None:
         try:
-            engine.stats["_ple_stats_dbg"] = ple_stats()
+            stats["_ple_stats_dbg"] = ple_stats()
         except Exception:  # pragma: no cover - observability must not die
             logger.exception("PLE stats failed; reporting without it")
     # Phase 0 KV capacity evidence (`.omx/plans/qwen38-dynamic-context-vllm-plan.md`):
@@ -1858,10 +1938,13 @@ def _collect_debug_stats() -> dict:
     kv_capacity = getattr(engine.runner, "kv_capacity_snapshot", None)
     if kv_capacity is not None:
         try:
-            engine.stats["_qwen_kv_capacity_dbg"] = kv_capacity()
+            stats["_qwen_kv_capacity_dbg"] = kv_capacity()
         except Exception:  # pragma: no cover - observability must not die
             logger.exception("KV capacity snapshot failed; reporting without it")
-    return engine.stats
+    stats["active_generating"] = len(engine.active)
+    stats["prefill_requests"] = _pending_prefill_count(engine)
+    stats["waiting_requests"] = _waiting_request_count(engine)
+    return stats
 
 
 @app.post("/v1/chat/completions")
@@ -2655,7 +2738,19 @@ async def metrics_endpoint():
     # LagunaBackend uses static block allocation (num_slots × blocks_per_slot),
     # not a dynamic BlockPool. Compute KV usage from active slot count.
     total_blocks = engine.num_slots * engine.blocks_per_slot
-    active_slots = len(engine.active)
+    active_generating = len(engine.active)
+    prefill_requests = _pending_prefill_count(engine)
+    pending_prefill_reqs = (
+        getattr(engine, "_pending_prefill_reqs", ())
+        if getattr(engine, "_pending_prefill", None) is not None
+        else ()
+    )
+    pending_prefill_reqs = tuple(pending_prefill_reqs) + tuple(
+        getattr(engine, "_admission_inflight_reqs", ()) or ()
+    )
+    pending_prefill_slots = {slot for slot, _req in pending_prefill_reqs}
+    running_slots = set(engine.active) | pending_prefill_slots
+    active_slots = len(running_slots)
     # This sum previously indexed the backend's own `slot_kv_len` and assumed
     # it was a mapping; it is a list, so a busy server (non-empty
     # `engine.active`) returned 500 while an idle one scraped fine. Observed
@@ -2668,14 +2763,15 @@ async def metrics_endpoint():
     else:
         by_slot = {s.slot: s.kv_len for s in snapshot.slots}
         used_blocks = sum(
-            (by_slot.get(s, 0) + engine.block_size - 1) // engine.block_size for s in engine.active
+            (by_slot.get(s, 0) + engine.block_size - 1) // engine.block_size
+            for s in running_slots
         )
         # Feed the per-slot gauge here, where the per-slot numbers already
         # exist. `record_slot_kv_usage` had zero callers, so D2's
         # `slot_kv_usage_fraction` series was exported and never populated --
         # and an empty series is omitted entirely, so it read as "no data yet"
         # rather than as a broken pipe.
-        for slot in engine.active:
+        for slot in running_slots:
             metrics.record_slot_kv_usage(
                 slot,
                 (by_slot.get(slot, 0) + engine.block_size - 1) // engine.block_size,
@@ -2683,17 +2779,25 @@ async def metrics_endpoint():
             )
     kv_usage = used_blocks / total_blocks if total_blocks > 0 else 0.0
 
-    num_running = len(engine.active)
-    num_waiting = len(engine.waiting)
+    num_running = active_generating + prefill_requests
+    num_waiting = _waiting_request_count(engine)
     num_free_slots = len(engine.free_slots)
+    occupied_slots = engine.num_slots - num_free_slots
 
     lines = [
         "# HELP blackwellm:num_requests_running Number of requests currently running.",
         "# TYPE blackwellm:num_requests_running gauge",
         f'blackwellm:num_requests_running{{model_name="{served_model}"}} {num_running}',
+        "# HELP blackwellm:num_requests_prefill Number of requests currently in chunked prefill.",
+        "# TYPE blackwellm:num_requests_prefill gauge",
+        f'blackwellm:num_requests_prefill{{model_name="{served_model}"}} {prefill_requests}',
         "# HELP blackwellm:num_requests_waiting Number of requests waiting to be processed.",
         "# TYPE blackwellm:num_requests_waiting gauge",
         f'blackwellm:num_requests_waiting{{model_name="{served_model}"}} {num_waiting}',
+        "# HELP blackwellm:num_occupied_slots Number of slots held by active, "
+        "prefill, or retained requests.",
+        "# TYPE blackwellm:num_occupied_slots gauge",
+        f'blackwellm:num_occupied_slots{{model_name="{served_model}"}} {occupied_slots}',
         "# HELP blackwellm:kv_cache_usage_perc KV cache usage percentage.",
         "# TYPE blackwellm:kv_cache_usage_perc gauge",
         f'blackwellm:kv_cache_usage_perc{{model_name="{served_model}"}} {kv_usage:.4f}',

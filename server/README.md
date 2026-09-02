@@ -48,7 +48,10 @@ add multi-model or multi-GPU routing here.
 - `GET /health` — liveness + slot occupancy.
 - `GET /debug/stats` — the engine's admission/round counters plus the P0
   prompt-prefix-overlap, P4a prefix-cache hit-rate, and P4b session-affinity
-  instrumentation.
+  instrumentation. The memory profile is served from the post-load cache while
+  traffic is active; use `GET /debug/stats?refresh_memory=true` only while the
+  engine is idle to request a fresh object-graph walk. A busy refresh is
+  skipped rather than perturbing decode.
 
 Explicit `temperature=0` remains greedy (and is the deterministic MTP escape
 hatch). For Flash-Next, omitted sampler fields follow the model-card profile:
@@ -180,6 +183,11 @@ generic `QSR_PREFILL_CHUNK` value is clamped to 1024 for this backend unless
 `QSR_FLASHNEXT_ALLOW_UNSAFE_PREFILL_CHUNK=1` is explicitly set for a numerical
 experiment; larger chunks currently change recurrent/MoE reduction order and
 are not production-safe.
+
+Simultaneous idle requests use a bounded 10 ms admission-coalesce window so
+their first synchronous prefill chunk can be batched. Set
+`QSR_ADMISSION_COALESCE_MS=0` only when strict first-arrival scheduling is
+needed; the window never applies while decode or an existing prefill is active.
 
 Flash-Next target verify batches the large GDN projections across the fixed
 `K+1` verify rows by default for the validated `qwen4_exp` checkpoint
