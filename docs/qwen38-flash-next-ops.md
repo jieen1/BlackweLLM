@@ -72,7 +72,9 @@ export QSR_FLASHNEXT_MTP_SPARSE_GRAPH=1
 export QSR_FLASHNEXT_PLE_CACHE_ROWS=4194304
 export QSR_FLASHNEXT_PLE_IO=io_uring
 export QSR_FLASHNEXT_PLE_IO_WORKERS=32
-export QSR_FLASHNEXT_QSA_TOPK_RERANK=0
+# Native QSA top-k emits an unordered set; keep score-order reranking enabled
+# unless running an explicit performance-only A/B experiment.
+export QSR_FLASHNEXT_QSA_TOPK_RERANK=1
 export QSR_FLASHNEXT_HC_NORM_FUSION=0
 export QSR_FLASHNEXT_HC_NORM_APPLY_FUSION=1
 export QSR_FLASHNEXT_HC_POINTWISE_FUSION=1
@@ -125,6 +127,23 @@ curl -N http://127.0.0.1:8300/v1/chat/completions \
 旧计时字段当作端到端基线。性能对比必须使用相同 prompt、上下文长度、输出长度
 和启动 profile，并按 `docs/diagnostics-guide.md` 先做 `bf diff`。
 
+### 默认采样参数
+
+服务不会把 Qwen3.8 Flash-Next 的省略参数错误地降成贪心温度 0。根据
+[官方模型卡](https://huggingface.co/Qwen/Qwen3.8-Flash-Next#recommended-sampling-parameters)，
+默认思考模式使用 `temperature=1.0, top_p=0.95, top_k=20`；请求显式
+关闭思考（`reasoning_effort=none`、`enable_thinking=false` 或等价的
+`chat_template_kwargs`）时使用非思考/指令模式的
+`temperature=0.7, top_p=0.80, top_k=20`。客户端显式提供的每个字段都会覆盖对应
+默认值，因此需要确定性输出时仍可传 `temperature=0`。当前 runtime 暴露的采样
+字段只有这三项；模型卡中的 `min_p`、presence penalty 和 repetition penalty
+尚未作为 runtime 采样字段实现，不能假装已经生效。
+
+Prefix cache 的 admission key 会同时携带 `sampled`/`greedy` 解码契约。采样请求
+会保存 target-only checkpoint，并可在相同 token 前缀上完整恢复；greedy/MTP 请求
+只接受带 MTP 状态的 checkpoint，绝不会误恢复 sampled checkpoint。两种模式的
+缓存因此不会互相污染，但仍要求 token 前缀和视觉 cache key 完全一致。
+
 ## OpenCode / Windows 客户端
 
 OpenCode provider 的最小配置如下，模型名使用服务实际暴露的
@@ -134,11 +153,15 @@ OpenCode provider 的最小配置如下，模型名使用服务实际暴露的
 {
   "$schema": "https://opencode.ai/config.json",
   "compaction": {
-    "reserved": 32003
+    "auto": true,
+    "prune": true,
+    "reserved": 32003,
+    "preserve_recent_tokens": 12000,
+    "tail_turns": 15
   },
   "provider": {
     "blackwellm": {
-      "npm": "@ai-sdk/openai",
+      "npm": "@ai-sdk/openai-compatible",
       "options": { "baseURL": "http://127.0.0.1:8300/v1" },
       "models": {
         "qwen3.8-flash-next": {
@@ -157,6 +180,7 @@ OpenCode provider 的最小配置如下，模型名使用服务实际暴露的
           },
           "limit": {
             "context": 262144,
+            "input": 262144,
             "output": 32000
           }
         }
@@ -166,6 +190,27 @@ OpenCode provider 的最小配置如下，模型名使用服务实际暴露的
   "model": "blackwellm/qwen3.8-flash-next"
 }
 ```
+
+这里使用 `@ai-sdk/openai-compatible`，因为本地服务的稳定入口是
+`/v1/chat/completions`；不要把它替换成会优先走 `/v1/responses` 的
+`@ai-sdk/openai`。`limit.input` 必须保留为 `262144`：OpenCode 1.18.25 的
+V1 overflow 公式是 `input - compaction.reserved`，因此当前配置得到
+`262144 - 32003 = 230141`，正好对齐服务 `/v1/models` 的安全输入上限（其中
+32000 是最大输出，3 是 MTP speculative tail）。不要把 `input` 改成
+`230141`，否则会提前丢掉 32003 个可用上下文 token。
+
+服务的流式结束 chunk 也会携带 `usage.prompt_tokens`、
+`usage.completion_tokens` 和 `usage.total_tokens`；这是 OpenCode 判断
+overflow 并触发自动压缩所需的协议字段。若自定义代理剥离了该字段，OpenCode
+会把该轮 token 记为 0，自动压缩就无法按上下文增长触发。
+
+Flash-Next 默认将 `preserve_thinking` 设为 `false`。OpenCode 会把上一轮的
+`reasoning_content` 原样回传；而该模型模板默认会把所有历史 reasoning 再放回
+新的 `<think>` 块，长工具会话会因此反复进入同一段思路。需要完整保留隐藏推理
+历史时，可在请求的 `chat_template_kwargs` 中显式设置
+`{"preserve_thinking": true}`，或在服务启动前设置
+`QSR_FLASHNEXT_PRESERVE_THINKING=1`。这不会关闭当前轮思考，只移除旧轮的隐藏
+reasoning；`reasoning_effort` 仍照常生效。
 
 Flash-Next tokenizer 原生支持 `low`、`medium`、`xhigh`；OpenCode 的
 `minimal`/`high`/`max` 是 runtime 在请求边界归一化的别名。修改 Windows

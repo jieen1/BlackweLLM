@@ -48,6 +48,8 @@ class RequestTrace:
     prefill_done_at: float = 0.0
     finished_at: float = 0.0
     finish_reason: str = ""
+    terminal_token_id: int | None = None
+    finish_source: str = ""
     prefill_ms: float = 0.0
     total_rounds: int = 0
     total_tokens: int = 0
@@ -95,6 +97,8 @@ class RequestTrace:
             "avg_round_ms": round(self.avg_round_ms, 2),
             "tokens_per_sec": round(self.tokens_per_sec, 1),
             "finish_reason": self.finish_reason,
+            "terminal_token_id": self.terminal_token_id,
+            "finish_source": self.finish_source,
             # Bounded by RequestTracer.max_rounds_per_trace (500). Keeping
             # the already-recorded rows visible is essential for separating
             # a one-round cold-start anomaly from sustained MTP rejection;
@@ -185,7 +189,14 @@ class RequestTracer:
             if len(trace.decode_rounds) < self.max_rounds_per_trace:
                 trace.decode_rounds.append((round_idx, tokens_committed, round_ms))
 
-    def request_finished(self, request_id: str, finish_reason: str) -> None:
+    def request_finished(
+        self,
+        request_id: str,
+        finish_reason: str,
+        *,
+        terminal_token_id: int | None = None,
+        finish_source: str | None = None,
+    ) -> None:
         """Called when a request completes (stop/length/error)."""
         if not self.enabled:
             return
@@ -195,6 +206,8 @@ class RequestTracer:
                 return
             trace.finished_at = time.perf_counter()
             trace.finish_reason = finish_reason
+            trace.terminal_token_id = terminal_token_id
+            trace.finish_source = finish_source or finish_reason
             self._completed.append(trace)
             if trace.total_ms >= self.slow_threshold_ms:
                 self._slow.append(trace)

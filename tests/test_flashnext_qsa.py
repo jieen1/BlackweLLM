@@ -587,6 +587,28 @@ def test_qsa_mqa_block_q_avoids_decode_padding():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_native_qsa_topk_is_score_ordered_by_default(monkeypatch):
+    """The unordered SM120 set must be reranked before sparse reduction."""
+
+    from runtime.kernels.flashnext_qsa_topk import load_native_flashnext_qsa_topk
+
+    native = load_native_flashnext_qsa_topk()
+    if native is None:
+        pytest.skip("native SM120 QSA top-k artifact is not built")
+
+    monkeypatch.delenv("QSR_FLASHNEXT_QSA_TOPK_RERANK", raising=False)
+    indexer = QSAIndexer()
+    torch.manual_seed(2026)
+    logits = torch.randn(1, 1024, device="cuda", dtype=torch.float32)
+    ends = torch.tensor([1024], device="cuda", dtype=torch.int64)
+    expected = torch.topk(logits, 512, dim=-1).indices
+
+    for _ in range(3):
+        got = indexer.select_blocks(logits, ends)
+        torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_native_qsa_topk_handles_a_broad_coarse_bin():
     """The radix selector must not drop indices when the half-float bin is wide."""
 

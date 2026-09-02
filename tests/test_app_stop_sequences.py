@@ -149,6 +149,49 @@ def _patch_common(monkeypatch, server_app, engine):
 
 
 class TestOpenAIStopWiring:
+    def test_flashnext_omitted_sampler_uses_thinking_profile(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        from server import app as server_app
+
+        engine = _CapturingEngine()
+        engine.backend_name = "flashnext"
+        _patch_common(monkeypatch, server_app, engine)
+        client = TestClient(server_app.app)
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 8,
+            },
+        )
+        assert resp.status_code == 200
+        params = engine.submit_calls[-1]["sampling_params"]
+        assert (params.temperature, params.top_p, params.top_k) == (1.0, 0.95, 20)
+
+    def test_flashnext_none_effort_uses_instruct_profile(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        from server import app as server_app
+
+        engine = _CapturingEngine()
+        engine.backend_name = "flashnext"
+        _patch_common(monkeypatch, server_app, engine)
+        client = TestClient(server_app.app)
+
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 8,
+                "reasoning_effort": "none",
+            },
+        )
+        assert resp.status_code == 200
+        params = engine.submit_calls[-1]["sampling_params"]
+        assert (params.temperature, params.top_p, params.top_k) == (0.7, 0.80, 20)
+
     def test_string_stop_normalized_and_threaded_to_engine(self, monkeypatch):
         from fastapi.testclient import TestClient
 
@@ -220,6 +263,43 @@ class TestOpenAIStopWiring:
             for _ in resp.iter_lines():
                 pass
         assert engine.submit_stream_calls[-1]["stop_sequences"] == ["STOP"]
+
+    def test_streaming_chat_completion_reports_usage_for_compaction(self, monkeypatch):
+        """Streaming usage must reach clients that drive context compaction.
+
+        OpenCode's overflow guard consumes the provider usage attached to the
+        terminal stream chunk.  The chunk keeps its normal choice payload so
+        existing OpenAI clients that inspect every chunk continue to work.
+        """
+        from fastapi.testclient import TestClient
+
+        from server import app as server_app
+
+        engine = _CapturingEngine()
+        _patch_common(monkeypatch, server_app, engine)
+        client = TestClient(server_app.app)
+
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        ) as resp:
+            payloads = []
+            for line in resp.iter_lines():
+                if line.startswith("data: ") and line != "data: [DONE]":
+                    payloads.append(json.loads(line[len("data: ") :]))
+
+        usage_chunks = [payload for payload in payloads if payload.get("usage")]
+        assert len(usage_chunks) == 1
+        assert usage_chunks[0]["choices"][0]["finish_reason"] == "stop"
+        assert usage_chunks[0]["usage"] == {
+            "prompt_tokens": 1,
+            "completion_tokens": 2,
+            "total_tokens": 3,
+        }
 
 
 class TestAnthropicStopSequencesWiring:

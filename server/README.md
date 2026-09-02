@@ -50,10 +50,14 @@ add multi-model or multi-GPU routing here.
   prompt-prefix-overlap, P4a prefix-cache hit-rate, and P4b session-affinity
   instrumentation.
 
-Decoding is greedy (DSpark/MTP verify requires a greedy match). `n != 1` is a
-clean 400. A request whose `prompt + max_tokens + K` would exceed the per-slot
-capacity is rejected with a clean 400 BEFORE it reaches the runtime (this is
-what keeps the server from triggering the known whole-batch attention crash).
+Explicit `temperature=0` remains greedy (and is the deterministic MTP escape
+hatch). For Flash-Next, omitted sampler fields follow the model-card profile:
+thinking uses `temperature=1.0, top_p=0.95, top_k=20`, while non-thinking uses
+`temperature=0.7, top_p=0.80, top_k=20`; an explicitly supplied field always
+wins. `n != 1` is a clean 400. A request whose `prompt + max_tokens + K` would
+exceed the per-slot capacity is rejected with a clean 400 BEFORE it reaches the
+runtime (this is what keeps the server from triggering the known whole-batch
+attention crash).
 Non-streaming responses carry non-standard `debug_committed_token_ids` /
 `debug_prompt_token_ids`, used solely by `benchmarks/server_e2e_check.py`
 (real clients ignore them).

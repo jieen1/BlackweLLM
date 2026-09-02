@@ -48,6 +48,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _UNCACHEABLE_VISION_PREFIX_KEY = "<uncacheable-vision-prefix>"
+_PREFIX_CACHE_MODE_MARKER = "<flashnext-prefix-cache-mode>"
+_PREFIX_CACHE_TEXT_KEY = "<text-prefix>"
 
 
 def _flashnext_gdn_projection_mode(model: FlashNextModel) -> str:
@@ -442,6 +444,49 @@ class FlashNextBackend:
             return (_UNCACHEABLE_VISION_PREFIX_KEY,)
         return keys
 
+    @classmethod
+    def prefix_cache_key_for_sampling(
+        cls,
+        vision_cache_key: tuple[str, ...] | None,
+        *,
+        sampled: bool,
+    ) -> tuple[str, ...]:
+        """Add the decode contract to the admission-time cache key.
+
+        A target-only checkpoint produced by sampled decode is safe for a
+        sampled continuation, but it does not contain the MTP state required
+        by a greedy continuation.  The scheduler reconciles prefixes before
+        calling ``prefill_chunked_begin``; carrying this small mode marker in
+        the existing opaque key lets the backend enforce that boundary
+        without changing the shared coordinator ABI.
+        """
+        mode = "sampled" if sampled else "greedy"
+        vision_parts = vision_cache_key or (_PREFIX_CACHE_TEXT_KEY,)
+        return (_PREFIX_CACHE_MODE_MARKER, mode, *vision_parts)
+
+    @staticmethod
+    def _split_prefix_cache_key(
+        prefix_cache_key: object | None,
+    ) -> tuple[str | None, tuple[str, ...] | None]:
+        """Return ``(decode_mode, vision_key)`` from an admission cache key.
+
+        Direct backend callers and older tests pass the original vision key;
+        those retain the conservative pre-sampled behaviour (``mode=None``).
+        """
+        if isinstance(prefix_cache_key, tuple) and len(prefix_cache_key) >= 3:
+            if (
+                prefix_cache_key[0] == _PREFIX_CACHE_MODE_MARKER
+                and prefix_cache_key[1] in {"greedy", "sampled"}
+            ):
+                raw_vision = tuple(str(item) for item in prefix_cache_key[2:])
+                vision_key = None if raw_vision == (_PREFIX_CACHE_TEXT_KEY,) else raw_vision
+                return str(prefix_cache_key[1]), vision_key
+        if prefix_cache_key is None:
+            return None, None
+        if isinstance(prefix_cache_key, tuple):
+            return None, tuple(str(item) for item in prefix_cache_key)
+        return None, (str(prefix_cache_key),)
+
     @staticmethod
     def _vision_cache_matches(
         current: tuple[str, ...] | None,
@@ -563,14 +608,20 @@ class FlashNextBackend:
         entry = entries[slot]
         if entry is None or not entry.token_ids:
             return PrefixHit(kv_hit=0, state_hit=0)
-        if not self._vision_cache_matches(prefix_cache_key, entry.vision_cache_key):
+        cache_mode, vision_cache_key = self._split_prefix_cache_key(prefix_cache_key)
+        if not self._vision_cache_matches(vision_cache_key, entry.vision_cache_key):
             return PrefixHit(kv_hit=0, state_hit=0)
         specs = getattr(self, "_specs", ())
-        if slot < len(specs) and specs[slot] is not None and not entry.mtp_ready:
-            # The scheduler cannot pass sampling mode into reconciliation.
-            # When the backend owns an MTP session, publish only checkpoints
-            # carrying its causal prefix so a later greedy admission can never
-            # restore target/GDN state without the matching speculative cache.
+        if (
+            slot < len(specs)
+            and specs[slot] is not None
+            and not entry.mtp_ready
+            and cache_mode != "sampled"
+        ):
+            # A target-only checkpoint is valid for sampled decode, but a
+            # greedy request must never restore it: greedy admission needs the
+            # matching MTP causal prefix as well.  ``cache_mode=None`` keeps
+            # direct legacy callers conservative.
             return PrefixHit(kv_hit=0, state_hit=0)
         limit = min(len(token_ids), entry.kv_len)
         if tuple(token_ids[:limit]) != entry.token_ids[:limit]:
@@ -687,14 +738,19 @@ class FlashNextBackend:
         sess.rope_next = entry.rope_next.detach().clone() if entry.rope_next is not None else None
         spec = self._specs[slot]
         if spec is not None:
-            if not entry.mtp_ready:
-                raise RuntimeError("Flash-Next prefix checkpoint is missing MTP state")
-            mtp_sess = spec.mtp_session
-            mtp_sess.sync_len = entry.mtp_sync_len
-            mtp_sess.pos = entry.mtp_pos
-            # Any previous verify candidate is invalid after a slot reset;
-            # the next proposal overwrites it before use.
-            spec.verify._last_tokens = None  # noqa: SLF001 - lifecycle reset
+            if entry.mtp_ready:
+                mtp_sess = spec.mtp_session
+                mtp_sess.sync_len = entry.mtp_sync_len
+                mtp_sess.pos = entry.mtp_pos
+                # Any previous verify candidate is invalid after a slot reset;
+                # the next proposal overwrites it before use.
+                spec.verify._last_tokens = None  # noqa: SLF001 - lifecycle reset
+            else:
+                # Sampled decode uses only the target state.  The slot reset
+                # intentionally retained fixed-address pools for the target;
+                # clear the stale speculative pools before the next sampled
+                # request so a later mode switch cannot observe them.
+                self._reset_mtp_state(spec, clear_cache=True)
         self.stats["prefix_cache_restores"] = self.stats.get("prefix_cache_restores", 0) + 1
 
     def _prepare_prefill_prefix(
@@ -1112,8 +1168,8 @@ class FlashNextBackend:
             raise ValueError(
                 f"prompt length {len(prompt_ids)} exceeds max_seq_len={self.max_seq_len}"
             )
-        prefix_cache_key = self.prefix_cache_key_for_vision_inputs(vision_inputs)
-        cacheable_vision = prefix_cache_key != (_UNCACHEABLE_VISION_PREFIX_KEY,)
+        vision_cache_key = self.prefix_cache_key_for_vision_inputs(vision_inputs)
+        cacheable_vision = vision_cache_key != (_UNCACHEABLE_VISION_PREFIX_KEY,)
         if vision_inputs is not None and not cacheable_vision:
             # Token ids alone do not authenticate image pixels.  Do not reuse
             # a text prefix for a multimodal request (or publish one for a
@@ -1124,10 +1180,14 @@ class FlashNextBackend:
             prefix_hit, prefix_entry = 0, None
             self._reset_runtime(slot, preserve_prefix=False)
         else:
+            request_cache_key = self.prefix_cache_key_for_sampling(
+                vision_cache_key,
+                sampled=params is not None and not params.is_greedy,
+            )
             prefix_hit, prefix_entry = self._prepare_prefill_prefix(
                 slot,
                 prompt_ids,
-                prefix_cache_key=prefix_cache_key,
+                prefix_cache_key=request_cache_key,
             )
         suffix_ids = prompt_ids[prefix_hit:]
         target = self._targets[slot]
@@ -1314,14 +1374,18 @@ class FlashNextBackend:
         self._slot_tokens[slot] = list(prompt_ids)
         self._last_logits[slot] = logits
         greedy_mtp = spec is not None and (params is None or params.is_greedy)
-        if cacheable_vision and (spec is None or greedy_mtp):
+        # Target-only checkpoints are useful for sampled decode too.  Their
+        # admission key carries ``sampled`` and the matcher refuses them for
+        # greedy/MTP requests, so publishing them here cannot cross the state
+        # family boundary.
+        if cacheable_vision:
             self._capture_prefix_snapshot(
                 slot,
                 prompt_ids,
                 anchor=anchor,
                 draft_tokens=drafts,
                 anchor_logits=logits,
-                vision_cache_key=prefix_cache_key,
+                vision_cache_key=vision_cache_key,
                 mtp_ready=spec is not None and greedy_mtp,
             )
         self.stats["prefill_requests"] += 1

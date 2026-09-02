@@ -416,6 +416,44 @@ def test_flashnext_visual_prefix_cache_key_must_match() -> None:
     )
 
 
+def test_flashnext_sampled_prefix_key_allows_target_only_checkpoint() -> None:
+    backend = object.__new__(FlashNextBackend)
+    backend.enable_prefix_cache = True
+    backend.num_slots = 1
+    backend._prefix_cache = [
+        FlashNextPrefixSnapshot(
+            token_ids=(301, 302, 303),
+            kv_len=3,
+            gdn={},
+            ple_conv_state=None,
+            rope_next=None,
+            window=(),
+            anchor=304,
+            draft_tokens=(),
+            anchor_logits=torch.tensor([0.3, 0.7]),
+            vision_cache_key=None,
+            mtp_ready=False,
+        )
+    ]
+    backend._specs = [object()]
+
+    assert backend._prefix_hit_for_slot([301, 302, 303, 305], 0).effective == 0
+    sampled_key = backend.prefix_cache_key_for_sampling(None, sampled=True)
+    greedy_key = backend.prefix_cache_key_for_sampling(None, sampled=False)
+    assert (
+        backend._prefix_hit_for_slot(
+            [301, 302, 303, 305], 0, prefix_cache_key=sampled_key
+        ).effective
+        == 3
+    )
+    assert (
+        backend._prefix_hit_for_slot(
+            [301, 302, 303, 305], 0, prefix_cache_key=greedy_key
+        ).effective
+        == 0
+    )
+
+
 def test_flashnext_shift_teacher_force_embeds_handles_overlap() -> None:
     backend = object.__new__(FlashNextBackend)
     backend.device = torch.device("cpu")

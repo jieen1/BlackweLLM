@@ -9,7 +9,9 @@ Capabilities (B1/C1 采样全链路 + streaming + tool calling):
   ``POST /v1/messages`` (Anthropic format).
 - Streaming (SSE) and non-streaming responses.
 - Full sampling: temperature, top_p, top_k, seed (``runtime/sampling.py``).
-  ``temperature == 0`` selects greedy with MTP speculative verification.
+  Explicit ``temperature == 0`` selects greedy; omitted sampler fields use the
+  loaded model's profile (Qwen3.8 Flash-Next follows the official thinking vs
+  non-thinking recommendations).
 - Tool calling via chat template (``convert_tools_to_chat_template``).
 - Configurable capacity (default 4 slots, 256K context per slot).
 - Prefix cache with session affinity for warm multi-turn.
@@ -124,6 +126,18 @@ def _is_qwen36_family_model(model_path: str) -> bool:
 _FLASHNEXT_DEFAULT_PROFILE = _is_flashnext_model(SERVER_MODEL_PATH)
 _QWEN_DSPARK_DEFAULT_PROFILE = _is_qwen36_family_model(SERVER_MODEL_PATH)
 _QWEN_DSPARK_POOL_BYTES = 19_629_342_720
+
+# Qwen3.8-Flash-Next publishes separate sampler recommendations for its two
+# template modes.  Keep these at the API boundary rather than changing
+# ``SamplingParams``'s constructor defaults: direct runtime callers and the
+# legacy Laguna/Qwen36 paths still rely on an explicit greedy default, while a
+# Flash-Next request with omitted fields must not silently become temperature
+# zero.  The model card also recommends min_p/presence/repetition penalties;
+# this runtime currently exposes only temperature/top_p/top_k, so only the
+# supported fields are resolved here and client-supplied values still win.
+_LEGACY_SAMPLING_DEFAULTS: tuple[float, float, int] = (0.0, 1.0, 0)
+_FLASHNEXT_THINKING_SAMPLING_DEFAULTS: tuple[float, float, int] = (1.0, 0.95, 20)
+_FLASHNEXT_INSTRUCT_SAMPLING_DEFAULTS: tuple[float, float, int] = (0.7, 0.80, 20)
 
 SERVER_CAPACITY = int(
     os.environ.get(
@@ -409,6 +423,20 @@ _FLASHNEXT_REASONING_EFFORT_ALIASES = {
 _QWEN_UNSUPPORTED_REASONING_EFFORTS = frozenset({"high", "xhigh", "max"})
 
 
+def _flashnext_preserve_thinking_default() -> bool:
+    """Return whether Flash-Next should replay old hidden reasoning by default.
+
+    OpenCode sends assistant ``reasoning_content`` back in every subsequent
+    request.  Flash-Next's template wraps that field in a new ``<think>``
+    block when ``preserve_thinking`` is true; replaying a long tool history
+    can therefore make a continuation deterministically re-enter the same
+    plan.  Keep the safer, context-efficient policy as the default while
+    retaining an explicit opt-in for clients that need full hidden-history
+    replay.
+    """
+    return os.environ.get("QSR_FLASHNEXT_PRESERVE_THINKING", "0") != "0"
+
+
 def _default_served_model_name(engine_ref) -> str:
     """Return the stable public model id, independent of snapshot paths."""
     configured = os.environ.get("QSR_SERVED_MODEL_NAME")
@@ -551,6 +579,17 @@ def _resolve_engine_chat_template_kwargs(
                     if key in thinking
                 },
             }
+        # OpenCode echoes every prior ``reasoning_content`` field.  The
+        # shipped Flash-Next template defaults ``preserve_thinking`` to true,
+        # which feeds those hidden plans back into the next generation prompt
+        # and is the direct cause of the observed repeated-thinking loop.
+        # Drop historical reasoning by default; an explicit request kwarg or
+        # QSR_FLASHNEXT_PRESERVE_THINKING=1 remains an escape hatch.
+        if not chat_template_kwargs or "preserve_thinking" not in chat_template_kwargs:
+            chat_template_kwargs = dict(chat_template_kwargs or {})
+            chat_template_kwargs["preserve_thinking"] = (
+                _flashnext_preserve_thinking_default()
+            )
     resolved = _resolve_chat_template_kwargs(
         chat_template_kwargs,
         reasoning_effort=reasoning_effort,
@@ -560,11 +599,13 @@ def _resolve_engine_chat_template_kwargs(
     )
     if DEBUG_REQUESTS and backend_name in {"qwen36", "flashnext"}:
         logger.info(
-            "Qwen reasoning effort resolved: backend=%s requested=%r effective=%r thinking=%r",
+            "Qwen reasoning resolved: backend=%s requested=%r effective=%r "
+            "thinking=%r preserve_history=%r",
             backend_name,
             requested_effort,
             resolved.get("reasoning_effort") if resolved else None,
             resolved.get("enable_thinking") if resolved else None,
+            resolved.get("preserve_thinking") if resolved else None,
         )
     return resolved
 
@@ -1265,17 +1306,49 @@ def _invalid_request(
     )
 
 
+def _sampling_defaults_for_request(
+    engine_ref,
+    chat_template_kwargs: dict | None = None,
+) -> tuple[float, float, int]:
+    """Return sampler defaults for the loaded model and template mode.
+
+    Qwen3.8 Flash-Next runs in thinking mode unless the chat template is
+    explicitly switched off.  Its model card recommends ``(1.0, 0.95, 20)``
+    for thinking and ``(0.7, 0.80, 20)`` for instruct/non-thinking.  Resolve
+    this only when the request omitted an individual field; callers can still
+    override temperature, top-p, or top-k independently in
+    :func:`_build_sampling_params`.
+
+    ``SERVER_MODEL_PATH`` is only a pre-load hint.  Once an engine exists its
+    resolved backend name is authoritative, which prevents a stale launcher
+    hint from applying Flash-Next sampling to a Qwen36 or Laguna engine.
+    """
+    backend_name = getattr(engine_ref, "backend_name", None)
+    is_flashnext = backend_name == "flashnext" or (
+        backend_name is None and _FLASHNEXT_DEFAULT_PROFILE
+    )
+    if not is_flashnext:
+        return _LEGACY_SAMPLING_DEFAULTS
+    if chat_template_kwargs and chat_template_kwargs.get("enable_thinking") is False:
+        return _FLASHNEXT_INSTRUCT_SAMPLING_DEFAULTS
+    return _FLASHNEXT_THINKING_SAMPLING_DEFAULTS
+
+
 def _build_sampling_params(
     temperature: float | None = None,
     top_p: float | None = None,
     top_k: int | None = None,
     seed: int | None = None,
     n: int | None = None,
+    *,
+    defaults: tuple[float, float, int] | None = None,
 ) -> SamplingParams:
     """Validate and build SamplingParams from API request fields.
 
-    ``temperature == 0`` (or ``None``) selects greedy decode. Both greedy
-    and ``temperature > 0`` (true sampling) get MTP speculative
+    Explicit ``temperature == 0`` selects greedy decode. An omitted field
+    uses ``defaults`` (the legacy fallback is greedy; the Flash-Next HTTP
+    adapters pass the model-card profile for the request's thinking mode).
+    Both greedy and ``temperature > 0`` (true sampling) get MTP speculative
     verification when the backend has DFlash enabled -- E2-b
     (docs/e2e-and-quality-plan.md §2.2) closed the gap where sampling used
     to silently fall back to non-speculative autoregressive decode
@@ -1289,13 +1362,16 @@ def _build_sampling_params(
         raise _invalid_request(
             f"n={n!r} is not supported: only a single completion (n=1) per request."
         )
-    temp = temperature if temperature is not None else 0.0
+    default_temperature, default_top_p, default_top_k = (
+        defaults if defaults is not None else _LEGACY_SAMPLING_DEFAULTS
+    )
+    temp = temperature if temperature is not None else default_temperature
     if temp < 0:
         raise _invalid_request(f"temperature must be >= 0, got {temp}")
-    resolved_top_p = top_p if top_p is not None else 1.0
+    resolved_top_p = top_p if top_p is not None else default_top_p
     if not (0.0 < resolved_top_p <= 1.0):
         raise _invalid_request(f"top_p must be in (0, 1], got {resolved_top_p}")
-    resolved_top_k = top_k if top_k is not None else 0
+    resolved_top_k = top_k if top_k is not None else default_top_k
     if resolved_top_k < 0:
         raise _invalid_request(f"top_k must be >= 0, got {resolved_top_k}")
     return SamplingParams(
@@ -1521,14 +1597,14 @@ def _reject_unsupported_response_format(response_format: dict | None) -> None:
     - the plain eager ``if params.is_greedy: argmax(...)`` shortcut in
       ``decode_batch_sampled`` (bypasses ``sample_from_logits`` entirely).
 
-    Since this runtime's default temperature is 0.0 (greedy) when a client
-    doesn't set one explicitly, EVERY one of those unreachable paths is
-    exactly the path a typical "give me guaranteed JSON" request (no
-    explicit temperature) takes, for every token including the first.
-    Wiring only the narrow reachable slice (temperature > 0, decode tokens
-    2+) would silently leave the common/default case completely
-    unconstrained while looking wired-in -- the same silent-failure shape
-    this check exists to eliminate, just relocated. Reject loudly instead.
+    Legacy/Laguna requests still default to temperature 0.0 (greedy) when a
+    client does not set one explicitly.  Flash-Next requests instead resolve
+    the model-card sampler profile at the API boundary, but structured-output
+    masking is still absent for either profile.  Wiring only the narrow
+    reachable slice (temperature > 0, decode tokens 2+) would silently leave
+    the common/default case unconstrained while looking wired-in -- the same
+    silent-failure shape this check exists to eliminate, just relocated.
+    Reject loudly instead.
     """
     fmt = ResponseFormat.from_api(response_format)
     if fmt.is_constrained:
@@ -1792,13 +1868,6 @@ def _collect_debug_stats() -> dict:
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     assert engine is not None
-    sampling_params = _build_sampling_params(
-        temperature=req.temperature,
-        top_p=req.top_p,
-        top_k=req.top_k,
-        seed=req.seed,
-        n=req.n,
-    )
     _reject_unsupported_response_format(req.response_format)
     stop_sequences = _normalize_stop(req.stop, max_count=4)
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
@@ -1832,6 +1901,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         chat_template_kwargs,
         reasoning=req.reasoning,
         thinking=req.thinking,
+    )
+    sampling_params = _build_sampling_params(
+        temperature=req.temperature,
+        top_p=req.top_p,
+        top_k=req.top_k,
+        seed=req.seed,
+        n=req.n,
+        defaults=_sampling_defaults_for_request(engine, chat_template_kwargs),
     )
 
     try:
@@ -1988,6 +2065,22 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             visible_text, tool_calls = proc.finalize()
             if tool_calls:
                 finish = "tool_calls"
+            stream_prompt_tokens = (
+                final_result.get("prompt_tokens") if final_result else None
+            )
+            stream_completion_tokens = (
+                final_result.get("completion_tokens") if final_result else None
+            )
+            prompt_tokens = (
+                int(stream_prompt_tokens)
+                if stream_prompt_tokens is not None
+                else len(prompt_ids)
+            )
+            completion_tokens = (
+                int(stream_completion_tokens)
+                if stream_completion_tokens is not None
+                else len(proc.all_ids)
+            )
             _lp_final = None
             if req.logprobs and final_result:
                 _lp_final = _format_logprobs_openai(
@@ -2002,16 +2095,21 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 "choices": [
                     {"index": 0, "delta": {}, "finish_reason": finish, "logprobs": _lp_final}
                 ],
+                # OpenCode's compaction/overflow guard consumes usage from the
+                # streaming chunks.  Keep it on the existing terminal chunk
+                # (rather than adding an empty-choice chunk) so clients that
+                # assume every chunk has choices remain compatible.
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
             }
             yield f"data: {_json.dumps(done)}\n\n"
             metrics.record_request(
                 "chat",
-                len(prompt_ids),
-                (
-                    final_result.get("completion_tokens", len(proc.all_ids))
-                    if final_result
-                    else len(proc.all_ids)
-                ),
+                prompt_tokens,
+                completion_tokens,
                 finish,
                 time.perf_counter() - t0,
                 (first_token_t - t0) if first_token_t is not None else None,
@@ -2085,6 +2183,10 @@ async def completions(req: CompletionRequest, request: Request):
         top_k=req.top_k,
         seed=req.seed,
         n=req.n,
+        # The legacy endpoint has no chat template and therefore no thinking
+        # block; use Flash-Next's instruct/non-thinking profile when its
+        # fields are omitted.
+        defaults=_sampling_defaults_for_request(engine, {"enable_thinking": False}),
     )
     _reject_unsupported_response_format(req.response_format)
     stop_sequences = _normalize_stop(req.stop, max_count=4)
@@ -2834,12 +2936,6 @@ async def anthropic_messages(request: Request):
     max_tokens = _validate_and_resolve_max_tokens(body.get("max_tokens"))
     model_name = body.get("model") or _default_served_model_name(engine)
     stream = body.get("stream", False)
-    sampling_params = _build_sampling_params(
-        temperature=body.get("temperature"),
-        top_p=body.get("top_p"),
-        top_k=body.get("top_k"),
-        seed=body.get("seed"),
-    )
     # Anthropic's stop_sequences has no documented count limit (unlike
     # OpenAI's stop, capped at 4) -- see _normalize_stop's docstring.
     stop_sequences = _normalize_stop(body.get("stop_sequences"))
@@ -2874,6 +2970,13 @@ async def anthropic_messages(request: Request):
         chat_template_kwargs,
         reasoning=body.get("reasoning"),
         thinking=anthropic_thinking,
+    )
+    sampling_params = _build_sampling_params(
+        temperature=body.get("temperature"),
+        top_p=body.get("top_p"),
+        top_k=body.get("top_k"),
+        seed=body.get("seed"),
+        defaults=_sampling_defaults_for_request(engine, chat_template_kwargs),
     )
 
     try:
@@ -3127,12 +3230,6 @@ async def responses_api(request: Request):
     truncation_mode = str(body.get("truncation") or "disabled")
     model_name = body.get("model") or _default_served_model_name(engine)
     stream = body.get("stream", False)
-    sampling_params = _build_sampling_params(
-        temperature=body.get("temperature"),
-        top_p=body.get("top_p"),
-        top_k=body.get("top_k"),
-        seed=body.get("seed"),
-    )
     chat_messages = responses_format.parse_input(body)
     if not chat_messages:
         raise _invalid_request("no messages provided")
@@ -3159,6 +3256,13 @@ async def responses_api(request: Request):
         chat_template_kwargs,
         reasoning=response_reasoning,
         thinking=body.get("thinking"),
+    )
+    sampling_params = _build_sampling_params(
+        temperature=body.get("temperature"),
+        top_p=body.get("top_p"),
+        top_k=body.get("top_k"),
+        seed=body.get("seed"),
+        defaults=_sampling_defaults_for_request(engine, chat_template_kwargs),
     )
     try:
         prompt_ids, vision_inputs = await _tokenize_multimodal_chat(

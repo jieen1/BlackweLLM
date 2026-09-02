@@ -1668,7 +1668,19 @@ class ServerEngine:
         build = getattr(self.runner, "prefix_cache_key_for_vision_inputs", None)
         if build is None:
             return None
-        return build(req.vision_inputs)
+        vision_cache_key = build(req.vision_inputs)
+        # Flash-Next keeps separate target-only (sampled) and MTP-ready
+        # (greedy) checkpoint contracts.  The backend-specific helper wraps
+        # the existing opaque vision key so both admission queries and the
+        # later prefill reconciliation see the same decode mode.
+        if self.backend_name == "flashnext":
+            with_mode = getattr(self.runner, "prefix_cache_key_for_sampling", None)
+            if with_mode is not None:
+                return with_mode(
+                    vision_cache_key,
+                    sampled=not req.sampling_params.is_greedy,
+                )
+        return vision_cache_key
 
     async def submit(
         self,
@@ -1988,7 +2000,14 @@ class ServerEngine:
         if anchor in self.eos_token_ids:
             if req.stream_channel is not None:
                 self._stream_close(req.stream_channel)
-            self._finish_request(slot, req, committed_tokens=[], finish_reason="stop")
+            self._finish_request(
+                slot,
+                req,
+                committed_tokens=[],
+                finish_reason="stop",
+                terminal_token_id=anchor,
+                finish_source="eos",
+            )
             return
 
         stop_sequences = req.stop_sequences or None
@@ -2060,7 +2079,13 @@ class ServerEngine:
         if matched is not None:
             self._drop_stop_pending_from_committed(st)
             self._finish_request(
-                slot, req, st["committed_tokens"], "stop", matched_stop_sequence=matched
+                slot,
+                req,
+                st["committed_tokens"],
+                "stop",
+                matched_stop_sequence=matched,
+                terminal_token_id=anchor,
+                finish_source="stop_sequence",
             )
             del self.active[slot]
             return
@@ -2071,7 +2096,14 @@ class ServerEngine:
                 self._flush_stop_pending(st)
             elif req.stream_channel is not None:
                 self._stream_put(req.stream_channel, [anchor])
-            self._finish_request(slot, req, st["committed_tokens"], "tool_calls")
+            self._finish_request(
+                slot,
+                req,
+                st["committed_tokens"],
+                "tool_calls",
+                terminal_token_id=anchor,
+                finish_source="tool_call",
+            )
             del self.active[slot]
             return
 
@@ -2080,7 +2112,13 @@ class ServerEngine:
 
         if len(st["committed_tokens"]) >= req.max_tokens:
             self._flush_stop_pending(st)
-            self._finish_request(slot, req, st["committed_tokens"], finish_reason="length")
+            self._finish_request(
+                slot,
+                req,
+                st["committed_tokens"],
+                finish_reason="length",
+                finish_source="length",
+            )
             del self.active[slot]
             return
 
@@ -2187,6 +2225,8 @@ class ServerEngine:
         finish_reason: str,
         logprobs_data: list[dict] | None = None,
         matched_stop_sequence: str | None = None,
+        terminal_token_id: int | None = None,
+        finish_source: str | None = None,
     ) -> None:
         if self.runner.capabilities.kv_reservation:
             # A request may stop at EOS long before its declared max_tokens.
@@ -2194,7 +2234,12 @@ class ServerEngine:
             # the live prefix/slot resident and therefore skips reset_slot().
             self.runner.release_kv_reservation(slot)
             self._kv_admission_retry_round = 0
-        tracer.request_finished(req.request_id, finish_reason)
+        tracer.request_finished(
+            req.request_id,
+            finish_reason,
+            terminal_token_id=terminal_token_id,
+            finish_source=finish_source,
+        )
         prefill_elapsed = max(
             0.0,
             getattr(req, "_prefill_done_at", 0.0) - getattr(req, "_admitted_at", 0.0),
@@ -2202,6 +2247,8 @@ class ServerEngine:
         result = {
             "committed_token_ids": committed_tokens,
             "finish_reason": finish_reason,
+            "terminal_token_id": terminal_token_id,
+            "finish_source": finish_source or finish_reason,
             "matched_stop_sequence": matched_stop_sequence,
             "prompt_tokens": len(req.prompt_ids),
             "completion_tokens": len(committed_tokens),
@@ -2818,6 +2865,7 @@ class ServerEngine:
                         st["committed_tokens"],
                         "length",
                         logprobs_data=st.get("logprobs_acc"),
+                        finish_source="length",
                     )
                     newly_finished.append(s)
                     continue
@@ -2829,6 +2877,8 @@ class ServerEngine:
                         st["committed_tokens"],
                         "stop",
                         logprobs_data=st.get("logprobs_acc"),
+                        terminal_token_id=int(tok),
+                        finish_source="eos",
                     )
                     newly_finished.append(s)
                     continue
@@ -2853,6 +2903,8 @@ class ServerEngine:
                             "stop",
                             logprobs_data=st.get("logprobs_acc"),
                             matched_stop_sequence=matched,
+                            terminal_token_id=int(tok),
+                            finish_source="stop_sequence",
                         )
                         newly_finished.append(s)
                         continue
@@ -2867,6 +2919,8 @@ class ServerEngine:
                         st["committed_tokens"],
                         "tool_calls",
                         logprobs_data=st.get("logprobs_acc"),
+                        terminal_token_id=int(tok),
+                        finish_source="tool_call",
                     )
                     newly_finished.append(s)
                     continue
@@ -2878,6 +2932,7 @@ class ServerEngine:
                         st["committed_tokens"],
                         "length",
                         logprobs_data=st.get("logprobs_acc"),
+                        finish_source="length",
                     )
                     newly_finished.append(s)
 
@@ -2952,13 +3007,18 @@ class ServerEngine:
                 matched_stop: str | None = None
                 tool_complete = False
                 finish_reason: str | None = None
+                terminal_token_id: int | None = None
+                finish_source: str | None = None
                 kept: list[int] = []
                 for t in new_tokens:
                     if len(st["committed_tokens"]) >= req.max_tokens:
                         finish_reason = "length"
+                        finish_source = "length"
                         break
                     if t in self.eos_token_ids:
                         finish_reason = "stop"
+                        terminal_token_id = int(t)
+                        finish_source = "eos"
                         break
                     st["committed_tokens"].append(t)
                     kept.append(t)
@@ -2968,10 +3028,14 @@ class ServerEngine:
                         matched_stop = self._stop_check_token(st, t)
                         if matched_stop is not None:
                             finish_reason = "stop"
+                            terminal_token_id = int(t)
+                            finish_source = "stop_sequence"
                             break
                     tool_complete = self._tool_call_check_token(st, t)
                     if tool_complete:
                         finish_reason = "tool_calls"
+                        terminal_token_id = int(t)
+                        finish_source = "tool_call"
                         break
                 if kept:
                     st["last_progress_round"] = self.stats["rounds"]
@@ -2985,6 +3049,7 @@ class ServerEngine:
                     self._stream_put(req.stream_channel, kept)
                 if finish_reason is None and len(st["committed_tokens"]) >= req.max_tokens:
                     finish_reason = "length"
+                    finish_source = "length"
 
                 if finish_reason is None:
                     st["anchor"] = decision["next_anchor"]
@@ -3001,6 +3066,8 @@ class ServerEngine:
                     finish_reason,
                     logprobs_data=st.get("logprobs_acc"),
                     matched_stop_sequence=matched_stop,
+                    terminal_token_id=terminal_token_id,
+                    finish_source=finish_source,
                 )
                 newly_finished.append(s)
 

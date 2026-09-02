@@ -673,13 +673,13 @@ class QSAIndexer(nn.Module):
                 )
                 lengths = lengths.reshape(-1).clamp_(min=0, max=logits.shape[1])
                 candidates = native.select(logits.contiguous(), lengths)
-                # The radix CTA intentionally emits an unordered set, which
-                # is the same contract as SGLang's fast_topk.  Sparse QSA
-                # consumes a set of blocks, not a score-ranked sequence, so
-                # skipping the extra 512-wide rerank keeps the kernel win on
-                # the graph path.  A score-order compatibility switch remains
-                # available for numerical A/B checks and debugging.
-                if os.environ.get("QSR_FLASHNEXT_QSA_TOPK_RERANK", "0") == "1":
+                # The radix CTA intentionally emits an unordered set.  That
+                # is sufficient for an exact real-arithmetic attention, but
+                # the sparse reduction is finite precision and therefore
+                # depends on the selected-block order.  Keep score order by
+                # default so greedy decoding is reproducible; an explicit
+                # opt-out remains available for performance experiments.
+                if os.environ.get("QSR_FLASHNEXT_QSA_TOPK_RERANK", "1") == "1":
                     safe = candidates.to(torch.long).clamp_(
                         min=0, max=logits.shape[1] - 1
                     )
@@ -697,7 +697,7 @@ class QSAIndexer(nn.Module):
         if row_block_ends is None:
             row_block_ends = torch.isfinite(logits).sum(dim=-1)
         if selected is not None and native is not None and os.environ.get(
-            "QSR_FLASHNEXT_QSA_TOPK_RERANK", "0"
+            "QSR_FLASHNEXT_QSA_TOPK_RERANK", "1"
         ) != "1":
             return selected
         ranks = torch.arange(k, device=logits.device).unsqueeze(0)
