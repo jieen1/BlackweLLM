@@ -151,6 +151,23 @@ def test_table_fifo_cache_evicts_stale_mapping():
         cached.close()
 
 
+def test_table_prefix_hint_survives_cold_row_churn():
+    cached = FlashNextPleTable(CKPT, layer_idx=1, cache_rows=4)
+    try:
+        base = int(cached.head_offsets[0])
+        prefix = torch.full((1, 16), base + 100, dtype=torch.long)
+        cached.gather(prefix, cache_hint=True)
+        for offset in range(1000, 1008):
+            cached.gather(torch.full((1, 16), base + offset, dtype=torch.long))
+
+        hits_before = cached.cache_hits
+        torch.testing.assert_close(cached.gather(prefix), cached.gather(prefix), rtol=0, atol=0)
+        assert cached.cache_hits >= hits_before + 16
+        assert cached.prefix_row_hits >= 16
+    finally:
+        cached.close()
+
+
 def test_table_page_cache_reuses_aligned_reads():
     cached = FlashNextPleTable(CKPT, layer_idx=1, cache_rows=0, cache_pages=128)
     try:
@@ -229,14 +246,18 @@ def test_ple_stateful_prefill_matches_full_history(table, seq_len):
     state = torch.randn(1, 4 * 2560, layer.state_len, dtype=torch.bfloat16)
     sequence = torch.randn(seq_len, 4 * 2560, dtype=torch.bfloat16)
     reference_input = torch.cat([state, sequence.t().unsqueeze(0)], dim=-1)
-    expected = torch.nn.functional.silu(
-        torch.nn.functional.conv1d(
-            reference_input,
-            layer.conv_weight,
-            groups=reference_input.shape[1],
-            dilation=layer.conv_dilation,
+    expected = (
+        torch.nn.functional.silu(
+            torch.nn.functional.conv1d(
+                reference_input,
+                layer.conv_weight,
+                groups=reference_input.shape[1],
+                dilation=layer.conv_dilation,
+            )
         )
-    ).squeeze(0).t()
+        .squeeze(0)
+        .t()
+    )
     expected_state = reference_input[:, :, -layer.state_len :]
 
     actual_state = state.clone()

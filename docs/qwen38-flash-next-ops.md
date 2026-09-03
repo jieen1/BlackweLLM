@@ -77,12 +77,27 @@ export QSR_FLASHNEXT_BATCH_GDN_PROJECTIONS=1
 export QSR_FLASHNEXT_MTP_CONTINUATION_GRAPH=1
 export QSR_FLASHNEXT_MTP_SPARSE_GRAPH=1
 export QSR_FLASHNEXT_PLE_CACHE_ROWS=4194304
-# Keep an 8 GiB host-side page LRU for repeated n-gram lookups.  This is
-# host RAM, not GPU memory; reduce only if the host is running other large
-# workloads.
-export QSR_FLASHNEXT_PLE_CACHE_PAGES=2097152
+# Long random prompts have almost no page reuse; leave the duplicate 4 KiB
+# page LRU off and spend the host budget on row bytes instead.
+export QSR_FLASHNEXT_PLE_CACHE_PAGES=0
+# Protect the first/system prefix from eviction by a long cold suffix.  This
+# is a bounded hot tier (about 10 MiB of FP8 row payload) and is separate from
+# the FIFO cold-row capacity above.
+export QSR_FLASHNEXT_PLE_PREFIX_CACHE_ROWS=65536
 export QSR_FLASHNEXT_PLE_IO=io_uring
 export QSR_FLASHNEXT_PLE_IO_WORKERS=32
+# One io_uring submission per 32K unique pages keeps random long-context
+# lookup latency bounded; the reader owns at most ~128 MiB of page payload
+# staging.  Override only after measuring host-RAM pressure.
+export QSR_FLASHNEXT_PLE_IO_MAX_BATCH=32768
+export QSR_FLASHNEXT_PLE_IO_QUEUE_DEPTH=8192
+# Two independent rings overlap submission/completion Python work and keep
+# the NVMe queue populated without allocating a prompt-sized second buffer.
+export QSR_FLASHNEXT_PLE_IO_READERS=2
+# Chunked long-context prefill submits the next PLE gather before the current
+# target chunk starts.  The queue is bounded to one chunk ahead, so this does
+# not add a second prompt-sized GPU/host allocation.
+export QSR_FLASHNEXT_PLE_AHEAD_PREFETCH=1
 # Compile the small-chat and production 1024-row eager prefill shapes before
 # /health reports ready.  This removes the first long-request shape/JIT stall;
 # more buckets may be supplied as a comma-separated list.
@@ -109,6 +124,25 @@ exec /home/bot/.venvs/torch-nightly/bin/python -m server.app \
 重复启动第二个实例，也不要用相同端口发送大量测试请求。服务是前台进程，使用
 `Ctrl-C` 停止。后台启动时先用 `pgrep -af 'server.app.*--port 8300'` 找到
 精确 PID，再只终止该 PID。
+
+长上下文冷 prefill 的 PLE 读取采用一块有界预取：当前块和下一块最多同时
+挂在单个持久 worker 上；每块内部再由两个独立 io_uring ring 并行取页，避免把
+256K prompt 的全部 n-gram 行排进队列。首块 row 会进入独立的热 tier，长冷后缀
+不会把重复 system prefix 冲掉。
+
+2026-09-03 的真实 profile（target-only、chunk=1024、prefix hit=0）为：
+32K target 9.94s，PLE gather 累计 4.58s，其中 page I/O 3.35s，真正等待
+PLE 只有 46ms（34 次中 33 次在 layer-1 前已 ready）；193K target 61.73s，
+PLE gather 37.22s/page I/O 28.19s，真正等待 0.160s（223 次中 221 次 ready）。
+这说明 PLE 的读取已经被计算覆盖；若端到端仍慢，最大项在 target 计算而不是
+继续盲目增大缓存。数字是冷请求，不代表热缓存或 decode 速度；更换 chunk、
+PLE cache 或并发后必须重新测量。
+
+缓存 A/B（同一组 32K×16 row、`cache_rows=4194304`）也已实测：首次冷读
+约 5.98s，第二次约 0.39s，`row_cache_hits=524288/524288` 且没有新增
+NVMe page read。因而重复 system/history 的收益来自 row cache；对完全随机的
+冷后缀，继续扩大 page LRU 不会提高命中率，必须依靠有界并行 I/O 或改变物理
+row 布局才能继续降低读放大。
 
 ## 启动验证
 

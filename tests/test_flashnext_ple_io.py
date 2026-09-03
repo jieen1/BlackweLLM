@@ -197,6 +197,39 @@ def test_load_pages_io_uring_reads_pages_in_requested_order():
     assert loaded[(0, 0)] == bytes([0x11]) * 4096
 
 
+def test_load_pages_io_uring_distributes_work_across_readers():
+    class FakeReader:
+        def __init__(self, marker):
+            self.marker = marker
+            self.calls = []
+
+        def read_pages(self, _fds, offsets):
+            self.calls.append(tuple(offsets))
+            return [bytes([self.marker]) for _ in offsets]
+
+    table = object.__new__(FlashNextPleTable)
+    table._uring_reader = None
+    table._uring_readers = (FakeReader(0x11), FakeReader(0x22))
+    table._uring_pool = None
+    table._uring_pool_workers = 0
+    table._uring_max_batch = 2
+    table._shards = [SimpleNamespace(direct_fd=7)]
+    try:
+        loaded = table._load_pages_io_uring([(0, 0), (0, 4096), (0, 8192), (0, 12288), (0, 16384)])
+        assert set(loaded) == {
+            (0, 0),
+            (0, 4096),
+            (0, 8192),
+            (0, 12288),
+            (0, 16384),
+        }
+        assert sum(len(reader.calls) for reader in table._uring_readers) == 3
+        assert {loaded[(0, 0)], loaded[(0, 4096)]} == {bytes([0x11]), bytes([0x22])}
+    finally:
+        if table._uring_pool is not None:
+            table._uring_pool.shutdown(wait=True)
+
+
 def test_io_uring_loader_does_not_import_sglang_package():
     before = {name for name in sys.modules if name == "sglang" or name.startswith("sglang.")}
     try:

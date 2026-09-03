@@ -482,10 +482,10 @@ class FlashNextBackend:
         those retain the conservative pre-sampled behaviour (``mode=None``).
         """
         if isinstance(prefix_cache_key, tuple) and len(prefix_cache_key) >= 3:
-            if (
-                prefix_cache_key[0] == _PREFIX_CACHE_MODE_MARKER
-                and prefix_cache_key[1] in {"greedy", "sampled"}
-            ):
+            if prefix_cache_key[0] == _PREFIX_CACHE_MODE_MARKER and prefix_cache_key[1] in {
+                "greedy",
+                "sampled",
+            }:
                 raw_vision = tuple(str(item) for item in prefix_cache_key[2:])
                 vision_key = None if raw_vision == (_PREFIX_CACHE_TEXT_KEY,) else raw_vision
                 return str(prefix_cache_key[1]), vision_key
@@ -735,9 +735,7 @@ class FlashNextBackend:
             mtp_ready=mtp_sess is not None,
             decode_mode=decode_mode,
             mtp_teacher_hidden=(
-                mtp_teacher_hidden.detach().clone()
-                if torch.is_tensor(mtp_teacher_hidden)
-                else None
+                mtp_teacher_hidden.detach().clone() if torch.is_tensor(mtp_teacher_hidden) else None
             ),
         )
         self._prefix_cache[slot] = entry
@@ -1335,6 +1333,15 @@ class FlashNextBackend:
         mtp_sync_ns = 0
         mtp_draft_ns = 0
         chunks = 1
+        prefill_layer_ns: dict[str, int] = {}
+        prefill_op_ns: dict[str, int] = {}
+
+        def merge_prefill_layer_profile() -> None:
+            for layer_name, elapsed_ns in getattr(target, "_last_prefill_layer_ns", {}).items():
+                prefill_layer_ns[layer_name] = prefill_layer_ns.get(layer_name, 0) + int(elapsed_ns)
+            for op_name, elapsed_ns in getattr(target, "_last_prefill_op_ns", {}).items():
+                prefill_op_ns[op_name] = prefill_op_ns.get(op_name, 0) + int(elapsed_ns)
+
         if not chunked:
             started = self._prefill_timestamp_ns()
             if not has_multimodal:
@@ -1347,6 +1354,7 @@ class FlashNextBackend:
                 if rope_next_position is not None:
                     prefill_kwargs["rope_next_position"] = rope_next_position
                 logits, final_hidden = target.prefill(suffix_ids, **prefill_kwargs)
+            merge_prefill_layer_profile()
             target_ns += self._prefill_timestamp_ns() - started
         else:
             logits = None
@@ -1358,14 +1366,62 @@ class FlashNextBackend:
             if suffix_embeds is not None and suffix_embeds.device.type == "cuda":
                 suffix_embeds = suffix_embeds.to("cpu")
             chunks = (len(suffix_ids) + effective_chunk - 1) // effective_chunk
+            # PLE reads are submitted one chunk at a time by the model's
+            # standalone prefill API.  On a long cold prompt that leaves the
+            # NVMe request for chunk N+1 idle until all of chunk N (including
+            # any teacher sync) has completed.  Keep exactly one immutable
+            # pending gather ahead of the GPU: the worker processes the
+            # current read first, then the next read can overlap the current
+            # transformer pass without unbounded host/page-cache growth.
+            ahead_raw = os.environ.get("QSR_FLASHNEXT_PLE_AHEAD_PREFETCH", "1")
+            ahead_enabled = ahead_raw.strip().lower() not in {"0", "false", "off", "no"}
+            start_ple_prefetch = (
+                getattr(target, "start_ple_prefetch", None) if ahead_enabled else None
+            )
+            ple_pending = None
+
+            def schedule_ple(start_offset: int, end_offset: int):
+                if not callable(start_ple_prefetch):
+                    return None
+                ngram_size = int(getattr(self.model.cfg, "ngram_size", 0))
+                if start_offset == 0:
+                    history_tokens = [
+                        *getattr(target.sess, "window", ()),
+                        *suffix_ids[:end_offset],
+                    ]
+                else:
+                    history_start = max(0, start_offset - ngram_size)
+                    history_tokens = suffix_ids[history_start:end_offset]
+                return start_ple_prefetch(
+                    suffix_ids[start_offset:end_offset],
+                    history_tokens=history_tokens,
+                    prefix_hint=start_offset == 0,
+                )
+
+            first_end = min(effective_chunk, len(suffix_ids))
+            ple_pending = schedule_ple(0, first_end)
             for start in range(0, len(suffix_ids), effective_chunk):
                 end = min(start + effective_chunk, len(suffix_ids))
                 final = end == len(suffix_ids)
+                next_start = end
+                next_pending = None
+                if next_start < len(suffix_ids):
+                    next_end = min(next_start + effective_chunk, len(suffix_ids))
+                    # Submit before launching the current target work.  The
+                    # PLE executor is FIFO, so this remains bounded at one
+                    # chunk while allowing the next read to run during the
+                    # current chunk's layer-0..47 compute.
+                    next_pending = schedule_ple(next_start, next_end)
                 started = self._prefill_timestamp_ns()
+                prefill_kwargs = {}
+                if ple_pending is not None:
+                    prefill_kwargs["_ple_pending"] = ple_pending
                 if not has_multimodal:
-                    logits, hidden_rows = target.prefill(suffix_ids[start:end])
+                    logits, hidden_rows = target.prefill(suffix_ids[start:end], **prefill_kwargs)
                 else:
                     prefill_kwargs = {"input_embeds": suffix_embeds[start:end]}
+                    if ple_pending is not None:
+                        prefill_kwargs["_ple_pending"] = ple_pending
                     if suffix_rope_positions is not None:
                         prefill_kwargs["rope_positions"] = suffix_rope_positions[:, start:end]
                     if final:
@@ -1373,7 +1429,9 @@ class FlashNextBackend:
                         if rope_next_position is not None:
                             prefill_kwargs["rope_next_position"] = rope_next_position
                     logits, hidden_rows = target.prefill(suffix_ids[start:end], **prefill_kwargs)
+                merge_prefill_layer_profile()
                 target_ns += self._prefill_timestamp_ns() - started
+                ple_pending = next_pending
                 if mtp_enabled and not final:
                     # The next real token is available for teacher forcing;
                     # discard the first draft/hidden immediately and retain
@@ -1432,9 +1490,7 @@ class FlashNextBackend:
                 started = self._prefill_timestamp_ns()
                 if prefix_mtp_resync:
                     shifted = [*suffix_ids, anchor]
-                    sync_hidden = torch.cat(
-                        [prefix_entry.mtp_teacher_hidden, final_hidden], dim=0
-                    )
+                    sync_hidden = torch.cat([prefix_entry.mtp_teacher_hidden, final_hidden], dim=0)
                 else:
                     shifted = [*suffix_ids[1:], anchor]
                     sync_hidden = final_hidden
@@ -1470,9 +1526,7 @@ class FlashNextBackend:
                 assert final_hidden is not None
                 if prefix_mtp_resync and final_chunk_start == 0:
                     shifted = suffix_ids + [anchor]
-                    sync_hidden = torch.cat(
-                        [prefix_entry.mtp_teacher_hidden, final_hidden], dim=0
-                    )
+                    sync_hidden = torch.cat([prefix_entry.mtp_teacher_hidden, final_hidden], dim=0)
                 else:
                     shifted = suffix_ids[final_chunk_start + 1 :] + [anchor]
                     sync_hidden = final_hidden
@@ -1542,6 +1596,10 @@ class FlashNextBackend:
         self.stats["prefill_last_mtp_sync_ns"] = mtp_sync_ns
         self.stats["prefill_last_mtp_draft_ns"] = mtp_draft_ns
         self.stats["prefill_last_trim_ns"] = trim_ns
+        if prefill_layer_ns:
+            self.stats["prefill_last_layer_ns"] = prefill_layer_ns
+        if prefill_op_ns:
+            self.stats["prefill_last_op_ns"] = prefill_op_ns
         return {"anchor": anchor, "draft_tokens": drafts}
 
     def prefill(self, slot: int, prompt_ids: list[int]) -> int:

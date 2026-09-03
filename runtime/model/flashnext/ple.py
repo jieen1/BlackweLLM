@@ -38,6 +38,7 @@ import os
 import pathlib
 import sys
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -280,6 +281,12 @@ class FlashNextPleTable:
             self._shards.append(_MappedShard(ckpt / weight_map[name], name))
         self.shard_rows = self._shards[0].rows
         self.total_rows = self.shard_rows * len(self._shards)
+        # Every checkpoint shard has the same fixed-width row layout.  Keep
+        # the absolute data bases locally so the hot random-row path can
+        # derive locations arithmetically instead of dispatching a Python
+        # method/property pair for every miss.
+        self._row_bytes = self._shards[0]._row_bytes
+        self._shard_data_offsets = tuple(shard._offset for shard in self._shards)
         self._resident: torch.Tensor | None = None
         # FIFO row cache (n-gram locality) to avoid rotational-media random
         # reads (~5 ms/cold row). cache_rows=0 disables.
@@ -292,6 +299,20 @@ class FlashNextPleTable:
         self.cache_misses = 0
         if self._cache_cap > 0:
             self._cache_rows = [None] * self._cache_cap
+        # Long prompts can stream millions of cold rows through the FIFO
+        # cache and evict the small, repeated system prefix before the next
+        # request arrives.  Keep a tiny hit-preserving tier populated only by
+        # the first prefill chunk; it is deliberately bounded independently
+        # of the cold-row capacity and stores the same FP8 bytes, not another
+        # decoded tensor.  With cache_rows=0 the default tier is disabled too;
+        # an explicit prefix-cap env var can still opt into just this tier.
+        configured_prefix_cap = os.environ.get("QSR_FLASHNEXT_PLE_PREFIX_CACHE_ROWS")
+        if configured_prefix_cap is None:
+            configured_prefix_cap = str(min(65_536, max(0, self._cache_cap // 2)))
+        self._prefix_cache_cap = max(0, int(configured_prefix_cap))
+        self._prefix_rows: OrderedDict[int, bytes] = OrderedDict()
+        self.prefix_row_hits = 0
+        self.prefix_row_misses = 0
         # The storage device presents as rotational and the 160-byte rows are
         # distributed over a 47 GiB table.  Drive it at page granularity so
         # one verify batch becomes one high-QD read instead of a sequence of
@@ -316,21 +337,51 @@ class FlashNextPleTable:
         )
         self._io_backend = _PLE_IO_PREAD
         self._io_mode = _PLE_IO_PREAD
+        # A single io_uring ring leaves the NVMe queue under-filled when the
+        # completion thread is copying a large batch of PyBytes objects.  A
+        # small number of independent rings lets the kernel and the Python
+        # bridge make progress concurrently.  Keep ``_uring_reader`` as the
+        # compatibility alias used by the diagnostics/tests; production reads
+        # use ``_uring_readers`` when it contains more than one ring.
         self._uring_reader = None
+        self._uring_readers: tuple[object, ...] = ()
+        self._uring_pool: ThreadPoolExecutor | None = None
+        self._uring_pool_workers = 0
         self._closed = False
         self._uring_max_batch = max(
-            1, int(os.environ.get("QSR_FLASHNEXT_PLE_IO_MAX_BATCH", "4096"))
+            1, int(os.environ.get("QSR_FLASHNEXT_PLE_IO_MAX_BATCH", "32768"))
         )
         self._uring_queue_depth = min(
             self._uring_max_batch,
-            max(1, int(os.environ.get("QSR_FLASHNEXT_PLE_IO_QUEUE_DEPTH", "512"))),
+            max(1, int(os.environ.get("QSR_FLASHNEXT_PLE_IO_QUEUE_DEPTH", "4096"))),
         )
+        self._uring_reader_count = max(1, int(os.environ.get("QSR_FLASHNEXT_PLE_IO_READERS", "2")))
         self._large_batch_pread_pages = max(
             1,
             int(os.environ.get("QSR_FLASHNEXT_PLE_IO_LARGE_BATCH_PREAD_PAGES", "8192")),
         )
         self.pread_pages = 0
         self.io_uring_pages = 0
+        # Diagnostic counters are opt-in because taking a clock around every
+        # gather is measurable on the one-row decode path.  Prefill profiling
+        # enables them automatically, so a cold request can distinguish hash,
+        # page-I/O, and Python row assembly instead of attributing all of the
+        # time to the target forward.
+        self._profile_enabled = os.environ.get(
+            "QSR_FLASHNEXT_PROFILE_PLE",
+            os.environ.get("QSR_FLASHNEXT_PROFILE_PREFILL", "0"),
+        ).strip().lower() in {"1", "true", "on"}
+        self._profile_gather_ns = 0
+        self._profile_lazy_factory_ns = 0
+        self._profile_read_rows_ns = 0
+        self._profile_page_load_ns = 0
+        self._profile_page_io_ns = 0
+        self._profile_row_assembly_ns = 0
+        self._profile_rows_read = 0
+        self._profile_gather_calls = 0
+        self._profile_finish_wait_ns = 0
+        self._profile_finish_calls = 0
+        self._profile_finish_ready_calls = 0
         if not resident:
             self._io_mode = _resolve_ple_io_mode()
             self._init_stream_backend(self._io_mode)
@@ -361,15 +412,23 @@ class FlashNextPleTable:
             return
         try:
             reader_type = _load_io_uring_reader_type()
-            self._uring_reader = reader_type(
-                self._uring_queue_depth,
-                self._uring_max_batch,
-                self._page_size,
+            reader_count = min(len(self._shards), self._uring_reader_count)
+            readers = tuple(
+                reader_type(
+                    self._uring_queue_depth,
+                    self._uring_max_batch,
+                    self._page_size,
+                )
+                for _ in range(reader_count)
             )
+            self._uring_readers = readers
+            self._uring_reader = readers[0]
             self._io_backend = _PLE_IO_URING
         except Exception:
             if mode == _PLE_IO_URING:
                 raise
+            self._uring_reader = None
+            self._uring_readers = ()
             self._io_backend = _PLE_IO_PREAD
             self._ensure_pread_pool()
 
@@ -457,6 +516,7 @@ class FlashNextPleTable:
         return pages
 
     def _load_pages(self, keys: Sequence[tuple[int, int]]) -> dict[tuple[int, int], bytes]:
+        started = time.perf_counter_ns() if getattr(self, "_profile_enabled", False) else 0
         pages: dict[tuple[int, int], bytes] = {}
         misses: list[tuple[int, int]] = []
         for key in dict.fromkeys(keys):
@@ -470,6 +530,7 @@ class FlashNextPleTable:
                 self.page_cache_hits += 1
         if misses:
             misses.sort()
+            io_started = time.perf_counter_ns() if started else 0
             try:
                 use_io_uring = self._uring_reader is not None and not (
                     self._io_mode == _PLE_IO_AUTO and len(misses) >= self._large_batch_pread_pages
@@ -488,13 +549,21 @@ class FlashNextPleTable:
                 ):
                     raise
                 self._uring_reader = None
+                self._uring_readers = ()
                 self._io_backend = _PLE_IO_PREAD
+                uring_pool = getattr(self, "_uring_pool", None)
+                if uring_pool is not None:
+                    uring_pool.shutdown(wait=True)
+                    self._uring_pool = None
+                    self._uring_pool_workers = 0
                 for shard in self._shards:
                     close_direct = getattr(shard, "close_direct", None)
                     if close_direct is not None:
                         close_direct()
                 self.pread_pages += len(misses)
                 loaded = self._load_pages_pread(misses)
+            if io_started:
+                self._profile_page_io_ns += time.perf_counter_ns() - io_started
             pages.update(loaded)
             if self._page_cache_cap:
                 for key, page in loaded.items():
@@ -502,6 +571,8 @@ class FlashNextPleTable:
                     self._page_cache.move_to_end(key)
                     while len(self._page_cache) > self._page_cache_cap:
                         self._page_cache.popitem(last=False)
+        if started:
+            self._profile_page_load_ns += time.perf_counter_ns() - started
         return pages
 
     def _load_pages_pread(self, keys: Sequence[tuple[int, int]]) -> dict[tuple[int, int], bytes]:
@@ -525,36 +596,126 @@ class FlashNextPleTable:
         return pages
 
     def _load_pages_io_uring(self, keys: Sequence[tuple[int, int]]) -> dict[tuple[int, int], bytes]:
-        reader = self._uring_reader
-        if reader is None:
+        readers = getattr(self, "_uring_readers", ())
+        if not readers:
+            reader = getattr(self, "_uring_reader", None)
+            readers = (reader,) if reader is not None else ()
+        if not readers:
             raise RuntimeError("io_uring reader is not initialized")
         pages: dict[tuple[int, int], bytes] = {}
         deduped = list(dict.fromkeys(keys))
-        for start in range(0, len(deduped), self._uring_max_batch):
-            batch_keys = deduped[start : start + self._uring_max_batch]
-            fds = [self._shards[shard_idx].direct_fd for shard_idx, _ in batch_keys]
-            offsets = [offset for _, offset in batch_keys]
-            batch_pages = reader.read_pages(fds, offsets)
-            for key, page in zip(batch_keys, batch_pages, strict=True):
-                pages[key] = bytes(page)
+
+        def read_partition(reader, partition: Sequence[tuple[int, int]]):
+            loaded: list[tuple[tuple[int, int], bytes]] = []
+            for start in range(0, len(partition), self._uring_max_batch):
+                batch_keys = partition[start : start + self._uring_max_batch]
+                fds = [self._shards[shard_idx].direct_fd for shard_idx, _ in batch_keys]
+                offsets = [offset for _, offset in batch_keys]
+                batch_pages = reader.read_pages(fds, offsets)
+                loaded.extend(
+                    (key, bytes(page)) for key, page in zip(batch_keys, batch_pages, strict=True)
+                )
+            return loaded
+
+        if len(readers) == 1:
+            loaded_partitions = [read_partition(readers[0], deduped)]
+        else:
+            # Interleave sorted keys instead of assigning one contiguous
+            # shard range to each ring.  Each ring then sees the same mixture
+            # of files/offsets and the device scheduler can balance them; the
+            # returned dictionary does not depend on completion order.
+            partitions = [deduped[index :: len(readers)] for index in range(len(readers))]
+            pool = getattr(self, "_uring_pool", None)
+            workers = getattr(self, "_uring_pool_workers", 0)
+            if pool is None or workers != len(readers):
+                if pool is not None:
+                    pool.shutdown(wait=True)
+                pool = ThreadPoolExecutor(
+                    max_workers=len(readers),
+                    thread_name_prefix="flashnext-ple-uring",
+                )
+                self._uring_pool = pool
+                self._uring_pool_workers = len(readers)
+            futures = [
+                pool.submit(read_partition, reader, partition)
+                for reader, partition in zip(readers, partitions, strict=True)
+            ]
+            # Drain every future before propagating an error.  This guarantees
+            # no ring is still touching its aligned buffer when a caller
+            # falls back to pread and releases the reader objects.
+            loaded_partitions = []
+            first_error = None
+            for future in futures:
+                try:
+                    loaded_partitions.append(future.result())
+                except BaseException as error:  # pragma: no cover - kernel dependent
+                    if first_error is None:
+                        first_error = error
+            if first_error is not None:
+                raise first_error
+
+        for loaded in loaded_partitions:
+            for key, page in loaded:
+                pages[key] = page
         return pages
 
     def _read_rows(self, row_ids: Sequence[int]) -> dict[int, bytes]:
+        started = time.perf_counter_ns() if getattr(self, "_profile_enabled", False) else 0
+        if started:
+            self._profile_rows_read += len(row_ids)
         locations: list[tuple[int, int, int]] = []
         location_keys: list[tuple[tuple[int, int], ...]] = []
         for row_id in row_ids:
             if row_id < 0 or row_id >= self.total_rows:
                 raise IndexError(f"PLE row {row_id} outside table with {self.total_rows} rows")
             shard_idx, local_row = divmod(row_id, self.shard_rows)
-            offset, nbytes = self._shards[shard_idx].row_location(local_row)
+            offset = self._shard_data_offsets[shard_idx] + local_row * self._row_bytes
+            nbytes = self._row_bytes
             locations.append((shard_idx, offset, nbytes))
-            location_keys.append(self._page_keys(shard_idx, local_row))
+            # Rows are 160 bytes in the current checkpoint, so they touch at
+            # most two 4 KiB pages.  Derive the keys from the location we just
+            # computed instead of calling row_location a second time through
+            # _page_keys; retaining the tuple shape keeps the generic page
+            # loader and its cache semantics unchanged.
+            first = offset // self._page_size * self._page_size
+            last = (offset + nbytes - 1) // self._page_size * self._page_size
+            first_key = (shard_idx, first)
+            if first == last:
+                location_keys.append((first_key,))
+            else:
+                location_keys.append((first_key, (shard_idx, last)))
         pages = self._load_pages([key for keys in location_keys for key in keys])
 
+        assembly_started = time.perf_counter_ns() if started else 0
         output: dict[int, bytes] = {}
         for row_id, (_, offset, nbytes), keys in zip(
             row_ids, locations, location_keys, strict=True
         ):
+            if len(keys) == 1:
+                key = keys[0]
+                page = pages[key]
+                within_page = offset - key[1]
+                if within_page < 0 or within_page + nbytes > len(page):
+                    raise OSError(f"PLE page does not cover row {row_id} at byte {offset}")
+                # A direct slice avoids the temporary one-element list and
+                # b"".join allocation on the overwhelmingly common path.
+                output[row_id] = page[within_page : within_page + nbytes]
+                continue
+            if len(keys) == 2:
+                first_key, second_key = keys
+                first_page = pages[first_key]
+                within_page = offset - first_key[1]
+                first_nbytes = min(nbytes, len(first_page) - within_page)
+                if within_page < 0 or first_nbytes <= 0:
+                    raise OSError(f"PLE page does not cover row {row_id} at byte {offset}")
+                remaining = nbytes - first_nbytes
+                second_page = pages[second_key]
+                if remaining > len(second_page):
+                    raise OSError(f"incomplete PLE row {row_id}: {remaining} bytes remain")
+                output[row_id] = (
+                    first_page[within_page : within_page + first_nbytes] + second_page[:remaining]
+                )
+                continue
             remaining = nbytes
             cursor = offset
             parts = []
@@ -570,6 +731,10 @@ class FlashNextPleTable:
             if remaining:
                 raise OSError(f"incomplete PLE row {row_id}: {remaining} bytes remain")
             output[row_id] = b"".join(parts)
+        if assembly_started:
+            self._profile_row_assembly_ns += time.perf_counter_ns() - assembly_started
+        if started:
+            self._profile_read_rows_ns += time.perf_counter_ns() - started
         return output
 
     def _to_output(
@@ -625,8 +790,14 @@ class FlashNextPleTable:
                 device_bytes.view(torch.float8_e4m3fn).to(torch.bfloat16) * self.weight_scale
             ).view(shape)
 
-    def _gather_raw_unlocked(self, ids: torch.Tensor) -> tuple[bytearray, tuple[int, int, int]]:
+    def _gather_raw_unlocked(
+        self,
+        ids: torch.Tensor,
+        *,
+        cache_hint: bool = False,
+    ) -> tuple[bytearray, tuple[int, int, int]]:
         """Resolve/cache rows and return their checkpoint FP8 bytes."""
+        started = time.perf_counter_ns() if getattr(self, "_profile_enabled", False) else 0
         t = ids.shape[0]
         flat_ids = ids.reshape(-1).long().tolist()
         shape = (t, self.ngram_heads, self.head_dim)
@@ -637,8 +808,17 @@ class FlashNextPleTable:
 
         rows: dict[int, bytes] = {}
         misses: list[int] = []
-        if self._cache_rows is not None:
-            for rid in flat_ids:
+        for rid in flat_ids:
+            protected = self._prefix_rows.get(rid)
+            if protected is not None:
+                self._prefix_rows.move_to_end(rid)
+                rows[rid] = protected
+                self.cache_hits += 1
+                self.prefix_row_hits += 1
+                continue
+            if self._prefix_cache_cap:
+                self.prefix_row_misses += 1
+            if self._cache_rows is not None:
                 slot = self._cache_map.get(rid)
                 if slot is not None:
                     row = self._cache_rows[slot]
@@ -648,12 +828,19 @@ class FlashNextPleTable:
                 else:
                     misses.append(rid)
                     self.cache_misses += 1
-        else:
-            misses = flat_ids
+            else:
+                misses.append(rid)
+                self.cache_misses += 1
         unique_misses = list(dict.fromkeys(misses))
         if unique_misses:
             loaded = self._read_rows(unique_misses)
             rows.update(loaded)
+            if cache_hint and self._prefix_cache_cap:
+                for rid in unique_misses:
+                    self._prefix_rows[rid] = loaded[rid]
+                    self._prefix_rows.move_to_end(rid)
+                    while len(self._prefix_rows) > self._prefix_cache_cap:
+                        self._prefix_rows.popitem(last=False)
             if self._cache_rows is not None:
                 for rid in unique_misses:
                     slot = self._cache_next
@@ -664,9 +851,18 @@ class FlashNextPleTable:
                     self._cache_rows[slot] = loaded[rid]
                     self._cache_keys[slot] = rid
                     self._cache_map[rid] = slot
-        return bytearray(b"".join(rows[rid] for rid in flat_ids)), shape
+        raw = bytearray(b"".join(rows[rid] for rid in flat_ids))
+        if started:
+            self._profile_gather_calls += 1
+            self._profile_gather_ns += time.perf_counter_ns() - started
+        return raw, shape
 
-    def _gather_raw_prefetch(self, ids: torch.Tensor) -> tuple[bytearray, tuple[int, int, int]]:
+    def _gather_raw_prefetch(
+        self,
+        ids: torch.Tensor,
+        *,
+        cache_hint: bool = False,
+    ) -> tuple[bytearray, tuple[int, int, int]]:
         """Read rows on the persistent prefetch worker.
 
         Cache and page-LRU mutation use the same lock as synchronous gathers;
@@ -674,20 +870,26 @@ class FlashNextPleTable:
         allows the caller to run the first model layer while NVMe is in flight.
         """
         with self._gather_lock:
-            return self._gather_raw_unlocked(ids)
+            return self._gather_raw_unlocked(ids, cache_hint=cache_hint)
 
     def _lazy_gather_prefetch(
-        self, ids_factory: Callable[[], torch.Tensor]
+        self,
+        ids_factory: Callable[[], torch.Tensor],
+        *,
+        cache_hint: bool = False,
     ) -> tuple[bytearray, tuple[int, int, int]]:
         """Build n-gram ids and read their rows entirely off the caller thread."""
+        started = time.perf_counter_ns() if getattr(self, "_profile_enabled", False) else 0
         ids = ids_factory()
+        if started:
+            self._profile_lazy_factory_ns += time.perf_counter_ns() - started
         if not torch.is_tensor(ids) or ids.ndim != 2:
             shape = getattr(ids, "shape", None)
             raise ValueError(f"PLE gather factory must return [T, heads] ids, got {shape}")
         ids_cpu = ids.detach().to(device="cpu", dtype=torch.long).contiguous()
-        return self._gather_raw_prefetch(ids_cpu)
+        return self._gather_raw_prefetch(ids_cpu, cache_hint=cache_hint)
 
-    def start_gather(self, ids: torch.Tensor) -> _PendingPleGather:
+    def start_gather(self, ids: torch.Tensor, *, cache_hint: bool = False) -> _PendingPleGather:
         """Schedule a PLE gather and return before its rows are available.
 
         ``ids`` is copied to CPU before submission so the worker never holds a
@@ -709,7 +911,11 @@ class FlashNextPleTable:
         with self._gather_lock:
             if self._closed or self._prefetch_pool is None:
                 raise RuntimeError("PLE table is closed")
-            future = self._prefetch_pool.submit(self._gather_raw_prefetch, ids_cpu)
+            future = self._prefetch_pool.submit(
+                self._gather_raw_prefetch,
+                ids_cpu,
+                cache_hint=cache_hint,
+            )
         return _PendingPleGather(future, shape)
 
     def start_gather_lazy(
@@ -717,6 +923,7 @@ class FlashNextPleTable:
         ids_factory: Callable[[], torch.Tensor],
         *,
         token_count: int,
+        cache_hint: bool = False,
     ) -> _PendingPleGather:
         """Schedule hash computation and the following row gather together.
 
@@ -735,6 +942,7 @@ class FlashNextPleTable:
             future = self._prefetch_pool.submit(
                 self._lazy_gather_prefetch,
                 ids_factory,
+                cache_hint=cache_hint,
             )
         return _PendingPleGather(future, shape)
 
@@ -746,7 +954,14 @@ class FlashNextPleTable:
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Wait for :meth:`start_gather` and materialise its BF16 output."""
+        started = time.perf_counter_ns() if getattr(self, "_profile_enabled", False) else 0
+        ready = pending.future.done() if started else False
         raw, shape = pending.future.result()
+        if started:
+            self._profile_finish_calls += 1
+            self._profile_finish_wait_ns += time.perf_counter_ns() - started
+            if ready:
+                self._profile_finish_ready_calls += 1
         if shape != pending.shape:
             raise RuntimeError(
                 f"PLE gather shape changed while reading: {shape} != {pending.shape}"
@@ -759,6 +974,7 @@ class FlashNextPleTable:
         *,
         device: torch.device | str | None = None,
         out: torch.Tensor | None = None,
+        cache_hint: bool = False,
     ) -> torch.Tensor:
         """``ids`` ``[T, ngram_heads]`` global row ids -> ``[T, heads, 160]`` bf16.
 
@@ -769,7 +985,7 @@ class FlashNextPleTable:
         with self._gather_lock:
             if self._closed:
                 raise RuntimeError("PLE table is closed")
-            raw, shape = self._gather_raw_unlocked(ids)
+            raw, shape = self._gather_raw_unlocked(ids, cache_hint=cache_hint)
             return self._to_output(raw, shape, device, out=out)
 
     def stats_snapshot(self) -> dict[str, int | float | str | bool]:
@@ -789,6 +1005,10 @@ class FlashNextPleTable:
             "row_cache_hits": self.cache_hits,
             "row_cache_misses": self.cache_misses,
             "row_cache_hit_rate": self.cache_hits / row_total if row_total else 0.0,
+            "prefix_row_cache_capacity": self._prefix_cache_cap,
+            "prefix_row_cache_entries": len(self._prefix_rows),
+            "prefix_row_cache_hits": self.prefix_row_hits,
+            "prefix_row_cache_misses": self.prefix_row_misses,
             "page_cache_capacity": self._page_cache_cap,
             "page_cache_entries": len(self._page_cache),
             "page_cache_hits": self.page_cache_hits,
@@ -797,6 +1017,21 @@ class FlashNextPleTable:
             "pread_pages": self.pread_pages,
             "io_uring_pages": self.io_uring_pages,
             "io_backend": self._io_backend,
+            "io_uring_readers": len(getattr(self, "_uring_readers", ()))
+            or int(getattr(self, "_uring_reader", None) is not None),
+            "io_uring_queue_depth": getattr(self, "_uring_queue_depth", 0),
+            "io_uring_max_batch": getattr(self, "_uring_max_batch", 0),
+            "profile_gather_calls": getattr(self, "_profile_gather_calls", 0),
+            "profile_gather_ns": getattr(self, "_profile_gather_ns", 0),
+            "profile_lazy_factory_ns": getattr(self, "_profile_lazy_factory_ns", 0),
+            "profile_read_rows_ns": getattr(self, "_profile_read_rows_ns", 0),
+            "profile_page_load_ns": getattr(self, "_profile_page_load_ns", 0),
+            "profile_page_io_ns": getattr(self, "_profile_page_io_ns", 0),
+            "profile_row_assembly_ns": getattr(self, "_profile_row_assembly_ns", 0),
+            "profile_rows_read": getattr(self, "_profile_rows_read", 0),
+            "profile_finish_wait_ns": getattr(self, "_profile_finish_wait_ns", 0),
+            "profile_finish_calls": getattr(self, "_profile_finish_calls", 0),
+            "profile_finish_ready_calls": getattr(self, "_profile_finish_ready_calls", 0),
         }
 
     def close(self) -> None:
@@ -815,6 +1050,11 @@ class FlashNextPleTable:
             self._io_pool = None
         with self._gather_lock:
             self._uring_reader = None
+            self._uring_readers = ()
+            if self._uring_pool is not None:
+                self._uring_pool.shutdown(wait=True)
+                self._uring_pool = None
+                self._uring_pool_workers = 0
             for event in self._stage_events:
                 if event is not None:
                     event.synchronize()
@@ -825,6 +1065,7 @@ class FlashNextPleTable:
                 self._cache_rows.clear()
                 self._cache_rows = None
             self._page_cache.clear()
+            self._prefix_rows.clear()
             self._pinned_stages.clear()
             self._stage_events.clear()
             for shard in self._shards:

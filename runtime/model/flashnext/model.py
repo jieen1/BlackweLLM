@@ -16,6 +16,7 @@ import json
 import math
 import os
 import pathlib
+import time
 from dataclasses import dataclass, field
 
 import torch
@@ -199,6 +200,26 @@ class FlashNextMlp(nn.Module):
         self._router_weights: torch.Tensor | None = None
         self._router_ids: torch.Tensor | None = None
         self._prefill_graphs: dict[int, _MlpPrefillGraph] = {}
+        # Set transiently by the opt-in prefill profiler.  Production forwards
+        # leave this unset, so CUDA graph capture sees no diagnostic events.
+        self._profile_op_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None = None
+        self._profile_op_layer: int | None = None
+
+    def _profile_op_start(self):
+        if self._profile_op_events is None or not torch.cuda.is_available():
+            return None
+        started = torch.cuda.Event(enable_timing=True)
+        started.record(torch.cuda.current_stream())
+        return started
+
+    def _profile_op_end(self, name: str, started) -> None:
+        if started is None or self._profile_op_events is None:
+            return
+        ended = torch.cuda.Event(enable_timing=True)
+        ended.record(torch.cuda.current_stream())
+        layer = self._profile_op_layer
+        if layer is not None:
+            self._profile_op_events.append((f"{layer}.mlp.{name}", started, ended))
 
     def _forward_eager(
         self,
@@ -216,6 +237,7 @@ class FlashNextMlp(nn.Module):
                 f"QSR_FLASHNEXT_ROUTER_IMPL must be triton or torch, got {router_impl!r}"
             )
         debug_skip_gate = os.environ.get("QSR_FLASHNEXT_DEBUG_SKIP_GATE", "0") == "1"
+        gate_started = self._profile_op_start()
         if debug_skip_router:
             weights = torch.zeros(rows, self.top_k, dtype=x.dtype, device=x.device)
             ids = torch.zeros(rows, self.top_k, dtype=torch.int32, device=x.device)
@@ -266,14 +288,30 @@ class FlashNextMlp(nn.Module):
                         weights_out=weights_out,
                         ids_out=ids_out,
                     )
+        self._profile_op_end("gate_router", gate_started)
+        routed_started = self._profile_op_start()
         if os.environ.get("QSR_FLASHNEXT_DEBUG_SKIP_ROUTED", "0") == "1":
             routed = torch.zeros_like(x)
         else:
             routed = self.expert_layer.forward(x, ids, weights)
+        # b12x may dispatch the fused expert work on its own stream.  During
+        # the opt-in profiler only, wait before closing this interval so that
+        # an inter-stream dependency is attributed to ``routed`` rather than
+        # incorrectly charged to the following shared-expert GEMMs.
+        if routed_started is not None:
+            # The fused b12x launcher can use a non-default internal stream;
+            # synchronizing only the caller stream would leave its work
+            # hidden behind the next dependency.  This branch is diagnostic
+            # only, so synchronize the device for an honest attribution.
+            torch.cuda.synchronize()
+        self._profile_op_end("routed", routed_started)
+        shared_started = self._profile_op_start()
         if os.environ.get("QSR_FLASHNEXT_DEBUG_SKIP_SHARED", "0") == "1":
             shared = torch.zeros_like(routed)
         else:
             shared = self.shared(x)
+        self._profile_op_end("shared", shared_started)
+        combine_started = self._profile_op_start()
         if output is None:
             # Both production expert adapters return a dedicated, contiguous
             # routed-output arena.  Reuse it for the final additive combine
@@ -283,8 +321,10 @@ class FlashNextMlp(nn.Module):
             # long prefill: 48 layers otherwise stream an extra full hidden
             # matrix through the allocator and DRAM on every layer.
             routed.add_(shared)
+            self._profile_op_end("combine", combine_started)
             return routed
         torch.add(routed, shared, out=output)
+        self._profile_op_end("combine", combine_started)
         return output
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -819,6 +859,9 @@ def prefill_session(
     input_embeds: torch.Tensor | None = None,
     rope_positions: torch.Tensor | None = None,
     rope_next_position: int | None = None,
+    _ple_pending: dict[int, object] | None = None,
+    _profile_sink: dict[str, int] | None = None,
+    _profile_op_sink: dict[str, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Prefill one sequence chunk and seed every incremental-decode state.
 
@@ -857,25 +900,39 @@ def prefill_session(
     # useful transformer compute, matching the reference runtime's
     # start_gather/finish_gather split.  The future returns the same raw FP8
     # rows as the synchronous gather; only the timing changes.
-    ple_pending: dict[int, object] = {}
     ple_layers = [layer for layer in model.layers if layer.ple is not None]
-    if ple_layers:
-        if sess.window:
-            history = torch.cat(
-                (
-                    torch.tensor(sess.window, dtype=torch.long),
-                    cpu_tokens,
+    if _ple_pending is None:
+        ple_pending: dict[int, object] = {}
+        if ple_layers:
+            if sess.window:
+                history = torch.cat(
+                    (
+                        torch.tensor(sess.window, dtype=torch.long),
+                        cpu_tokens,
+                    )
                 )
-            )
-        else:
-            history = cpu_tokens
-        for layer in ple_layers:
-            assert layer.ple is not None
-            assert layer.ple_hasher is not None
-            hasher = layer.ple_hasher
-            ple_pending[layer.layer_idx] = layer.ple.table.start_gather_lazy(
-                lambda hasher=hasher, history=history: hasher.sequence_ids(history)[-seq_len:],
-                token_count=seq_len,
+            else:
+                history = cpu_tokens
+            for layer in ple_layers:
+                assert layer.ple is not None
+                assert layer.ple_hasher is not None
+                hasher = layer.ple_hasher
+                ple_pending[layer.layer_idx] = layer.ple.table.start_gather_lazy(
+                    lambda hasher=hasher, history=history: hasher.sequence_ids(history)[-seq_len:],
+                    token_count=seq_len,
+                    cache_hint=start == 0,
+                )
+    else:
+        # The serving adapter may submit the next chunk while this one is on
+        # the GPU.  Copy the mapping because the layer loop consumes entries
+        # with ``pop``; callers can safely retain their one-chunk-ahead handle
+        # until this invocation starts.
+        ple_pending = dict(_ple_pending)
+        expected = {layer.layer_idx for layer in ple_layers}
+        if set(ple_pending) != expected:
+            raise RuntimeError(
+                "prefill PLE pending handles do not match model layers: "
+                f"expected={sorted(expected)}, got={sorted(ple_pending)}"
             )
     tokens = cpu_tokens.to(device=device)
     positions = torch.arange(start, end, dtype=torch.long, device=device)
@@ -892,8 +949,52 @@ def prefill_session(
             state.recurrent_state.zero_()
             state.has_previous_state = False
 
+    profile_layers = _profile_sink is not None
+    profile_ops = _profile_op_sink is not None
+    layer_events: list[tuple[int, torch.cuda.Event, torch.cuda.Event]] = []
+    layer_host_started: dict[int, int] = {}
+    op_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
+    op_layer_ids: set[int] = set()
+    if profile_ops:
+        raw_layers = os.environ.get("QSR_FLASHNEXT_PROFILE_PREFILL_OPS", "1")
+        raw_layers = raw_layers.strip().lower()
+        if raw_layers in {"1", "true", "on", "all"}:
+            op_layer_ids = {layer.layer_idx for layer in model.layers}
+        else:
+            try:
+                op_layer_ids = {
+                    int(value.strip()) for value in raw_layers.split(",") if value.strip()
+                }
+            except ValueError as exc:
+                raise ValueError(
+                    "QSR_FLASHNEXT_PROFILE_PREFILL_OPS must be 1/all or comma-separated layer ids"
+                ) from exc
+    op_stream = torch.cuda.current_stream(device) if profile_ops and device.type == "cuda" else None
+
+    def op_start(layer_idx: int, name: str):
+        if op_stream is None or layer_idx not in op_layer_ids:
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(op_stream)
+        return event
+
+    def op_end(layer_idx: int, name: str, started):
+        if started is None:
+            return
+        ended = torch.cuda.Event(enable_timing=True)
+        ended.record(op_stream)
+        op_events.append((f"{layer_idx}.{name}", started, ended))
+
     for layer in model.layers:
+        if profile_layers and device.type == "cuda":
+            layer_start_event = torch.cuda.Event(enable_timing=True)
+            layer_end_event = torch.cuda.Event(enable_timing=True)
+            layer_start_event.record(torch.cuda.current_stream(device))
+            layer_events.append((layer.layer_idx, layer_start_event, layer_end_event))
+        elif profile_layers:
+            layer_host_started[layer.layer_idx] = time.perf_counter_ns()
         if layer.ple is not None:
+            ple_started = op_start(layer.layer_idx, "ple")
             pending = ple_pending.pop(layer.layer_idx, None)
             if pending is None:
                 raise RuntimeError(f"missing scheduled PLE gather for layer {layer.layer_idx}")
@@ -904,8 +1005,12 @@ def prefill_session(
                 raise RuntimeError("PLE graph state was not allocated")
             conv_out = layer.ple.prefill_conv_with_state(normed_flat, state)
             x = x + gated_flat + conv_out
+            op_end(layer.layer_idx, "ple", ple_started)
 
+        mix_started = op_start(layer.layer_idx, "attn_hc_mix")
         mixed, residuals = layer.attn_hc.mix(x)
+        op_end(layer.layer_idx, "attn_hc_mix", mix_started)
+        attn_started = op_start(layer.layer_idx, "attention")
         if layer.is_qsa:
             bundle = layer.attn
             qsa_positions = positions if rope is None else rope
@@ -978,10 +1083,36 @@ def prefill_session(
         else:
             state = sess.gdn[f"gdn_{layer.layer_idx}"]
             attn_out = layer.attn(mixed.unsqueeze(0), state).squeeze(0)
+        op_end(layer.layer_idx, "attention", attn_started)
 
+        combine_started = op_start(layer.layer_idx, "attn_hc_combine")
         x = layer.attn_hc.combine(attn_out, residuals)
+        op_end(layer.layer_idx, "attn_hc_combine", combine_started)
+        mlp_mix_started = op_start(layer.layer_idx, "mlp_hc_mix")
         mixed2, residuals2 = layer.mlp_hc.mix(x)
-        x = layer.mlp_hc.combine(layer.mlp(mixed2), residuals2)
+        op_end(layer.layer_idx, "mlp_hc_mix", mlp_mix_started)
+        mlp_started = op_start(layer.layer_idx, "mlp")
+        mlp_module = layer.mlp
+        if (
+            profile_ops
+            and device.type == "cuda"
+            and layer.layer_idx in op_layer_ids
+            and mlp_module is not None
+        ):
+            mlp_module._profile_op_events = op_events
+            mlp_module._profile_op_layer = layer.layer_idx
+        try:
+            mlp_out = mlp_module(mixed2)
+        finally:
+            if mlp_module is not None:
+                mlp_module._profile_op_events = None
+                mlp_module._profile_op_layer = None
+        op_end(layer.layer_idx, "mlp", mlp_started)
+        mlp_combine_started = op_start(layer.layer_idx, "mlp_hc_combine")
+        x = layer.mlp_hc.combine(mlp_out, residuals2)
+        op_end(layer.layer_idx, "mlp_hc_combine", mlp_combine_started)
+        if profile_layers and device.type == "cuda":
+            layer_events[-1][2].record(torch.cuda.current_stream(device))
 
     sess.window.extend(int(token) for token in cpu_tokens.tolist())
     sess.window = sess.window[-model.cfg.ngram_size :]
@@ -994,7 +1125,28 @@ def prefill_session(
         )
         sess.rope_next = torch.full((3,), next_position, dtype=torch.long, device=device)
     mixed, _ = model.final_mixer.mix(x[-1:])
-    return model.lm_head(mixed).float().squeeze(0), x
+    logits = model.lm_head(mixed).float().squeeze(0)
+    if profile_layers or op_events:
+        if device.type == "cuda":
+            torch.cuda.current_stream(device).synchronize()
+            if profile_layers:
+                for layer_idx, started_event, ended_event in layer_events:
+                    elapsed_ns = int(round(started_event.elapsed_time(ended_event) * 1_000_000))
+                    _profile_sink[str(layer_idx)] = (
+                        _profile_sink.get(str(layer_idx), 0) + elapsed_ns
+                    )
+            if op_events:
+                for name, started_event, ended_event in op_events:
+                    elapsed_ns = int(round(started_event.elapsed_time(ended_event) * 1_000_000))
+                    _profile_op_sink[name] = _profile_op_sink.get(name, 0) + elapsed_ns
+        else:
+            finished = time.perf_counter_ns()
+            if profile_layers:
+                for layer_idx, started in layer_host_started.items():
+                    _profile_sink[str(layer_idx)] = _profile_sink.get(str(layer_idx), 0) + (
+                        finished - started
+                    )
+    return logits, x
 
 
 @torch.no_grad()
@@ -1643,6 +1795,8 @@ class FlashNextGraphEngine:
         self.device = device
         self.graph: torch.cuda.CUDAGraph | None = None
         self._logits: torch.Tensor | None = None
+        self._last_prefill_layer_ns: dict[str, int] = {}
+        self._last_prefill_op_ns: dict[str, int] = {}
 
     def _zero_state(self, *, clear_kv: bool = True) -> None:
         """Reset recurrent/decode metadata, optionally retaining QSA KV.
@@ -1686,6 +1840,48 @@ class FlashNextGraphEngine:
                 raise RuntimeError(f"Flash-Next layer {layer.layer_idx} has no MLP")
             layer.mlp.capture_prefill_graph(rows, pool=pool)
 
+    def start_ple_prefetch(
+        self,
+        token_ids,
+        *,
+        history_tokens: list[int] | tuple[int, ...] | None = None,
+        prefix_hint: bool = False,
+    ) -> dict[int, object]:
+        """Submit one chunk's PLE hash/read work before target execution.
+
+        Chunked serving uses this to keep a single bounded read ahead of the
+        GPU.  ``history_tokens`` is explicit because the worker may run while
+        the live session advances through the preceding chunk; defaulting to
+        the current session window preserves the standalone prefill API.
+        The returned handles are consumed by :meth:`prefill` and never retain
+        CUDA tensors.
+        """
+        tokens = torch.as_tensor(token_ids, dtype=torch.long).detach().to("cpu").contiguous()
+        seq_len = int(tokens.numel())
+        if seq_len <= 0:
+            raise ValueError("PLE prefetch needs at least one token")
+        if history_tokens is None:
+            history = torch.cat((torch.tensor(self.sess.window, dtype=torch.long), tokens))
+        else:
+            history = (
+                torch.as_tensor(history_tokens, dtype=torch.long).detach().to("cpu").contiguous()
+            )
+        pending: dict[int, object] = {}
+        for layer in self.model.layers:
+            if layer.ple is None:
+                continue
+            if layer.ple_hasher is None:
+                raise RuntimeError(f"Flash-Next PLE layer {layer.layer_idx} has no hasher")
+            hasher = layer.ple_hasher
+            pending[layer.layer_idx] = layer.ple.table.start_gather_lazy(
+                lambda hasher=hasher, history=history, seq_len=seq_len: hasher.sequence_ids(
+                    history
+                )[-seq_len:],
+                token_count=seq_len,
+                cache_hint=prefix_hint,
+            )
+        return pending
+
     def capture(self) -> None:
         sess = self.sess
         self._zero_state()
@@ -1711,9 +1907,24 @@ class FlashNextGraphEngine:
         input_embeds: torch.Tensor | None = None,
         rope_positions: torch.Tensor | None = None,
         rope_next_position: int | None = None,
+        _ple_pending: dict[int, object] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one true large-M prompt prefill and seed graph-decode state."""
         tokens = torch.as_tensor(token_ids, dtype=torch.long)
+        profile_layers = os.environ.get("QSR_FLASHNEXT_PROFILE_PREFILL_LAYERS", "0").strip().lower()
+        profile_sink = (
+            self._last_prefill_layer_ns if profile_layers in {"1", "true", "on"} else None
+        )
+        if profile_sink is not None:
+            profile_sink.clear()
+        profile_ops = os.environ.get("QSR_FLASHNEXT_PROFILE_PREFILL_OPS", "0").strip().lower()
+        profile_op_sink = (
+            self._last_prefill_op_ns
+            if profile_ops not in {"", "0", "false", "off", "none"}
+            else None
+        )
+        if profile_op_sink is not None:
+            profile_op_sink.clear()
         if layer_major is None:
             # Layer-major changes the row shape of HC/router/shared GEMMs and
             # has not passed the long-prompt numerical gate.  Keep the
@@ -1729,17 +1940,33 @@ class FlashNextGraphEngine:
             if rope_next_position is not None:
                 kwargs["rope_next_position"] = rope_next_position
             return prefill_session_layer_major(self.model, tokens, self.sess, **kwargs)
+
+        def session_kwargs(extra: dict[str, object] | None = None) -> dict[str, object]:
+            kwargs = {} if extra is None else dict(extra)
+            if _ple_pending is not None:
+                kwargs["_ple_pending"] = _ple_pending
+            if profile_sink is not None:
+                kwargs["_profile_sink"] = profile_sink
+            if profile_op_sink is not None:
+                kwargs["_profile_op_sink"] = profile_op_sink
+            return kwargs
+
         if chunk_size <= 0 or chunk_size >= tokens.numel():
             if input_embeds is None and rope_positions is None:
-                return prefill_session(self.model, tokens, self.sess)
-            kwargs = {}
+                return prefill_session(
+                    self.model,
+                    tokens,
+                    self.sess,
+                    **session_kwargs(),
+                )
+            kwargs: dict[str, object] = {}
             if input_embeds is not None:
                 kwargs["input_embeds"] = input_embeds
             if rope_positions is not None:
                 kwargs["rope_positions"] = rope_positions
             if rope_next_position is not None:
                 kwargs["rope_next_position"] = rope_next_position
-            return prefill_session(self.model, tokens, self.sess, **kwargs)
+            return prefill_session(self.model, tokens, self.sess, **session_kwargs(kwargs))
         hidden_rows = []
         logits = None
         for start in range(0, tokens.numel(), chunk_size):
@@ -1758,7 +1985,7 @@ class FlashNextGraphEngine:
                 self.model,
                 chunk_tokens,
                 self.sess,
-                **kwargs,
+                **session_kwargs(kwargs),
             )
             hidden_rows.append(hidden)
         return logits, torch.cat(hidden_rows)

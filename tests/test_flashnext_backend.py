@@ -141,6 +141,63 @@ def test_chunked_prefill_syncs_partial_tail_at_its_real_width() -> None:
     assert result == {"anchor": 42, "draft_tokens": [7]}
 
 
+def test_chunked_prefill_submits_one_ple_chunk_ahead() -> None:
+    """The long-prompt path queues only the current and next PLE reads."""
+
+    backend = object.__new__(FlashNextBackend)
+    backend.max_seq_len = 64
+    backend.device = torch.device("cpu")
+    backend.enable_prefix_cache = False
+    backend._slot_tokens = [[]]
+    backend._last_logits = [None]
+    backend._specs = [None]
+    backend.stats = {
+        "prefill_requests": 0,
+        "prefill_chunks": 0,
+        "prefill_tokens": 0,
+        "prefill_target_ns": 0,
+        "prefill_mtp_sync_ns": 0,
+        "prefill_mtp_draft_ns": 0,
+        "prefill_trim_ns": 0,
+        "prefill_last_chunks": 0,
+        "prefill_last_tokens": 0,
+        "prefill_last_target_ns": 0,
+        "prefill_last_mtp_sync_ns": 0,
+        "prefill_last_mtp_draft_ns": 0,
+        "prefill_last_trim_ns": 0,
+    }
+    backend._reset_runtime = lambda slot: None
+    backend._trim_prefill_cuda_cache = lambda prompt_tokens: None
+    backend.model = SimpleNamespace(cfg=SimpleNamespace(ngram_size=3))
+
+    prefetched: list[tuple[list[int], list[int]]] = []
+    consumed: list[tuple[list[int], object | None]] = []
+
+    class _Target:
+        sess = SimpleNamespace(window=[99])
+
+        def start_ple_prefetch(self, token_ids, *, history_tokens, prefix_hint=False):
+            prefetched.append((list(token_ids), list(history_tokens)))
+            return object()
+
+        def prefill(self, token_ids, **kwargs):
+            consumed.append((list(token_ids), kwargs.get("_ple_pending")))
+            return torch.zeros(8), torch.zeros(len(token_ids), 4)
+
+    backend._targets = [_Target()]
+    result = backend._prefill_slot(0, list(range(6)), forced_token=42, chunk_size=2)
+
+    assert [tokens for tokens, _history in prefetched] == [[0, 1], [2, 3], [4, 5]]
+    assert [history for _tokens, history in prefetched] == [
+        [99, 0, 1],
+        [0, 1, 2, 3],
+        [1, 2, 3, 4, 5],
+    ]
+    assert [tokens for tokens, _pending in consumed] == [[0, 1], [2, 3], [4, 5]]
+    assert all(pending is not None for _tokens, pending in consumed)
+    assert result == {"anchor": 42, "draft_tokens": []}
+
+
 def test_chunked_visual_prefill_keeps_external_embeddings_for_every_chunk() -> None:
     """Chunking must not turn image rows back into plain token embeddings."""
 
@@ -461,9 +518,7 @@ def test_flashnext_sampled_prefix_key_allows_target_only_checkpoint() -> None:
         == 3
     )
     assert (
-        backend._prefix_hit_for_slot(
-            [301, 302, 303, 305], 0, prefix_cache_key=greedy_key
-        ).effective
+        backend._prefix_hit_for_slot([301, 302, 303, 305], 0, prefix_cache_key=greedy_key).effective
         == 0
     )
 
