@@ -57,11 +57,18 @@ export QSR_SERVER_ENABLE_PREFIX_CACHE=1
 export QSR_SERVER_ENABLE_MTP=1
 export QSR_SERVER_MTP_K=3
 export QSR_QWEN_KV_MODE=legacy
+# Total in-flight request budget (active + prefill + waiting).  This prevents
+# a client retry loop from retaining unbounded 256K prompt copies in host RAM.
+# Omit to use the runtime default max(8, 4*capacity) = 8 for this profile.
+export QSR_SERVER_MAX_PENDING_REQUESTS=8
 # Flash-Next QSA main-attention K/V: row-scaled FP8 E4M3.  BF16 is only for
 # explicit reference A/B runs; QSR_QWEN_KV_MODE does not select this dtype.
 export QSR_FLASHNEXT_QSA_KV_DTYPE=fp8_e4m3
 export QSR_SERVER_GPU_MEM_UTIL=0.90
-export QSR_DISABLE_GC=1
+# Keep cyclic GC enabled in production.  Disabling it is an explicit,
+# benchmark-only A/B switch because disconnected streaming requests can form
+# cycles that otherwise remain until the process hits the host memory limit.
+export QSR_DISABLE_GC=0
 
 # Flash-Next 的已验证批量/图/PLE 配置
 export QSR_FLASHNEXT_BATCH_GDN_RECURRENCE=1

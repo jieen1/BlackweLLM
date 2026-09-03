@@ -394,7 +394,12 @@ class TestStepSyncMtpPathStopSequences:
         )
         engine = _bare_step_sync_engine(id_to_str, runner)
         req, channel = _make_req(engine, ["STOP"], stream=True)
-        engine._activate_slot(0, req, anchor=10, drafts=[])
+        # The runtime deliberately falls back to target-only decode when a
+        # speculative admission has no draft tokens.  Supply a minimal fake
+        # draft window here so this fixture actually exercises the MTP branch;
+        # _FakeRunner consumes its scripted verify result and does not inspect
+        # the draft values.
+        engine._activate_slot(0, req, anchor=10, drafts=[19, 18, 17])
         assert _drain_channel_buf(channel) == [10]  # anchor: safe, flushed
 
         _run_step_sync_until_finished(engine, 0, max_rounds=3)

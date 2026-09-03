@@ -209,6 +209,21 @@ _PREFIX_OVERLAP_HISTORY = 64
 _PREFIX_OVERLAP_SAMPLES_KEPT = 200
 _PREFIX_CACHE_HIT_SAMPLES_KEPT = 200
 _SESSION_WARM_CONTINUATION_SAMPLES_KEPT = 200
+_PREFIX_DEDUP_PUBLISHED_KEYS_KEPT = 256
+_ADMISSION_BATCH_SAMPLES_KEPT = 200
+_ROUND_BATCH_SAMPLES_KEPT = 512
+_BOOTSTRAP_FAILURES_KEPT = 50
+
+
+class RequestQueueFull(RuntimeError):
+    """Raised when the runtime's bounded request budget is exhausted.
+
+    A request carries a Python copy of the complete prompt until it reaches a
+    terminal state.  Rejecting above a small, explicit bound is therefore a
+    correctness/survivability requirement, not merely a throughput policy:
+    an upstream retry loop must never be able to turn prompt storage into an
+    unbounded host-memory allocation.
+    """
 
 
 def _cuda_graph_extra_slots(
@@ -297,6 +312,9 @@ class GenerationRequest:
     # Prepared CPU-side visual patches for Flash-Next. Image requests use the
     # target path only until multimodal MTP state is implemented.
     vision_inputs: Any | None = None
+    # Internal lifecycle bit.  It is protected by ServerEngine's request
+    # counter lock so error/cancel paths can safely be idempotent.
+    _queue_released: bool = field(default=False, init=False, repr=False)
 
 
 class StreamChannel:
@@ -324,6 +342,8 @@ class StreamChannel:
 
     def close(self, loop: asyncio.AbstractEventLoop) -> None:
         """Engine thread: signal end-of-stream."""
+        if self._closed:
+            return
         self._closed = True
         self._buf.append(None)
         if self._event is not None:
@@ -344,6 +364,10 @@ class StreamChannel:
                 continue
             await self._event.wait()
         return self._buf.popleft()
+
+    def clear(self) -> None:
+        """Drop token batches that no consumer can observe anymore."""
+        self._buf.clear()
 
 
 class ServerEngine:
@@ -417,6 +441,7 @@ class ServerEngine:
         production: bool = True,
         watchdog_max_stale_rounds: int = 200,
         request_timeout_s: float = 600.0,
+        max_pending_requests: int | None = None,
     ) -> None:
         if backend not in IMPLEMENTED_BACKENDS:
             raise ValueError(
@@ -627,6 +652,30 @@ class ServerEngine:
         self.idle_sleep_s = idle_sleep_s
         self.watchdog_max_stale_rounds = watchdog_max_stale_rounds
         self.request_timeout_s = request_timeout_s
+        if max_pending_requests is None:
+            configured_pending = os.environ.get("QSR_SERVER_MAX_PENDING_REQUESTS")
+            if configured_pending:
+                try:
+                    max_pending_requests = int(configured_pending)
+                except ValueError as exc:
+                    raise ValueError(
+                        "QSR_SERVER_MAX_PENDING_REQUESTS must be an integer"
+                    ) from exc
+            else:
+                # Keep a few retries ahead of the fixed slot count while
+                # bounding the number of full prompt copies retained by the
+                # process.  This is deliberately a total in-flight budget,
+                # not just the lock-free incoming deque: the engine may move
+                # requests into ``waiting`` while a long prefill is active.
+                max_pending_requests = max(8, 4 * capacity)
+        if max_pending_requests < max(1, capacity):
+            raise ValueError(
+                "max_pending_requests must be >= capacity; "
+                f"got {max_pending_requests} for capacity={capacity}"
+            )
+        self.max_pending_requests = int(max_pending_requests)
+        self._request_count_lock = threading.Lock()
+        self._request_count = 0
         self._kv_cache_dtype = kv_cache_dtype
         self._enable_cudagraph = enable_cudagraph
         self.enable_prefix_cache = enable_prefix_cache
@@ -720,6 +769,7 @@ class ServerEngine:
         self._asyncio_loop: asyncio.AbstractEventLoop | None = None
         self._stop = False
         self._cancel_set: set[str] = set()
+        self._cancel_lock = threading.Lock()
 
         # -- slot management (only mutated from engine thread after start) --
         self.free_slots: list[int] = list(range(capacity))
@@ -740,7 +790,13 @@ class ServerEngine:
         # released as soon as that prefill commits, so all duplicates can
         # restore together without serializing the cheap cache-hit path.
         self._prefix_dedup_inflight: set[tuple[int, ...]] = set()
-        self._prefix_dedup_published: set[tuple[int, ...]] = set()
+        # This is only a batching hint: it says that a prefix was published
+        # recently, so exact duplicates may share the next warm admission
+        # wave.  Keep compact fingerprints rather than full prompt tuples.
+        # A previous implementation retained every 256K-token tuple for the
+        # process lifetime; 1900 unique requests were enough to consume the
+        # host's 24 GiB limit before the GPU was under pressure.
+        self._prefix_dedup_published: set[int] = set()
         # SGLang-style wave admission: when the GPU is idle and the first
         # request of a concurrent wave has arrived, briefly collect wakeups
         # already in flight before starting a long prefill.  Keep the default
@@ -1732,12 +1788,16 @@ class ServerEngine:
             vision_inputs=vision_inputs,
         )
         req._admitted_at = time.perf_counter()
-        self._req_deque.append(req)
+        self._enqueue_request(req)
         try:
-            os.write(self._req_pipe_w, b"\x00")
-        except (BlockingIOError, OSError):
-            pass
-        return await fut
+            return await fut
+        finally:
+            # A disconnected non-streaming caller cancels this coroutine. If
+            # the engine has not resolved the request yet, make that
+            # cancellation visible to the engine thread instead of leaving a
+            # full prompt alive until generation (or the timeout) completes.
+            if not req._queue_released:
+                self.cancel(req.request_id)
 
     async def submit_stream(
         self,
@@ -1760,8 +1820,6 @@ class ServerEngine:
         channel = StreamChannel()
         request_id = str(uuid.uuid4())
         channel.request_id = request_id
-        if cancel_ref is not None:
-            cancel_ref[0] = request_id
         req = GenerationRequest(
             request_id=request_id,
             prompt_ids=list(prompt_ids),
@@ -1778,30 +1836,86 @@ class ServerEngine:
             vision_inputs=vision_inputs,
         )
         req._admitted_at = time.perf_counter()
-        self._req_deque.append(req)
+        self._enqueue_request(req)
+        completed = False
+        try:
+            if cancel_ref is not None:
+                cancel_ref[0] = request_id
+            while True:
+                item = await channel.get()
+                if item is None:
+                    break
+                if item:
+                    yield item
+            # The stream carries token batches through the channel, while the
+            # completion metadata is resolved on the request future.  Returning
+            # that result here keeps the streaming contract identical to
+            # ``submit`` and gives protocol adapters the authoritative finish
+            # reason, token usage, and merged logprobs.
+            result = await fut
+            completed = True
+            yield result
+        finally:
+            # ``async for`` consumers are allowed to stop after the terminal
+            # result (or disappear on a broken socket).  Explicitly cancel an
+            # unfinished request and drop buffered token batches in either
+            # case; relying on cyclic GC here was the source of long-lived
+            # prompt/channel object graphs during the observed empty-stream
+            # retry loop.
+            if not completed and not req._queue_released:
+                self.cancel(request_id)
+            channel.clear()
+
+    def _enqueue_request(self, req: GenerationRequest) -> None:
+        """Account for and enqueue one request under the bounded budget."""
+        with self._request_count_lock:
+            if self._request_count >= self.max_pending_requests:
+                raise RequestQueueFull(
+                    "runtime request budget exhausted: "
+                    f"{self._request_count}/{self.max_pending_requests} requests in flight; "
+                    "retry after an active request completes"
+                )
+            self._request_count += 1
+            try:
+                self._req_deque.append(req)
+            except BaseException:
+                self._request_count -= 1
+                raise
         try:
             os.write(self._req_pipe_w, b"\x00")
         except (BlockingIOError, OSError):
             pass
-        while True:
-            item = await channel.get()
-            if item is None:
-                break
-            if item:
-                yield item
-        # The stream carries token batches through the channel, while the
-        # completion metadata is resolved on the request future.  Returning
-        # that result here keeps the streaming contract identical to
-        # ``submit`` and gives protocol adapters the authoritative finish
-        # reason, token usage, and merged logprobs.
-        yield await fut
+
+    def ensure_request_capacity(self) -> None:
+        """Fail fast before an HTTP stream has sent its first SSE bytes."""
+        with self._request_count_lock:
+            if self._request_count >= self.max_pending_requests:
+                raise RequestQueueFull(
+                    "runtime request budget exhausted: "
+                    f"{self._request_count}/{self.max_pending_requests} requests in flight; "
+                    "retry after an active request completes"
+                )
+
+    def pending_request_count(self) -> int:
+        """Return the total number of requests owned by the runtime."""
+        with self._request_count_lock:
+            return self._request_count
+
+    def _release_request(self, req: GenerationRequest) -> None:
+        """Release one request's host-memory budget exactly once."""
+        with self._request_count_lock:
+            if req._queue_released:
+                return
+            req._queue_released = True
+            self._request_count = max(0, self._request_count - 1)
 
     def cancel(self, request_id: str) -> None:
         """Request cancellation from any thread (asyncio-safe).
 
         The engine thread will reclaim the slot on its next round.
         """
-        self._cancel_set.add(request_id)
+        with self._cancel_lock:
+            self._cancel_set.add(request_id)
         try:
             os.write(self._req_pipe_w, b"\x00")
         except (BlockingIOError, OSError):
@@ -1815,6 +1929,13 @@ class ServerEngine:
     def _fail_future(self, fut: asyncio.Future, exc: BaseException) -> None:
         if not fut.done():
             self._asyncio_loop.call_soon_threadsafe(fut.set_exception, exc)
+
+    def _fail_request(self, req: GenerationRequest, exc: BaseException) -> None:
+        """Fail and release a request from any recovery/cancel path."""
+        self._release_request(req)
+        if req.stream_channel is not None:
+            self._stream_close(req.stream_channel)
+        self._fail_future(req.future, exc)
 
     def _stream_put(self, channel: StreamChannel, item: Any) -> None:
         channel.put(item, self._asyncio_loop)
@@ -1842,6 +1963,8 @@ class ServerEngine:
             self.stats["bootstrap_failures"].append(
                 {"request_id": req.request_id, "slot": slot, "diag": diag}
             )
+            if len(self.stats["bootstrap_failures"]) > _BOOTSTRAP_FAILURES_KEPT:
+                del self.stats["bootstrap_failures"][:-_BOOTSTRAP_FAILURES_KEPT]
             logger.warning("bootstrap check FAILED for %s: %s", req.request_id, diag)
 
     # -- observability (engine thread) ---------------------------------------
@@ -1883,8 +2006,12 @@ class ServerEngine:
                 self.stats["prefix_overlap_same_round_events"] += 1
             if history_best >= self.block_size:
                 self.stats["prefix_overlap_history_events"] += 1
+        # Only the inspected prefix is needed for this advisory metric.  The
+        # old history kept every 256K-token list alive for 64 admissions
+        # (~640 MiB of Python integers) even though every comparison was
+        # capped at ``block_size``.
         for rid, prompt in new_prompts:
-            self._recent_prompts.append((rid, prompt))
+            self._recent_prompts.append((rid, prompt[: self.block_size]))
 
     def _record_prefix_cache_hits(
         self, admit_now: list[tuple[int, GenerationRequest]], hit_depths: list[int]
@@ -2278,6 +2405,7 @@ class ServerEngine:
             result["logprobs"] = logprobs_data
         if req.stream_channel is not None:
             self._stream_close(req.stream_channel)
+        self._release_request(req)
         self._resolve_future(req.future, result)
         self.stats["requests_completed"] += 1
         if self.enable_session_affinity and req.session_id and self.enable_prefix_cache:
@@ -2327,18 +2455,21 @@ class ServerEngine:
             except Exception as exc:
                 logger.exception("engine round failed, failing active requests")
                 for slot, st in list(self.active.items()):
-                    self._fail_future(st["req"].future, exc)
-                    if st["req"].stream_channel is not None:
-                        self._stream_close(st["req"].stream_channel)
+                    self._fail_request(st["req"], exc)
                     try:
                         self.runner.reset_slot(slot)
                     except Exception:
                         logger.exception("reset_slot(%d) failed in error recovery", slot)
                     self.free_slots.append(slot)
                 self.active.clear()
+                self._fail_pending_requests(exc)
                 self._release_all_retained()
                 time.sleep(0.05)
 
+        # A graceful server stop can race with HTTP tasks that have already
+        # enqueued work.  Do not leave their futures, prompt lists, or stream
+        # channels reachable after the engine thread exits.
+        self._fail_pending_requests(RuntimeError("engine stopped"))
         self._release_all_retained()
         logger.info("engine thread stopped")
 
@@ -2346,6 +2477,48 @@ class ServerEngine:
         """Drain all pending requests from the lock-free deque."""
         while self._req_deque:
             self.waiting.append(self._req_deque.popleft())
+
+    def _fail_pending_requests(self, exc: BaseException) -> None:
+        """Fail and release every request outside ``active``.
+
+        Round failures used to clean only active slots.  Requests already
+        drained into ``waiting`` (or caught between ``prefill_begin`` and its
+        hand-off) remained reachable indefinitely, so a client retry loop
+        converted one backend error into an ever-growing host-memory queue.
+        Keep this recovery idempotent and reset pending slots before the next
+        round can observe half-written KV state.
+        """
+        queued: list[GenerationRequest] = []
+        while self._req_deque:
+            queued.append(self._req_deque.popleft())
+        queued.extend(self.waiting)
+        self.waiting.clear()
+
+        pending_slots = list(self._pending_prefill_reqs)
+        pending_slots.extend(self._admission_inflight_reqs)
+        if pending_slots:
+            self._release_prefix_dedup_keys(pending_slots, published=False)
+        self._pending_prefill = None
+        self._pending_prefill_reqs = []
+        self._admission_inflight_reqs = []
+        self._prefix_dedup_inflight.clear()
+        self._prefix_dedup_published.clear()
+
+        seen_slots: set[int] = set()
+        for slot, req in pending_slots:
+            self._fail_request(req, exc)
+            if slot in seen_slots:
+                continue
+            seen_slots.add(slot)
+            try:
+                self.runner.reset_slot(slot)
+            except Exception:
+                logger.exception("reset_slot(%d) failed while clearing pending requests", slot)
+            if slot not in self.free_slots:
+                self.free_slots.append(slot)
+
+        for req in queued:
+            self._fail_request(req, exc)
 
     def _coalesce_admission_wave(self) -> None:
         """Collect a just-arriving idle wave before launching prefill.
@@ -2443,7 +2616,7 @@ class ServerEngine:
             duplicate_selected = (
                 aligned
                 and key in selected_keys
-                and key not in self._prefix_dedup_published
+                and hash(key) not in self._prefix_dedup_published
             )
             if len(selected) < limit and not duplicate_inflight and not duplicate_selected:
                 selected.append(req)
@@ -2474,7 +2647,13 @@ class ServerEngine:
                 key = tuple(req.prompt_ids)
                 self._prefix_dedup_inflight.discard(key)
                 if published:
-                    self._prefix_dedup_published.add(key)
+                    # The fingerprint is used only to choose whether to defer
+                    # a duplicate in the same admission wave.  A collision
+                    # can change batching, never token correctness, and is
+                    # preferable to retaining the complete prompt forever.
+                    self._prefix_dedup_published.add(hash(key))
+                    if len(self._prefix_dedup_published) > _PREFIX_DEDUP_PUBLISHED_KEYS_KEPT:
+                        self._prefix_dedup_published.pop()
 
     def _step_sync(self) -> None:
         """One engine round. Runs entirely on the engine thread."""
@@ -2487,15 +2666,22 @@ class ServerEngine:
         self._coalesce_admission_wave()
 
         # -- process cancellations (asyncio thread → engine thread) --
-        if self._cancel_set and self.active:
-            cancelled_slots = []
-            for s, st in list(self.active.items()):
-                if st["req"].request_id in self._cancel_set:
-                    cancelled_slots.append(s)
-            for s in cancelled_slots:
-                st = self.active.pop(s)
+        # Handle queued requests even when no slot is active.  The old nested
+        # ``if self._cancel_set and self.active`` left disconnects that
+        # happened during idle/prefill in the incoming deque forever.
+        with self._cancel_lock:
+            cancel_ids = set(self._cancel_set)
+            self._cancel_set.clear()
+        if cancel_ids:
+            cancel_exc = asyncio.CancelledError("request cancelled by client")
+            cancelled_slots = [
+                (s, st)
+                for s, st in list(self.active.items())
+                if st["req"].request_id in cancel_ids
+            ]
+            for s, st in cancelled_slots:
+                self.active.pop(s, None)
                 req = st["req"]
-                self._cancel_set.discard(req.request_id)
                 self.stats["cancellations"] += 1
                 logger.info(
                     "cancelled request %s on slot %d (%d tokens committed)",
@@ -2503,19 +2689,59 @@ class ServerEngine:
                     s,
                     len(st["committed_tokens"]),
                 )
-                if req.stream_channel is not None:
-                    self._stream_close(req.stream_channel)
-                self._fail_future(req.future, asyncio.CancelledError("request cancelled by client"))
+                self._fail_request(req, cancel_exc)
                 try:
                     self.runner.reset_slot(s)
                 except Exception:
                     logger.exception("cancel reset_slot(%d) failed", s)
                 self.free_slots.append(s)
                 self._kv_admission_retry_round = 0
-            # Also remove from waiting queue
-            if self._cancel_set:
-                self.waiting = [r for r in self.waiting if r.request_id not in self._cancel_set]
-                self._cancel_set.clear()
+
+            remaining_waiting = []
+            for req in self.waiting:
+                if req.request_id in cancel_ids:
+                    self.stats["cancellations"] += 1
+                    self._fail_request(req, cancel_exc)
+                else:
+                    remaining_waiting.append(req)
+            self.waiting = remaining_waiting
+
+            # Remove not-yet-drained requests directly so an idle engine does
+            # not admit work after its streaming consumer has disappeared.
+            remaining_incoming: collections.deque[GenerationRequest] = collections.deque()
+            while self._req_deque:
+                req = self._req_deque.popleft()
+                if req.request_id in cancel_ids:
+                    self.stats["cancellations"] += 1
+                    self._fail_request(req, cancel_exc)
+                else:
+                    remaining_incoming.append(req)
+            self._req_deque.extend(remaining_incoming)
+
+            # A chunked prefill is a shared backend state for its admission
+            # wave, so removing one request in place is unsafe.  Reset the
+            # affected slots, requeue surviving requests, and let the next
+            # round restart them from a clean prefix.
+            if self._pending_prefill_reqs:
+                pending = list(self._pending_prefill_reqs)
+                if any(req.request_id in cancel_ids for _slot, req in pending):
+                    self._release_prefix_dedup_keys(pending, published=False)
+                    self._pending_prefill = None
+                    self._pending_prefill_reqs = []
+                    for slot, req in pending:
+                        try:
+                            self.runner.reset_slot(slot)
+                        except Exception:
+                            logger.exception(
+                                "cancel reset_slot(%d) failed while aborting prefill", slot
+                            )
+                        if slot not in self.free_slots:
+                            self.free_slots.append(slot)
+                        if req.request_id in cancel_ids:
+                            self.stats["cancellations"] += 1
+                            self._fail_request(req, cancel_exc)
+                        else:
+                            self.waiting.insert(0, req)
 
         # -- P4b: expire retained warm slots --
         self._expire_retained_slots()
@@ -2577,9 +2803,7 @@ class ServerEngine:
                 logger.exception("incremental prefill step failed")
                 self._release_prefix_dedup_keys(self._pending_prefill_reqs, published=False)
                 for slot, req in self._pending_prefill_reqs:
-                    self._fail_future(req.future, exc)
-                    if req.stream_channel is not None:
-                        self._stream_close(req.stream_channel)
+                    self._fail_request(req, exc)
                     try:
                         self.runner.reset_slot(slot)
                     except Exception:
@@ -2607,6 +2831,8 @@ class ServerEngine:
                     self._release_prefix_dedup_keys(admit_now, published=True)
                     self.stats["admissions"] += 1
                     self.stats["admission_batch_sizes"].append(len(admit_now))
+                    if len(self.stats["admission_batch_sizes"]) > _ADMISSION_BATCH_SAMPLES_KEPT:
+                        del self.stats["admission_batch_sizes"][:-_ADMISSION_BATCH_SAMPLES_KEPT]
                     for slot, req in admit_now:
                         anchor = prefill_result[slot]["anchor"]
                         drafts = prefill_result[slot]["draft_tokens"]
@@ -2739,9 +2965,7 @@ class ServerEngine:
                 logger.exception("admission failed for %d request(s)", len(admit_now))
                 self._release_prefix_dedup_keys(admit_now, published=False)
                 for slot, req in admit_now:
-                    self._fail_future(req.future, exc)
-                    if req.stream_channel is not None:
-                        self._stream_close(req.stream_channel)
+                    self._fail_request(req, exc)
                     try:
                         self.runner.reset_slot(slot)
                     except Exception:
@@ -2757,6 +2981,8 @@ class ServerEngine:
                     self._record_prefix_cache_hits(admit_now, hit_depths)
                     self.stats["admissions"] += 1
                     self.stats["admission_batch_sizes"].append(len(admit_now))
+                    if len(self.stats["admission_batch_sizes"]) > _ADMISSION_BATCH_SAMPLES_KEPT:
+                        del self.stats["admission_batch_sizes"][:-_ADMISSION_BATCH_SAMPLES_KEPT]
                     prefill_result = prefill_state.result
                     for slot, req in admit_now:
                         anchor = prefill_result[slot]["anchor"]
@@ -2844,6 +3070,8 @@ class ServerEngine:
 
         self.stats["rounds"] += 1
         self.stats["round_batch_sizes"].append(len(active_slots))
+        if len(self.stats["round_batch_sizes"]) > _ROUND_BATCH_SAMPLES_KEPT:
+            del self.stats["round_batch_sizes"][:-_ROUND_BATCH_SAMPLES_KEPT]
 
         newly_finished: list[int] = []
 
@@ -3119,6 +3347,7 @@ class ServerEngine:
                 )
                 if req.stream_channel is not None:
                     self._stream_close(req.stream_channel)
+                self._release_request(req)
                 self._fail_future(
                     req.future,
                     TimeoutError(
@@ -3163,6 +3392,7 @@ class ServerEngine:
                     kv_len,
                     committed,
                 )
+                self._release_request(req)
                 self._fail_future(
                     req.future,
                     RuntimeError(

@@ -111,7 +111,11 @@ do not infer its live settings from the historical `Deployed` column.
 | `QSR_SERVED_MODEL_NAME` | — | `qwen3.8` for Qwen | `qwen3.8` | name(s) reported by `/v1/models` (space-separated list) |
 | `QSR_DEFAULT_REASONING_EFFORT` | — | `medium` for native Qwen/Flash-Next | `medium` | in-memory Qwen template default; omitted requests keep request kwargs empty and explicit effort wins |
 | `QSR_SERVER_REQUEST_TIMEOUT_S` | — | 600 | 0 | server-side request cap; 0 disables (long generations) |
-| `QSR_DEBUG_REQUESTS` | — | 1 | 1 | log raw request/response (see **Raw I/O logging**); legacy alias `QSR_DEBUG_ANTHROPIC` |
+| `QSR_DEBUG_REQUESTS` | — | 0 | 0 | opt-in bounded raw request/response logging (see **Raw I/O logging**); legacy alias `QSR_DEBUG_ANTHROPIC` |
+| `QSR_DEBUG_MAX_PROMPT_TOKENS` | — | 4096 | 4096 | maximum head/tail prompt tokens decoded by opt-in diagnostics |
+| `QSR_DEBUG_MAX_RAW_BYTES` | — | 65536 | 65536 | maximum raw/parsed JSON characters retained by opt-in diagnostics |
+| `QSR_DEBUG_MAX_OUTPUT_TOKENS` | — | 4096 | 4096 | maximum head/tail output tokens decoded by opt-in diagnostics |
+| `QSR_SERVER_MAX_PENDING_REQUESTS` | — | `max(8, 4×capacity)` | derived | total in-flight request budget; excess requests receive retryable 503 |
 
 CLI also accepts `--host` / `--port` (default `127.0.0.1:8000`).
 
@@ -400,23 +404,24 @@ Useful PromQL:
 
 ## Raw I/O logging
 
-With `QSR_DEBUG_REQUESTS=1` (default ON) every request logs, to the service
+With `QSR_DEBUG_REQUESTS=1` (opt-in; default OFF) every request logs, to the service
 log (stdout of the server process; the quality runbook keeps it under
 `logs/quality/server_*_<label>.log`):
 
-- `<ENDPOINT> RAW REQUEST (N bytes): <full JSON body>` — the verbatim client
-  request (OpenAI and Anthropic alike).
+- `<ENDPOINT> RAW REQUEST (N bytes): <JSON body>` — the client request shape
+  (large bodies are bounded by `QSR_DEBUG_MAX_RAW_BYTES`).
 - `<ENDPOINT> PARSED MESSAGES: <parsed chat messages>` — what the format
-  layer produced.
-- `<ENDPOINT> DECODED PROMPT (N ids, M chars): <text>` — the EXACT input fed
-  to the model.
+  layer produced (also bounded for large requests).
+- `<ENDPOINT> DECODED PROMPT (N ids, M chars): <text>` — a bounded head/tail
+  sample of the input fed to the model (set `QSR_DEBUG_MAX_PROMPT_TOKENS` to
+  adjust the sample size).
 - `<ENDPOINT> RAW OUTPUT (N tokens, finish=..., M chars): <text>` and
-  `<ENDPOINT> VISIBLE OUTPUT (M chars): <text>` — the model's raw decoded
-  output and the thinking-stripped visible text.
+  `<ENDPOINT> VISIBLE OUTPUT (M chars): <text>` — bounded raw/visible samples;
+  raw decoding is capped by `QSR_DEBUG_MAX_OUTPUT_TOKENS`.
 
 This is how format/length bugs are diagnosed (compare RAW REQUEST → PARSED →
-DECODED PROMPT to see whether a user message survived). Set
-`QSR_DEBUG_REQUESTS=0` to disable in production. When a real request exposes a
+DECODED PROMPT to see whether a user message survived). Keep
+`QSR_DEBUG_REQUESTS=0` (the default) in production. When a real request exposes a
 bug, capture its RAW REQUEST line into `tests/fixtures/` and add a case to
 `tests/test_format_regression.py`.
 

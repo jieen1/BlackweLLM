@@ -43,7 +43,7 @@ from runtime.sampling import PersistentSeed, SamplingParams
 from runtime.structured_output import ResponseFormat
 from runtime.thinking_budget import ThinkingBudgetConfig
 from server import metrics
-from server.engine import ServerEngine
+from server.engine import RequestQueueFull, ServerEngine
 from server.formats import anthropic as anthropic_format
 from server.formats import convert_tools_to_chat_template
 from server.formats import openai as openai_format
@@ -66,13 +66,27 @@ if not logger.handlers:
 logger.propagate = False
 
 # Verbose raw request/response capture for ALL endpoints (OpenAI + Anthropic).
-# Default ON so real client traffic (e.g. Claude Desktop) is captured for
-# debugging and regression fixtures; set QSR_DEBUG_REQUESTS=0 (or the legacy
-# QSR_DEBUG_ANTHROPIC=0) to disable. Logs the raw request body, the parsed
-# messages, the decoded prompt (exact model input), and the raw model output.
+# Default OFF: decoding/logging complete 256K prompts on the request path can
+# retain multi-megabyte bodies and prompt lists while a slow prefill is in
+# flight.  Opt in with QSR_DEBUG_REQUESTS=1 for a bounded diagnostic capture
+# (or the legacy QSR_DEBUG_ANTHROPIC=1). Logs the request shape, a bounded
+# prompt sample, and the raw model output.
 DEBUG_REQUESTS = (
-    os.environ.get("QSR_DEBUG_REQUESTS", os.environ.get("QSR_DEBUG_ANTHROPIC", "1")) != "0"
+    os.environ.get("QSR_DEBUG_REQUESTS", os.environ.get("QSR_DEBUG_ANTHROPIC", "0")) != "0"
 )
+
+try:
+    _DEBUG_MAX_PROMPT_TOKENS = max(256, int(os.environ.get("QSR_DEBUG_MAX_PROMPT_TOKENS", "4096")))
+except ValueError as exc:
+    raise RuntimeError("QSR_DEBUG_MAX_PROMPT_TOKENS must be an integer") from exc
+try:
+    _DEBUG_MAX_RAW_BYTES = max(4096, int(os.environ.get("QSR_DEBUG_MAX_RAW_BYTES", "65536")))
+except ValueError as exc:
+    raise RuntimeError("QSR_DEBUG_MAX_RAW_BYTES must be an integer") from exc
+try:
+    _DEBUG_MAX_OUTPUT_TOKENS = max(256, int(os.environ.get("QSR_DEBUG_MAX_OUTPUT_TOKENS", "4096")))
+except ValueError as exc:
+    raise RuntimeError("QSR_DEBUG_MAX_OUTPUT_TOKENS must be an integer") from exc
 
 DEFAULT_MAX_TOKENS = 16384
 
@@ -375,6 +389,13 @@ SERVER_CHECKPOINT_BUDGET_MULTIPLE = int(
 _mtp_resync_env = os.environ.get("QSR_SERVER_MTP_RESYNC")
 SERVER_MTP_RESYNC = None if _mtp_resync_env is None else _mtp_resync_env != "0"
 SERVER_REQUEST_TIMEOUT_S = float(os.environ.get("QSR_SERVER_REQUEST_TIMEOUT_S", "600"))
+_max_pending_env = os.environ.get("QSR_SERVER_MAX_PENDING_REQUESTS")
+try:
+    SERVER_MAX_PENDING_REQUESTS = int(_max_pending_env) if _max_pending_env else None
+except ValueError as exc:
+    raise RuntimeError("QSR_SERVER_MAX_PENDING_REQUESTS must be an integer") from exc
+if SERVER_MAX_PENDING_REQUESTS is not None and SERVER_MAX_PENDING_REQUESTS < 1:
+    raise RuntimeError("QSR_SERVER_MAX_PENDING_REQUESTS must be positive")
 # T0-3/E4 (docs/roadmap.md §7 D1): reasoning/thinking contract. "expose"
 # (default) surfaces a <think> block as OpenAI message.reasoning_content /
 # delta.reasoning_content, and Anthropic's non-standard top-level
@@ -939,28 +960,57 @@ def _endpoint_from_path(path: str) -> str:
     return "other"
 
 
+def _debug_token_sample(token_ids: list[int], limit: int) -> tuple[list[int], bool]:
+    """Return a bounded head/tail sample for opt-in diagnostic decoding."""
+    if len(token_ids) <= limit:
+        return token_ids, False
+    head = limit // 2
+    return token_ids[:head] + token_ids[-(limit - head) :], True
+
+
+def _debug_text_sample(value: str, limit: int) -> tuple[str, bool]:
+    """Bound a diagnostic JSON/text field without retaining the full copy."""
+    if len(value) <= limit:
+        return value, False
+    return value[:limit] + "…<truncated>", True
+
+
 async def _debug_log_input(tag: str, body: dict, parsed_messages, prompt_ids: list[int]) -> None:
-    """Capture the full raw request, the parsed messages, and the decoded
-    prompt (the exact input the model receives). Gated on DEBUG_REQUESTS."""
+    """Capture bounded request/message/prompt diagnostics when opted in."""
     if not DEBUG_REQUESTS:
         return
     try:
-        _raw = json.dumps(body, ensure_ascii=False, default=str)
-        logger.info("%s RAW REQUEST (%d bytes): %s", tag, len(_raw), _raw)
+        _raw_full = json.dumps(body, ensure_ascii=False, default=str)
+        _raw, raw_truncated = _debug_text_sample(_raw_full, _DEBUG_MAX_RAW_BYTES)
         logger.info(
-            "%s PARSED MESSAGES: %s",
+            "%s RAW REQUEST (%d bytes%s): %s",
             tag,
-            json.dumps(parsed_messages, ensure_ascii=False, default=str),
+            len(_raw_full),
+            ", truncated" if raw_truncated else "",
+            _raw,
         )
+        _parsed_full = json.dumps(parsed_messages, ensure_ascii=False, default=str)
+        _parsed, parsed_truncated = _debug_text_sample(_parsed_full, _DEBUG_MAX_RAW_BYTES)
+        logger.info(
+            "%s PARSED MESSAGES%s: %s",
+            tag,
+            " (truncated)" if parsed_truncated else "",
+            _parsed,
+        )
+        del _raw_full, _parsed_full, _raw, _parsed
         _loop = asyncio.get_running_loop()
+        _prompt_ids, prompt_truncated = _debug_token_sample(
+            prompt_ids, _DEBUG_MAX_PROMPT_TOKENS
+        )
         _prompt_text = await _loop.run_in_executor(
             None,
-            functools.partial(engine.tok.decode, prompt_ids, skip_special_tokens=False),
+            functools.partial(engine.tok.decode, _prompt_ids, skip_special_tokens=False),
         )
         logger.info(
-            "%s DECODED PROMPT (%d ids, %d chars): %s",
+            "%s DECODED PROMPT (%d ids%s, %d chars): %s",
             tag,
             len(prompt_ids),
+            ", sample" if prompt_truncated else "",
             len(_prompt_text),
             _prompt_text,
         )
@@ -992,21 +1042,24 @@ def _debug_log_output(
 async def _debug_log_stream_output(
     tag: str, proc, visible_text: str, tool_calls, finish_reason: str
 ) -> None:
-    """Capture the raw + visible model output for a STREAMING response by
-    decoding the full committed token list. Gated on DEBUG_REQUESTS."""
+    """Capture bounded raw + visible output for a streaming response."""
     if not DEBUG_REQUESTS:
         return
     try:
         gen_tokens = len(proc.all_ids)
         _loop = asyncio.get_running_loop()
+        _output_ids, output_truncated = _debug_token_sample(
+            proc.all_ids, _DEBUG_MAX_OUTPUT_TOKENS
+        )
         _raw = await _loop.run_in_executor(
             None,
-            functools.partial(engine.tok.decode, proc.all_ids, skip_special_tokens=False),
+            functools.partial(engine.tok.decode, _output_ids, skip_special_tokens=False),
         )
         logger.info(
-            "%s RAW OUTPUT (%d tokens, finish=%s, %d chars): %s",
+            "%s RAW OUTPUT (%d tokens%s, finish=%s, %d chars): %s",
             tag,
             gen_tokens,
+            ", sample" if output_truncated else "",
             finish_reason,
             len(_raw),
             _raw,
@@ -1084,6 +1137,7 @@ async def lifespan(app: FastAPI):
         enable_mtp=SERVER_ENABLE_MTP,
         mtp_num_speculative_tokens=SERVER_MTP_K,
         mtp_resync=SERVER_MTP_RESYNC,
+        max_pending_requests=SERVER_MAX_PENDING_REQUESTS,
         enable_dspark=SERVER_ENABLE_DSPARK,
         dspark_draft_model=SERVER_DSPARK_DRAFT_MODEL,
         dspark_num_speculative_tokens=SERVER_DSPARK_K,
@@ -1105,6 +1159,7 @@ async def lifespan(app: FastAPI):
     logger.info(
         "engine ready: backend=%s served_model=%s checkpoint=%s capacity=%d "
         "num_slots=%d capacity_tokens_per_slot=%d "
+        "max_pending_requests=%d "
         "cudagraph=%s prefix_cache=%s session_affinity=%s ttl=%.1fs dflash=%s "
         "mtp=%s(K=%d,resync=%s) dspark=%s(K=%d,draft=%s,verify=%s,require_cg=%s) "
         "dflash2=%s(K=%d,draft=%s)",
@@ -1114,6 +1169,7 @@ async def lifespan(app: FastAPI):
         engine.capacity,
         engine.num_slots,
         engine.capacity_tokens_per_slot,
+        engine.max_pending_requests,
         SERVER_ENABLE_CUDAGRAPH,
         engine.enable_prefix_cache,
         SERVER_ENABLE_SESSION_AFFINITY,
@@ -1131,16 +1187,13 @@ async def lifespan(app: FastAPI):
         SERVER_DFLASH2_K,
         SERVER_DFLASH2_DRAFT_MODEL,
     )
-    # Cyclic-GC pauses land in the decode hot loop as 50-150 ms host stalls:
-    # the 2026-08-06 128K/c4 node trace measured 667 GPU-idle gaps >0.5 ms
-    # (33% of steady-state wall) and the round profile's worst rounds put
-    # 100-150 ms inside accept_decision/draft_batch with the GPU idle --
-    # the classic full-heap collection signature on a process holding a
-    # 27B-parameter object graph. vLLM disables GC in its engine core for
-    # the same reason; serving objects here are acyclic (request/response
-    # trees freed by refcount), so the generational collector only costs.
-    # QSR_DISABLE_GC=0 restores the default for comparison runs.
-    if os.environ.get("QSR_DISABLE_GC", "1") == "1":
+    # Disabling cyclic GC used to be the default based on an older benchmark
+    # where request trees were effectively acyclic.  Streaming disconnects
+    # and failed SSE generators do create cycles, however, and the observed
+    # empty-stream retry loop retained those graphs until the host OOM killer
+    # terminated the process.  Keep the benchmark escape hatch, but make it
+    # explicit: QSR_DISABLE_GC=1 is never a production default.
+    if os.environ.get("QSR_DISABLE_GC", "0") == "1":
         import gc
 
         gc.collect()
@@ -1565,13 +1618,23 @@ async def _submit_stream_with_thinking_budget(
     }
     if vision_inputs is not None:
         submit_kwargs["vision_inputs"] = vision_inputs
-    async for item in engine_ref.submit_stream(prompt_ids, max_tokens, **submit_kwargs):
-        if isinstance(item, dict):
-            result = item
-            break
-        processor.add_tokens(item)
-        stream_ids.extend(item)
-        yield item
+    stream = engine_ref.submit_stream(prompt_ids, max_tokens, **submit_kwargs)
+    try:
+        async for item in stream:
+            if isinstance(item, dict):
+                result = item
+                break
+            processor.add_tokens(item)
+            stream_ids.extend(item)
+            yield item
+    finally:
+        # A protocol adapter often breaks as soon as it receives the terminal
+        # result, and a disconnected client may close the outer SSE without
+        # another ``anext`` call.  Close the engine iterator explicitly so its
+        # request finally block cancels the slot and drops the channel buffer.
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            await close()
 
     if result is None:
         return
@@ -1743,6 +1806,24 @@ async def _http_exception_handler(request: Request, exc: HTTPException):
     )
 
 
+@app.exception_handler(RequestQueueFull)
+async def _request_queue_full_handler(request: Request, exc: RequestQueueFull):
+    """Return a retryable protocol error instead of admitting more prompts."""
+    metrics.record_error(_endpoint_from_path(request.url.path), 503)
+    return JSONResponse(
+        status_code=503,
+        content=_protocol_error_body(
+            request.url.path,
+            {
+                "message": str(exc),
+                "type": "server_busy",
+                "code": "request_queue_full",
+            },
+        ),
+        headers={"Retry-After": "1"},
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def _validation_exception_handler(request: Request, exc: RequestValidationError):
     """Same fix as ``_http_exception_handler``, for the OTHER shape FastAPI
@@ -1780,6 +1861,11 @@ async def health():
     active_generating = len(engine.active)
     prefill_requests = _pending_prefill_count(engine)
     waiting_requests = _waiting_request_count(engine)
+    pending_budget = getattr(engine, "pending_request_count", None)
+    pending_requests = pending_budget() if pending_budget is not None else (
+        active_generating + prefill_requests + waiting_requests
+    )
+    max_pending = getattr(engine, "max_pending_requests", None)
     return {
         "status": "ok",
         "capacity": capacity,
@@ -1792,6 +1878,8 @@ async def health():
         "prefill": prefill_requests,
         "occupied_slots": capacity - len(engine.free_slots),
         "waiting": waiting_requests,
+        "pending_requests": pending_requests,
+        "max_pending_requests": max_pending,
     }
 
 
@@ -1836,6 +1924,13 @@ def _waiting_request_count(engine_ref) -> int:
     waiting = len(getattr(engine_ref, "waiting", ()) or ())
     incoming = len(getattr(engine_ref, "_req_deque", ()) or ())
     return waiting + incoming
+
+
+def _ensure_request_capacity(engine_ref) -> None:
+    """Use the runtime admission guard when a test/embedding engine has it."""
+    ensure = getattr(engine_ref, "ensure_request_capacity", None)
+    if callable(ensure):
+        ensure()
 
 
 def _engine_has_work(engine_ref) -> bool:
@@ -1950,6 +2045,7 @@ def _collect_debug_stats(*, refresh_memory: bool = False) -> dict:
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     assert engine is not None
+    _ensure_request_capacity(engine)
     _reject_unsupported_response_format(req.response_format)
     stop_sequences = _normalize_stop(req.stop, max_count=4)
     max_tokens = _validate_and_resolve_max_tokens(req.max_tokens)
@@ -2014,6 +2110,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     model_name = req.model or _default_served_model_name(engine)
 
     if req.stream:
+        _ensure_request_capacity(engine)
         import json as _json
 
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -2259,6 +2356,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 @app.post("/v1/completions")
 async def completions(req: CompletionRequest, request: Request):
     assert engine is not None
+    _ensure_request_capacity(engine)
     sampling_params = _build_sampling_params(
         temperature=req.temperature,
         top_p=req.top_p,
@@ -3017,6 +3115,7 @@ async def anthropic_count_tokens(request: Request):
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
     assert engine is not None
+    _ensure_request_capacity(engine)
     body = await request.json()
     t0 = time.perf_counter()
 
@@ -3098,6 +3197,7 @@ async def anthropic_messages(request: Request):
     effective_max = max_tokens
 
     if stream:
+        _ensure_request_capacity(engine)
         import json as _json
 
         async def _anthropic_sse():
@@ -3326,6 +3426,7 @@ async def anthropic_messages(request: Request):
 @app.post("/v1/responses")
 async def responses_api(request: Request):
     assert engine is not None
+    _ensure_request_capacity(engine)
     body = await request.json()
     t0 = time.perf_counter()
 
@@ -3388,6 +3489,7 @@ async def responses_api(request: Request):
         )
 
     if stream:
+        _ensure_request_capacity(engine)
 
         async def _responses_sse():
             proc = _new_stream_processor(engine.tok, chat_template_kwargs)
