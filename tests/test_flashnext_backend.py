@@ -338,6 +338,179 @@ def test_flashnext_prefix_snapshot_restores_recurrent_state_without_qsa_copy() -
     assert torch.equal(target.sess.rope_next, torch.tensor([11, 12, 13]))
 
 
+def test_flashnext_prefix_history_selects_shorter_authenticated_checkpoint() -> None:
+    """A compacted prompt can resume from an older checkpoint, not only latest."""
+
+    backend = object.__new__(FlashNextBackend)
+    backend.enable_prefix_cache = True
+    backend.num_slots = 1
+    backend.prefix_cache_checkpoints_per_slot = 4
+    backend._slot_tokens = [[]]
+    backend._last_logits = [None]
+    backend._prefix_cache = [None]
+    backend._prefix_cache_history = [[]]
+    backend._prefix_cache_tokens = [None]
+    backend._prefix_cache_kv_len = [0]
+    backend._pending_prefix_hits = {}
+    backend._specs = [None]
+    backend.stats = {}
+
+    class _Target:
+        def __init__(self) -> None:
+            self.sess = SimpleNamespace(
+                gdn={
+                    "gdn_0": SimpleNamespace(
+                        conv_state=torch.tensor([[1.0]]),
+                        recurrent_state=torch.tensor([[2.0]]),
+                        has_previous_state=True,
+                    )
+                },
+                ple_conv_state=torch.tensor([[3.0]]),
+                rope_next=None,
+                window=[],
+                pos=0,
+                qsa_k={},
+                qsa_v={},
+                qsa_idx_k={},
+            )
+
+        def _zero_state(self, *, clear_kv: bool = True) -> None:
+            del clear_kv
+            state = self.sess.gdn["gdn_0"]
+            state.conv_state.zero_()
+            state.recurrent_state.zero_()
+            self.sess.ple_conv_state.zero_()
+            self.sess.pos = 0
+            self.sess.window = []
+            self.sess.rope_next = None
+
+    target = _Target()
+    backend._targets = [target]
+    logits = torch.tensor([0.1, 0.9])
+    backend._capture_prefix_snapshot(
+        0,
+        [1, 2, 3, 4],
+        anchor=5,
+        draft_tokens=[],
+        anchor_logits=logits,
+        mtp_ready=False,
+        target_only_reusable=True,
+        decode_mode="greedy",
+    )
+    target.sess.gdn["gdn_0"].conv_state.fill_(7.0)
+    target.sess.gdn["gdn_0"].recurrent_state.fill_(8.0)
+    target.sess.ple_conv_state.fill_(9.0)
+    backend._capture_prefix_snapshot(
+        0,
+        [1, 2, 3, 4, 5, 6, 7, 8],
+        anchor=9,
+        draft_tokens=[],
+        anchor_logits=logits,
+        mtp_ready=False,
+        target_only_reusable=True,
+        decode_mode="greedy",
+    )
+
+    request = [1, 2, 3, 4, 10, 11]
+    greedy_key = backend.prefix_cache_key_for_sampling(None, sampled=False)
+    assert backend._prefix_hit_for_slot(request, 0, prefix_cache_key=greedy_key).effective == 4
+    hit, entry = backend._prepare_prefill_prefix(
+        0,
+        request,
+        prefix_cache_key=greedy_key,
+    )
+    assert hit == 4
+    assert entry is not None and entry.kv_len == 4
+    assert torch.equal(target.sess.gdn["gdn_0"].conv_state, torch.tensor([[1.0]]))
+    assert torch.equal(target.sess.gdn["gdn_0"].recurrent_state, torch.tensor([[2.0]]))
+    assert torch.equal(target.sess.ple_conv_state, torch.tensor([[3.0]]))
+
+
+def test_flashnext_prefix_history_is_bounded_and_keeps_early_anchor() -> None:
+    """History retention is bounded so long prompts cannot clone unbounded state."""
+
+    backend = object.__new__(FlashNextBackend)
+    backend.enable_prefix_cache = True
+    backend.num_slots = 1
+    backend.prefix_cache_checkpoints_per_slot = 3
+    backend._prefix_cache = [None]
+    backend._prefix_cache_history = [[]]
+    backend._prefix_cache_tokens = [None]
+    backend._prefix_cache_kv_len = [0]
+    backend._specs = [None]
+    backend.stats = {}
+    backend._targets = [
+        SimpleNamespace(
+            sess=SimpleNamespace(
+                gdn={},
+                ple_conv_state=None,
+                rope_next=None,
+                window=[],
+                pos=0,
+            )
+        )
+    ]
+    logits = torch.tensor([0.1, 0.9])
+    for length in (4, 8, 12, 16, 20):
+        backend._capture_prefix_snapshot(
+            0,
+            list(range(length)),
+            anchor=1,
+            draft_tokens=[],
+            anchor_logits=logits,
+            mtp_ready=False,
+            target_only_reusable=True,
+        )
+    retained = backend._prefix_cache_history[0]
+    assert len(retained) == 3
+    assert [entry.kv_len for entry in retained] == [4, 16, 20]
+
+
+def test_flashnext_target_only_checkpoint_retains_mtp_cursor_without_proposal() -> None:
+    """Teacher-forced history entries must not be mistaken for proposals."""
+
+    backend = object.__new__(FlashNextBackend)
+    backend.enable_prefix_cache = True
+    backend.num_slots = 1
+    backend.prefix_cache_checkpoints_per_slot = 3
+    backend._prefix_cache = [None]
+    backend._prefix_cache_history = [[]]
+    backend._prefix_cache_tokens = [None]
+    backend._prefix_cache_kv_len = [0]
+    backend.stats = {}
+    backend._specs = [
+        SimpleNamespace(mtp_session=SimpleNamespace(sync_len=8, pos=8))
+    ]
+    backend._targets = [
+        SimpleNamespace(
+            sess=SimpleNamespace(
+                gdn={},
+                ple_conv_state=None,
+                rope_next=None,
+                window=[],
+            )
+        )
+    ]
+
+    backend._capture_prefix_snapshot(
+        0,
+        list(range(8)),
+        anchor=1,
+        draft_tokens=[],
+        anchor_logits=torch.tensor([0.1, 0.9]),
+        mtp_ready=False,
+        mtp_prefix_ready=True,
+        target_only_reusable=True,
+    )
+
+    entry = backend._prefix_cache_history[0][0]
+    assert entry.mtp_ready is False
+    assert entry.mtp_prefix_ready is True
+    assert entry.target_only_reusable is True
+    assert entry.mtp_sync_len == 8
+    assert entry.mtp_pos == 8
+
+
 def test_vision_prefix_cache_requires_matching_image_keys() -> None:
     backend = object.__new__(FlashNextBackend)
     backend.enable_prefix_cache = True

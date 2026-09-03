@@ -209,6 +209,16 @@ class FlashNextPrefixSnapshot:
     mtp_sync_len: int = 0
     mtp_pos: int = 0
     mtp_ready: bool = False
+    # Historical checkpoints are captured after target prefill and real-token
+    # MTP teacher sync, before the final proposal is made.  They therefore
+    # carry a valid real-prefix MTP state but no speculative tail.  Keeping
+    # this bit separate from ``mtp_ready`` lets an extension restore the MTP
+    # pool cursor without pretending that cached drafts are reusable.
+    mtp_prefix_ready: bool = False
+    # Target-only checkpoints created by the bounded historical cache may be
+    # used for both greedy and sampled requests.  Older target-only entries
+    # keep the conservative sampled-only behaviour for compatibility.
+    target_only_reusable: bool = False
     # The mode is part of the checkpoint contract.  Greedy and sampled MTP
     # share the recurrent prefix but not the proposal RNG/distribution state;
     # never restore one mode's speculative tail for the other.
@@ -277,6 +287,35 @@ class FlashNextBackend:
         self._slot_tokens: list[list[int]] = [[] for _ in range(num_slots)]
         self._last_logits: list[torch.Tensor | None] = [None for _ in range(num_slots)]
         self._prefix_cache: list[FlashNextPrefixSnapshot | None] = [None] * num_slots
+        # A single latest checkpoint cannot serve a prompt that is shorter
+        # than the last request (the common shape after client compaction).
+        # Keep a small bounded history of recurrent checkpoints so any
+        # authenticated common boundary can be resumed without replaying the
+        # whole cold prefix.  Six entries/slot costs roughly 0.9 GiB/slot on
+        # the production checkpoint and is below the measured two-slot headroom.
+        try:
+            checkpoint_limit = int(
+                os.environ.get("QSR_FLASHNEXT_PREFIX_CHECKPOINTS_PER_SLOT", "6")
+            )
+        except ValueError:
+            checkpoint_limit = 6
+            logger.warning(
+                "invalid QSR_FLASHNEXT_PREFIX_CHECKPOINTS_PER_SLOT; using 6"
+            )
+        self.prefix_cache_checkpoints_per_slot = max(1, min(checkpoint_limit, 16))
+        try:
+            checkpoint_interval = int(
+                os.environ.get("QSR_FLASHNEXT_PREFIX_CHECKPOINT_INTERVAL", "8192")
+            )
+        except ValueError:
+            checkpoint_interval = 8192
+            logger.warning(
+                "invalid QSR_FLASHNEXT_PREFIX_CHECKPOINT_INTERVAL; using 8192"
+            )
+        self.prefix_cache_checkpoint_interval = max(1, min(checkpoint_interval, max_seq_len))
+        self._prefix_cache_history: list[list[FlashNextPrefixSnapshot]] = [
+            [] for _ in range(num_slots)
+        ]
         # These two side tables mirror the names consumed by the existing
         # /debug/stats compatibility surface.
         self._prefix_cache_tokens: list[list[int] | None] = [None] * num_slots
@@ -312,6 +351,11 @@ class FlashNextBackend:
             "mtp_last_ple_ns": 0,
             "mtp_last_verify_ns": 0,
             "mtp_last_proposal_ns": 0,
+            "prefix_cache_history_hits": 0,
+            "prefix_cache_history_entries": 0,
+            "prefix_cache_full_hits": 0,
+            "prefix_cache_stores": 0,
+            "prefix_cache_restores": 0,
             "prefill_chunks": 0,
             "prefill_tokens": 0,
             "prefill_target_ns": 0,
@@ -573,7 +617,7 @@ class FlashNextBackend:
             raise IndexError(f"slot {slot} out of range ({self.num_slots} slots)")
         target = self._targets[slot]
         sess = target.sess
-        keep_prefix = preserve_prefix and self._prefix_cache[slot] is not None
+        keep_prefix = preserve_prefix and bool(self._prefix_entries_for_slot(slot))
         target._zero_state(clear_kv=not keep_prefix)  # noqa: SLF001 - graph-owned state lifecycle
         # Eager decode uses append-only dictionaries rather than the graph
         # pools.  Clearing them prevents a no-CG fallback from inheriting a
@@ -586,11 +630,98 @@ class FlashNextBackend:
         self._last_logits[slot] = None
 
     def reset_slot(self, slot: int) -> None:
-        # Keep the last prompt's fixed-address KV and its small recurrent
-        # checkpoint available for the next admission.  A future cold miss
-        # explicitly calls _reset_runtime(preserve_prefix=False), so stale
-        # rows can never leak into a different prompt.
+        # Keep the prompt history's fixed-address KV and recurrent checkpoints
+        # available for the next admission.  A future cold miss explicitly
+        # calls _reset_runtime(preserve_prefix=False), so stale rows can never
+        # leak into a different prompt.
         self._reset_runtime(slot, preserve_prefix=self.enable_prefix_cache)
+
+    def _prefix_entries_for_slot(self, slot: int) -> tuple[FlashNextPrefixSnapshot, ...]:
+        """Return the bounded history, with a legacy latest-entry fallback."""
+        history = getattr(self, "_prefix_cache_history", None)
+        if isinstance(history, list) and 0 <= slot < len(history) and history[slot]:
+            return tuple(history[slot])
+        entries = getattr(self, "_prefix_cache", ())
+        if not isinstance(entries, (list, tuple)) or not 0 <= slot < len(entries):
+            return ()
+        entry = entries[slot]
+        return (entry,) if entry is not None else ()
+
+    def _prefix_checkpoint_limit(self) -> int:
+        configured = getattr(self, "prefix_cache_checkpoints_per_slot", None)
+        if configured is not None:
+            return max(1, min(int(configured), 16))
+        return 6
+
+    def _prefix_checkpoint_interval(self) -> int:
+        configured = getattr(self, "prefix_cache_checkpoint_interval", None)
+        if configured is not None:
+            return max(1, int(configured))
+        return 8192
+
+    def _select_prefix_entry(
+        self,
+        token_ids: list[int],
+        slot: int,
+        *,
+        prefix_cache_key: tuple[str, ...] | None = None,
+        exact_kv_len: int | None = None,
+    ) -> FlashNextPrefixSnapshot | None:
+        """Find the deepest authenticated checkpoint that fits this prompt."""
+        if not getattr(self, "enable_prefix_cache", True) or not token_ids:
+            return None
+        if not 0 <= slot < self.num_slots:
+            raise IndexError(f"slot {slot} out of range ({self.num_slots} slots)")
+        cache_mode, vision_cache_key = self._split_prefix_cache_key(prefix_cache_key)
+        specs = getattr(self, "_specs", ())
+        has_spec = slot < len(specs) and specs[slot] is not None
+        candidates: list[FlashNextPrefixSnapshot] = []
+        for entry in self._prefix_entries_for_slot(slot):
+            if not entry.token_ids or not self._vision_cache_matches(
+                vision_cache_key, entry.vision_cache_key
+            ):
+                continue
+            if (
+                cache_mode in {"greedy", "sampled"}
+                and entry.decode_mode in {"greedy", "sampled"}
+                and cache_mode != entry.decode_mode
+                and not (not entry.mtp_ready and entry.target_only_reusable)
+            ):
+                # The target-only historical state is mode agnostic; a full
+                # MTP proposal remains mode-specific.
+                continue
+            if (
+                entry.mtp_ready
+                and cache_mode == entry.decode_mode
+                and entry.decode_mode in {"greedy", "sampled"}
+                and entry.mtp_teacher_hidden is None
+            ):
+                # Full MTP checkpoints need the boundary teacher row to
+                # repair the shifted anchor on an extension/sample hit.
+                continue
+            if (
+                has_spec
+                and not entry.mtp_ready
+                and not entry.target_only_reusable
+                and cache_mode != "sampled"
+            ):
+                # Preserve the old conservative direct/greedy contract for
+                # legacy checkpoints that have no mode-neutral marker.
+                continue
+            if len(token_ids) < entry.kv_len:
+                # A shorter request may still match an older checkpoint; do
+                # not reject the whole slot because its newest entry is later.
+                continue
+            if exact_kv_len is not None and entry.kv_len != exact_kv_len:
+                continue
+            if tuple(token_ids[: entry.kv_len]) != entry.token_ids:
+                continue
+            if len(token_ids) == entry.kv_len and not entry.anchor_logits.numel():
+                continue
+            candidates.append(entry)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda candidate: candidate.kv_len)
 
     def _prefix_hit_for_slot(
         self,
@@ -603,67 +734,31 @@ class FlashNextBackend:
 
         Flash-Next has both QSA and recurrent state.  A token match is useful
         only when the recurrent snapshot was taken at that *same* boundary;
-        therefore this deliberately exposes the stored prompt length rather
-        than rounding to an attention page or claiming a partial KV-only hit.
+        therefore this deliberately exposes the deepest stored checkpoint
+        length rather than rounding to an attention page or claiming a
+        partial KV-only hit.
         The fixed QSA pools make arbitrary token boundaries safe.
         """
         if not getattr(self, "enable_prefix_cache", True) or not token_ids:
             return PrefixHit(kv_hit=0, state_hit=0)
         if not 0 <= slot < self.num_slots:
             raise IndexError(f"slot {slot} out of range ({self.num_slots} slots)")
-        entries = getattr(self, "_prefix_cache", ())
-        if slot >= len(entries):
+        entry = self._select_prefix_entry(
+            token_ids,
+            slot,
+            prefix_cache_key=prefix_cache_key,
+        )
+        if entry is None:
             return PrefixHit(kv_hit=0, state_hit=0)
-        entry = entries[slot]
-        if entry is None or not entry.token_ids:
-            return PrefixHit(kv_hit=0, state_hit=0)
-        cache_mode, vision_cache_key = self._split_prefix_cache_key(prefix_cache_key)
-        if not self._vision_cache_matches(vision_cache_key, entry.vision_cache_key):
-            return PrefixHit(kv_hit=0, state_hit=0)
+        latest = getattr(self, "_prefix_cache", ())
         if (
-            cache_mode in {"greedy", "sampled"}
-            and entry.decode_mode in {"greedy", "sampled"}
-            and cache_mode != entry.decode_mode
+            slot >= len(latest)
+            or latest[slot] is not entry
         ):
-            # The target checkpoint is shared, but the retained MTP pools are
-            # mode-specific.  A mode switch must cold-prefill (or use a
-            # separately captured checkpoint), never consume another mode's
-            # stochastic proposal state.
-            return PrefixHit(kv_hit=0, state_hit=0)
-        if (
-            cache_mode == entry.decode_mode
-            and entry.mtp_ready
-            and entry.decode_mode in {"greedy", "sampled"}
-            and entry.mtp_teacher_hidden is None
-        ):
-            # New-mode checkpoints carry the one boundary hidden row needed
-            # to repair an extension/full sampled hit.  Treat an incomplete
-            # legacy checkpoint as a miss instead of restoring an MTP pointer
-            # that the next shifted sync cannot authenticate.
-            return PrefixHit(kv_hit=0, state_hit=0)
-        specs = getattr(self, "_specs", ())
-        if (
-            slot < len(specs)
-            and specs[slot] is not None
-            and not entry.mtp_ready
-            and cache_mode != "sampled"
-        ):
-            # A target-only legacy checkpoint is valid for sampled decode, but
-            # a greedy request must never restore it: greedy admission needs
-            # the matching MTP causal prefix as well.  ``cache_mode=None``
-            # keeps direct legacy callers conservative.
-            return PrefixHit(kv_hit=0, state_hit=0)
-        limit = min(len(token_ids), entry.kv_len)
-        if tuple(token_ids[:limit]) != entry.token_ids[:limit]:
-            return PrefixHit(kv_hit=0, state_hit=0)
-        # A shorter request cannot resume from a later checkpoint.  For an
-        # equal-length request the saved logits/anchor are required; the
-        # matcher always has them because _capture_prefix_snapshot publishes
-        # complete checkpoints only.
-        if len(token_ids) < entry.kv_len:
-            return PrefixHit(kv_hit=0, state_hit=0)
-        if len(token_ids) == entry.kv_len and not entry.anchor_logits.numel():
-            return PrefixHit(kv_hit=0, state_hit=0)
+            stats = getattr(self, "stats", {})
+            stats["prefix_cache_history_hits"] = stats.get(
+                "prefix_cache_history_hits", 0
+            ) + 1
         return PrefixHit(kv_hit=entry.kv_len, state_hit=entry.kv_len)
 
     def prefix_hit_for_slot(self, token_ids: list[int], slot: int) -> PrefixHit:
@@ -687,6 +782,8 @@ class FlashNextBackend:
         draft_tokens: list[int],
         anchor_logits: torch.Tensor,
         mtp_ready: bool,
+        mtp_prefix_ready: bool = False,
+        target_only_reusable: bool = False,
         vision_cache_key: tuple[str, ...] | None = None,
         decode_mode: str | None = None,
         mtp_teacher_hidden: torch.Tensor | None = None,
@@ -718,7 +815,8 @@ class FlashNextBackend:
         )
         rope_next = sess.rope_next.detach().clone() if torch.is_tensor(sess.rope_next) else None
         spec = self._specs[slot]
-        mtp_sess = spec.mtp_session if spec is not None and mtp_ready else None
+        retain_mtp_prefix = spec is not None and (mtp_ready or mtp_prefix_ready)
+        mtp_sess = spec.mtp_session if retain_mtp_prefix else None
         entry = FlashNextPrefixSnapshot(
             token_ids=tuple(int(token) for token in prompt_ids),
             kv_len=len(prompt_ids),
@@ -732,12 +830,35 @@ class FlashNextBackend:
             vision_cache_key=vision_cache_key,
             mtp_sync_len=int(mtp_sess.sync_len) if mtp_sess is not None else 0,
             mtp_pos=int(mtp_sess.pos) if mtp_sess is not None else 0,
-            mtp_ready=mtp_sess is not None,
+            # ``mtp_ready`` means that this snapshot also owns a proposal
+            # anchored at the boundary.  A historical checkpoint captured
+            # after teacher-forcing a real prefix only retains the MTP
+            # cursor; it must stay target-only so restore does not rewind a
+            # nonexistent proposal row or apply mode-specific sampling.
+            mtp_ready=bool(mtp_ready and mtp_sess is not None),
+            mtp_prefix_ready=bool(mtp_prefix_ready and mtp_sess is not None),
+            target_only_reusable=bool(target_only_reusable),
             decode_mode=decode_mode,
             mtp_teacher_hidden=(
                 mtp_teacher_hidden.detach().clone() if torch.is_tensor(mtp_teacher_hidden) else None
             ),
         )
+        history = getattr(self, "_prefix_cache_history", None)
+        if isinstance(history, list) and slot < len(history):
+            slot_history = history[slot]
+            slot_history[:] = [old for old in slot_history if old.kv_len != entry.kv_len]
+            slot_history.append(entry)
+            limit = self._prefix_checkpoint_limit()
+            if len(slot_history) > limit:
+                # Keep the earliest authenticated boundary as a cheap anchor
+                # for aggressively compacted sessions, plus the newest tail
+                # where most same-session edits land.
+                first = slot_history[0]
+                tail = slot_history[-(limit - 1) :] if limit > 1 else []
+                slot_history[:] = [first, *[old for old in tail if old is not first]]
+            self.stats["prefix_cache_history_entries"] = sum(
+                len(items) for items in history
+            )
         self._prefix_cache[slot] = entry
         self._prefix_cache_tokens[slot] = list(entry.token_ids)
         self._prefix_cache_kv_len[slot] = entry.kv_len
@@ -745,13 +866,34 @@ class FlashNextBackend:
 
     def _drop_prefix_snapshot(self, slot: int) -> None:
         """Invalidate one cache entry before a cold write can overwrite it."""
+        history = getattr(self, "_prefix_cache_history", None)
+        if isinstance(history, list) and slot < len(history):
+            history[slot].clear()
+            stats = getattr(self, "stats", {})
+            stats["prefix_cache_history_entries"] = sum(len(items) for items in history)
         self._prefix_cache[slot] = None
         self._prefix_cache_tokens[slot] = None
         self._prefix_cache_kv_len[slot] = 0
 
-    def _restore_prefix_snapshot(self, slot: int, prompt_ids: list[int], hit: int) -> None:
+    def _restore_prefix_snapshot(
+        self,
+        slot: int,
+        prompt_ids: list[int],
+        hit: int,
+        *,
+        entry: FlashNextPrefixSnapshot | None = None,
+    ) -> None:
         """Restore recurrent/metadata state at an already retained KV prefix."""
-        entry = self._prefix_cache[slot]
+        if entry is None:
+            entry = next(
+                (
+                    candidate
+                    for candidate in self._prefix_entries_for_slot(slot)
+                    if candidate.kv_len == hit
+                    and tuple(prompt_ids[:hit]) == candidate.token_ids
+                ),
+                None,
+            )
         if entry is None or hit != entry.kv_len:
             raise RuntimeError(
                 f"Flash-Next prefix restore has no checkpoint at hit={hit} for slot={slot}"
@@ -774,16 +916,20 @@ class FlashNextBackend:
         sess.rope_next = entry.rope_next.detach().clone() if entry.rope_next is not None else None
         spec = self._specs[slot]
         if spec is not None:
-            if entry.mtp_ready:
+            if entry.mtp_prefix_ready or entry.mtp_ready:
                 mtp_sess = spec.mtp_session
-                if entry.decode_mode in {"greedy", "sampled"} and len(prompt_ids) > hit:
+                if (
+                    entry.mtp_ready
+                    and entry.decode_mode in {"greedy", "sampled"}
+                    and len(prompt_ids) > hit
+                ):
                     # The cached proposal consumed the old anchor at L-1.
                     # An extended prompt replaces that row with the first
                     # suffix token, so rewind one row for the shifted
                     # teacher sync below.
                     mtp_sess.sync_len = max(entry.mtp_sync_len - 1, 0)
                     mtp_sess.pos = mtp_sess.sync_len
-                elif entry.decode_mode == "sampled":
+                elif entry.mtp_ready and entry.decode_mode == "sampled":
                     # The cached proposal already consumed the old anchor at
                     # position L-1.  Rewind that one row so a new request can
                     # overwrite it with its own sampled anchor before
@@ -833,9 +979,17 @@ class FlashNextBackend:
                 prefix_cache_key=prefix_cache_key,
             ).effective
         if hit > 0:
-            entry = self._prefix_cache[slot]
+            entry = self._select_prefix_entry(
+                prompt_ids,
+                slot,
+                prefix_cache_key=prefix_cache_key,
+                exact_kv_len=hit,
+            )
+            if entry is None:
+                hit = 0
+        if hit > 0:
             self._reset_runtime(slot, preserve_prefix=True)
-            self._restore_prefix_snapshot(slot, prompt_ids, hit)
+            self._restore_prefix_snapshot(slot, prompt_ids, hit, entry=entry)
             return hit, entry
         self._drop_prefix_snapshot(slot)
         self._reset_runtime(slot, preserve_prefix=False)
@@ -889,6 +1043,7 @@ class FlashNextBackend:
             "target_session_kv": 0,
             "target_session_recurrent": 0,
             "target_session_io": 0,
+            "prefix_cache_snapshots": 0,
             "target_graph_static": 0,
             "mtp_session_kv": 0,
             "mtp_sparse_graph": 0,
@@ -1025,6 +1180,8 @@ class FlashNextBackend:
             add_tree("target_session_kv", session_kv)
             add_tree("target_session_recurrent", session_recurrent)
             add_tree("target_session_io", session_io)
+            prefix_entries = self._prefix_entries_for_slot(slot_index)
+            add_tree("prefix_cache_snapshots", prefix_entries)
             add_tree("target_graph_static", target._logits)  # noqa: SLF001 - debug accounting
             # These fields deliberately use a per-slot storage set.  They are
             # diagnostic, not part of ``explicit_tensor_bytes``: if a future
@@ -1034,6 +1191,7 @@ class FlashNextBackend:
             totals[f"target_session_kv_slot_{slot_index}"] = tree_bytes(session_kv)
             totals[f"target_session_recurrent_slot_{slot_index}"] = tree_bytes(session_recurrent)
             totals[f"target_session_io_slot_{slot_index}"] = tree_bytes(session_io)
+            totals[f"prefix_cache_snapshots_slot_{slot_index}"] = tree_bytes(prefix_entries)
 
         for layer in self.model.layers:
             mlp = getattr(layer, "mlp", None)
@@ -1105,6 +1263,7 @@ class FlashNextBackend:
             + totals["target_session_io"]
             + totals["target_graph_static"]
         )
+        prefix_total = totals["prefix_cache_snapshots"]
         mtp_total = (
             totals["mtp_session_kv"]
             + totals["mtp_sparse_graph"]
@@ -1112,11 +1271,11 @@ class FlashNextBackend:
             + totals["mtp_verify_outputs"]
             + totals["mtp_graph_static"]
         )
-        explicit_total = model_total + target_total + mtp_total
+        explicit_total = model_total + target_total + mtp_total + prefix_total
         totals["model_tensor_bytes"] = model_total
         totals["target_session_tensor_bytes"] = target_total
         totals["mtp_session_tensor_bytes"] = mtp_total
-        totals["session_tensor_bytes"] = target_total + mtp_total
+        totals["session_tensor_bytes"] = target_total + mtp_total + prefix_total
         totals["explicit_tensor_bytes"] = explicit_total
         totals["torch_allocated"] = torch.cuda.memory_allocated(device_type)
         totals["torch_reserved"] = torch.cuda.memory_reserved(device_type)
@@ -1255,6 +1414,15 @@ class FlashNextBackend:
             and prefix_entry.decode_mode == decode_mode
             and prefix_entry.mtp_teacher_hidden is not None
         )
+        # Historical target-only checkpoints normally retain the real-prefix
+        # MTP cursor as well.  Very old entries may not; serving those from a
+        # target checkpoint is still correct, but MTP must stay disabled for
+        # that request because its causal prefix would otherwise be missing.
+        prefix_mtp_state_ready = bool(
+            prefix_entry is not None
+            and (prefix_entry.mtp_prefix_ready or prefix_entry.mtp_ready)
+        )
+        use_mtp = spec is not None and (prefix_hit == 0 or prefix_mtp_state_ready)
 
         if prefix_hit == len(prompt_ids):
             if prefix_entry is None:
@@ -1285,6 +1453,22 @@ class FlashNextBackend:
                     [anchor],
                     teacher_hidden,
                     params=params,
+                )
+            elif (
+                spec is not None
+                and use_mtp
+                and prefix_entry.mtp_prefix_ready
+                and prefix_entry.mtp_teacher_hidden is not None
+            ):
+                # A historical target-only checkpoint has the real-prefix
+                # MTP cursor but no cached proposal. Re-teacher-force the
+                # boundary row so an exact compacted-prefix hit still keeps
+                # speculative decode instead of falling back to one-token
+                # target decode.
+                drafts = spec.sync_and_propose(
+                    [anchor],
+                    prefix_entry.mtp_teacher_hidden,
+                    params=params if sampled else None,
                 )
             else:
                 drafts = (
@@ -1358,7 +1542,7 @@ class FlashNextBackend:
             target_ns += self._prefill_timestamp_ns() - started
         else:
             logits = None
-            mtp_enabled = spec is not None
+            mtp_enabled = use_mtp
             # The full fused embedding matrix is only needed for one target
             # chunk at a time. Move it back to host memory for long image
             # prompts so a 256K multimodal request does not retain another
@@ -1459,6 +1643,34 @@ class FlashNextBackend:
                         **sync_kwargs,
                     )
                     mtp_sync_ns += self._prefill_timestamp_ns() - started
+                    absolute_end = prefix_hit + end
+                    absolute_start = prefix_hit + start
+                    checkpoint_interval = self._prefix_checkpoint_interval()
+                    crossed_checkpoint = (
+                        absolute_end >= checkpoint_interval
+                        and absolute_end // checkpoint_interval
+                        > absolute_start // checkpoint_interval
+                    )
+                    if crossed_checkpoint and cacheable_vision:
+                        # At this point target state and real-prefix MTP rows
+                        # are both at ``absolute_end``.  Do not run a draft
+                        # proposal here: capturing it would consume an anchor
+                        # that the next chunk still needs.  The checkpoint is
+                        # therefore explicitly target-only, while preserving
+                        # the MTP teacher cursor for a later extension.
+                        self._capture_prefix_snapshot(
+                            slot,
+                            prompt_ids[:absolute_end],
+                            anchor=int(logits.argmax(dim=-1).item()),
+                            draft_tokens=[],
+                            anchor_logits=logits,
+                            vision_cache_key=vision_cache_key,
+                            mtp_ready=False,
+                            mtp_prefix_ready=True,
+                            target_only_reusable=True,
+                            decode_mode=decode_mode,
+                            mtp_teacher_hidden=hidden_rows[-1:].detach(),
+                        )
                 elif final:
                     final_hidden = hidden_rows
                     final_chunk_start = start
@@ -1472,7 +1684,7 @@ class FlashNextBackend:
             anchor = self._sample(logits, params or SamplingParams())
 
         drafts: list[int] = []
-        if spec is not None:
+        if use_mtp:
             if final_hidden is not None:
                 # The target hidden row at the prompt boundary lets a full
                 # prefix hit re-teacher-force the first sampled anchor while
@@ -1570,7 +1782,7 @@ class FlashNextBackend:
         trim_ns = self._prefill_timestamp_ns() - started
         self._slot_tokens[slot] = list(prompt_ids)
         self._last_logits[slot] = logits
-        mtp_ready = spec is not None
+        mtp_ready = use_mtp
         if cacheable_vision:
             self._capture_prefix_snapshot(
                 slot,
@@ -1580,6 +1792,8 @@ class FlashNextBackend:
                 anchor_logits=logits,
                 vision_cache_key=vision_cache_key,
                 mtp_ready=mtp_ready,
+                mtp_prefix_ready=use_mtp,
+                target_only_reusable=not use_mtp and prefix_hit > 0,
                 decode_mode=decode_mode,
                 mtp_teacher_hidden=mtp_teacher_hidden,
             )

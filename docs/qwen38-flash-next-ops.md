@@ -112,6 +112,12 @@ export QSR_FLASHNEXT_QSA_TOPK_RERANK=1
 export QSR_FLASHNEXT_HC_NORM_FUSION=0
 export QSR_FLASHNEXT_HC_NORM_APPLY_FUSION=1
 export QSR_FLASHNEXT_HC_POINTWISE_FUSION=1
+# Keep the latest six target/recurrent boundaries per slot.  Checkpoints are
+# captured every 8192 tokens plus the final prompt; this lets a compacted or
+# shortened same-session prompt resume from an older authenticated boundary.
+# Each slot remains bounded (about 0.9 GiB at the production GDN state size).
+export QSR_FLASHNEXT_PREFIX_CHECKPOINTS_PER_SLOT=6
+export QSR_FLASHNEXT_PREFIX_CHECKPOINT_INTERVAL=8192
 export QSR_TRACE=1
 
 exec /home/bot/.venvs/torch-nightly/bin/python -m server.app \
@@ -196,7 +202,11 @@ Prefix cache 的 admission key 会同时携带 `sampled`/`greedy` 解码契约�
 都会保存 target + MTP 状态；采样命中时恢复真实 MTP 前缀、覆盖旧 anchor 并重新
 采样 draft/q 分布，greedy 命中则复用确定性 draft。模式不匹配的 checkpoint 不会
 被恢复，避免把另一请求的随机 proposal 状态带进来；仍要求 token 前缀和视觉
-cache key 完全一致。
+cache key 完全一致。长 prompt 还会在 chunk 边界保存有界的 target-only 历史
+checkpoint；这些 checkpoint 保留已 teacher-sync 的 MTP real-prefix cursor，
+但不复用旧 proposal，因此同一会话被 OpenCode 压缩、prompt 变短或 suffix 改写时，
+仍能从最近的共同边界恢复并继续走 MTP。完全不匹配的 prompt 会清空整组历史，
+不会读取另一会话的 QSA/GDN 状态。
 
 ## OpenCode / Windows 客户端
 
@@ -209,9 +219,9 @@ OpenCode provider 的最小配置如下，模型名使用服务实际暴露的
   "compaction": {
     "auto": true,
     "prune": true,
-    "reserved": 32003,
-    "preserve_recent_tokens": 12000,
-    "tail_turns": 15
+    "reserved": 48003,
+    "preserve_recent_tokens": 8000,
+    "tail_turns": 4
   },
   "provider": {
     "blackwellm": {
@@ -247,11 +257,14 @@ OpenCode provider 的最小配置如下，模型名使用服务实际暴露的
 
 这里使用 `@ai-sdk/openai-compatible`，因为本地服务的稳定入口是
 `/v1/chat/completions`；不要把它替换成会优先走 `/v1/responses` 的
-`@ai-sdk/openai`。`limit.input` 必须保留为 `262144`：OpenCode 1.18.25 的
-V1 overflow 公式是 `input - compaction.reserved`，因此当前配置得到
-`262144 - 32003 = 230141`，正好对齐服务 `/v1/models` 的安全输入上限（其中
-32000 是最大输出，3 是 MTP speculative tail）。不要把 `input` 改成
-`230141`，否则会提前丢掉 32003 个可用上下文 token。
+`@ai-sdk/openai`。`limit.input` 必须保留为 `262144`，而不是把客户端模型上限
+改成服务端的输入预算：OpenCode 1.18.x 的 V1 overflow 公式是
+`input - compaction.reserved`。现在 `262144 - 48003 = 214141`，会在服务端的
+230141 安全输入预算前约 16K 提前压缩；48003 由 32000 最大输出、3 个 MTP
+speculative token 和 16K 序列化/估算误差余量组成。这样不会再把边界溢出请求送到
+API，也给 compact summary 留出足够空间。不要把 `input` 改成 `230141`，否则
+OpenCode 会失去这段安全余量并可能再次触发 `Conversation history too large to
+compact`。
 
 服务的流式结束 chunk 也会携带 `usage.prompt_tokens`、
 `usage.completion_tokens` 和 `usage.total_tokens`；这是 OpenCode 判断

@@ -144,11 +144,15 @@ shape (the model-level default is `medium`):
 ```json
 {
   "compaction": {
-    "reserved": 32003
+    "auto": true,
+    "prune": true,
+    "reserved": 48003,
+    "preserve_recent_tokens": 8000,
+    "tail_turns": 4
   },
   "provider": {
     "blackwellm": {
-      "npm": "@ai-sdk/openai",
+      "npm": "@ai-sdk/openai-compatible",
       "options": { "baseURL": "http://127.0.0.1:8300/v1" },
       "models": {
         "qwen3.8-flash-next": {

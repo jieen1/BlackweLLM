@@ -171,6 +171,16 @@ def restore_checkpoint(
     if prefix_cache_tokens is not None:
         prefix_cache_tokens[slot] = None
         backend._prefix_cache_kv_len[slot] = 0
+    # Flash-Next retains a bounded list of recurrent checkpoints in addition
+    # to the compatibility side tables above.  A restored checkpoint belongs
+    # to a different conversation, so neither the latest entry nor any older
+    # historical boundary may survive this slot reset.
+    prefix_cache_history = getattr(backend, "_prefix_cache_history", None)
+    if isinstance(prefix_cache_history, list) and slot < len(prefix_cache_history):
+        prefix_cache_history[slot].clear()
+    prefix_cache_entries = getattr(backend, "_prefix_cache", None)
+    if isinstance(prefix_cache_entries, list) and slot < len(prefix_cache_entries):
+        prefix_cache_entries[slot] = None
 
     # Step 3: write tensors back, recomputing ranges from the MANIFEST's
     # kv_len (the live slot is at kv_len=0 right after reset_slot above).
