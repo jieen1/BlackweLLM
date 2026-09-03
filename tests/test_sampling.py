@@ -132,6 +132,24 @@ class TestSamplingParamsTorch:
             result = sample_from_logits(logits, params, generator=gen)
             assert result.item() == 0
 
+    def test_nonfinite_logits_fail_before_multinomial(self):
+        import torch
+
+        from runtime.sampling import SamplingNumericalError, sample_from_logits
+
+        logits = torch.tensor([[float("nan"), 0.0, 1.0]])
+        with pytest.raises(SamplingNumericalError, match="probability distribution"):
+            sample_from_logits(logits, SamplingParams(temperature=0.7))
+
+    def test_invalid_distribution_is_rejected(self):
+        import torch
+
+        from runtime.sampling import SamplingNumericalError, sample_from_distribution
+
+        probs = torch.tensor([0.5, -0.1, 0.6])
+        with pytest.raises(SamplingNumericalError, match="negative"):
+            sample_from_distribution(probs)
+
     def test_temperature_scaling_effect(self):
         import torch
 

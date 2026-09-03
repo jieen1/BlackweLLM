@@ -224,6 +224,8 @@ starting the server when tuning the quality/capacity trade-off:
 | `QSR_FLASHNEXT_IMAGE_MIN_PIXELS` | `65536` | processor's minimum area budget |
 | `QSR_FLASHNEXT_IMAGE_MAX_TOKENS` | `16384` | total merged visual-token cap per request |
 | `QSR_FLASHNEXT_VISION_ATTN` | `sdpa` | vision attention implementation; `eager` is the fallback |
+| `QSR_FLASHNEXT_PLE_CACHE_PAGES` | `0` | host-side 4 KiB page-LRU capacity for streamed PLE lookups; `2097152` reserves up to 8 GiB and matches the production ops profile |
+| `QSR_FLASHNEXT_PREFILL_WARMUP_ROWS` | `64` | comma-separated eager target-prefill row buckets compiled before readiness; `0` disables startup warmup |
 
 The request log reports source dimensions, resized dimensions, and visual token
 count. Visual requests carry an authenticated image fingerprint through slot

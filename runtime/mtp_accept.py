@@ -23,6 +23,7 @@ from __future__ import annotations
 import torch
 
 from runtime.round_profile import round_profile
+from runtime.sampling import sample_from_distribution, validate_sampling_distribution
 
 
 def determine_accept_reject_from_predictions(
@@ -335,6 +336,12 @@ def sample_accept_reject(
             f"distribution (need {k + 1}, got {target_probs.shape[0]})"
         )
 
+    # Validate both model distributions before the first random draw.  If a
+    # graph produced NaN/Inf, calling CUDA multinomial first would poison the
+    # context with a device-side assert and make slot recovery impossible.
+    validate_sampling_distribution(draft_probs, context="MTP draft")
+    validate_sampling_distribution(target_probs, context="MTP target")
+
     device = draft_probs.device
     committed: list[int] = []
     for p in range(k):
@@ -345,11 +352,13 @@ def sample_accept_reject(
             committed.append(token)
             continue
         residual = residual_distribution(target_probs[p], draft_probs[p])
-        recovered = int(torch.multinomial(residual, 1, generator=generator).item())
+        recovered = int(
+            sample_from_distribution(residual, generator=generator).item()
+        )
         committed.append(recovered)
         return {"num_accepted": p, "committed": committed, "rejected_at": p}
 
-    bonus = int(torch.multinomial(target_probs[k], 1, generator=generator).item())
+    bonus = int(sample_from_distribution(target_probs[k], generator=generator).item())
     committed.append(bonus)
     return {"num_accepted": k, "committed": committed, "rejected_at": None}
 
@@ -394,6 +403,9 @@ def sample_accept_reject_sparse(
             "must share a device"
         )
 
+    validate_sampling_distribution(draft_probs, context="sparse MTP draft")
+    validate_sampling_distribution(target_probs, context="sparse MTP target")
+
     committed: list[int] = []
     for position, token in enumerate(draft_tokens):
         indices = draft_indices[position].long()
@@ -420,7 +432,9 @@ def sample_accept_reject_sparse(
             residual = residual / total
         else:
             residual = target_probs[position]
-        recovered = int(torch.multinomial(residual, 1, generator=generator).item())
+        recovered = int(
+            sample_from_distribution(residual, generator=generator).item()
+        )
         committed.append(recovered)
         return {
             "num_accepted": position,
@@ -428,6 +442,6 @@ def sample_accept_reject_sparse(
             "rejected_at": position,
         }
 
-    bonus = int(torch.multinomial(target_probs[k], 1, generator=generator).item())
+    bonus = int(sample_from_distribution(target_probs[k], generator=generator).item())
     committed.append(bonus)
     return {"num_accepted": k, "committed": committed, "rejected_at": None}

@@ -32,7 +32,7 @@ from runtime.sampling import (
     SamplingParams,
     compute_sampling_distribution,
     make_generator,
-    sample_from_logits,
+    sample_from_distribution,
 )
 
 if TYPE_CHECKING:
@@ -2043,10 +2043,10 @@ class FlashNextSpecEngine:
         sess.pos = sess.sync_len
         if sampled:
             first_probs = compute_sampling_distribution(first_logits, params)
-            first_token = sample_from_logits(
-                first_logits,
-                params,
+            first_token = sample_from_distribution(
+                first_probs,
                 generator=make_generator(params.seed, str(self.device)),
+                output_device=first_logits.device,
             )
             # Keep the sampled id on device while chaining the remaining MTP
             # rows.  ``.item()`` here used to force a CUDA sync before every
@@ -2140,10 +2140,10 @@ class FlashNextSpecEngine:
             sess.pos += 1
             if sampled:
                 probs = compute_sampling_distribution(logits, params)
-                next_token = sample_from_logits(
-                    logits,
-                    params,
+                next_token = sample_from_distribution(
+                    probs,
                     generator=make_generator(params.seed, str(self.device)),
+                    output_device=logits.device,
                 ).reshape(-1)
                 draft_token_tensors.append(next_token)
                 draft_probs.append(probs.squeeze(0))

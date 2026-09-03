@@ -1857,6 +1857,9 @@ async def _unhandled_exception_handler(request, exc: Exception):
 @app.get("/health")
 async def health():
     assert engine is not None
+    fatal_error = getattr(engine, "_fatal_error", None)
+    load_error = getattr(engine, "_load_error", None)
+    runtime_error = fatal_error or load_error
     capacity = getattr(engine, "capacity", engine.num_slots)
     active_generating = len(engine.active)
     prefill_requests = _pending_prefill_count(engine)
@@ -1867,7 +1870,9 @@ async def health():
     )
     max_pending = getattr(engine, "max_pending_requests", None)
     return {
-        "status": "ok",
+        "status": "error" if runtime_error is not None else "ok",
+        "ready": runtime_error is None,
+        "error": str(runtime_error) if runtime_error is not None else None,
         "capacity": capacity,
         "free_slots": len(engine.free_slots),
         # A long chunked prefill owns a slot before it is promoted to

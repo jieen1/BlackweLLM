@@ -77,8 +77,15 @@ export QSR_FLASHNEXT_BATCH_GDN_PROJECTIONS=1
 export QSR_FLASHNEXT_MTP_CONTINUATION_GRAPH=1
 export QSR_FLASHNEXT_MTP_SPARSE_GRAPH=1
 export QSR_FLASHNEXT_PLE_CACHE_ROWS=4194304
+# Keep an 8 GiB host-side page LRU for repeated n-gram lookups.  This is
+# host RAM, not GPU memory; reduce only if the host is running other large
+# workloads.
+export QSR_FLASHNEXT_PLE_CACHE_PAGES=2097152
 export QSR_FLASHNEXT_PLE_IO=io_uring
 export QSR_FLASHNEXT_PLE_IO_WORKERS=32
+# Compile the common eager prefill shape before /health reports ready.  More
+# buckets may be supplied as a comma-separated list (for example 64,512).
+export QSR_FLASHNEXT_PREFILL_WARMUP_ROWS=64
 # Native QSA top-k emits an unordered set; keep score-order reranking enabled
 # unless running an explicit performance-only A/B experiment.
 export QSR_FLASHNEXT_QSA_TOPK_RERANK=1

@@ -148,8 +148,23 @@ class RequestTracer:
         self._sample_counter += 1
         return (self._sample_counter % max(1, int(1.0 / self.sample_rate))) == 0
 
-    def request_admitted(self, request_id: str, slot: int, prompt_len: int) -> None:
-        """Called when a request is admitted to a slot (starts prefill)."""
+    def request_admitted(
+        self,
+        request_id: str,
+        slot: int,
+        prompt_len: int,
+        *,
+        admitted_at: float | None = None,
+    ) -> None:
+        """Record the request's real admission start.
+
+        The engine validates the anchor only after prefill, but the request
+        enters the admission path (and starts waiting for GPU work) earlier.
+        Accepting that timestamp keeps ``total_ms`` inclusive of queue and
+        prefill time instead of making a 50-second cold prefill look like a
+        sub-second request in the trace.  Direct callers retain the old
+        ``perf_counter`` behaviour when no timestamp is supplied.
+        """
         if not self.enabled:
             return
         with self._lock:
@@ -159,7 +174,9 @@ class RequestTracer:
                 request_id=request_id,
                 slot=slot,
                 prompt_len=prompt_len,
-                admitted_at=time.perf_counter(),
+                admitted_at=(
+                    time.perf_counter() if admitted_at is None else float(admitted_at)
+                ),
             )
             self._active[request_id] = trace
 

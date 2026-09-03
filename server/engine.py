@@ -36,7 +36,7 @@ from runtime.architecture import ArchitectureSpec, parse_architecture
 from runtime.backends.dflash_constants import NUM_SPECULATIVE_TOKENS
 from runtime.model_registry import IMPLEMENTED_BACKENDS
 from runtime.round_profile import round_profile
-from runtime.sampling import SamplingParams
+from runtime.sampling import SamplingNumericalError, SamplingParams
 from runtime.slot_resource_manager import SlotResourceManager
 from runtime.thinking_budget import ThinkingBudgetConfig, ThinkingBudgetState
 from server import metrics
@@ -65,6 +65,25 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 # runtime/round_profile.py.
 _ADMISSION_PROFILE = os.environ.get("QSR_PROFILE_ADMISSION") == "1"
 _adm_logger = logging.getLogger("qwen_sm120.round_profile")
+
+
+class EngineUnavailable(RuntimeError):
+    """Request-facing error after the engine enters a terminal failure state."""
+
+
+def _is_fatal_runtime_error(exc: BaseException) -> bool:
+    """Return whether continuing to touch the CUDA backend is unsafe."""
+    if isinstance(exc, SamplingNumericalError):
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "device-side assert",
+            "cuda_error_assert",
+            "cuda error: device-side assert",
+        )
+    )
 
 
 def _adm_start(req: GenerationRequest) -> None:
@@ -765,6 +784,7 @@ class ServerEngine:
         # -- engine thread state --
         self._ready_event = threading.Event()
         self._load_error: BaseException | None = None
+        self._fatal_error: BaseException | None = None
         self._engine_thread: threading.Thread | None = None
         self._asyncio_loop: asyncio.AbstractEventLoop | None = None
         self._stop = False
@@ -1076,6 +1096,17 @@ class ServerEngine:
             mtp_num_speculative_tokens=self.mtp_num_speculative_tokens,
             enable_prefix_cache=self.enable_prefix_cache,
         )
+        # The first real prefill can otherwise pay one-time b12x/Triton/
+        # TileLang workspace compilation and allocator growth on the client
+        # request.  That is indistinguishable from a hung OpenCode turn.  Run
+        # the smallest production-shaped target prefill while no slot is
+        # observable yet, then clear all state and discard its prefix entry.
+        # This must precede decode-graph capture so capture sees the settled
+        # eager workspace addresses.  MTP graphs are intentionally captured
+        # by ``capture_decode_cuda_graph`` below, so the warmup temporarily
+        # detaches the slot's MTP spec rather than trying to replay an absent
+        # continuation graph.
+        self._warmup_flashnext_prefill()
         if self._enable_cudagraph:
             graph_batch_size = self.runner.capture_decode_cuda_graph()
             if graph_batch_size is not None:
@@ -1127,6 +1158,118 @@ class ServerEngine:
             max_model_len,
             self.enable_mtp,
             self.mtp_num_speculative_tokens,
+        )
+
+    def _warmup_flashnext_prefill(self) -> None:
+        """Compile the common Flash-Next prefill shape before readiness.
+
+        Flash-Next's target prefill is eager (the decode/MTP CUDA graphs do
+        not cover it), so the first request can trigger b12x MoE workspace
+        growth and lazy QSA kernels.  A real target pass is the only reliable
+        way to materialize those paths; MTP verify/proposal/continuation
+        graphs are captured immediately afterwards by the normal load path.
+        The default 64 rows covers
+        the small-chat/request shape without reserving the multi-GiB scratch
+        needed by a full 1024-row probe; operators can provide a comma-
+        separated list through ``QSR_FLASHNEXT_PREFILL_WARMUP_ROWS`` when a
+        workload needs additional shape families.
+
+        Warmup is best-effort: a failed probe must not turn a latency issue
+        into an unavailable service.  Any cache/state/statistics it creates
+        are cleared before the engine advertises readiness.
+        """
+        raw = os.environ.get("QSR_FLASHNEXT_PREFILL_WARMUP_ROWS", "64").strip()
+        if raw.lower() in {"0", "off", "false", "no"}:
+            logger.info("Flash-Next prefill warmup disabled by configuration")
+            return
+        try:
+            rows = sorted({int(part.strip()) for part in raw.split(",") if part.strip()})
+        except ValueError as exc:
+            raise ValueError(
+                "QSR_FLASHNEXT_PREFILL_WARMUP_ROWS must be a comma-separated list of "
+                f"positive integers, got {raw!r}"
+            ) from exc
+        if not rows or any(row <= 0 for row in rows):
+            raise ValueError(
+                "QSR_FLASHNEXT_PREFILL_WARMUP_ROWS must contain positive integers, "
+                f"got {raw!r}"
+            )
+
+        import torch  # local import keeps CPU-only module importable
+
+        runner = self.runner
+        if runner is None:
+            raise RuntimeError("Flash-Next prefill warmup requires a loaded runner")
+        max_seq_len = int(getattr(runner, "max_seq_len", 0))
+        if max_seq_len <= 0:
+            raise RuntimeError("Flash-Next runner has no positive max_seq_len")
+        rows = [row for row in rows if row <= max_seq_len]
+        if not rows:
+            logger.warning(
+                "Flash-Next prefill warmup skipped: configured rows exceed max_seq_len=%d",
+                max_seq_len,
+            )
+            return
+
+        backend_stats = getattr(runner, "stats", None)
+        stats_before = dict(backend_stats) if isinstance(backend_stats, dict) else None
+        specs = getattr(runner, "_specs", None)
+        saved_spec = None
+        if isinstance(specs, list) and specs:
+            saved_spec = specs[0]
+            specs[0] = None
+        started = time.perf_counter()
+        completed: list[int] = []
+        try:
+            for row_count in rows:
+                probe = [0] * row_count
+                probe_started = time.perf_counter()
+                state = runner.prefill_chunked_begin(
+                    [0],
+                    [probe],
+                    chunk_size=min(self._prefill_chunk_size, row_count),
+                )
+                while not state.done:
+                    runner.prefill_chunked_step(state)
+                # The prefill API launches asynchronous CUDA work.  Do not
+                # reset the session or start graph capture until it is done.
+                torch.cuda.synchronize("cuda")
+                completed.append(row_count)
+                logger.info(
+                    "Flash-Next prefill warmup rows=%d completed in %.3fs",
+                    row_count,
+                    time.perf_counter() - probe_started,
+                )
+        except Exception:
+            logger.exception(
+                "Flash-Next prefill warmup failed after rows=%s; first request may be slower",
+                completed,
+            )
+        finally:
+            if saved_spec is not None and isinstance(specs, list):
+                specs[0] = saved_spec
+            # ``reset_slot`` intentionally retains a prefix checkpoint for
+            # production reuse.  Warmup is synthetic, so use the backend's
+            # cold reset and explicitly drop the checkpoint before traffic.
+            try:
+                reset_runtime = getattr(runner, "_reset_runtime", None)
+                if reset_runtime is not None:
+                    reset_runtime(0, preserve_prefix=False)
+                else:
+                    runner.reset_slot(0)
+                drop_snapshot = getattr(runner, "_drop_prefix_snapshot", None)
+                if drop_snapshot is not None:
+                    drop_snapshot(0)
+            except Exception:
+                logger.exception("Flash-Next reset_slot(0) failed after prefill warmup")
+            if stats_before is not None:
+                backend_stats.clear()
+                backend_stats.update(stats_before)
+
+        logger.info(
+            "Flash-Next prefill warmup finished: rows=%s elapsed=%.3fs",
+            completed,
+            time.perf_counter() - started,
         )
 
     def _warmup_qwen36_full_forward(self) -> None:
@@ -1868,6 +2011,14 @@ class ServerEngine:
 
     def _enqueue_request(self, req: GenerationRequest) -> None:
         """Account for and enqueue one request under the bounded budget."""
+        fatal_error = getattr(self, "_fatal_error", None)
+        if fatal_error is not None:
+            raise EngineUnavailable(
+                "inference engine is unavailable after an unrecoverable runtime error; "
+                "restart the service"
+            ) from fatal_error
+        if getattr(self, "_stop", False):
+            raise EngineUnavailable("inference engine is stopped")
         with self._request_count_lock:
             if self._request_count >= self.max_pending_requests:
                 raise RequestQueueFull(
@@ -2045,13 +2196,16 @@ class ServerEngine:
             self.free_slots.append(ret["slot"])
             self.stats["session_expirations"] += 1
 
-    def _release_all_retained(self) -> None:
+    def _release_all_retained(self, *, reset_slots: bool = True) -> None:
         for sid in list(self.retained.keys()):
             ret = self.retained.pop(sid)
-            try:
-                self.runner.reset_slot(ret["slot"])
-            except Exception:
-                logger.exception("reset_slot(%d) failed releasing session %s", ret["slot"], sid)
+            if reset_slots:
+                try:
+                    self.runner.reset_slot(ret["slot"])
+                except Exception:
+                    logger.exception(
+                        "reset_slot(%d) failed releasing session %s", ret["slot"], sid
+                    )
 
     def _thinking_decode_kwargs(self, slots: list[int]) -> dict[str, object]:
         """Build the optional one-token logits constraint for plain decode."""
@@ -2197,7 +2351,12 @@ class ServerEngine:
             )
             st["stop_pending_ids"] = []
             st["stop_pending_text"] = ""
-        tracer.request_admitted(req.request_id, slot, len(req.prompt_ids))
+        tracer.request_admitted(
+            req.request_id,
+            slot,
+            len(req.prompt_ids),
+            admitted_at=getattr(req, "_admitted_at", None),
+        )
         # The trace entry is created here because this is the first point at
         # which the request has a validated anchor.  Preserve the actual
         # prefill start separately so ``prefill_ms`` does not silently stay at
@@ -2453,6 +2612,26 @@ class ServerEngine:
             try:
                 self._step_sync()
             except Exception as exc:
+                if _is_fatal_runtime_error(exc):
+                    # A CUDA device-side assert is sticky for this process.
+                    # Do not call reset_slot() on the poisoned context: that
+                    # was the old failure loop which made every later request
+                    # hang while emitting the same CUDA error.
+                    self._fatal_error = exc
+                    self._stop = True
+                    logger.critical(
+                        "FATAL: engine disabled after unrecoverable runtime error; "
+                        "restart required",
+                        exc_info=True,
+                    )
+                    for slot, st in list(self.active.items()):
+                        self._fail_request(st["req"], exc)
+                        if slot not in self.free_slots:
+                            self.free_slots.append(slot)
+                    self.active.clear()
+                    self._fail_pending_requests(exc, reset_slots=False)
+                    self._release_all_retained(reset_slots=False)
+                    break
                 logger.exception("engine round failed, failing active requests")
                 for slot, st in list(self.active.items()):
                     self._fail_request(st["req"], exc)
@@ -2469,8 +2648,11 @@ class ServerEngine:
         # A graceful server stop can race with HTTP tasks that have already
         # enqueued work.  Do not leave their futures, prompt lists, or stream
         # channels reachable after the engine thread exits.
-        self._fail_pending_requests(RuntimeError("engine stopped"))
-        self._release_all_retained()
+        self._fail_pending_requests(
+            RuntimeError("engine stopped"),
+            reset_slots=self._fatal_error is None,
+        )
+        self._release_all_retained(reset_slots=self._fatal_error is None)
         logger.info("engine thread stopped")
 
     def _drain_requests(self) -> None:
@@ -2478,7 +2660,7 @@ class ServerEngine:
         while self._req_deque:
             self.waiting.append(self._req_deque.popleft())
 
-    def _fail_pending_requests(self, exc: BaseException) -> None:
+    def _fail_pending_requests(self, exc: BaseException, *, reset_slots: bool = True) -> None:
         """Fail and release every request outside ``active``.
 
         Round failures used to clean only active slots.  Requests already
@@ -2510,10 +2692,13 @@ class ServerEngine:
             if slot in seen_slots:
                 continue
             seen_slots.add(slot)
-            try:
-                self.runner.reset_slot(slot)
-            except Exception:
-                logger.exception("reset_slot(%d) failed while clearing pending requests", slot)
+            if reset_slots:
+                try:
+                    self.runner.reset_slot(slot)
+                except Exception:
+                    logger.exception(
+                        "reset_slot(%d) failed while clearing pending requests", slot
+                    )
             if slot not in self.free_slots:
                 self.free_slots.append(slot)
 

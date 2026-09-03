@@ -88,6 +88,53 @@ class PersistentSeed:
         return self._generator
 
 
+class SamplingNumericalError(RuntimeError):
+    """Raised before multinomial when model probabilities are unusable.
+
+    CUDA's multinomial implementation reports the same condition with a
+    device-side assert.  That error poisons the CUDA context and makes every
+    later reset fail as well, so the sampling boundary must detect it in
+    Python before launching multinomial.
+    """
+
+
+def validate_sampling_distribution(
+    probs: torch.Tensor, *, context: str = "sampling"
+) -> None:
+    """Validate a probability tensor without launching ``multinomial``.
+
+    The reduction is deliberately performed on the device and synchronized
+    once.  This is cheaper and safer than allowing CUDA's asynchronous
+    multinomial assertion to poison the whole process.  A valid distribution
+    only needs finite, non-negative entries and a finite positive row sum;
+    normalization is intentionally not required because residual sampling can
+    be normalized by the caller immediately before drawing.
+    """
+    import torch as _torch
+
+    if probs.ndim == 0:
+        raise SamplingNumericalError(f"{context} probability tensor must have a row dimension")
+    rows = probs.unsqueeze(0) if probs.ndim == 1 else probs.reshape(-1, probs.shape[-1])
+    finite = _torch.isfinite(rows)
+    row_sums = rows.sum(dim=-1)
+    valid = (
+        finite.all(dim=-1)
+        & (rows >= 0).all(dim=-1)
+        & _torch.isfinite(row_sums)
+        & (row_sums > 0)
+    )
+    if bool(valid.all().item()):
+        return
+    bad_rows = (~valid).nonzero(as_tuple=False).flatten().tolist()
+    suffix = ",".join(str(int(row)) for row in bad_rows[:8])
+    if len(bad_rows) > 8:
+        suffix += ",..."
+    raise SamplingNumericalError(
+        f"{context} probability distribution is non-finite, negative, or empty "
+        f"(shape={tuple(probs.shape)}, device={probs.device}, bad_rows=[{suffix}])"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SamplingParams:
     """Per-request sampling configuration.
@@ -172,17 +219,39 @@ def sample_from_logits(
     Returns:
         Token ids of shape ``[batch]`` (int64).
     """
-    import torch as _torch
-
     if params.is_greedy:
         return logits.argmax(dim=-1)
 
     probs = compute_sampling_distribution(logits, params)
+    return sample_from_distribution(probs, generator=generator, output_device=logits.device)
+
+
+def sample_from_distribution(
+    probs: torch.Tensor,
+    *,
+    generator: torch.Generator | None = None,
+    output_device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Draw from an already transformed distribution.
+
+    Keeping this seam separate avoids recomputing temperature/top-k/top-p in
+    speculative decoding, where the same distribution must be retained for
+    rejection sampling.  Validation happens exactly at the multinomial
+    boundary, before CUDA can emit its unrecoverable device-side assert.
+    """
+    import torch as _torch
+
+    validate_sampling_distribution(probs)
     if generator is not None and probs.device != generator.device:
         probs = probs.to(generator.device)
         result = _torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
-        return result.to(logits.device)
-    return _torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
+        if output_device is not None:
+            result = result.to(output_device)
+        return result
+    result = _torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
+    if output_device is not None:
+        result = result.to(output_device)
+    return result
 
 
 def _apply_top_k(logits: torch.Tensor, k: int) -> torch.Tensor:
