@@ -1107,6 +1107,18 @@ class ServerEngine:
         # detaches the slot's MTP spec rather than trying to replay an absent
         # continuation graph.
         self._warmup_flashnext_prefill()
+        prefill_mlp_cg = os.environ.get("QSR_FLASHNEXT_PREFILL_MLP_CG", "0").strip().lower()
+        if prefill_mlp_cg in {"1", "true", "yes", "on"}:
+            rows = self._prefill_chunk_size
+            if rows <= 0:
+                raise RuntimeError("Flash-Next prefill MLP CUDA Graph needs a positive chunk size")
+            started = time.perf_counter()
+            self.runner.capture_prefill_mlp_graphs(rows)
+            logger.info(
+                "Flash-Next prefill MLP CUDA Graph captured: rows=%d elapsed=%.3fs",
+                rows,
+                time.perf_counter() - started,
+            )
         if self._enable_cudagraph:
             graph_batch_size = self.runner.capture_decode_cuda_graph()
             if graph_batch_size is not None:
@@ -1168,17 +1180,18 @@ class ServerEngine:
         growth and lazy QSA kernels.  A real target pass is the only reliable
         way to materialize those paths; MTP verify/proposal/continuation
         graphs are captured immediately afterwards by the normal load path.
-        The default 64 rows covers
-        the small-chat/request shape without reserving the multi-GiB scratch
-        needed by a full 1024-row probe; operators can provide a comma-
-        separated list through ``QSR_FLASHNEXT_PREFILL_WARMUP_ROWS`` when a
-        workload needs additional shape families.
+        The default 64 and 1024 rows cover both the small-chat/request shape
+        and the production long-prefill chunk.  The 1024-row pass is cheap
+        after the first kernel build and prevents the first long request from
+        paying the large-M QSA/GDN/MLP shape setup cost.  Operators can provide
+        a comma-separated list through ``QSR_FLASHNEXT_PREFILL_WARMUP_ROWS``
+        when a workload needs additional shape families.
 
         Warmup is best-effort: a failed probe must not turn a latency issue
         into an unavailable service.  Any cache/state/statistics it creates
         are cleared before the engine advertises readiness.
         """
-        raw = os.environ.get("QSR_FLASHNEXT_PREFILL_WARMUP_ROWS", "64").strip()
+        raw = os.environ.get("QSR_FLASHNEXT_PREFILL_WARMUP_ROWS", "64,1024").strip()
         if raw.lower() in {"0", "off", "false", "no"}:
             logger.info("Flash-Next prefill warmup disabled by configuration")
             return

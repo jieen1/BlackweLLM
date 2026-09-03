@@ -70,6 +70,20 @@ def test_flashnext_qwen4_exp_bf16_contract_batches_by_default(monkeypatch) -> No
     assert _flashnext_batch_gdn_projections_enabled(model) is False
 
 
+def test_prefill_mlp_graph_capture_forwards_to_shared_target(monkeypatch) -> None:
+    backend = object.__new__(FlashNextBackend)
+    backend.device = torch.device("cuda")
+    captured: list[int] = []
+    backend._targets = [
+        SimpleNamespace(capture_prefill_mlp_graphs=lambda rows: captured.append(rows))
+    ]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    backend.capture_prefill_mlp_graphs(1024)
+
+    assert captured == [1024]
+
+
 def test_chunked_prefill_syncs_partial_tail_at_its_real_width() -> None:
     backend = object.__new__(FlashNextBackend)
     backend.max_seq_len = 64

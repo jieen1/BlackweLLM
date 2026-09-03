@@ -29,6 +29,7 @@ from runtime.model.flashnext.qsa import (
 from runtime.model.qwen36_model import GdnLayerState
 from runtime.mtp_accept import sample_accept_reject
 from runtime.sampling import (
+    SamplingNumericalError,
     SamplingParams,
     compute_sampling_distribution,
     make_generator,
@@ -44,6 +45,35 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger("qwen_sm120_runtime.flashnext.spec")
+
+
+def _sampling_tensor_stats(value: torch.Tensor | None) -> str:
+    """Summarize a tensor for a rare sampled-MTP numerical failure.
+
+    This intentionally performs device-to-host reductions only on the error
+    path.  Calling it before every stochastic draw would serialize the hot
+    decode loop, which is exactly what the sampled-MTP path was optimized to
+    avoid.
+    """
+    if value is None:
+        return "none"
+    tensor = value.detach().float().reshape(-1)
+    total = int(tensor.numel())
+    finite = torch.isfinite(tensor)
+    finite_count = int(finite.sum().item())
+    nan_count = int(torch.isnan(tensor).sum().item())
+    inf_count = int(torch.isinf(tensor).sum().item())
+    if finite_count:
+        finite_values = tensor[finite]
+        minimum = float(finite_values.min().item())
+        maximum = float(finite_values.max().item())
+        range_text = f"min={minimum:.6g},max={maximum:.6g}"
+    else:
+        range_text = "min=none,max=none"
+    return (
+        f"shape={tuple(value.shape)},dtype={value.dtype},finite={finite_count}/{total},"
+        f"nan={nan_count},inf={inf_count},{range_text}"
+    )
 
 
 def _new_gdn_row(state: GdnLayerState) -> GdnLayerState:
@@ -2042,12 +2072,20 @@ class FlashNextSpecEngine:
         sess.sync_len = start + query_len
         sess.pos = sess.sync_len
         if sampled:
-            first_probs = compute_sampling_distribution(first_logits, params)
-            first_token = sample_from_distribution(
-                first_probs,
-                generator=make_generator(params.seed, str(self.device)),
-                output_device=first_logits.device,
-            )
+            try:
+                first_probs = compute_sampling_distribution(first_logits, params)
+                first_token = sample_from_distribution(
+                    first_probs,
+                    generator=make_generator(params.seed, str(self.device)),
+                    output_device=first_logits.device,
+                )
+            except SamplingNumericalError as exc:
+                raise SamplingNumericalError(
+                    f"{exc}; Flash-Next MTP teacher sampling failed "
+                    f"start={start},query_len={query_len},position={sess.pos},"
+                    f"logits={_sampling_tensor_stats(first_logits)},"
+                    f"target_hc_hidden={_sampling_tensor_stats(target_hc_hidden)}"
+                ) from exc
             # Keep the sampled id on device while chaining the remaining MTP
             # rows.  ``.item()`` here used to force a CUDA sync before every
             # continuation, turning the exact sampled path into one host
@@ -2112,15 +2150,16 @@ class FlashNextSpecEngine:
             sess.pos += self.k - 1
             result = [*drafts, *(int(token) for token in continuation.tolist())]
             return (result, None) if return_probs else result
-        for _ in range(1, self.k):
+        for draft_step in range(1, self.k):
             token_tensor = draft_token_tensors[-1] if sampled else torch.tensor(
                 [drafts[-1]], dtype=torch.long, device=self.device
             )
-            if (
+            using_graph = (
                 sampled_step_graph is not None
                 and sampled_step_graph.graph is not None
                 and sess.pos < sampled_step_graph.graph_capacity
-            ):
+            )
+            if using_graph:
                 hidden, logits = sampled_step_graph.replay(
                     token_tensor,
                     hidden,
@@ -2139,12 +2178,25 @@ class FlashNextSpecEngine:
                 logits = self.model.lm_head(mixed)
             sess.pos += 1
             if sampled:
-                probs = compute_sampling_distribution(logits, params)
-                next_token = sample_from_distribution(
-                    probs,
-                    generator=make_generator(params.seed, str(self.device)),
-                    output_device=logits.device,
-                ).reshape(-1)
+                try:
+                    probs = compute_sampling_distribution(logits, params)
+                    next_token = sample_from_distribution(
+                        probs,
+                        generator=make_generator(params.seed, str(self.device)),
+                        output_device=logits.device,
+                    ).reshape(-1)
+                except SamplingNumericalError as exc:
+                    raise SamplingNumericalError(
+                        f"{exc}; Flash-Next MTP continuation sampling failed "
+                        f"draft_step={draft_step},position={sess.pos - 1},"
+                        f"using_graph={using_graph},graph_capacity="
+                        f"{getattr(sampled_step_graph, 'graph_capacity', None)},"
+                        f"sparse={sess.sparse_graph_buffers is not None},"
+                        f"token={_sampling_tensor_stats(token_tensor)},"
+                        f"logits={_sampling_tensor_stats(logits)},"
+                        f"hidden={_sampling_tensor_stats(hidden)},"
+                        f"first_hidden={_sampling_tensor_stats(first_hidden)}"
+                    ) from exc
                 draft_token_tensors.append(next_token)
                 draft_probs.append(probs.squeeze(0))
             else:

@@ -26,7 +26,7 @@
 | CUDA Graph | 开启 |
 | persistent prefix cache | 开启 |
 | 视觉输入 | 开启（默认 1 MP 后处理面积上限） |
-| 两槽冷启动显存 | `explicit=85.11 GiB`，`torch_reserved=86.76 GiB`，driver free 约 `6.05 GiB` |
+| 两槽冷启动显存 | `explicit=85.67 GiB`，`torch_reserved=87.65 GiB`，driver free 约 `5.06 GiB`（含 1024-row prefill MLP graph） |
 
 256K 是每个 slot 的容量上限，不代表模型加载时立即为每个 token 分配显存。
 当前 `capacity=2` / `num_slots=2` 已经过本机 FP8 冷启动、CUDA Graph 捕获和两路
@@ -83,9 +83,14 @@ export QSR_FLASHNEXT_PLE_CACHE_ROWS=4194304
 export QSR_FLASHNEXT_PLE_CACHE_PAGES=2097152
 export QSR_FLASHNEXT_PLE_IO=io_uring
 export QSR_FLASHNEXT_PLE_IO_WORKERS=32
-# Compile the common eager prefill shape before /health reports ready.  More
-# buckets may be supplied as a comma-separated list (for example 64,512).
-export QSR_FLASHNEXT_PREFILL_WARMUP_ROWS=64
+# Compile the small-chat and production 1024-row eager prefill shapes before
+# /health reports ready.  This removes the first long-request shape/JIT stall;
+# more buckets may be supplied as a comma-separated list.
+export QSR_FLASHNEXT_PREFILL_WARMUP_ROWS=64,1024
+# Capture the fixed 1024-row target MLP graph used by long-prompt chunks.
+# This costs about 0.55 GiB on the validated two-slot profile and is included
+# in the measured production memory line above.
+export QSR_FLASHNEXT_PREFILL_MLP_CG=1
 # Native QSA top-k emits an unordered set; keep score-order reranking enabled
 # unless running an explicit performance-only A/B experiment.
 export QSR_FLASHNEXT_QSA_TOPK_RERANK=1

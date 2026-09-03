@@ -118,8 +118,9 @@ class FlashNextTextConfig:
             shared_expert_intermediate_size=tc["shared_expert_intermediate_size"],
             mamba_ssm_dtype=tc.get("mamba_ssm_dtype", tc.get("dtype", "bfloat16")),
             image_token_id=full_config.get("image_token_id"),
-            mrope_section=(tuple(int(value) for value in mrope_section)
-                           if mrope_section is not None else None),
+            mrope_section=(
+                tuple(int(value) for value in mrope_section) if mrope_section is not None else None
+            ),
             mrope_interleaved=bool(rope_parameters.get("mrope_interleaved", False)),
             vision_start_token_id=(
                 int(full_config["vision_start_token_id"])
@@ -212,8 +213,7 @@ class FlashNextMlp(nn.Module):
         router_impl = os.environ.get("QSR_FLASHNEXT_ROUTER_IMPL", "triton").strip().lower()
         if router_impl not in {"triton", "torch"}:
             raise ValueError(
-                "QSR_FLASHNEXT_ROUTER_IMPL must be triton or torch, "
-                f"got {router_impl!r}"
+                f"QSR_FLASHNEXT_ROUTER_IMPL must be triton or torch, got {router_impl!r}"
             )
         debug_skip_gate = os.environ.get("QSR_FLASHNEXT_DEBUG_SKIP_GATE", "0") == "1"
         if debug_skip_router:
@@ -229,10 +229,7 @@ class FlashNextMlp(nn.Module):
                 )
             else:
                 logits = self.gate(x)
-            if (
-                self._router_weights is None
-                or self._router_weights.shape[0] < rows
-            ):
+            if self._router_weights is None or self._router_weights.shape[0] < rows:
                 cap = max(rows, 64)
                 self._router_weights = torch.empty(cap, self.top_k, dtype=x.dtype, device=x.device)
                 self._router_ids = torch.empty(cap, self.top_k, dtype=torch.int32, device=x.device)
@@ -278,7 +275,15 @@ class FlashNextMlp(nn.Module):
         else:
             shared = self.shared(x)
         if output is None:
-            return routed + shared
+            # Both production expert adapters return a dedicated, contiguous
+            # routed-output arena.  Reuse it for the final additive combine
+            # instead of allocating and writing another full ``[T, H]``
+            # tensor.  The operation and BF16 rounding order are unchanged;
+            # only the destination pointer is different.  This matters for
+            # long prefill: 48 layers otherwise stream an extra full hidden
+            # matrix through the allocator and DRAM on every layer.
+            routed.add_(shared)
+            return routed
         torch.add(routed, shared, out=output)
         return output
 
@@ -576,9 +581,7 @@ def new_layer_states(model: FlashNextModel, device) -> dict:
         "float16": torch.float16,
     }.get(model.cfg.mamba_ssm_dtype)
     if recurrent_dtype is None:
-        raise ValueError(
-            f"unsupported Flash-Next mamba_ssm_dtype={model.cfg.mamba_ssm_dtype!r}"
-        )
+        raise ValueError(f"unsupported Flash-Next mamba_ssm_dtype={model.cfg.mamba_ssm_dtype!r}")
     states: dict = {}
     for layer in model.layers:
         if not layer.is_qsa:
@@ -697,9 +700,7 @@ def prepare_graph_buffers(
                 dtype=kv_dtype,
                 device=device,
             )
-            sess.qsa_v_row[layer.layer_idx] = torch.empty_like(
-                sess.qsa_k_row[layer.layer_idx]
-            )
+            sess.qsa_v_row[layer.layer_idx] = torch.empty_like(sess.qsa_k_row[layer.layer_idx])
             sess.qsa_k_scale_row[layer.layer_idx] = torch.empty(
                 1,
                 attn.num_kv_heads,
@@ -736,10 +737,7 @@ def prepare_graph_buffers(
             sess.ends_buf[layer.layer_idx] = torch.zeros(1, dtype=torch.long, device=device)
     sess.token_buf = torch.zeros(1, dtype=torch.long, device=device)
     sess.pos_buf = torch.zeros(1, dtype=torch.long, device=device)
-    if any(
-        layer.is_qsa and layer.attn.indexer.mrope_section
-        for layer in model.layers
-    ):
+    if any(layer.is_qsa and layer.attn.indexer.mrope_section for layer in model.layers):
         sess.rope_pos_buf = torch.zeros(3, 1, dtype=torch.long, device=device)
     else:
         sess.rope_pos_buf = None
@@ -849,15 +847,39 @@ def prefill_session(
 
     device = next(model.parameters()).device
     cpu_tokens = input_ids.detach().to(device="cpu", dtype=torch.long)
-    tokens = cpu_tokens.to(device=device)
-    seq_len = int(tokens.shape[0])
+    seq_len = int(cpu_tokens.shape[0])
     start = sess.pos
     end = start + seq_len
-    positions = torch.arange(start, end, dtype=torch.long, device=device)
-    rope = _prefill_rope_positions(rope_positions, seq_len, device)
     if end > next(iter(sess.qsa_k_pool.values())).shape[0]:
         raise ValueError(f"Flash-Next prefill end {end} exceeds allocated graph capacity")
-    history = None
+    # PLE is injected at layer 1 in the production checkpoint.  Schedule its
+    # stream read before embedding/layer-0 work so NVMe latency overlaps with
+    # useful transformer compute, matching the reference runtime's
+    # start_gather/finish_gather split.  The future returns the same raw FP8
+    # rows as the synchronous gather; only the timing changes.
+    ple_pending: dict[int, object] = {}
+    ple_layers = [layer for layer in model.layers if layer.ple is not None]
+    if ple_layers:
+        if sess.window:
+            history = torch.cat(
+                (
+                    torch.tensor(sess.window, dtype=torch.long),
+                    cpu_tokens,
+                )
+            )
+        else:
+            history = cpu_tokens
+        for layer in ple_layers:
+            assert layer.ple is not None
+            assert layer.ple_hasher is not None
+            hasher = layer.ple_hasher
+            ple_pending[layer.layer_idx] = layer.ple.table.start_gather_lazy(
+                lambda hasher=hasher, history=history: hasher.sequence_ids(history)[-seq_len:],
+                token_count=seq_len,
+            )
+    tokens = cpu_tokens.to(device=device)
+    positions = torch.arange(start, end, dtype=torch.long, device=device)
+    rope = _prefill_rope_positions(rope_positions, seq_len, device)
     x = _prefill_embeddings(model, tokens, input_embeds)
     x = torch.cat([x] * model.cfg.hc_count, dim=-1)
 
@@ -872,12 +894,10 @@ def prefill_session(
 
     for layer in model.layers:
         if layer.ple is not None:
-            if history is None:
-                history = torch.tensor(
-                    [*sess.window, *cpu_tokens.tolist()], dtype=torch.long
-                )
-            ids = layer.ple_hasher.sequence_ids(history)[-seq_len:]
-            embeddings = layer.ple.table.gather(ids, device=device).flatten(start_dim=-2)
+            pending = ple_pending.pop(layer.layer_idx, None)
+            if pending is None:
+                raise RuntimeError(f"missing scheduled PLE gather for layer {layer.layer_idx}")
+            embeddings = layer.ple.table.finish_gather(pending, device=device).flatten(start_dim=-2)
             gated_flat, normed_flat = layer.ple.inject(embeddings, x)
             state = sess.ple_conv_state
             if state is None:
@@ -972,9 +992,7 @@ def prefill_session(
             if rope_next_position is not None
             else int(rope.max().item()) + 1
         )
-        sess.rope_next = torch.full(
-            (3,), next_position, dtype=torch.long, device=device
-        )
+        sess.rope_next = torch.full((3,), next_position, dtype=torch.long, device=device)
     mixed, _ = model.final_mixer.mix(x[-1:])
     return model.lm_head(mixed).float().squeeze(0), x
 
@@ -1003,9 +1021,7 @@ def prefill_session_layer_major(
             f"Flash-Next prefill expects non-empty input_ids [T], got {tuple(input_ids.shape)}"
         )
     if attention_chunk_size <= 0:
-        raise ValueError(
-            f"attention_chunk_size must be positive, got {attention_chunk_size}"
-        )
+        raise ValueError(f"attention_chunk_size must be positive, got {attention_chunk_size}")
     if (
         sess.qsa_k_pool is None
         or sess.qsa_v_pool is None
@@ -1022,9 +1038,7 @@ def prefill_session_layer_major(
     sequence_end = sequence_start + seq_len
     rope = _prefill_rope_positions(rope_positions, seq_len, device)
     if sequence_end > next(iter(sess.qsa_k_pool.values())).shape[0]:
-        raise ValueError(
-            f"Flash-Next prefill end {sequence_end} exceeds allocated graph capacity"
-        )
+        raise ValueError(f"Flash-Next prefill end {sequence_end} exceeds allocated graph capacity")
 
     history = None
     x = _prefill_embeddings(model, tokens, input_embeds)
@@ -1054,9 +1068,7 @@ def prefill_session_layer_major(
 
             if layer.ple is not None:
                 assert ple_embeddings is not None
-                gated_flat, normed_flat = layer.ple.inject(
-                    ple_embeddings[offset:chunk_end], chunk
-                )
+                gated_flat, normed_flat = layer.ple.inject(ple_embeddings[offset:chunk_end], chunk)
                 state = sess.ple_conv_state
                 if state is None:
                     raise RuntimeError("PLE graph state was not allocated")
@@ -1104,9 +1116,7 @@ def prefill_session_layer_major(
                     v_pool[start:end],
                     sess.qsa_v_scale_pool[layer.layer_idx][start:end],
                 )
-                sparse_budget = (
-                    bundle.indexer.block_topk * bundle.indexer.compress_ratio
-                )
+                sparse_budget = bundle.indexer.block_topk * bundle.indexer.compress_ratio
                 if end <= sparse_budget:
                     attn_out = sess.qsa_attn[layer.layer_idx].causal_prefix(
                         q,
@@ -1135,9 +1145,7 @@ def prefill_session_layer_major(
                 state = sess.gdn[f"gdn_{layer.layer_idx}"]
                 attn_out = layer.attn(mixed.unsqueeze(0), state).squeeze(0)
 
-            attention_hidden[offset:chunk_end].copy_(
-                layer.attn_hc.combine(attn_out, residuals)
-            )
+            attention_hidden[offset:chunk_end].copy_(layer.attn_hc.combine(attn_out, residuals))
 
         mixed, residuals = layer.mlp_hc.mix(attention_hidden)
         x = layer.mlp_hc.combine(layer.mlp(mixed), residuals)
@@ -1151,9 +1159,7 @@ def prefill_session_layer_major(
             if rope_next_position is not None
             else int(rope.max().item()) + 1
         )
-        sess.rope_next = torch.full(
-            (3,), next_position, dtype=torch.long, device=device
-        )
+        sess.rope_next = torch.full((3,), next_position, dtype=torch.long, device=device)
     mixed, _ = model.final_mixer.mix(x[-1:])
     return model.lm_head(mixed).float().squeeze(0), x
 
@@ -1268,9 +1274,7 @@ def decode_step(model: FlashNextModel, token_id: int, sess: FlashNextSession) ->
                 rope_history = sess.qsa_idx_rope.get(layer.layer_idx)
                 rope_row = rope_pos.transpose(0, 1)
                 sess.qsa_idx_rope[layer.layer_idx] = (
-                    rope_row
-                    if rope_history is None
-                    else torch.cat([rope_history, rope_row], dim=0)
+                    rope_row if rope_history is None else torch.cat([rope_history, rope_row], dim=0)
                 )
                 pooled = bundle.indexer.pool_keys(
                     sess.qsa_idx_k[layer.layer_idx],
@@ -1343,10 +1347,7 @@ def load_flashnext_model(
     if enable_vision is None:
         vision_env = os.environ.get("QSR_FLASHNEXT_VISION", "1").strip().lower()
         if vision_env not in {"0", "1", "false", "true", "off", "on"}:
-            raise ValueError(
-                "QSR_FLASHNEXT_VISION must be 0 or 1, "
-                f"got {vision_env!r}"
-            )
+            raise ValueError(f"QSR_FLASHNEXT_VISION must be 0 or 1, got {vision_env!r}")
         enable_vision = vision_env in {"1", "true", "on"}
 
     def load(name: str) -> torch.Tensor:
@@ -1586,13 +1587,9 @@ def decode_body(model: FlashNextModel, sess: FlashNextSession) -> torch.Tensor:
                 v_row = (sess.qsa_v_row or {}).get(layer_idx)
                 k_scale_row = (sess.qsa_k_scale_row or {}).get(layer_idx)
                 v_scale_row = (sess.qsa_v_scale_row or {}).get(layer_idx)
-                if any(
-                    value is None
-                    for value in (k_row, v_row, k_scale_row, v_scale_row)
-                ):
+                if any(value is None for value in (k_row, v_row, k_scale_row, v_scale_row)):
                     raise RuntimeError(
-                        "quantized QSA decode requires graph-owned row scratch; "
-                        f"layer={layer_idx}"
+                        f"quantized QSA decode requires graph-owned row scratch; layer={layer_idx}"
                     )
                 quantize_qsa_kv(k, k_row, k_scale_row)
                 quantize_qsa_kv(v, v_row, v_scale_row)
@@ -1750,9 +1747,7 @@ class FlashNextGraphEngine:
             if input_embeds is None:
                 kwargs = {}
             else:
-                kwargs = {
-                    "input_embeds": input_embeds[start : start + chunk_size]
-                }
+                kwargs = {"input_embeds": input_embeds[start : start + chunk_size]}
             if rope_positions is not None:
                 kwargs["rope_positions"] = _prefill_rope_slice(
                     torch.as_tensor(rope_positions), start, start + chunk_size

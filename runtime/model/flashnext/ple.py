@@ -39,8 +39,8 @@ import pathlib
 import sys
 import threading
 from collections import OrderedDict
-from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import torch
 from torch import nn
@@ -92,9 +92,7 @@ def _resolve_ple_io_mode() -> str:
         return _PLE_IO_PREAD
     if raw in ("1", "true", "on", "uring", "io_uring"):
         return _PLE_IO_URING
-    raise ValueError(
-        f"invalid {_PLE_IO_ENV}={raw!r}; expected auto, pread, or io_uring"
-    )
+    raise ValueError(f"invalid {_PLE_IO_ENV}={raw!r}; expected auto, pread, or io_uring")
 
 
 def _sglang_python_candidates() -> tuple[str, ...]:
@@ -232,6 +230,20 @@ class _MappedShard:
         self._file.close()
 
 
+class _PendingPleGather:
+    """Future-backed PLE gather used to overlap NVMe reads with layer compute."""
+
+    __slots__ = ("future", "shape")
+
+    def __init__(
+        self,
+        future: Future[tuple[bytearray, tuple[int, int, int]]],
+        shape: tuple[int, int, int],
+    ) -> None:
+        self.future = future
+        self.shape = shape
+
+
 class FlashNextPleTable:
     """The 128-shard FP8 n-gram table, streamed or resident."""
 
@@ -294,6 +306,14 @@ class FlashNextPleTable:
         self.page_cache_misses = 0
         self._io_workers = min(len(self._shards), max(1, int(io_workers)))
         self._io_pool: ThreadPoolExecutor | None = None
+        # A single persistent foreground reader lets the model schedule the
+        # next PLE lookup before it enters the first transformer layer.  The
+        # page-read pool remains separate: it fans out over shards while this
+        # executor keeps request ordering/cache mutation deterministic.
+        self._prefetch_pool = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="flashnext-ple-prefetch",
+        )
         self._io_backend = _PLE_IO_PREAD
         self._io_mode = _PLE_IO_PREAD
         self._uring_reader = None
@@ -452,8 +472,7 @@ class FlashNextPleTable:
             misses.sort()
             try:
                 use_io_uring = self._uring_reader is not None and not (
-                    self._io_mode == _PLE_IO_AUTO
-                    and len(misses) >= self._large_batch_pread_pages
+                    self._io_mode == _PLE_IO_AUTO and len(misses) >= self._large_batch_pread_pages
                 )
                 if use_io_uring:
                     self.io_uring_pages += len(misses)
@@ -606,9 +625,7 @@ class FlashNextPleTable:
                 device_bytes.view(torch.float8_e4m3fn).to(torch.bfloat16) * self.weight_scale
             ).view(shape)
 
-    def _gather_raw_unlocked(
-        self, ids: torch.Tensor
-    ) -> tuple[bytearray, tuple[int, int, int]]:
+    def _gather_raw_unlocked(self, ids: torch.Tensor) -> tuple[bytearray, tuple[int, int, int]]:
         """Resolve/cache rows and return their checkpoint FP8 bytes."""
         t = ids.shape[0]
         flat_ids = ids.reshape(-1).long().tolist()
@@ -648,6 +665,93 @@ class FlashNextPleTable:
                     self._cache_keys[slot] = rid
                     self._cache_map[rid] = slot
         return bytearray(b"".join(rows[rid] for rid in flat_ids)), shape
+
+    def _gather_raw_prefetch(self, ids: torch.Tensor) -> tuple[bytearray, tuple[int, int, int]]:
+        """Read rows on the persistent prefetch worker.
+
+        Cache and page-LRU mutation use the same lock as synchronous gathers;
+        keeping the lock in the worker (rather than around ``submit``) is what
+        allows the caller to run the first model layer while NVMe is in flight.
+        """
+        with self._gather_lock:
+            return self._gather_raw_unlocked(ids)
+
+    def _lazy_gather_prefetch(
+        self, ids_factory: Callable[[], torch.Tensor]
+    ) -> tuple[bytearray, tuple[int, int, int]]:
+        """Build n-gram ids and read their rows entirely off the caller thread."""
+        ids = ids_factory()
+        if not torch.is_tensor(ids) or ids.ndim != 2:
+            shape = getattr(ids, "shape", None)
+            raise ValueError(f"PLE gather factory must return [T, heads] ids, got {shape}")
+        ids_cpu = ids.detach().to(device="cpu", dtype=torch.long).contiguous()
+        return self._gather_raw_prefetch(ids_cpu)
+
+    def start_gather(self, ids: torch.Tensor) -> _PendingPleGather:
+        """Schedule a PLE gather and return before its rows are available.
+
+        ``ids`` is copied to CPU before submission so the worker never holds a
+        CUDA tensor or a caller-owned storage view.  The paired
+        :meth:`finish_gather` performs the existing pinned staging and FP8
+        conversion exactly once, preserving the synchronous path's bytes.
+        """
+        if ids.ndim != 2:
+            raise ValueError(f"PLE gather expects [T, heads] ids, got {tuple(ids.shape)}")
+        with self._gather_lock:
+            if self._closed:
+                raise RuntimeError("PLE table is closed")
+        ids_cpu = ids.detach().to(device="cpu", dtype=torch.long).contiguous()
+        shape = (int(ids_cpu.shape[0]), self.ngram_heads, self.head_dim)
+        # Submit while holding the same lifecycle lock used by ``close``.  A
+        # close racing this call therefore either waits for the submission or
+        # rejects it cleanly; it can never replace the executor between the
+        # closed check and ``submit``.
+        with self._gather_lock:
+            if self._closed or self._prefetch_pool is None:
+                raise RuntimeError("PLE table is closed")
+            future = self._prefetch_pool.submit(self._gather_raw_prefetch, ids_cpu)
+        return _PendingPleGather(future, shape)
+
+    def start_gather_lazy(
+        self,
+        ids_factory: Callable[[], torch.Tensor],
+        *,
+        token_count: int,
+    ) -> _PendingPleGather:
+        """Schedule hash computation and the following row gather together.
+
+        The factory must be side-effect free and return CPU or CUDA ids with
+        shape ``[token_count, ngram_heads]``.  Keeping the factory on the
+        persistent worker lets token-major prefill overlap CPU hash work,
+        page reads, and the embedding/first-layer GPU work instead of doing
+        the hash synchronously before the overlap window opens.
+        """
+        if token_count <= 0:
+            raise ValueError(f"PLE gather token_count must be positive, got {token_count}")
+        with self._gather_lock:
+            if self._closed or self._prefetch_pool is None:
+                raise RuntimeError("PLE table is closed")
+            shape = (int(token_count), self.ngram_heads, self.head_dim)
+            future = self._prefetch_pool.submit(
+                self._lazy_gather_prefetch,
+                ids_factory,
+            )
+        return _PendingPleGather(future, shape)
+
+    def finish_gather(
+        self,
+        pending: _PendingPleGather,
+        *,
+        device: torch.device | str | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Wait for :meth:`start_gather` and materialise its BF16 output."""
+        raw, shape = pending.future.result()
+        if shape != pending.shape:
+            raise RuntimeError(
+                f"PLE gather shape changed while reading: {shape} != {pending.shape}"
+            )
+        return self._to_output(raw, shape, device, out=out)
 
     def gather(
         self,
@@ -699,10 +803,17 @@ class FlashNextPleTable:
         with self._gather_lock:
             if self._closed:
                 return
+            # Mark the table closed before waiting for the worker.  The
+            # worker intentionally does not re-check this flag: a gather that
+            # was already submitted must drain before its file descriptors
+            # and page cache are released.
             self._closed = True
-            if self._io_pool is not None:
-                self._io_pool.shutdown(wait=True)
-                self._io_pool = None
+        self._prefetch_pool.shutdown(wait=True)
+        self._prefetch_pool = None
+        if self._io_pool is not None:
+            self._io_pool.shutdown(wait=True)
+            self._io_pool = None
+        with self._gather_lock:
             self._uring_reader = None
             for event in self._stage_events:
                 if event is not None:
@@ -893,8 +1004,7 @@ class FlashNextPLELayer(nn.Module):
 
         if normed_flat.ndim != 2 or normed_flat.shape[0] == 0:
             raise ValueError(
-                "PLE stateful prefill expects non-empty [T,C], got "
-                f"{tuple(normed_flat.shape)}"
+                f"PLE stateful prefill expects non-empty [T,C], got {tuple(normed_flat.shape)}"
             )
         sequence = normed_flat.t().unsqueeze(0)
         seq_len = int(sequence.shape[-1])

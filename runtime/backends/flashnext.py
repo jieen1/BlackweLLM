@@ -1724,6 +1724,14 @@ class FlashNextBackend:
                     logger.exception("Flash-Next reset failed after graph capture error")
             return None
 
+    def capture_prefill_mlp_graphs(self, rows: int) -> None:
+        """Capture the shared fixed-row MLP graph used by target prefill."""
+        if self.device.type != "cuda" or not torch.cuda.is_available():
+            raise RuntimeError("Flash-Next prefill MLP CUDA Graph requires CUDA")
+        if not self._targets:
+            raise RuntimeError("Flash-Next prefill MLP CUDA Graph has no target slots")
+        self._targets[0].capture_prefill_mlp_graphs(rows)
+
     def reconcile_prefix_hit(self, token_ids: list[int]) -> PrefixHit:
         return self.reconcile_prefix_hit_with_key(token_ids, None)
 

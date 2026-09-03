@@ -105,6 +105,24 @@ def test_table_gather_writes_into_out_buffer(table):
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
+def test_table_async_gather_matches_synchronous_bytes(table):
+    local_rows = torch.tensor([11, 37, 101], dtype=torch.long)
+    ids = (9 * table.shard_rows + local_rows).view(3, 1).expand(3, 16)
+    pending = table.start_gather(ids)
+    got = table.finish_gather(pending)
+    expected = table.gather(ids)
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+def test_table_lazy_async_gather_matches_synchronous_bytes(table):
+    local_rows = torch.tensor([13, 41, 109], dtype=torch.long)
+    ids = (11 * table.shard_rows + local_rows).view(3, 1).expand(3, 16)
+    pending = table.start_gather_lazy(lambda: ids, token_count=ids.shape[0])
+    got = table.finish_gather(pending)
+    expected = table.gather(ids)
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
 def test_table_default_keeps_page_cache_off():
     cached = FlashNextPleTable(CKPT, layer_idx=1)
     try:
