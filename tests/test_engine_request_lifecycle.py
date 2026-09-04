@@ -15,6 +15,7 @@ from server.engine import (
     GenerationRequest,
     RequestQueueFull,
     ServerEngine,
+    _is_fatal_runtime_error,
 )
 from server.formats.stream import StreamProcessor
 
@@ -43,6 +44,19 @@ def _request(loop: asyncio.AbstractEventLoop, request_id: str) -> GenerationRequ
         max_tokens=8,
         future=loop.create_future(),
     )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RuntimeError("CUDA error: out of memory"),
+        RuntimeError("CUDA_ERROR_OUT_OF_MEMORY"),
+        type("OutOfMemoryError", (RuntimeError,), {})("allocation failed"),
+    ],
+)
+def test_cuda_oom_is_terminal_runtime_failure(exc):
+    """OOM must not enter slot-reset recovery on a partially-written context."""
+    assert _is_fatal_runtime_error(exc) is True
 
 
 def test_request_budget_rejects_and_reuses_capacity():

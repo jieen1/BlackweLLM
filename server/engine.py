@@ -76,6 +76,20 @@ def _is_fatal_runtime_error(exc: BaseException) -> bool:
     if isinstance(exc, SamplingNumericalError):
         return True
     message = str(exc).lower()
+    # CUDA OOM can surface either as torch.OutOfMemoryError or as an
+    # AcceleratorError whose message is reported only after a later async
+    # operation (for example ``.item()``).  Both leave the admission/prefill
+    # round with partially-written GPU state.  Resetting a slot in that state
+    # was observed to re-enter CUDA and fail again, so treat it like the
+    # already-sticky device-side assert path and require a clean process.
+    if (
+        "out of memory" in message
+        or "cuda_error_out_of_memory" in message
+        or "cuda error: out of memory" in message
+        or "cublas_status_alloc_failed" in message
+        or "outofmemoryerror" in type(exc).__name__.lower()
+    ):
+        return True
     return any(
         marker in message
         for marker in (
@@ -2999,16 +3013,23 @@ class ServerEngine:
                 done = self.runner.prefill_chunked_step(self._pending_prefill)
             except Exception as exc:
                 logger.exception("incremental prefill step failed")
+                fatal = _is_fatal_runtime_error(exc)
                 self._release_prefix_dedup_keys(self._pending_prefill_reqs, published=False)
                 for slot, req in self._pending_prefill_reqs:
                     self._fail_request(req, exc)
-                    try:
-                        self.runner.reset_slot(slot)
-                    except Exception:
-                        logger.exception("reset_slot(%d) failed in prefill recovery", slot)
+                    if not fatal:
+                        try:
+                            self.runner.reset_slot(slot)
+                        except Exception:
+                            logger.exception("reset_slot(%d) failed in prefill recovery", slot)
                     self.free_slots.append(slot)
                 self._pending_prefill = None
                 self._pending_prefill_reqs = []
+                if fatal:
+                    # Propagate to the engine-thread boundary.  It performs
+                    # the one terminal cleanup pass without touching the
+                    # poisoned CUDA context again.
+                    raise
             else:
                 if _ADMISSION_PROFILE:
                     _adm_logger.info(
@@ -3161,14 +3182,21 @@ class ServerEngine:
                         _adm_phase(req, "prefill_begin")
             except Exception as exc:
                 logger.exception("admission failed for %d request(s)", len(admit_now))
+                fatal = _is_fatal_runtime_error(exc)
                 self._release_prefix_dedup_keys(admit_now, published=False)
                 for slot, req in admit_now:
                     self._fail_request(req, exc)
-                    try:
-                        self.runner.reset_slot(slot)
-                    except Exception:
-                        logger.exception("reset_slot(%d) failed in admission recovery", slot)
+                    if not fatal:
+                        try:
+                            self.runner.reset_slot(slot)
+                        except Exception:
+                            logger.exception("reset_slot(%d) failed in admission recovery", slot)
                     self.free_slots.append(slot)
+                if fatal:
+                    # A prefill OOM is not recoverable by zeroing the slot:
+                    # the failing CUDA allocation may still be asynchronous,
+                    # and reset_slot would only mask the original failure.
+                    raise
             else:
                 if prefill_state is None:
                     pass

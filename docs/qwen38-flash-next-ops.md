@@ -112,11 +112,11 @@ export QSR_FLASHNEXT_QSA_TOPK_RERANK=1
 export QSR_FLASHNEXT_HC_NORM_FUSION=0
 export QSR_FLASHNEXT_HC_NORM_APPLY_FUSION=1
 export QSR_FLASHNEXT_HC_POINTWISE_FUSION=1
-# Keep the latest six target/recurrent boundaries per slot.  Checkpoints are
-# captured every 8192 tokens plus the final prompt; this lets a compacted or
-# shortened same-session prompt resume from an older authenticated boundary.
-# Each slot remains bounded (about 0.9 GiB at the production GDN state size).
-export QSR_FLASHNEXT_PREFIX_CHECKPOINTS_PER_SLOT=6
+# Keep the latest sixteen target/recurrent boundaries per slot.  Checkpoint
+# tensors are host-resident and captured every 8192 tokens plus the final
+# prompt; this lets a compacted or shortened same-session prompt resume from
+# an older authenticated boundary without consuming additional GPU memory.
+export QSR_FLASHNEXT_PREFIX_CHECKPOINTS_PER_SLOT=16
 export QSR_FLASHNEXT_PREFIX_CHECKPOINT_INTERVAL=8192
 export QSR_TRACE=1
 

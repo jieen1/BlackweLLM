@@ -866,8 +866,31 @@ class FlashNextMTP(nn.Module):
             )
             pooled = sess.mtp_pooled_k_pool[: visible_end // self.indexer.compress_ratio]
             ends = torch.clamp((pos - 3) // self.indexer.compress_ratio + 1, min=0)
-            scores = self.indexer.score_blocks(qi, pooled, ends)
-            blocks = self.indexer.select_blocks(scores, ends)
+            # A long teacher-sync suffix can otherwise allocate the complete
+            # [rows, pooled_keys] FP32 score matrix at once.  Keep its peak
+            # bounded to the same 128 MiB row-tiled budget as target QSA
+            # prefill; the per-row top-k result is exactly unchanged.
+            workspace_mb = int(
+                os.environ.get("QSR_FLASHNEXT_MTP_SCORE_WORKSPACE_MB", "128")
+            )
+            if workspace_mb <= 0:
+                raise ValueError(
+                    "QSR_FLASHNEXT_MTP_SCORE_WORKSPACE_MB must be positive, "
+                    f"got {workspace_mb}"
+                )
+            bounded_selector = getattr(self.indexer, "select_blocks_bounded", None)
+            if bounded_selector is None:
+                # Keep small protocol/test doubles source-compatible.  The
+                # production QSAIndexer always takes the bounded path.
+                scores = self.indexer.score_blocks(qi, pooled, ends)
+                blocks = self.indexer.select_blocks(scores, ends)
+            else:
+                blocks = bounded_selector(
+                    qi,
+                    pooled,
+                    ends,
+                    logits_workspace_bytes=workspace_mb * 1024 * 1024,
+                )
             idx, valid = self.indexer.batch_decode_gather_indices(
                 blocks, pos, self.qsa_pad
             )

@@ -279,6 +279,55 @@ def test_fixed_sparse_reuse_matches_dynamic_reference_at_long_context():
     torch.testing.assert_close(fixed_valid, dynamic_valid, rtol=0, atol=0)
 
 
+def test_bounded_block_selection_matches_full_score_matrix():
+    """Row tiling must preserve exact per-row top-k selection."""
+    indexer = QSAIndexer(
+        hidden_size=32,
+        n_heads=2,
+        kv_heads=1,
+        head_dim=8,
+        rotary_dim=4,
+        compress_ratio=4,
+        block_topk=4,
+    )
+    torch.manual_seed(79)
+    q = torch.randn(9, 2, 8, dtype=torch.bfloat16)
+    pooled = torch.randn(37, 8, dtype=torch.bfloat16)
+    ends = torch.tensor([3, 7, 9, 12, 15, 19, 23, 31, 37], dtype=torch.long)
+
+    full_scores = indexer.score_blocks(q, pooled, ends)
+    expected = indexer.select_blocks(full_scores, ends)
+    bounded = indexer.select_blocks_bounded(
+        q,
+        pooled,
+        ends,
+        logits_workspace_bytes=1,
+    )
+
+    torch.testing.assert_close(bounded, expected, rtol=0, atol=0)
+
+
+def test_bounded_block_selection_rejects_invalid_workspace():
+    indexer = QSAIndexer(
+        hidden_size=16,
+        n_heads=1,
+        kv_heads=1,
+        head_dim=4,
+        rotary_dim=4,
+        compress_ratio=2,
+        block_topk=2,
+    )
+    q = torch.zeros(1, 1, 4, dtype=torch.bfloat16)
+    pooled = torch.zeros(2, 4, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="workspace must be positive"):
+        indexer.select_blocks_bounded(
+            q,
+            pooled,
+            torch.ones(1, dtype=torch.long),
+            logits_workspace_bytes=0,
+        )
+
+
 def test_pool_normalizes_after_fp32_group_average(indexer):
     torch.manual_seed(6)
     raw = torch.randn(8, 128, dtype=torch.bfloat16)

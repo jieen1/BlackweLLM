@@ -704,6 +704,75 @@ class QSAIndexer(nn.Module):
         valid = ranks < row_block_ends.to(logits.device).reshape(-1, 1).clamp(max=k)
         return torch.where(valid, selected, selected.new_full((), -1))
 
+    def select_blocks_bounded(
+        self,
+        q: torch.Tensor,
+        pooled_k: torch.Tensor,
+        row_block_ends: torch.Tensor,
+        *,
+        logits_workspace_bytes: int = 128 * 1024 * 1024,
+    ) -> torch.Tensor:
+        """Score and select blocks without materialising an unbounded matrix.
+
+        The eager MTP teacher-sync path used to call ``score_blocks`` for the
+        whole suffix.  At a 256K context that is roughly ``1024 x 57K`` FP32
+        logits (over 220 MiB) before the top-k result is consumed.  Split the
+        *rows* using the same workspace rule as long-context target prefill,
+        consume each tile immediately, and retain only the fixed-width block
+        indices.  Top-k is row independent, so this is numerically identical
+        to selecting from one full score matrix while bounding the peak.
+        """
+        if q.ndim != 3:
+            raise ValueError(f"QSA query rows must be rank-3, got {tuple(q.shape)}")
+        if pooled_k.ndim != 2:
+            raise ValueError(
+                f"QSA pooled keys must be rank-2, got {tuple(pooled_k.shape)}"
+            )
+        rows = int(q.shape[0])
+        if row_block_ends.numel() != rows:
+            raise ValueError(
+                "QSA row block ends must match query rows: "
+                f"rows={rows}, ends={tuple(row_block_ends.shape)}"
+            )
+        if logits_workspace_bytes <= 0:
+            raise ValueError(
+                "QSA logits workspace must be positive, "
+                f"got {logits_workspace_bytes}"
+            )
+        if rows == 0:
+            width = min(self.block_topk, int(pooled_k.shape[0]))
+            return torch.empty((0, width), dtype=torch.long, device=q.device)
+
+        compressed_keys = max(int(pooled_k.shape[0]), 1)
+        rows_per_chunk = max(1, logits_workspace_bytes // (compressed_keys * 4))
+        # TileLang's QSA prefill kernel has a regular row granularity.  Keep
+        # that alignment when it fits, while preserving the exact final tail.
+        row_granularity = max(1, 128 // max(int(self.n_heads), 1))
+        if rows_per_chunk >= row_granularity:
+            rows_per_chunk = max(
+                row_granularity,
+                rows_per_chunk // row_granularity * row_granularity,
+            )
+        rows_per_chunk = min(rows, rows_per_chunk)
+        if rows_per_chunk >= rows:
+            return self.select_blocks(
+                self.score_blocks(q, pooled_k, row_block_ends), row_block_ends
+            )
+
+        selected_tiles: list[torch.Tensor] = []
+        for row_start in range(0, rows, rows_per_chunk):
+            row_end = min(row_start + rows_per_chunk, rows)
+            logits = self.score_blocks(
+                q[row_start:row_end], pooled_k, row_block_ends[row_start:row_end]
+            )
+            selected_tiles.append(
+                self.select_blocks(logits, row_block_ends[row_start:row_end])
+            )
+            # Do not let a previous tile survive into the next score launch;
+            # the allocator can then reuse the bounded workspace immediately.
+            del logits
+        return torch.cat(selected_tiles, dim=0)
+
     def select_blocks_fixed(
         self,
         logits: torch.Tensor,

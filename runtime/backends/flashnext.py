@@ -192,8 +192,10 @@ class FlashNextPrefixSnapshot:
     The large QSA/FP8 pools are deliberately *not* cloned.  They remain in
     the slot's fixed-address allocation across ``reset_slot`` and are reused
     in place.  Only the length-independent recurrent/PLE state, plus the
-    small MTP scalars and first-token result, is copied.  This keeps a prefix
-    hit bounded to tens of MiB instead of allocating another 256K KV cache.
+    small MTP scalars and first-token result, is copied.  Checkpoint tensors
+    are host-resident and copied back into the slot on restore, so retaining
+    history does not consume additional GPU memory.  This keeps a prefix hit
+    bounded to tens of MiB instead of allocating another 256K KV cache.
     """
 
     token_ids: tuple[int, ...]
@@ -289,18 +291,20 @@ class FlashNextBackend:
         self._prefix_cache: list[FlashNextPrefixSnapshot | None] = [None] * num_slots
         # A single latest checkpoint cannot serve a prompt that is shorter
         # than the last request (the common shape after client compaction).
-        # Keep a small bounded history of recurrent checkpoints so any
-        # authenticated common boundary can be resumed without replaying the
-        # whole cold prefix.  Six entries/slot costs roughly 0.9 GiB/slot on
-        # the production checkpoint and is below the measured two-slot headroom.
+        # Keep a bounded history of recurrent checkpoints so any authenticated
+        # common boundary can be resumed without replaying the whole cold
+        # prefix.  Checkpoint tensors live in host memory (see
+        # _capture_prefix_snapshot), so the history does not consume GPU KV
+        # headroom.  Six entries were insufficient for a 128K compaction after
+        # a 230K request; the larger default keeps the nearest 8K boundary.
         try:
             checkpoint_limit = int(
-                os.environ.get("QSR_FLASHNEXT_PREFIX_CHECKPOINTS_PER_SLOT", "6")
+                os.environ.get("QSR_FLASHNEXT_PREFIX_CHECKPOINTS_PER_SLOT", "16")
             )
         except ValueError:
-            checkpoint_limit = 6
+            checkpoint_limit = 16
             logger.warning(
-                "invalid QSR_FLASHNEXT_PREFIX_CHECKPOINTS_PER_SLOT; using 6"
+                "invalid QSR_FLASHNEXT_PREFIX_CHECKPOINTS_PER_SLOT; using 16"
             )
         self.prefix_cache_checkpoints_per_slot = max(1, min(checkpoint_limit, 16))
         try:
@@ -800,20 +804,30 @@ class FlashNextBackend:
             return
         if not hasattr(self, "_prefix_cache"):
             return
+        def snapshot_tensor(value: torch.Tensor) -> torch.Tensor:
+            """Copy a checkpoint tensor to host memory without retaining GPU storage."""
+            detached = value.detach()
+            if detached.device.type == "cuda":
+                return detached.to(device="cpu", copy=True)
+            return detached.clone()
+
+        def snapshot_optional(value: torch.Tensor | None) -> torch.Tensor | None:
+            if not torch.is_tensor(value):
+                return None
+            return snapshot_tensor(value)
+
         target = self._targets[slot]
         sess = target.sess
         gdn = {
             name: (
-                state.conv_state.detach().clone(),
-                state.recurrent_state.detach().clone(),
+                snapshot_tensor(state.conv_state),
+                snapshot_tensor(state.recurrent_state),
                 bool(state.has_previous_state),
             )
             for name, state in sess.gdn.items()
         }
-        ple_state = (
-            sess.ple_conv_state.detach().clone() if torch.is_tensor(sess.ple_conv_state) else None
-        )
-        rope_next = sess.rope_next.detach().clone() if torch.is_tensor(sess.rope_next) else None
+        ple_state = snapshot_optional(sess.ple_conv_state)
+        rope_next = snapshot_optional(sess.rope_next)
         spec = self._specs[slot]
         retain_mtp_prefix = spec is not None and (mtp_ready or mtp_prefix_ready)
         mtp_sess = spec.mtp_session if retain_mtp_prefix else None
@@ -826,7 +840,7 @@ class FlashNextBackend:
             window=tuple(int(token) for token in sess.window),
             anchor=int(anchor),
             draft_tokens=tuple(int(token) for token in draft_tokens),
-            anchor_logits=anchor_logits.detach().clone(),
+            anchor_logits=snapshot_tensor(anchor_logits),
             vision_cache_key=vision_cache_key,
             mtp_sync_len=int(mtp_sess.sync_len) if mtp_sess is not None else 0,
             mtp_pos=int(mtp_sess.pos) if mtp_sess is not None else 0,
@@ -839,9 +853,7 @@ class FlashNextBackend:
             mtp_prefix_ready=bool(mtp_prefix_ready and mtp_sess is not None),
             target_only_reusable=bool(target_only_reusable),
             decode_mode=decode_mode,
-            mtp_teacher_hidden=(
-                mtp_teacher_hidden.detach().clone() if torch.is_tensor(mtp_teacher_hidden) else None
-            ),
+            mtp_teacher_hidden=snapshot_optional(mtp_teacher_hidden),
         )
         history = getattr(self, "_prefix_cache_history", None)
         if isinstance(history, list) and slot < len(history):
@@ -913,7 +925,13 @@ class FlashNextBackend:
             sess.ple_conv_state.copy_(entry.ple_conv_state)
         sess.window = list(entry.window)
         sess.pos = hit
-        sess.rope_next = entry.rope_next.detach().clone() if entry.rope_next is not None else None
+        if entry.rope_next is None:
+            sess.rope_next = None
+        elif sess.rope_next is None:
+            restore_device = getattr(self, "device", entry.rope_next.device)
+            sess.rope_next = entry.rope_next.to(device=restore_device, copy=True)
+        else:
+            sess.rope_next.copy_(entry.rope_next)
         spec = self._specs[slot]
         if spec is not None:
             if entry.mtp_prefix_ready or entry.mtp_ready:
@@ -1427,7 +1445,9 @@ class FlashNextBackend:
         if prefix_hit == len(prompt_ids):
             if prefix_entry is None:
                 raise RuntimeError("Flash-Next full prefix hit has no checkpoint")
-            logits = prefix_entry.anchor_logits
+            # Checkpoint tensors are host-resident; materialize only the
+            # boundary logits needed by this request on the target device.
+            logits = prefix_entry.anchor_logits.to(device=self.device)
             anchor = (
                 int(forced_token)
                 if forced_token is not None
@@ -1445,6 +1465,7 @@ class FlashNextBackend:
                     raise RuntimeError(
                         "Flash-Next sampled prefix hit is missing the target teacher hidden row"
                     )
+                teacher_hidden = teacher_hidden.to(device=self.device)
                 # Reuse the retained real MTP prefix rows, but sample a fresh
                 # anchor-conditioned draft and q distribution for this
                 # request.  Replaying cached sampled token ids would couple
@@ -1467,7 +1488,7 @@ class FlashNextBackend:
                 # target decode.
                 drafts = spec.sync_and_propose(
                     [anchor],
-                    prefix_entry.mtp_teacher_hidden,
+                    prefix_entry.mtp_teacher_hidden.to(device=self.device),
                     params=params if sampled else None,
                 )
             else:
@@ -1630,18 +1651,35 @@ class FlashNextBackend:
                         # before syncing the remaining rows of this chunk.
                         sync_tokens = suffix_ids[: end + 1]
                         sync_hidden = torch.cat(
-                            [prefix_entry.mtp_teacher_hidden, hidden_rows], dim=0
+                            [
+                                prefix_entry.mtp_teacher_hidden.to(device=self.device),
+                                hidden_rows,
+                            ],
+                            dim=0,
                         )
                     if suffix_embeds is not None:
                         if prefix_mtp_resync and start == 0:
                             sync_kwargs["input_embeds"] = suffix_embeds[: end + 1]
                         else:
                             sync_kwargs["input_embeds"] = suffix_embeds[start + 1 : end + 1]
-                    spec.sync_real_suffix(
-                        sync_tokens,
-                        sync_hidden,
-                        **sync_kwargs,
-                    )
+                    try:
+                        spec.sync_real_suffix(
+                            sync_tokens,
+                            sync_hidden,
+                            # The first draft from an intermediate chunk is
+                            # discarded; only MTP state must advance.  Skipping
+                            # lm_head/argmax avoids one vocabulary-wide matmul
+                            # and a CUDA-to-host sync per prefill chunk.
+                            return_first_token=False,
+                            **sync_kwargs,
+                        )
+                    except TypeError as exc:
+                        # Keep pre-change protocol test doubles and external
+                        # adapters source-compatible while the production
+                        # FlashNextSpecEngine uses the optimized keyword.
+                        if "return_first_token" not in str(exc):
+                            raise
+                        spec.sync_real_suffix(sync_tokens, sync_hidden, **sync_kwargs)
                     mtp_sync_ns += self._prefill_timestamp_ns() - started
                     absolute_end = prefix_hit + end
                     absolute_start = prefix_hit + start
@@ -1702,7 +1740,13 @@ class FlashNextBackend:
                 started = self._prefill_timestamp_ns()
                 if prefix_mtp_resync:
                     shifted = [*suffix_ids, anchor]
-                    sync_hidden = torch.cat([prefix_entry.mtp_teacher_hidden, final_hidden], dim=0)
+                    sync_hidden = torch.cat(
+                        [
+                            prefix_entry.mtp_teacher_hidden.to(device=self.device),
+                            final_hidden,
+                        ],
+                        dim=0,
+                    )
                 else:
                     shifted = [*suffix_ids[1:], anchor]
                     sync_hidden = final_hidden
@@ -1738,7 +1782,13 @@ class FlashNextBackend:
                 assert final_hidden is not None
                 if prefix_mtp_resync and final_chunk_start == 0:
                     shifted = suffix_ids + [anchor]
-                    sync_hidden = torch.cat([prefix_entry.mtp_teacher_hidden, final_hidden], dim=0)
+                    sync_hidden = torch.cat(
+                        [
+                            prefix_entry.mtp_teacher_hidden.to(device=self.device),
+                            final_hidden,
+                        ],
+                        dim=0,
+                    )
                 else:
                     shifted = suffix_ids[final_chunk_start + 1 :] + [anchor]
                     sync_hidden = final_hidden

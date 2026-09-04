@@ -1991,6 +1991,7 @@ class FlashNextSpecEngine:
         params: SamplingParams | None = None,
         return_probs: bool = False,
         return_token_tensor: bool = False,
+        return_first_token: bool = True,
     ) -> (
         tuple[int | torch.Tensor, torch.Tensor]
         | tuple[int | torch.Tensor, torch.Tensor, torch.Tensor | None]
@@ -2068,10 +2069,22 @@ class FlashNextSpecEngine:
                 sess,
                 capture_sparse_indices=True,
             )
-            first_logits = self.model.lm_head(mixed[-1:])
+            first_logits = self.model.lm_head(mixed[-1:]) if return_first_token else None
         sess.sync_len = start + query_len
         sess.pos = sess.sync_len
-        if sampled:
+        if not return_first_token:
+            if params is not None:
+                raise ValueError(
+                    "MTP sync cannot sample when return_first_token is false"
+                )
+            first_probs = None
+            # Intermediate chunk sync only needs to advance the recurrent and
+            # QSA state.  Its first draft is intentionally discarded by the
+            # caller, so avoid a vocabulary-wide lm_head and host argmax.
+            first_draft = 0
+        elif sampled:
+            if first_logits is None:
+                raise RuntimeError("MTP sync sampling requires first logits")
             try:
                 first_probs = compute_sampling_distribution(first_logits, params)
                 first_token = sample_from_distribution(
@@ -2097,6 +2110,8 @@ class FlashNextSpecEngine:
                 else int(first_token.item())
             )
         else:
+            if first_logits is None:
+                raise RuntimeError("MTP sync requires first logits")
             first_probs = None
             first_draft = int(first_logits.argmax(dim=-1).item())
         if return_probs:

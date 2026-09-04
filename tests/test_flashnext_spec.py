@@ -706,6 +706,42 @@ def test_sync_real_suffix_uses_precomputed_input_embeds() -> None:
     assert engine.mtp_session.pos == 7
 
 
+def test_sync_real_suffix_can_advance_state_without_lm_head() -> None:
+    """Intermediate chunk sync must not run a discarded vocabulary matmul."""
+    engine = object.__new__(FlashNextSpecEngine)
+    engine.device = torch.device("cpu")
+    engine.k = 3
+    engine.max_seq = 16
+    engine.mtp_session = SimpleNamespace(sync_len=5, pos=0)
+
+    def forward(embeds, target_hc_hidden, positions, sess, **kwargs):
+        del embeds, target_hc_hidden, positions, sess, kwargs
+        return torch.zeros(2, 4, dtype=torch.bfloat16), torch.ones(2, 4)
+
+    engine.mtp = SimpleNamespace(forward=forward)
+
+    def lm_head(_mixed):
+        raise AssertionError("intermediate sync must skip lm_head")
+
+    engine.model = SimpleNamespace(
+        cfg=SimpleNamespace(hc_count=1, hidden_size=4),
+        embed_tokens=lambda tokens: tokens.to(torch.bfloat16).unsqueeze(-1).repeat(1, 4),
+        lm_head=lm_head,
+    )
+
+    first_draft, hidden = FlashNextSpecEngine.sync_real_suffix(
+        engine,
+        shifted_token_ids=[7, 8],
+        target_hc_hidden=torch.ones(2, 4, dtype=torch.bfloat16),
+        return_first_token=False,
+    )
+
+    assert first_draft == 0
+    assert hidden.shape == (1, 4)
+    assert engine.mtp_session.sync_len == 7
+    assert engine.mtp_session.pos == 7
+
+
 def test_sync_and_propose_replays_graph_with_precomputed_input_embeds() -> None:
     engine = object.__new__(FlashNextSpecEngine)
     engine.k = 3
